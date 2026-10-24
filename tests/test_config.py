@@ -124,7 +124,7 @@ def test_opencode_provider_does_not_require_deepseek_key(tmp_path: Path) -> None
     assert s.opencode.server_url == ""
     assert s.opencode.db_path == "data/opencode-bot.db"
     assert s.opencode.host == "127.0.0.1"
-    assert s.opencode.port == 4310
+    assert s.opencode.port == 24310
     assert s.opencode.startup_timeout_seconds == 30.0
 
 

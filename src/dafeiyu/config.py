@@ -72,7 +72,7 @@ class OpenCodeConfig:
     server_url: str = ""
     db_path: str = "data/opencode-bot.db"
     host: str = "127.0.0.1"
-    port: int = 4310
+    port: int = 24310
     startup_timeout_seconds: float = 30.0
 
 
@@ -205,7 +205,7 @@ def load_settings(
     server_url = str(opencode_raw.get("server_url") or "").strip()
     db_path = str(opencode_raw.get("db_path") or "data/opencode-bot.db").strip()
     host = str(opencode_raw.get("host") or "127.0.0.1").strip()
-    port = _int(opencode_raw.get("port", 4310), "opencode.port")
+    port = _int(opencode_raw.get("port", 24310), "opencode.port")
     startup_timeout = _float(
         opencode_raw.get("startup_timeout_seconds", 30.0),
         "opencode.startup_timeout_seconds",

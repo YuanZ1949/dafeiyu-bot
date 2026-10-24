@@ -18,7 +18,7 @@ class OpenCodeServer:
         project_dir: str,
         db_path: str,
         host: str = "127.0.0.1",
-        port: int = 4310,
+        port: int = 24310,
         startup_timeout: float = 30.0,
         env: Mapping[str, str] | None = None,
     ) -> None:
@@ -70,9 +70,10 @@ class OpenCodeServer:
 
     async def _probe(self) -> bool:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=1.0)
+            self._client = httpx.AsyncClient(timeout=1.0, trust_env=False)
         response = await self._client.get(f"{self.url}/api/info")
-        return response.status_code == 200
+        # opencode v2 起 serve 强制 Basic 认证，401 同样说明服务已经就绪。
+        return response.status_code < 500
 
     async def _read_stderr(self) -> str:
         if self._proc is None or self._proc.stderr is None:

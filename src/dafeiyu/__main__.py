@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .brain.client import BrainClient, BrainError
 from .brain.opencode import OpenCodeBrain, resolve_opencode_bin
+from .brain.opencode_server import OpenCodeServer
 from .brain.persona import load_persona
 from .config import ConfigError, Settings, load_settings
 from .gateway.qq import QQAdapter
@@ -53,69 +54,93 @@ async def main() -> None:
     store.init_schema()
 
     provider = settings.brain.provider
-    if provider == "opencode":
-        try:
-            opencode_bin = resolve_opencode_bin(settings.opencode.bin)
-        except BrainError as exc:
-            raise ConfigError(str(exc)) from exc
-        brain = OpenCodeBrain(
-            bin_path=opencode_bin,
-            store=store,
-            agent=settings.opencode.agent,
-            project_dir=settings.opencode.project_dir,
-            timeout=settings.opencode.timeout_seconds,
-        )
-        impressions = None
-    else:
-        # trust_env=False：不让系统代理参与，避免 httpx 为代理额外构建 transport。
-        brain = BrainClient(
-            api_key=settings.api_key,
-            base_url=settings.base_url,
-            model=settings.model,
-            trust_env=False,
-            reasoning_effort=settings.reasoning_effort or None,
-        )
-        impressions = ImpressionWorker(
-            store, brain, every=settings.memory.extract_every
-        )
+    server: OpenCodeServer | None = None
+    service: Service | None = None
+    service_started = False
+    summary_task: asyncio.Task | None = None
 
-    adapter = QQAdapter(
-        host=settings.ws_host,
-        port=settings.ws_port,
-        token=settings.ws_token,
-        bot_qq=settings.bot_qq,
-    )
-    router = Router(settings, store)
-    service = Service(
-        settings, store, brain, adapter, router, persona_text, impressions
-    )
-
-    scheduler = SummaryScheduler(store, brain) if provider == "local" else None
-    summary_task = (
-        asyncio.create_task(summary_loop(scheduler, interval=600))
-        if scheduler is not None
-        else None
-    )
-
-    await service.start()
-    log.info(
-        "%s已上线（brain=%s），等待 NapCat 反向 WS 连接 ws://%s:%s（QQ %s）",
-        settings.persona.name,
-        provider,
-        settings.ws_host,
-        settings.ws_port,
-        settings.bot_qq,
-    )
     try:
-        await asyncio.Event().wait()
-    except (KeyboardInterrupt, SystemExit):
-        log.info("收到退出信号")
+        if provider == "opencode":
+            try:
+                opencode_bin = resolve_opencode_bin(settings.opencode.bin)
+            except BrainError as exc:
+                raise ConfigError(str(exc)) from exc
+            if settings.opencode.manage_server:
+                server = OpenCodeServer(
+                    bin_path=opencode_bin,
+                    project_dir=settings.opencode.project_dir,
+                    db_path=settings.opencode.db_path,
+                    host=settings.opencode.host,
+                    port=settings.opencode.port,
+                    startup_timeout=settings.opencode.startup_timeout_seconds,
+                )
+                await server.start()
+                server_url = server.url
+            else:
+                server_url = settings.opencode.server_url
+            brain = OpenCodeBrain(
+                bin_path=opencode_bin,
+                store=store,
+                agent=settings.opencode.agent,
+                project_dir=settings.opencode.project_dir,
+                timeout=settings.opencode.timeout_seconds,
+                server_url=server_url,
+            )
+            impressions = None
+        else:
+            # trust_env=False：不让系统代理参与，避免 httpx 为代理额外构建 transport。
+            brain = BrainClient(
+                api_key=settings.api_key,
+                base_url=settings.base_url,
+                model=settings.model,
+                trust_env=False,
+                reasoning_effort=settings.reasoning_effort or None,
+            )
+            impressions = ImpressionWorker(
+                store, brain, every=settings.memory.extract_every
+            )
+
+        adapter = QQAdapter(
+            host=settings.ws_host,
+            port=settings.ws_port,
+            token=settings.ws_token,
+            bot_qq=settings.bot_qq,
+        )
+        router = Router(settings, store)
+        service = Service(
+            settings, store, brain, adapter, router, persona_text, impressions
+        )
+
+        scheduler = SummaryScheduler(store, brain) if provider == "local" else None
+        summary_task = (
+            asyncio.create_task(summary_loop(scheduler, interval=600))
+            if scheduler is not None
+            else None
+        )
+
+        await service.start()
+        service_started = True
+        log.info(
+            "%s已上线（brain=%s），等待 NapCat 反向 WS 连接 ws://%s:%s（QQ %s）",
+            settings.persona.name,
+            provider,
+            settings.ws_host,
+            settings.ws_port,
+            settings.bot_qq,
+        )
+        try:
+            await asyncio.Event().wait()
+        except (KeyboardInterrupt, SystemExit):
+            log.info("收到退出信号")
     finally:
         if summary_task is not None:
             summary_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await summary_task
-        await service.stop()
+        if service_started and service is not None:
+            await service.stop()
+        if server is not None:
+            await server.stop()
         store.close()
 
 

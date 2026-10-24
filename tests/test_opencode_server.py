@@ -106,3 +106,31 @@ async def test_start_fails_when_process_exits(monkeypatch, tmp_path):
 
     with pytest.raises(BrainError, match="启动失败"):
         await server.start()
+
+
+async def test_probe_ignores_system_proxy(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def get(self, url):
+            captured["url"] = url
+
+            class _Response:
+                status_code = 401
+
+            return _Response()
+
+        async def aclose(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr(
+        "dafeiyu.brain.opencode_server.httpx.AsyncClient", FakeClient
+    )
+    server = OpenCodeServer("opencode.exe", str(tmp_path), "data/bot.db")
+
+    assert await server._probe() is True
+    assert captured["trust_env"] is False
+    assert captured["url"] == "http://127.0.0.1:24310/api/info"
