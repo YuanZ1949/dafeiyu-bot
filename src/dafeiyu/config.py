@@ -95,6 +95,19 @@ class LocalModelConfig:
 
 
 @dataclass(frozen=True)
+class NapCatConfig:
+    """NapCat 快登失败时的密码回退。
+
+    QQ 密码是凭据，默认留空：只有 ``-q <uin>`` 快速登录失败时才用得上。
+    值从 ``.env``（已 gitignore）或进程环境读，不要写进被 git 跟踪的
+    config.yaml；``_md5`` 是 32 位十六进制，优先于明文。
+    """
+
+    quick_password: str = ""
+    quick_password_md5: str = ""
+
+
+@dataclass(frozen=True)
 class RestartConfig:
     backoff_seconds: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
     max_failures: int = 5
@@ -135,6 +148,7 @@ class Settings:
     brain: BrainConfig = field(default_factory=BrainConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
     local_model: LocalModelConfig = field(default_factory=LocalModelConfig)
+    napcat: NapCatConfig = field(default_factory=NapCatConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
 
 
@@ -300,6 +314,21 @@ def load_settings(
     if startup_timeout <= 0:
         raise ConfigError("opencode.startup_timeout_seconds 必须大于 0")
 
+    napcat_raw = raw.get("napcat") or {}
+    if not isinstance(napcat_raw, dict):
+        raise ConfigError("config.yaml 的 napcat 必须是映射")
+    quick_password = str(napcat_raw.get("quick_password") or "").strip() or str(
+        env.get("NAPCAT_QUICK_PASSWORD", "")
+    ).strip()
+    quick_password_md5 = str(
+        napcat_raw.get("quick_password_md5") or ""
+    ).strip() or str(env.get("NAPCAT_QUICK_PASSWORD_MD5", "")).strip()
+    if quick_password_md5 and (
+        len(quick_password_md5) != 32
+        or any(c not in "0123456789abcdefABCDEF" for c in quick_password_md5)
+    ):
+        raise ConfigError("napcat.quick_password_md5 必须是 32 位十六进制")
+
     api_key = env.get("DEEPSEEK_API_KEY", "").strip()
     if provider == "token" and not api_key:
         raise ConfigError("缺少环境变量 DEEPSEEK_API_KEY")
@@ -411,6 +440,10 @@ def load_settings(
             startup_timeout_seconds=startup_timeout,
         ),
         local_model=local_model,
+        napcat=NapCatConfig(
+            quick_password=quick_password,
+            quick_password_md5=quick_password_md5,
+        ),
         supervisor=SupervisorConfig(
             dashboard=DashboardConfig(
                 host=str(dash_raw.get("host") or "127.0.0.1").strip(),

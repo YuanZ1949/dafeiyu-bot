@@ -70,11 +70,18 @@ class SummaryScheduler:
         brain,
         clock: Callable[[], datetime] = now_shanghai,
         hour: int = 4,
+        brain_getter: Callable[[], Any] | None = None,
     ) -> None:
         self._store = store
         self._brain = brain
         self._clock = clock
         self._hour = hour
+        # dashboard 换脑只更新 Service.brain，拿不到 scheduler 手里的引用；
+        # 有 getter 就每轮现取，避免摘要一直用旧 provider 的 client。
+        self._brain_getter = brain_getter
+
+    def _current_brain(self):
+        return self._brain_getter() if self._brain_getter is not None else self._brain
 
     async def run_pending(self) -> int:
         now = self._clock()
@@ -87,7 +94,9 @@ class SummaryScheduler:
         for chat_type, chat_id in self._store.active_chats_between(start_ts, end_ts):
             if self._store.get_summary(chat_type, chat_id, target):
                 continue
-            if await summarize_chat(self._store, self._brain, chat_type, chat_id, target):
+            if await summarize_chat(
+                self._store, self._current_brain(), chat_type, chat_id, target
+            ):
                 created += 1
         return created
 

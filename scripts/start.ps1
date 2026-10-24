@@ -1,4 +1,4 @@
-# Dafeiyu QQ bot launcher
+﻿# Dafeiyu QQ bot launcher
 # Usage: powershell -ExecutionPolicy Bypass -File scripts/start.ps1
 $ErrorActionPreference = "Stop"
 

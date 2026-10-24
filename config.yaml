@@ -29,6 +29,14 @@ opencode:
   port: 24310
   startup_timeout_seconds: 30
 
+# NapCat 快登失败时的密码回退（可选）。凭据不要写在这里：config.yaml 进版本库。
+# 把值放 .env（已 gitignore）或进程环境，键名 NAPCAT_QUICK_PASSWORD /
+# NAPCAT_QUICK_PASSWORD_MD5（32 位十六进制，优先于明文）。
+# 留空则只用 `-q <uin>` 快登，失败后回落二维码。
+napcat:
+  quick_password: ""
+  quick_password_md5: ""
+
 local_model:
   # 本机 LM Studio 默认端口
   base_url: http://127.0.0.1:1234/v1

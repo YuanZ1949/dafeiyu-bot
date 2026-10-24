@@ -170,10 +170,17 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
     # -q <uin> 让 NapCat 用机器人号已有的本地票据自动登录，冷启动不必再扫码。
     # 必须显式给 uin：本机快速登录列表里还有用户的个人号 504567327，
     # 不给 -q 会按列表顺序登错号。票据失效时 NapCat 自己回落到二维码，不会卡死。
+    # 配了密码时，快登失败会自动走一次密码回退（napcat.mjs:83224）。
+    napcat_env: dict[str, str] = {}
+    if settings.napcat.quick_password:
+        napcat_env["NAPCAT_QUICK_PASSWORD"] = settings.napcat.quick_password
+    if settings.napcat.quick_password_md5:
+        napcat_env["NAPCAT_QUICK_PASSWORD_MD5"] = settings.napcat.quick_password_md5
     specs["napcat"] = ProcSpec(
         name="napcat",
         command=[str(node), "index.js", "-q", str(settings.bot_qq)],
         cwd=str(NAPCAT_DIR),
+        env=napcat_env or None,
         creationflags=CREATE_NO_WINDOW,
     )
     return specs

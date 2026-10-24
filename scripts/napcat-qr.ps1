@@ -1,4 +1,4 @@
-# Show a large, auto-refreshing NapCat login QR.
+﻿# Show a large, auto-refreshing NapCat login QR.
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -NoOpen

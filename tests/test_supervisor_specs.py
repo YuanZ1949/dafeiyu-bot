@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dafeiyu.config import load_settings
+import pytest
+
+from dafeiyu.config import ConfigError, load_settings
 from dafeiyu.supervisor.main import build_specs
 
 BASE = """\
@@ -58,3 +60,29 @@ def test_napcat_quick_login_env_var_is_gone(tmp_path: Path) -> None:
     _settings, specs = build(tmp_path)
 
     assert "NAPCAT_QUICK_LOGIN" not in (specs["napcat"].env or {})
+
+
+def test_napcat_password_fallback_goes_to_env(tmp_path: Path) -> None:
+    """快登失败后 NapCat 会用这个环境变量再试一次密码登录。"""
+    _settings, specs = build(tmp_path, ENV + "NAPCAT_QUICK_PASSWORD=hunter2\n")
+
+    assert (specs["napcat"].env or {})["NAPCAT_QUICK_PASSWORD"] == "hunter2"
+
+
+def test_napcat_password_md5_goes_to_env(tmp_path: Path) -> None:
+    md5 = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    _settings, specs = build(tmp_path, ENV + f"NAPCAT_QUICK_PASSWORD_MD5={md5}\n")
+
+    assert (specs["napcat"].env or {})["NAPCAT_QUICK_PASSWORD_MD5"] == md5
+
+
+def test_napcat_without_password_keeps_inherited_env(tmp_path: Path) -> None:
+    """没配密码就别塞 env，让 NapCat 直接继承父进程环境。"""
+    _settings, specs = build(tmp_path)
+
+    assert specs["napcat"].env is None
+
+
+def test_invalid_quick_password_md5_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="quick_password_md5"):
+        build(tmp_path, ENV + "NAPCAT_QUICK_PASSWORD_MD5=not-a-md5\n")

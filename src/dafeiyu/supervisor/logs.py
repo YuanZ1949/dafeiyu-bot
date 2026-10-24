@@ -34,6 +34,22 @@ class LogHub:
         self._subscribers: dict[str, set[asyncio.Queue[str]]] = {
             s: set() for s in SOURCES
         }
+        self._rotate_existing()
+
+    def _rotate_existing(self) -> None:
+        """每次启动轮转一次，让当前文件 == 本次运行的日志。
+
+        只按大小轮转（10MB）时，单次运行往往几周都到不了阈值，修复之前的
+        历史错误会一直留在 ``supervisor.log`` 里，让「文件里没有 401」这类
+        判据永远不成立。历史仍然保留在 ``.log.1``。
+        """
+        for source in SOURCES:
+            target = self.dir / f"{source}.log"
+            try:
+                if target.exists() and target.stat().st_size > 0:
+                    self._rotate(target)
+            except OSError as exc:
+                log.debug("启动轮转 %s 失败：%s", target, exc)
 
     def write(self, source: str, text: str) -> None:
         if source not in self._buffers:

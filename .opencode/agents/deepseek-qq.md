@@ -1,8 +1,14 @@
 ---
 description: Deepseek娘 QQ 群聊人格（禁用工具，只输出聊天 JSON）
 mode: primary
+# 只给模型一步：V2 在最后一步会移除全部工具，模型只能直接吐文本，
+# 从根上堵住「自己发起工具调用 → 几十秒延迟 → 多条 assistant」。
+steps: 1
 permissions:
-  - action: read
+  # 通配 deny 必须放最前：规则是「最后匹配者胜」，后面才能用 allow 开例外。
+  # 只逐项写 read/grep/shell 的话，MCP 工具（ast_grep_search 之类）不在名单里，
+  # 将来一接 MCP 就会漏。
+  - action: "*"
     resource: "*"
     effect: deny
   - action: read

@@ -100,3 +100,27 @@ async def test_scheduler_ignores_day_without_messages():
 
     assert await scheduler.run_pending() == 0
     assert brain.calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_uses_brain_from_getter_after_switch():
+    """dashboard 换脑只改 service.brain，scheduler 必须每轮现取，不能啃旧引用。"""
+    store = make_store()
+    seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ))
+    old = FakeBrain("旧大脑")
+    new = FakeBrain("新大脑")
+    current = {"brain": old}
+    scheduler = SummaryScheduler(
+        store,
+        old,
+        clock=lambda: NOW,
+        hour=4,
+        brain_getter=lambda: current["brain"],
+    )
+
+    current["brain"] = new  # 模拟控制口换脑
+    assert await scheduler.run_pending() == 1
+
+    assert old.calls == []
+    assert len(new.calls) == 1
+    assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) == "新大脑"

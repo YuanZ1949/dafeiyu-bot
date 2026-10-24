@@ -36,6 +36,10 @@ def setup_logging(settings: Settings) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=handlers,
     )
+    # 一条消息约 10 次 HTTP 调用（1 次 prompt + 8~9 次轮询），httpx 的 INFO
+    # 会把 bot.log 淹掉，真正有用的行被埋。4xx/5xx 仍在 WARNING 以上，不丢错。
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 async def main() -> None:
@@ -111,7 +115,7 @@ async def main() -> None:
         )
 
         scheduler = (
-            SummaryScheduler(store, brain)
+            SummaryScheduler(store, brain, brain_getter=lambda: service.brain)
             if provider in ("token", "local_model")
             else None
         )

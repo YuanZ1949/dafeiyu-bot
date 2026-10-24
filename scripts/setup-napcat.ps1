@@ -1,4 +1,4 @@
-# Download and prepare a portable NapCat inside this project.
+﻿# Download and prepare a portable NapCat inside this project.
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts/setup-napcat.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts/setup-napcat.ps1 -Proxy http://127.0.0.1:10808
