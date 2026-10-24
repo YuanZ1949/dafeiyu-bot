@@ -428,12 +428,13 @@ def test_reply_uses_round_tokens():
 
 - [ ] **Step 3: 实现**
 
-排序：客户端按 `time.created` **升序**（不信任服务端顺序）。
-`since = max(baseline, prompt_time - 1.0 * unit)`：`unit` 由 `_unit()` 判定（把 `prompt_time` 与 `time.time()` 比较：>`1e11` 视为毫秒），Task 2 有结论则写死。
-结束判据（按 Task 2 结论选一条，代码里留 TODO 注释指向 spike 文档）：① `wait` 端点；② 最后一条 assistant 有 `time.completed` 且所有 tool part `state.status not in {"pending","running"}`；③ 静默窗口（同文本连续 2 次轮询不变 + 无 running tool）。
-`until = max(time.created)`（同一单位，绝不用 `time.time()`）。
-`on_tool`：本轮第一个 `webfetch` tool part 触发一次。
-token：累加本轮全部 assistant 的 `_usage`；`_usage` 读 `tokens.input` / `tokens.output`。
+排序：客户端按 `time.created` **升序**（不信任服务端顺序；spike 证实服务端默认倒序、`?order=asc` 虽可用但不用它，避免依赖未承诺的行为）。
+`since = max(baseline, prompt_time - 1000)`：spike S2b 已定死 **`time.created` 是毫秒**，容差用 1000（=1 秒）。
+结束判据（spike S2d 已定死，不留 TODO）：`prompt` → `POST /api/experimental/session/{id}/wait`（204 表示会话空闲）→ 再读 message → 取「`created >= since` 且带非空 text 的 assistant 中 `created` 最大的一条」。
+**不要**用「最后一条 assistant 有 `time.completed`」判定：工具步那条 assistant 也是 completed（spike S1 证据），会提前返回半截。
+`until = max(time.created)`（同一单位毫秒，绝不用 `time.time()`）。
+`on_tool`：本轮第一个 `part["name"] == "webfetch"` 的 tool part 触发一次（**工具名在 `name` 字段**，不是 `tool`；状态在 `state.status`）。
+token：累加本轮全部 assistant 的 `_usage`；`_usage` 读 `tokens.input` / `tokens.output`（`cache.read` 不计入）。
 
 - [ ] **Step 4: 跑测试确认通过 + 相关旧用例**
 
@@ -505,7 +506,7 @@ def test_reply_rotates_on_foreign_message(fake):
 `_temp_session(text)`：`_create_session(agent="dafeiyu-memory", title=f"mem:{purpose}")` → `_ask` → `DELETE`（`except Exception: log.debug`）→ `(text, tin, tout)`。
 `complete_detailed`：`text = f"{system}\n\n" + "\n".join(f"{m['role']}: {m['content']}" for m in messages)`，返回三元组。
 `forget`：有 sid 才 DELETE；404 由 `_UnknownSession` 覆盖，捕获后照常清映射。
-`_audit_round`：取 `limit=50`；命中条件 `type not in {"user","assistant"}` 或（`type == "user"` 且 `created` 不在 `[since, until]`）；**窗口与消息同单位**，测试里显式给同单位值。
+`_audit_round`：取 `limit=50`；**白名单 `{"user","assistant","idle"}`**（spike S3：每轮都有 `idle`，漏掉它会每轮误判），命中条件 `type not in 白名单` 或（`type == "user"` 且 `created` 不在 `[since, until]`）；**窗口与消息同为毫秒**，测试里显式给同单位值。
 `reply`：`result = await self._ask(...)`；`hits = self._audit_round(sid, result.since, result.until)`；非空则 warning + 清映射，不 raise。
 
 - [ ] **Step 4: 跑测试确认通过** → `pytest tests/test_brain_complete.py -v`
@@ -817,6 +818,8 @@ def test_workspace_disabled_creates_deny_session(fake):
 agent 文件：frontmatter 顺序「通配 deny 在前，allow 在后」；删 `:66` 的自否句；persona 三段两边同步。
 `config.yaml` 按 spec §12；`WorkspaceConfig.dir` 默认 `"data/bot-workspace"`，代码侧 `""` 时禁用注入并给 session 下 deny。
 **不新增 lifecycle hook**：64KB 只在 `_run_batch` 结束后检查（Task 12 已接）。
+**隔离（spike S6b 已证实可做，成本低）**：找到 supervisor 里启动 opencode 的那处，注入 `XDG_CONFIG_HOME=<仓库内 data/opencode-config>` 并把 `OPENCODE_CONFIG` 置空；把 `~/.config/opencode/opencode.jsonc` 里业务需要的段（provider/model 定义，不含 agent 列表）复制进该目录。实测效果：`GET /api/agent` 从 16 个降到 0 个全局 agent，provider 凭据仍可用（auth 在 data 目录，不复制）。若该目录会进 git，加进 `.gitignore`。
+如果 supervisor 那处不好改，**退化方案**：不改启动环境，只靠 agent 权限 + Task 8 的审计兜底，并在 spec §11 记一行「实测：未隔离，理由 X」。
 
 - [ ] **Step 4: 跑测试确认通过 + 全量**
 
