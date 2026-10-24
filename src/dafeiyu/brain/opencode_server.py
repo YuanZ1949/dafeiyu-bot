@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import socket
 import time
+from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
 
 import httpx
 
 from .client import BrainError
+
+logger = logging.getLogger(__name__)
 
 
 class OpenCodeServer:
@@ -35,6 +39,8 @@ class OpenCodeServer:
         self._env = dict(env or {})
         self._proc: asyncio.subprocess.Process | None = None
         self._client: httpx.AsyncClient | None = None
+        self._output_tail: deque[str] = deque(maxlen=50)
+        self._drain_tasks: list[asyncio.Task[None]] = []
 
     @property
     def url(self) -> str:
@@ -54,6 +60,17 @@ class OpenCodeServer:
     @property
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
+
+    @property
+    def drain_tasks(self) -> list[asyncio.Task[None]]:
+        """仍在读子进程输出的后台任务；stop() 之后必须为空。"""
+        return list(self._drain_tasks)
+
+    def recent_output(self, limit: int = 50) -> str:
+        """最近若干行 serve 输出，用于启动失败时给出可读原因。"""
+        if limit <= 0:
+            return ""
+        return "\n".join(list(self._output_tail)[-limit:])
 
     def _db_abs(self) -> Path:
         path = Path(self.db_path).expanduser()
@@ -76,14 +93,25 @@ class OpenCodeServer:
         # opencode v2 起 serve 强制 Basic 认证，401 同样说明服务已经就绪。
         return response.status_code < 500
 
-    async def _read_stderr(self) -> str:
-        if self._proc is None or self._proc.stderr is None:
-            return ""
+    async def _drain(self, stream: asyncio.StreamReader) -> None:
+        """持续读走子进程输出。
+
+        stdout/stderr 都是 PIPE：不读的话管道缓冲（Windows 上 64KB）写满后，
+        serve 会阻塞在写日志上，表现为服务活着但不再响应。
+        """
         try:
-            data = await asyncio.wait_for(self._proc.stderr.read(), timeout=1.0)
-        except (asyncio.TimeoutError, OSError):
-            return ""
-        return data.decode("utf-8", errors="replace")
+            while True:
+                line = await stream.readline()
+                if not line:
+                    return
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    self._output_tail.append(text)
+                    logger.debug("opencode serve: %s", text)
+        except asyncio.CancelledError:
+            raise
+        except OSError:
+            return
 
     def _port_in_use(self) -> bool:
         """端口上是否已有进程在监听。
@@ -107,13 +135,24 @@ class OpenCodeServer:
                 "请先关掉残留进程或换一个端口"
             )
         self._db_abs().parent.mkdir(parents=True, exist_ok=True)
-        self._proc = await asyncio.create_subprocess_exec(
-            *self.command,
-            cwd=self.project_dir or None,
-            env=self._build_env(),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        self._output_tail.clear()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self.command,
+                cwd=self.project_dir or None,
+                env=self._build_env(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise BrainError(
+                f"无法启动 opencode serve（{self.bin}）：{exc.strerror or exc}；"
+                "请确认 opencode.bin 指向的文件存在，或已在 PATH 中"
+            ) from exc
+        self._proc = proc
+        for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+            if stream is not None:
+                self._drain_tasks.append(asyncio.create_task(self._drain(stream)))
         try:
             await self._wait_ready()
         except Exception:
@@ -125,7 +164,7 @@ class OpenCodeServer:
         last_error = ""
         while time.monotonic() < deadline:
             if self._proc is None or self._proc.returncode is not None:
-                detail = await self._read_stderr()
+                detail = self.recent_output(20) or "进程已退出，没有输出"
                 raise BrainError(f"opencode serve 启动失败：{detail[:400]}")
             try:
                 if await self._probe():
@@ -133,19 +172,25 @@ class OpenCodeServer:
             except Exception as exc:
                 last_error = str(exc)
             await asyncio.sleep(0.25)
-        raise BrainError(f"opencode serve 启动超时：{last_error[:400]}")
+        detail = self.recent_output(20) or last_error
+        raise BrainError(f"opencode serve 启动超时：{detail[:400]}")
 
     async def stop(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        tasks = self._drain_tasks
+        self._drain_tasks = []
         proc = self._proc
         self._proc = None
-        if proc is None or proc.returncode is not None:
-            return
-        proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+        if proc is not None and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)

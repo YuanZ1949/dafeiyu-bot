@@ -243,6 +243,7 @@ async def test_forget_group_clears_memory_for_admin(tmp_path):
     await service.handle(make_msg(content="/forget", message_id="gf1"))
 
     assert store.get_opencode_session(ChatType.GROUP, 1001) is None
+    assert store.count_messages(ChatType.GROUP, 1001) == 0
     assert brain.forgotten == [(ChatType.GROUP, 1001)]
     assert adapter.sent[-1] == (ChatType.GROUP, 1001, FORGET_REPLY)
 

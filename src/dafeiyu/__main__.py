@@ -74,7 +74,10 @@ async def main() -> None:
                     port=settings.opencode.port,
                     startup_timeout=settings.opencode.startup_timeout_seconds,
                 )
-                await server.start()
+                try:
+                    await server.start()
+                except BrainError as exc:
+                    raise ConfigError(str(exc)) from exc
                 server_url = server.url
             else:
                 server_url = settings.opencode.server_url

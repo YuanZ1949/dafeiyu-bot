@@ -162,3 +162,61 @@ async def test_start_fails_when_port_already_in_use(monkeypatch, tmp_path):
     finally:
         listener.close()
     assert spawned == []
+
+
+class FakeStream:
+    """模拟子进程的 stdout/stderr：逐行吐出，读完 EOF。"""
+
+    def __init__(self, lines: list[bytes]) -> None:
+        self._lines = list(lines)
+
+    async def readline(self) -> bytes:
+        return self._lines.pop(0) if self._lines else b""
+
+
+class StreamingProc(FakeProc):
+    def __init__(self, stdout: FakeStream | None, stderr: FakeStream | None) -> None:
+        super().__init__()
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+async def test_child_output_is_drained_continuously(monkeypatch, tmp_path):
+    """stderr 曾是只写不读的 PIPE：日志攒满 64KB 后 serve 会阻塞在写日志上。"""
+    lines = [f"line {i}\n".encode() for i in range(500)]
+    proc = StreamingProc(FakeStream(list(lines)), FakeStream(list(lines)))
+
+    async def fake_exec(*args, **kwargs):
+        return proc
+
+    async def probe():
+        return True
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    server = OpenCodeServer("opencode.exe", str(tmp_path), "data/bot.db")
+    monkeypatch.setattr(server, "_probe", probe)
+    monkeypatch.setattr(server, "_port_in_use", lambda: False)
+
+    await server.start()
+    await asyncio.sleep(0.05)
+
+    assert "line 499" in server.recent_output()
+    assert len(server.recent_output().splitlines()) <= 50
+
+    await server.stop()
+    assert server.drain_tasks == []
+
+
+async def test_start_reports_missing_bin_as_brain_error(monkeypatch, tmp_path):
+    async def fake_exec(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", args[0])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    server = OpenCodeServer(
+        "C:/nope/opencode.exe", str(tmp_path), "data/bot.db", startup_timeout=0.5
+    )
+    monkeypatch.setattr(server, "_port_in_use", lambda: False)
+
+    with pytest.raises(BrainError, match="opencode"):
+        await server.start()
+
