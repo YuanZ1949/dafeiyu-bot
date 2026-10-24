@@ -1,11 +1,24 @@
 persona:
-  name: 溟月
-  aliases: [大肥鱼, 小鲸鱼, 溟月, 鱼鱼, 肥鱼]
+  name: Deepseek娘
+  aliases: [Deepseek娘, 大肥鱼, 小鲸鱼, 鱼鱼, 肥鱼]
   max_reply_chars: 120
   max_reply_chars_technical: 300
   os_probability: 0.05
   # 留空使用内置人设 brain/persona.md；也可填自己的 md 路径（绝对或相对仓库根目录）
   prompt_file: ""
+
+# local：原来的 DeepSeek API + 本地记忆拼装
+# opencode：每个 QQ 会话映射一个 OpenCode session，人设见 .opencode/agents/deepseek-qq.md
+brain:
+  provider: opencode
+
+opencode:
+  # 留空自动找 npm 全局安装的 opencode.exe
+  bin: ""
+  agent: deepseek-qq
+  # 留空使用当前工作目录（start.ps1 会切到 dafeiyu-bot）
+  project_dir: ""
+  timeout_seconds: 90
 
 triggers:
   cooldown_seconds: 60

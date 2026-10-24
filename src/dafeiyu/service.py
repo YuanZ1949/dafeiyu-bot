@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Any
 
-from .brain.client import BrainError
+from .brain.client import BrainError, BrainReply
 from .brain.persona import build_system_prompt
 from .gateway.base import Adapter
 from .memory.context import build_context
@@ -82,7 +83,15 @@ class Service:
 
             await self._reply(msg)
 
-    async def _reply(self, msg: Message) -> None:
+    async def _ask_brain(self, msg: Message) -> BrainReply:
+        """OpenCode 模式走会话接口；本地模式仍走原来的上下文拼装。"""
+        responder = getattr(self.brain, "reply", None)
+        if callable(responder):
+            # 一个群共用一个 OpenCode session，必须让模型看到是谁在说话，
+            # 否则多人对话会糊成一团。私聊也保留昵称，语气更自然。
+            prompt = f"{msg.nickname}：{msg.content}"
+            return await responder(msg.chat_type, msg.chat_id, prompt)
+
         today = now_shanghai().date().isoformat()
         chat_title = "本群" if msg.chat_type is ChatType.GROUP else msg.nickname
         system = build_system_prompt(
@@ -102,9 +111,11 @@ class Service:
             today,
             upto_message_id=msg.message_id,
         )
+        return await self.brain.decide(ctx.system, ctx.messages)
 
+    async def _reply(self, msg: Message) -> None:
         try:
-            reply = await self.brain.decide(ctx.system, ctx.messages)
+            reply = await self._ask_brain(msg)
         except BrainError as exc:
             # 失败也占一次调用额度，避免异常时无限重试烧钱。
             self.store.record_usage(msg.chat_type, msg.chat_id, "error", 0, 0)
@@ -211,6 +222,11 @@ class Service:
             return True
         if cmd == "forget":
             self.store.forget_chat(msg.chat_type, msg.chat_id)
+            forget = getattr(self.brain, "forget", None)
+            if forget is not None:
+                result = forget(msg.chat_type, msg.chat_id)
+                if inspect.isawaitable(result):
+                    await result
             await self.adapter.send(msg.chat_type, msg.chat_id, "记忆清空了，本鱼失忆中……🫧")
             return True
         return False

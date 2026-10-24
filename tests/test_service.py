@@ -187,3 +187,41 @@ async def test_forget_private_clears_memory(tmp_path):
     )
     assert store.count_messages(ChatType.PRIVATE, 2002) == 0
     assert len(adapter.sent) == 2
+
+
+class FakeOpenCodeBrain:
+    def __init__(self, text: str = "在呢") -> None:
+        self.text = text
+        self.calls: list[tuple[ChatType, int, str]] = []
+        self.forgotten: list[tuple[ChatType, int]] = []
+
+    async def reply(self, chat_type: ChatType, chat_id: int, text: str) -> BrainReply:
+        self.calls.append((chat_type, chat_id, text))
+        return BrainReply(True, self.text, "test", 0, 0)
+
+    async def forget(self, chat_type: ChatType, chat_id: int) -> None:
+        self.forgotten.append((chat_type, chat_id))
+
+
+async def test_opencode_brain_receives_speaker_and_chat(tmp_path):
+    brain = FakeOpenCodeBrain()
+    service, _, _, adapter, _ = build(tmp_path, brain=brain)
+    await service.handle(make_msg())
+    assert brain.calls == [(ChatType.GROUP, 1001, "阿鱼：@溟月 在吗")]
+    assert adapter.sent == [(ChatType.GROUP, 1001, "在呢")]
+
+
+async def test_forget_clears_opencode_session(tmp_path):
+    brain = FakeOpenCodeBrain()
+    service, store, _, _, _ = build(tmp_path, brain=brain)
+    store.set_opencode_session(ChatType.PRIVATE, 1001, "ses_x")
+    await service.handle(
+        make_msg(
+            chat_type=ChatType.PRIVATE,
+            chat_id=1001,
+            content="/forget",
+            message_id="f1",
+        )
+    )
+    assert store.get_opencode_session(ChatType.PRIVATE, 1001) is None
+    assert brain.forgotten == [(ChatType.PRIVATE, 1001)]

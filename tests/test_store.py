@@ -113,6 +113,35 @@ def test_forget_chat_keeps_other_chats(store: Store) -> None:
     assert store.count_messages(ChatType.GROUP, 2) == 1
 
 
+def test_opencode_session_roundtrip_and_isolated(store: Store) -> None:
+    assert store.get_opencode_session(ChatType.GROUP, 1) is None
+    store.set_opencode_session(ChatType.GROUP, 1, "ses_group")
+    store.set_opencode_session(ChatType.PRIVATE, 1, "ses_private")
+    assert store.get_opencode_session(ChatType.GROUP, 1) == "ses_group"
+    assert store.get_opencode_session(ChatType.PRIVATE, 1) == "ses_private"
+
+    store.set_opencode_session(ChatType.GROUP, 1, "ses_group_2")
+    assert store.get_opencode_session(ChatType.GROUP, 1) == "ses_group_2"
+
+    store.clear_opencode_session(ChatType.GROUP, 1)
+    assert store.get_opencode_session(ChatType.GROUP, 1) is None
+    assert store.get_opencode_session(ChatType.PRIVATE, 1) == "ses_private"
+
+
+def test_forget_chat_clears_opencode_session(store: Store) -> None:
+    store.set_opencode_session(ChatType.GROUP, 1, "ses_x")
+    store.forget_chat(ChatType.GROUP, 1)
+    assert store.get_opencode_session(ChatType.GROUP, 1) is None
+
+
+def test_forget_all_clears_opencode_session(store: Store) -> None:
+    store.set_opencode_session(ChatType.GROUP, 1, "ses_x")
+    store.set_opencode_session(ChatType.PRIVATE, 2, "ses_y")
+    store.forget_all()
+    assert store.get_opencode_session(ChatType.GROUP, 1) is None
+    assert store.get_opencode_session(ChatType.PRIVATE, 2) is None
+
+
 def test_persistence_across_reopen(tmp_path: Path) -> None:
     path = tmp_path / "persist.db"
     first = Store(path)

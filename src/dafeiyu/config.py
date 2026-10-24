@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +58,19 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class BrainConfig:
+    provider: str = "local"
+
+
+@dataclass(frozen=True)
+class OpenCodeConfig:
+    bin: str = ""
+    agent: str = "deepseek-qq"
+    project_dir: str = ""
+    timeout_seconds: float = 90.0
+
+
+@dataclass(frozen=True)
 class Settings:
     api_key: str
     base_url: str
@@ -74,6 +87,8 @@ class Settings:
     memory: MemoryConfig
     logging: LoggingConfig
     reasoning_effort: str = ""
+    brain: BrainConfig = field(default_factory=BrainConfig)
+    opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -159,8 +174,27 @@ def load_settings(
     env.update({k: v for k, v in dotenv_values(env_file).items() if v is not None})
     env.update(os.environ)
 
+    brain_raw = raw.get("brain") or {}
+    if not isinstance(brain_raw, dict):
+        raise ConfigError("config.yaml 的 brain 必须是映射")
+    provider = str(brain_raw.get("provider", "local")).strip().casefold()
+    if provider not in ("local", "opencode"):
+        raise ConfigError("brain.provider 只能是 local 或 opencode")
+
+    opencode_raw = raw.get("opencode") or {}
+    if not isinstance(opencode_raw, dict):
+        raise ConfigError("config.yaml 的 opencode 必须是映射")
+    opencode_agent = str(opencode_raw.get("agent") or "deepseek-qq").strip()
+    if not opencode_agent:
+        raise ConfigError("opencode.agent 不能为空")
+    opencode_timeout = _float(
+        opencode_raw.get("timeout_seconds", 90), "opencode.timeout_seconds"
+    )
+    if opencode_timeout <= 0:
+        raise ConfigError("opencode.timeout_seconds 必须大于 0")
+
     api_key = env.get("DEEPSEEK_API_KEY", "").strip()
-    if not api_key:
+    if provider == "local" and not api_key:
         raise ConfigError("缺少环境变量 DEEPSEEK_API_KEY")
     if "BOT_QQ" not in env or not str(env["BOT_QQ"]).strip():
         raise ConfigError("缺少环境变量 BOT_QQ")
@@ -209,5 +243,12 @@ def load_settings(
         logging=LoggingConfig(
             level=str(logging_raw.get("level", "INFO")),
             dir=str(logging_raw.get("dir", "logs")),
+        ),
+        brain=BrainConfig(provider=provider),
+        opencode=OpenCodeConfig(
+            bin=str(opencode_raw.get("bin") or "").strip(),
+            agent=opencode_agent,
+            project_dir=str(opencode_raw.get("project_dir") or "").strip(),
+            timeout_seconds=opencode_timeout,
         ),
     )

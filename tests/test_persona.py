@@ -5,7 +5,7 @@ from dafeiyu.brain.persona import build_system_prompt, load_persona
 
 def test_load_persona_reads_package_file() -> None:
     text = load_persona()
-    assert "溟月" in text
+    assert "Deepseek娘" in text
     assert "大肥鱼" in text
 
 
@@ -23,7 +23,7 @@ def test_system_prompt_contains_identity_and_rules() -> None:
         max_chars=120,
         max_chars_technical=300,
     )
-    for needle in ("溟月", "大肥鱼", "不人身攻击", "医疗", "120", "300", "2026-10-24", "测试群"):
+    for needle in ("Deepseek娘", "大肥鱼", "不人身攻击", "医疗", "120", "300", "2026-10-24", "测试群"):
         assert needle in text
 
 

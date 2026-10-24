@@ -42,6 +42,67 @@ def _strip_fence(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def parse_brain_reply(
+    content: str,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    finish_reason: str = "",
+) -> BrainReply:
+    """把模型正文解析成 BrainReply。
+
+    OpenCode 和 DeepSeek 共用同一套输出协议，避免两条链路对 JSON 残缺、
+    speak 字符串等边界行为不一致。
+    """
+    text = _strip_fence(content)
+    looks_like_json = text.lstrip()[:1] in ("{", "[")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        # 被 max_tokens 截断、或明显是残缺 JSON 时，不要把协议原文丢到群里。
+        if finish_reason == "length" or looks_like_json:
+            return BrainReply(
+                speak=True,
+                reply=FALLBACK_REPLY,
+                reason="模型输出被截断或 JSON 残缺，已降级",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+        reply = content.strip()
+        return BrainReply(
+            speak=True,
+            reply=reply or FALLBACK_REPLY,
+            reason="非 JSON 返回，按原文处理",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+    if not isinstance(data, dict):
+        return BrainReply(
+            speak=True,
+            reply=content.strip() or FALLBACK_REPLY,
+            reason="返回不是对象，按原文处理",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+    raw_speak = data.get("speak", True)
+    if isinstance(raw_speak, str):
+        # 模型偶尔把布尔值写成字符串，bool("false") 会是 True，必须显式归一。
+        speak = raw_speak.strip().casefold() not in ("false", "no", "0", "off", "")
+    else:
+        speak = bool(raw_speak)
+    reply = str(data.get("reply") or "").strip()
+    if speak and not reply:
+        reply = FALLBACK_REPLY
+    return BrainReply(
+        speak=speak,
+        reply=reply,
+        reason=str(data.get("reason") or ""),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+
+
 class BrainClient:
     def __init__(
         self,
@@ -170,51 +231,6 @@ class BrainClient:
         completion_tokens: int,
         finish_reason: str = "",
     ) -> BrainReply:
-        text = _strip_fence(content)
-        looks_like_json = text.lstrip()[:1] in ("{", "[")
-        try:
-            data = json.loads(text)
-        except ValueError:
-            # 被 max_tokens 截断、或明显是残缺 JSON 时，不要把协议原文丢到群里。
-            if finish_reason == "length" or looks_like_json:
-                return BrainReply(
-                    speak=True,
-                    reply=FALLBACK_REPLY,
-                    reason="模型输出被截断或 JSON 残缺，已降级",
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                )
-            reply = content.strip()
-            return BrainReply(
-                speak=True,
-                reply=reply or FALLBACK_REPLY,
-                reason="非 JSON 返回，按原文处理",
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-            )
-
-        if not isinstance(data, dict):
-            return BrainReply(
-                speak=True,
-                reply=content.strip() or FALLBACK_REPLY,
-                reason="返回不是对象，按原文处理",
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-            )
-
-        raw_speak = data.get("speak", True)
-        if isinstance(raw_speak, str):
-            # 模型偶尔把布尔值写成字符串，bool("false") 会是 True，必须显式归一。
-            speak = raw_speak.strip().casefold() not in ("false", "no", "0", "off", "")
-        else:
-            speak = bool(raw_speak)
-        reply = str(data.get("reply") or "").strip()
-        if speak and not reply:
-            reply = FALLBACK_REPLY
-        return BrainReply(
-            speak=speak,
-            reply=reply,
-            reason=str(data.get("reason") or ""),
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
+        return parse_brain_reply(
+            content, prompt_tokens, completion_tokens, finish_reason
         )

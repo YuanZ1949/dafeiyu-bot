@@ -106,3 +106,51 @@ def test_error_message_does_not_leak_key(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as exc:
         load_settings(env_file=env, config_file=write_yaml(tmp_path, bad))
     assert "sk-super-secret" not in str(exc.value)
+
+
+def test_opencode_provider_does_not_require_deepseek_key(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "BOT_QQ=10001\n")
+    yaml = BASE_YAML.replace(
+        "triggers:", "brain:\n  provider: opencode\ntriggers:"
+    )
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+    assert s.brain.provider == "opencode"
+    assert s.api_key == ""
+    assert s.opencode.agent == "deepseek-qq"
+    assert s.opencode.bin == ""
+    assert s.opencode.project_dir == ""
+    assert s.opencode.timeout_seconds == 90.0
+
+
+def test_opencode_section_is_parsed(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "BOT_QQ=10001\n")
+    yaml = BASE_YAML.replace(
+        "triggers:",
+        "brain:\n  provider: opencode\n"
+        "opencode:\n  bin: C:/tools/opencode.exe\n  agent: fish\n"
+        "  project_dir: C:/bot\n  timeout_seconds: 12.5\n"
+        "triggers:",
+    )
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+    assert s.opencode.bin == "C:/tools/opencode.exe"
+    assert s.opencode.agent == "fish"
+    assert s.opencode.project_dir == "C:/bot"
+    assert s.opencode.timeout_seconds == 12.5
+
+
+def test_invalid_brain_provider_raises(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "BOT_QQ=10001\n")
+    bad = BASE_YAML.replace(
+        "triggers:", "brain:\n  provider: magic\ntriggers:"
+    )
+    with pytest.raises(ConfigError, match="brain.provider"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, bad))
+
+
+def test_opencode_timeout_must_be_positive(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    bad = BASE_YAML.replace(
+        "triggers:", "opencode:\n  timeout_seconds: 0\ntriggers:"
+    )
+    with pytest.raises(ConfigError, match="timeout_seconds"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, bad))
