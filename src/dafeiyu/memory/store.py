@@ -144,6 +144,29 @@ class Store:
         ).fetchall()
         return [self._row_to_message(r) for r in reversed(rows)]
 
+    def messages_between(
+        self, chat_type: ChatType, chat_id: int, start_ts: int, end_ts: int
+    ) -> list[Message]:
+        rows = self._conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE chat_type = ? AND chat_id = ? AND timestamp >= ? AND timestamp < ?
+            ORDER BY id ASC
+            """,
+            (chat_type.value, chat_id, start_ts, end_ts),
+        ).fetchall()
+        return [self._row_to_message(r) for r in rows]
+
+    def active_chats_between(self, start_ts: int, end_ts: int) -> list[tuple[ChatType, int]]:
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT chat_type, chat_id FROM messages
+            WHERE timestamp >= ? AND timestamp < ?
+            """,
+            (start_ts, end_ts),
+        ).fetchall()
+        return [(ChatType(r["chat_type"]), int(r["chat_id"])) for r in rows]
+
     def count_messages(self, chat_type: ChatType, chat_id: int) -> int:
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM messages WHERE chat_type = ? AND chat_id = ?",
