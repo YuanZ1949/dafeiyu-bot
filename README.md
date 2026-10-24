@@ -117,6 +117,32 @@ powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1
 NapCat 窗口里用 `BOT_QQ` 对应的小号扫码登录。二维码也会保存到
 `vendor/napcat/napcat/cache/qrcode.png`。登录成功后，bot 日志会出现 `NapCat 已连接`。
 
+### 扫码页与二维码刷新
+
+终端里的二维码太小，`start-all.ps1` 会自动在后台启动一个二维码助手，等二维码生成后
+用默认浏览器打开放大版登录页：
+
+```text
+vendor/napcat/napcat/cache/qrcode.html
+```
+
+这个页面每 2 秒重新读取 `qrcode.png`，NapCat 换码后页面会自动跟着换，不用手动刷新。
+同时会生成 4 倍放大的 `qrcode-big.png`，适合直接用图片查看器打开。
+
+QQ 服务端的单张二维码有效期约 2 分钟，无法从 NapCat 侧改长；NapCat 会在过期后自动
+重新拉取，页面持续跟着更新，所以不用抢时间。
+
+```powershell
+# 只生成/打开二维码页，不启动 bot
+powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1
+
+# 用系统图片查看器打开 qrcode-big.png（不会自动跟随刷新）
+powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
+
+# 启动时不要自动打开二维码页
+powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoQr
+```
+
 > 如果改了 `.env` 里的 `BOT_QQ`、`NAPCAT_WS_PORT` 或 `NAPCAT_WS_TOKEN`，重跑一次
 > `setup-napcat.ps1` 刷新 OneBot 配置；`-Force` 只用于重新下载 NapCat 本体。
 
