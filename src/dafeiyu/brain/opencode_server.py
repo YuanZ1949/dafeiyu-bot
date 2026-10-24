@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -84,9 +85,27 @@ class OpenCodeServer:
             return ""
         return data.decode("utf-8", errors="replace")
 
+    def _port_in_use(self) -> bool:
+        """端口上是否已有进程在监听。
+
+        用连接探测而不是 bind：TIME_WAIT 不会接受连接，重启不会被误判；
+        而端口上残留着上一次崩溃的 serve 时必须报错，否则就绪探测会把
+        别人的服务当成自己的，会话写进另一个数据库。
+        """
+        try:
+            with socket.create_connection((self.host, self.port), timeout=0.3):
+                return True
+        except OSError:
+            return False
+
     async def start(self) -> None:
         if self.is_running:
             return
+        if self._port_in_use():
+            raise BrainError(
+                f"opencode serve 端口 {self.port} 已被占用；"
+                "请先关掉残留进程或换一个端口"
+            )
         self._db_abs().parent.mkdir(parents=True, exist_ok=True)
         self._proc = await asyncio.create_subprocess_exec(
             *self.command,

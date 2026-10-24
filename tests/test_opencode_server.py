@@ -63,6 +63,7 @@ async def test_start_waits_until_probe_ready(monkeypatch, tmp_path):
         "opencode.exe", str(tmp_path), "data/bot.db", startup_timeout=1.0
     )
     monkeypatch.setattr(server, "_probe", probe)
+    monkeypatch.setattr(server, "_port_in_use", lambda: False)
 
     await server.start()
     assert calls == 2
@@ -87,6 +88,7 @@ async def test_start_timeout_stops_process(monkeypatch, tmp_path):
         "opencode.exe", str(tmp_path), "data/bot.db", startup_timeout=0.01
     )
     monkeypatch.setattr(server, "_probe", probe)
+    monkeypatch.setattr(server, "_port_in_use", lambda: False)
 
     with pytest.raises(BrainError, match="启动超时"):
         await server.start()
@@ -103,6 +105,7 @@ async def test_start_fails_when_process_exits(monkeypatch, tmp_path):
     server = OpenCodeServer(
         "opencode.exe", str(tmp_path), "data/bot.db", startup_timeout=1.0
     )
+    monkeypatch.setattr(server, "_port_in_use", lambda: False)
 
     with pytest.raises(BrainError, match="启动失败"):
         await server.start()
@@ -134,3 +137,28 @@ async def test_probe_ignores_system_proxy(monkeypatch, tmp_path):
     assert await server._probe() is True
     assert captured["trust_env"] is False
     assert captured["url"] == "http://127.0.0.1:24310/api/info"
+
+
+async def test_start_fails_when_port_already_in_use(monkeypatch, tmp_path):
+    import socket
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    spawned: list[int] = []
+
+    async def fake_exec(*args, **kwargs):
+        spawned.append(1)
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    server = OpenCodeServer(
+        "opencode.exe", str(tmp_path), "data/bot.db", port=port, startup_timeout=0.5
+    )
+    try:
+        with pytest.raises(BrainError, match="已被占用"):
+            await server.start()
+    finally:
+        listener.close()
+    assert spawned == []
