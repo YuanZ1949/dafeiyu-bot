@@ -18,6 +18,7 @@ from .config import Settings
 log = logging.getLogger(__name__)
 
 SHUTUP_MINUTES = 60
+FORGET_REPLY = "记忆清空了，本鱼失忆中……🫧"
 
 
 class Service:
@@ -193,10 +194,19 @@ class Service:
             and tokens < self.settings.budget.daily_tokens
         )
 
+    async def _forget_chat(self, msg: Message) -> None:
+        self.store.forget_chat(msg.chat_type, msg.chat_id)
+        forget = getattr(self.brain, "forget", None)
+        if forget is not None:
+            result = forget(msg.chat_type, msg.chat_id)
+            if inspect.isawaitable(result):
+                await result
+        await self.adapter.send(msg.chat_type, msg.chat_id, FORGET_REPLY)
+
     async def _run_command(self, msg: Message, name: str) -> bool:
         cmd = name.casefold()
         if msg.chat_type is ChatType.GROUP:
-            if cmd not in ("闭嘴", "shutup", "醒来", "wake"):
+            if cmd not in ("闭嘴", "shutup", "醒来", "wake", "forget"):
                 return False
             if msg.user_id not in self.settings.groups.admins:
                 log.info(
@@ -206,6 +216,9 @@ class Service:
                     msg.user_id,
                     cmd,
                 )
+                return True
+            if cmd == "forget":
+                await self._forget_chat(msg)
                 return True
             if cmd in ("闭嘴", "shutup"):
                 self.router.quiet(msg.chat_type, msg.chat_id, SHUTUP_MINUTES)
@@ -221,12 +234,6 @@ class Service:
             )
             return True
         if cmd == "forget":
-            self.store.forget_chat(msg.chat_type, msg.chat_id)
-            forget = getattr(self.brain, "forget", None)
-            if forget is not None:
-                result = forget(msg.chat_type, msg.chat_id)
-                if inspect.isawaitable(result):
-                    await result
-            await self.adapter.send(msg.chat_type, msg.chat_id, "记忆清空了，本鱼失忆中……🫧")
+            await self._forget_chat(msg)
             return True
         return False

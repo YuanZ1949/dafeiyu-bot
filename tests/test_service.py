@@ -15,7 +15,7 @@ from dafeiyu.config import (
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router, now_shanghai
-from dafeiyu.service import Service
+from dafeiyu.service import FORGET_REPLY, Service
 
 
 def make_settings(**overrides) -> Settings:
@@ -225,3 +225,38 @@ async def test_forget_clears_opencode_session(tmp_path):
     )
     assert store.get_opencode_session(ChatType.PRIVATE, 1001) is None
     assert brain.forgotten == [(ChatType.PRIVATE, 1001)]
+
+
+async def test_forget_group_clears_memory_for_admin(tmp_path):
+    settings = make_settings(
+        groups=GroupsConfig(frozenset(), frozenset(), frozenset({2002}))
+    )
+    service, store, brain, adapter, _ = build(
+        tmp_path, settings=settings, brain=FakeOpenCodeBrain()
+    )
+    store.set_opencode_session(ChatType.GROUP, 1001, "ses_group")
+    store.add_message(make_msg(content="记住我", message_id="gf0"))
+
+    await service.handle(make_msg(content="/forget", message_id="gf1"))
+
+    assert store.get_opencode_session(ChatType.GROUP, 1001) is None
+    assert brain.forgotten == [(ChatType.GROUP, 1001)]
+    assert adapter.sent[-1] == (ChatType.GROUP, 1001, FORGET_REPLY)
+
+
+async def test_forget_group_requires_admin(tmp_path):
+    settings = make_settings(
+        groups=GroupsConfig(frozenset(), frozenset(), frozenset({2002}))
+    )
+    service, store, brain, adapter, _ = build(
+        tmp_path, settings=settings, brain=FakeOpenCodeBrain()
+    )
+    store.set_opencode_session(ChatType.GROUP, 1001, "ses_group")
+
+    await service.handle(
+        make_msg(user_id=99, content="/forget", message_id="gf2")
+    )
+
+    assert store.get_opencode_session(ChatType.GROUP, 1001) == "ses_group"
+    assert brain.forgotten == []
+    assert adapter.sent == []
