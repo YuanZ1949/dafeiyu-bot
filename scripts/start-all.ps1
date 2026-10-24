@@ -1,8 +1,12 @@
-# Start NapCat (embedded under vendor/napcat) and then the bot.
-# Usage: powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1
-#        powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoQr
+# 启动 supervisor（接管 OpenCode / bot / NapCat），然后打开本地控制台。
+# 用法：
+#   powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1
+#   powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoBrowser
+# 控制台里可以启动/停止/重启各个进程、切换大脑模式、看日志和二维码。
 param(
-    [switch]$NoQr
+    [switch]$NoBrowser,
+    [switch]$NoQr,
+    [int]$WaitSeconds = 60
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,35 +14,63 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$napcatDir = Join-Path $root "vendor\napcat"
-$napcatBat = Join-Path $napcatDir "napcat.bat"
-
-if (-not (Test-Path $napcatBat)) {
-    Write-Host "NapCat is not installed under vendor/napcat." -ForegroundColor Red
-    Write-Host "Run this first:" -ForegroundColor Yellow
-    Write-Host "  powershell -ExecutionPolicy Bypass -File scripts/setup-napcat.ps1" -ForegroundColor Yellow
+$python = Join-Path $root ".venv\Scripts\python.exe"
+$pythonw = Join-Path $root ".venv\Scripts\pythonw.exe"
+if (-not (Test-Path $python)) {
+    Write-Host "找不到虚拟环境：$python" -ForegroundColor Red
+    Write-Host "先运行：python -m venv .venv; .venv\Scripts\python -m pip install -e ." -ForegroundColor Yellow
     exit 1
 }
+if (-not (Test-Path $pythonw)) { $pythonw = $python }
 
-$running = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -and $_.CommandLine.Contains($napcatDir) }
+$env:PYTHONIOENCODING = "utf-8"
 
-if ($running) {
-    Write-Host "[1/2] NapCat is already running." -ForegroundColor Green
-} else {
-    Write-Host "[1/2] Starting NapCat in a new window ..." -ForegroundColor Cyan
-    Start-Process -FilePath $napcatBat -WorkingDirectory $napcatDir
-    Start-Sleep -Seconds 3
+# 端口从配置里读，读不到就退回默认值
+$port = 8787
+try {
+    $printed = & $python -c "from dafeiyu.config import load_settings; print(load_settings().supervisor.dashboard.port)" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $printed) { $port = [int]($printed | Select-Object -Last 1) }
+} catch {
+    Write-Host "读取配置失败，使用默认端口 8787" -ForegroundColor DarkYellow
 }
 
-if (-not $NoQr) {
-    $qrScript = Join-Path $PSScriptRoot "napcat-qr.ps1"
-    if (Test-Path -LiteralPath $qrScript) {
-        Write-Host "[1/2] QR helper will open the large login page when a code is ready." -ForegroundColor DarkGray
-        $qrArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$qrScript`" -TimeoutSeconds 120"
-        Start-Process -FilePath "powershell.exe" -ArgumentList $qrArgs -WindowStyle Hidden
+$pidFile = Join-Path $root "data\supervisor.pid"
+$alreadyRunning = $false
+if (Test-Path -LiteralPath $pidFile) {
+    $oldPid = (Get-Content -LiteralPath $pidFile -Raw).Trim()
+    if ($oldPid -and (Get-Process -Id $oldPid -ErrorAction SilentlyContinue)) {
+        $alreadyRunning = $true
+        Write-Host "supervisor 已在运行（pid $oldPid），直接打开控制台。" -ForegroundColor Green
     }
 }
 
-Write-Host "[2/2] Starting Dafeiyu ... (Ctrl+C to stop the bot)" -ForegroundColor Cyan
-& (Join-Path $PSScriptRoot "start.ps1")
+if (-not $alreadyRunning) {
+    Write-Host "启动 supervisor（隐藏窗口）..." -ForegroundColor Cyan
+    Start-Process -FilePath $pythonw -ArgumentList "-m", "dafeiyu.supervisor" `
+        -WorkingDirectory $root -WindowStyle Hidden
+}
+
+$url = "http://127.0.0.1:$port/"
+$deadline = (Get-Date).AddSeconds($WaitSeconds)
+$healthy = $false
+while ((Get-Date) -lt $deadline) {
+    try {
+        $resp = Invoke-WebRequest -Uri "${url}api/health" -UseBasicParsing -TimeoutSec 2
+        if ($resp.StatusCode -eq 200) { $healthy = $true; break }
+    } catch {
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+if (-not $healthy) {
+    Write-Host "控制台在 $WaitSeconds 秒内没有就绪。" -ForegroundColor Red
+    Write-Host "查看日志：logs\supervisor\supervisor.log" -ForegroundColor Yellow
+    exit 1
+}
+
+Write-Host "控制台已就绪：$url" -ForegroundColor Green
+Write-Host "（关掉这个窗口不会停止后台进程；要停请用控制台上的「退出控制台」。）" -ForegroundColor DarkGray
+
+if (-not $NoBrowser) {
+    Start-Process $url
+}

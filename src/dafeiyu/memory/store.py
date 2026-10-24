@@ -63,6 +63,15 @@ CREATE TABLE IF NOT EXISTS opencode_sessions (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (chat_type, chat_id)
 );
+
+CREATE TABLE IF NOT EXISTS brain_sessions (
+    provider TEXT NOT NULL,
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (provider, chat_type, chat_id)
+);
 """
 
 _FTS_SCHEMA = """
@@ -224,36 +233,65 @@ class Store:
         )
 
     # ---- OpenCode session mapping ---------------------------------
-    def get_opencode_session(self, chat_type: ChatType, chat_id: int) -> str | None:
+    def migrate_opencode_sessions(self) -> int:
+        """把旧表数据搬进 brain_sessions(provider='opencode')，幂等。"""
+        cur = self._conn.execute(
+            """
+            INSERT OR IGNORE INTO brain_sessions (provider, chat_type, chat_id, session_id)
+            SELECT 'opencode', chat_type, chat_id, session_id FROM opencode_sessions
+            """
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def get_brain_session(
+        self, provider: str, chat_type: ChatType, chat_id: int
+    ) -> str | None:
         row = self._conn.execute(
             """
-            SELECT session_id FROM opencode_sessions
-            WHERE chat_type = ? AND chat_id = ?
+            SELECT session_id FROM brain_sessions
+            WHERE provider = ? AND chat_type = ? AND chat_id = ?
             """,
-            (chat_type.value, chat_id),
+            (provider, chat_type.value, chat_id),
         ).fetchone()
         return None if row is None else str(row["session_id"])
+
+    def set_brain_session(
+        self, provider: str, chat_type: ChatType, chat_id: int, session_id: str
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO brain_sessions (provider, chat_type, chat_id, session_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (provider, chat_type, chat_id)
+            DO UPDATE SET session_id = excluded.session_id, updated_at = datetime('now')
+            """,
+            (provider, chat_type.value, chat_id, session_id),
+        )
+        self._conn.commit()
+
+    def clear_brain_session(
+        self, provider: str, chat_type: ChatType, chat_id: int
+    ) -> None:
+        self._conn.execute(
+            """
+            DELETE FROM brain_sessions
+            WHERE provider = ? AND chat_type = ? AND chat_id = ?
+            """,
+            (provider, chat_type.value, chat_id),
+        )
+        self._conn.commit()
+
+    def get_opencode_session(self, chat_type: ChatType, chat_id: int) -> str | None:
+        return self.get_brain_session("opencode", chat_type, chat_id)
 
     def set_opencode_session(
         self, chat_type: ChatType, chat_id: int, session_id: str
     ) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO opencode_sessions (chat_type, chat_id, session_id)
-            VALUES (?, ?, ?)
-            ON CONFLICT (chat_type, chat_id)
-            DO UPDATE SET session_id = excluded.session_id, updated_at = datetime('now')
-            """,
-            (chat_type.value, chat_id, session_id),
-        )
-        self._conn.commit()
+        self.set_brain_session("opencode", chat_type, chat_id, session_id)
 
     def clear_opencode_session(self, chat_type: ChatType, chat_id: int) -> None:
-        self._conn.execute(
-            "DELETE FROM opencode_sessions WHERE chat_type = ? AND chat_id = ?",
-            (chat_type.value, chat_id),
-        )
-        self._conn.commit()
+        self.clear_brain_session("opencode", chat_type, chat_id)
 
     # ---- impressions ----------------------------------------------
     def upsert_impression(
@@ -385,7 +423,14 @@ class Store:
 
     # ---- forgetting -----------------------------------------------
     def forget_chat(self, chat_type: ChatType, chat_id: int) -> None:
-        for table in ("messages", "impressions", "summaries", "usage", "opencode_sessions"):
+        for table in (
+            "messages",
+            "impressions",
+            "summaries",
+            "usage",
+            "opencode_sessions",
+            "brain_sessions",
+        ):
             self._conn.execute(
                 f"DELETE FROM {table} WHERE chat_type = ? AND chat_id = ?",
                 (chat_type.value, chat_id),
@@ -393,6 +438,13 @@ class Store:
         self._conn.commit()
 
     def forget_all(self) -> None:
-        for table in ("messages", "impressions", "summaries", "usage", "opencode_sessions"):
+        for table in (
+            "messages",
+            "impressions",
+            "summaries",
+            "usage",
+            "opencode_sessions",
+            "brain_sessions",
+        ):
             self._conn.execute(f"DELETE FROM {table}")
         self._conn.commit()

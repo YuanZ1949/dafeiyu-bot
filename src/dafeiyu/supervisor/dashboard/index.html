@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>大肥鱼控制台</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --panel-2: #1e2230;
+    --line: #2a3040;
+    --text: #dfe4ee;
+    --muted: #8b93a7;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --accent: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    position: sticky;
+    top: 0;
+    z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  .btn {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: #1d4ed8; border-color: #1d4ed8; }
+  .btn.danger { background: #7f1d1d; border-color: #7f1d1d; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  main { padding: 16px 20px 40px; display: grid; gap: 16px; max-width: 1400px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px;
+  }
+  .card h2 { margin: 0 0 10px; font-size: 13px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 2px 9px; border-radius: 999px; font-size: 12px;
+    background: var(--panel-2); border: 1px solid var(--line);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .st-running .dot { background: var(--ok); }
+  .st-starting .dot, .st-restarting .dot { background: var(--warn); }
+  .st-failed .dot { background: var(--bad); }
+  .st-external .dot { background: var(--accent); }
+  .st-stopped .dot { background: #4b5563; }
+  .kv { color: var(--muted); font-size: 12px; }
+  .proc-name { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
+  .proc-actions { margin-top: 10px; display: flex; gap: 6px; }
+  .proc-actions .btn { padding: 4px 10px; font-size: 12px; }
+  .mode-list { display: grid; gap: 8px; }
+  .mode {
+    display: flex; align-items: center; gap: 10px;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+    cursor: pointer; background: var(--panel-2);
+  }
+  .mode.active { border-color: var(--accent); background: #1b2436; }
+  .mode.disabled { opacity: .5; cursor: not-allowed; }
+  .mode .label { font-weight: 600; }
+  .mode .reason { color: var(--muted); font-size: 12px; margin-left: auto; }
+  select {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-width: 180px;
+  }
+  #qr-wrap { display: flex; gap: 14px; align-items: center; }
+  #qr { width: 180px; height: 180px; object-fit: contain; background: #fff; border-radius: 8px; }
+  #qr.empty { display: none; }
+  #qr-placeholder { width: 180px; height: 180px; border: 1px dashed var(--line); border-radius: 8px; display: grid; place-items: center; color: var(--muted); font-size: 12px; text-align: center; padding: 8px; }
+  .log-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .tab { padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); cursor: pointer; font-size: 12px; color: var(--muted); }
+  .tab.active { color: var(--text); border-color: var(--accent); background: var(--panel-2); }
+  pre#logs {
+    margin: 0; height: 320px; overflow: auto;
+    background: #0b0d12; border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px; font: 12px/1.55 Consolas, "Cascadia Mono", monospace;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; max-width: 380px;
+    background: #1f2937; border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    padding: 10px 14px; border-radius: 8px; font-size: 13px; opacity: 0;
+    transition: opacity .2s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  .toast.err { border-left-color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>大肥鱼控制台</h1>
+  <span id="hub-state" class="pill"><span class="dot"></span><span>连接中…</span></span>
+  <span class="spacer"></span>
+  <button class="btn" data-act="start" data-target="all">全部启动</button>
+  <button class="btn" data-act="restart" data-target="all">全部重启</button>
+  <button class="btn danger" data-act="stop" data-target="all">全部停止</button>
+  <button class="btn danger" id="btn-shutdown">退出控制台</button>
+</header>
+
+<main>
+  <section class="grid-3" id="processes"></section>
+
+  <section class="card">
+    <h2>大脑模式</h2>
+    <div class="mode-list" id="modes"></div>
+    <div class="row" style="margin-top:12px" id="model-row" hidden>
+      <select id="model-select"></select>
+      <button class="btn" id="btn-refresh-models">刷新模型列表</button>
+      <span class="kv" id="model-hint"></span>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn primary" id="btn-apply-brain">应用切换</button>
+      <span class="kv" id="brain-hint"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>登录二维码</h2>
+    <div id="qr-wrap">
+      <img id="qr" alt="登录二维码" class="empty" />
+      <div id="qr-placeholder">暂无二维码<br />NapCat 需要登录时会自动出现</div>
+      <div>
+        <div class="kv" id="qr-meta">—</div>
+        <div class="kv" style="margin-top:6px">扫码后会自动刷新，过期二维码会标黄。</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>日志</h2>
+    <div class="log-head" id="log-tabs"></div>
+    <pre id="logs"></pre>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const STATUS_TEXT = {
+  running: "运行中", starting: "启动中", stopping: "停止中", stopped: "已停止",
+  restarting: "重启中", failed: "连续失败", external: "外部运行",
+};
+const PROC_TITLE = { opencode: "OpenCode", bot: "Bot", napcat: "NapCat" };
+const LOG_SOURCES = ["supervisor", "opencode", "bot", "napcat"];
+const MODE_ORDER = ["local_model", "token", "opencode"];
+
+let state = null;
+let selectedProvider = null;
+let selectedModel = "";
+let currentSource = "bot";
+let eventSource = null;
+
+const $ = (id) => document.getElementById(id);
+
+function toast(message, isError = false) {
+  const el = $("toast");
+  el.textContent = message;
+  el.classList.toggle("err", isError);
+  el.classList.add("show");
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => el.classList.remove("show"), 3200);
+}
+
+async function api(path, options = {}) {
+  const resp = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  let data = null;
+  try { data = await resp.json(); } catch (_) { data = null; }
+  if (!resp.ok) {
+    const reason = (data && (data.error || data.reason)) || `HTTP ${resp.status}`;
+    throw new Error(reason);
+  }
+  return data;
+}
+
+function fmtUptime(seconds) {
+  if (!seconds) return "—";
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m${s % 60}s`;
+  return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
+}
+
+function renderProcesses() {
+  const box = $("processes");
+  const list = (state && state.processes) || [];
+  if (!list.length) { box.innerHTML = '<div class="card kv">尚未获取到进程状态</div>'; return; }
+  box.innerHTML = list.map((p) => {
+    const st = p.status || "stopped";
+    return `
+      <div class="card">
+        <div class="proc-name">${PROC_TITLE[p.name] || p.name}</div>
+        <span class="pill st-${st}"><span class="dot"></span>${STATUS_TEXT[st] || st}</span>
+        <div class="kv" style="margin-top:8px">
+          PID ${p.pid || "—"} · 端口 ${p.port || "—"}<br />
+          运行 ${fmtUptime(p.uptime_seconds)} · 重启 ${p.restart_count} 次
+          ${p.last_exit_code !== null && p.last_exit_code !== undefined ? ` · 上次退出码 ${p.last_exit_code}` : ""}
+        </div>
+        <div class="proc-actions">
+          <button class="btn" data-act="start" data-target="${p.name}" ${st === "external" ? "disabled" : ""}>启动</button>
+          <button class="btn" data-act="stop" data-target="${p.name}" ${st === "external" ? "disabled" : ""}>停止</button>
+          <button class="btn" data-act="restart" data-target="${p.name}" ${st === "external" ? "disabled" : ""}>重启</button>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+function renderBrain() {
+  const brain = (state && state.brain) || {};
+  const modes = brain.modes && brain.modes.length
+    ? brain.modes
+    : MODE_ORDER.map((id) => ({ id, label: id, ready: false, reason: "bot 未运行" }));
+  if (selectedProvider === null) selectedProvider = brain.provider || modes[0].id;
+  if (brain.provider) selectedProvider = selectedProvider || brain.provider;
+
+  $("modes").innerHTML = modes
+    .slice()
+    .sort((a, b) => MODE_ORDER.indexOf(a.id) - MODE_ORDER.indexOf(b.id))
+    .map((m) => {
+      const active = m.id === selectedProvider ? " active" : "";
+      const disabled = m.ready ? "" : " disabled";
+      return `<div class="mode${active}${disabled}" data-mode="${m.id}">
+        <span class="label">${m.label}</span>
+        ${m.ready ? "" : `<span class="reason">${m.reason || "不可用"}</span>`}
+      </div>`;
+    }).join("");
+
+  const showModel = selectedProvider === "local_model";
+  $("model-row").hidden = !showModel;
+  if (showModel) {
+    const select = $("model-select");
+    const activeModel = selectedModel || brain.model || "";
+    const options = Array.from(select.options).map((o) => o.value);
+    if (activeModel && !options.includes(activeModel)) {
+      select.insertAdjacentHTML("beforeend", `<option value="${activeModel}">${activeModel}</option>`);
+    }
+    if (activeModel) select.value = activeModel;
+  }
+
+  const gw = brain.gateway_connected;
+  const tip = brain.available === false
+    ? "bot 未运行，无法读取模式"
+    : `当前：${(modes.find((m) => m.id === brain.provider) || {}).label || brain.provider || "—"}` +
+      (brain.model ? ` · ${brain.model}` : "") +
+      ` · OneBot ${gw ? "已连接" : "未连接"}`;
+  $("brain-hint").textContent = tip;
+}
+
+function applyStatus(data) {
+  state = data;
+  const alive = data.brain && data.brain.available;
+  $("hub-state").className = `pill st-${alive ? "running" : "failed"}`;
+  $("hub-state").innerHTML = `<span class="dot"></span>${alive ? "bot 在线" : "bot 离线"}`;
+  renderProcesses();
+  renderBrain();
+  renderQr(data.qr);
+}
+
+function renderQr(qr) {
+  const img = $("qr");
+  const placeholder = $("qr-placeholder");
+  const meta = $("qr-meta");
+  if (!qr || !qr.exists) {
+    img.classList.add("empty");
+    placeholder.style.display = "grid";
+    meta.textContent = "暂无二维码";
+    return;
+  }
+  placeholder.style.display = "none";
+  img.classList.remove("empty");
+  const bust = Math.floor(Date.now() / 5000);
+  img.src = `/api/qr/image?t=${bust}`;
+  meta.textContent = `生成于 ${qr.age_seconds}s 前${qr.stale ? " · 可能已过期" : ""}`;
+  meta.style.color = qr.stale ? "var(--warn)" : "var(--muted)";
+}
+
+async function refresh() {
+  try {
+    applyStatus(await api("/api/status"));
+  } catch (err) {
+    $("hub-state").className = "pill st-failed";
+    $("hub-state").innerHTML = '<span class="dot"></span>控制台异常';
+  }
+}
+
+async function doControl(act, target) {
+  const label = { start: "启动", stop: "停止", restart: "重启" }[act] || act;
+  const name = target === "all" ? "全部进程" : (PROC_TITLE[target] || target);
+  try {
+    const res = await api(`/api/control/${act}`, {
+      method: "POST",
+      body: JSON.stringify({ target }),
+    });
+    if (res.errors && res.errors.length) toast(`${name}：${res.errors.join("；")}`, true);
+    else toast(`${name} 已${label}`);
+  } catch (err) {
+    toast(`${name} ${label}失败：${err.message}`, true);
+  }
+  refresh();
+}
+
+async function loadModels() {
+  const select = $("model-select");
+  select.innerHTML = '<option value="">加载中…</option>';
+  try {
+    const data = await api("/api/brain/models");
+    const models = data.models || [];
+    if (!models.length) {
+      select.innerHTML = '<option value="">LM Studio 没有可用模型</option>';
+      return;
+    }
+    select.innerHTML = models.map((m) => `<option value="${m}">${m}</option>`).join("");
+    if (selectedModel && models.includes(selectedModel)) select.value = selectedModel;
+  } catch (err) {
+    select.innerHTML = '<option value="">加载失败</option>';
+    toast(`拉取模型列表失败：${err.message}`, true);
+  }
+}
+
+async function applyBrain() {
+  if (!selectedProvider) return;
+  const model = selectedProvider === "local_model" ? $("model-select").value : "";
+  try {
+    const data = await api("/api/brain", {
+      method: "POST",
+      body: JSON.stringify({ provider: selectedProvider, model }),
+    });
+    selectedModel = data.model || model;
+    toast("已切换大脑模式");
+    refresh();
+  } catch (err) {
+    toast(`切换失败：${err.message}`, true);
+  }
+}
+
+function setLogSource(source) {
+  currentSource = source;
+  document.querySelectorAll("#log-tabs .tab").forEach((el) => {
+    el.classList.toggle("active", el.dataset.source === source);
+  });
+  if (eventSource) eventSource.close();
+  const pre = $("logs");
+  pre.textContent = "";
+  eventSource = new EventSource(`/api/logs/stream?source=${encodeURIComponent(source)}&tail=200`);
+  eventSource.onmessage = (ev) => {
+    pre.textContent += ev.data + "\n";
+    if (pre.scrollTop + pre.clientHeight > pre.scrollHeight - 60) {
+      pre.scrollTop = pre.scrollHeight;
+    }
+  };
+  eventSource.onerror = () => {
+    pre.textContent += "[控制台] 日志流断开，正在重连…\n";
+  };
+}
+
+function initTabs() {
+  $("log-tabs").innerHTML = LOG_SOURCES.map(
+    (s) => `<span class="tab" data-source="${s}">${s}</span>`
+  ).join("");
+  document.querySelectorAll("#log-tabs .tab").forEach((el) => {
+    el.addEventListener("click", () => setLogSource(el.dataset.source));
+  });
+  setLogSource("bot");
+}
+
+document.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-act]");
+  if (btn) { doControl(btn.dataset.act, btn.dataset.target); return; }
+  const mode = ev.target.closest(".mode");
+  if (mode && !mode.classList.contains("disabled")) {
+    selectedProvider = mode.dataset.mode;
+    renderBrain();
+    if (selectedProvider === "local_model") loadModels();
+  }
+});
+
+$("btn-refresh-models").addEventListener("click", loadModels);
+$("btn-apply-brain").addEventListener("click", applyBrain);
+$("model-select").addEventListener("change", (ev) => { selectedModel = ev.target.value; });
+$("btn-shutdown").addEventListener("click", async () => {
+  if (!confirm("将停止 OpenCode / Bot / NapCat 三个进程并退出控制台，确定吗？")) return;
+  try {
+    await api("/api/shutdown", { method: "POST", body: "{}" });
+    toast("正在关闭…可以关掉这个页面了");
+  } catch (err) {
+    toast(`退出失败：${err.message}`, true);
+  }
+});
+
+initTabs();
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

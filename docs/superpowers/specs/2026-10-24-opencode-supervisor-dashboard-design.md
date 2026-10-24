@@ -408,7 +408,7 @@ bot 先于 NapCat 启动，让 8080 上的反向 WS 服务端先就位，避免 
 
 单文件 `src/dafeiyu/supervisor/dashboard/index.html`，vanilla JS，无构建步骤，四个区域：
 
-1. **进程卡 ×3**：状态徽章（RUNNING / EXTERNAL / RESTARTING / FAILED / STOPPED）、PID、端口、重启次数、退出码；点开抽屉看最后 50 行。
+1. **进程卡 ×3**：状态徽章（RUNNING / EXTERNAL / RESTARTING / FAILED / STOPPED）、PID、端口、重启次数、退出码；卡片上直接有启动 / 停止 / 重启按钮。
 2. **二维码**：2 秒轮询 `/api/qr/image`；显示登录状态与“上一张已过期”。
 3. **模式**：三选一；选 `local_model` 时显示模型下拉与刷新按钮，未就绪则灰掉并显示 reason。
 4. **日志**：source 切换（napcat / opencode / bot / supervisor）+ SSE 实时流 + 首屏回放 + 暂停/继续。
@@ -423,6 +423,8 @@ bot 先于 NapCat 启动，让 8080 上的反向 WS 服务端先就位，避免 
 | GET | `/api/qr/image` | 转发 `qrcode.png`，未生成返回 204 | — |
 | GET | `/api/brain/models` | 代理 LM Studio `{base_url}/models`，3s 超时 | 502 / 504 |
 | POST | `/api/brain` | 切换模式 / 选定模型 | 400 参数或非法 provider；409 未就绪（附 reason） |
+| POST | `/api/control/{start\|stop\|restart}` | body `{"target": "all"\|"opencode"\|"bot"\|"napcat"}` | 400 未知目标；207 部分失败（附 errors） |
+| POST | `/api/shutdown` | 先停三个子进程再退出 supervisor 自身 | 400 未注册回调 |
 
 ### 16.3 日志
 
@@ -440,7 +442,11 @@ bot 先于 NapCat 启动，让 8080 上的反向 WS 服务端先就位，避免 
 
 - 切换成功 → toast + 徽章更新；失败 → 红色 toast 显示 reason。
 - 日志暂停只停止自动滚动，SSE 连接保持。
-- **无启停/重启按钮**（Phase 3）。
+- **控制台能控制整个程序**：顶栏「全部启动 / 全部重启 / 全部停止 / 退出控制台」，每张进程卡另有单个启停按钮。
+  - 启动顺序 opencode → bot → napcat；停止逆序。
+  - 手动停止不触发自动重启（`manual_stop` 标记）；`EXTERNAL` 实例的按钮灰掉，绝不杀。
+  - 「退出控制台」二次确认后调用 `/api/shutdown`，停完子进程再退出 supervisor；关掉浏览器页面不会停进程。
+  - 失败不是全有全无：单个进程失败返回 207 并列出 errors，其余进程照常执行。
 - 只绑 `127.0.0.1`；POST 校验 `Origin`/`Host` 防 DNS rebinding；dashboard → bot 使用 `X-Control-Token`，token 由 supervisor 生成一次并写入 `data/supervisor.token`。
 
 ## 17. 配置、依赖、测试与验收
@@ -492,7 +498,8 @@ supervisor:
 3. 手动结束 NapCat → 15 秒内 `/api/status` 显示 `running` 且 `restart_count: 1`。
 4. 打开 8787 能扫码登录，状态变为“已登录”（需人工扫码）。
 5. 切 `token` 后群聊有回复；切 `local_model` 选模型后有回复；切回 `opencode` 上下文接续（session 未变）。
-6. Ctrl+C 停止 supervisor 后 8080 / 24310 / 8787 / 8788 全部关闭，无孤儿 `node.exe` / `opencode.exe`。
+6. 退出控制台（或 Ctrl+C 停止 supervisor）后 8080 / 24310 / 8787 / 8788 全部关闭，无孤儿 `node.exe` / `opencode.exe`。
+7. dashboard 上能对单个进程和全部进程执行启动 / 停止 / 重启；「退出控制台」结束整栈。
 
 ### 17.5 风险
 
@@ -501,3 +508,36 @@ supervisor:
 - 双开 supervisor 由 pid 文件与 8787 占用双重拦截。
 - `taskkill /T` 会杀进程树，因此绝不对 `EXTERNAL` 的 NapCat 使用它。
 
+
+
+## 18. 端到端实测修正（2026-10-24）
+
+按 §17.4 在本机真跑一遍后，以下七处与初版实现不一致，已按实测结论修正：
+
+1. **内部 HTTP 一律复用 `aiohttp.ClientSession`**。httpx 每建一个 `AsyncClient` 都会
+   `ssl.create_default_context()`，在 Windows 上同步阻塞事件循环；dashboard 最初每请求新建，
+   实测直接把整个控制台卡死（`/api/status` 无响应、supervisor CPU 118s）。涉及
+   `supervisor/dashboard.py`、`supervisor/manager.py::_default_probe`、`control.py::list_models`。
+   只剩 `brain/client.py` 与 `brain/opencode_server.py` 保留 httpx（进程内单例，一次代价）。
+2. **bot 子进程用 `python.exe` + `CREATE_NO_WINDOW`**，不能用 `pythonw.exe`：pythonw 无 stdout，
+   管道拿不到任何日志，控制台日志面板会是空的。
+3. **外部实例要监视存活**。`mark_external()` 之后启动 `_watch_external()`，每 2s 查一次 pid；
+   外部 NapCat 退出后状态转 `stopped`，用户可以从控制台重新拉起（否则永久卡在 `external`，
+   且「结束 NapCat 后自动重启」的验收无法通过）。
+4. **双开拦截**。Windows 的 `SO_REUSEADDR` 允许两个进程同时绑定 8787，bind 失败不能作为唯一防线；
+   `run()` 现在先查 pid 文件（活着就退出），再查 dashboard 端口占用（`port_owner()`），
+   只有都空才写 pid 并启动。
+5. **退出不能挂在 SSE 上**。`/api/logs/stream` 是长连接，`runner.cleanup()` 会等它结束。
+   现在 `on_shutdown` 置 `closing` 事件让流退出，`AppRunner(shutdown_timeout=5.0)`；
+   `main.py` 另对 `supervisor.shutdown()`（45s）与 `runner.cleanup()`（15s）加 `wait_for` 兜底，
+   并逐段写 `logs.write` 便于定位。实测退出从「卡满 60s」变成 2.1s。
+6. **换脑请求单独用 20s 超时**。构造新 brain 实测 3–5s，`BOT_TIMEOUT = 2.0` 会让 dashboard
+   误报 `504 bot 响应超时`，而 bot 侧其实已经切换成功（`data/runtime.json` 已更新）。
+   新增 `BOT_SWITCH_TIMEOUT = 20.0`，只用于 `POST /api/brain` 与 `GET /api/brain/models`。
+7. **`Supervisor.restart` 被属性遮蔽**。`self.restart = RestartConfig` 覆盖了同名方法，
+   控制台点「重启」会报 `'RestartConfig' object is not callable`；属性改名 `restart_config`，
+   并补测试 `test_restart_replaces_process`。
+
+补充测试（共 4 条）：
+`test_restart_replaces_process`、`test_external_instance_turns_stopped_when_pid_dies`、
+`test_open_log_stream_does_not_block_cleanup`、`test_brain_switch_survives_slow_brain_build`。

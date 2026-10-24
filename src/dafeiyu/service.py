@@ -54,6 +54,18 @@ class Service:
         if closer is not None:
             await closer()
 
+    def set_brain(self, brain: Any) -> Any:
+        """原子换脑；返回旧实例，由调用方决定何时关闭。
+
+        进行中的消息在入口处已取到旧引用，会继续跑完，不会被打断。
+        """
+        previous = self.brain
+        self.brain = brain
+        worker = self.impressions
+        if worker is not None and hasattr(worker, "brain"):
+            worker.brain = brain
+        return previous
+
     def _lock(self, chat_type: ChatType, chat_id: int) -> asyncio.Lock:
         return self._locks.setdefault((chat_type, chat_id), asyncio.Lock())
 

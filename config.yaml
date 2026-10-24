@@ -7,8 +7,10 @@ persona:
   # 留空使用内置人设 brain/persona.md；也可填自己的 md 路径（绝对或相对仓库根目录）
   prompt_file: ""
 
-# local：原来的 DeepSeek API + 本地记忆拼装
-# opencode：每个 QQ 会话映射一个 OpenCode session，人设见 .opencode/agents/deepseek-qq.md
+# opencode：走专用 OpenCode 服务（supervisor 启动，独立 DB）
+# token：直连 DeepSeek API（原 local，向后兼容）
+# local_model：任意 OpenAI 兼容端点（默认本机 LM Studio）
+# 运行时可在 dashboard 切换，选择存 data/runtime.json
 brain:
   provider: opencode
 
@@ -19,12 +21,32 @@ opencode:
   # 留空使用当前工作目录（start.ps1 会切到 dafeiyu-bot）
   project_dir: ""
   timeout_seconds: 90
-  manage_server: true
-  server_url: ""
+  # Phase 2 起由 supervisor 拉起 serve，bot 只当客户端
+  manage_server: false
+  server_url: http://127.0.0.1:24310
   db_path: data/opencode-bot.db
   host: 127.0.0.1
   port: 24310
   startup_timeout_seconds: 30
+
+local_model:
+  # 本机 LM Studio 默认端口
+  base_url: http://127.0.0.1:1234/v1
+  # 留空：在 dashboard 里从 /v1/models 侦测并选择
+  model: ""
+  api_key: local
+
+supervisor:
+  dashboard:
+    host: 127.0.0.1
+    port: 8787
+    open_browser: true
+  control:
+    host: 127.0.0.1
+    port: 8788
+  restart:
+    backoff_seconds: [1, 2, 4, 8, 16, 30]
+    max_failures: 5
 
 triggers:
   cooldown_seconds: 60

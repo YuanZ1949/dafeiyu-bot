@@ -6,14 +6,17 @@ import logging
 import sys
 from pathlib import Path
 
-from .brain.client import BrainClient, BrainError
-from .brain.opencode import OpenCodeBrain, resolve_opencode_bin
+from .brain.client import BrainError
+from .brain.factory import build_brain, current_provider, local_model_name
+from .brain.opencode import resolve_opencode_bin
 from .brain.opencode_server import OpenCodeServer
 from .brain.persona import load_persona
 from .config import ConfigError, Settings, load_settings
+from .control import start_control_server
 from .gateway.qq import QQAdapter
 from .memory.store import Store
 from .router import Router
+from .runtime import load_runtime
 from .service import Service
 from .workers.impressions import ImpressionWorker
 from .workers.summary import SummaryScheduler, summary_loop
@@ -52,56 +55,49 @@ async def main() -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
     store = Store(settings.db_path)
     store.init_schema()
+    store.migrate_opencode_sessions()
 
-    provider = settings.brain.provider
+    provider = current_provider(settings, load_runtime())
     server: OpenCodeServer | None = None
     service: Service | None = None
+    control_runner = None
     service_started = False
     summary_task: asyncio.Task | None = None
 
     try:
-        if provider == "opencode":
+        runtime = load_runtime()
+        effective_server_url = settings.opencode.server_url
+        if provider == "opencode" and settings.opencode.manage_server:
             try:
                 opencode_bin = resolve_opencode_bin(settings.opencode.bin)
             except BrainError as exc:
                 raise ConfigError(str(exc)) from exc
-            if settings.opencode.manage_server:
-                server = OpenCodeServer(
-                    bin_path=opencode_bin,
-                    project_dir=settings.opencode.project_dir,
-                    db_path=settings.opencode.db_path,
-                    host=settings.opencode.host,
-                    port=settings.opencode.port,
-                    startup_timeout=settings.opencode.startup_timeout_seconds,
-                )
-                try:
-                    await server.start()
-                except BrainError as exc:
-                    raise ConfigError(str(exc)) from exc
-                server_url = server.url
-            else:
-                server_url = settings.opencode.server_url
-            brain = OpenCodeBrain(
+            server = OpenCodeServer(
                 bin_path=opencode_bin,
-                store=store,
-                agent=settings.opencode.agent,
                 project_dir=settings.opencode.project_dir,
-                timeout=settings.opencode.timeout_seconds,
-                server_url=server_url,
+                db_path=settings.opencode.db_path,
+                host=settings.opencode.host,
+                port=settings.opencode.port,
+                startup_timeout=settings.opencode.startup_timeout_seconds,
             )
-            impressions = None
-        else:
-            # trust_env=False：不让系统代理参与，避免 httpx 为代理额外构建 transport。
-            brain = BrainClient(
-                api_key=settings.api_key,
-                base_url=settings.base_url,
-                model=settings.model,
-                trust_env=False,
-                reasoning_effort=settings.reasoning_effort or None,
-            )
-            impressions = ImpressionWorker(
-                store, brain, every=settings.memory.extract_every
-            )
+            try:
+                await server.start()
+            except BrainError as exc:
+                raise ConfigError(str(exc)) from exc
+            effective_server_url = server.url
+
+        brain = build_brain(
+            settings,
+            store,
+            provider,
+            local_model_name(settings, runtime) if provider == "local_model" else "",
+            server_url=effective_server_url,
+        )
+        impressions = (
+            ImpressionWorker(store, brain, every=settings.memory.extract_every)
+            if provider in ("token", "local_model")
+            else None
+        )
 
         adapter = QQAdapter(
             host=settings.ws_host,
@@ -114,7 +110,11 @@ async def main() -> None:
             settings, store, brain, adapter, router, persona_text, impressions
         )
 
-        scheduler = SummaryScheduler(store, brain) if provider == "local" else None
+        scheduler = (
+            SummaryScheduler(store, brain)
+            if provider in ("token", "local_model")
+            else None
+        )
         summary_task = (
             asyncio.create_task(summary_loop(scheduler, interval=600))
             if scheduler is not None
@@ -123,6 +123,9 @@ async def main() -> None:
 
         await service.start()
         service_started = True
+        control_runner = await start_control_server(
+            settings, store, service, adapter
+        )
         log.info(
             "%s已上线（brain=%s），等待 NapCat 反向 WS 连接 ws://%s:%s（QQ %s）",
             settings.persona.name,
@@ -140,6 +143,8 @@ async def main() -> None:
             summary_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await summary_task
+        if control_runner is not None:
+            await control_runner.cleanup()
         if service_started and service is not None:
             await service.stop()
         if server is not None:

@@ -77,6 +77,36 @@ class OpenCodeConfig:
 
 
 @dataclass(frozen=True)
+class LocalModelConfig:
+    """任意 OpenAI 兼容端点；默认指向本机 LM Studio。"""
+
+    base_url: str = "http://127.0.0.1:1234/v1"
+    model: str = ""
+    api_key: str = "local"
+
+
+@dataclass(frozen=True)
+class RestartConfig:
+    backoff_seconds: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+    max_failures: int = 5
+
+
+@dataclass(frozen=True)
+class DashboardConfig:
+    host: str = "127.0.0.1"
+    port: int = 8787
+    open_browser: bool = True
+
+
+@dataclass(frozen=True)
+class SupervisorConfig:
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    control_host: str = "127.0.0.1"
+    control_port: int = 8788
+    restart: RestartConfig = field(default_factory=RestartConfig)
+
+
+@dataclass(frozen=True)
 class Settings:
     api_key: str
     base_url: str
@@ -95,6 +125,8 @@ class Settings:
     reasoning_effort: str = ""
     brain: BrainConfig = field(default_factory=BrainConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
+    local_model: LocalModelConfig = field(default_factory=LocalModelConfig)
+    supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -183,9 +215,25 @@ def load_settings(
     brain_raw = raw.get("brain") or {}
     if not isinstance(brain_raw, dict):
         raise ConfigError("config.yaml 的 brain 必须是映射")
-    provider = str(brain_raw.get("provider", "local")).strip().casefold()
-    if provider not in ("local", "opencode"):
-        raise ConfigError("brain.provider 只能是 local 或 opencode")
+    raw_provider = str(brain_raw.get("provider", "token")).strip().casefold()
+    provider = "token" if raw_provider == "local" else raw_provider
+    if provider not in ("token", "opencode", "local_model"):
+        raise ConfigError(
+            "brain.provider 只能是 opencode、token 或 local_model（local 为 token 的别名）"
+        )
+
+    local_model_raw = raw.get("local_model") or {}
+    if not isinstance(local_model_raw, dict):
+        raise ConfigError("config.yaml 的 local_model 必须是映射")
+    local_model = LocalModelConfig(
+        base_url=str(
+            local_model_raw.get("base_url") or "http://127.0.0.1:1234/v1"
+        ).strip(),
+        model=str(local_model_raw.get("model") or "").strip(),
+        api_key=str(local_model_raw.get("api_key") or "local").strip(),
+    )
+    if not local_model.base_url:
+        raise ConfigError("local_model.base_url 不能为空")
 
     opencode_raw = raw.get("opencode") or {}
     if not isinstance(opencode_raw, dict):
@@ -228,7 +276,7 @@ def load_settings(
         raise ConfigError("opencode.startup_timeout_seconds 必须大于 0")
 
     api_key = env.get("DEEPSEEK_API_KEY", "").strip()
-    if provider == "local" and not api_key:
+    if provider == "token" and not api_key:
         raise ConfigError("缺少环境变量 DEEPSEEK_API_KEY")
     if "BOT_QQ" not in env or not str(env["BOT_QQ"]).strip():
         raise ConfigError("缺少环境变量 BOT_QQ")
@@ -240,6 +288,50 @@ def load_settings(
     budget_raw = _section(raw, "budget")
     memory_raw = _section(raw, "memory")
     logging_raw = _section(raw, "logging")
+
+    supervisor_raw = raw.get("supervisor") or {}
+    if not isinstance(supervisor_raw, dict):
+        raise ConfigError("config.yaml 的 supervisor 必须是映射")
+    dash_raw = supervisor_raw.get("dashboard") or {}
+    if not isinstance(dash_raw, dict):
+        raise ConfigError("supervisor.dashboard 必须是映射")
+    dash_port = _int(dash_raw.get("port", 8787), "supervisor.dashboard.port")
+    open_browser = dash_raw.get("open_browser", True)
+    if not isinstance(open_browser, bool):
+        raise ConfigError("supervisor.dashboard.open_browser 必须是布尔值")
+    ctrl_raw = supervisor_raw.get("control") or {}
+    if not isinstance(ctrl_raw, dict):
+        raise ConfigError("supervisor.control 必须是映射")
+    env_ctrl_port = env.get("DAFEIYU_CONTROL_PORT", "").strip()
+    ctrl_port = _int(
+        env_ctrl_port or ctrl_raw.get("port", 8788), "supervisor.control.port"
+    )
+    restart_raw = supervisor_raw.get("restart") or {}
+    if not isinstance(restart_raw, dict):
+        raise ConfigError("supervisor.restart 必须是映射")
+    backoff_raw = restart_raw.get("backoff_seconds", [1, 2, 4, 8, 16, 30])
+    if not isinstance(backoff_raw, list) or not backoff_raw:
+        raise ConfigError("supervisor.restart.backoff_seconds 必须是非空列表")
+    backoff = tuple(
+        _float(v, "supervisor.restart.backoff_seconds") for v in backoff_raw
+    )
+    if any(v <= 0 for v in backoff):
+        raise ConfigError("supervisor.restart.backoff_seconds 必须全部大于 0")
+    max_failures = _int(
+        restart_raw.get("max_failures", 5), "supervisor.restart.max_failures"
+    )
+    if max_failures < 1:
+        raise ConfigError("supervisor.restart.max_failures 必须大于等于 1")
+    for name, value in (
+        ("supervisor.dashboard.port", dash_port),
+        ("supervisor.control.port", ctrl_port),
+    ):
+        if not 1 <= value <= 65535:
+            raise ConfigError(f"{name} 必须在 1-65535 之间")
+    if dash_port == ctrl_port:
+        raise ConfigError("supervisor.dashboard.port 与 supervisor.control.port 不能相同")
+    if dash_port == port or ctrl_port == port:
+        raise ConfigError("supervisor 端口不能与 opencode.port 相同")
 
     window_size = _int(memory_raw.get("window_size", 20), "memory.window_size")
     if window_size < 1:
@@ -290,5 +382,18 @@ def load_settings(
             host=host,
             port=port,
             startup_timeout_seconds=startup_timeout,
+        ),
+        local_model=local_model,
+        supervisor=SupervisorConfig(
+            dashboard=DashboardConfig(
+                host=str(dash_raw.get("host") or "127.0.0.1").strip(),
+                port=dash_port,
+                open_browser=open_browser,
+            ),
+            control_host=str(ctrl_raw.get("host") or "127.0.0.1").strip(),
+            control_port=ctrl_port,
+            restart=RestartConfig(
+                backoff_seconds=backoff, max_failures=max_failures
+            ),
         ),
     )
