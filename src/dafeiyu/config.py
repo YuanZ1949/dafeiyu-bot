@@ -68,6 +68,12 @@ class OpenCodeConfig:
     agent: str = "deepseek-qq"
     project_dir: str = ""
     timeout_seconds: float = 90.0
+    manage_server: bool = False
+    server_url: str = ""
+    db_path: str = "data/opencode-bot.db"
+    host: str = "127.0.0.1"
+    port: int = 4310
+    startup_timeout_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -193,6 +199,28 @@ def load_settings(
     if opencode_timeout <= 0:
         raise ConfigError("opencode.timeout_seconds 必须大于 0")
 
+    manage_server = opencode_raw.get("manage_server", False)
+    if not isinstance(manage_server, bool):
+        raise ConfigError("opencode.manage_server 必须是布尔值")
+    server_url = str(opencode_raw.get("server_url") or "").strip()
+    db_path = str(opencode_raw.get("db_path") or "data/opencode-bot.db").strip()
+    host = str(opencode_raw.get("host") or "127.0.0.1").strip()
+    port = _int(opencode_raw.get("port", 4310), "opencode.port")
+    startup_timeout = _float(
+        opencode_raw.get("startup_timeout_seconds", 30.0),
+        "opencode.startup_timeout_seconds",
+    )
+    if manage_server and server_url:
+        raise ConfigError(
+            "opencode.manage_server 为 true 时 server_url 必须为空"
+        )
+    if manage_server and not db_path:
+        raise ConfigError("opencode.manage_server 为 true 时 db_path 不能为空")
+    if not 1 <= port <= 65535:
+        raise ConfigError("opencode.port 必须在 1-65535 之间")
+    if startup_timeout <= 0:
+        raise ConfigError("opencode.startup_timeout_seconds 必须大于 0")
+
     api_key = env.get("DEEPSEEK_API_KEY", "").strip()
     if provider == "local" and not api_key:
         raise ConfigError("缺少环境变量 DEEPSEEK_API_KEY")
@@ -250,5 +278,11 @@ def load_settings(
             agent=opencode_agent,
             project_dir=str(opencode_raw.get("project_dir") or "").strip(),
             timeout_seconds=opencode_timeout,
+            manage_server=manage_server,
+            server_url=server_url,
+            db_path=db_path,
+            host=host,
+            port=port,
+            startup_timeout_seconds=startup_timeout,
         ),
     )
