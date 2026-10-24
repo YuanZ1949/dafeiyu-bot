@@ -1,4 +1,4 @@
-# 启动 supervisor（接管 OpenCode / bot / NapCat），然后打开本地控制台。
+﻿# 启动 supervisor（接管 OpenCode / bot / NapCat），然后打开本地控制台。
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoBrowser
