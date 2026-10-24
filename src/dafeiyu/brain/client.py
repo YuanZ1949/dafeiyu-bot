@@ -52,10 +52,12 @@ class BrainClient:
         sleep=None,
         transport: httpx.AsyncBaseTransport | None = None,
         trust_env: bool = True,
+        reasoning_effort: str | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.reasoning_effort = (reasoning_effort or "").strip() or None
         self.timeout = timeout
         self._sleep = sleep or asyncio.sleep
         self._transport = transport
@@ -117,6 +119,8 @@ class BrainClient:
         return _strip_fence(content), prompt_tokens, completion_tokens
 
     async def _call(self, payload: dict) -> tuple[str, int, int, str]:
+        if self.reasoning_effort:
+            payload = {**payload, "reasoning_effort": self.reasoning_effort}
         for attempt in range(2):
             try:
                 return await self._request_raw(payload)

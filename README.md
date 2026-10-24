@@ -67,11 +67,25 @@ Copy-Item .env.example .env
 | `DEEPSEEK_API_KEY` | ✅ | — | DeepSeek 密钥 |
 | `DEEPSEEK_BASE_URL` | | `https://api.deepseek.com` | 兼容其他 OpenAI 风格网关时可改 |
 | `DEEPSEEK_MODEL` | | `deepseek-chat` | 可换 `deepseek-reasoner` |
+| `DEEPSEEK_REASONING_EFFORT` | | 空 | 设为 `none` 可关闭 Qwen3.5 等本地模型的思考过程 |
 | `BOT_QQ` | ✅ | — | 机器人 QQ 号（NapCat 登录的那个） |
 | `NAPCAT_WS_HOST` | | `127.0.0.1` | 监听地址 |
 | `NAPCAT_WS_PORT` | | `8080` | 监听端口，需与 NapCat 里填的一致 |
 | `NAPCAT_WS_TOKEN` | | 空 | 与 NapCat 的 Token 一致 |
 | `DAFEIYU_DB_PATH` | | `data/dafeiyu.db` | SQLite 路径 |
+
+### 接本机 LM Studio（可选，零 API 费用）
+
+LM Studio 的 OpenAI 兼容服务默认监听 `http://127.0.0.1:1234/v1`。加载模型后把 `.env` 改成：
+
+```ini
+DEEPSEEK_API_KEY=lm-studio
+DEEPSEEK_BASE_URL=http://127.0.0.1:1234/v1
+DEEPSEEK_MODEL=qwen/qwen3.5-9b
+DEEPSEEK_REASONING_EFFORT=none
+```
+
+Qwen3.5 默认会先输出一大段思考（`reasoning_content`），`max_tokens` 小时正文会为空。LM Studio 不认 `/no_think` 和 `chat_template_kwargs`，但认 `reasoning_effort: "none"`；本仓库已把它做成 `DEEPSEEK_REASONING_EFFORT` 配置项。若服务开了认证，把 `DEEPSEEK_API_KEY` 换成 LM Studio 里创建的 token。
 
 行为配置在 `config.yaml`：
 

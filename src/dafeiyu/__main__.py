@@ -57,6 +57,7 @@ async def main() -> None:
         base_url=settings.base_url,
         model=settings.model,
         trust_env=False,
+        reasoning_effort=settings.reasoning_effort or None,
     )
     adapter = QQAdapter(
         host=settings.ws_host,

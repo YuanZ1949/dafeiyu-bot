@@ -73,6 +73,7 @@ class Settings:
     budget: BudgetConfig
     memory: MemoryConfig
     logging: LoggingConfig
+    reasoning_effort: str = ""
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -183,6 +184,7 @@ def load_settings(
         api_key=api_key,
         base_url=env.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
         model=env.get("DEEPSEEK_MODEL", "deepseek-chat").strip(),
+        reasoning_effort=env.get("DEEPSEEK_REASONING_EFFORT", "").strip(),
         bot_qq=_int(env["BOT_QQ"], "BOT_QQ"),
         ws_host=env.get("NAPCAT_WS_HOST", "127.0.0.1"),
         ws_port=ws_port,

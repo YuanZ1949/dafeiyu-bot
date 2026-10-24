@@ -59,10 +59,12 @@ def test_missing_bot_qq_raises(tmp_path: Path) -> None:
 def test_env_overrides_yaml_and_applies_defaults(tmp_path: Path) -> None:
     env = write_env(
         tmp_path,
-        "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\nDEEPSEEK_MODEL=deepseek-reasoner\n",
+        "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\nDEEPSEEK_MODEL=deepseek-reasoner\n"
+        "DEEPSEEK_REASONING_EFFORT=none\n",
     )
     s = load_settings(env_file=env, config_file=write_yaml(tmp_path))
     assert s.model == "deepseek-reasoner"
+    assert s.reasoning_effort == "none"
     assert s.bot_qq == 10001
     assert s.base_url == "https://api.deepseek.com"
     assert s.db_path == "data/dafeiyu.db"
@@ -75,6 +77,7 @@ def test_persona_prompt_file_defaults_empty_and_reads_yaml(tmp_path: Path) -> No
     env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
     default = load_settings(env_file=env, config_file=write_yaml(tmp_path))
     assert default.persona.prompt_file == ""
+    assert default.reasoning_effort == ""
 
     custom = BASE_YAML.replace(
         "  os_probability: 0.05", '  os_probability: 0.05\n  prompt_file: "my_persona.md"'

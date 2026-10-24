@@ -52,6 +52,25 @@ async def test_normal_json_reply(client) -> None:
     assert body["model"] == "deepseek-chat"
     assert body["temperature"] == 1.0
     assert body["messages"][0]["role"] == "system"
+    assert "reasoning_effort" not in body
+
+
+@respx.mock
+async def test_reasoning_effort_is_sent_when_configured() -> None:
+    brain = BrainClient(
+        api_key="sk-test",
+        base_url="https://api.deepseek.com",
+        model="qwen/qwen3.5-9b",
+        trust_env=False,
+        reasoning_effort="none",
+    )
+    route = respx.post(URL).mock(return_value=httpx.Response(200, json=OK_PAYLOAD))
+
+    await brain.decide("system prompt", [{"role": "user", "content": "在吗"}])
+    await brain.aclose()
+
+    body = json.loads(route.calls[0].request.content)
+    assert body["reasoning_effort"] == "none"
 
 
 @respx.mock
