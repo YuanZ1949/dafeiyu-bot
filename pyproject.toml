@@ -21,6 +21,9 @@ dev = [
     "respx>=0.21",
 ]
 
+[project.scripts]
+dafeiyu-cli = "dafeiyu.cli:main"
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 
