@@ -73,6 +73,28 @@ def test_build_command_contains_agent_and_session(store: Store) -> None:
     assert "--session" not in brain._build_command("你好", None)
 
 
+def test_build_command_contains_server(store: Store) -> None:
+    brain = OpenCodeBrain(
+        "C:/opencode.exe",
+        store,
+        agent="fish",
+        server_url="http://127.0.0.1:4310",
+    )
+    assert brain._build_command("你好", "ses_1") == [
+        "C:/opencode.exe",
+        "run",
+        "--server",
+        "http://127.0.0.1:4310",
+        "--agent",
+        "fish",
+        "--format",
+        "json",
+        "--session",
+        "ses_1",
+        "你好",
+    ]
+
+
 async def test_reply_creates_then_reuses_session(store: Store) -> None:
     brain = OpenCodeBrain("opencode.exe", store)
     calls: list[tuple[str, str | None]] = []

@@ -116,10 +116,12 @@ class OpenCodeBrain:
         project_dir: str = "",
         timeout: float = 90.0,
         env: Mapping[str, str] | None = None,
+        server_url: str = "",
     ) -> None:
         self.bin = bin_path
         self.store = store
         self.agent = agent.strip() or "deepseek-qq"
+        self.server_url = server_url.strip()
         self.project_dir = str(Path(project_dir).expanduser().resolve()) if project_dir.strip() else ""
         if self.project_dir and not Path(self.project_dir).is_dir():
             raise BrainError(f"opencode.project_dir 不存在：{self.project_dir}")
@@ -171,9 +173,10 @@ class OpenCodeBrain:
         )
 
     def _build_command(self, text: str, session_id: str | None) -> list[str]:
-        command = [
-            self.bin,
-            "run",
+        command = [self.bin, "run"]
+        if self.server_url:
+            command += ["--server", self.server_url]
+        command += [
             "--agent",
             self.agent,
             "--format",
