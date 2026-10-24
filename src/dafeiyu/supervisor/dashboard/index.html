@@ -142,6 +142,10 @@
 
   <section class="card">
     <h2>登录二维码</h2>
+    <div class="row" style="margin-bottom:10px">
+      <span class="pill st-stopped" id="login-state"><span class="dot"></span>登录状态未知</span>
+      <span class="kv" id="login-hint"></span>
+    </div>
     <div id="qr-wrap">
       <img id="qr" alt="登录二维码" class="empty" />
       <div id="qr-placeholder">暂无二维码<br />NapCat 需要登录时会自动出现</div>
@@ -281,13 +285,52 @@ function applyStatus(data) {
   $("hub-state").innerHTML = `<span class="dot"></span>${alive ? "bot 在线" : "bot 离线"}`;
   renderProcesses();
   renderBrain();
-  renderQr(data.qr);
+  renderLogin(data.napcat);
+  renderQr(data.qr, data.napcat);
 }
 
-function renderQr(qr) {
+function renderLogin(napcat) {
+  const pill = $("login-state");
+  const hint = $("login-hint");
+  let cls = "st-stopped";
+  let text = "未配置登录探测";
+  let note = "";
+  if (napcat && napcat.configured !== false) {
+    if (!napcat.reachable) {
+      cls = "st-failed";
+      text = "NapCat 未响应";
+      note = napcat.error || "";
+    } else if (napcat.logged_in) {
+      const who = [napcat.qq, napcat.nickname].filter(Boolean).join(" ");
+      cls = "st-running";
+      text = who ? `已登录 · ${who}` : "已登录";
+      note = "NapCat 已在线，二维码已失效。";
+    } else {
+      cls = "st-starting";
+      text = napcat.phase_label ? `未登录 · ${napcat.phase_label}` : "未登录";
+      note = napcat.error || "用手机 QQ 扫描二维码登录。";
+    }
+  }
+  pill.className = `pill ${cls}`;
+  pill.textContent = "";
+  const dot = document.createElement("span");
+  dot.className = "dot";
+  pill.appendChild(dot);
+  pill.appendChild(document.createTextNode(text));
+  hint.textContent = note;
+}
+
+function renderQr(qr, napcat) {
   const img = $("qr");
   const placeholder = $("qr-placeholder");
   const meta = $("qr-meta");
+  if (napcat && napcat.logged_in) {
+    img.classList.add("empty");
+    placeholder.style.display = "grid";
+    meta.textContent = "已登录，无需二维码";
+    meta.style.color = "var(--ok)";
+    return;
+  }
   if (!qr || !qr.exists) {
     img.classList.add("empty");
     placeholder.style.display = "grid";

@@ -17,6 +17,7 @@ from ..config import ConfigError, Settings, load_settings
 from .dashboard import serve
 from .logs import LogHub
 from .manager import ProcSpec, Supervisor, pid_alive, port_owner
+from .napcat_login import NapCatLogin, load_webui_auth
 
 log = logging.getLogger(__name__)
 
@@ -275,6 +276,7 @@ async def run() -> int:
         bot_url,
         token=token,
         on_shutdown=request_shutdown,
+        napcat_login=NapCatLogin(load_webui_auth()),
     )
 
     url = (

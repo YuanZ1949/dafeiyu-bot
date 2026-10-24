@@ -12,6 +12,7 @@ from aiohttp import web
 from ..config import Settings
 from .logs import SOURCES, LogHub
 from .manager import Supervisor
+from .napcat_login import NapCatLogin
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ def create_app(
     bot_url: str,
     token: str = "",
     on_shutdown: Callable[[], Awaitable[None]] | None = None,
+    napcat_login: NapCatLogin | None = None,
 ) -> web.Application:
     app = web.Application(middlewares=[_same_origin])
     closing = asyncio.Event()
@@ -65,6 +67,8 @@ def create_app(
         client = session.pop("client", None)
         if client is not None and not client.closed:
             await client.close()
+        if napcat_login is not None:
+            await napcat_login.close()
 
     app.on_cleanup.append(close_session)
 
@@ -96,7 +100,13 @@ def create_app(
         return web.json_response({"ok": True})
 
     async def status(_: web.Request) -> web.Response:
-        code, brain = await bot_call("GET", "/api/brain")
+        brain_task = asyncio.create_task(bot_call("GET", "/api/brain"))
+        login_task = (
+            asyncio.create_task(napcat_login.state())
+            if napcat_login is not None
+            else None
+        )
+        code, brain = await brain_task
         if code != 200 or not isinstance(brain, dict):
             brain = {"available": False, "provider": "", "model": "", "modes": []}
         else:
@@ -106,6 +116,7 @@ def create_app(
                 "processes": supervisor.status(),
                 "brain": brain,
                 "qr": _qr_meta(qr_path),
+                "napcat": await login_task if login_task is not None else None,
             }
         )
 
@@ -258,8 +269,11 @@ async def serve(
     bot_url: str,
     token: str = "",
     on_shutdown: Callable[[], Awaitable[None]] | None = None,
+    napcat_login: NapCatLogin | None = None,
 ) -> web.AppRunner:
-    app = create_app(supervisor, settings, logs, qr_path, bot_url, token, on_shutdown)
+    app = create_app(
+        supervisor, settings, logs, qr_path, bot_url, token, on_shutdown, napcat_login
+    )
     runner = web.AppRunner(app, access_log=None, shutdown_timeout=5.0)
     await runner.setup()
     site = web.TCPSite(
