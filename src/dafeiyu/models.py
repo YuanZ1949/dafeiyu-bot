@@ -31,3 +31,14 @@ class Message:
 
     def to_prompt_line(self) -> str:
         return f"{self.nickname}: {self.content}"
+
+
+@dataclass
+class Impression:
+    chat_type: ChatType
+    chat_id: int
+    subject_user_id: int | None
+    kind: str
+    content: str
+    confidence: float
+    updated_at: str = ""
