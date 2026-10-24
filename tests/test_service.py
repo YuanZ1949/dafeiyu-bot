@@ -15,7 +15,7 @@ from dafeiyu.config import (
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router, now_shanghai
-from dafeiyu.service import FORGET_REPLY, Service
+from dafeiyu.service import BRAIN_ERROR_REPLY, FORGET_REPLY, Service
 
 
 def make_settings(**overrides) -> Settings:
@@ -150,10 +150,13 @@ async def test_duplicate_message_id_is_ignored(tmp_path):
     assert brain.calls == 1
 
 
-async def test_brain_error_does_not_send_or_crash(tmp_path):
-    service, _, _, adapter, _ = build(tmp_path, brain=FakeBrain(error=BrainError("boom")))
+async def test_brain_error_sends_short_reply(tmp_path):
+    service, _, _, adapter, _ = build(
+        tmp_path, brain=FakeBrain(error=BrainError("boom"))
+    )
     await service.handle(make_msg())
-    assert adapter.sent == []
+
+    assert adapter.sent == [(ChatType.GROUP, 1001, BRAIN_ERROR_REPLY)]
 
 
 async def test_concurrent_same_group_sends_only_once(tmp_path):

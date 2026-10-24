@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 
 SHUTUP_MINUTES = 60
 FORGET_REPLY = "记忆清空了，本鱼失忆中……🫧"
+BRAIN_ERROR_REPLY = "本鱼刚刚和大脑断线了…你过一会儿再问我？🐋"
 
 
 class Service:
@@ -121,6 +122,7 @@ class Service:
             # 失败也占一次调用额度，避免异常时无限重试烧钱。
             self.store.record_usage(msg.chat_type, msg.chat_id, "error", 0, 0)
             log.warning("模型调用失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
+            await self.adapter.send(msg.chat_type, msg.chat_id, BRAIN_ERROR_REPLY)
             return
 
         self.store.record_usage(
