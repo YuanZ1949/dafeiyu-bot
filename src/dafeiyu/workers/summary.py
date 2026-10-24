@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Callable
+from typing import Any, Callable
 
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType
-from dafeiyu.router import SHANGHAI, now_shanghai
+from dafeiyu.timeutil import SHANGHAI, now_shanghai
 
 logger = logging.getLogger(__name__)
 
@@ -39,14 +40,22 @@ async def summarize_chat(
 
     lines = [m.to_prompt_line() for m in messages][-MAX_SOURCE_LINES:]
     prompt = f"日期：{date}\n以下是当天的群聊记录：\n" + "\n".join(lines)
+    detailed = getattr(brain, "complete_detailed", None)
     try:
-        raw = await brain.complete(
-            SUMMARY_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=600
-        )
+        if detailed is not None:
+            raw, prompt_tokens, completion_tokens = await detailed(
+                SUMMARY_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=600
+            )
+        else:
+            raw = await brain.complete(
+                SUMMARY_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=600
+            )
+            prompt_tokens = completion_tokens = 0
     except Exception:  # noqa: BLE001 - 摘要失败不影响主链路
         logger.warning("生成摘要失败：%s/%s %s", chat_type.value, chat_id, date, exc_info=True)
         return ""
 
+    store.record_usage(chat_type, chat_id, "summary", prompt_tokens, completion_tokens)
     text = (raw or "").strip()[:MAX_SUMMARY_CHARS]
     if not text:
         return ""
@@ -81,3 +90,21 @@ class SummaryScheduler:
             if await summarize_chat(self._store, self._brain, chat_type, chat_id, target):
                 created += 1
         return created
+
+
+async def summary_loop(
+    scheduler: Any,
+    interval: float = 600,
+    stop: asyncio.Event | None = None,
+) -> None:
+    """后台长期任务：周期性调用 scheduler.run_pending()，直到 stop 被置位。"""
+    stop = stop or asyncio.Event()
+    while not stop.is_set():
+        try:
+            await scheduler.run_pending()
+        except Exception:  # noqa: BLE001 - 摘要失败不能拖垮主循环
+            logger.exception("摘要调度执行失败")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass

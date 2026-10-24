@@ -81,8 +81,10 @@ class BrainClient:
             "temperature": 1.0,
             "max_tokens": max_tokens,
         }
-        content, prompt_tokens, completion_tokens = await self._call(payload)
-        return self._parse_content(content, prompt_tokens, completion_tokens)
+        content, prompt_tokens, completion_tokens, finish_reason = await self._call(payload)
+        return self._parse_content(
+            content, prompt_tokens, completion_tokens, finish_reason
+        )
 
     async def complete(
         self,
@@ -92,16 +94,29 @@ class BrainClient:
         temperature: float = 0.2,
     ) -> str:
         """原始补全：不注入 OUTPUT_INSTRUCTION，返回去掉围栏的正文。"""
+        content, _, _ = await self.complete_detailed(
+            system, messages, max_tokens=max_tokens, temperature=temperature
+        )
+        return content
+
+    async def complete_detailed(
+        self,
+        system: str,
+        messages: list[dict],
+        max_tokens: int = 400,
+        temperature: float = 0.2,
+    ) -> tuple[str, int, int]:
+        """原始补全，同时返回 token 用量，供旁路任务记账。"""
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, *messages],
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        content, _, _ = await self._call(payload)
-        return _strip_fence(content)
+        content, prompt_tokens, completion_tokens, _ = await self._call(payload)
+        return _strip_fence(content), prompt_tokens, completion_tokens
 
-    async def _call(self, payload: dict) -> tuple[str, int, int]:
+    async def _call(self, payload: dict) -> tuple[str, int, int, str]:
         for attempt in range(2):
             try:
                 return await self._request_raw(payload)
@@ -113,7 +128,7 @@ class BrainClient:
 
         raise BrainError("DeepSeek 请求失败：未知原因")
 
-    async def _request_raw(self, payload: dict) -> tuple[str, int, int]:
+    async def _request_raw(self, payload: dict) -> tuple[str, int, int, str]:
         url = f"{self.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
@@ -130,8 +145,10 @@ class BrainClient:
 
         try:
             data = resp.json()
-            content = data["choices"][0]["message"]["content"] or ""
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            choice = data["choices"][0]
+            content = choice["message"]["content"] or ""
+            finish_reason = str(choice.get("finish_reason") or "")
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
             raise BrainError("DeepSeek 返回格式异常") from exc
 
         usage = data.get("usage") or {}
@@ -139,16 +156,30 @@ class BrainClient:
             str(content),
             int(usage.get("prompt_tokens") or 0),
             int(usage.get("completion_tokens") or 0),
+            finish_reason,
         )
 
     @staticmethod
     def _parse_content(
-        content: str, prompt_tokens: int, completion_tokens: int
+        content: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        finish_reason: str = "",
     ) -> BrainReply:
         text = _strip_fence(content)
+        looks_like_json = text.lstrip()[:1] in ("{", "[")
         try:
             data = json.loads(text)
         except ValueError:
+            # 被 max_tokens 截断、或明显是残缺 JSON 时，不要把协议原文丢到群里。
+            if finish_reason == "length" or looks_like_json:
+                return BrainReply(
+                    speak=True,
+                    reply=FALLBACK_REPLY,
+                    reason="模型输出被截断或 JSON 残缺，已降级",
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
             reply = content.strip()
             return BrainReply(
                 speak=True,
@@ -167,7 +198,12 @@ class BrainClient:
                 completion_tokens=completion_tokens,
             )
 
-        speak = bool(data.get("speak", True))
+        raw_speak = data.get("speak", True)
+        if isinstance(raw_speak, str):
+            # 模型偶尔把布尔值写成字符串，bool("false") 会是 True，必须显式归一。
+            speak = raw_speak.strip().casefold() not in ("false", "no", "0", "off", "")
+        else:
+            speak = bool(raw_speak)
         reply = str(data.get("reply") or "").strip()
         if speak and not reply:
             reply = FALLBACK_REPLY

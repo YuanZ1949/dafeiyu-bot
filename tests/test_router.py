@@ -119,9 +119,13 @@ def test_blacklist_group_never_replies() -> None:
     assert d.reason == "blacklist"
 
 
-def test_whitelist_blocks_unlisted_group() -> None:
+def test_whitelist_blocks_unlisted_group_but_not_hard_trigger() -> None:
     router, _, _ = make_router(whitelist=(999,))
-    assert router.should_handle(msg(at=True)).call_model is False
+    plain = router.should_handle(msg("随便聊聊"))
+    assert plain.call_model is False
+    assert plain.reason == "whitelist"
+    # 被 @ 时硬触发优先，白名单不再拦截
+    assert router.should_handle(msg(at=True)).call_model is True
 
 
 def test_cooldown_blocks_then_expires() -> None:

@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import sys
 from pathlib import Path
 
 from .brain.client import BrainClient
 from .brain.persona import load_persona
-from .config import Settings, load_settings
+from .config import ConfigError, Settings, load_settings
 from .gateway.qq import QQAdapter
 from .memory.store import Store
 from .router import Router
 from .service import Service
 from .workers.impressions import ImpressionWorker
+from .workers.summary import SummaryScheduler, summary_loop
 
 log = logging.getLogger(__name__)
 
@@ -40,10 +43,12 @@ async def main() -> None:
     store = Store(settings.db_path)
     store.init_schema()
 
+    # trust_env=False：不让系统代理参与，避免 httpx 为代理额外构建 transport。
     brain = BrainClient(
         api_key=settings.api_key,
         base_url=settings.base_url,
         model=settings.model,
+        trust_env=False,
     )
     adapter = QQAdapter(
         host=settings.ws_host,
@@ -57,6 +62,9 @@ async def main() -> None:
         settings, store, brain, adapter, router, load_persona(), impressions
     )
 
+    scheduler = SummaryScheduler(store, brain)
+    summary_task = asyncio.create_task(summary_loop(scheduler, interval=600))
+
     await service.start()
     log.info(
         "溟月已上线，等待 NapCat 反向 WS 连接 ws://%s:%s（QQ %s）",
@@ -69,16 +77,23 @@ async def main() -> None:
     except (KeyboardInterrupt, SystemExit):
         log.info("收到退出信号")
     finally:
+        summary_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await summary_task
         await service.stop()
         store.close()
 
 
-def run() -> None:
+def run() -> int:
     try:
         asyncio.run(main())
+    except ConfigError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         pass
+    return 0
 
 
 if __name__ == "__main__":
-    run()
+    raise SystemExit(run())

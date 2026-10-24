@@ -34,10 +34,13 @@ def _as_int(value: Any) -> int:
         return 0
 
 
-def _render_segments(raw_segments: list[Any]) -> tuple[str, list[Segment], str | None]:
+def _render_segments(
+    raw_segments: list[Any],
+) -> tuple[str, list[Segment], str | None, int | None]:
     parts: list[str] = []
     segments: list[Segment] = []
     reply_id: str | None = None
+    reply_qq: int | None = None
 
     for item in raw_segments:
         if not isinstance(item, dict):
@@ -54,9 +57,10 @@ def _render_segments(raw_segments: list[Any]) -> tuple[str, list[Segment], str |
             parts.append(_PLACEHOLDERS[seg_type])
         elif seg_type == "reply":
             reply_id = str(data.get("id", ""))
+            reply_qq = _as_int(data.get("qq")) or None
         # 其余段类型（json/xml/未知）一律忽略，不抛异常
 
-    return "".join(parts).strip(), segments, reply_id
+    return "".join(parts).strip(), segments, reply_id, reply_qq
 
 
 def parse_event(
@@ -85,13 +89,14 @@ def parse_event(
 
     raw_message = event.get("message", "")
     reply_id: str | None = None
+    reply_qq: int | None = None
     segments: list[Segment] = []
 
     if isinstance(raw_message, str):
         content = raw_message.strip()
         at_bot = False
     elif isinstance(raw_message, list):
-        content, segments, reply_id = _render_segments(raw_message)
+        content, segments, reply_id, reply_qq = _render_segments(raw_message)
         at_bot = any(
             seg.type == "at" and str(seg.data.get("qq", "")) == str(bot_qq) for seg in segments
         )
@@ -99,7 +104,9 @@ def parse_event(
         content = ""
         at_bot = False
 
-    reply_to_bot = reply_id is not None and reply_id in {str(i) for i in bot_message_ids}
+    reply_to_bot = (
+        reply_id is not None and reply_id in {str(i) for i in bot_message_ids}
+    ) or (reply_qq is not None and reply_qq == bot_qq)
 
     return Message(
         chat_type=chat_type,

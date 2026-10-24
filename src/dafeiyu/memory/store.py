@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
 from pathlib import Path
 
 from dafeiyu.models import ChatType, Impression, Message
+from dafeiyu.timeutil import today_shanghai
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -109,7 +109,7 @@ class Store:
 
     @staticmethod
     def today() -> str:
-        return datetime.now().strftime("%Y-%m-%d")
+        return today_shanghai()
 
     # ---- messages -------------------------------------------------
     def add_message(self, m: Message) -> bool:
@@ -133,14 +133,42 @@ class Store:
         self._conn.commit()
         return cur.rowcount > 0
 
-    def recent_messages(self, chat_type: ChatType, chat_id: int, limit: int) -> list[Message]:
+    def recent_messages(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        limit: int,
+        upto_message_id: str | None = None,
+    ) -> list[Message]:
+        """取最近 limit 条消息；传入 upto_message_id 时只取该消息（含）之前的。"""
+        if upto_message_id is None:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM messages
+                WHERE chat_type = ? AND chat_id = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (chat_type.value, chat_id, limit),
+            ).fetchall()
+            return [self._row_to_message(r) for r in reversed(rows)]
+
+        anchor = self._conn.execute(
+            """
+            SELECT id FROM messages
+            WHERE chat_type = ? AND chat_id = ? AND message_id = ?
+            """,
+            (chat_type.value, chat_id, upto_message_id),
+        ).fetchone()
+        if anchor is None:
+            return self.recent_messages(chat_type, chat_id, limit)
+
         rows = self._conn.execute(
             """
             SELECT * FROM messages
-            WHERE chat_type = ? AND chat_id = ?
+            WHERE chat_type = ? AND chat_id = ? AND id <= ?
             ORDER BY id DESC LIMIT ?
             """,
-            (chat_type.value, chat_id, limit),
+            (chat_type.value, chat_id, int(anchor["id"]), limit),
         ).fetchall()
         return [self._row_to_message(r) for r in reversed(rows)]
 

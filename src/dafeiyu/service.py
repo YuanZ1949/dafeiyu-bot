@@ -55,10 +55,14 @@ class Service:
         return self._locks.setdefault((chat_type, chat_id), asyncio.Lock())
 
     async def handle(self, msg: Message) -> None:
-        if msg.is_bot:
-            return
+        # 机器人自己的消息也要先落库（作为 assistant 轮次），但不触发任何回复。
         if not self.store.add_message(msg):
             return
+        if msg.is_bot:
+            return
+
+        # 印象抽取按消息条数触发，与是否回复无关，必须在早退分支之前调度。
+        self._schedule_impressions(msg)
 
         async with self._lock(msg.chat_type, msg.chat_id):
             if msg.reply_to_bot:
@@ -96,11 +100,14 @@ class Service:
             self.settings.memory.impression_topk,
             system,
             today,
+            upto_message_id=msg.message_id,
         )
 
         try:
             reply = await self.brain.decide(ctx.system, ctx.messages)
         except BrainError as exc:
+            # 失败也占一次调用额度，避免异常时无限重试烧钱。
+            self.store.record_usage(msg.chat_type, msg.chat_id, "error", 0, 0)
             log.warning("模型调用失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
             return
 
@@ -126,15 +133,34 @@ class Service:
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
 
+        sent: list[str] = []
         try:
             for chunk in chunks:
                 await self.adapter.send(msg.chat_type, msg.chat_id, chunk)
+                sent.append(chunk)
         except Exception as exc:  # 网络抖动不应拖垮整条链路
             log.warning("发送失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
-            return
+        else:
+            self.router.note_bot_spoke(msg.chat_type, msg.chat_id)
+        finally:
+            # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
+            self._store_bot_chunks(msg, sent)
 
-        self.router.note_bot_spoke(msg.chat_type, msg.chat_id)
-        self._schedule_impressions(msg)
+    def _store_bot_chunks(self, msg: Message, chunks: list[str]) -> None:
+        now_ts = int(now_shanghai().timestamp())
+        for index, chunk in enumerate(chunks):
+            self.store.add_message(
+                Message(
+                    chat_type=msg.chat_type,
+                    chat_id=msg.chat_id,
+                    user_id=self.settings.bot_qq,
+                    nickname=self.settings.persona.name,
+                    content=chunk,
+                    message_id=f"{msg.message_id}:bot:{index}",
+                    is_bot=True,
+                    timestamp=now_ts,
+                )
+            )
 
     def _schedule_impressions(self, msg: Message) -> None:
         if self.impressions is None:
@@ -150,19 +176,31 @@ class Service:
 
     def _private_budget_ok(self, msg: Message) -> bool:
         today = now_shanghai().date().isoformat()
-        calls, _ = self.store.usage_today(msg.chat_type, msg.chat_id, today)
-        return calls < self.settings.budget.daily_calls
+        calls, tokens = self.store.usage_today(msg.chat_type, msg.chat_id, today)
+        return (
+            calls < self.settings.budget.daily_calls
+            and tokens < self.settings.budget.daily_tokens
+        )
 
     async def _run_command(self, msg: Message, name: str) -> bool:
         cmd = name.casefold()
         if msg.chat_type is ChatType.GROUP:
+            if cmd not in ("闭嘴", "shutup", "醒来", "wake"):
+                return False
+            if msg.user_id not in self.settings.groups.admins:
+                log.info(
+                    "非管理员尝试执行群指令 %s/%s: user=%s cmd=%s",
+                    msg.chat_id,
+                    msg.message_id,
+                    msg.user_id,
+                    cmd,
+                )
+                return True
             if cmd in ("闭嘴", "shutup"):
                 self.router.quiet(msg.chat_type, msg.chat_id, SHUTUP_MINUTES)
-                return True
-            if cmd in ("醒来", "wake"):
+            else:
                 self.router.wake(msg.chat_type, msg.chat_id)
-                return True
-            return False
+            return True
 
         if cmd == "stats":
             today = now_shanghai().date().isoformat()

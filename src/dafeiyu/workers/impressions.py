@@ -70,14 +70,18 @@ class ImpressionWorker:
         self.store = store
         self.brain = brain
         self.every = max(1, every)
-        self._seen: dict[tuple[ChatType, int], int] = {}
+        self._last_count: dict[tuple[ChatType, int], int] = {}
 
     async def maybe_extract(self, chat_type: ChatType, chat_id: int) -> int:
+        """按会话累计消息数触发；同一批消息不会重复抽取。"""
         key = (chat_type, chat_id)
-        count = self._seen.get(key, 0) + 1
-        self._seen[key] = count
-        if count % self.every:
+        count = self.store.count_messages(chat_type, chat_id)
+        last = self._last_count.get(key, 0)
+        if count < last:  # 会话被 /forget 清空过，重新开始计数
+            last = 0
+        if count < last + self.every:
             return 0
+        self._last_count[key] = count
         return await self.extract(chat_type, chat_id)
 
     async def extract(self, chat_type: ChatType, chat_id: int) -> int:
@@ -86,15 +90,27 @@ class ImpressionWorker:
             return 0
 
         lines = "\n".join(f"{m.user_id}|{m.nickname}: {m.content}" for m in messages)
+        detailed = getattr(self.brain, "complete_detailed", None)
         try:
-            raw = await self.brain.complete(
-                EXTRACT_SYSTEM,
-                [{"role": "user", "content": lines}],
-                max_tokens=600,
-            )
+            if detailed is not None:
+                raw, prompt_tokens, completion_tokens = await detailed(
+                    EXTRACT_SYSTEM,
+                    [{"role": "user", "content": lines}],
+                    max_tokens=600,
+                )
+            else:
+                raw = await self.brain.complete(
+                    EXTRACT_SYSTEM,
+                    [{"role": "user", "content": lines}],
+                    max_tokens=600,
+                )
+                prompt_tokens = completion_tokens = 0
         except Exception:
             log.exception("印象抽取调用失败 %s/%s", chat_type.value, chat_id)
             return 0
+        self.store.record_usage(
+            chat_type, chat_id, "impression", prompt_tokens, completion_tokens
+        )
 
         existing = {
             (im.subject_user_id, im.kind, im.content)

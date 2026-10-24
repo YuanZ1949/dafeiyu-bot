@@ -2,17 +2,12 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Callable
 
 from dafeiyu.config import Settings
 from dafeiyu.models import ChatType, Message
-
-SHANGHAI = timezone(timedelta(hours=8))
-
-
-def now_shanghai() -> datetime:
-    return datetime.now(SHANGHAI)
+from dafeiyu.timeutil import SHANGHAI, now_shanghai  # noqa: F401 - 兼容旧导入路径
 
 
 @dataclass(frozen=True)
@@ -105,7 +100,10 @@ class Router:
         hours, minutes = hhmm.split(":")
         return int(hours) * 60 + int(minutes)
 
-    def is_quiet(self, chat_type: ChatType, chat_id: int, now: datetime) -> bool:
+    def is_quiet(
+        self, chat_type: ChatType, chat_id: int, now: datetime | None = None
+    ) -> bool:
+        now = now or self.clock()
         st = self._state(chat_type, chat_id)
         if st.muted_until is not None and now < st.muted_until:
             return True
@@ -146,15 +144,21 @@ class Router:
             return TriggerDecision(False, False, "muted")
         if msg.chat_id in self.settings.groups.blacklist:
             return TriggerDecision(False, False, "blacklist")
-        if self.settings.groups.whitelist and msg.chat_id not in self.settings.groups.whitelist:
-            return TriggerDecision(False, False, "whitelist")
 
-        calls, _ = self.store.usage_today(msg.chat_type, msg.chat_id, now.date().isoformat())
+        calls, tokens = self.store.usage_today(
+            msg.chat_type, msg.chat_id, now.date().isoformat()
+        )
         if calls >= self.settings.budget.daily_calls:
             return TriggerDecision(False, False, "budget")
+        if tokens >= self.settings.budget.daily_tokens:
+            return TriggerDecision(False, False, "budget")
 
+        # 硬触发（@/引用/别名）优先于白名单：被点名的群一定回。
         if self.hard_trigger(msg):
             return TriggerDecision(True, True, "hard")
+
+        if self.settings.groups.whitelist and msg.chat_id not in self.settings.groups.whitelist:
+            return TriggerDecision(False, False, "whitelist")
 
         ok, reason = self.rule_filter(msg, now)
         return TriggerDecision(ok, False, reason)

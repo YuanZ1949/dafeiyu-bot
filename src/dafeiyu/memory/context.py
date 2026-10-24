@@ -9,7 +9,9 @@ from dafeiyu.models import ChatType
 
 CONTEXT_BUDGET = 2500
 OUTPUT_RESERVE = 300
-SYSTEM_MAX_TOKENS = 600
+# 人设本体（含“当前场景”）的上限。真实人设约 830 token，留足余量；
+# 注意只截断人设本体，绝不截断已拼好的印象/摘要，否则记忆会静默消失。
+SYSTEM_MAX_TOKENS = 1400
 
 IMPRESSION_HEADER = "【群友印象】"
 SUMMARY_HEADER = "【昨日摘要】"
@@ -62,8 +64,11 @@ def build_context(
     impression_topk: int,
     system: str,
     today: str,
+    upto_message_id: str | None = None,
 ) -> ContextBundle:
-    history = store.recent_messages(chat_type, chat_id, window_size)
+    history = store.recent_messages(
+        chat_type, chat_id, window_size, upto_message_id=upto_message_id
+    )
     messages = [
         {
             "role": "assistant" if m.is_bot else "user",
@@ -82,23 +87,23 @@ def build_context(
 
     available = CONTEXT_BUDGET - OUTPUT_RESERVE
 
+    # 0) 只对人设本体设上限；印象/摘要属于记忆，不能在这里被截掉。
+    base = _truncate_to_tokens(system, SYSTEM_MAX_TOKENS)
+
     # 1) 先裁窗口，但永远保留最新的一条（当前消息）
-    while total(_compose_system(system, impression_lines, summary), messages) > available and len(messages) > 1:
+    while total(_compose_system(base, impression_lines, summary), messages) > available and len(messages) > 1:
         messages.pop(0)
 
-    system_text = _compose_system(system, impression_lines, summary)
+    system_text = _compose_system(base, impression_lines, summary)
     # 2) 再逐条去掉印象
     while total(system_text, messages) > available and impression_lines:
         impression_lines.pop()
-        system_text = _compose_system(system, impression_lines, summary)
+        system_text = _compose_system(base, impression_lines, summary)
 
     # 3) 最后去摘要
     if total(system_text, messages) > available and summary is not None:
         summary = None
-        system_text = _compose_system(system, impression_lines, summary)
-
-    # 4) 兜底：system 自身超长时截断
-    system_text = _truncate_to_tokens(system_text, SYSTEM_MAX_TOKENS)
+        system_text = _compose_system(base, impression_lines, summary)
 
     return ContextBundle(
         system=system_text,

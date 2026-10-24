@@ -5,6 +5,7 @@ import pytest
 from dafeiyu.memory.context import (
     CONTEXT_BUDGET,
     OUTPUT_RESERVE,
+    SYSTEM_MAX_TOKENS,
     ContextBundle,
     build_context,
     estimate_tokens,
@@ -99,7 +100,7 @@ def test_system_truncated_when_alone_too_big(store: Store) -> None:
     add(store, 0, "在吗")
     huge = "设定" * 8000
     bundle = build_context(store, GROUP, CHAT, 20, 5, huge, "2026-10-24")
-    assert estimate_tokens(bundle.system) <= 600
+    assert estimate_tokens(bundle.system) <= SYSTEM_MAX_TOKENS
     assert bundle.messages[-1]["content"] == "阿伟: 在吗"
 
 

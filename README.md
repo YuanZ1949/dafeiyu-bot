@@ -85,8 +85,9 @@ Copy-Item .env.example .env
 | `triggers.sample_rate` | `0.05` | 普通消息被纳入模型判断的采样率 |
 | `triggers.quiet_hours` | `["01:00","07:00"]` | 静默时段，不主动插话（@ 仍会回） |
 | `triggers.keywords` | 怎么/为什么/崩了… | 命中即进入模型判断 |
-| `groups.whitelist` | `[]` | 留空 = 所有群；非空 = 只服务这些群号 |
+| `groups.whitelist` | `[]` | 留空 = 所有群；非空 = 只服务这些群号（被 @/引用/叫名字时不受限） |
 | `groups.blacklist` | `[]` | 永不响应的群号 |
+| `groups.admins` | `[]` | 允许执行 `/闭嘴`、`/醒来` 的 QQ 号 |
 | `budget.daily_calls` | `200` | 每群每天最多调用模型次数 |
 | `budget.daily_tokens` | `300000` | 每群每天 token 上限 |
 | `memory.window_size` | `20` | 上下文窗口消息数 |
@@ -118,8 +119,8 @@ NapCat 已连接
 - 直接叫「大肥鱼」「小鲸鱼」「鱼鱼」—— 必回
 - 引用她的消息继续问 —— 必回
 - 其他消息 —— 她按规则 + 模型判断决定要不要插话
-- `/闭嘴`（或 `/shutup`）—— 本群静默 60 分钟
-- `/醒来`（或 `/wake`）—— 解除静默
+- `/闭嘴`（或 `/shutup`）—— 本群静默 60 分钟（仅 `groups.admins` 里的 QQ 可用）
+- `/醒来`（或 `/wake`）—— 解除静默（仅 `groups.admins` 里的 QQ 可用）
 
 私聊：
 

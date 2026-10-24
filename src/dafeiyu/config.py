@@ -34,6 +34,7 @@ class TriggerConfig:
 class GroupsConfig:
     whitelist: frozenset[int]
     blacklist: frozenset[int]
+    admins: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -190,6 +191,7 @@ def load_settings(
         groups=GroupsConfig(
             whitelist=_int_set(_section(raw, "groups").get("whitelist"), "groups.whitelist"),
             blacklist=_int_set(_section(raw, "groups").get("blacklist"), "groups.blacklist"),
+            admins=_int_set(_section(raw, "groups").get("admins"), "groups.admins"),
         ),
         budget=BudgetConfig(
             daily_calls=_int(budget_raw.get("daily_calls", 200), "budget.daily_calls"),

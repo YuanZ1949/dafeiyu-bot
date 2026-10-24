@@ -30,7 +30,7 @@ def make_settings(**overrides) -> Settings:
         db_path=":memory:",
         persona=PersonaConfig("溟月", ("大肥鱼",), 120, 300, 0.05),
         triggers=TriggerConfig(60, 0.0, ("01:00", "07:00"), ("怎么",)),
-        groups=GroupsConfig(frozenset(), frozenset()),
+        groups=GroupsConfig(frozenset(), frozenset(), frozenset({2002})),
         budget=BudgetConfig(200, 300000),
         memory=MemoryConfig(20, 5, 20),
         logging=LoggingConfig("INFO", "logs"),
