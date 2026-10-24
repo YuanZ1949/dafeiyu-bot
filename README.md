@@ -87,6 +87,39 @@ DEEPSEEK_REASONING_EFFORT=none
 
 Qwen3.5 默认会先输出一大段思考（`reasoning_content`），`max_tokens` 小时正文会为空。LM Studio 不认 `/no_think` 和 `chat_template_kwargs`，但认 `reasoning_effort: "none"`；本仓库已把它做成 `DEEPSEEK_REASONING_EFFORT` 配置项。若服务开了认证，把 `DEEPSEEK_API_KEY` 换成 LM Studio 里创建的 token。
 
+### QQ 协议端 NapCat（已内嵌到项目）
+
+NapCat 的可执行文件较大（解压后约 345MB），放在 `vendor/napcat/`，已加入 `.gitignore`，不提交进 git。首次准备：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup-napcat.ps1
+```
+
+国内网络下载 GitHub 慢时可加代理（端口按自己的代理改）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup-napcat.ps1 -Proxy http://127.0.0.1:10808
+```
+
+脚本会下载 `NapCat v4.18.41` 的 Windows Node 便携版，并根据 `.env` 自动生成
+`vendor/napcat/napcat/config/onebot11_<BOT_QQ>.json`：
+
+- 反向 WS：`ws://127.0.0.1:<NAPCAT_WS_PORT>`
+- 消息格式：`array`（必须是 array，否则 @ 识别不到）
+- Token：与 `.env` 的 `NAPCAT_WS_TOKEN` 一致
+
+一键启动（先开 NapCat 窗口，再启动 bot）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1
+```
+
+NapCat 窗口里用 `BOT_QQ` 对应的小号扫码登录。二维码也会保存到
+`vendor/napcat/napcat/cache/qrcode.png`。登录成功后，bot 日志会出现 `NapCat 已连接`。
+
+> 如果改了 `.env` 里的 `BOT_QQ`、`NAPCAT_WS_PORT` 或 `NAPCAT_WS_TOKEN`，重跑一次
+> `setup-napcat.ps1` 刷新 OneBot 配置；`-Force` 只用于重新下载 NapCat 本体。
+
 行为配置在 `config.yaml`：
 
 | 字段 | 默认 | 说明 |

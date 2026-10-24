@@ -7,3 +7,5 @@ logs/
 .pytest_cache/
 .superpowers/
 *.egg-info/
+vendor/napcat/
+vendor/napcat.zip

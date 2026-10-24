@@ -13,8 +13,20 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
     python -m venv .venv
 }
 
-Write-Host "[2/3] Checking dependencies ..." -ForegroundColor Cyan
-& .venv\Scripts\python -m pip install -q -e .
+$marker = ".venv\.deps-installed"
+$needInstall = $true
+if ((Test-Path $marker) -and (Test-Path "pyproject.toml")) {
+    if ((Get-Item $marker).LastWriteTime -ge (Get-Item "pyproject.toml").LastWriteTime) {
+        $needInstall = $false
+    }
+}
+if ($needInstall) {
+    Write-Host "[2/3] Installing dependencies ..." -ForegroundColor Cyan
+    & .venv\Scripts\python -m pip install -q --disable-pip-version-check -e .
+    Set-Content -LiteralPath $marker -Value (Get-Date).ToString("o")
+} else {
+    Write-Host "[2/3] Dependencies already installed." -ForegroundColor Green
+}
 
 if (-not (Test-Path "config.yaml")) {
     Write-Host "config.yaml is missing. Restore it from the repository root." -ForegroundColor Red
