@@ -10,6 +10,7 @@ from .brain.persona import build_system_prompt
 from .gateway.base import Adapter
 from .memory.context import build_context
 from .memory.store import Store
+from .memory.timeline import build_delivery
 from .models import ChatType, Message
 from .router import Router, now_shanghai, parse_command
 from .sender import is_technical_question, shape_reply
@@ -101,10 +102,13 @@ class Service:
         """OpenCode 模式走会话接口；本地模式仍走原来的上下文拼装。"""
         responder = getattr(self.brain, "reply", None)
         if callable(responder):
-            # 一个群共用一个 OpenCode session，必须让模型看到是谁在说话，
-            # 否则多人对话会糊成一团。私聊也保留昵称，语气更自然。
-            prompt = f"{msg.nickname}：{msg.content}"
-            return await responder(msg.chat_type, msg.chat_id, prompt)
+            # 一个群共用一个 OpenCode session，必须让模型看到是谁在说话；
+            # 被规则跳过的消息也要补上，否则模型会把「你没回我」当成网络问题。
+            prompt, delivered = build_delivery(self.store, msg)
+            reply = await responder(msg.chat_type, msg.chat_id, prompt)
+            # 只有真正送到模型那里才记账；失败时整批留到下一次重投。
+            self.store.mark_delivered(msg.chat_type, msg.chat_id, *delivered)
+            return reply
 
         today = now_shanghai().date().isoformat()
         chat_title = "本群" if msg.chat_type is ChatType.GROUP else msg.nickname

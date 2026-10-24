@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -16,6 +17,8 @@ from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router, now_shanghai
 from dafeiyu.service import BRAIN_ERROR_REPLY, FORGET_REPLY, Service
+
+SHANGHAI = timezone(timedelta(hours=8))
 
 
 def make_settings(**overrides) -> Settings:
@@ -73,7 +76,7 @@ class FakeBrain:
 
 
 def make_msg(chat_id=1001, user_id=2002, content="@溟月 在吗", message_id="m1",
-             chat_type=ChatType.GROUP) -> Message:
+             chat_type=ChatType.GROUP, timestamp=0) -> Message:
     return Message(
         chat_type=chat_type,
         chat_id=chat_id,
@@ -85,7 +88,7 @@ def make_msg(chat_id=1001, user_id=2002, content="@溟月 在吗", message_id="m
         is_bot=False,
         at_bot=content.startswith("@溟月"),
         reply_to_bot=False,
-        timestamp=0,
+        timestamp=timestamp,
     )
 
 
@@ -193,14 +196,15 @@ async def test_forget_private_clears_memory(tmp_path):
 
 
 class FakeOpenCodeBrain:
-    def __init__(self, text: str = "在呢") -> None:
+    def __init__(self, text: str = "在呢", speak: bool = True) -> None:
         self.text = text
+        self.speak = speak
         self.calls: list[tuple[ChatType, int, str]] = []
         self.forgotten: list[tuple[ChatType, int]] = []
 
     async def reply(self, chat_type: ChatType, chat_id: int, text: str) -> BrainReply:
         self.calls.append((chat_type, chat_id, text))
-        return BrainReply(True, self.text, "test", 0, 0)
+        return BrainReply(self.speak, self.text, "test", 0, 0)
 
     async def forget(self, chat_type: ChatType, chat_id: int) -> None:
         self.forgotten.append((chat_type, chat_id))
@@ -210,8 +214,97 @@ async def test_opencode_brain_receives_speaker_and_chat(tmp_path):
     brain = FakeOpenCodeBrain()
     service, _, _, adapter, _ = build(tmp_path, brain=brain)
     await service.handle(make_msg())
-    assert brain.calls == [(ChatType.GROUP, 1001, "阿鱼：@溟月 在吗")]
+    assert brain.calls == [(ChatType.GROUP, 1001, "阿鱼：@溟月 在吗（@了你）")]
     assert adapter.sent == [(ChatType.GROUP, 1001, "在呢")]
+
+
+def at(hour: int, minute: int, second: int = 0) -> int:
+    return int(
+        datetime(2026, 10, 24, hour, minute, second, tzinfo=SHANGHAI).timestamp()
+    )
+
+
+def timeline_settings(**overrides) -> Settings:
+    return make_settings(
+        triggers=TriggerConfig(60, 0.0, ("01:00", "07:00"), ("怎么", "什么", "为什么", "吗")),
+        **overrides,
+    )
+
+
+async def test_skipped_messages_are_backfilled_into_next_prompt(tmp_path):
+    """冷却吃掉的消息不能凭空消失：下一次投递要带上完整时间线。"""
+    brain = FakeOpenCodeBrain()
+    service, _, _, _, _ = build(tmp_path, brain=brain, settings=timeline_settings())
+
+    await service.handle(
+        make_msg(content="@溟月 在吗", message_id="m1", timestamp=at(21, 4, 13))
+    )
+    # 下面两条都在冷却窗口内、且不是提问 → 被 Router 跳过
+    await service.handle(
+        make_msg(content="群里谁说话你都会应么", message_id="m2", timestamp=at(21, 4, 40))
+    )
+    await service.handle(
+        make_msg(content="今天天气不错", message_id="m3", timestamp=at(21, 5))
+    )
+    # 明确提问不受冷却约束
+    await service.handle(
+        make_msg(content="我问了你什么问题", message_id="m4", timestamp=at(21, 9, 2))
+    )
+
+    assert len(brain.calls) == 2
+    prompt = brain.calls[-1][2]
+    assert "[10-24 21:04] 阿鱼：群里谁说话你都会应么" in prompt
+    assert "[10-24 21:05] 阿鱼：今天天气不错" in prompt
+    assert "[10-24 21:09] 阿鱼：我问了你什么问题" in prompt
+    assert "自你上次开口以来的新消息" in prompt
+
+
+async def test_each_message_is_delivered_at_most_once(tmp_path):
+    """补投过的消息要记账，不能每次接话都重发一遍。"""
+    brain = FakeOpenCodeBrain()
+    service, _, _, _, _ = build(tmp_path, brain=brain, settings=timeline_settings())
+
+    await service.handle(make_msg(content="@溟月 在吗", message_id="m1"))
+    await service.handle(make_msg(content="随便说说", message_id="m2"))  # 冷却跳过
+    await service.handle(make_msg(content="到底怎么弄", message_id="m3"))  # 提问，补投 m2
+    assert "随便说说" in brain.calls[-1][2]
+
+    await service.handle(make_msg(content="那另一个怎么弄", message_id="m4"))
+    prompt = brain.calls[-1][2]
+    assert "随便说说" not in prompt  # 已经补投过，不重复
+    assert "那另一个怎么弄" in prompt
+    assert "在吗" not in prompt
+
+
+async def test_speak_false_still_advances_cursor(tmp_path):
+    """模型看过但选择沉默，也算已投递；否则下次会被当成新消息再喂一遍。"""
+    brain = FakeOpenCodeBrain(speak=False)
+    service, store, _, adapter, _ = build(
+        tmp_path, brain=brain, settings=timeline_settings()
+    )
+
+    await service.handle(make_msg(content="@溟月 在吗", message_id="m1"))
+    await service.handle(make_msg(content="到底怎么弄", message_id="m2"))
+
+    assert adapter.sent == []
+    assert store.last_delivered_id(ChatType.GROUP, 1001) is not None
+    assert "在吗" not in brain.calls[-1][2]
+
+
+async def test_private_prompt_stays_single_line(tmp_path):
+    brain = FakeOpenCodeBrain()
+    service, _, _, _, _ = build(tmp_path, brain=brain, settings=timeline_settings())
+
+    await service.handle(
+        make_msg(chat_type=ChatType.PRIVATE, chat_id=2002, content="在吗", message_id="p1")
+    )
+    await service.handle(
+        make_msg(chat_type=ChatType.PRIVATE, chat_id=2002, content="帮我看看", message_id="p2")
+    )
+
+    prompt = brain.calls[-1][2]
+    assert prompt.endswith("：帮我看看")
+    assert "在吗" not in prompt
 
 
 async def test_forget_clears_opencode_session(tmp_path):

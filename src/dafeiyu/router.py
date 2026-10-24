@@ -9,6 +9,9 @@ from dafeiyu.config import Settings
 from dafeiyu.models import ChatType, Message
 from dafeiyu.timeutil import SHANGHAI, now_shanghai  # noqa: F401 - 兼容旧导入路径
 
+# 关键词前一个字落在这些字上时，多半是否定口语（没什么 / 不怎么 / 别问什么）。
+_NEGATION_CHARS = "没不无别"
+
 
 @dataclass(frozen=True)
 class TriggerDecision:
@@ -39,6 +42,8 @@ class _ChatState:
     no_reply_streak: int = 0
     downshift_until: datetime | None = None
     muted_until: datetime | None = None
+    last_prompt: str = ""
+    last_prompt_at: datetime | None = None
 
 
 @dataclass
@@ -112,25 +117,47 @@ class Router:
     def rule_filter(self, msg: Message, now: datetime) -> tuple[bool, str]:
         st = self._state(msg.chat_type, msg.chat_id)
 
+        if self._in_quiet_hours(now):
+            return False, "quiet"
+
+        # 同一句话在冷却窗口内重复出现（含并发重复投递），不重复回。
+        content = msg.content.strip()
+        if (
+            content
+            and content == st.last_prompt
+            and st.last_prompt_at is not None
+            and (now - st.last_prompt_at).total_seconds()
+            < self.settings.triggers.cooldown_seconds
+        ):
+            return False, "duplicate"
+
+        # 明确提问不受冷却约束：追问被静默丢掉，比多回一句的代价高得多。
+        if self._is_question(msg.content):
+            self._remember_prompt(st, content, now)
+            return True, "question"
+
+        # 冷却只压「热聊」和随机抽样这两类没被点名的发言。
         if st.last_bot_spoke is not None:
             elapsed = (now - st.last_bot_spoke).total_seconds()
             if elapsed < self.settings.triggers.cooldown_seconds:
                 return False, "cooldown"
 
-        if self._in_quiet_hours(now):
-            return False, "quiet"
-
-        if self._is_question(msg.content):
-            return True, "question"
         if self._is_hot(msg, now):
+            self._remember_prompt(st, content, now)
             return True, "hot"
 
         rate = self.settings.triggers.sample_rate
         if st.downshift_until is not None and now < st.downshift_until:
             rate /= 2
         if self._rng.random() < rate:
+            self._remember_prompt(st, content, now)
             return True, "sample"
         return False, "sample_skip"
+
+    @staticmethod
+    def _remember_prompt(st: _ChatState, content: str, now: datetime) -> None:
+        st.last_prompt = content
+        st.last_prompt_at = now
 
     def should_handle(self, msg: Message) -> TriggerDecision:
         if msg.is_bot:
@@ -165,7 +192,22 @@ class Router:
 
     # ---- helpers --------------------------------------------------
     def _is_question(self, text: str) -> bool:
-        return any(word in text for word in self.settings.triggers.keywords)
+        """问号结尾直接算提问；关键词命中时排除「没什么/不怎么」这类否定口语。"""
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if stripped.endswith(("?", "？")):
+            return True
+
+        for word in self.settings.triggers.keywords:
+            if not word:
+                continue
+            start = 0
+            while (index := stripped.find(word, start)) != -1:
+                if index == 0 or stripped[index - 1] not in _NEGATION_CHARS:
+                    return True
+                start = index + 1
+        return False
 
     def _is_hot(self, msg: Message, now: datetime) -> bool:
         cutoff = now.timestamp() - 60

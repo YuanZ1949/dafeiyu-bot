@@ -72,6 +72,26 @@ CREATE TABLE IF NOT EXISTS brain_sessions (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (provider, chat_type, chat_id)
 );
+
+-- 会话型大脑（OpenCode）的投递记录：
+--   * delivered_cursors 是该群的「投递下限」，id 小于等于它的消息视为已归档，不再回溯；
+--   * delivered_messages 逐条记录模型真正看过的消息，被冷却/抽样跳过的消息不在其中，
+--     下一次投递时自动补上（单靠单调游标会跨过空洞，漏掉更早的缺口）。
+CREATE TABLE IF NOT EXISTS delivered_cursors (
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    last_message_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_type, chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS delivered_messages (
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id TEXT NOT NULL,
+    delivered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_type, chat_id, message_id)
+);
 """
 
 _FTS_SCHEMA = """
@@ -218,6 +238,95 @@ class Store:
             (chat_type.value, chat_id),
         ).fetchone()
         return int(row["n"])
+
+    # ---- delivery cursors -----------------------------------------
+    def _row_id(self, chat_type: ChatType, chat_id: int, message_id: str) -> int | None:
+        row = self._conn.execute(
+            """
+            SELECT id FROM messages
+            WHERE chat_type = ? AND chat_id = ? AND message_id = ?
+            """,
+            (chat_type.value, chat_id, message_id),
+        ).fetchone()
+        return None if row is None else int(row["id"])
+
+    def last_delivered_id(self, chat_type: ChatType, chat_id: int) -> int | None:
+        row = self._conn.execute(
+            "SELECT last_message_id FROM delivered_cursors WHERE chat_type = ? AND chat_id = ?",
+            (chat_type.value, chat_id),
+        ).fetchone()
+        return None if row is None else int(row["last_message_id"])
+
+    def pending_messages(
+        self, chat_type: ChatType, chat_id: int, upto_message_id: str, limit: int
+    ) -> tuple[int, list[Message]]:
+        """取「模型还没看过」的人类消息，按时间正序，最多 limit 条。
+
+        返回 (被省略的条数, 消息列表)。首次投递（还没有投递下限）时只算当前这条，
+        不回填历史 —— 老会话里已经有的内容不该再灌一遍。
+        逐条投递记录保证：中间被跳过的消息即使后面接话了，也仍然留在待投队列里。
+        """
+        anchor = self._row_id(chat_type, chat_id, upto_message_id)
+        if anchor is None:
+            return 0, []
+
+        floor = self.last_delivered_id(chat_type, chat_id)
+        if floor is None:
+            row = self._conn.execute(
+                "SELECT * FROM messages WHERE id = ?", (anchor,)
+            ).fetchone()
+            return 0, ([] if row is None else [self._row_to_message(row)])
+        floor = min(floor, anchor)
+
+        where = """
+            FROM messages m
+            WHERE m.chat_type = ? AND m.chat_id = ? AND m.is_bot = 0
+              AND m.id > ? AND m.id <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM delivered_messages d
+                  WHERE d.chat_type = m.chat_type AND d.chat_id = m.chat_id
+                    AND d.message_id = m.message_id
+              )
+        """
+        params = (chat_type.value, chat_id, floor, anchor)
+        total = int(
+            self._conn.execute(f"SELECT COUNT(*) AS n {where}", params).fetchone()["n"]
+        )
+        rows = self._conn.execute(
+            f"SELECT m.* {where} ORDER BY m.id DESC LIMIT ?", (*params, limit)
+        ).fetchall()
+        messages = [self._row_to_message(r) for r in reversed(rows)]
+        if not messages:
+            # 当前这条已经投递过（重复事件），至少让模型再看到它一次。
+            row = self._conn.execute(
+                "SELECT * FROM messages WHERE id = ?", (anchor,)
+            ).fetchone()
+            return 0, ([] if row is None else [self._row_to_message(row)])
+        return max(0, total - len(messages)), messages
+
+    def mark_delivered(self, chat_type: ChatType, chat_id: int, *message_ids: str) -> None:
+        """把一批消息记为「已送达模型」；首次投递同时钉住回溯下限。"""
+        rows = [self._row_id(chat_type, chat_id, mid) for mid in message_ids]
+        present = [(mid, row) for mid, row in zip(message_ids, rows) if row is not None]
+        if not present:
+            return
+        self._conn.executemany(
+            """
+            INSERT OR IGNORE INTO delivered_messages (chat_type, chat_id, message_id)
+            VALUES (?, ?, ?)
+            """,
+            [(chat_type.value, chat_id, mid) for mid, _ in present],
+        )
+        # 第一次投递时把下限钉在本批最新一条上：更早的历史属于「上线前」。
+        self._conn.execute(
+            """
+            INSERT INTO delivered_cursors (chat_type, chat_id, last_message_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT (chat_type, chat_id) DO NOTHING
+            """,
+            (chat_type.value, chat_id, max(row for _, row in present)),
+        )
+        self._conn.commit()
 
     @staticmethod
     def _row_to_message(r: sqlite3.Row) -> Message:
@@ -430,6 +539,8 @@ class Store:
             "usage",
             "opencode_sessions",
             "brain_sessions",
+            "delivered_cursors",
+            "delivered_messages",
         ):
             self._conn.execute(
                 f"DELETE FROM {table} WHERE chat_type = ? AND chat_id = ?",
@@ -445,6 +556,8 @@ class Store:
             "usage",
             "opencode_sessions",
             "brain_sessions",
+            "delivered_cursors",
+            "delivered_messages",
         ):
             self._conn.execute(f"DELETE FROM {table}")
         self._conn.commit()

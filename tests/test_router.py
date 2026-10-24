@@ -48,6 +48,7 @@ def make_settings(
     blacklist: tuple[int, ...] = (),
     daily_calls: int = 200,
     quiet_hours: tuple[str, str] = ("01:00", "07:00"),
+    keywords: tuple[str, ...] = ("怎么", "为什么", "崩了"),
 ) -> SimpleNamespace:
     return SimpleNamespace(
         persona=SimpleNamespace(name="溟月", aliases=("大肥鱼", "小鲸鱼", "溟月", "鱼鱼")),
@@ -55,7 +56,7 @@ def make_settings(
             cooldown_seconds=60,
             sample_rate=sample_rate,
             quiet_hours=quiet_hours,
-            keywords=("怎么", "为什么", "崩了"),
+            keywords=keywords,
         ),
         groups=SimpleNamespace(whitelist=frozenset(whitelist), blacklist=frozenset(blacklist)),
         budget=SimpleNamespace(daily_calls=daily_calls, daily_tokens=1000),
@@ -162,13 +163,13 @@ def test_sample_rate_allows_low_roll() -> None:
 
 def test_downshift_halves_sample_rate() -> None:
     router, _, _ = make_router(sample_rate=0.2, rng=0.08)
-    assert router.should_handle(msg("随便聊聊")).call_model is True
+    assert router.should_handle(msg("随便聊聊甲")).call_model is True
     for _ in range(3):
         router.note_no_reply(ChatType.GROUP, 1)
     # 降频后阈值 0.1：0.08 仍通过，0.15 被拒
-    assert router.should_handle(msg("随便聊聊")).reason == "sample"
+    assert router.should_handle(msg("随便聊聊乙")).reason == "sample"
     router._rng = FakeRng(0.15)
-    assert router.should_handle(msg("随便聊聊")).call_model is False
+    assert router.should_handle(msg("随便聊聊丙")).call_model is False
 
 
 def test_question_keyword_passes_without_sampling() -> None:
@@ -176,6 +177,69 @@ def test_question_keyword_passes_without_sampling() -> None:
     d = router.should_handle(msg("这个怎么弄"))
     assert d.call_model is True
     assert d.reason == "question"
+
+
+def test_question_bypasses_cooldown() -> None:
+    """冷却只压抽样：刚说完话时，明确提问仍然要回。"""
+    router, _, clock = make_router(
+        sample_rate=0.0, rng=0.99, keywords=("怎么", "什么")
+    )
+    router.note_bot_spoke(ChatType.GROUP, 1)
+    clock.advance(10)
+    d = router.should_handle(msg("我问了你什么问题"))
+    assert d.call_model is True
+    assert d.reason == "question"
+
+
+def test_cooldown_still_blocks_non_question() -> None:
+    router, _, clock = make_router(sample_rate=1.0, rng=0.0)
+    router.note_bot_spoke(ChatType.GROUP, 1)
+    clock.advance(10)
+    d = router.should_handle(msg("随便聊聊"))
+    assert d.call_model is False
+    assert d.reason == "cooldown"
+
+
+def test_cooldown_still_blocks_hot_group() -> None:
+    router, store, clock = make_router()
+    store.msgs = [
+        msg("热闹", timestamp=int(clock().timestamp()) - 1) for _ in range(6)
+    ]
+    router.note_bot_spoke(ChatType.GROUP, 1)
+    clock.advance(10)
+    d = router.should_handle(msg("随便聊聊"))
+    assert d.call_model is False
+    assert d.reason == "cooldown"
+
+
+def test_question_mark_alone_counts_as_question() -> None:
+    router, _, _ = make_router(sample_rate=0.0, rng=0.99)
+    assert router.should_handle(msg("那你说?")).reason == "question"
+    assert router.should_handle(msg("那你说？")).reason == "question"
+
+
+def test_negated_keyword_is_not_a_question() -> None:
+    router, _, _ = make_router(
+        sample_rate=0.0, rng=0.99, keywords=("怎么", "什么")
+    )
+    d = router.should_handle(msg("没什么，就是路过"))
+    assert d.call_model is False
+    assert d.reason == "sample_skip"
+
+
+def test_duplicate_question_within_cooldown_is_skipped() -> None:
+    """冷却期内同一句话重复投递（并发/平台重发）不该回两遍。"""
+    router, _, clock = make_router(
+        sample_rate=0.0, rng=0.99, keywords=("怎么", "什么")
+    )
+    assert router.should_handle(msg("这个怎么弄")).call_model is True
+    clock.advance(1)
+    d = router.should_handle(msg("这个怎么弄"))
+    assert d.call_model is False
+    assert d.reason == "duplicate"
+    # 换句话仍然算提问
+    clock.advance(1)
+    assert router.should_handle(msg("那这个呢怎么弄")).reason == "question"
 
 
 def test_quiet_hours_wrap_across_midnight() -> None:

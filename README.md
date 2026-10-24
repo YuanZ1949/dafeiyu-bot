@@ -155,10 +155,10 @@ powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoQr
 | `persona.max_reply_chars_technical` | `300` | 技术问题回复上限（字） |
 | `persona.os_probability` | `0.05` | 出现「内心 OS」的概率 |
 | `persona.prompt_file` | `""` | 自定义人设文件路径；留空使用内置 `brain/persona.md`。改完重启生效 |
-| `triggers.cooldown_seconds` | `60` | 同一群两次主动发言的最小间隔 |
+| `triggers.cooldown_seconds` | `60` | 同一群两次**非提问**发言的最小间隔（明确提问、@/引用/叫名字不受限） |
 | `triggers.sample_rate` | `0.05` | 普通消息被纳入模型判断的采样率 |
 | `triggers.quiet_hours` | `["01:00","07:00"]` | 静默时段，不主动插话（@ 仍会回） |
-| `triggers.keywords` | 怎么/为什么/崩了… | 命中即进入模型判断 |
+| `triggers.keywords` | 怎么/为什么/崩了… | 命中即进入模型判断（问号结尾也算；「没什么」这类否定口语不算） |
 | `groups.whitelist` | `[]` | 留空 = 所有群；非空 = 只服务这些群号（被 @/引用/叫名字时不受限） |
 | `groups.blacklist` | `[]` | 永不响应的群号 |
 | `groups.admins` | `[]` | 允许执行 `/闭嘴`、`/醒来` 的 QQ 号 |
@@ -193,6 +193,7 @@ NapCat 已连接
 - 直接叫「大肥鱼」「小鲸鱼」「鱼鱼」—— 必回
 - 引用她的消息继续问 —— 必回
 - 其他消息 —— 她按规则 + 模型判断决定要不要插话
+- 被规则跳过的消息不会丢：下次接话时会把这些漏掉的消息按 `[时:分] 昵称：内容` 的时间线一起交给模型
 - `/闭嘴`（或 `/shutup`）—— 本群静默 60 分钟（仅 `groups.admins` 里的 QQ 可用）
 - `/醒来`（或 `/wake`）—— 解除静默（仅 `groups.admins` 里的 QQ 可用）
 
