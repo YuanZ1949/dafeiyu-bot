@@ -1,0 +1,29 @@
+persona:
+  name: 溟月
+  aliases: [大肥鱼, 小鲸鱼, 溟月, 鱼鱼, 肥鱼]
+  max_reply_chars: 120
+  max_reply_chars_technical: 300
+  os_probability: 0.05
+
+triggers:
+  cooldown_seconds: 60
+  sample_rate: 0.05
+  quiet_hours: ["01:00", "07:00"]
+  keywords: [怎么, 为什么, 为啥, 求, 有没有, 是不是, 崩了, 报错, 怎么办]
+
+groups:
+  whitelist: []
+  blacklist: []
+
+budget:
+  daily_calls: 200
+  daily_tokens: 300000
+
+memory:
+  window_size: 20
+  impression_topk: 5
+  extract_every: 20
+
+logging:
+  level: INFO
+  dir: logs
