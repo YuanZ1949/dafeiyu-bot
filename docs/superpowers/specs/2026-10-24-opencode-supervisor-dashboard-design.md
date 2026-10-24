@@ -280,9 +280,7 @@ dashboard 代理 OpenCode API，不把 24310 直接暴露给浏览器；默认�
 
 ### Phase 2
 
-1. `start-all.ps1` 隐藏启动，无多余控制台窗口。
-2. dashboard 显示 NapCat / OpenCode / bot 状态和实时日志。
-3. 二维码可刷新，登录状态可见。
+见 §17.4（本阶段新增“自动重启、三种模式切换、日志 SSE”三项验收，原三条保留为 2、4、6 的子集）。
 
 ### Phase 3
 
@@ -306,3 +304,200 @@ dashboard 代理 OpenCode API，不把 24310 直接暴露给浏览器；默认�
 - **系统代理干扰探测**：本机 Windows 系统代理（`127.0.0.1:10808`）会让 httpx 连 `127.0.0.1` 也走代理并返回 503，导致就绪探测永远超时。`OpenCodeServer._probe` 使用 `trust_env=False`。
 
 验收第 2 条相应改为：`GET http://127.0.0.1:24310/api/info` 返回 **< 500**（v2 下未认证为 401，同样说明服务已就绪）。
+
+## 14. Phase 2 进程模型（supervisor）
+
+> 本节在 2026-10-24 设计评审中确定，替代 §5.2 的概要描述；§5.2 的其余内容仍然有效。
+
+### 14.1 入口与单实例
+
+- 入口：`python -m dafeiyu.supervisor`。
+- `start-all.ps1` 用 `Start-Process -WindowStyle Hidden` 拉起 supervisor，轮询 `GET /api/health` 最多 15 秒；就绪后按 `open_browser` 打开 `http://127.0.0.1:8787`。自检失败时弹出可见提示并输出 `logs/supervisor/supervisor.log` 尾部，避免“点了没反应”。
+- `data/supervisor.pid` 写入自身 PID。启动时若文件存在且该 PID 存活，打印错误并退出，不抢占；PID 已失效则覆盖。
+- dashboard 端口被占用 → 直接退出并报错，不自动换端口（换端口会让书签和用户认知失效，也会掩盖残留进程）。
+
+### 14.2 进程表与启动顺序
+
+顺序固定为 **OpenCode → bot → NapCat**：
+
+| 进程 | 命令 | 关键环境 |
+| --- | --- | --- |
+| OpenCode | 复用 `OpenCodeServer.command` | `OPENCODE_DB`（已有）、`NO_COLOR=1` |
+| bot | `[sys.executable, "-m", "dafeiyu"]`，cwd=项目根 | `DAFEIYU_CONTROL_PORT`、`DAFEIYU_CONTROL_TOKEN` |
+| NapCat | `[node, "index.js"]`，cwd=`vendor/napcat` | 沿用 `start-all.ps1` 现有参数 |
+
+bot 先于 NapCat 启动，让 8080 上的反向 WS 服务端先就位，避免 NapCat 首次连接失败后等待重连。
+
+### 14.3 外部进程判定
+
+- **NapCat**：启动前探测 8080。若已监听且 PID 不属于 supervisor → 标记 `EXTERNAL`，不启动、不终止、不重启，dashboard 显示“外部 NapCat（PID xxx）”。8080 空闲时才由 supervisor 启动并纳入管理。
+- **OpenCode**：24310 被占且不属于 supervisor → 进入 `FAILED`，错误文案沿用 `OpenCodeServer` 的端口占用提示，**不自动重启**，避免与外部服务反复抢端口。
+- **bot**：不存在外部 bot 场景；8788 被占则 bot 启动失败并标 `FAILED`。
+
+### 14.4 自动重启
+
+三个受管进程统一策略：
+
+- 正常退出（exit code 0，且 supervisor 不处于关闭流程）→ 不重启，标 `STOPPED`。
+- 非预期退出 → 重启，退避 `1/2/4/8/16/30s`，第 6 次起保持 30s。
+- 同一进程**连续 5 次**退出且每次存活 < 30s → 标 `FAILED`，停止重启，保留 `last_exit_code`、`last_exit_at` 与最后 50 行输出。
+- 由 supervisor 关闭流程触发的退出一律不重启。
+- 每次重启更新 `restart_count`，并通过 SSE 向页面推送一条 `restarted` 事件。
+
+### 14.5 OpenCode 归属与单独调试
+
+- supervisor 模式下 `config.yaml` 固定为 `manage_server: false` + `server_url: http://127.0.0.1:24310`，bot 只当客户端，杜绝双开 serve。
+- 单独调试 bot（不经 supervisor）时 24310 无人监听，`BrainError` 会按 Phase 1 行为回聊天窗口；README 补充“先 `opencode serve` 或临时改 `manage_server: true`”。
+- `manage_server: true` 的 bot-managed 模式保留为回退路径，Phase 2 不删除。
+
+### 14.6 关闭顺序
+
+`SIGINT`/`SIGTERM`/`start-all` 停止 → 依次 **bot → OpenCode → NapCat**：每步 `terminate`，等 5 秒，超时执行 `taskkill /PID <pid> /T /F`（仅 Windows），再等 2 秒。全部结束后删除 `data/supervisor.pid`，写 `supervisor stopped` 日志。
+
+## 15. 三种大脑模式与运行时切换
+
+### 15.1 provider 取值
+
+`opencode` | `token` | `local_model`。`local` 作为 `token` 的别名保留（现有 `config.yaml` 与文档不改），加载时归一化为三者之一；非法值仍报 `ConfigError`。
+
+### 15.2 后端映射
+
+| provider | 实现 | 参数来源 |
+| --- | --- | --- |
+| `opencode` | `OpenCodeBrain`（现有） | `opencode.*` + 独立 DB |
+| `token` | `BrainClient`（现有，OpenAI 兼容） | `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` |
+| `local_model` | 同一个 `BrainClient` | `local_model.base_url` / `local_model.api_key` / 选中模型 |
+
+三者共用 `decide()` 协议与 `parse_brain_reply`；`forget()` 的远端 session 语义只有 `opencode` 具备，直连模式只清本地消息。
+
+### 15.3 就绪判定（`GET /api/brain`）
+
+| provider | ready 条件 | 未就绪示例 reason |
+| --- | --- | --- |
+| `opencode` | `server_url` 非空 | “未配置 server_url” |
+| `token` | `DEEPSEEK_API_KEY` 非空 | “缺少 DEEPSEEK_API_KEY” |
+| `local_model` | `base_url` 非空且（runtime 已选模型或配置有 model） | “未选择模型” |
+
+就绪判定只读配置，不发网络请求，避免控制口被外部服务拖慢。`opencode` 进程是否真的活着由 dashboard 依据 `/api/status` 灰化该选项（bot 侧不重复探测）。
+
+### 15.4 切换语义
+
+- `POST /api/brain {provider, model?}`：校验 → 构造新 brain → `Service.set_brain()` → 写 `data/runtime.json` → 返回新状态。
+- `Service.set_brain`：`asyncio.Lock` 保护；原子替换 `self.brain`；旧 brain 由延迟任务在 30 秒后 `aclose()`，进行中的消息继续用旧 brain 完成，不中断。
+- 失败（未就绪/构造异常）→ 400 或 409 + reason，不改 runtime、不改 `self.brain`。
+- 同 provider 且同模型重复调用 → 200 幂等，不重建实例。
+- 切换不清空历史消息，不重置 session 映射。
+
+### 15.5 会话隔离
+
+- 新表 `brain_sessions(provider, chat_type, chat_id, session_id, updated_at)`，主键 `(provider, chat_type, chat_id)`。
+- 启动时迁移：`opencode_sessions` 有数据则 `INSERT OR IGNORE` 为 `provider='opencode'`；迁移幂等，旧表保留只读、不再写入。
+- 直连模式不写映射（没有远端 session，上下文由本地 `messages` 提供）。
+- 切回 `opencode` 读到原 session，对话接续。
+
+### 15.6 持久化
+
+- `data/runtime.json`：`{"provider": "...", "local_model_model": "...", "updatedAt": "..."}`。
+- 优先级：`runtime.json` > `config.yaml` 的 `brain.provider`。
+- 文件损坏或字段非法 → 记 warning、回落配置文件、不阻止启动。
+- 程序**不写** `config.yaml`。
+
+## 16. Dashboard
+
+### 16.1 页面
+
+单文件 `src/dafeiyu/supervisor/dashboard/index.html`，vanilla JS，无构建步骤，四个区域：
+
+1. **进程卡 ×3**：状态徽章（RUNNING / EXTERNAL / RESTARTING / FAILED / STOPPED）、PID、端口、重启次数、退出码；点开抽屉看最后 50 行。
+2. **二维码**：2 秒轮询 `/api/qr/image`；显示登录状态与“上一张已过期”。
+3. **模式**：三选一；选 `local_model` 时显示模型下拉与刷新按钮，未就绪则灰掉并显示 reason。
+4. **日志**：source 切换（napcat / opencode / bot / supervisor）+ SSE 实时流 + 首屏回放 + 暂停/继续。
+
+### 16.2 接口
+
+| 方法 | 路径 | 说明 | 错误 |
+| --- | --- | --- | --- |
+| GET | `/api/health` | supervisor 自身健康 | — |
+| GET | `/api/status` | 三进程状态 + gateway 是否连接 + 当前 provider/模型 | — |
+| GET | `/api/logs/stream?source=&tail=` | SSE，先回放再实时，15s 心跳注释帧 | 400 未知 source |
+| GET | `/api/qr/image` | 转发 `qrcode.png`，未生成返回 204 | — |
+| GET | `/api/brain/models` | 代理 LM Studio `{base_url}/models`，3s 超时 | 502 / 504 |
+| POST | `/api/brain` | 切换模式 / 选定模型 | 400 参数或非法 provider；409 未就绪（附 reason） |
+
+### 16.3 日志
+
+- 每个 source 内存环 2000 行；SSE `tail` 默认 200、上限 2000。
+- 落盘 `logs/supervisor/{source}.log`，单文件 10MB，轮转保留 3 份。
+- 日志行格式 `YYYY-MM-DD HH:MM:SS [source] text`。
+
+### 16.4 二维码与登录状态
+
+- 图片源：`vendor/napcat/napcat/cache/qrcode.png`；文件不存在 → 204，前端显示“等待 NapCat 生成”。
+- 登录状态：`/api/status` 聚合 bot 控制口的 gateway 连接状态；`connected=true` → “已登录”。
+- 二维码过期：文件 mtime 超过 130 秒 → 前端显示“已过期，等待 NapCat 换码”。
+
+### 16.5 交互与安全
+
+- 切换成功 → toast + 徽章更新；失败 → 红色 toast 显示 reason。
+- 日志暂停只停止自动滚动，SSE 连接保持。
+- **无启停/重启按钮**（Phase 3）。
+- 只绑 `127.0.0.1`；POST 校验 `Origin`/`Host` 防 DNS rebinding；dashboard → bot 使用 `X-Control-Token`，token 由 supervisor 生成一次并写入 `data/supervisor.token`。
+
+## 17. 配置、依赖、测试与验收
+
+### 17.1 新增配置
+
+```yaml
+brain:
+  provider: opencode   # opencode | token | local_model（local 为 token 别名）
+
+local_model:
+  base_url: http://127.0.0.1:1234/v1
+  model: ""            # 空则由 dashboard 选择，选中值存 data/runtime.json
+  api_key: local
+
+supervisor:
+  dashboard:
+    host: 127.0.0.1
+    port: 8787
+    open_browser: true
+  control:
+    host: 127.0.0.1
+    port: 8788
+  restart:
+    backoff_seconds: [1, 2, 4, 8, 16, 30]
+    max_failures: 5
+```
+
+校验：dashboard/control 端口均在 1–65535，彼此不相等且不等于 `opencode.port`；`backoff_seconds` 非空且全为正；`max_failures >= 1`。
+
+控制口参数优先级：环境变量 `DAFEIYU_CONTROL_PORT` / `DAFEIYU_CONTROL_TOKEN` > 配置文件 > 默认值。supervisor 注入的环境变量是权威来源；手动单独启动 bot 时读取配置，配置为空则控制口不启用（不影响聊天）。
+
+### 17.2 新依赖
+
+`aiohttp>=3.9`（dashboard、bot 控制口、SSE）。
+
+### 17.3 测试
+
+- supervisor：假子进程驱动退避序列、5 次上限转 `FAILED`、`EXTERNAL` 判定、关闭顺序、单实例锁、异常退出不重启。
+- dashboard：aiohttp 测试客户端覆盖 `/api/status` 聚合、`/api/qr/image` 204 分支、SSE 首帧回放、未知 source 400。
+- 控制口：`GET /api/brain` 就绪表、`POST` 非法 provider 400、未就绪 409、重复切换幂等、in-flight 期间切换不中断。
+- 直连模式：`respx` 模拟 LM Studio `/v1/models` 与 `/chat/completions`。
+- 迁移：旧 `opencode_sessions` 数据迁入 `brain_sessions`，二次运行幂等。
+
+### 17.4 Phase 2 验收
+
+1. `pytest -q` 全绿。
+2. `start-all.ps1` 后 `GET 127.0.0.1:8787/api/status` 三个进程均为 `running`，且没有新弹控制台窗口。
+3. 手动结束 NapCat → 15 秒内 `/api/status` 显示 `running` 且 `restart_count: 1`。
+4. 打开 8787 能扫码登录，状态变为“已登录”（需人工扫码）。
+5. 切 `token` 后群聊有回复；切 `local_model` 选模型后有回复；切回 `opencode` 上下文接续（session 未变）。
+6. Ctrl+C 停止 supervisor 后 8080 / 24310 / 8787 / 8788 全部关闭，无孤儿 `node.exe` / `opencode.exe`。
+
+### 17.5 风险
+
+- supervisor 以隐藏方式运行时崩溃没有可见提示，只能看 `logs/supervisor/supervisor.log`；`start-all.ps1` 的 15 秒自检是主要兜底。
+- LM Studio 未启动时 `local_model` 灰掉；若它是当前模式而服务挂了，切换失败不回滚，聊天提示 `BRAIN_ERROR_REPLY`。
+- 双开 supervisor 由 pid 文件与 8787 占用双重拦截。
+- `taskkill /T` 会杀进程树，因此绝不对 `EXTERNAL` 的 NapCat 使用它。
+
