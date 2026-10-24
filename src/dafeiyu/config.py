@@ -214,6 +214,12 @@ def load_settings(
         raise ConfigError(
             "opencode.manage_server 为 true 时 server_url 必须为空"
         )
+    if provider == "opencode" and not manage_server and not server_url:
+        raise ConfigError(
+            "brain.provider 为 opencode 时必须二选一："
+            "opencode.manage_server: true，或填写 opencode.server_url；"
+            "两者都空会回落到个人 OpenCode 服务，把机器人会话写进个人库"
+        )
     if manage_server and not db_path:
         raise ConfigError("opencode.manage_server 为 true 时 db_path 不能为空")
     if not 1 <= port <= 65535:

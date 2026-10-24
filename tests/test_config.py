@@ -111,7 +111,9 @@ def test_error_message_does_not_leak_key(tmp_path: Path) -> None:
 def test_opencode_provider_does_not_require_deepseek_key(tmp_path: Path) -> None:
     env = write_env(tmp_path, "BOT_QQ=10001\n")
     yaml = BASE_YAML.replace(
-        "triggers:", "brain:\n  provider: opencode\ntriggers:"
+        "triggers:",
+        "brain:\n  provider: opencode\n"
+        "opencode:\n  manage_server: true\ntriggers:",
     )
     s = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
     assert s.brain.provider == "opencode"
@@ -120,7 +122,7 @@ def test_opencode_provider_does_not_require_deepseek_key(tmp_path: Path) -> None
     assert s.opencode.bin == ""
     assert s.opencode.project_dir == ""
     assert s.opencode.timeout_seconds == 90.0
-    assert s.opencode.manage_server is False
+    assert s.opencode.manage_server is True
     assert s.opencode.server_url == ""
     assert s.opencode.db_path == "data/opencode-bot.db"
     assert s.opencode.host == "127.0.0.1"
@@ -184,11 +186,40 @@ def test_opencode_manage_server_rejects_server_url(tmp_path: Path) -> None:
         load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
 
 
+def test_opencode_requires_server_url_when_not_managing(tmp_path: Path) -> None:
+    """manage_server=false 且不写 server_url 会静默回落到个人 OpenCode 服务，
+    机器人会话写进个人库 —— 必须在启动前拦住。"""
+    env = write_env(tmp_path, "BOT_QQ=10001\n")
+    yaml = BASE_YAML.replace(
+        "triggers:",
+        "brain:\n  provider: opencode\n"
+        "opencode:\n  manage_server: false\n  server_url: \"\"\n"
+        "triggers:",
+    )
+    with pytest.raises(ConfigError, match="server_url"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+
+def test_opencode_accepts_explicit_server_url_when_not_managing(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "BOT_QQ=10001\n")
+    yaml = BASE_YAML.replace(
+        "triggers:",
+        "brain:\n  provider: opencode\n"
+        "opencode:\n  manage_server: false\n"
+        "  server_url: http://127.0.0.1:25000\n"
+        "triggers:",
+    )
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+    assert s.opencode.manage_server is False
+    assert s.opencode.server_url == "http://127.0.0.1:25000"
+
+
 def test_opencode_port_must_be_valid(tmp_path: Path) -> None:
     env = write_env(tmp_path, "BOT_QQ=10001\n")
     yaml = BASE_YAML.replace(
         "triggers:",
-        "brain:\n  provider: opencode\nopencode:\n  port: 0\ntriggers:",
+        "brain:\n  provider: opencode\n"
+        "opencode:\n  manage_server: true\n  port: 0\ntriggers:",
     )
     with pytest.raises(ConfigError, match="opencode.port"):
         load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
@@ -199,7 +230,8 @@ def test_opencode_startup_timeout_must_be_positive(tmp_path: Path) -> None:
     yaml = BASE_YAML.replace(
         "triggers:",
         "brain:\n  provider: opencode\n"
-        "opencode:\n  startup_timeout_seconds: 0\ntriggers:",
+        "opencode:\n  manage_server: true\n"
+        "  startup_timeout_seconds: 0\ntriggers:",
     )
     with pytest.raises(ConfigError, match="startup_timeout_seconds"):
         load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
