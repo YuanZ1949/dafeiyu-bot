@@ -136,3 +136,24 @@ async def test_bad_json_body_raises_brain_error(client) -> None:
 
     with pytest.raises(BrainError):
         await client.decide("s", [])
+
+@respx.mock
+async def test_complete_returns_raw_content_without_json_instruction(client) -> None:
+    client, _ = client
+    route = respx.post(URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "[]"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            },
+        )
+    )
+
+    text = await client.complete("你是抽取器", [{"role": "user", "content": "x"}], max_tokens=600)
+
+    assert text == "[]"
+    body = json.loads(route.calls[0].request.content)
+    assert "speak" not in body["messages"][0]["content"]
+    assert body["temperature"] == 0.2
+    assert body["max_tokens"] == 600

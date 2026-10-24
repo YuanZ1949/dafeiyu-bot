@@ -11,6 +11,7 @@ from .gateway.qq import QQAdapter
 from .memory.store import Store
 from .router import Router
 from .service import Service
+from .workers.impressions import ImpressionWorker
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +52,10 @@ async def main() -> None:
         bot_qq=settings.bot_qq,
     )
     router = Router(settings, store)
-    service = Service(settings, store, brain, adapter, router, load_persona())
+    impressions = ImpressionWorker(store, brain, every=settings.memory.extract_every)
+    service = Service(
+        settings, store, brain, adapter, router, load_persona(), impressions
+    )
 
     await service.start()
     log.info(

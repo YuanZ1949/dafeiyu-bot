@@ -142,7 +142,7 @@ class Service:
 
         async def run() -> None:
             try:
-                await self.impressions.maybe_extract(self.store, msg.chat_type, msg.chat_id)
+                await self.impressions.maybe_extract(msg.chat_type, msg.chat_id)
             except Exception:
                 log.exception("印象抽取失败 %s/%s", msg.chat_type, msg.chat_id)
 

@@ -81,10 +81,30 @@ class BrainClient:
             "temperature": 1.0,
             "max_tokens": max_tokens,
         }
+        content, prompt_tokens, completion_tokens = await self._call(payload)
+        return self._parse_content(content, prompt_tokens, completion_tokens)
 
+    async def complete(
+        self,
+        system: str,
+        messages: list[dict],
+        max_tokens: int = 400,
+        temperature: float = 0.2,
+    ) -> str:
+        """原始补全：不注入 OUTPUT_INSTRUCTION，返回去掉围栏的正文。"""
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system}, *messages],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        content, _, _ = await self._call(payload)
+        return _strip_fence(content)
+
+    async def _call(self, payload: dict) -> tuple[str, int, int]:
         for attempt in range(2):
             try:
-                return await self._request(payload)
+                return await self._request_raw(payload)
             except _Retryable as exc:
                 if attempt == 0:
                     await self._sleep(2)
@@ -93,7 +113,7 @@ class BrainClient:
 
         raise BrainError("DeepSeek 请求失败：未知原因")
 
-    async def _request(self, payload: dict) -> BrainReply:
+    async def _request_raw(self, payload: dict) -> tuple[str, int, int]:
         url = f"{self.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
@@ -115,10 +135,10 @@ class BrainClient:
             raise BrainError("DeepSeek 返回格式异常") from exc
 
         usage = data.get("usage") or {}
-        return self._parse_content(
+        return (
             str(content),
-            prompt_tokens=int(usage.get("prompt_tokens") or 0),
-            completion_tokens=int(usage.get("completion_tokens") or 0),
+            int(usage.get("prompt_tokens") or 0),
+            int(usage.get("completion_tokens") or 0),
         )
 
     @staticmethod
