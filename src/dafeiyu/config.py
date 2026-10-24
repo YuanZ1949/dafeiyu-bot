@@ -83,6 +83,11 @@ class LocalModelConfig:
     base_url: str = "http://127.0.0.1:1234/v1"
     model: str = ""
     api_key: str = "local"
+    # 本地 Qwen3.x 这类思考型模型会先写一大段 reasoning，预算太低会导致
+    # finish_reason=length 且 content 为空，群里只能看到兜底话术。
+    max_tokens: int = 2048
+    # 本地推理比云端慢，15s 默认超时对思考型模型不够。
+    timeout_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -231,9 +236,17 @@ def load_settings(
         ).strip(),
         model=str(local_model_raw.get("model") or "").strip(),
         api_key=str(local_model_raw.get("api_key") or "local").strip(),
+        max_tokens=_int(local_model_raw.get("max_tokens", 2048), "local_model.max_tokens"),
+        timeout_seconds=_float(
+            local_model_raw.get("timeout_seconds", 60.0), "local_model.timeout_seconds"
+        ),
     )
     if not local_model.base_url:
         raise ConfigError("local_model.base_url 不能为空")
+    if local_model.max_tokens < 256:
+        raise ConfigError("local_model.max_tokens 必须大于等于 256")
+    if local_model.timeout_seconds <= 0:
+        raise ConfigError("local_model.timeout_seconds 必须大于 0")
 
     opencode_raw = raw.get("opencode") or {}
     if not isinstance(opencode_raw, dict):

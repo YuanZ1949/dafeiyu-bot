@@ -77,6 +77,58 @@ def test_local_model_section_is_parsed(tmp_path: Path) -> None:
     assert settings.local_model.api_key == "whatever"
 
 
+def test_local_model_max_tokens_defaults_and_overrides(tmp_path: Path) -> None:
+    default = load(tmp_path, "brain:\n  provider: local_model\n", env="BOT_QQ=10001\n")
+    assert default.local_model.max_tokens == 2048
+    assert default.local_model.timeout_seconds == 60.0
+
+    custom = load(
+        tmp_path,
+        "brain:\n  provider: local_model\nlocal_model:\n"
+        "  max_tokens: 4096\n  timeout_seconds: 120\n",
+        env="BOT_QQ=10001\n",
+    )
+    assert custom.local_model.max_tokens == 4096
+    assert custom.local_model.timeout_seconds == 120.0
+
+
+def test_local_model_max_tokens_too_small_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="local_model.max_tokens"):
+        load(
+            tmp_path,
+            "brain:\n  provider: local_model\nlocal_model:\n  max_tokens: 128\n",
+            env="BOT_QQ=10001\n",
+        )
+
+
+def test_local_model_timeout_must_be_positive(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="local_model.timeout_seconds"):
+        load(
+            tmp_path,
+            "brain:\n  provider: local_model\nlocal_model:\n  timeout_seconds: 0\n",
+            env="BOT_QQ=10001\n",
+        )
+
+
+def test_local_model_brain_uses_configured_max_tokens(tmp_path: Path) -> None:
+    from dafeiyu.brain.factory import build_brain
+    from dafeiyu.memory.store import Store
+
+    settings = load(
+        tmp_path,
+        "brain:\n  provider: local_model\nlocal_model:\n  max_tokens: 3072\n",
+        env="BOT_QQ=10001\n",
+    )
+    store = Store(tmp_path / "mem.db")
+    try:
+        brain = build_brain(settings, store, "local_model", model="qwen3-8b")
+        assert brain.max_tokens == 3072
+        assert brain.timeout == 60.0
+        assert brain.model == "qwen3-8b"
+    finally:
+        store.close()
+
+
 def test_unknown_provider_rejected(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="local_model"):
         load(tmp_path, "brain:\n  provider: gpt\n")

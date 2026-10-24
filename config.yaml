@@ -35,6 +35,10 @@ local_model:
   # 留空：在 dashboard 里从 /v1/models 侦测并选择
   model: ""
   api_key: local
+  # 思考型模型（Qwen3.x 等）先写 reasoning，预算太小会只出兜底话术
+  max_tokens: 2048
+  # 本地推理比云端慢
+  timeout_seconds: 60
 
 supervisor:
   dashboard:

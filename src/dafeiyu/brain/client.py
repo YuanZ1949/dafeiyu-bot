@@ -114,11 +114,13 @@ class BrainClient:
         transport: httpx.AsyncBaseTransport | None = None,
         trust_env: bool = True,
         reasoning_effort: str | None = None,
+        max_tokens: int = 400,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.reasoning_effort = (reasoning_effort or "").strip() or None
+        self.max_tokens = max_tokens
         self.timeout = timeout
         self._sleep = sleep or asyncio.sleep
         self._transport = transport
@@ -133,7 +135,7 @@ class BrainClient:
         self,
         system: str,
         messages: list[dict],
-        max_tokens: int = 400,
+        max_tokens: int | None = None,
     ) -> BrainReply:
         payload = {
             "model": self.model,
@@ -142,7 +144,7 @@ class BrainClient:
                 *messages,
             ],
             "temperature": 1.0,
-            "max_tokens": max_tokens,
+            "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
         }
         content, prompt_tokens, completion_tokens, finish_reason = await self._call(payload)
         return self._parse_content(

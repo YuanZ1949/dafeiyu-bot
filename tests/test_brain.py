@@ -53,6 +53,7 @@ async def test_normal_json_reply(client) -> None:
     assert body["temperature"] == 1.0
     assert body["messages"][0]["role"] == "system"
     assert "reasoning_effort" not in body
+    assert body["max_tokens"] == 400
 
 
 @respx.mock
@@ -71,6 +72,37 @@ async def test_reasoning_effort_is_sent_when_configured() -> None:
 
     body = json.loads(route.calls[0].request.content)
     assert body["reasoning_effort"] == "none"
+
+
+@respx.mock
+async def test_decide_uses_configured_max_tokens_by_default() -> None:
+    brain = BrainClient(
+        api_key="local",
+        base_url="http://127.0.0.1:1234/v1",
+        model="qwen/qwen3.5-9b",
+        trust_env=False,
+        max_tokens=2048,
+    )
+    route = respx.post("http://127.0.0.1:1234/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=OK_PAYLOAD)
+    )
+
+    await brain.decide("system prompt", [{"role": "user", "content": "在吗"}])
+    await brain.aclose()
+
+    assert json.loads(route.calls[0].request.content)["max_tokens"] == 2048
+
+
+@respx.mock
+async def test_explicit_max_tokens_overrides_configured_default(client) -> None:
+    client, _ = client
+    route = respx.post(URL).mock(return_value=httpx.Response(200, json=OK_PAYLOAD))
+
+    await client.decide(
+        "system prompt", [{"role": "user", "content": "在吗"}], max_tokens=600
+    )
+
+    assert json.loads(route.calls[0].request.content)["max_tokens"] == 600
 
 
 @respx.mock

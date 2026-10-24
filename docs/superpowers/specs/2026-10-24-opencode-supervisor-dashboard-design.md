@@ -537,7 +537,30 @@ supervisor:
 7. **`Supervisor.restart` 被属性遮蔽**。`self.restart = RestartConfig` 覆盖了同名方法，
    控制台点「重启」会报 `'RestartConfig' object is not callable`；属性改名 `restart_config`，
    并补测试 `test_restart_replaces_process`。
+8. **`local_model` 用 400 max_tokens 喂思考型模型，群里只能看到兜底话术**。LM Studio 里的
+   `qwen/qwen3.5-9b` 这类模型先写 reasoning 再写正文，400 token 被 reasoning 吃光，
+   `finish_reason=length` 且 `content=""`，`parse_brain_reply` 只能返回 `FALLBACK_REPLY`。
+   新增 `local_model.max_tokens`（默认 2048）并透传给 `BrainClient.decide`；实测 2000 token 时
+   reasoning 4502 字符后正常出正文。`chat_template_kwargs.enable_thinking=false` 对该模型无效，
+   所以只能给预算，不能关思考。
+9. **`BrainClient` 的 15s 默认超时对本地推理不够**。思考型模型单次 30s+，切到本地模式后
+   每次都被 `ReadTimeout` 打断、退化成兜底话术。新增 `local_model.timeout_seconds`（默认 60）。
 
-补充测试（共 4 条）：
+### 18.5 群回复链路的可复现探针
+
+QQ 未扫码登录时 `gateway_connected=false`，真 NapCat 不连入，群消息进不来。新增
+`scripts/fake-napcat-probe.py`：以 OneBot v11 客户端身份连 bot 的反向 WS（`NAPCAT_WS_PORT`），
+发一条群消息事件，捕获 bot 下发的 `send_group_msg` 并回 ack。三种 provider 实测
+opencode / token / local_model 均返回 `send_group_msg`，正文来自所选模型。
+它只替代「NapCat ↔ QQ」一跳，真实投递仍依赖扫码登录（验收 4）。
+token 模式的 `base_url`/`model` 来自 `.env`，本机当前指向 `http://127.0.0.1:1234/v1`
+与 `qwen/qwen3.5-9b`，因此那条回复由 LM Studio 生成——走的仍是 Token 通路（`BrainClient`）。
+
+补充测试（端到端回归 4 条）：
 `test_restart_replaces_process`、`test_external_instance_turns_stopped_when_pid_dies`、
 `test_open_log_stream_does_not_block_cleanup`、`test_brain_switch_survives_slow_brain_build`。
+
+补充测试（本地模型配置 6 条）：
+`test_local_model_max_tokens_defaults_and_overrides`、`test_local_model_max_tokens_too_small_is_rejected`、
+`test_local_model_timeout_must_be_positive`、`test_local_model_brain_uses_configured_max_tokens`、
+`test_decide_uses_configured_max_tokens_by_default`、`test_explicit_max_tokens_overrides_configured_default`。
