@@ -37,6 +37,14 @@ async def main() -> None:
     settings = load_settings()
     setup_logging(settings)
 
+    persona_path = settings.persona.prompt_file
+    try:
+        persona_text = load_persona(Path(persona_path) if persona_path else None)
+    except OSError as exc:
+        raise ConfigError(f"人设文件无法读取：{persona_path}") from exc
+    if not persona_text:
+        raise ConfigError(f"人设文件为空：{persona_path or '内置 persona.md'}")
+
     db_path = Path(settings.db_path)
     if db_path.parent and str(db_path.parent) != ".":
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,7 +67,7 @@ async def main() -> None:
     router = Router(settings, store)
     impressions = ImpressionWorker(store, brain, every=settings.memory.extract_every)
     service = Service(
-        settings, store, brain, adapter, router, load_persona(), impressions
+        settings, store, brain, adapter, router, persona_text, impressions
     )
 
     scheduler = SummaryScheduler(store, brain)

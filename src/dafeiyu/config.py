@@ -20,6 +20,7 @@ class PersonaConfig:
     max_reply_chars: int
     max_reply_chars_technical: int
     os_probability: float
+    prompt_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,7 @@ def _build_persona(raw: dict[str, Any]) -> PersonaConfig:
         max_reply_chars=max_chars,
         max_reply_chars_technical=max_tech,
         os_probability=_float(raw.get("os_probability", 0.05), "persona.os_probability"),
+        prompt_file=str(raw.get("prompt_file") or "").strip(),
     )
 
 

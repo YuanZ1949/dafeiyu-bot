@@ -81,6 +81,7 @@ Copy-Item .env.example .env
 | `persona.max_reply_chars` | `120` | 闲聊回复上限（字） |
 | `persona.max_reply_chars_technical` | `300` | 技术问题回复上限（字） |
 | `persona.os_probability` | `0.05` | 出现「内心 OS」的概率 |
+| `persona.prompt_file` | `""` | 自定义人设文件路径；留空使用内置 `brain/persona.md`。改完重启生效 |
 | `triggers.cooldown_seconds` | `60` | 同一群两次主动发言的最小间隔 |
 | `triggers.sample_rate` | `0.05` | 普通消息被纳入模型判断的采样率 |
 | `triggers.quiet_hours` | `["01:00","07:00"]` | 静默时段，不主动插话（@ 仍会回） |

@@ -71,6 +71,18 @@ def test_env_overrides_yaml_and_applies_defaults(tmp_path: Path) -> None:
     assert s.persona.max_reply_chars == 120
 
 
+def test_persona_prompt_file_defaults_empty_and_reads_yaml(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    default = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+    assert default.persona.prompt_file == ""
+
+    custom = BASE_YAML.replace(
+        "  os_probability: 0.05", '  os_probability: 0.05\n  prompt_file: "my_persona.md"'
+    )
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, custom))
+    assert s.persona.prompt_file == "my_persona.md"
+
+
 def test_invalid_sample_rate_raises(tmp_path: Path) -> None:
     env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
     bad = BASE_YAML.replace("sample_rate: 0.05", "sample_rate: 1.5")

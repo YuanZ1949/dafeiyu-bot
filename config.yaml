@@ -4,6 +4,8 @@ persona:
   max_reply_chars: 120
   max_reply_chars_technical: 300
   os_probability: 0.05
+  # 留空使用内置人设 brain/persona.md；也可填自己的 md 路径（绝对或相对仓库根目录）
+  prompt_file: ""
 
 triggers:
   cooldown_seconds: 60
