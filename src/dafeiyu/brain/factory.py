@@ -4,6 +4,7 @@ from typing import Any
 
 from .client import BrainClient
 from .opencode import OpenCodeBrain, resolve_opencode_bin
+from .opencode_http import OpenCodeHttpBrain
 from ..config import ConfigError, Settings
 from ..memory.store import Store
 from ..runtime import RuntimeState
@@ -49,7 +50,10 @@ def mode_status(settings: Settings, runtime: RuntimeState) -> list[dict[str, Any
 
 def _unready_reason(settings: Settings, runtime: RuntimeState, provider: str) -> str:
     if provider == "opencode":
-        return "" if settings.opencode.server_url else "未配置 opencode.server_url"
+        # manage_server 时 url 由 host/port 拼，不需要用户填 server_url。
+        if settings.opencode.server_url or settings.opencode.manage_server:
+            return ""
+        return "未配置 opencode.server_url"
     if provider == "token":
         return "" if settings.api_key else "缺少 DEEPSEEK_API_KEY"
     if provider == "local_model":
@@ -70,6 +74,21 @@ def build_brain(
 ) -> Any:
     provider = normalize_provider(provider)
     if provider == "opencode":
+        # manage_server 时 server_url 为空，用 host/port 拼出真实地址。
+        resolved = (
+            server_url.strip()
+            or settings.opencode.server_url
+            or f"http://{settings.opencode.host}:{settings.opencode.port}"
+        )
+        if settings.opencode.transport == "http":
+            return OpenCodeHttpBrain(
+                base_url=resolved,
+                store=store,
+                password=settings.opencode.server_password,
+                agent=settings.opencode.agent,
+                project_dir=settings.opencode.project_dir,
+                timeout=settings.opencode.timeout_seconds,
+            )
         try:
             bin_path = resolve_opencode_bin(settings.opencode.bin)
         except Exception as exc:  # BrainError，避免这里重复导入异常类型

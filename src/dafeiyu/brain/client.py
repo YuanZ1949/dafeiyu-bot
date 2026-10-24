@@ -2,9 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 from dataclasses import dataclass
 
 import httpx
+
+log = logging.getLogger(__name__)
+
+# UTF-8 解码失败的残渣。丢了原字，但至少别把替换符发到群里。
+_REPLACEMENT_RE = re.compile(r"\ufffd+\??")
+# 抢救用：贪到最后一个引号，能吞掉字符串里插进来的裸引号。
+_REPLY_RE = re.compile(r'"reply"\s*:\s*"(.*)"', re.S)
+_SPEAK_FALSE_RE = re.compile(
+    r'"speak"\s*:\s*(?:false|"false"|0|"no"|"off")', re.IGNORECASE
+)
 
 OUTPUT_INSTRUCTION = """\
 只输出一个 JSON 对象，不要输出解释、前后缀或代码围栏。格式：
@@ -42,6 +54,58 @@ def _strip_fence(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _clean_replacements(text: str) -> str:
+    return _REPLACEMENT_RE.sub("", text)
+
+
+def _reply_from_dict(data: dict) -> tuple[bool, str] | None:
+    raw_speak = data.get("speak", True)
+    if isinstance(raw_speak, str):
+        # 模型偶尔把布尔值写成字符串，bool("false") 会是 True，必须显式归一。
+        speak = raw_speak.strip().casefold() not in ("false", "no", "0", "off", "")
+    else:
+        speak = bool(raw_speak)
+    reply = str(data.get("reply") or "").strip()
+    return (speak, reply) if reply else None
+
+
+def salvage_reply(text: str) -> tuple[bool, str] | None:
+    """从损坏的模型输出里抢救出 (speak, reply)。
+
+    真实见过的三种损坏：
+
+    * 字符串里插进一个裸引号，让 reply 提前闭合 —— json 报 Extra data；
+    * 多字节字符被拆坏，出现 U+FFFD；
+    * 两段 JSON 首尾相接 —— json 报 Extra data，取第一个对象即可。
+    """
+    cleaned = _clean_replacements(text).strip()
+    if not cleaned:
+        return None
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(cleaned):
+        if char != "{":
+            continue
+        try:
+            data, _ = decoder.raw_decode(cleaned[index:])
+        except ValueError:
+            # 第一个 { 就解析不出，后面的 { 只可能是嵌套，不必再试。
+            break
+        if isinstance(data, dict):
+            found = _reply_from_dict(data)
+            if found is not None:
+                return found
+        break
+
+    match = _REPLY_RE.search(cleaned)
+    if not match:
+        return None
+    reply = match.group(1).replace('\\"', '"').replace("\\n", "\n").strip()
+    if not reply:
+        return None
+    return (not _SPEAK_FALSE_RE.search(cleaned)), reply
+
+
 def parse_brain_reply(
     content: str,
     prompt_tokens: int = 0,
@@ -58,8 +122,28 @@ def parse_brain_reply(
     try:
         data = json.loads(text)
     except ValueError:
+        salvaged = salvage_reply(text)
+        if salvaged is not None:
+            speak, reply = salvaged
+            log.warning(
+                "模型输出 JSON 损坏，已抢救出回复（finish_reason=%s，片段=%r）",
+                finish_reason,
+                text[:160],
+            )
+            return BrainReply(
+                speak=speak,
+                reply=reply,
+                reason="模型输出 JSON 损坏，已抢救",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
         # 被 max_tokens 截断、或明显是残缺 JSON 时，不要把协议原文丢到群里。
         if finish_reason == "length" or looks_like_json:
+            log.warning(
+                "模型输出无法修复，降级为兜底话术（finish_reason=%s，片段=%r）",
+                finish_reason,
+                text[:160],
+            )
             return BrainReply(
                 speak=True,
                 reply=FALLBACK_REPLY,
@@ -68,6 +152,10 @@ def parse_brain_reply(
                 completion_tokens=completion_tokens,
             )
         reply = content.strip()
+        if not reply:
+            log.warning(
+                "模型返回空内容，降级为兜底话术（finish_reason=%s）", finish_reason
+            )
         return BrainReply(
             speak=True,
             reply=reply or FALLBACK_REPLY,
@@ -92,7 +180,12 @@ def parse_brain_reply(
     else:
         speak = bool(raw_speak)
     reply = str(data.get("reply") or "").strip()
+    if "\ufffd" in reply:
+        # JSON 合法但字符串里带着解码残渣（管道损坏的残留），清掉再发。
+        log.warning("回复含 UTF-8 替换符，已清理（片段=%r）", reply[:160])
+        reply = _clean_replacements(reply).strip()
     if speak and not reply:
+        log.warning("模型返回 speak=true 但 reply 为空，降级为兜底话术")
         reply = FALLBACK_REPLY
     return BrainReply(
         speak=speak,

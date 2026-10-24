@@ -167,11 +167,13 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
         ready_url=f"http://127.0.0.1:{control_port}/api/health",
         creationflags=CREATE_NO_WINDOW,
     )
+    # -q <uin> 让 NapCat 用机器人号已有的本地票据自动登录，冷启动不必再扫码。
+    # 必须显式给 uin：本机快速登录列表里还有用户的个人号 504567327，
+    # 不给 -q 会按列表顺序登错号。票据失效时 NapCat 自己回落到二维码，不会卡死。
     specs["napcat"] = ProcSpec(
         name="napcat",
-        command=[str(node), "index.js"],
+        command=[str(node), "index.js", "-q", str(settings.bot_qq)],
         cwd=str(NAPCAT_DIR),
-        env={"NAPCAT_QUICK_LOGIN": "0"},
         creationflags=CREATE_NO_WINDOW,
     )
     return specs

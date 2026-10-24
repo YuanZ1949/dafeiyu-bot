@@ -70,6 +70,10 @@ class OpenCodeConfig:
     timeout_seconds: float = 90.0
     manage_server: bool = False
     server_url: str = ""
+    # http：直接调 server API（默认，读结构化消息）；cli：spawn `opencode run`。
+    transport: str = "http"
+    # server 的 Basic 认证密码，用户名固定 opencode；空则读同名的环境变量。
+    server_password: str = ""
     db_path: str = "data/opencode-bot.db"
     host: str = "127.0.0.1"
     port: int = 24310
@@ -264,6 +268,14 @@ def load_settings(
     if not isinstance(manage_server, bool):
         raise ConfigError("opencode.manage_server 必须是布尔值")
     server_url = str(opencode_raw.get("server_url") or "").strip()
+    opencode_transport = (
+        str(opencode_raw.get("transport") or "http").strip().casefold()
+    )
+    if opencode_transport not in ("http", "cli"):
+        raise ConfigError("opencode.transport 只能是 http 或 cli")
+    server_password = str(opencode_raw.get("server_password") or "").strip()
+    if not server_password:
+        server_password = str(env.get("OPENCODE_SERVER_PASSWORD", "")).strip()
     db_path = str(opencode_raw.get("db_path") or "data/opencode-bot.db").strip()
     host = str(opencode_raw.get("host") or "127.0.0.1").strip()
     port = _int(opencode_raw.get("port", 24310), "opencode.port")
@@ -391,6 +403,8 @@ def load_settings(
             timeout_seconds=opencode_timeout,
             manage_server=manage_server,
             server_url=server_url,
+            transport=opencode_transport,
+            server_password=server_password,
             db_path=db_path,
             host=host,
             port=port,
