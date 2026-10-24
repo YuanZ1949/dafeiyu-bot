@@ -6,6 +6,7 @@ data/
 logs/
 .pytest_cache/
 .superpowers/
+.tamako/
 *.egg-info/
 vendor/napcat/
 vendor/napcat.zip
