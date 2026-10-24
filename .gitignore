@@ -6,3 +6,4 @@ data/
 logs/
 .pytest_cache/
 .superpowers/
+*.egg-info/
