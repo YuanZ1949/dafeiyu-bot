@@ -545,6 +545,11 @@ supervisor:
    所以只能给预算，不能关思考。
 9. **`BrainClient` 的 15s 默认超时对本地推理不够**。思考型模型单次 30s+，切到本地模式后
    每次都被 `ReadTimeout` 打断、退化成兜底话术。新增 `local_model.timeout_seconds`（默认 60）。
+10. **切走「本地模型」后模式卡被置灰，回不去**。`local_model_name()` 原实现只在
+    `runtime.provider == "local_model"` 时才读 `runtime.local_model_model`，切到 opencode 后
+    模型名回落到 `config.yaml` 的空值，`mode_status` 报「未选择模型」，前端把卡设为 `disabled`；
+    而模型下拉框只在选中该模式时才显示 —— 用户被锁在门外。改为
+    「runtime 记着就用 runtime，否则用 config」，实测 `provider=opencode` 时三模式 `ready` 全 `true`。
 
 ### 18.5 群回复链路的可复现探针
 
@@ -564,3 +569,4 @@ token 模式的 `base_url`/`model` 来自 `.env`，本机当前指向 `http://12
 `test_local_model_max_tokens_defaults_and_overrides`、`test_local_model_max_tokens_too_small_is_rejected`、
 `test_local_model_timeout_must_be_positive`、`test_local_model_brain_uses_configured_max_tokens`、
 `test_decide_uses_configured_max_tokens_by_default`、`test_explicit_max_tokens_overrides_configured_default`。
+另补 `test_local_model_mode_stays_ready_after_switching_away`（第 10 条缺陷的回归）。

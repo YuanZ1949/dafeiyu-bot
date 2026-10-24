@@ -4,14 +4,17 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 from aiohttp.test_utils import TestClient, TestServer
 
 from dafeiyu import control as control_module
 from dafeiyu.brain.client import BrainClient
+from dafeiyu.brain.factory import mode_status
 from dafeiyu.config import load_settings
 from dafeiyu.control import BrainControl, create_app
 from dafeiyu.memory.store import Store
+from dafeiyu.runtime import RuntimeState
 
 YAML = """\
 persona:
@@ -115,6 +118,20 @@ async def test_snapshot_lists_three_modes(tmp_path: Path) -> None:
     assert by_id["opencode"]["ready"] is False
     assert "server_url" in by_id["opencode"]["reason"]
     assert by_id["local_model"]["ready"] is False  # 还没选模型
+
+
+def test_local_model_mode_stays_ready_after_switching_away() -> None:
+    settings = SimpleNamespace(
+        local_model=SimpleNamespace(base_url="http://127.0.0.1:1234/v1", model=""),
+        opencode=SimpleNamespace(server_url="http://127.0.0.1:24310"),
+        api_key="sk-test",
+    )
+    runtime = RuntimeState(provider="opencode", local_model_model="qwen/qwen3.5-9b")
+
+    by_id = {m["id"]: m for m in mode_status(settings, runtime)}
+
+    assert by_id["local_model"]["ready"] is True
+    assert by_id["local_model"]["reason"] == ""
 
 
 async def test_token_guard(tmp_path: Path) -> None:

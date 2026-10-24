@@ -26,9 +26,9 @@ def current_provider(settings: Settings, runtime: RuntimeState) -> str:
 
 
 def local_model_name(settings: Settings, runtime: RuntimeState) -> str:
-    if runtime.provider == "local_model" and runtime.local_model_model:
-        return runtime.local_model_model
-    return settings.local_model.model
+    # 记住用户上次在 dashboard 选的模型。若只在 provider == local_model 时才读 runtime，
+    # 切到别的模式后本模式会显示「未选择模型」并被前端置灰，成了回不去的死路。
+    return runtime.local_model_model or settings.local_model.model
 
 
 def mode_status(settings: Settings, runtime: RuntimeState) -> list[dict[str, Any]]:
