@@ -13,12 +13,16 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 WEBUI_CONFIG = REPO_ROOT / "vendor" / "napcat" / "napcat" / "config" / "webui.json"
 
 # 扫码登录过程中 NapCat 依次报的阶段，映射成人话给 dashboard 用。
+# 实机观察到的序列：waiting_qrcode → qrcode_scanned → ready（isLogin 同时变 true）。
+# waiting_confirm / logging_in / online 是从 WebUI 前端反推出来的兼容值，一并留着。
 PHASE_LABELS = {
     "": "",
     "waiting_qrcode": "等待扫码",
+    "qrcode_scanned": "已扫码，等待手机确认",
     "waiting_confirm": "已扫码，等待手机确认",
     "logging_in": "正在登录",
     "login_failed": "登录失败",
+    "ready": "已登录",
     "online": "已登录",
 }
 
@@ -76,7 +80,7 @@ def _shape(raw: Any) -> dict[str, Any]:
             "error": "NapCat 返回了非预期数据",
         }
     qq = str(raw.get("uin") or raw.get("qq") or raw.get("uid") or "")
-    nickname = str(raw.get("nickname") or raw.get("nickName") or "")
+    nickname = str(raw.get("nick") or raw.get("nickname") or raw.get("nickName") or "")
     phase = str(raw.get("loginPhase") or "")
     return {
         "reachable": True,
@@ -170,7 +174,23 @@ class NapCatLogin:
             # WebUI 重启后旧 credential 失效，重新登录一次再问。
             await self._login()
             payload = await self._post("/QQLogin/CheckLoginStatus", {})
-        return _shape(payload)
+        state = _shape(payload)
+        if state["logged_in"] and not state["qq"]:
+            # CheckLoginStatus 里没有账号信息，已登录时再问一次 GetQQLoginInfo
+            # （实机返回 {"uid","uin","nick","online"}）。拿不到就算了，不影响登录态。
+            state.update(await self._account())
+        return state
+
+    async def _account(self) -> dict[str, str]:
+        try:
+            info = await self._post("/QQLogin/GetQQLoginInfo", {})
+        except (_Unauthorized, ValueError, aiohttp.ClientError, asyncio.TimeoutError):
+            return {}
+        if not isinstance(info, dict):
+            return {}
+        qq = str(info.get("uin") or info.get("uid") or "")
+        nick = str(info.get("nick") or info.get("nickname") or info.get("nickName") or "")
+        return {"qq": qq, "nickname": nick}
 
     async def _login(self) -> None:
         assert self._auth is not None

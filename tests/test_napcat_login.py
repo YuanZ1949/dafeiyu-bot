@@ -16,29 +16,37 @@ CREDENTIAL = "cred-1"
 
 
 class StubNapCat:
-    """最小 NapCat WebUI：/api/auth/login 发 credential，CheckLoginStatus 报登录态。"""
+    """最小 NapCat WebUI，字段照实机抄。
+
+    实机 CheckLoginStatus 只有 isLogin/loginPhase/coreReady/loginError 这些，
+    **不含账号信息**；QQ 号与昵称在已登录之后要另外问 GetQQLoginInfo。
+    """
 
     def __init__(
         self,
         *,
-        urin: str = "",
+        uin: str = "",
         nickname: str = "",
         phase: str = "waiting_qrcode",
         reject_first_status: bool = False,
+        info_available: bool = True,
     ):
-        self.uin = urin
+        self.uin = uin
         self.nickname = nickname
         self.phase = phase
-        self.logged_in = bool(urin)
+        self.logged_in = bool(uin)
         self.reject_first_status = reject_first_status
+        self.info_available = info_available
         self.login_calls = 0
         self.status_calls = 0
+        self.info_calls = 0
         self._server: TestServer | None = None
 
     async def __aenter__(self) -> "StubNapCat":
         app = web.Application()
         app.router.add_post("/api/auth/login", self._login)
         app.router.add_post("/api/QQLogin/CheckLoginStatus", self._status)
+        app.router.add_post("/api/QQLogin/GetQQLoginInfo", self._info)
         self._server = TestServer(app)
         await self._server.start_server()
         return self
@@ -71,10 +79,31 @@ class StubNapCat:
                 "code": 0,
                 "data": {
                     "isLogin": self.logged_in,
-                    "loginPhase": "online" if self.logged_in else self.phase,
-                    "uin": self.uin,
-                    "nickname": self.nickname,
+                    "isOffline": False,
+                    # 实机登录成功后报的是 ready，不是 online。
+                    "loginPhase": "ready" if self.logged_in else self.phase,
+                    "qrLoginAccepted": False,
+                    "coreReady": self.logged_in,
+                    "qrcodeurl": "https://txz.qq.com/p?k=stub",
                     "loginError": "",
+                },
+            }
+        )
+
+    async def _info(self, request: web.Request) -> web.Response:
+        self.info_calls += 1
+        if request.headers.get("Authorization") != f"Bearer {CREDENTIAL}":
+            return web.Response(status=401)
+        if not self.logged_in or not self.info_available:
+            return web.json_response({"code": -1, "message": "QQ Is Not Logined"})
+        return web.json_response(
+            {
+                "code": 0,
+                "data": {
+                    "uid": "u_stub",
+                    "uin": self.uin,
+                    "nick": self.nickname,
+                    "online": True,
                 },
             }
         )
@@ -109,7 +138,8 @@ async def test_state_reports_waiting_for_scan() -> None:
 
 
 async def test_state_reports_logged_in_qq() -> None:
-    async with StubNapCat(urin="10001", nickname="飞鱼小号") as stub:
+    """实机路径：CheckLoginStatus 说已登录但没账号信息，得再问 GetQQLoginInfo。"""
+    async with StubNapCat(uin="10001", nickname="飞鱼小号") as stub:
         probe = NapCatLogin(stub.auth)
         try:
             state = await probe.state()
@@ -118,7 +148,34 @@ async def test_state_reports_logged_in_qq() -> None:
     assert state["logged_in"] is True
     assert state["qq"] == "10001"
     assert state["nickname"] == "飞鱼小号"
+    assert state["phase"] == "ready"
     assert state["phase_label"] == "已登录"
+    assert stub.info_calls == 1
+
+
+async def test_state_maps_scanned_phase() -> None:
+    async with StubNapCat(phase="qrcode_scanned") as stub:
+        probe = NapCatLogin(stub.auth)
+        try:
+            state = await probe.state()
+        finally:
+            await probe.close()
+    assert state["logged_in"] is False
+    assert state["phase_label"] == "已扫码，等待手机确认"
+    assert stub.info_calls == 0
+
+
+async def test_state_survives_missing_account_info() -> None:
+    """GetQQLoginInfo 报错时不能把登录态一起丢掉。"""
+    async with StubNapCat(uin="10001", nickname="飞鱼小号", info_available=False) as stub:
+        probe = NapCatLogin(stub.auth)
+        try:
+            state = await probe.state()
+        finally:
+            await probe.close()
+    assert state["logged_in"] is True
+    assert state["qq"] == ""
+    assert state["nickname"] == ""
 
 
 async def test_state_is_cached_within_ttl() -> None:
