@@ -359,7 +359,7 @@ S2 的判据从"二选一"改成"三条同时可观测"。
 
 ### 9.2 轮换流程
 
-1. 到阈值 → 写一条**轮换摘要**（复用 §6 的 `dafeiyu-memory`，输入是本 session 被丢弃前最近 40 条消息），落 `summaries` 表并标 `kind='rotation'`。
+1. 到阈值 → 写一条**轮换摘要**（复用 §6 的 `dafeiyu-memory`，输入是本 session 被丢弃前最近 40 条消息），落**新表 `session_summaries`**（`summaries` 的主键是 `(chat, date)`，塞不下同日第二条）。
 2. 新建 session（agent/title 带 `v2`），`brain_sessions` 记新 id + `created_at` + 计数清零；旧 session 保留不删（留档，不再写）。
 3. 新 session 首轮 prompt 用【接续】段：`这是你在本会话的新 session。上次聊到：<轮换摘要>。长期记忆见上文。`
    - **不再复用【昨日摘要】**：那条已经在同一轮注入过，重复注入等于占两份预算。
