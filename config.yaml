@@ -19,6 +19,12 @@ opencode:
   # 留空使用当前工作目录（start.ps1 会切到 dafeiyu-bot）
   project_dir: ""
   timeout_seconds: 90
+  manage_server: true
+  server_url: ""
+  db_path: data/opencode-bot.db
+  host: 127.0.0.1
+  port: 24310
+  startup_timeout_seconds: 30
 
 triggers:
   cooldown_seconds: 60
