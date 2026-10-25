@@ -93,6 +93,25 @@ def create_app(
         except aiohttp.ClientError as exc:
             return 502, {"error": f"bot 不可达：{exc.__class__.__name__}"}
 
+    async def bot_raw(method: str, path: str) -> tuple[int, bytes, dict[str, str]]:
+        """导出类接口要原样转发 body 与下载头，不能先解析成 JSON。"""
+        try:
+            async with bot_session().request(method, path) as resp:
+                body = await resp.read()
+                headers = {}
+                for name in ("Content-Type", "Content-Disposition"):
+                    value = resp.headers.get(name)
+                    if value:
+                        headers[name] = value
+                return resp.status, body, headers
+        except asyncio.TimeoutError:
+            return 504, b'{"error":"bot timeout"}', {
+                "Content-Type": "application/json"
+            }
+        except aiohttp.ClientError as exc:
+            message = f'{{"error":"bot 不可达：{exc.__class__.__name__}"}}'
+            return 502, message.encode("utf-8"), {"Content-Type": "application/json"}
+
     async def index(_: web.Request) -> web.Response:
         return web.FileResponse(DASHBOARD_DIR / "index.html")
 
@@ -189,6 +208,66 @@ def create_app(
         code, data = await bot_call("GET", path)
         return web.json_response(data, status=code)
 
+    async def proxy_get(request: web.Request, path: str) -> web.Response:
+        if request.query_string:
+            path = f"{path}?{request.query_string}"
+        code, data = await bot_call("GET", path)
+        return web.json_response(data, status=code)
+
+    async def usage(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/usage")
+
+    async def memory_search(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/memory/search")
+
+    async def sessions(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/sessions")
+
+    async def config(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/config")
+
+    def _session_target(
+        request: web.Request,
+    ) -> tuple[str, str, web.Response | None]:
+        chat_type = request.match_info.get("chat_type", "")
+        chat_id = request.match_info.get("chat_id", "")
+        if chat_type not in ("group", "private"):
+            return "", "", web.json_response(
+                {"error": "chat_type 必须是 group 或 private"}, status=400
+            )
+        if not chat_id.isdigit() or int(chat_id) <= 0:
+            return "", "", web.json_response(
+                {"error": "chat_id 必须是正整数"}, status=400
+            )
+        return chat_type, chat_id, None
+
+    async def session_action(request: web.Request) -> web.Response:
+        chat_type, chat_id, error = _session_target(request)
+        if error is not None:
+            return error
+        action = request.match_info.get("action", "")
+        if action not in ("new", "forget"):
+            return web.json_response({"error": "未知会话操作"}, status=400)
+        code, data = await bot_call(
+            "POST", f"/api/sessions/{chat_type}/{chat_id}/{action}"
+        )
+        return web.json_response(data, status=code)
+
+    async def session_delete(request: web.Request) -> web.Response:
+        chat_type, chat_id, error = _session_target(request)
+        if error is not None:
+            return error
+        code, data = await bot_call("DELETE", f"/api/sessions/{chat_type}/{chat_id}")
+        return web.json_response(data, status=code)
+
+    async def memory_export(request: web.Request) -> web.Response:
+        path = "/api/memory/export"
+        if request.query_string:
+            path = f"{path}?{request.query_string}"
+        status, body, headers = await bot_raw("GET", path)
+        return web.Response(body=body, status=status, headers=headers)
+
+
     async def memory_summary(request: web.Request) -> web.Response:
         payload = await _json_body(request)
         if payload is None:
@@ -257,6 +336,13 @@ def create_app(
     app.router.add_post("/api/brain", post_brain)
     app.router.add_get("/api/brain/models", models)
     app.router.add_get("/api/memory", memory)
+    app.router.add_get("/api/usage", usage)
+    app.router.add_get("/api/memory/search", memory_search)
+    app.router.add_get("/api/memory/export", memory_export)
+    app.router.add_get("/api/sessions", sessions)
+    app.router.add_post("/api/sessions/{chat_type}/{chat_id}/{action}", session_action)
+    app.router.add_delete("/api/sessions/{chat_type}/{chat_id}", session_delete)
+    app.router.add_get("/api/config", config)
     app.router.add_post("/api/memory/summaries", memory_summary)
     app.router.add_post("/api/memory/impressions", memory_impressions)
     app.router.add_delete(

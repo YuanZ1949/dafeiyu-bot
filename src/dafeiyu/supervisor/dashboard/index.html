@@ -117,6 +117,30 @@
   }
   .toast.show { opacity: 1; }
   .toast.err { border-left-color: var(--bad); }
+  input {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+  }
+  input:focus, select:focus { outline: 1px solid var(--accent); }
+  .usage-grid { display: grid; grid-template-columns: minmax(320px, 2fr) minmax(240px, 1fr); gap: 16px; }
+  .usage-bars { display: flex; align-items: flex-end; gap: 4px; height: 128px; padding-top: 6px; }
+  .bar-col { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; gap: 4px; height: 100%; }
+  .bar-stack { display: flex; flex-direction: column; justify-content: flex-end; height: 100px; gap: 1px; }
+  .bar-seg { background: var(--accent); border-radius: 2px; min-height: 0; }
+  .bar-seg.err { background: var(--bad); }
+  .bar-label { color: var(--muted); font-size: 10px; text-align: center; white-space: nowrap; overflow: hidden; }
+  .usage-totals { margin-top: 8px; justify-content: space-between; }
+  .session-list { display: grid; gap: 8px; max-height: 360px; overflow: auto; }
+  .session-row {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--panel-2);
+  }
+  .session-row .who { font-weight: 600; min-width: 110px; }
+  .session-row .meta { color: var(--muted); font-size: 12px; flex: 1; min-width: 180px; }
+  .session-row .acts { display: flex; gap: 6px; flex-wrap: wrap; }
+  .session-row .btn { padding: 4px 9px; font-size: 12px; }
+  .cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 6px 18px; }
+  .cfg-grid b { color: var(--text); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -173,6 +197,72 @@
         <div class="mem-list" id="memory-impressions"></div>
       </div>
     </div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="margin-bottom:10px">
+      <h2 style="margin:0">用量趋势</h2>
+      <span class="kv" id="usage-hint"></span>
+      <span class="spacer" style="flex:1"></span>
+      <select id="usage-days" title="统计区间">
+        <option value="7">近 7 天</option>
+        <option value="14">近 14 天</option>
+        <option value="30">近 30 天</option>
+      </select>
+      <button class="btn" id="btn-refresh-usage">刷新</button>
+    </div>
+    <div class="usage-grid">
+      <div>
+        <div class="usage-bars" id="usage-bars"></div>
+        <div class="row kv usage-totals" id="usage-totals"></div>
+      </div>
+      <div>
+        <h3 style="font-size:12px;color:var(--muted);margin:0 0 6px">回复最多的会话</h3>
+        <div class="mem-list" id="usage-top" style="max-height:110px"></div>
+        <h3 style="font-size:12px;color:var(--muted);margin:10px 0 6px">最近错误</h3>
+        <div class="mem-list" id="usage-errors" style="max-height:110px"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="margin-bottom:10px">
+      <h2 style="margin:0">记忆搜索</h2>
+      <span class="kv" id="search-hint"></span>
+    </div>
+    <div class="row" style="margin-bottom:10px">
+      <input id="search-q" placeholder="搜聊天记录里的关键词…" style="flex:1;min-width:200px" />
+      <select id="search-chat-filter">
+        <option value="">全部会话</option>
+        <option value="group">只看群聊</option>
+        <option value="private">只看私聊</option>
+      </select>
+      <input id="search-chat-id" type="number" min="1" placeholder="会话 ID（可选）" style="width:130px" />
+      <button class="btn primary" id="btn-search">搜索</button>
+      <button class="btn" id="btn-search-more" disabled>更多</button>
+    </div>
+    <div class="mem-list" id="search-results" style="max-height:340px"></div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="margin-bottom:10px">
+      <h2 style="margin:0">会话管理</h2>
+      <span class="kv" id="sessions-hint"></span>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn" id="btn-refresh-sessions">刷新</button>
+    </div>
+    <div class="session-list" id="sessions"></div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="margin-bottom:10px">
+      <h2 style="margin:0">运行配置</h2>
+      <span class="kv" id="config-hint">只读</span>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn" id="btn-restart-bot">重启 Bot</button>
+      <button class="btn" id="btn-refresh-config">刷新</button>
+    </div>
+    <div class="kv cfg-grid" id="config-body"></div>
   </section>
 
   <section class="card">
@@ -533,6 +623,235 @@ async function deleteImpression(id) {
   }
 }
 
+function chatName(type, id) {
+  return `${type === "group" ? "群" : "私聊"} ${id}`;
+}
+
+function fmtTokens(n) {
+  const value = Number(n) || 0;
+  if (value >= 100000000) return `${(value / 100000000).toFixed(1)}亿`;
+  if (value >= 10000) return `${(value / 10000).toFixed(1)}万`;
+  return String(value);
+}
+
+let usageDays = 7;
+
+async function loadUsage() {
+  try {
+    const data = await api(`/api/usage?days=${usageDays}`);
+    const series = data.series || [];
+    const max = Math.max(1, ...series.map((d) => (d.calls || 0) + (d.errors || 0)));
+    $("usage-bars").innerHTML = series.map((d) => {
+      const calls = d.calls || 0;
+      const errors = d.errors || 0;
+      const total = calls + errors;
+      const scaled = Math.round((total / max) * 100);
+      const errHeight = total ? Math.round((errors / total) * scaled) : 0;
+      const callHeight = scaled - errHeight;
+      const label = usageDays > 14 ? String(Number(d.date.slice(8))) : d.date.slice(5);
+      return `<div class="bar-col" title="${d.date} · 回复 ${calls} · 错误 ${errors} · Token ${d.tokens}">
+        <div class="bar-stack">
+          ${errors ? `<div class="bar-seg err" style="height:${errHeight}px"></div>` : ""}
+          ${calls ? `<div class="bar-seg" style="height:${callHeight}px"></div>` : ""}
+        </div>
+        <div class="bar-label">${label}</div>
+      </div>`;
+    }).join("");
+    const totals = data.totals || {};
+    $("usage-hint").textContent = `${data.start} ~ ${data.end}`;
+    $("usage-totals").innerHTML =
+      `<span>回复 <b>${totals.calls || 0}</b></span>` +
+      `<span>错误 <b>${totals.errors || 0}</b></span>` +
+      `<span>Token <b>${fmtTokens(totals.tokens)}</b></span>`;
+
+    const top = data.top || [];
+    $("usage-top").innerHTML = top.length
+      ? top.map((r) => `<div class="mem-item">
+          <div class="mem-meta">${chatName(r.chat_type, r.chat_id)}</div>
+          <div class="mem-text">回复 ${r.calls} 次 · ${fmtTokens(r.tokens)} token${r.errors ? ` · 错误 ${r.errors}` : ""}</div>
+        </div>`).join("")
+      : '<div class="mem-empty">区间内还没有回复</div>';
+
+    const errors = data.recent_errors || [];
+    $("usage-errors").innerHTML = errors.length
+      ? errors.map((r) => `<div class="mem-item">
+          <div class="mem-meta">${r.at || "—"}</div>
+          <div class="mem-text">${chatName(r.chat_type, r.chat_id)}</div>
+        </div>`).join("")
+      : '<div class="mem-empty">没有错误记录</div>';
+  } catch (err) {
+    $("usage-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+const SEARCH_PAGE = 20;
+let searchOffset = 0;
+let searchTotal = 0;
+
+async function searchMessages(append) {
+  const q = $("search-q").value.trim();
+  if (!q) { toast("先输入关键词", true); return; }
+  const chatType = $("search-chat-filter").value;
+  const chatId = $("search-chat-id").value.trim();
+  if (chatId && !chatType) { toast("填了会话 ID 就要选会话类型", true); return; }
+  const params = new URLSearchParams({ q, limit: String(SEARCH_PAGE) });
+  if (chatType) params.set("chat_type", chatType);
+  if (chatId) params.set("chat_id", chatId);
+  if (append) params.set("offset", String(searchOffset));
+  try {
+    const data = await api(`/api/memory/search?${params.toString()}`);
+    const items = data.items || [];
+    const box = $("search-results");
+    if (!append) box.replaceChildren();
+    items.forEach((m) => {
+      box.appendChild(memItem(
+        `${chatName(m.chat_type, m.chat_id)} · ${m.at || "—"} · ${m.is_bot ? "大肥鱼" : m.nickname}`,
+        m.content
+      ));
+    });
+    searchTotal = data.total || 0;
+    searchOffset = (append ? searchOffset : 0) + items.length;
+    if (!searchTotal) box.innerHTML = '<div class="mem-empty">没有匹配的消息</div>';
+    $("search-hint").textContent = `匹配 ${searchTotal} 条 · 已显示 ${searchOffset}`;
+    $("btn-search-more").disabled = searchOffset >= searchTotal;
+  } catch (err) {
+    toast(`搜索失败：${err.message}`, true);
+  }
+}
+
+async function loadSessions() {
+  try {
+    const data = await api("/api/sessions");
+    const items = data.items || [];
+    const box = $("sessions");
+    box.replaceChildren();
+    items.forEach((s) => {
+      const row = document.createElement("div");
+      row.className = "session-row";
+      const who = document.createElement("div");
+      who.className = "who";
+      who.textContent = chatName(s.chat_type, s.chat_id);
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      const parts = [
+        `消息 ${s.message_count}`,
+        `摘要 ${s.summary_count}`,
+        `印象 ${s.impression_count}`,
+      ];
+      if (s.last_message_at) {
+        parts.push(`最近 ${new Date(s.last_message_at * 1000).toLocaleString("zh-CN", { hour12: false })}`);
+      }
+      if (s.session_id) parts.push(`session ${String(s.session_id).slice(0, 14)}`);
+      if (s.delivered_count) parts.push(`已投递 ${s.delivered_count}`);
+      if (s.token_estimate) parts.push(`${fmtTokens(s.token_estimate)} token`);
+      meta.textContent = parts.join(" · ");
+      const acts = document.createElement("div");
+      acts.className = "acts";
+      const add = (label, cls, onClick) => {
+        const btn = document.createElement("button");
+        btn.className = `btn ${cls}`.trim();
+        btn.textContent = label;
+        btn.addEventListener("click", onClick);
+        acts.appendChild(btn);
+      };
+      add("新建会话", "", () => sessionAction(s, "new", "只清 session 映射，消息和摘要都会保留。继续？"));
+      add("软忘记", "", () => sessionAction(s, "forget", "将清空该会话的消息和映射，保留摘要与印象。继续？"));
+      add("彻底删除", "danger", () => hardDeleteSession(s));
+      add("导出 MD", "", () => exportChat(s, "md"));
+      add("导出 JSON", "", () => exportChat(s, "json"));
+      row.append(who, meta, acts);
+      box.appendChild(row);
+    });
+    $("sessions-hint").textContent = `${items.length} 个会话`;
+    if (!items.length) box.innerHTML = '<div class="mem-empty">还没有会话记录</div>';
+  } catch (err) {
+    $("sessions-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+async function sessionAction(session, action, ask) {
+  if (!confirm(ask)) return;
+  try {
+    await api(`/api/sessions/${session.chat_type}/${session.chat_id}/${action}`, {
+      method: "POST",
+      body: "{}",
+    });
+    toast(action === "new" ? "已新建会话" : "已软忘记");
+    loadSessions();
+    loadMemory();
+    loadUsage();
+  } catch (err) {
+    toast(`操作失败：${err.message}`, true);
+  }
+}
+
+async function hardDeleteSession(session) {
+  if (!confirm(`彻底删除 ${chatName(session.chat_type, session.chat_id)}？\n会删除远端 session 和本地全部消息、摘要、印象、用量，且不可恢复。`)) return;
+  try {
+    await api(`/api/sessions/${session.chat_type}/${session.chat_id}`, { method: "DELETE" });
+    toast("已彻底删除");
+    loadSessions();
+    loadMemory();
+    loadUsage();
+  } catch (err) {
+    toast(`删除失败：${err.message}`, true);
+  }
+}
+
+async function exportChat(session, format) {
+  const params = new URLSearchParams({
+    chat_type: session.chat_type,
+    chat_id: String(session.chat_id),
+    format,
+  });
+  try {
+    const resp = await fetch(`/api/memory/export?${params.toString()}`);
+    if (!resp.ok) {
+      let reason = `HTTP ${resp.status}`;
+      try {
+        const data = await resp.json();
+        reason = (data && data.error) || reason;
+      } catch (_) { /* 非 JSON 错误体 */ }
+      throw new Error(reason);
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `dafeiyu-${session.chat_type}-${session.chat_id}.${format === "json" ? "json" : "md"}`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    toast("已开始下载");
+  } catch (err) {
+    toast(`导出失败：${err.message}`, true);
+  }
+}
+
+async function loadConfig() {
+  try {
+    const c = await api("/api/config");
+    const providerModel = c.brain.model ? `${c.brain.provider} · ${c.brain.model}` : c.brain.provider;
+    const agent = c.brain.provider === "opencode" ? ` · agent ${c.brain.agent}` : "";
+    const rows = [
+      ["大脑", providerModel + agent],
+      ["人设", `${c.persona.name} · 回复 ${c.persona.max_reply_chars}/${c.persona.max_reply_chars_technical} 字 · OS ${(c.persona.os_probability * 100).toFixed(1)}%`],
+      ["冷却", `错误回复 ${c.cooldown.brain_error_seconds}s · 工具提示 ${c.cooldown.tool_hint_seconds}s`],
+      ["限流", `${c.rate_limit.window_seconds / 60} 分钟内 ${c.rate_limit.threshold} 次 429 → 退避 ${c.rate_limit.backoff_seconds}s · 配额暂停 ${Math.round(c.rate_limit.quota_pause_seconds / 60)} 分钟`],
+      ["预算", `每日 ${c.budget.daily_calls} 次 / ${fmtTokens(c.budget.daily_tokens)} token`],
+      ["网关", c.gateway.provider],
+    ];
+    $("config-body").innerHTML = rows
+      .map(([label, value]) => `<div><b>${label}</b>：${value}</div>`)
+      .join("");
+    $("config-hint").textContent = "只读 · 改配置需编辑 config.yaml";
+  } catch (err) {
+    $("config-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+
 async function doControl(act, target) {
   const label = { start: "启动", stop: "停止", restart: "重启" }[act] || act;
   const name = target === "all" ? "全部进程" : (PROC_TITLE[target] || target);
@@ -639,6 +958,21 @@ $("memory-chat-filter").addEventListener("change", () => {
   loadMemory();
 });
 $("model-select").addEventListener("change", (ev) => { selectedModel = ev.target.value; });
+$("btn-refresh-usage").addEventListener("click", loadUsage);
+$("usage-days").addEventListener("change", (ev) => {
+  usageDays = Number(ev.target.value) || 7;
+  loadUsage();
+});
+$("btn-search").addEventListener("click", () => searchMessages(false));
+$("search-q").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") searchMessages(false);
+});
+$("btn-search-more").addEventListener("click", () => searchMessages(true));
+$("btn-refresh-sessions").addEventListener("click", loadSessions);
+$("btn-refresh-config").addEventListener("click", loadConfig);
+$("btn-restart-bot").addEventListener("click", () => {
+  if (confirm("重启 Bot 进程？正在处理的对话会中断。")) doControl("restart", "bot");
+});
 $("btn-shutdown").addEventListener("click", async () => {
   if (!confirm("将停止 OpenCode / Bot / NapCat 三个进程并退出控制台，确定吗？")) return;
   try {
@@ -652,8 +986,13 @@ $("btn-shutdown").addEventListener("click", async () => {
 initTabs();
 refresh();
 loadMemory();
+loadUsage();
+loadSessions();
+loadConfig();
 setInterval(refresh, 2000);
 setInterval(loadMemory, 10000);
+setInterval(loadUsage, 30000);
+setInterval(loadSessions, 15000);
 </script>
 </body>
 </html>

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -14,7 +15,7 @@ from conftest import TEST_CONFIG_YAML
 from dafeiyu.config import load_settings
 from dafeiyu.control import BrainControl, create_app as create_bot_app
 from dafeiyu.memory.store import Store
-from dafeiyu.models import ChatType
+from dafeiyu.models import ChatType, Message
 from dafeiyu.supervisor.dashboard import create_app as create_dashboard_app
 from dafeiyu.supervisor.logs import LogHub
 
@@ -129,3 +130,123 @@ async def test_dashboard_memory_reads_seeded_store_end_to_end(tmp_path: Path) ->
             await dash_client.close()
         await bot_client.close()
         store.close()
+
+
+@asynccontextmanager
+async def boot(tmp_path: Path):
+    config = tmp_path / "config.yaml"
+    config.write_text(YAML, encoding="utf-8")
+    env = tmp_path / "test.env"
+    env.write_text("BOT_QQ=10001\nDEEPSEEK_API_KEY=sk-test\n", encoding="utf-8")
+    settings = load_settings(env_file=env, config_file=config)
+
+    store = Store(tmp_path / "demo.db")
+    store.init_schema()
+    seed(store)
+    for index, content in enumerate(("第一条：显卡", "第二条：钓鱼")):
+        store.add_message(
+            Message(
+                chat_type=ChatType.GROUP,
+                chat_id=GROUP_ID,
+                user_id=42,
+                nickname="鱼片",
+                content=content,
+                message_id=f"m{index}",
+                timestamp=1_700_000_000 + index,
+            )
+        )
+    store.set_brain_session("opencode", ChatType.GROUP, GROUP_ID, "ses_demo")
+    store.record_usage(ChatType.GROUP, GROUP_ID, "reply", 10, 5)
+    store.record_usage(ChatType.GROUP, GROUP_ID, "error", 0, 0)
+
+    control = BrainControl(
+        settings,
+        store,
+        FakeService(),
+        FakeAdapter(),
+        runtime_path=str(tmp_path / "runtime.json"),
+    )
+    bot_client = TestClient(TestServer(create_bot_app(control)))
+    await bot_client.start_server()
+    dash_client = None
+    try:
+        bot_url = str(bot_client.server.make_url("/")).rstrip("/")
+        dash_app = create_dashboard_app(
+            FakeSupervisor(),
+            settings,
+            LogHub(tmp_path / "logs"),
+            tmp_path / "qrcode.png",
+            bot_url,
+        )
+        dash_client = TestClient(TestServer(dash_app))
+        await dash_client.start_server()
+        yield dash_client, store
+    finally:
+        if dash_client is not None:
+            await dash_client.close()
+        await bot_client.close()
+        store.close()
+
+
+async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
+    async with boot(tmp_path) as (dash, store):
+        usage = await (await dash.get("/api/usage?days=7")).json()
+        assert len(usage["series"]) == 7
+        assert usage["series"][-1]["calls"] == 1
+        assert usage["series"][-1]["errors"] == 1
+        assert usage["series"][-1]["tokens"] == 15
+        assert usage["top"][0]["chat_id"] == GROUP_ID
+
+        found = await (
+            await dash.get("/api/memory/search", params={"q": "显卡"})
+        ).json()
+        assert found["total"] == 1
+        assert found["items"][0]["content"] == "第一条：显卡"
+
+        md = await dash.get(
+            "/api/memory/export",
+            params={"chat_type": "group", "chat_id": str(GROUP_ID)},
+        )
+        text = await md.text()
+        assert md.status == 200
+        assert "text/markdown" in md.headers["Content-Type"]
+        assert "第一条：显卡" in text and "群里聊了显卡和钓鱼" in text
+
+        bundle = await (
+            await dash.get(
+                "/api/memory/export",
+                params={
+                    "chat_type": "group",
+                    "chat_id": str(GROUP_ID),
+                    "format": "json",
+                },
+            )
+        ).json()
+        assert bundle["message_total"] == 2
+        assert len(bundle["summaries"]) == 1
+
+        sessions = await (await dash.get("/api/sessions")).json()
+        row = next(item for item in sessions["items"] if item["chat_id"] == GROUP_ID)
+        assert row["message_count"] == 2
+        assert row["session_id"] == "ses_demo"
+        assert row["summary_count"] == 1
+
+        config = await (await dash.get("/api/config")).json()
+        assert config["brain"]["provider"] == "token"
+        assert config["cooldown"]["brain_error_seconds"] == 30.0
+
+        # 新建 session：消息还在，映射没了。
+        assert (await dash.post(f"/api/sessions/group/{GROUP_ID}/new")).status == 200
+        assert store.count_messages(ChatType.GROUP, GROUP_ID) == 2
+        assert store.get_brain_session("opencode", ChatType.GROUP, GROUP_ID) is None
+
+        # 软忘记：消息清掉，摘要保留。
+        assert (
+            await dash.post(f"/api/sessions/group/{GROUP_ID}/forget")
+        ).status == 200
+        assert store.count_messages(ChatType.GROUP, GROUP_ID) == 0
+        assert store.count_summaries(ChatType.GROUP, GROUP_ID) == 1
+
+        # 彻底删除：FakeService 无 forget_chat 时走 brain/store 兜底。
+        assert (await dash.delete(f"/api/sessions/group/{GROUP_ID}")).status == 200
+        assert store.count_summaries(ChatType.GROUP, GROUP_ID) == 0

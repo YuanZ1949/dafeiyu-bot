@@ -18,7 +18,7 @@ from dafeiyu.brain.factory import mode_status
 from dafeiyu.config import load_settings
 from dafeiyu.control import BrainControl, MemoryActions, create_app
 from dafeiyu.memory.store import MAX_MEMORY_PAGE, Store
-from dafeiyu.models import ChatType
+from dafeiyu.models import ChatType, Message
 from dafeiyu.runtime import RuntimeState
 from dafeiyu.workers.failure import QUOTA_KEY, MemoryPaused
 
@@ -577,3 +577,261 @@ def test_dashboard_surfaces_quota_pause() -> None:
     assert "data.quota" in html
     assert "quota.paused" in html
     assert "配额暂停中" in html
+
+
+def _seed_message(
+    store: Store,
+    message_id: str,
+    content: str,
+    *,
+    chat_type: ChatType = ChatType.GROUP,
+    chat_id: int = 100,
+    user_id: int = 42,
+    nickname: str = "鱼片",
+    timestamp: int = 1_700_000_000,
+    is_bot: bool = False,
+) -> None:
+    store.add_message(
+        Message(
+            chat_type=chat_type,
+            chat_id=chat_id,
+            user_id=user_id,
+            nickname=nickname,
+            content=content,
+            message_id=message_id,
+            is_bot=is_bot,
+            timestamp=timestamp,
+        )
+    )
+
+
+async def test_usage_endpoint_fills_empty_days(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    control.store.record_usage(ChatType.GROUP, 100, "reply", 10, 5)
+    control.store.record_usage(ChatType.GROUP, 100, "ambient", 2, 1)
+    control.store.record_usage(ChatType.GROUP, 100, "error", 0, 0)
+    control.store.record_usage(ChatType.GROUP, 100, "summary", 4, 2)
+
+    async with running(app) as client:
+        resp = await client.get("/api/usage?days=7")
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload["days"] == 7
+    assert len(payload["series"]) == 7
+    assert payload["series"][-1] == {
+        "date": control.store.today(),
+        "calls": 2,
+        "errors": 1,
+        "tokens": 24,
+    }
+    assert payload["totals"] == {"calls": 2, "errors": 1, "tokens": 24}
+    assert payload["top"] == [
+        {"chat_type": "group", "chat_id": 100, "calls": 2, "errors": 1, "tokens": 24}
+    ]
+    assert len(payload["recent_errors"]) == 1
+    assert re.fullmatch(r"\d\d-\d\d \d\d:\d\d", payload["recent_errors"][0]["at"])
+
+
+async def test_usage_endpoint_rejects_bad_days(tmp_path: Path) -> None:
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        assert (await client.get("/api/usage?days=0")).status == 400
+        assert (await client.get("/api/usage?days=abc")).status == 400
+        assert (await client.get("/api/usage?days=91")).status == 400
+
+
+async def test_search_endpoint_matches_and_escapes(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    _seed_message(control.store, "m1", "100% 装机", timestamp=1_700_000_100)
+    _seed_message(control.store, "m2", "1000 装机")
+    _seed_message(control.store, "m3", "装机私聊", chat_type=ChatType.PRIVATE, chat_id=9)
+
+    async with running(app) as client:
+        resp = await client.get("/api/memory/search", params={"q": "100%"})
+        payload = await resp.json()
+        assert resp.status == 200
+        assert payload["total"] == 1
+        assert [item["message_id"] for item in payload["items"]] == ["m1"]
+        assert payload["items"][0]["at"]
+
+        scoped = await (
+            await client.get(
+                "/api/memory/search",
+                params={"q": "装机", "chat_type": "group", "chat_id": "100"},
+            )
+        ).json()
+        assert scoped["total"] == 2
+        assert [item["message_id"] for item in scoped["items"]] == ["m2", "m1"]
+
+        paged = await (
+            await client.get(
+                "/api/memory/search", params={"q": "装机", "limit": "1", "offset": "1"}
+            )
+        ).json()
+        assert paged["total"] == 3
+        assert [item["message_id"] for item in paged["items"]] == ["m2"]
+
+
+async def test_search_endpoint_validates_query(tmp_path: Path) -> None:
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        assert (await client.get("/api/memory/search")).status == 400
+        assert (await client.get("/api/memory/search?q=x")).status == 200
+        assert (await client.get("/api/memory/search?q=x&offset=-1")).status == 400
+        assert (
+            await client.get("/api/memory/search?q=x&chat_id=1")
+        ).status == 400  # 只给 chat_id 不够
+
+
+async def test_export_markdown_and_json(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    _seed_message(control.store, "m1", "第一句", timestamp=1_700_000_100)
+    _seed_message(control.store, "m2", "第二句", timestamp=1_700_000_200)
+    control.store.upsert_summary(ChatType.GROUP, 100, "2026-10-23", "聊了装机")
+    control.store.upsert_impression(ChatType.GROUP, 100, 42, "preference", "喜欢猫", 0.9)
+
+    async with running(app) as client:
+        md = await client.get(
+            "/api/memory/export", params={"chat_type": "group", "chat_id": "100"}
+        )
+        text = await md.text()
+        assert md.status == 200
+        assert md.headers["Content-Type"].startswith("text/markdown")
+        assert "attachment" in md.headers["Content-Disposition"]
+        assert "大肥鱼记忆导出 · group/100" in text
+        assert text.index("第一句") < text.index("第二句")
+        assert "聊了装机" in text
+        assert "喜欢猫" in text
+
+        js = await client.get(
+            "/api/memory/export",
+            params={"chat_type": "group", "chat_id": "100", "format": "json"},
+        )
+        bundle = await js.json()
+        assert js.status == 200
+        assert bundle["truncated"] is False
+        assert [m["message_id"] for m in bundle["messages"]] == ["m1", "m2"]
+        assert bundle["message_total"] == 2
+        assert bundle["summaries"][0]["date"] == "2026-10-23"
+
+        truncated = await (
+            await client.get(
+                "/api/memory/export",
+                params={"chat_type": "group", "chat_id": "100", "format": "json", "limit": "1"},
+            )
+        ).json()
+        assert truncated["truncated"] is True
+        assert len(truncated["messages"]) == 1
+
+
+async def test_export_endpoint_validates_scope_and_format(tmp_path: Path) -> None:
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        assert (await client.get("/api/memory/export")).status == 400
+        assert (
+            await client.get("/api/memory/export?chat_type=group&chat_id=0")
+        ).status == 400
+        assert (
+            await client.get(
+                "/api/memory/export?chat_type=group&chat_id=1&format=pdf"
+            )
+        ).status == 400
+
+
+async def test_sessions_endpoint_and_actions(tmp_path: Path) -> None:
+    control, service, app = make_control(tmp_path)
+    _seed_message(control.store, "m1", "群消息")
+    control.store.upsert_summary(ChatType.GROUP, 200, "2026-10-23", "只有摘要")
+    control.store.set_brain_session("opencode", ChatType.GROUP, 100, "ses_abc")
+
+    async with running(app) as client:
+        payload = await (await client.get("/api/sessions")).json()
+        assert [item["chat_id"] for item in payload["items"]] == [100, 200]
+        assert payload["items"][0]["session_id"] == "ses_abc"
+
+        new = await client.post("/api/sessions/group/100/new")
+        assert new.status == 200
+        assert control.store.count_messages(ChatType.GROUP, 100) == 1
+        assert control.store.get_brain_session("opencode", ChatType.GROUP, 100) is None
+
+        forget = await client.post("/api/sessions/group/100/forget")
+        assert forget.status == 200
+        assert control.store.count_messages(ChatType.GROUP, 100) == 0
+        assert control.store.get_summary(ChatType.GROUP, 200, "2026-10-23") is not None
+
+        calls: list[tuple[ChatType, int]] = []
+
+        async def forget_chat(chat_type: ChatType, chat_id: int) -> None:
+            calls.append((chat_type, chat_id))
+            control.store.forget_chat(chat_type, chat_id)
+
+        service.forget_chat = forget_chat
+        deleted = await client.delete("/api/sessions/group/100")
+        assert deleted.status == 200
+        assert calls == [(ChatType.GROUP, 100)]
+        assert control.store.count_summaries(ChatType.GROUP, 100) == 0
+
+
+async def test_session_action_rejects_unknown(tmp_path: Path) -> None:
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        assert (await client.post("/api/sessions/group/1/rotate")).status == 400
+        assert (await client.post("/api/sessions/team/1/new")).status == 400
+        assert (await client.delete("/api/sessions/group/abc")).status == 400
+
+
+async def test_config_endpoint_has_thresholds_and_no_secrets(tmp_path: Path) -> None:
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.get("/api/config")
+        raw = await resp.text()
+        payload = json.loads(raw)
+
+    assert resp.status == 200
+    assert "sk-test" not in raw
+    assert "api_key" not in raw
+    assert payload["brain"]["provider"] == "token"
+    assert payload["persona"]["os_probability"] == 0.05
+    assert payload["cooldown"]["brain_error_seconds"] == 30.0
+    assert payload["rate_limit"] == {
+        "threshold": 3,
+        "window_seconds": 600.0,
+        "backoff_seconds": 300.0,
+        "quota_pause_seconds": 3600.0,
+    }
+    assert payload["budget"]["daily_calls"] == 200
+
+
+def test_dashboard_exposes_new_panels() -> None:
+    html = (
+        Path(__file__).resolve().parents[1]
+        / "src/dafeiyu/supervisor/dashboard/index.html"
+    ).read_text(encoding="utf-8")
+    for anchor in (
+        'id="usage-bars"',
+        'id="usage-days"',
+        'id="search-q"',
+        'id="btn-search-more"',
+        'id="sessions"',
+        'id="config-body"',
+        'id="btn-restart-bot"',
+    ):
+        assert anchor in html, f"面板缺少 {anchor}"
+    assert "/api/usage?days=" in html
+    assert "/api/memory/search?" in html
+    assert "/api/memory/export?" in html
+    assert "/api/sessions" in html
+    assert "/api/config" in html
+    assert "URL.createObjectURL" in html
+    assert "confirm(" in html
+
+
+def test_dashboard_usage_bars_scale_by_max() -> None:
+    html = (
+        Path(__file__).resolve().parents[1]
+        / "src/dafeiyu/supervisor/dashboard/index.html"
+    ).read_text(encoding="utf-8")
+    assert "Math.max(1, ...series.map" in html
+    assert "bar-seg err" in html
+    assert "usage-totals" in html
