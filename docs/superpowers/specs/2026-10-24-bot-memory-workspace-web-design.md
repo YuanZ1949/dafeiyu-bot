@@ -407,7 +407,11 @@ S2 的判据从"二选一"改成"三条同时可观测"。
 - 真正的阻断只能靠独立配置目录。杠杆是 `XDG_CONFIG_HOME`（V2 文档；`OPENCODE_CONFIG` 不存在，v1 写错了），另有 `%ProgramData%\opencode` 也会被加载。
 - 代价：搬走配置目录会连带搬走 `opencode.jsonc`（bot 正继承的模型配置）和 `auth.json`（provider 凭据）。要么在隔离目录里重建一份最小配置 + 复制凭据，要么接受"检测 + 轮换"这一层。
 - 因此 **S6 的产出是一个选择题**，不是自动执行：能隔离且不丢凭据 → 隔离；需要复制凭据 → 交给你决定。
-- 实测（Task 13）：**本轮未隔离**，理由同上——隔离要搬 `opencode.jsonc` 与 `auth.json`，属于「需要你拍板」的分支，本轮没有替你选。兜底是 §11.3 的检测 + 轮换，加上工作区侧的 agent 权限与会话级 deny（`workspace.dir` 为空时下推全量 deny）。
+- 实测（Task 13）：**本轮未隔离**；兜底是 §11.3 的检测 + 轮换，加上工作区侧的 agent 权限与会话级 deny（`workspace.dir` 为空时下推全量 deny）。
+- 实测修正（Task 13.1）：上面「要搬 `auth.json`」的成本判断**不成立**。本机 `opencode debug paths` 显示 `config` 与 `data` 分离，`auth.json` 在 data 目录（`~/.local/share/opencode/auth.json`），不在配置目录；那 15 个外来 agent 来自 `plugins`（`yzOpencode` / `OpencodeLiberation` / `oceanus` 等），配置里既没有 `agents:` 段也没有 agents 目录。所以只隔离 `XDG_CONFIG_HOME` 就能去掉全局插件 / MCP / 外来 agent，**不需要复制凭据**。
+- 已实现（Task 13.1）：新增 `opencode.config_home`（留空 = 软回滚），bot 的 `OpenCodeServer` 子进程用 `env={"XDG_CONFIG_HOME": <abs>}` 指向 `data/opencode-runtime/config`；该目录下的 `opencode/opencode.jsonc` 由 `ensure_isolated_config` 幂等生成（`$schema` + 钉住 model + `plugins: []`）。只作用于 bot 子进程，不改用户全局配置，也不影响日常 opencode。
+- 被否的方案：仓库级 `.opencode/opencode.jsonc`。同一仓库也是开发目录，仓库级 `policies` 会连带禁掉开发会话自己的 MCP / 插件。
+- 仍待真机确认（Task 14）：隔离后模型与凭据是否可用；全局插件是否真是 §11.1 污染的来源（污染文本与 OmO 自动续跑的措辞高度吻合，尚未验证）。
 - 减少暴露面（同轮必做）：dashboard 若给 OpenCode session 深链，改为只读提示（避免一键把 bot 会话开进 TUI）。
 
 ### 11.5 验收（可观测）
@@ -502,7 +506,7 @@ memory:
 | S3 | `DELETE /api/session/{id}` 可用性（文档有，smoke 即可） | 临时 session 用完即删 | 留档，每群固定 worker session |
 | S4 | 权限 glob 对 `data/bot-workspace/**` 是否生效、越界是否被拒 | 按 4.2 | 补绝对路径规则；仍不行则把 workspace 移出仓库 |
 | S5 | message info 是否带 tokens/cost | 接真实记账 | 保持 0 + warning，`daily_tokens` 暂不生效 |
-| S6 | 全局插件是否作用到 bot server；`XDG_CONFIG_HOME` 能否隔离且不丢凭据 | 交给用户二选一（§11.4） | 只做检测 + 轮换，写明限制 |
+| S6 | 全局插件是否作用到 bot server；`XDG_CONFIG_HOME` 能否隔离且不丢凭据 | 已实现隔离（Task 13.1，§11.4） | 隔离 + 检测/轮换双层；真机确认留给 Task 14 |
 | S7 | `steps: 4` 下回复是否仍只输出一条 JSON | 继续 | 调整 persona/降 steps |
 
 ### 14.3 端到端验收（可判定）

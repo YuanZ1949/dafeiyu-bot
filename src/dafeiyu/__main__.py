@@ -12,6 +12,7 @@ from .brain.client import BrainError
 from .brain.factory import build_brain, current_provider, local_model_name
 from .brain.opencode import resolve_opencode_bin
 from .brain.opencode_server import OpenCodeServer
+from .brain.runtime_config import server_env
 from .brain.persona import load_persona
 from .config import ConfigError, Settings, load_settings
 from .control import start_control_server
@@ -116,6 +117,7 @@ async def main() -> None:
                 host=settings.opencode.host,
                 port=settings.opencode.port,
                 startup_timeout=settings.opencode.startup_timeout_seconds,
+                env=server_env(settings.opencode.config_home),
             )
             try:
                 await server.start()

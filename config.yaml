@@ -29,6 +29,10 @@ opencode:
   host: 127.0.0.1
   port: 24310
   startup_timeout_seconds: 30
+  # bot 专用 opencode 配置目录：隔离全局插件 / MCP / 外来 agent。
+  # 留空 = 沿用启动环境的配置（软回滚）；相对路径按启动目录解析。
+  # 凭据（auth.json）在 data 目录，不受影响，不需要复制。
+  config_home: data/opencode-runtime/config
 
 # NapCat 快登失败时的密码回退（可选）。凭据不要写在这里：config.yaml 进版本库。
 # 把值放 .env（已 gitignore）或进程环境，键名 NAPCAT_QUICK_PASSWORD /

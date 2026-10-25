@@ -118,6 +118,8 @@ class OpenCodeConfig:
     host: str = "127.0.0.1"
     port: int = 24310
     startup_timeout_seconds: float = 30.0
+    # bot 专用 opencode 配置目录；空 = 沿用启动环境的配置（软回滚）。
+    config_home: str = ""
 
 
 @dataclass(frozen=True)
@@ -418,6 +420,7 @@ def load_settings(
         opencode_raw.get("startup_timeout_seconds", 30.0),
         "opencode.startup_timeout_seconds",
     )
+    config_home = str(opencode_raw.get("config_home") or "").strip()
     if manage_server and server_url:
         raise ConfigError(
             "opencode.manage_server 为 true 时 server_url 必须为空"
@@ -575,6 +578,7 @@ def load_settings(
             host=host,
             port=port,
             startup_timeout_seconds=startup_timeout,
+            config_home=config_home,
         ),
         local_model=local_model,
         napcat=NapCatConfig(

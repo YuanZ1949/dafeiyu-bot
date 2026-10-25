@@ -194,6 +194,8 @@ def test_memory_agent_file_denies_all_tools() -> None:
     fm = text.split("---")[1]
     assert "mode: primary" in fm
     assert "steps: 1" in fm
+    # 专用配置目录没有全局 model 兜底，记忆 agent 必须自己钉住模型
+    assert "model: opencode/deepseek-v4.1-flash-free" in fm
     assert 'action: "*"' in fm and "effect: deny" in fm
     assert "effect: allow" not in fm
     assert "摘要" in text and "印象" in text
