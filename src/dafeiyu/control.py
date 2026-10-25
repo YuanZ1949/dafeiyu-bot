@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
+import json
 import logging
 import os
 import time
@@ -22,8 +24,16 @@ from .config import ConfigError, Settings
 from .memory.store import MAX_MEMORY_PAGE, Store
 from .models import ChatType
 from .runtime import RuntimeState, load_runtime, save_runtime
+from .service import BRAIN_ERROR_COOLDOWN_SECONDS, TOOL_HINT_INTERVAL_SECONDS
 from .timeutil import SHANGHAI
-from .workers.failure import QUOTA_KEY, MemoryPaused
+from .workers.failure import (
+    QUOTA_KEY,
+    QUOTA_PAUSE_SECONDS,
+    RATE_LIMIT_BACKOFF_SECONDS,
+    RATE_LIMIT_THRESHOLD,
+    RATE_LIMIT_WINDOW_SECONDS,
+    MemoryPaused,
+)
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +125,83 @@ def _query_int(request: web.Request, name: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise ValueError(f"{name} 必须是整数") from exc
+
+
+def _query_scope(
+    request: web.Request,
+) -> tuple[ChatType | None, int | None, web.Response | None]:
+    raw_chat_type = (request.query.get("chat_type") or "").strip()
+    chat_type: ChatType | None = None
+    if raw_chat_type:
+        try:
+            chat_type = ChatType(raw_chat_type)
+        except ValueError:
+            return None, None, web.json_response(
+                {"error": "chat_type 必须是 group 或 private"}, status=400
+            )
+
+    chat_id: int | None = None
+    raw_chat_id = (request.query.get("chat_id") or "").strip()
+    if raw_chat_id:
+        try:
+            chat_id = int(raw_chat_id)
+        except ValueError:
+            return None, None, web.json_response(
+                {"error": "chat_id 必须是整数"}, status=400
+            )
+        if chat_id <= 0:
+            return None, None, web.json_response(
+                {"error": "chat_id 必须是正整数"}, status=400
+            )
+    if chat_id is not None and chat_type is None:
+        return None, None, web.json_response(
+            {"error": "指定 chat_id 时必须同时指定 chat_type"}, status=400
+        )
+    return chat_type, chat_id, None
+
+
+def _path_target(
+    request: web.Request,
+) -> tuple[ChatType | None, int | None, web.Response | None]:
+    raw_type = request.match_info.get("chat_type", "")
+    try:
+        chat_type = ChatType(raw_type)
+    except ValueError:
+        return None, None, web.json_response(
+            {"error": "chat_type 必须是 group 或 private"}, status=400
+        )
+    raw_id = request.match_info.get("chat_id", "")
+    try:
+        chat_id = int(raw_id)
+    except ValueError:
+        return None, None, web.json_response(
+            {"error": "chat_id 必须是整数"}, status=400
+        )
+    if chat_id <= 0:
+        return None, None, web.json_response(
+            {"error": "chat_id 必须是正整数"}, status=400
+        )
+    return chat_type, chat_id, None
+
+
+def _fmt_ts(timestamp: int | None) -> str:
+    if not timestamp:
+        return ""
+    return datetime.fromtimestamp(int(timestamp), SHANGHAI).strftime("%m-%d %H:%M")
+
+
+def _message_json(message: Any) -> dict[str, Any]:
+    return {
+        "chat_type": message.chat_type.value,
+        "chat_id": message.chat_id,
+        "message_id": message.message_id,
+        "user_id": message.user_id,
+        "nickname": message.nickname,
+        "content": message.content,
+        "is_bot": message.is_bot,
+        "timestamp": message.timestamp,
+        "at": _fmt_ts(message.timestamp),
+    }
 
 
 class BrainControl:
@@ -275,6 +362,197 @@ class BrainControl:
             return [str(item["id"]) for item in items if item.get("id")]
         except (KeyError, TypeError, AttributeError) as exc:
             raise SwitchError(502, "LM Studio 返回格式异常") from exc
+
+    # ---- dashboard 扩展：用量 / 搜索 / 导出 / 会话 / 配置 ----
+    def usage_snapshot(self, days: int = 7) -> dict[str, Any]:
+        days = max(1, min(90, int(days)))
+        end = datetime.now(SHANGHAI).date()
+        start = end - timedelta(days=days - 1)
+        rows = {
+            str(row["date"]): row
+            for row in self.store.usage_series(start.isoformat(), end.isoformat())
+        }
+        series = []
+        totals = {"calls": 0, "errors": 0, "tokens": 0}
+        for offset in range(days):
+            date = (start + timedelta(days=offset)).isoformat()
+            row = rows.get(date) or {}
+            item = {
+                "date": date,
+                "calls": int(row.get("calls") or 0),
+                "errors": int(row.get("errors") or 0),
+                "tokens": int(row.get("tokens") or 0),
+            }
+            for key in totals:
+                totals[key] += item[key]
+            series.append(item)
+        return {
+            "days": days,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "series": series,
+            "totals": totals,
+            "top": self.store.usage_top(start.isoformat(), 5),
+            "recent_errors": self.store.recent_errors(10),
+        }
+
+    def search_snapshot(
+        self,
+        query: str,
+        chat_type: ChatType | None = None,
+        chat_id: int | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        total, messages = self.store.search_messages(
+            query, chat_type, chat_id, limit, offset
+        )
+        return {
+            "query": query,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": [_message_json(m) for m in messages],
+        }
+
+    def export_snapshot(
+        self, chat_type: ChatType, chat_id: int, limit: int = 1000
+    ) -> dict[str, Any]:
+        total = self.store.count_messages(chat_type, chat_id)
+        messages = self.store.recent_messages(chat_type, chat_id, limit)
+        summaries = self.store.all_summaries(chat_type, chat_id)
+        impressions = self.store.list_impressions(chat_type, chat_id, topk=10000)
+        return {
+            "chat": {"chat_type": chat_type.value, "chat_id": chat_id},
+            "exported_at": datetime.now(SHANGHAI).isoformat(timespec="seconds"),
+            "message_total": total,
+            "truncated": total > len(messages),
+            "messages": [_message_json(m) for m in messages],
+            "summaries": [
+                {
+                    "date": summary.date,
+                    "content": summary.content,
+                    "updated_at": summary.updated_at,
+                }
+                for summary in summaries
+            ],
+            "impressions": [
+                {
+                    "subject_user_id": impression.subject_user_id,
+                    "kind": impression.kind,
+                    "content": impression.content,
+                    "confidence": impression.confidence,
+                    "updated_at": impression.updated_at,
+                }
+                for impression in impressions
+            ],
+        }
+
+    @staticmethod
+    def export_markdown(bundle: dict[str, Any]) -> str:
+        chat = bundle["chat"]
+        lines = [
+            f"# 大肥鱼记忆导出 · {chat['chat_type']}/{chat['chat_id']}",
+            "",
+            f"- 导出时间：{bundle['exported_at']}",
+            f"- 消息：{len(bundle['messages'])} / {bundle['message_total']} 条"
+            + ("（已截断，仅保留最近的消息）" if bundle["truncated"] else ""),
+            f"- 按日摘要：{len(bundle['summaries'])} 条",
+            f"- 印象：{len(bundle['impressions'])} 条",
+            "",
+            "## 消息",
+            "",
+        ]
+        for message in bundle["messages"]:
+            who = "大肥鱼" if message["is_bot"] else message["nickname"]
+            content = str(message["content"]).replace("\r\n", "\n").replace("\n", " / ")
+            lines.append(f"- [{message['at']}] {who}: {content}")
+        if not bundle["messages"]:
+            lines.append("（无）")
+
+        lines.extend(["", "## 按日摘要", ""])
+        for summary in bundle["summaries"]:
+            lines.append(f"### {summary['date']}")
+            lines.append("")
+            lines.append(str(summary["content"]))
+            lines.append("")
+        if not bundle["summaries"]:
+            lines.append("（无）")
+
+        lines.extend(["", "## 印象", ""])
+        for impression in bundle["impressions"]:
+            subject = impression["subject_user_id"] or "-"
+            lines.append(
+                f"- [{impression['kind']}] {impression['content']}"
+                f"（主体 {subject}，置信度 {impression['confidence']}）"
+            )
+        if not bundle["impressions"]:
+            lines.append("（无）")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def sessions_snapshot(self) -> dict[str, Any]:
+        return {"items": self.store.chat_overview()}
+
+    async def session_action(
+        self, action: str, chat_type: ChatType, chat_id: int
+    ) -> dict[str, Any]:
+        if action == "new":
+            self.store.reset_chat(chat_type, chat_id)
+            return {"ok": True, "action": action}
+        if action == "forget":
+            self.store.forget_messages(chat_type, chat_id)
+            return {"ok": True, "action": action}
+        if action != "delete":
+            raise ValueError(f"未知会话操作：{action}")
+
+        forget_chat = getattr(self.service, "forget_chat", None)
+        if forget_chat is not None:
+            result = forget_chat(chat_type, chat_id)
+            if inspect.isawaitable(result):
+                await result
+        else:
+            brain = getattr(self.service, "brain", None)
+            forget = getattr(brain, "forget", None) if brain is not None else None
+            if forget is not None:
+                result = forget(chat_type, chat_id)
+                if inspect.isawaitable(result):
+                    await result
+            self.store.forget_chat(chat_type, chat_id)
+        return {"ok": True, "action": action}
+
+    def config_snapshot(self) -> dict[str, Any]:
+        state = self.snapshot()
+        persona = self.settings.persona
+        return {
+            "brain": {
+                "provider": state["provider"],
+                "model": state["model"],
+                "agent": self.settings.opencode.agent,
+                "transport": self.settings.opencode.transport,
+            },
+            "persona": {
+                "name": persona.name,
+                "max_reply_chars": persona.max_reply_chars,
+                "max_reply_chars_technical": persona.max_reply_chars_technical,
+                "os_probability": persona.os_probability,
+            },
+            "cooldown": {
+                "brain_error_seconds": BRAIN_ERROR_COOLDOWN_SECONDS,
+                "tool_hint_seconds": TOOL_HINT_INTERVAL_SECONDS,
+            },
+            "rate_limit": {
+                "threshold": RATE_LIMIT_THRESHOLD,
+                "window_seconds": RATE_LIMIT_WINDOW_SECONDS,
+                "backoff_seconds": RATE_LIMIT_BACKOFF_SECONDS,
+                "quota_pause_seconds": QUOTA_PAUSE_SECONDS,
+            },
+            "budget": {
+                "daily_calls": self.settings.budget.daily_calls,
+                "daily_tokens": self.settings.budget.daily_tokens,
+                "ambient_ratio": self.settings.budget.ambient_ratio,
+            },
+            "gateway": {"provider": self.settings.gateway.provider},
+        }
 
 
 @web.middleware
@@ -440,6 +718,142 @@ def create_app(
             return web.json_response({"error": "印象不存在"}, status=404)
         return web.json_response({"ok": True, "deleted": impression_id})
 
+    async def usage(request: web.Request) -> web.Response:
+        try:
+            days = _query_int(request, "days", 7)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        if not 1 <= days <= 90:
+            return web.json_response({"error": "days 必须在 1..90 之间"}, status=400)
+        try:
+            return web.json_response(control.usage_snapshot(days))
+        except Exception as exc:  # noqa: BLE001 - 读库失败不能把控制口打挂
+            log.warning("读取用量失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取用量失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def search_messages(request: web.Request) -> web.Response:
+        query = (request.query.get("q") or "").strip()
+        if not query:
+            return web.json_response({"error": "q 不能为空"}, status=400)
+        if len(query) > 200:
+            return web.json_response({"error": "q 不能超过 200 字"}, status=400)
+        try:
+            limit = _query_int(request, "limit", 20)
+            offset = _query_int(request, "offset", 0)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        if not 1 <= limit <= MAX_MEMORY_PAGE:
+            return web.json_response(
+                {"error": f"limit 必须在 1..{MAX_MEMORY_PAGE} 之间"}, status=400
+            )
+        if offset < 0:
+            return web.json_response({"error": "offset 不能为负数"}, status=400)
+        chat_type, chat_id, error = _query_scope(request)
+        if error is not None:
+            return error
+        try:
+            return web.json_response(
+                control.search_snapshot(query, chat_type, chat_id, limit, offset)
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("搜索消息失败：%s", exc)
+            return web.json_response(
+                {"error": f"搜索失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def export_memory(request: web.Request) -> web.Response:
+        chat_type, chat_id, error = _query_scope(request)
+        if error is not None:
+            return error
+        if chat_type is None or chat_id is None:
+            return web.json_response(
+                {"error": "导出需要同时指定 chat_type 和 chat_id"}, status=400
+            )
+        fmt = (request.query.get("format") or "md").strip().lower()
+        if fmt not in ("md", "json"):
+            return web.json_response({"error": "format 必须是 md 或 json"}, status=400)
+        try:
+            limit = _query_int(request, "limit", 1000)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        if not 1 <= limit <= 5000:
+            return web.json_response({"error": "limit 必须在 1..5000 之间"}, status=400)
+        try:
+            bundle = control.export_snapshot(chat_type, chat_id, limit)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("导出记忆失败：%s", exc)
+            return web.json_response(
+                {"error": f"导出失败：{exc.__class__.__name__}"}, status=500
+            )
+        stem = f"dafeiyu-{chat_type.value}-{chat_id}"
+        if fmt == "json":
+            body = json.dumps(bundle, ensure_ascii=False, indent=2)
+            headers = {"Content-Disposition": f'attachment; filename="{stem}.json"'}
+            return web.Response(
+                body=body.encode("utf-8"),
+                content_type="application/json",
+                charset="utf-8",
+                headers=headers,
+            )
+        headers = {"Content-Disposition": f'attachment; filename="{stem}.md"'}
+        return web.Response(
+            body=control.export_markdown(bundle).encode("utf-8"),
+            content_type="text/markdown",
+            charset="utf-8",
+            headers=headers,
+        )
+
+    async def sessions(_: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.sessions_snapshot())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取会话列表失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取会话失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def session_action(request: web.Request) -> web.Response:
+        chat_type, chat_id, error = _path_target(request)
+        if error is not None:
+            return error
+        action = request.match_info.get("action", "")
+        if action not in ("new", "forget"):
+            return web.json_response({"error": "未知会话操作"}, status=400)
+        try:
+            return web.json_response(
+                await control.session_action(action, chat_type, chat_id)
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("会话操作 %s 失败：%s", action, exc)
+            return web.json_response(
+                {"error": f"会话操作失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def delete_session(request: web.Request) -> web.Response:
+        chat_type, chat_id, error = _path_target(request)
+        if error is not None:
+            return error
+        try:
+            return web.json_response(
+                await control.session_action("delete", chat_type, chat_id)
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("彻底删除会话失败：%s", exc)
+            return web.json_response(
+                {"error": f"删除会话失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def config(_: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.config_snapshot())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取配置失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取配置失败：{exc.__class__.__name__}"}, status=500
+            )
+
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/brain", get_brain)
@@ -451,6 +865,13 @@ def create_app(
     app.router.add_delete(
         "/api/memory/impressions/{impression_id}", delete_impression
     )
+    app.router.add_get("/api/usage", usage)
+    app.router.add_get("/api/memory/search", search_messages)
+    app.router.add_get("/api/memory/export", export_memory)
+    app.router.add_get("/api/sessions", sessions)
+    app.router.add_post("/api/sessions/{chat_type}/{chat_id}/{action}", session_action)
+    app.router.add_delete("/api/sessions/{chat_type}/{chat_id}", delete_session)
+    app.router.add_get("/api/config", config)
     return app
 
 

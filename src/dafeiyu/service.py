@@ -517,15 +517,20 @@ class Service:
             and tokens < self.settings.budget.daily_tokens
         )
 
-    async def _forget_chat(self, msg: Message) -> None:
-        # 先让 brain 删远端 session：它要读映射，而 forget_chat 会连映射一起清掉。
-        # 顺序反了的话远端 session 永远删不掉，历史还能从 server 侧翻出来。
+    async def forget_chat(self, chat_type: ChatType, chat_id: int) -> None:
+        """硬忘记：先删远端 session（它要读映射），再清本地全部数据。
+
+        控制口的 `DELETE /api/sessions/...` 复用这里；不带群聊回复。
+        """
         forget = getattr(self.brain, "forget", None)
         if forget is not None:
-            result = forget(msg.chat_type, msg.chat_id)
+            result = forget(chat_type, chat_id)
             if inspect.isawaitable(result):
                 await result
-        self.store.forget_chat(msg.chat_type, msg.chat_id)
+        self.store.forget_chat(chat_type, chat_id)
+
+    async def _forget_chat(self, msg: Message) -> None:
+        await self.forget_chat(msg.chat_type, msg.chat_id)
         await self.adapter.send(msg.chat_type, msg.chat_id, FORGET_REPLY)
 
     async def _run_command(self, msg: Message, name: str) -> bool:

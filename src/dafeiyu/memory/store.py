@@ -349,6 +349,35 @@ class Store:
         ).fetchone()
         return int(row["n"])
 
+    def search_messages(
+        self,
+        query: str,
+        chat_type: ChatType | None = None,
+        chat_id: int | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[int, list[Message]]:
+        """跨会话内容模糊搜索，最新在前；LIKE 通配符已转义，总数不受分页影响。"""
+        scope, params = _memory_scope(chat_type, chat_id)
+        needle = _like_pattern(query)
+        clause = f"{scope} AND" if scope else "WHERE"
+        condition = f"{clause} content LIKE ? ESCAPE '\\'"
+        total_row = self._conn.execute(
+            f"SELECT COUNT(*) AS total FROM messages {condition}",
+            (*params, needle),
+        ).fetchone()
+        page, skip = _page_bounds(limit, offset)
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM messages
+            {condition}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, needle, page, skip),
+        ).fetchall()
+        return int(total_row["total"] or 0), [self._row_to_message(r) for r in rows]
+
     # ---- delivery cursors -----------------------------------------
     def _row_id(self, chat_type: ChatType, chat_id: int, message_id: str) -> int | None:
         row = self._conn.execute(
@@ -789,6 +818,27 @@ class Store:
         )
 
     # ---- summaries ------------------------------------------------
+    def all_summaries(self, chat_type: ChatType, chat_id: int) -> list[Summary]:
+        """导出用：某会话全部按日摘要，时间正序。"""
+        rows = self._conn.execute(
+            """
+            SELECT chat_type, chat_id, date, content, updated_at FROM summaries
+            WHERE chat_type = ? AND chat_id = ?
+            ORDER BY date ASC, updated_at ASC
+            """,
+            (chat_type.value, chat_id),
+        ).fetchall()
+        return [
+            Summary(
+                chat_type=ChatType(r["chat_type"]),
+                chat_id=r["chat_id"],
+                date=r["date"],
+                content=r["content"],
+                updated_at=r["updated_at"],
+            )
+            for r in rows
+        ]
+
     def upsert_summary(self, chat_type: ChatType, chat_id: int, date: str, content: str) -> None:
         self._conn.execute(
             """
@@ -984,7 +1034,189 @@ class Store:
         ).fetchone()
         return int(row["calls"]), int(row["tokens"])
 
-    # ---- forgetting -----------------------------------------------
+    def usage_series(self, start_date: str, end_date: str) -> list[dict[str, object]]:
+        """按日落库的用量聚合；缺日由调用方补齐。"""
+        rows = self._conn.execute(
+            """
+            SELECT date,
+                   SUM(CASE WHEN purpose IN ('reply', 'ambient') THEN 1 ELSE 0 END) AS calls,
+                   SUM(CASE WHEN purpose = 'error' THEN 1 ELSE 0 END) AS errors,
+                   COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens
+            FROM usage
+            WHERE date >= ? AND date <= ?
+            GROUP BY date
+            ORDER BY date ASC
+            """,
+            (start_date, end_date),
+        ).fetchall()
+        return [
+            {
+                "date": str(row["date"]),
+                "calls": int(row["calls"] or 0),
+                "errors": int(row["errors"] or 0),
+                "tokens": int(row["tokens"] or 0),
+            }
+            for row in rows
+        ]
+
+    def usage_top(self, since_date: str, limit: int = 5) -> list[dict[str, object]]:
+        """区间内回复量最高的会话，附带错误数与 token。"""
+        rows = self._conn.execute(
+            """
+            SELECT chat_type, chat_id,
+                   SUM(CASE WHEN purpose IN ('reply', 'ambient') THEN 1 ELSE 0 END) AS calls,
+                   SUM(CASE WHEN purpose = 'error' THEN 1 ELSE 0 END) AS errors,
+                   COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens
+            FROM usage
+            WHERE date >= ?
+            GROUP BY chat_type, chat_id
+            HAVING calls > 0
+            ORDER BY calls DESC, tokens DESC
+            LIMIT ?
+            """,
+            (since_date, max(1, int(limit))),
+        ).fetchall()
+        return [
+            {
+                "chat_type": str(row["chat_type"]),
+                "chat_id": int(row["chat_id"]),
+                "calls": int(row["calls"] or 0),
+                "errors": int(row["errors"] or 0),
+                "tokens": int(row["tokens"] or 0),
+            }
+            for row in rows
+        ]
+
+    def recent_errors(self, limit: int = 10) -> list[dict[str, object]]:
+        """最近的 brain 错误时间线；created_at 是 UTC，这里直接换成上海时间展示串。"""
+        rows = self._conn.execute(
+            """
+            SELECT chat_type, chat_id,
+                   strftime('%m-%d %H:%M', created_at, '+8 hours') AS at
+            FROM usage
+            WHERE purpose = 'error'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [
+            {
+                "chat_type": str(row["chat_type"]),
+                "chat_id": int(row["chat_id"]),
+                "at": str(row["at"] or ""),
+            }
+            for row in rows
+        ]
+
+    # ---- sessions / forgetting ------------------------------------
+    def chat_overview(self) -> list[dict[str, object]]:
+        """会话总览：消息/摘要/印象计数 + 当前 brain session 元信息。
+
+        以消息、摘要、印象、brain_sessions 的并集为会话集合，避免“只剩摘要”的会话消失。
+        按最近消息时间倒序，没有消息的排最后。
+        """
+        chats: dict[tuple[str, int], dict[str, object]] = {}
+
+        def bucket(raw_type: str, raw_id: int) -> dict[str, object]:
+            key = (raw_type, int(raw_id))
+            return chats.setdefault(
+                key,
+                {
+                    "chat_type": raw_type,
+                    "chat_id": int(raw_id),
+                    "message_count": 0,
+                    "last_message_at": None,
+                    "summary_count": 0,
+                    "impression_count": 0,
+                    "provider": None,
+                    "session_id": None,
+                    "session_updated_at": None,
+                    "delivered_count": 0,
+                    "token_estimate": 0,
+                },
+            )
+
+        for row in self._conn.execute(
+            """
+            SELECT chat_type, chat_id, COUNT(*) AS n, MAX(timestamp) AS last_ts
+            FROM messages GROUP BY chat_type, chat_id
+            """
+        ):
+            item = bucket(row["chat_type"], row["chat_id"])
+            item["message_count"] = int(row["n"])
+            item["last_message_at"] = (
+                None if row["last_ts"] is None else int(row["last_ts"])
+            )
+
+        for row in self._conn.execute(
+            "SELECT chat_type, chat_id, COUNT(*) AS n FROM summaries GROUP BY chat_type, chat_id"
+        ):
+            bucket(row["chat_type"], row["chat_id"])["summary_count"] = int(row["n"])
+
+        for row in self._conn.execute(
+            "SELECT chat_type, chat_id, COUNT(*) AS n FROM impressions GROUP BY chat_type, chat_id"
+        ):
+            bucket(row["chat_type"], row["chat_id"])["impression_count"] = int(row["n"])
+
+        # 同一会话可能有多个 provider 的映射；优先展示 opencode，其次最近更新的。
+        sessions: dict[tuple[str, int], sqlite3.Row] = {}
+        for row in self._conn.execute("SELECT * FROM brain_sessions"):
+            key = (row["chat_type"], int(row["chat_id"]))
+            current = sessions.get(key)
+            if current is None:
+                sessions[key] = row
+                continue
+            if current["provider"] != _SESSION_PROVIDER and row["provider"] == _SESSION_PROVIDER:
+                sessions[key] = row
+            elif (
+                current["provider"] != _SESSION_PROVIDER
+                and row["provider"] != _SESSION_PROVIDER
+                and str(row["updated_at"]) > str(current["updated_at"])
+            ):
+                sessions[key] = row
+        for (raw_type, raw_id), row in sessions.items():
+            item = bucket(raw_type, raw_id)
+            item["provider"] = row["provider"]
+            item["session_id"] = row["session_id"]
+            item["session_updated_at"] = row["updated_at"]
+            item["delivered_count"] = int(row["delivered_count"] or 0)
+            item["token_estimate"] = int(row["token_estimate"] or 0)
+
+        return sorted(
+            chats.values(),
+            key=lambda item: (
+                int(item["last_message_at"] or 0),
+                int(item["message_count"]),
+            ),
+            reverse=True,
+        )
+
+    def forget_messages(self, chat_type: ChatType, chat_id: int) -> None:
+        """软忘记：清消息与 session 映射，保留按日摘要、印象和用量。"""
+        for table in (
+            "messages",
+            "opencode_sessions",
+            "brain_sessions",
+            "delivered_cursors",
+            "delivered_messages",
+            "session_summaries",
+        ):
+            self._conn.execute(
+                f"DELETE FROM {table} WHERE chat_type = ? AND chat_id = ?",
+                (chat_type.value, chat_id),
+            )
+        self._conn.commit()
+
+    def reset_chat(self, chat_type: ChatType, chat_id: int) -> None:
+        """只换 session：消息、摘要、印象、用量全部保留。"""
+        for table in ("opencode_sessions", "brain_sessions", "session_summaries"):
+            self._conn.execute(
+                f"DELETE FROM {table} WHERE chat_type = ? AND chat_id = ?",
+                (chat_type.value, chat_id),
+            )
+        self._conn.commit()
+
     def forget_chat(self, chat_type: ChatType, chat_id: int) -> None:
         for table in (
             "messages",
