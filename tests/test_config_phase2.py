@@ -257,3 +257,20 @@ def test_max_failures_must_be_positive(tmp_path: Path) -> None:
 def test_open_browser_must_be_bool(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="open_browser"):
         load(tmp_path, "supervisor:\n  dashboard:\n    open_browser: yes please\n")
+
+def test_gateway_defaults_to_qq(tmp_path: Path) -> None:
+    assert load(tmp_path).gateway.provider == "qq"
+
+
+def test_gateway_wechat_fails_at_startup_with_three_paths(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="微信接入未实现") as exc:
+        load(tmp_path, "gateway:\n  provider: wechat\n")
+    message = str(exc.value)
+    assert "WeChatPadPro" in message
+    assert "wxauto" in message
+    assert "继续用 QQ" in message
+
+
+def test_gateway_rejects_unknown_provider(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="只能是 qq 或 wechat"):
+        load(tmp_path, "gateway:\n  provider: telegram\n")

@@ -103,6 +103,11 @@ class BrainConfig:
 
 
 @dataclass(frozen=True)
+class GatewayConfig:
+    provider: str = "qq"
+
+
+@dataclass(frozen=True)
 class OpenCodeConfig:
     bin: str = ""
     agent: str = "deepseek-qq"
@@ -194,6 +199,7 @@ class Settings:
     injection: InjectionConfig = field(default_factory=InjectionConfig)
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
+    gateway: GatewayConfig = field(default_factory=GatewayConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
     local_model: LocalModelConfig = field(default_factory=LocalModelConfig)
     napcat: NapCatConfig = field(default_factory=NapCatConfig)
@@ -370,6 +376,20 @@ def load_settings(
     if provider not in ("token", "opencode", "local_model"):
         raise ConfigError(
             "brain.provider 只能是 opencode、token 或 local_model（local 为 token 的别名）"
+        )
+
+    gateway_raw = raw.get("gateway") or {}
+    if not isinstance(gateway_raw, dict):
+        raise ConfigError("config.yaml 的 gateway 必须是映射")
+    gateway_provider = str(gateway_raw.get("provider") or "qq").strip().casefold()
+    if gateway_provider not in ("qq", "wechat"):
+        raise ConfigError("gateway.provider 只能是 qq 或 wechat")
+    if gateway_provider == "wechat":
+        raise ConfigError(
+            "gateway.provider=wechat 暂不可用：微信接入未实现。可选路径只有三条："
+            "1) WeChatPadPro（付费 iPad 协议，LangBot 内置 wechatpad_api）；"
+            "2) wechatauto-replica / wxauto（Windows 桌面 RPA，依赖微信窗口常驻）；"
+            "3) 继续用 QQ（gateway.provider=qq）。"
         )
 
     local_model_raw = raw.get("local_model") or {}
@@ -570,6 +590,7 @@ def load_settings(
             dir=str(logging_raw.get("dir", "logs")),
         ),
         brain=BrainConfig(provider=provider),
+        gateway=GatewayConfig(provider=gateway_provider),
         opencode=OpenCodeConfig(
             bin=str(opencode_raw.get("bin") or "").strip(),
             agent=opencode_agent,

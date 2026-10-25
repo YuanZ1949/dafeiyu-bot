@@ -14,6 +14,10 @@ persona:
 brain:
   provider: opencode
 
+gateway:
+  # 只支持 qq；wechat 会在启动期直接报 ConfigError（协议未实现，不假装能跑）。
+  provider: qq
+
 opencode:
   # 留空自动找 npm 全局安装的 opencode.exe
   bin: ""
