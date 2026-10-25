@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -383,6 +384,110 @@ class Store:
         )
         self._conn.commit()
 
+    def pending_batch(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        anchor_id: str,
+        limit: int = 20,
+    ) -> list[Message]:
+        """批次投递要看的消息：游标之后、未投递、id 升序，最多 limit 条。
+
+        首次投递（还没有投递下限）时只返回 anchor 这一条，不回填历史 —
+        与 pending_messages 的语义保持一致，但这里是 id 正序且不带「被省略条数」。
+        """
+        anchor = self._row_id(chat_type, chat_id, anchor_id)
+        if anchor is None:
+            return []
+
+        floor = self.last_delivered_id(chat_type, chat_id)
+        if floor is None:
+            row = self._conn.execute(
+                "SELECT * FROM messages WHERE id = ?", (anchor,)
+            ).fetchone()
+            return [] if row is None else [self._row_to_message(row)]
+
+        rows = self._conn.execute(
+            """
+            SELECT m.* FROM messages m
+            WHERE m.chat_type = ? AND m.chat_id = ? AND m.is_bot = 0
+              AND m.id > ? AND m.id <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM delivered_messages d
+                  WHERE d.chat_type = m.chat_type AND d.chat_id = m.chat_id
+                    AND d.message_id = m.message_id
+              )
+            ORDER BY m.id ASC LIMIT ?
+            """,
+            (chat_type.value, chat_id, floor, anchor, limit),
+        ).fetchall()
+        return [self._row_to_message(r) for r in rows]
+
+    def chats_with_pending(self, since_ts: int) -> list[tuple[ChatType, int]]:
+        """哪些会话还有「游标之后、窗口内、未投递」的人类消息（无游标的会话不算）。"""
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT m.chat_type, m.chat_id
+            FROM messages m
+            JOIN delivered_cursors c
+              ON c.chat_type = m.chat_type AND c.chat_id = m.chat_id
+            WHERE m.is_bot = 0 AND m.id > c.last_message_id AND m.timestamp >= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM delivered_messages d
+                  WHERE d.chat_type = m.chat_type AND d.chat_id = m.chat_id
+                    AND d.message_id = m.message_id
+              )
+            ORDER BY m.chat_type, m.chat_id
+            """,
+            (since_ts,),
+        ).fetchall()
+        return [(ChatType(r["chat_type"]), int(r["chat_id"])) for r in rows]
+
+    def mark_skipped(
+        self, chat_type: ChatType, chat_id: int, message_ids: Sequence[str], reason: str
+    ) -> None:
+        """把一批消息标成「已处理但不投递」，并记下原因（quiet/budget/error…）。
+
+        仍然推进投递游标：跳过是终局，不是待办，否则次日会把积压再灌一遍。
+        """
+        rows = [self._row_id(chat_type, chat_id, mid) for mid in message_ids]
+        present = [(mid, row) for mid, row in zip(message_ids, rows) if row is not None]
+        if not present:
+            return
+        self._conn.executemany(
+            """
+            INSERT OR IGNORE INTO delivered_messages (chat_type, chat_id, message_id)
+            VALUES (?, ?, ?)
+            """,
+            [(chat_type.value, chat_id, mid) for mid, _ in present],
+        )
+        self._conn.executemany(
+            """
+            UPDATE delivered_messages SET skipped_reason = ?
+            WHERE chat_type = ? AND chat_id = ? AND message_id = ?
+            """,
+            [(reason, chat_type.value, chat_id, mid) for mid, _ in present],
+        )
+        self._conn.execute(
+            """
+            INSERT INTO delivered_cursors (chat_type, chat_id, last_message_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT (chat_type, chat_id) DO NOTHING
+            """,
+            (chat_type.value, chat_id, max(row for _, row in present)),
+        )
+        self._conn.commit()
+
+    def skip_reason(self, chat_type: ChatType, chat_id: int, message_id: str) -> str | None:
+        row = self._conn.execute(
+            """
+            SELECT skipped_reason FROM delivered_messages
+            WHERE chat_type = ? AND chat_id = ? AND message_id = ?
+            """,
+            (chat_type.value, chat_id, message_id),
+        ).fetchone()
+        return None if row is None else row["skipped_reason"]
+
     @staticmethod
     def _row_to_message(r: sqlite3.Row) -> Message:
         return Message(
@@ -661,6 +766,29 @@ class Store:
         ).fetchone()
         return int(row["calls"]), int(row["tokens"])
 
+    def usage_today_by_purpose(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        today: str,
+        purposes: Sequence[str],
+    ) -> tuple[int, int]:
+        """按用途过滤的当日用量（批评测/摘要不该占用对话预算）。"""
+        names = list(purposes)
+        if not names:
+            return (0, 0)
+        placeholders = ", ".join("?" for _ in names)
+        row = self._conn.execute(
+            f"""
+            SELECT COUNT(*) AS calls,
+                   COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens
+            FROM usage
+            WHERE chat_type = ? AND chat_id = ? AND date = ? AND purpose IN ({placeholders})
+            """,
+            (chat_type.value, chat_id, today, *names),
+        ).fetchone()
+        return int(row["calls"]), int(row["tokens"])
+
     # ---- forgetting -----------------------------------------------
     def forget_chat(self, chat_type: ChatType, chat_id: int) -> None:
         for table in (
@@ -672,6 +800,7 @@ class Store:
             "brain_sessions",
             "delivered_cursors",
             "delivered_messages",
+            "session_summaries",
         ):
             self._conn.execute(
                 f"DELETE FROM {table} WHERE chat_type = ? AND chat_id = ?",
@@ -689,6 +818,7 @@ class Store:
             "brain_sessions",
             "delivered_cursors",
             "delivered_messages",
+            "session_summaries",
         ):
             self._conn.execute(f"DELETE FROM {table}")
         self._conn.commit()
