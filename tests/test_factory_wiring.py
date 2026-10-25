@@ -5,11 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from dafeiyu.__main__ import build_workers
 from dafeiyu.brain import factory
 from dafeiyu.brain.client import BrainClient
 from dafeiyu.config import load_settings
 from dafeiyu.memory.store import Store
+from dafeiyu.models import ChatType, Message
 
 BASE = """\
 persona:
@@ -109,6 +112,47 @@ def test_build_brain_passes_memory_agent(tmp_path: Path) -> None:
             settings, store, "opencode", memory_agent="dafeiyu-memory-v2"
         )
         assert custom.memory_agent == "dafeiyu-memory-v2"
+    finally:
+        store.close()
+
+
+class RecordingBrain:
+    """记录调用次数，用来验证 worker 是否跟随 dashboard 换脑。"""
+
+    def __init__(self, payload: str = "[]") -> None:
+        self.payload = payload
+        self.calls = 0
+
+    async def complete_detailed(self, system, messages, max_tokens=400, temperature=0.2):
+        self.calls += 1
+        return (self.payload, 12, 6)
+
+
+@pytest.mark.asyncio
+async def test_memory_workers_follow_brain_switch(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    store = make_store()
+    try:
+        store.add_message(
+            Message(ChatType.GROUP, 20001, 1, "鱼片", "周末去钓鱼吗", "m1")
+        )
+        old = RecordingBrain()
+        new = RecordingBrain(
+            '[{"user_id": 1, "kind": "preference", "content": "喜欢钓鱼", "confidence": 0.9}]'
+        )
+        current = {"brain": old}
+        workers = build_workers(
+            settings, store, old, "token", brain_getter=lambda: current["brain"]
+        )
+        assert workers.impressions is not None
+        assert workers.scheduler is not None
+
+        current["brain"] = new
+        added = await workers.impressions.extract(ChatType.GROUP, 20001)
+
+        assert added == 1
+        assert (old.calls, new.calls) == (0, 1)
+        assert workers.scheduler._current_brain() is new
     finally:
         store.close()
 

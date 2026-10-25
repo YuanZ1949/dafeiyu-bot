@@ -147,7 +147,7 @@ class FlakyBrain:
     async def complete(self, system, messages, max_tokens=400, temperature=0.2) -> str:
         self.calls += 1
         if self.calls == 1:
-            raise BrainError("provider.quota: Free usage limit reached")
+            raise BrainError("provider.timeout: upstream timeout")
         return "恢复后的摘要"
 
 

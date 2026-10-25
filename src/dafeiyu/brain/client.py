@@ -4,9 +4,11 @@ import asyncio
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
+
+from .tokens import resolve_usage
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +43,7 @@ class BrainReply:
     reason: str = ""
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    estimated: bool = False
 
 
 def _strip_fence(text: str) -> str:
@@ -240,9 +243,16 @@ class BrainClient:
             "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
         }
         content, prompt_tokens, completion_tokens, finish_reason = await self._call(payload)
-        return self._parse_content(
+        prompt_text = system + "\n" + "\n".join(
+            str(message.get("content") or "") for message in messages
+        )
+        prompt_tokens, completion_tokens, estimated = resolve_usage(
+            prompt_text, content, prompt_tokens, completion_tokens
+        )
+        reply = self._parse_content(
             content, prompt_tokens, completion_tokens, finish_reason
         )
+        return replace(reply, estimated=True) if estimated else reply
 
     async def complete(
         self,

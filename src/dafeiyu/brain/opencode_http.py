@@ -14,7 +14,7 @@ import base64
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import httpx
@@ -22,6 +22,7 @@ import httpx
 from ..memory.store import Store
 from ..models import ChatType
 from .client import BrainError, BrainReply, parse_brain_reply
+from .tokens import resolve_usage
 
 log = logging.getLogger(__name__)
 
@@ -248,11 +249,18 @@ class OpenCodeHttpBrain:
                     foreign,
                 )
                 self.store.clear_opencode_session(chat_type, chat_id)
-            return parse_brain_reply(
+            prompt_tokens, completion_tokens, estimated = resolve_usage(
+                prompt,
                 result.text,
-                prompt_tokens=result.prompt_tokens,
-                completion_tokens=result.completion_tokens,
+                result.prompt_tokens,
+                result.completion_tokens,
             )
+            reply = parse_brain_reply(
+                result.text,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+            return replace(reply, estimated=True) if estimated else reply
 
         raise BrainError("OpenCode 调用失败：session 重建失败")
 

@@ -6,11 +6,17 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from dafeiyu.brain.tokens import resolve_usage
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.timeutil import SHANGHAI, now_shanghai
 
-from .failure import FAILURE_BACKOFF_SECONDS, FailureBackoff, log_memory_failure
+from .failure import (
+    FAILURE_BACKOFF_SECONDS,
+    FailureBackoff,
+    MemoryPaused,
+    log_memory_failure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +47,7 @@ async def summarize_chat(
     chat_type: ChatType,
     chat_id: int,
     date: str,
+    on_error: Callable[[BaseException], None] | None = None,
 ) -> str | None:
     """返回摘要正文；当天没有消息返回 ""，模型调用失败返回 None。"""
     start_ts, end_ts = _day_bounds(date)
@@ -63,9 +70,16 @@ async def summarize_chat(
             prompt_tokens = completion_tokens = 0
     except Exception as exc:  # noqa: BLE001 - 摘要失败不影响主链路
         log_memory_failure(logger, f"生成摘要 {date}", exc, chat_type, chat_id)
+        if on_error is not None:
+            on_error(exc)
         return None
 
-    store.record_usage(chat_type, chat_id, "summary", prompt_tokens, completion_tokens)
+    prompt_tokens, completion_tokens, estimated = resolve_usage(
+        f"{SUMMARY_SYSTEM}\n{prompt}", raw or "", prompt_tokens, completion_tokens
+    )
+    store.record_usage(
+        chat_type, chat_id, "summary", prompt_tokens, completion_tokens, estimated
+    )
     text = (raw or "").strip()[:MAX_SUMMARY_CHARS]
     if not text:
         return ""
@@ -100,7 +114,12 @@ async def summarize_for_rotation(
         log_memory_failure(logger, "生成轮换摘要", exc, chat_type, chat_id)
         return ""
 
-    store.record_usage(chat_type, chat_id, "summary", prompt_tokens, completion_tokens)
+    prompt_tokens, completion_tokens, estimated = resolve_usage(
+        f"{ROTATION_SYSTEM}\n{prompt}", raw or "", prompt_tokens, completion_tokens
+    )
+    store.record_usage(
+        chat_type, chat_id, "summary", prompt_tokens, completion_tokens, estimated
+    )
     text = (raw or "").strip()[:MAX_SUMMARY_CHARS]
     if not text:
         return ""
@@ -118,6 +137,7 @@ class SummaryScheduler:
         brain_getter: Callable[[], Any] | None = None,
         backoff_seconds: float = FAILURE_BACKOFF_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
+        backoff: FailureBackoff | None = None,
     ) -> None:
         self._store = store
         self._brain = brain
@@ -127,20 +147,49 @@ class SummaryScheduler:
         # 有 getter 就每轮现取，避免摘要一直用旧 provider 的 client。
         self._brain_getter = brain_getter
         # 失败后按 (会话, 日期) 退避，避免配额耗尽时每轮都重试同一份摘要。
-        self._backoff = FailureBackoff(backoff_seconds, monotonic)
+        # 与印象抽取共享同一个实例时，配额熔断才能一次管住两条旁路。
+        self._backoff = backoff or FailureBackoff(backoff_seconds, monotonic)
 
     def _current_brain(self):
         return self._brain_getter() if self._brain_getter is not None else self._brain
 
+    @property
+    def paused(self) -> bool:
+        return self._backoff.is_paused()
+
+    async def summarize_now(
+        self, chat_type: ChatType, chat_id: int, date: str
+    ) -> str | None:
+        """面板手动触发：跳过「已存在」与按会话退避，但仍尊重全局配额熔断。"""
+        if self._backoff.is_paused():
+            raise MemoryPaused("配额暂停中，稍后再试")
+        key = (chat_type, chat_id, date)
+        text = await summarize_chat(
+            self._store,
+            self._current_brain(),
+            chat_type,
+            chat_id,
+            date,
+            on_error=lambda exc: self._backoff.mark_failed(key, exc),
+        )
+        if text is None:
+            return None
+        self._backoff.mark_ok(key)
+        return text
+
     async def run_pending(self) -> int:
         now = self._clock()
         if now.hour < self._hour:
+            return 0
+        if self._backoff.is_paused():
             return 0
 
         target = (now.date() - timedelta(days=1)).isoformat()
         start_ts, end_ts = _day_bounds(target)
         created = 0
         for chat_type, chat_id in self._store.active_chats_between(start_ts, end_ts):
+            if self._backoff.is_paused():
+                break
             key = (chat_type, chat_id, target)
             if self._store.get_summary(chat_type, chat_id, target):
                 self._backoff.mark_ok(key)
@@ -148,10 +197,14 @@ class SummaryScheduler:
             if self._backoff.should_skip(key):
                 continue
             text = await summarize_chat(
-                self._store, self._current_brain(), chat_type, chat_id, target
+                self._store,
+                self._current_brain(),
+                chat_type,
+                chat_id,
+                target,
+                on_error=lambda exc: self._backoff.mark_failed(key, exc),
             )
             if text is None:
-                self._backoff.mark_failed(key)
                 continue
             self._backoff.mark_ok(key)
             if text:

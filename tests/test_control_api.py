@@ -8,45 +8,19 @@ from types import SimpleNamespace
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
+from conftest import TEST_CONFIG_YAML
 
 from dafeiyu import control as control_module
 from dafeiyu.brain.client import BrainClient
 from dafeiyu.brain.factory import mode_status
 from dafeiyu.config import load_settings
-from dafeiyu.control import BrainControl, create_app
+from dafeiyu.control import BrainControl, MemoryActions, create_app
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType
 from dafeiyu.runtime import RuntimeState
+from dafeiyu.workers.failure import MemoryPaused
 
-YAML = """\
-persona:
-  name: 溟月
-  aliases: [大肥鱼]
-triggers:
-  cooldown_seconds: 60
-  sample_rate: 0.05
-  quiet_hours: ["01:00", "07:00"]
-  keywords: [怎么]
-groups:
-  whitelist: []
-  blacklist: []
-budget:
-  daily_calls: 200
-  daily_tokens: 300000
-memory:
-  window_size: 20
-  impression_topk: 5
-  extract_every: 20
-logging:
-  level: INFO
-  dir: logs
-brain:
-  provider: token
-local_model:
-  base_url: http://127.0.0.1:1/v1
-  model: ""
-  api_key: local
-"""
+YAML = TEST_CONFIG_YAML
 
 
 class FakeBrain:
@@ -90,7 +64,12 @@ def make_settings(tmp_path: Path):
     return load_settings(env_file=env, config_file=config)
 
 
-def make_control(tmp_path: Path, token: str = "", runtime: str | None = None):
+def make_control(
+    tmp_path: Path,
+    token: str = "",
+    runtime: str | None = None,
+    memory_actions: MemoryActions | None = None,
+):
     settings = make_settings(tmp_path)
     store = Store(tmp_path / "test.db")
     store.init_schema()
@@ -102,7 +81,7 @@ def make_control(tmp_path: Path, token: str = "", runtime: str | None = None):
         FakeAdapter(),
         runtime_path=runtime or str(tmp_path / "runtime.json"),
     )
-    return control, service, create_app(control, token)
+    return control, service, create_app(control, token, memory_actions)
 
 
 async def test_snapshot_lists_three_modes(tmp_path: Path) -> None:
@@ -241,7 +220,14 @@ async def test_memory_endpoint_empty(tmp_path: Path) -> None:
         resp = await client.get("/api/memory")
         payload = await resp.json()
     assert resp.status == 200
-    assert payload == {"summaries": [], "impressions": []}
+    assert payload == {
+        "summaries": [],
+        "impressions": [],
+        "summary_total": 0,
+        "impression_total": 0,
+        "summary_has_more": False,
+        "impression_has_more": False,
+    }
 
 
 async def test_memory_endpoint_returns_store_rows(tmp_path: Path) -> None:
@@ -266,6 +252,34 @@ async def test_memory_endpoint_returns_store_rows(tmp_path: Path) -> None:
     assert impression["kind"] == "preference"
     assert impression["content"] == "喜欢猫"
     assert impression["confidence"] == 0.9
+
+
+async def test_memory_endpoint_reports_totals_and_has_more(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    for day in ("2026-10-22", "2026-10-23", "2026-10-24"):
+        control.store.upsert_summary(ChatType.GROUP, 100, day, day)
+    control.store.upsert_impression(ChatType.GROUP, 100, 42, "fact", "群聊", 0.9)
+    control.store.upsert_impression(ChatType.PRIVATE, 200, 43, "fact", "私聊", 0.9)
+
+    async with running(app) as client:
+        first = await (await client.get("/api/memory?limit=2")).json()
+        second = await (await client.get("/api/memory?limit=2&offset=2")).json()
+        filtered = await (
+            await client.get("/api/memory?limit=10&chat_type=private")
+        ).json()
+
+    assert first["summary_total"] == 3
+    assert len(first["summaries"]) == 2
+    assert first["summary_has_more"] is True
+    assert second["summary_has_more"] is False
+    assert len(second["summaries"]) == 1
+
+    assert first["impression_total"] == 2
+    assert first["impression_has_more"] is False
+
+    assert filtered["impression_total"] == 1
+    assert filtered["summary_total"] == 0
+    assert filtered["summary_has_more"] is False
 
 
 async def test_memory_endpoint_reports_read_failure(tmp_path: Path) -> None:
@@ -336,3 +350,187 @@ async def test_memory_endpoint_rejects_invalid_query(tmp_path: Path, query: str)
         resp = await client.get(f"/api/memory?{query}")
     assert resp.status == 400
 
+
+async def test_memory_actions_disabled_returns_503(tmp_path: Path) -> None:
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        summary = await client.post(
+            "/api/memory/summaries", json={"chat_type": "group", "chat_id": 100}
+        )
+        impression = await client.post(
+            "/api/memory/impressions", json={"chat_type": "group", "chat_id": 100}
+        )
+        deleted = await client.delete("/api/memory/impressions/1")
+    assert summary.status == 503
+    assert impression.status == 503
+    assert deleted.status == 503
+
+
+def make_actions(control, *, summarize=None, extract=None) -> MemoryActions:
+    async def default_summarize(chat_type, chat_id, date):
+        return "默认摘要"
+
+    async def default_extract(chat_type, chat_id):
+        return 0
+
+    return MemoryActions(
+        summarize=summarize or default_summarize,
+        extract=extract or default_extract,
+        delete_impression=control.store.delete_impression,
+    )
+
+
+async def test_post_summary_runs_action_with_target(tmp_path: Path) -> None:
+    control, _, _ = make_control(tmp_path)
+    seen = {}
+
+    async def summarize(chat_type, chat_id, date):
+        seen.update(chat_type=chat_type, chat_id=chat_id, date=date)
+        return "昨天聊了钓鱼"
+
+    app = create_app(control, "", make_actions(control, summarize=summarize))
+    async with running(app) as client:
+        resp = await client.post(
+            "/api/memory/summaries",
+            json={"chat_type": "private", "chat_id": 200, "date": "2026-10-24"},
+        )
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload == {"ok": True, "date": "2026-10-24", "summary": "昨天聊了钓鱼"}
+    assert seen == {
+        "chat_type": ChatType.PRIVATE,
+        "chat_id": 200,
+        "date": "2026-10-24",
+    }
+
+
+async def test_post_summary_defaults_to_yesterday(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta
+
+    from dafeiyu.timeutil import SHANGHAI
+
+    control, _, _ = make_control(tmp_path)
+    seen = {}
+
+    async def summarize(chat_type, chat_id, date):
+        seen["date"] = date
+        return "ok"
+
+    app = create_app(control, "", make_actions(control, summarize=summarize))
+    async with running(app) as client:
+        resp = await client.post(
+            "/api/memory/summaries", json={"chat_type": "group", "chat_id": 100}
+        )
+    expected = (datetime.now(SHANGHAI).date() - timedelta(days=1)).isoformat()
+    assert resp.status == 200
+    assert seen["date"] == expected
+
+
+async def test_post_summary_reports_generation_failure(tmp_path: Path) -> None:
+    control, _, _ = make_control(tmp_path)
+
+    async def summarize(chat_type, chat_id, date):
+        return None
+
+    app = create_app(control, "", make_actions(control, summarize=summarize))
+    async with running(app) as client:
+        resp = await client.post(
+            "/api/memory/summaries", json={"chat_type": "group", "chat_id": 100}
+        )
+        payload = await resp.json()
+    assert resp.status == 502
+    assert "生成摘要失败" in payload["error"]
+
+
+async def test_post_summary_reports_quota_pause(tmp_path: Path) -> None:
+    control, _, _ = make_control(tmp_path)
+
+    async def summarize(chat_type, chat_id, date):
+        raise MemoryPaused("配额暂停中，稍后再试")
+
+    app = create_app(control, "", make_actions(control, summarize=summarize))
+    async with running(app) as client:
+        resp = await client.post(
+            "/api/memory/summaries", json={"chat_type": "group", "chat_id": 100}
+        )
+    assert resp.status == 409
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"chat_type": "channel", "chat_id": 100},
+        {"chat_type": "group"},
+        {"chat_type": "group", "chat_id": 0},
+        {"chat_type": "group", "chat_id": "abc"},
+        {"chat_type": "group", "chat_id": 100, "date": "2026/10/24"},
+    ],
+)
+async def test_post_summary_rejects_invalid_body(tmp_path: Path, body: dict) -> None:
+    control, _, _ = make_control(tmp_path)
+    app = create_app(control, "", make_actions(control))
+    async with running(app) as client:
+        resp = await client.post("/api/memory/summaries", json=body)
+    assert resp.status == 400
+
+
+async def test_post_impressions_returns_added_count(tmp_path: Path) -> None:
+    control, _, _ = make_control(tmp_path)
+    seen = {}
+
+    async def extract(chat_type, chat_id):
+        seen.update(chat_type=chat_type, chat_id=chat_id)
+        return 3
+
+    app = create_app(control, "", make_actions(control, extract=extract))
+    async with running(app) as client:
+        resp = await client.post(
+            "/api/memory/impressions", json={"chat_type": "group", "chat_id": 100}
+        )
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload == {"ok": True, "added": 3}
+    assert seen == {"chat_type": ChatType.GROUP, "chat_id": 100}
+
+
+async def test_post_impressions_reports_failure(tmp_path: Path) -> None:
+    control, _, _ = make_control(tmp_path)
+
+    async def extract(chat_type, chat_id):
+        return None
+
+    app = create_app(control, "", make_actions(control, extract=extract))
+    async with running(app) as client:
+        resp = await client.post(
+            "/api/memory/impressions", json={"chat_type": "group", "chat_id": 100}
+        )
+    assert resp.status == 502
+
+
+async def test_delete_impression_removes_row(tmp_path: Path) -> None:
+    control, _, _ = make_control(tmp_path)
+    control.store.upsert_impression(ChatType.GROUP, 100, 42, "fact", "喜欢猫", 0.9)
+
+    async with running(create_app(control, "", make_actions(control))) as client:
+        listing = await (await client.get("/api/memory")).json()
+        impression_id = listing["impressions"][0]["id"]
+        resp = await client.delete(f"/api/memory/impressions/{impression_id}")
+        payload = await resp.json()
+        again = await client.delete(f"/api/memory/impressions/{impression_id}")
+
+    assert resp.status == 200
+    assert payload == {"ok": True, "deleted": impression_id}
+    assert again.status == 404
+    assert control.store.count_impressions() == 0
+
+
+@pytest.mark.parametrize("impression_id", ["abc", "0", "-3"])
+async def test_delete_impression_rejects_bad_id(
+    tmp_path: Path, impression_id: str
+) -> None:
+    control, _, _ = make_control(tmp_path)
+    async with running(create_app(control, "", make_actions(control))) as client:
+        resp = await client.delete(f"/api/memory/impressions/{impression_id}")
+    assert resp.status == 400

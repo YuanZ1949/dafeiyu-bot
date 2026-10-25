@@ -15,13 +15,15 @@ from .brain.opencode_server import OpenCodeServer
 from .brain.runtime_config import server_env
 from .brain.persona import load_persona
 from .config import ConfigError, Settings, load_settings
-from .control import start_control_server
+from .control import MemoryActions, start_control_server
 from .gateway.qq import QQAdapter
 from .memory.store import Store
 from .memory.workspace import Workspace
+from .models import ChatType
 from .router import Router
 from .runtime import load_runtime
 from .service import Service
+from .workers.failure import FailureBackoff, MemoryPaused
 from .workers.impressions import ImpressionWorker
 from .workers.summary import SummaryScheduler, summary_loop
 
@@ -52,9 +54,43 @@ def build_workers(
     if not hasattr(brain, "complete_detailed"):
         log.debug("brain=%s 不支持 complete_detailed，跳过摘要/印象旁路", provider)
         return Workers()
+    # 两条旁路共用一份退避：配额熔断必须一次管住摘要与印象，且写入库跨重启存活。
+    backoff = FailureBackoff(persistence=store)
     return Workers(
-        impressions=ImpressionWorker(store, brain, every=settings.memory.extract_every),
-        scheduler=SummaryScheduler(store, brain, brain_getter=brain_getter),
+        impressions=ImpressionWorker(
+            store,
+            brain,
+            every=settings.memory.extract_every,
+            brain_getter=brain_getter,
+            backoff=backoff,
+        ),
+        scheduler=SummaryScheduler(
+            store, brain, brain_getter=brain_getter, backoff=backoff
+        ),
+    )
+
+
+def build_memory_actions(store: Store, workers: Workers) -> MemoryActions | None:
+    """把 worker 包装成控制口能调用的三个动作；旁路全关时返回 None（路由 503）。"""
+    if workers.impressions is None and workers.scheduler is None:
+        return None
+
+    async def summarize(chat_type: ChatType, chat_id: int, date: str):
+        if workers.scheduler is None:
+            raise RuntimeError("摘要旁路未启用（当前 brain 无 complete_detailed）")
+        return await workers.scheduler.summarize_now(chat_type, chat_id, date)
+
+    async def extract(chat_type: ChatType, chat_id: int):
+        if workers.impressions is None:
+            raise RuntimeError("印象旁路未启用（当前 brain 无 complete_detailed）")
+        if workers.impressions.paused:
+            raise MemoryPaused("配额暂停中，稍后再试")
+        return await workers.impressions.extract(chat_type, chat_id)
+
+    return MemoryActions(
+        summarize=summarize,
+        extract=extract,
+        delete_impression=store.delete_impression,
     )
 
 
@@ -173,7 +209,11 @@ async def main() -> None:
         await service.start()
         service_started = True
         control_runner = await start_control_server(
-            settings, store, service, adapter
+            settings,
+            store,
+            service,
+            adapter,
+            memory_actions=build_memory_actions(store, workers),
         )
         log.info(
             "%s已上线（brain=%s），等待 NapCat 反向 WS 连接 ws://%s:%s（QQ %s）",

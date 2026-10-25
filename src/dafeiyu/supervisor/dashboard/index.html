@@ -157,6 +157,9 @@
         <option value="group">只看群聊</option>
         <option value="private">只看私聊</option>
       </select>
+      <input id="memory-chat-id" type="number" min="1" placeholder="会话 ID" style="width:110px" title="手动触发用的会话 ID" />
+      <button class="btn" id="btn-summarize">生成摘要</button>
+      <button class="btn" id="btn-extract">抽取印象</button>
       <button class="btn" id="btn-more-memory">显示更多</button>
       <button class="btn" id="btn-refresh-memory">刷新</button>
     </div>
@@ -418,13 +421,32 @@ function renderMemory(data) {
   impressions.forEach((i) => {
     const subject = i.subject_user_id ? ` · 用户 ${i.subject_user_id}` : "";
     const confidence = Math.round((i.confidence || 0) * 100);
-    impressionBox.appendChild(
-      memItem(`${chatLabel(i)} · ${i.kind}${subject} · ${confidence}%`, i.content)
+    const item = memItem(
+      `${chatLabel(i)} · ${i.kind}${subject} · ${confidence}%`,
+      i.content
     );
+    if (i.id) {
+      const remove = document.createElement("button");
+      remove.className = "btn";
+      remove.textContent = "删除";
+      remove.addEventListener("click", () => deleteImpression(i.id));
+      item.appendChild(remove);
+    }
+    impressionBox.appendChild(item);
   });
   if (!summaries.length) summaryBox.innerHTML = '<div class="mem-empty">库里还没有摘要</div>';
   if (!impressions.length) impressionBox.innerHTML = '<div class="mem-empty">库里还没有印象</div>';
-  $("memory-hint").textContent = `摘要 ${summaries.length} 条 · 印象 ${impressions.length} 条`;
+  const summaryTotal = Number(data && data.summary_total);
+  const impressionTotal = Number(data && data.impression_total);
+  const totalShown = Number.isFinite(summaryTotal) && Number.isFinite(impressionTotal);
+  $("memory-hint").textContent = totalShown
+    ? `摘要 ${summaries.length}/${summaryTotal} · 印象 ${impressions.length}/${impressionTotal}`
+    : `摘要 ${summaries.length} 条 · 印象 ${impressions.length} 条`;
+  const more =
+    data && (data.summary_has_more || data.impression_has_more) !== undefined
+      ? Boolean(data.summary_has_more || data.impression_has_more)
+      : summaries.length >= memoryLimit || impressions.length >= memoryLimit;
+  $("btn-more-memory").disabled = !more || memoryLimit >= MEMORY_PAGE_MAX;
 }
 
 const MEMORY_PAGE = 30;
@@ -441,11 +463,54 @@ function memoryUrl() {
 async function loadMemory() {
   try {
     renderMemory(await api(memoryUrl()));
-    $("btn-more-memory").disabled = memoryLimit >= MEMORY_PAGE_MAX;
   } catch (err) {
     $("memory-summaries").replaceChildren();
     $("memory-impressions").replaceChildren();
     $("memory-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+function memoryTarget() {
+  const chatId = Number($("memory-chat-id").value);
+  if (!Number.isInteger(chatId) || chatId <= 0) throw new Error("请先填会话 ID");
+  const chatType = $("memory-chat-filter").value || "group";
+  return { chat_type: chatType, chat_id: chatId };
+}
+
+async function triggerSummary() {
+  try {
+    const data = await api("/api/memory/summaries", {
+      method: "POST",
+      body: JSON.stringify(memoryTarget()),
+    });
+    toast(data.summary ? `已生成 ${data.date} 摘要` : `${data.date} 没有可总结的消息`);
+    loadMemory();
+  } catch (err) {
+    toast(`生成摘要失败：${err.message}`, true);
+  }
+}
+
+async function triggerExtract() {
+  try {
+    const data = await api("/api/memory/impressions", {
+      method: "POST",
+      body: JSON.stringify(memoryTarget()),
+    });
+    toast(`已抽取 ${data.added} 条印象`);
+    loadMemory();
+  } catch (err) {
+    toast(`抽取印象失败：${err.message}`, true);
+  }
+}
+
+async function deleteImpression(id) {
+  if (!confirm(`删除印象 #${id}？`)) return;
+  try {
+    await api(`/api/memory/impressions/${id}`, { method: "DELETE" });
+    toast("已删除");
+    loadMemory();
+  } catch (err) {
+    toast(`删除失败：${err.message}`, true);
   }
 }
 
@@ -543,6 +608,8 @@ document.addEventListener("click", (ev) => {
 $("btn-refresh-models").addEventListener("click", loadModels);
 $("btn-apply-brain").addEventListener("click", applyBrain);
 $("btn-refresh-memory").addEventListener("click", loadMemory);
+$("btn-summarize").addEventListener("click", triggerSummary);
+$("btn-extract").addEventListener("click", triggerExtract);
 $("btn-more-memory").addEventListener("click", () => {
   if (memoryLimit >= MEMORY_PAGE_MAX) return;
   memoryLimit = Math.min(MEMORY_PAGE_MAX, memoryLimit + MEMORY_PAGE);

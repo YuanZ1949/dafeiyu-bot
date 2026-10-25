@@ -4,7 +4,8 @@ import asyncio
 import contextlib
 import logging
 import os
-from typing import Any
+from datetime import datetime, timedelta
+from typing import Any, Callable
 
 import aiohttp
 from aiohttp import web
@@ -20,11 +21,82 @@ from .config import ConfigError, Settings
 from .memory.store import MAX_MEMORY_PAGE, Store
 from .models import ChatType
 from .runtime import RuntimeState, load_runtime, save_runtime
+from .timeutil import SHANGHAI
+from .workers.failure import MemoryPaused
 
 log = logging.getLogger(__name__)
 
 CLOSE_DELAY_SECONDS = 30.0
 MODEL_PROBE_TIMEOUT = 3.0
+
+
+class MemoryActions:
+    """控制口的手动记忆操作；实现由启动方注入，未注入时三条路由返回 503。"""
+
+    def __init__(
+        self,
+        summarize: Callable[..., Any],
+        extract: Callable[..., Any],
+        delete_impression: Callable[[int], bool],
+    ) -> None:
+        self.summarize = summarize
+        self.extract = extract
+        self.delete_impression = delete_impression
+
+
+def _json_ok(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return "请求体必须是对象"
+    return None
+
+
+async def _read_json_object(
+    request: web.Request,
+) -> tuple[dict[str, Any] | None, web.Response | None]:
+    try:
+        payload = await request.json()
+    except ValueError:
+        return None, web.json_response({"error": "请求体必须是 JSON"}, status=400)
+    error = _json_ok(payload)
+    if error is not None:
+        return None, web.json_response({"error": error}, status=400)
+    return payload, None
+
+
+def _chat_target(
+    payload: dict[str, Any],
+) -> tuple[ChatType | None, int | None, web.Response | None]:
+    raw_type = str(payload.get("chat_type") or "").strip()
+    if raw_type not in ("group", "private"):
+        return None, None, web.json_response(
+            {"error": "chat_type 必须是 group 或 private"}, status=400
+        )
+    try:
+        chat_id = int(payload.get("chat_id"))
+    except (TypeError, ValueError):
+        return None, None, web.json_response(
+            {"error": "chat_id 必须是整数"}, status=400
+        )
+    if chat_id <= 0:
+        return None, None, web.json_response(
+            {"error": "chat_id 必须是正整数"}, status=400
+        )
+    return ChatType(raw_type), chat_id, None
+
+
+def _summary_date(payload: dict[str, Any]) -> tuple[str | None, web.Response | None]:
+    raw = str(payload.get("date") or "").strip()
+    if not raw:
+        return (
+            datetime.now(SHANGHAI).date() - timedelta(days=1)
+        ).isoformat(), None
+    try:
+        datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        return None, web.json_response(
+            {"error": "date 必须是 YYYY-MM-DD"}, status=400
+        )
+    return raw, None
 
 
 class SwitchError(Exception):
@@ -129,33 +201,39 @@ class BrainControl:
         """dashboard 只读记忆面板的数据源：最近摘要 + 最近印象。"""
         limit = max(1, min(MAX_MEMORY_PAGE, int(limit)))
         offset = max(0, int(offset))
+        summaries = [
+            {
+                "chat_type": s.chat_type.value,
+                "chat_id": s.chat_id,
+                "date": s.date,
+                "content": s.content,
+                "updated_at": s.updated_at,
+            }
+            for s in self.store.recent_summaries(limit, offset, chat_type, chat_id)
+        ]
+        impressions = [
+            {
+                "id": i.id,
+                "chat_type": i.chat_type.value,
+                "chat_id": i.chat_id,
+                "subject_user_id": i.subject_user_id,
+                "kind": i.kind,
+                "content": i.content,
+                "confidence": i.confidence,
+                "updated_at": i.updated_at,
+            }
+            for i in self.store.recent_impressions(limit, offset, chat_type, chat_id)
+        ]
+        # 面板要显示「已加载 n / 共 m」，否则分页器只能靠「这一页满没满」猜。
+        summary_total = self.store.count_summaries(chat_type, chat_id)
+        impression_total = self.store.count_impressions(chat_type, chat_id)
         return {
-            "summaries": [
-                {
-                    "chat_type": s.chat_type.value,
-                    "chat_id": s.chat_id,
-                    "date": s.date,
-                    "content": s.content,
-                    "updated_at": s.updated_at,
-                }
-                for s in self.store.recent_summaries(
-                    limit, offset, chat_type, chat_id
-                )
-            ],
-            "impressions": [
-                {
-                    "chat_type": i.chat_type.value,
-                    "chat_id": i.chat_id,
-                    "subject_user_id": i.subject_user_id,
-                    "kind": i.kind,
-                    "content": i.content,
-                    "confidence": i.confidence,
-                    "updated_at": i.updated_at,
-                }
-                for i in self.store.recent_impressions(
-                    limit, offset, chat_type, chat_id
-                )
-            ],
+            "summaries": summaries,
+            "impressions": impressions,
+            "summary_total": summary_total,
+            "impression_total": impression_total,
+            "summary_has_more": offset + len(summaries) < summary_total,
+            "impression_has_more": offset + len(impressions) < impression_total,
         }
 
     async def list_models(self) -> list[str]:
@@ -201,7 +279,11 @@ async def _auth_middleware(request: web.Request, handler):
 TOKEN_KEY: web.AppKey[str] = web.AppKey("control_token", str)
 
 
-def create_app(control: BrainControl, token: str = "") -> web.Application:
+def create_app(
+    control: BrainControl,
+    token: str = "",
+    memory_actions: MemoryActions | None = None,
+) -> web.Application:
     app = web.Application(middlewares=[_auth_middleware])
     app[TOKEN_KEY] = token
 
@@ -279,12 +361,85 @@ def create_app(control: BrainControl, token: str = "") -> web.Application:
                 {"error": f"读取记忆失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def post_summary(request: web.Request) -> web.Response:
+        if memory_actions is None:
+            return web.json_response({"error": "记忆操作未启用"}, status=503)
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        chat_type, chat_id, error = _chat_target(payload)
+        if error is not None:
+            return error
+        date, error = _summary_date(payload)
+        if error is not None:
+            return error
+        try:
+            text = await memory_actions.summarize(chat_type, chat_id, date)
+        except MemoryPaused as exc:
+            return web.json_response({"error": str(exc)}, status=409)
+        except Exception as exc:  # noqa: BLE001 - 手动触发失败要回给面板
+            log.warning("手动生成摘要失败：%s", exc)
+            return web.json_response(
+                {"error": f"生成摘要失败：{exc.__class__.__name__}"}, status=502
+            )
+        if text is None:
+            return web.json_response({"error": "生成摘要失败，详见日志"}, status=502)
+        return web.json_response({"ok": True, "date": date, "summary": text})
+
+    async def post_impressions(request: web.Request) -> web.Response:
+        if memory_actions is None:
+            return web.json_response({"error": "记忆操作未启用"}, status=503)
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        chat_type, chat_id, error = _chat_target(payload)
+        if error is not None:
+            return error
+        try:
+            added = await memory_actions.extract(chat_type, chat_id)
+        except MemoryPaused as exc:
+            return web.json_response({"error": str(exc)}, status=409)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("手动抽取印象失败：%s", exc)
+            return web.json_response(
+                {"error": f"抽取印象失败：{exc.__class__.__name__}"}, status=502
+            )
+        if added is None:
+            return web.json_response({"error": "抽取印象失败，详见日志"}, status=502)
+        return web.json_response({"ok": True, "added": added})
+
+    async def delete_impression(request: web.Request) -> web.Response:
+        if memory_actions is None:
+            return web.json_response({"error": "记忆操作未启用"}, status=503)
+        raw = request.match_info.get("impression_id", "")
+        try:
+            impression_id = int(raw)
+        except ValueError:
+            return web.json_response({"error": "印象 id 必须是整数"}, status=400)
+        if impression_id <= 0:
+            return web.json_response({"error": "印象 id 必须是正整数"}, status=400)
+        try:
+            deleted = memory_actions.delete_impression(impression_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("删除印象失败：%s", exc)
+            return web.json_response(
+                {"error": f"删除印象失败：{exc.__class__.__name__}"}, status=500
+            )
+        if not deleted:
+            return web.json_response({"error": "印象不存在"}, status=404)
+        return web.json_response({"ok": True, "deleted": impression_id})
+
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/brain", get_brain)
     app.router.add_post("/api/brain", post_brain)
     app.router.add_get("/api/brain/models", models)
     app.router.add_get("/api/memory", memory)
+    app.router.add_post("/api/memory/summaries", post_summary)
+    app.router.add_post("/api/memory/impressions", post_impressions)
+    app.router.add_delete(
+        "/api/memory/impressions/{impression_id}", delete_impression
+    )
     return app
 
 
@@ -294,6 +449,7 @@ async def start_control_server(
     service: Any,
     adapter: Any,
     runtime_path: str = "data/runtime.json",
+    memory_actions: MemoryActions | None = None,
 ) -> web.AppRunner | None:
     """按环境变量启动控制口；返回 Runner 供退出时 cleanup。"""
     raw_port = os.environ.get("DAFEIYU_CONTROL_PORT", "").strip()
@@ -309,7 +465,7 @@ async def start_control_server(
     token = os.environ.get("DAFEIYU_CONTROL_TOKEN", "").strip()
 
     control = BrainControl(settings, store, service, adapter, runtime_path)
-    app = create_app(control, token)
+    app = create_app(control, token, memory_actions)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, host, port)

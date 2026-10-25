@@ -273,6 +273,7 @@ class Service:
             "reply" if addressed else "ambient",
             reply.prompt_tokens,
             reply.completion_tokens,
+            reply.estimated,
         )
         self.store.mark_delivered(chat_type, chat_id, *ids)
         self.store.bump_session_stats(
@@ -435,6 +436,7 @@ class Service:
             "reply",
             reply.prompt_tokens,
             reply.completion_tokens,
+            reply.estimated,
         )
 
         if not reply.speak:

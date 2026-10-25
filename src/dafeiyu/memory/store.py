@@ -60,9 +60,16 @@ CREATE TABLE IF NOT EXISTS usage (
     purpose TEXT NOT NULL,
     prompt_tokens INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_usage_chat_date ON usage (chat_type, chat_id, date);
+
+-- 记忆旁路的失败冷却与配额熔断；存到库里才能跨进程重启存活。
+CREATE TABLE IF NOT EXISTS memory_backoff (
+    key TEXT PRIMARY KEY,
+    until REAL NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS opencode_sessions (
     chat_type TEXT NOT NULL,
@@ -130,6 +137,9 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
     },
     "delivered_messages": {
         "skipped_reason": "TEXT",
+    },
+    "usage": {
+        "estimated": "INTEGER NOT NULL DEFAULT 0",
     },
 }
 
@@ -672,6 +682,13 @@ class Store:
         )
         self._conn.commit()
 
+    def delete_impression(self, impression_id: int) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM impressions WHERE id = ?", (int(impression_id),)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
     def search_impressions(
         self, chat_type: ChatType, chat_id: int, query: str, topk: int
     ) -> list[Impression]:
@@ -737,6 +754,15 @@ class Store:
         ).fetchall()
         return [self._row_to_impression(r) for r in rows]
 
+    def count_impressions(
+        self, chat_type: ChatType | None = None, chat_id: int | None = None
+    ) -> int:
+        scope, params = _memory_scope(chat_type, chat_id)
+        row = self._conn.execute(
+            f"SELECT COUNT(*) AS total FROM impressions {scope}", params
+        ).fetchone()
+        return int(row["total"] or 0)
+
     @staticmethod
     def _row_to_impression(r: sqlite3.Row) -> Impression:
         return Impression(
@@ -747,6 +773,7 @@ class Store:
             content=r["content"],
             confidence=r["confidence"],
             updated_at=r["updated_at"],
+            id=r["id"],
         )
 
     # ---- summaries ------------------------------------------------
@@ -768,6 +795,15 @@ class Store:
             (chat_type.value, chat_id, date),
         ).fetchone()
         return None if row is None else str(row["content"])
+
+    def count_summaries(
+        self, chat_type: ChatType | None = None, chat_id: int | None = None
+    ) -> int:
+        scope, params = _memory_scope(chat_type, chat_id)
+        row = self._conn.execute(
+            f"SELECT COUNT(*) AS total FROM summaries {scope}", params
+        ).fetchone()
+        return int(row["total"] or 0)
 
     def recent_summaries(
         self,
@@ -821,6 +857,27 @@ class Store:
         ).fetchone()
         return None if row is None else str(row["content"])
 
+    # ---- worker backoff -------------------------------------------
+    def load_backoff(self) -> dict[str, float]:
+        rows = self._conn.execute(
+            "SELECT key, until FROM memory_backoff"
+        ).fetchall()
+        return {str(row["key"]): float(row["until"]) for row in rows}
+
+    def save_backoff(self, key: str, until: float) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO memory_backoff (key, until) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET until = excluded.until
+            """,
+            (key, float(until)),
+        )
+        self._conn.commit()
+
+    def clear_backoff(self, key: str) -> None:
+        self._conn.execute("DELETE FROM memory_backoff WHERE key = ?", (key,))
+        self._conn.commit()
+
     # ---- usage ----------------------------------------------------
     def record_usage(
         self,
@@ -829,13 +886,23 @@ class Store:
         purpose: str,
         prompt_tokens: int,
         completion_tokens: int,
+        estimated: bool = False,
     ) -> None:
         self._conn.execute(
             """
-            INSERT INTO usage (chat_type, chat_id, date, purpose, prompt_tokens, completion_tokens)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO usage
+                (chat_type, chat_id, date, purpose, prompt_tokens, completion_tokens, estimated)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (chat_type.value, chat_id, self.today(), purpose, prompt_tokens, completion_tokens),
+            (
+                chat_type.value,
+                chat_id,
+                self.today(),
+                purpose,
+                prompt_tokens,
+                completion_tokens,
+                1 if estimated else 0,
+            ),
         )
         self._conn.commit()
 

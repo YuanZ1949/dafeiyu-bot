@@ -189,6 +189,27 @@ def create_app(
         code, data = await bot_call("GET", path)
         return web.json_response(data, status=code)
 
+    async def memory_summary(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call("POST", "/api/memory/summaries", payload)
+        return web.json_response(data, status=code)
+
+    async def memory_impressions(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call("POST", "/api/memory/impressions", payload)
+        return web.json_response(data, status=code)
+
+    async def memory_impression_delete(request: web.Request) -> web.Response:
+        impression_id = request.match_info["impression_id"]
+        code, data = await bot_call(
+            "DELETE", f"/api/memory/impressions/{impression_id}"
+        )
+        return web.json_response(data, status=code)
+
     async def control(request: web.Request) -> web.Response:
         action = request.match_info["action"]
         if action not in ("start", "stop", "restart"):
@@ -236,6 +257,11 @@ def create_app(
     app.router.add_post("/api/brain", post_brain)
     app.router.add_get("/api/brain/models", models)
     app.router.add_get("/api/memory", memory)
+    app.router.add_post("/api/memory/summaries", memory_summary)
+    app.router.add_post("/api/memory/impressions", memory_impressions)
+    app.router.add_delete(
+        "/api/memory/impressions/{impression_id}", memory_impression_delete
+    )
     app.router.add_post("/api/control/{action}", control)
     app.router.add_post("/api/shutdown", shutdown)
     return app

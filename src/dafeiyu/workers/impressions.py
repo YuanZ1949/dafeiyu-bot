@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import time
+from typing import Any, Callable
 
+from dafeiyu.brain.tokens import resolve_usage
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType
 
@@ -76,16 +78,30 @@ class ImpressionWorker:
         every: int = 20,
         backoff_seconds: float = FAILURE_BACKOFF_SECONDS,
         monotonic=time.monotonic,
+        brain_getter: Callable[[], Any] | None = None,
+        backoff: FailureBackoff | None = None,
     ) -> None:
         self.store = store
         self.brain = brain
         self.every = max(1, every)
         self._last_count: dict[tuple[ChatType, int], int] = {}
-        self._backoff = FailureBackoff(backoff_seconds, monotonic)
+        self._backoff = backoff or FailureBackoff(backoff_seconds, monotonic)
+        # dashboard 换脑只更新 Service.brain，拿不到 worker 手里的引用；
+        # 有 getter 就每次现取，否则印象抽取会一直用启动时的 provider。
+        self._brain_getter = brain_getter
+
+    def _current_brain(self):
+        return self._brain_getter() if self._brain_getter is not None else self.brain
+
+    @property
+    def paused(self) -> bool:
+        return self._backoff.is_paused()
 
     async def maybe_extract(self, chat_type: ChatType, chat_id: int) -> int:
         """按会话累计消息数触发；同一批消息不会重复抽取。"""
         key = (chat_type, chat_id)
+        if self._backoff.is_paused():
+            return 0
         if self._backoff.should_skip(key):
             return 0
         count = self.store.count_messages(chat_type, chat_id)
@@ -96,11 +112,7 @@ class ImpressionWorker:
             return 0
         self._last_count[key] = count
         added = await self.extract(chat_type, chat_id)
-        if added is None:
-            self._backoff.mark_failed(key)
-            return 0
-        self._backoff.mark_ok(key)
-        return added
+        return 0 if added is None else added
 
     async def extract(self, chat_type: ChatType, chat_id: int) -> int | None:
         """抽取并写入印象；调用失败返回 None，供上层决定是否退避。"""
@@ -109,7 +121,8 @@ class ImpressionWorker:
             return 0
 
         lines = "\n".join(f"{m.user_id}|{m.nickname}: {m.content}" for m in messages)
-        detailed = getattr(self.brain, "complete_detailed", None)
+        brain = self._current_brain()
+        detailed = getattr(brain, "complete_detailed", None)
         try:
             if detailed is not None:
                 raw, prompt_tokens, completion_tokens = await detailed(
@@ -118,7 +131,7 @@ class ImpressionWorker:
                     max_tokens=600,
                 )
             else:
-                raw = await self.brain.complete(
+                raw = await brain.complete(
                     EXTRACT_SYSTEM,
                     [{"role": "user", "content": lines}],
                     max_tokens=600,
@@ -126,9 +139,18 @@ class ImpressionWorker:
                 prompt_tokens = completion_tokens = 0
         except Exception as exc:
             log_memory_failure(log, "印象抽取", exc, chat_type, chat_id)
+            self._backoff.mark_failed((chat_type, chat_id), exc)
             return None
+        prompt_tokens, completion_tokens, estimated = resolve_usage(
+            f"{EXTRACT_SYSTEM}\n{lines}", raw or "", prompt_tokens, completion_tokens
+        )
         self.store.record_usage(
-            chat_type, chat_id, "impression", prompt_tokens, completion_tokens
+            chat_type,
+            chat_id,
+            "impression",
+            prompt_tokens,
+            completion_tokens,
+            estimated,
         )
 
         existing = {
@@ -148,4 +170,5 @@ class ImpressionWorker:
             self.store.upsert_impression(
                 chat_type, chat_id, user_id, kind, content, confidence
             )
+        self._backoff.mark_ok((chat_type, chat_id))
         return added

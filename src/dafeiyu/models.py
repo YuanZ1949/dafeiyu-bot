@@ -42,6 +42,7 @@ class Impression:
     content: str
     confidence: float
     updated_at: str = ""
+    id: int | None = None
 
 
 @dataclass

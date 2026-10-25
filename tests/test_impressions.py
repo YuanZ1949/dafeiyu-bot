@@ -152,7 +152,7 @@ async def test_unexpected_failure_keeps_traceback(store: Store, caplog) -> None:
 
 async def test_failure_cooldown_blocks_retry_until_expired(store: Store) -> None:
     clock = {"t": 0.0}
-    brain = FakeBrain(exc=BrainError("provider.quota"))
+    brain = FakeBrain(exc=BrainError("provider.timeout"))
     worker = ImpressionWorker(
         store,
         brain,
