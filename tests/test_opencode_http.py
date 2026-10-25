@@ -397,3 +397,28 @@ def test_check_response_keeps_http_status() -> None:
     with pytest.raises(BrainError) as excinfo:
         OpenCodeHttpBrain._check_response(response)
     assert excinfo.value.status == 429
+
+
+async def test_provider_error_status_code_is_kept(store: Store) -> None:
+    """文案里没有 429 时，靠 provider 给的 statusCode 也要能识别限流。"""
+    server = FakeServer(
+        text_parts=[],
+        error={"type": "provider.error", "message": "slow down", "statusCode": 429},
+    )
+    brain = make_brain(store, server, timeout=2.0)
+    with pytest.raises(BrainError) as excinfo:
+        await brain.reply(ChatType.PRIVATE, 42, "在吗")
+    await brain.aclose()
+
+    assert excinfo.value.status == 429
+    assert "429" not in str(excinfo.value)
+
+
+def test_error_status_accepts_common_field_names() -> None:
+    from dafeiyu.brain.opencode_http import _error_status
+
+    assert _error_status({"statusCode": 429}) == 429
+    assert _error_status({"status_code": "503"}) == 503
+    assert _error_status({"code": 402}) == 402
+    assert _error_status({"code": "rate_limit_exceeded"}) is None
+    assert _error_status({"status": True}) is None

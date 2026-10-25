@@ -68,6 +68,22 @@ def _created(message: dict[str, Any]) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
+def _error_status(error: dict[str, Any]) -> int | None:
+    """provider 错误里的 HTTP 状态码：字段名随 SDK 版本变，能认几个认几个。"""
+    for field in ("statusCode", "status_code", "status", "code"):
+        raw = error.get(field)
+        if isinstance(raw, bool):
+            continue
+        value: int | None = None
+        if isinstance(raw, int):
+            value = raw
+        elif isinstance(raw, str) and raw.strip().isdigit():
+            value = int(raw.strip())
+        if value is not None and 400 <= value <= 599:
+            return value
+    return None
+
+
 @dataclass(frozen=True)
 class RoundResult:
     """一轮对话的结构化结果：最终文本、token 与时间窗（服务端毫秒）。"""
@@ -326,7 +342,7 @@ class OpenCodeHttpBrain:
                 messages = await self._round_messages(session_id, since)
                 failure = self._round_error(messages)
                 if failure is not None:
-                    raise BrainError(failure)
+                    raise failure
                 if self._round_finished(messages):
                     prompt_tokens = 0
                     completion_tokens = 0
@@ -366,11 +382,12 @@ class OpenCodeHttpBrain:
         )
 
     @staticmethod
-    def _round_error(messages: list[dict[str, Any]]) -> str | None:
-        """本轮最后一条 assistant 以 error 收尾时，返回可直接抛出的原因。
+    def _round_error(messages: list[dict[str, Any]]) -> BrainError | None:
+        """本轮最后一条 assistant 以 error 收尾时，返回可直接抛出的错误。
 
         模型侧失败（配额、限流、鉴权）在 opencode 里表现为 ``finish: "error"``
         且 content 为空；不认这个标记的话只能等到超时，真实原因会被吞掉。
+        provider 若在 error 里给了状态码就一并带出去：限流判定不该只靠文案。
         """
         for message in reversed(messages):
             if message.get("type") != "assistant":
@@ -380,9 +397,12 @@ class OpenCodeHttpBrain:
             error = message.get("error") or {}
             kind = str(error.get("type") or "unknown")
             detail = str(error.get("message") or "").strip()
-            if detail:
-                return f"OpenCode 调用失败（{kind}）：{detail}"
-            return f"OpenCode 调用失败（{kind}）"
+            text = (
+                f"OpenCode 调用失败（{kind}）：{detail}"
+                if detail
+                else f"OpenCode 调用失败（{kind}）"
+            )
+            return BrainError(text, status=_error_status(error))
         return None
 
     @staticmethod
