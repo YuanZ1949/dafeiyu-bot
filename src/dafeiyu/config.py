@@ -29,6 +29,10 @@ class TriggerConfig:
     sample_rate: float
     quiet_hours: tuple[str, str]
     keywords: tuple[str, ...]
+    # rules：旧的同步投递；model：入库后交给批次调度器决定何时回复。
+    mode: str = "rules"
+    # 点名消息的硬上限：防抖一直被打断时，最多等这么久也必须回。
+    addressed_max_wait_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,8 @@ class GroupsConfig:
 class BudgetConfig:
     daily_calls: int
     daily_tokens: int
+    # 非点名消息可动用的额度比例；点名的回复永远优先。
+    ambient_ratio: float = 0.8
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,17 @@ class MemoryConfig:
     window_size: int
     impression_topk: int
     extract_every: int
+
+
+@dataclass(frozen=True)
+class InjectionConfig:
+    """opencode 分支的三段前缀预算，单位是字符数（不是 token）。"""
+
+    memory_chars: int = 500
+    summary_chars: int = 250
+    impression_chars: int = 150
+    inject_summaries: bool = True
+    inject_impressions: bool = True
 
 
 @dataclass(frozen=True)
