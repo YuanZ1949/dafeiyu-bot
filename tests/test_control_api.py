@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,7 @@ from dafeiyu.control import BrainControl, MemoryActions, create_app
 from dafeiyu.memory.store import MAX_MEMORY_PAGE, Store
 from dafeiyu.models import ChatType
 from dafeiyu.runtime import RuntimeState
-from dafeiyu.workers.failure import MemoryPaused
+from dafeiyu.workers.failure import QUOTA_KEY, MemoryPaused
 
 YAML = TEST_CONFIG_YAML
 
@@ -229,7 +230,21 @@ async def test_memory_endpoint_empty(tmp_path: Path) -> None:
         "summary_has_more": False,
         "impression_has_more": False,
         "limit_max": MAX_MEMORY_PAGE,
+        "quota": {"paused": False, "until": None},
     }
+
+
+async def test_memory_endpoint_reports_quota_pause(tmp_path: Path) -> None:
+    """熔断中面板要能说明原因：从库里读，跨重启也准。"""
+    control, _, app = make_control(tmp_path)
+    until = time.time() + 600
+    control.store.save_backoff(QUOTA_KEY, until)
+
+    async with running(app) as client:
+        payload = await (await client.get("/api/memory")).json()
+
+    assert payload["quota"]["paused"] is True
+    assert abs(payload["quota"]["until"] - until) < 1
 
 
 async def test_memory_endpoint_returns_store_rows(tmp_path: Path) -> None:
@@ -551,3 +566,14 @@ def test_dashboard_page_max_fallback_matches_backend() -> None:
     assert "data.limit_max" in html
     assert "if (memoryLimit > memoryPageMax) memoryLimit = memoryPageMax;" in html
     assert "memoryPageMax" in html
+
+
+def test_dashboard_surfaces_quota_pause() -> None:
+    """记忆面板要显示熔断状态，否则「没有新摘要」会被当成故障。"""
+    html = (
+        Path(__file__).resolve().parents[1]
+        / "src/dafeiyu/supervisor/dashboard/index.html"
+    ).read_text(encoding="utf-8")
+    assert "data.quota" in html
+    assert "quota.paused" in html
+    assert "配额暂停中" in html

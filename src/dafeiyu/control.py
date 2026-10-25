@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -22,7 +23,7 @@ from .memory.store import MAX_MEMORY_PAGE, Store
 from .models import ChatType
 from .runtime import RuntimeState, load_runtime, save_runtime
 from .timeutil import SHANGHAI
-from .workers.failure import MemoryPaused
+from .workers.failure import QUOTA_KEY, MemoryPaused
 
 log = logging.getLogger(__name__)
 
@@ -227,6 +228,9 @@ class BrainControl:
         # 面板要显示「已加载 n / 共 m」，否则分页器只能靠「这一页满没满」猜。
         summary_total = self.store.count_summaries(chat_type, chat_id)
         impression_total = self.store.count_impressions(chat_type, chat_id)
+        # 熔断状态只有库里有真值：进程重启后仍然延续，面板不该比 worker 更乐观。
+        quota_until = self.store.load_backoff().get(QUOTA_KEY)
+        quota_paused = bool(quota_until and float(quota_until) > time.time())
         return {
             "summaries": summaries,
             "impressions": impressions,
@@ -236,6 +240,11 @@ class BrainControl:
             "impression_has_more": offset + len(impressions) < impression_total,
             # 分页上限的后端真值：面板据此禁用「显示更多」，不再各自写死 200。
             "limit_max": MAX_MEMORY_PAGE,
+            # 配额熔断中时面板要说明「为什么记忆不动」，别让人以为坏了。
+            "quota": {
+                "paused": quota_paused,
+                "until": float(quota_until) if quota_paused else None,
+            },
         }
 
     async def list_models(self) -> list[str]:

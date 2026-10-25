@@ -439,9 +439,22 @@ function renderMemory(data) {
   const summaryTotal = Number(data && data.summary_total);
   const impressionTotal = Number(data && data.impression_total);
   const totalShown = Number.isFinite(summaryTotal) && Number.isFinite(impressionTotal);
-  $("memory-hint").textContent = totalShown
+  let hint = totalShown
     ? `摘要 ${summaries.length}/${summaryTotal} · 印象 ${impressions.length}/${impressionTotal}`
     : `摘要 ${summaries.length} 条 · 印象 ${impressions.length} 条`;
+  // 配额熔断时记忆任务全停，面板只说「没有摘要」会被当成故障。
+  const quota = (data && data.quota) || {};
+  const quotaUntil = Number(quota.until);
+  if (quota.paused && Number.isFinite(quotaUntil)) {
+    const at = new Date(quotaUntil * 1000);
+    const clock = at.toLocaleTimeString("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+    hint += ` · 配额暂停中，${clock} 后恢复`;
+  }
+  $("memory-hint").textContent = hint;
   // 分页上限以服务端 limit_max 为准；字段缺失（旧服务端）才用下面的兜底常量。
   const limitMax = Number(data && data.limit_max);
   if (Number.isFinite(limitMax) && limitMax > 0) memoryPageMax = limitMax;
