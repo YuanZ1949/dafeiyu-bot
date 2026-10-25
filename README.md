@@ -153,7 +153,7 @@ powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoQr
 | `persona.name` / `persona.aliases` | 溟月 / 大肥鱼、小鲸鱼… | 人设名与「叫名字」触发的别名 |
 | `persona.max_reply_chars` | `120` | 闲聊回复上限（字） |
 | `persona.max_reply_chars_technical` | `300` | 技术问题回复上限（字） |
-| `persona.os_probability` | `0.05` | 出现「内心 OS」的概率 |
+| `persona.os_probability` | `0.05` | 出现「内心 OS」的概率，`0` 关闭；三种 provider 模式都生效（opencode 模式按轮注入覆盖指令） |
 | `persona.prompt_file` | `""` | 自定义人设文件路径；留空使用内置 `brain/persona.md`。改完重启生效 |
 | `triggers.cooldown_seconds` | `60` | 同一群两次**非提问**发言的最小间隔（明确提问、@/引用/叫名字不受限） |
 | `triggers.sample_rate` | `0.05` | 普通消息被纳入模型判断的采样率 |

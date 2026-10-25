@@ -1,6 +1,11 @@
 from pathlib import Path
 
-from dafeiyu.brain.persona import build_system_prompt, load_persona
+from dafeiyu.brain.persona import (
+    DEFAULT_OS_PROBABILITY,
+    build_system_prompt,
+    load_persona,
+    os_probability_hint,
+)
 
 
 def test_load_persona_reads_package_file() -> None:
@@ -32,3 +37,34 @@ def test_system_prompt_has_no_secrets() -> None:
     assert "sk-" not in text
     assert "API_KEY" not in text
     assert "DEEPSEEK_API_KEY" not in text
+
+
+def test_persona_placeholders_are_rendered() -> None:
+    """Template 不递归替换：人设里的占位符必须先渲染，不能漏成字面量。"""
+    text = build_system_prompt(load_persona(), "测试群", "2026-10-24", 120, 300, 0.2)
+    assert "约 20%" in text
+    assert "$os_rule" not in text
+    assert "$max_chars" not in text
+    assert "$max_chars_technical" not in text
+
+
+def test_os_probability_zero_turns_off() -> None:
+    text = build_system_prompt(load_persona(), "测试群", "2026-10-24", 120, 300, 0)
+    assert "不要主动冒内心 OS" in text
+    assert "小概率" not in text
+
+
+def test_os_probability_hint_only_when_non_default() -> None:
+    assert os_probability_hint(DEFAULT_OS_PROBABILITY) == ""
+    assert "约 20%" in os_probability_hint(0.2)
+    assert "[人设覆盖]" in os_probability_hint(0.2)
+    assert "不要主动使用内心 OS" in os_probability_hint(0)
+
+
+def test_opencode_agent_default_stays_in_sync() -> None:
+    """opencode 的人设文件自带默认值，改 DEFAULT_OS_PROBABILITY 时要一起改。"""
+    repo_root = Path(__file__).resolve().parents[1]
+    text = (repo_root / ".opencode/agents/deepseek-qq.md").read_text(encoding="utf-8")
+    percent = f"{DEFAULT_OS_PROBABILITY * 100:g}%"
+    assert f"约 {percent}" in text
+    assert "[人设覆盖]" in text

@@ -162,6 +162,31 @@ async def test_brain_error_sends_short_reply(tmp_path):
     assert adapter.sent == [(ChatType.GROUP, 1001, BRAIN_ERROR_REPLY)]
 
 
+async def test_brain_error_reply_has_30s_cooldown_per_chat(tmp_path, monkeypatch):
+    clock = {"now": 1000.0}
+    monkeypatch.setattr("dafeiyu.service.time.monotonic", lambda: clock["now"])
+    service, store, _, adapter, _ = build(
+        tmp_path, brain=FakeBrain(error=BrainError("boom"))
+    )
+
+    await service._reply(make_msg(chat_type=ChatType.PRIVATE, chat_id=2002))
+    await service._reply(
+        make_msg(chat_type=ChatType.PRIVATE, chat_id=2002, message_id="m2")
+    )
+
+    assert adapter.sent == [(ChatType.PRIVATE, 2002, BRAIN_ERROR_REPLY)]
+    calls, _ = store.usage_today_by_purpose(
+        ChatType.PRIVATE, 2002, store.today(), ("error",)
+    )
+    assert calls == 2
+
+    clock["now"] += 31
+    await service._reply(
+        make_msg(chat_type=ChatType.PRIVATE, chat_id=2002, message_id="m3")
+    )
+    assert len(adapter.sent) == 2
+
+
 async def test_concurrent_same_group_sends_only_once(tmp_path):
     service, _, brain, adapter, _ = build(tmp_path, brain=FakeBrain(delay=0.05))
     await asyncio.gather(
@@ -216,6 +241,21 @@ async def test_opencode_brain_receives_speaker_and_chat(tmp_path):
     await service.handle(make_msg())
     assert brain.calls == [(ChatType.GROUP, 1001, "阿鱼：@溟月 在吗（@了你）")]
     assert adapter.sent == [(ChatType.GROUP, 1001, "在呢")]
+    assert "[人设覆盖]" not in brain.calls[0][2]
+
+
+async def test_opencode_prompt_gets_os_override_when_configured(tmp_path):
+    brain = FakeOpenCodeBrain()
+    settings = make_settings(
+        persona=PersonaConfig("溟月", ("大肥鱼",), 120, 300, 0.2)
+    )
+    service, _, _, _, _ = build(tmp_path, brain=brain, settings=settings)
+
+    await service.handle(make_msg())
+
+    assert brain.calls[0][2].endswith(
+        "[人设覆盖] 本轮内心 OS 概率约 20%，以本条为准。"
+    )
 
 
 def at(hour: int, minute: int, second: int = 0) -> int:

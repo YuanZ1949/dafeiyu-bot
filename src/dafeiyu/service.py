@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 from .brain.client import BrainError, BrainReply
-from .brain.persona import build_system_prompt
+from .brain.persona import build_system_prompt, os_probability_hint
 from .config import InjectionConfig, Settings
 from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
@@ -31,6 +31,8 @@ TOOL_HINT_REPLY = "本鱼去网上查一下，稍等…"
 FOLLOWUP_REPLY = "没查到什么有用的，本鱼先不瞎说了"
 # 同一会话 60s 内不重复发「去查一下」；每轮最多一次由 brain 侧保证。
 TOOL_HINT_INTERVAL_SECONDS = 60.0
+# 同一会话 30s 内不重复发「和大脑断线了」；失败本身照常记账。
+BRAIN_ERROR_COOLDOWN_SECONDS = 30.0
 # 轮换摘要的输入窗口（spec §9.2：最近 40 条）。
 ROTATION_WINDOW = 40
 # 批次被跳过的原因。error 与 record_usage(purpose="error") 同口径
@@ -70,6 +72,7 @@ class Service:
         # 轮换后的接续文本：成功投递才弹出，失败留到下一批重试。
         self._continuations: dict[tuple[ChatType, int], str] = {}
         self._hint_at: dict[tuple[ChatType, int], float] = {}
+        self._error_reply_at: dict[tuple[ChatType, int], float] = {}
 
     async def start(self) -> None:
         self._start_scheduler()
@@ -394,6 +397,10 @@ class Service:
             # 一个群共用一个 OpenCode session，必须让模型看到是谁在说话；
             # 被规则跳过的消息也要补上，否则模型会把「你没回我」当成网络问题。
             prompt, delivered = build_delivery(self.store, msg)
+            hint = os_probability_hint(self.settings.persona.os_probability)
+            if hint:
+                # 人设文件写死了默认概率，配置偏离时只能逐轮纠偏。
+                prompt = f"{prompt}\n\n{hint}"
             reply = await responder(msg.chat_type, msg.chat_id, prompt)
             # 只有真正送到模型那里才记账；失败时整批留到下一次重投。
             self.store.mark_delivered(msg.chat_type, msg.chat_id, *delivered)
@@ -407,6 +414,7 @@ class Service:
             today,
             self.settings.persona.max_reply_chars,
             self.settings.persona.max_reply_chars_technical,
+            self.settings.persona.os_probability,
         )
         ctx = build_context(
             self.store,
@@ -427,6 +435,13 @@ class Service:
             # 失败也占一次调用额度，避免异常时无限重试烧钱。
             self.store.record_usage(msg.chat_type, msg.chat_id, "error", 0, 0)
             log.warning("模型调用失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
+            key = (msg.chat_type, msg.chat_id)
+            now = time.monotonic()
+            last = self._error_reply_at.get(key)
+            if last is not None and now - last < BRAIN_ERROR_COOLDOWN_SECONDS:
+                log.debug("错误回复冷却中，跳过 %s/%s", msg.chat_id, msg.message_id)
+                return
+            self._error_reply_at[key] = now
             await self.adapter.send(msg.chat_type, msg.chat_id, BRAIN_ERROR_REPLY)
             return
 
