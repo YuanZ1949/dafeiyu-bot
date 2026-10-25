@@ -506,14 +506,14 @@ memory:
 | S2 | 2.0.18 是否支持 `order`/`type`/`context`/`wait`；tool part 字段；本轮结束判据能否三条同时观测 | 按 7.3 实现 | 退到"本地排序 + 静默窗口"（7.3 的退路） |
 | S3 | `DELETE /api/session/{id}` 可用性（文档有，smoke 即可） | 临时 session 用完即删 | 留档，每群固定 worker session |
 | S4 | 权限 glob 对 `data/bot-workspace/**` 是否生效、越界是否被拒 | 按 4.2 | 补绝对路径规则；仍不行则把 workspace 移出仓库 |
-| S5 | message info 是否带 tokens/cost | 接真实记账 | 保持 0 + warning，`daily_tokens` 暂不生效 |
+| S5 | message info 是否带 tokens/cost | 有则用真实值；缺失的一侧按字符估算并写 `usage.estimated=1`（2026-10-25，见 §14.4） | 保持 0 + warning，`daily_tokens` 暂不生效 |
 | S6 | 全局插件是否作用到 bot server；`XDG_CONFIG_HOME` 能否隔离且不丢凭据 | 已实现隔离（Task 13.1，§11.4） | 隔离 + 检测/轮换双层；真机确认留给 Task 14 |
 | S7 | `steps: 4` 下回复是否仍只输出一条 JSON | 继续 | 调整 persona/降 steps |
 
 ### 14.3 端到端验收（可判定）
 
 1. `pytest -q` 全绿，新增用例覆盖 14.1 的 17 项。
-2. 强制跑一次摘要与印象：`summaries` / `impressions` 行数 > 0，dashboard 可见。
+2. 强制跑一次摘要与印象：`summaries` / `impressions` 行数 > 0，dashboard 可见（实现见 §14.4 与 P1-5 手动触发接口）。
 3. 群里问一个需要联网的问题（给一个真实 URL）：10 秒内先出提示语，最终回复引用页面事实。
 4. 3 次对话内 `MEMORY.md` 出现模型自写条目：断言"日志里出现 `read`/`edit` 工具调用 ≥1 次"；若 3 轮为 0，再看日志里的权限拒绝记录与 tool 调用次数（可观测，不靠模型心情）。
 5. `/forget` 后：该会话 SQLite 记忆为 0，`MEMORY.md` 与 `chats/*.md` 仍在，session 已删除。
@@ -523,6 +523,14 @@ memory:
 9. 注入外来 synthetic → 日志命中 + 下一轮换 session。
 
 **实测（Task 14）**：全量 **394 passed**。第 1 / 5 / 6 / 7 / 9 条通过（离线）；第 4 / 8 条通过（真机）；第 3 条通过（真机：事实引用 ✅，5.3s / 12.5s / 6.7s 三次真抓 httpbin 返回真实 uuid；10 秒内提示语 ✅，`_wait` 长轮询按 2s 切片后 4.31s 触发、6.73s 结束）；第 2 条先被 provider 免费额度阻塞（429 `provider.quota`），后改用**本地模型模式**补验通过（`qwen/qwen3-8b` + 假 NapCat：`impressions` 11 行 / `summaries` 1 行 156 字，下一轮回复引用印象）；云端 free 模型仍属外部配额问题。另记录一条选型风险：`qwen/qwen3.5-9b` 的 reasoning 会吃满记忆旁路的 600-token 预算（提到 2048 时印象 JSON 仍为空），本地模型模式跑旁路应选非思考模型。共暴露 5 个真缺陷，均已修复：① 第 5 条首跑发现 `Service._forget_chat` 先 `store.forget_chat()` 清掉 session 映射，`brain.forget()` 随后查不到 id，**远端 session 从未被 DELETE**；② `manage_server: false` 时 supervisor 拉起 serve 没带隔离 env，隔离在生产路径完全没生效；③ `OPENCODE_CONFIG` 优先级高于 `XDG_CONFIG_HOME`，只设后者仍加载全局插件；④ `_ask` 只认「有非空文本」为完成，模型 `finish="error"` + `content: []` 时死等到 240s 超时、真实错误（配额/限流）被吞掉；⑤ `on_tool` 的检查在长轮询 `_wait` 之前，真实 server 一轮跑完才返回，导致提示语永不触发——已用 `asyncio.wait_for` 2s 切片修复，并补了忠实模拟「阻塞到空闲」的测试替身 `BlockingWaitServer`。明细见 `docs/superpowers/spikes/2026-10-24-e2e-acceptance.md`。
+
+### 14.4 收尾增补（2026-10-25）
+
+1. **记忆全模式**：`SummaryScheduler` 与 `ImpressionWorker` 都通过 `brain_getter` 取当前 brain（`build_workers` 注入同一个 getter），dashboard 切脑对两条旁路即时生效；单测断言切换后旧 brain 调用 0 次、新 brain 1 次。
+2. **配额熔断**：`is_quota_error()` 命中后写入全局键 `__quota__`，暂停 **1 小时**；暂停期间任意会话的摘要/印象都直接跳过（实测切换 session 不能重置账号级配额，故不再做「换会话重试一次」）。暂停到期自动重试，仍失败继续暂停 1 小时。暂停状态持久化在 `memory_backoff(key, until)`，重启后仍生效；成功后清空。
+3. **token 记账**：新增 `brain/tokens.py`。`estimate_tokens` 按字符估（ASCII 4 字符/token，非 ASCII 1.5 字符/token，向上取整）；`resolve_usage` 只补为 0 的一侧，`BrainReply.estimated` 标记，`usage` 表新增 `estimated INTEGER NOT NULL DEFAULT 0`（老库自动补列）。回复、摘要、印象三条路径都落 `estimated`。
+4. **面板分页与手动操作**：`/api/memory` 增加 `summary_total` / `impression_total` / `summary_has_more` / `impression_has_more`（原有字段不变），面板显示「已加载 n / 共 m」并按 has_more 控制「显示更多」。新增 `POST /api/memory/summaries`、`POST /api/memory/impressions`、`DELETE /api/memory/impressions/{id}`；未装配返回 503，参数非法 400，生成失败 502，配额暂停 409。
+5. **gateway.provider**：`config.yaml` 新增 `gateway.provider`（默认 `qq`）。配成 `wechat` 时**启动期**即抛 `ConfigError`，并列出三条可行路径（WeChatPadPro / wxauto 系 RPA / 继续用 QQ），不再等到运行期 `NotImplementedError`。
 
 ## 15. 上线与回滚
 
