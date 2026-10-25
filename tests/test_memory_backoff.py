@@ -12,7 +12,12 @@ from dafeiyu.brain.client import BrainError
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.timeutil import SHANGHAI
-from dafeiyu.workers.failure import QUOTA_PAUSE_SECONDS, FailureBackoff
+from dafeiyu.workers.failure import (
+    QUOTA_PAUSE_SECONDS,
+    RATE_LIMIT_BACKOFF_SECONDS,
+    RATE_LIMIT_WINDOW_SECONDS,
+    FailureBackoff,
+)
 from dafeiyu.workers.impressions import ImpressionWorker
 from dafeiyu.workers.summary import SummaryScheduler
 
@@ -145,6 +150,7 @@ async def test_scheduler_stops_after_quota_error() -> None:
     assert brain.calls == 1  # 第二个会话被全局熔断拦住
     assert scheduler._backoff.is_paused()
     assert "__quota__" in store.load_backoff()
+    assert store.load_rate_limit() == (0, 0.0)
     store.close()
 
 
@@ -173,6 +179,7 @@ def test_rate_limit_detection() -> None:
     from dafeiyu.workers.failure import is_rate_limit_error
 
     assert is_rate_limit_error(BrainError("HTTP 429"))
+    assert is_rate_limit_error(BrainError("限流了，稍后再试", status=429))
     assert is_rate_limit_error(BrainError("Too Many Requests"))
     assert is_rate_limit_error(SimpleNamespace(status=429))
     assert not is_rate_limit_error(BrainError("network down"))
@@ -238,3 +245,65 @@ def test_non_429_failure_resets_429_streak() -> None:
     backoff.mark_failed((ChatType.GROUP, 5), RATE_LIMITED)
 
     assert not backoff.is_paused()
+
+
+def test_single_429_cools_only_five_minutes() -> None:
+    clock = Clock()
+    backoff = FailureBackoff(monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall)
+
+    backoff.mark_failed((ChatType.GROUP, 1), RATE_LIMITED)
+
+    clock.advance(RATE_LIMIT_BACKOFF_SECONDS + 1)
+    assert not backoff.should_skip((ChatType.GROUP, 1))
+
+
+def test_429_streak_survives_restart(tmp_path: Path) -> None:
+    path = tmp_path / "streak.db"
+    clock = Clock()
+    store = Store(path)
+    store.init_schema()
+    first = FailureBackoff(
+        monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall, persistence=store
+    )
+    first.mark_failed((ChatType.GROUP, 1), RATE_LIMITED)
+    first.mark_failed((ChatType.GROUP, 2), RATE_LIMITED)
+    assert store.load_rate_limit()[0] == 2
+    store.close()
+
+    clock.advance(30)
+    store = Store(path)
+    store.init_schema()
+    second = FailureBackoff(
+        monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall, persistence=store
+    )
+    second.mark_failed((ChatType.GROUP, 3), RATE_LIMITED)
+
+    assert second.is_paused()
+    assert store.load_rate_limit() == (0, 0.0)
+    store.close()
+
+
+def test_stale_429_streak_is_discarded(tmp_path: Path) -> None:
+    path = tmp_path / "stale.db"
+    clock = Clock()
+    store = Store(path)
+    store.init_schema()
+    first = FailureBackoff(
+        monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall, persistence=store
+    )
+    first.mark_failed((ChatType.GROUP, 1), RATE_LIMITED)
+    first.mark_failed((ChatType.GROUP, 2), RATE_LIMITED)
+    store.close()
+
+    clock.advance(RATE_LIMIT_WINDOW_SECONDS + 1)
+    store = Store(path)
+    store.init_schema()
+    second = FailureBackoff(
+        monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall, persistence=store
+    )
+    second.mark_failed((ChatType.GROUP, 3), RATE_LIMITED)
+    second.mark_failed((ChatType.GROUP, 4), RATE_LIMITED)
+
+    assert not second.is_paused()
+    assert store.load_rate_limit()[0] == 2
+    store.close()

@@ -71,6 +71,13 @@ CREATE TABLE IF NOT EXISTS memory_backoff (
     until REAL NOT NULL
 );
 
+-- 连续 429 的账号级计数：跨重启保留，超过窗口即作废（只存一行）。
+CREATE TABLE IF NOT EXISTS memory_rate_limit (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    streak INTEGER NOT NULL DEFAULT 0,
+    updated REAL NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS opencode_sessions (
     chat_type TEXT NOT NULL,
     chat_id INTEGER NOT NULL,
@@ -876,6 +883,30 @@ class Store:
 
     def clear_backoff(self, key: str) -> None:
         self._conn.execute("DELETE FROM memory_backoff WHERE key = ?", (key,))
+        self._conn.commit()
+
+    def load_rate_limit(self) -> tuple[int, float]:
+        """连续 429 计数（账号级单行）：返回 (streak, 最近一次 429 的墙钟时间)。"""
+        row = self._conn.execute(
+            "SELECT streak, updated FROM memory_rate_limit WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return 0, 0.0
+        return int(row["streak"]), float(row["updated"])
+
+    def save_rate_limit(self, streak: int, updated: float) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO memory_rate_limit (id, streak, updated) VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                streak = excluded.streak, updated = excluded.updated
+            """,
+            (int(streak), float(updated)),
+        )
+        self._conn.commit()
+
+    def clear_rate_limit(self) -> None:
+        self._conn.execute("DELETE FROM memory_rate_limit WHERE id = 1")
         self._conn.commit()
 
     # ---- usage ----------------------------------------------------
