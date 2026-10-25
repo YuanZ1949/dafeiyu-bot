@@ -97,7 +97,9 @@ class FailureBackoff:
     (chat_type, chat_id)）。时间源可注入，便于测试。
 
     ``persistence`` 需要提供 ``load_backoff() / save_backoff(key, until) /
-    clear_backoff(key)``；传 Store 即可让退避跨进程重启存活。
+    clear_backoff(key)``；传 Store 即可让退避跨进程重启存活。连续 429 计数
+    用可选的 ``load_rate_limit() / save_rate_limit(streak, updated) /
+    clear_rate_limit()``，缺这几个方法时只在内存里数。
     """
 
     def __init__(
