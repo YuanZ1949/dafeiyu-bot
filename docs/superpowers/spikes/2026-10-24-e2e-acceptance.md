@@ -11,12 +11,13 @@
 | 范围 | 结果 |
 | --- | --- |
 | 离线（MockTransport，不连 QQ） | 5 条完全通过（1 / 5 / 6 / 7 / 9），2 条部分通过（2 / 3） |
-| 真机（真实 opencode server + 真实模型，未连 QQ） | 3 条通过（3 / 4 / 8），1 条被外部配额阻塞（2） |
-| 全量测试 | `394 passed in 83.43s`（Task 14 起点基线 386；含后续 on_tool 修复新增 1 条） |
+| 真机（真实 opencode server + 真实模型，未连 QQ） | 3 条通过（3 / 4 / 8），1 条云端配额阻塞（2） |
+| 本地模型模式（LM Studio + 假 NapCat） | 第 2 条补验通过（摘要 1 行 / 印象 11 行 / 下一轮回复引用印象） |
+| 全量测试 | `394 passed in 156.78s`（Task 14 起点基线 386；含后续 on_tool 修复新增 1 条） |
 | 发现缺陷 | 5 个已修（`/forget` 不删 session、supervisor 没注入隔离 env、`OPENCODE_CONFIG` 覆盖隔离、provider 错误死等 240s、`on_tool` 提示语从不触发） |
 
 真机部分**未连 QQ**：直接对隔离后的 `opencode serve` 发真实 prompt，覆盖了权限、联网、记笔记三条；唯一必须进群才能判定的只剩「真实群消息 → 提示语时延」的场景差异（见第 3 条）。
-第 2 条（摘要/印象）被 provider 免费额度（429）挡住，属于外部阻塞，不是代码缺陷——但它顺带暴露了第 4 个缺陷（错误被吞成超时），已修。
+第 2 条（摘要/印象）先被 provider 免费额度（429）挡住，属于外部阻塞，不是代码缺陷——但它顺带暴露了第 4 个缺陷（错误被吞成超时），已修；后来改用**本地模型模式**（LM Studio `qwen/qwen3-8b` + 假 NapCat）补验通过，见第 2 条。
 
 ## 验收明细
 
@@ -58,7 +59,7 @@
 | 16 `/forget`（清库 / DELETE / 保留笔记） | `test_service.py`、`test_brain_complete.py`、`test_e2e_batch.py` |
 | 17 跨群越权（无 glob/grep allow、read 限工作区） | `test_config_agents.py` |
 
-### 2. 摘要与印象真跑一次，`summaries` / `impressions` 行数 > 0，dashboard 可见 —— 🔒 外部阻塞（provider 配额）
+### 2. 摘要与印象真跑一次，`summaries` / `impressions` 行数 > 0，dashboard 可见 —— ✅ 通过（本地模型模式）
 
 离线已证（落库与展示链路）：
 
@@ -86,6 +87,53 @@
 同一时刻 `deepseek-qq` 用同一个模型能正常返回（`finish=stop`），所以是**该模型免费额度被打满**，不是 agent 配置错、也不是模型不可用。`summary.py` 捕获异常后打印「生成摘要失败」并返回空串，`ImpressionWorker` 写入 0 行——降级行为符合设计。
 
 **退路**：等额度恢复，或把 `deepseek-qq` / `dafeiyu-memory` 的 `model:` 换成非 free 模型后重跑本步。落库与展示链路由离线用例保证，真机只差一次成功产出。
+
+#### 本地模型模式补验（2026-10-25 16:0x）
+
+环境隔离：临时 cwd + 复制 `config.yaml`（`brain.provider: local_model`、`local_model.model: qwen/qwen3-8b`），`NAPCAT_WS_PORT=18080`、`DAFEIYU_CONTROL_PORT=18788`；SQLite、workspace、日志全部落在临时目录。生产 `data/dafeiyu.db` 与 `data/runtime.json` 的 mtime / sha256 跑前跑后不变。
+
+操作与结果：
+
+| 步骤 | 命令 / 操作 | 结果 |
+| --- | --- | --- |
+| 1 启动 | `python -m dafeiyu`（临时 cwd，`provider=local_model`） | `GET /api/brain` → `{"provider":"local_model","model":"qwen/qwen3-8b"}` |
+| 2 群消息 | 假 NapCat 连 `ws://127.0.0.1:18080/`，发 20 条群消息（含昵称 / 偏好 / 事实） | 收到群回复 31 字：`在在在！本鱼已经准备好翻肚皮给你看了～…` |
+| 3 印象落库 | 第 20 条消息触发真实 `ImpressionWorker` | `impressions` **11 行**；`usage` `purpose=impression p=596 c=404` |
+| 4 摘要落库 | 真实 `summarize_chat(store, brain, GROUP, 910000001, "2026-10-25")` | `summaries` **1 行**，156 字；`usage` `purpose=summary p=435 c=107` |
+| 5 记忆生效 | 再发「你还记得群里谁养猫吗」 | 回复 `红姐养的猫，不过小美也喜欢猫……`（来自印象注入，不是当轮消息） |
+
+印象样本（节选）：
+
+```
+10002 nickname 外号叫鱼片            0.9
+10003 nickname 外号叫红姐            0.9
+10003 fact     住在杭州              0.9
+10003 preference 喝咖啡不加糖，只加奶  0.9
+10002 fact     养了一只柯基叫土豆      0.8
+```
+
+摘要正文（156 字，≤200）：
+
+```
+群聊中成员分享日常与兴趣，提及养猫、编程语言学习及职业规划。小明养了两只猫，分别叫团子和土豆，
+红姐住在杭州，喜欢爬山且喝咖啡不加糖。阿强外号强哥，是左撇子，不吃香菜。小美喜欢猫，讨厌狗，
+正在准备考研。验收员提到本地模型记忆功能测试，Deepseek娘回应表示已准备好。群内成员包括程序员、
+产品经理等不同职业背景。
+```
+
+**模型选型坑（本地模型模式）**：`qwen/qwen3.5-9b` 是重推理模型，记忆旁路固定传 `max_tokens=600`，预算全被 reasoning 吃掉，正文为空：
+
+| 模型 / 参数 | completion_tokens | reasoning 长度 | 正文 |
+| --- | --- | --- | --- |
+| `qwen/qwen3.5-9b`，600 | 600（打满） | 1833 字符 | 空 |
+| `qwen/qwen3.5-9b`，2048（印象 JSON） | 2048（打满） | — | 空 |
+| `qwen/qwen3.5-9b`，2048（摘要） | 1118 | — | 119 字 ✅ |
+| `qwen/qwen3.5-9b` + `/no_think` 或 `chat_template_kwargs.enable_thinking=false` | 600（打满） | 1817 字符 | 空（模板忽略开关） |
+| `qwen/qwen3-8b`，600 | 404 | 0 | 11 条 JSON ✅ |
+
+结论：本地模型模式要跑记忆旁路，选**非思考模型**（本轮 `qwen/qwen3-8b`）；若坚持用 9B 思考模型，需要调大 workers 的预算，而印象抽取即使 2048 也会被打满——所以选型比调参更可靠。这是模型选型风险，不是代码缺陷，本轮未改代码。
+
+**「dashboard 可见」的偏差**：dashboard 路由只有 `health / status / logs / qr / brain / control / shutdown`，没有摘要/印象面板。可判定证据改为「库内行数 > 0 + 下一轮回复确实引用印象」；若需要面板，属于新需求。
 
 ### 3. 群里问联网问题：10 秒内先出提示语，最终回复引用页面事实 —— ✅ 通过（事实 ✅ / 提示语 ✅ 已修）
 
@@ -261,7 +309,7 @@ GET /api/config
 | 步骤 | 状态 | 结果 |
 | --- | --- | --- |
 | 1 启动 + 隔离确认 | ✅ | 见上 |
-| 2 摘要/印象真跑 | 🔒 | provider 免费额度 429，见第 2 条 |
+| 2 摘要/印象真跑 | ✅ | 云端 429 后改用本地模型模式补验：摘要 1 行 / 印象 11 行，见第 2 条 |
 | 3 联网 + 提示语 | ⚠️ | 事实 ✅（5.3s / 12.5s，真 uuid）、提示语 ❌，见第 3 条 |
 | 4 `MEMORY.md` 自写 | ✅ | `read`/`edit` 均 completed，见第 4 条 |
 | 5 权限三项 | ✅ | 拒 / 拒 / 成，见第 8 条 |
@@ -271,7 +319,8 @@ GET /api/config
 
 ## 未验证项与风险
 
-- **第 2 条**：被 provider 免费额度挡住（429），成功产出未观测。落库/展示链路由离线用例保证，真机只差一次成功调用。
+- **第 2 条**：云端 free 模型仍被 429 挡住；已改用本地模型模式（`qwen/qwen3-8b` + 假 NapCat）补验通过。云端 opencode 路径下的摘要/印象仍未成功产出过一次，属外部配额问题。
+- **本地模型模式的模型选型**：`qwen/qwen3.5-9b` 会把 workers 的 600-token 预算全花在 reasoning 上，正文为空；要跑记忆旁路请选非思考模型。dashboard 没有摘要/印象面板，「可见」以库内行数 + 下一轮注入为准。
 - **第 3 条提示语**：已修并在真机复跑验证（4.31s 触发 / 6.73s 结束）；仍需进群确认 QQ 侧的发送时延。「事实引用」已通过。
 - **第 9 条真机复核**：未做，离线用例已覆盖审计与轮换逻辑。
 - **未连 QQ**：真实群消息的时延、`@` 识别、静音判定都走的是离线用例；`triggers.mode: model` 的批次链路只在 MockTransport 下跑过完整流程。
