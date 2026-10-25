@@ -422,3 +422,22 @@ def test_error_status_accepts_common_field_names() -> None:
     assert _error_status({"code": 402}) == 402
     assert _error_status({"code": "rate_limit_exceeded"}) is None
     assert _error_status({"status": True}) is None
+
+
+async def test_named_error_nested_status_is_kept(store: Store) -> None:
+    """NamedError 风格（name/data）也要能取到状态码和原因。"""
+    server = FakeServer(
+        text_parts=[],
+        error={
+            "name": "APIError",
+            "data": {"statusCode": 429, "message": "slow down"},
+        },
+    )
+    brain = make_brain(store, server, timeout=2.0)
+    with pytest.raises(BrainError) as excinfo:
+        await brain.reply(ChatType.PRIVATE, 42, "在吗")
+    await brain.aclose()
+
+    assert excinfo.value.status == 429
+    assert "APIError" in str(excinfo.value)
+    assert "slow down" in str(excinfo.value)

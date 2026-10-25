@@ -70,6 +70,17 @@ def _created(message: dict[str, Any]) -> float:
 
 def _error_status(error: dict[str, Any]) -> int | None:
     """provider 错误里的 HTTP 状态码：字段名随 SDK 版本变，能认几个认几个。"""
+    status = _status_field(error)
+    if status is not None:
+        return status
+    # 有的 provider 把细节包在 data 里（NamedError 风格）：再看一层。
+    nested = error.get("data")
+    if isinstance(nested, dict):
+        return _status_field(nested)
+    return None
+
+
+def _status_field(error: dict[str, Any]) -> int | None:
     for field in ("statusCode", "status_code", "status", "code"):
         raw = error.get(field)
         if isinstance(raw, bool):
@@ -395,8 +406,9 @@ class OpenCodeHttpBrain:
             if message.get("finish") != "error":
                 return None
             error = message.get("error") or {}
-            kind = str(error.get("type") or "unknown")
-            detail = str(error.get("message") or "").strip()
+            data = error.get("data") if isinstance(error.get("data"), dict) else {}
+            kind = str(error.get("type") or error.get("name") or "unknown")
+            detail = str(error.get("message") or data.get("message") or "").strip()
             text = (
                 f"OpenCode 调用失败（{kind}）：{detail}"
                 if detail
