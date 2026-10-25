@@ -233,6 +233,42 @@ async def test_addressed_batch_uses_reply_purpose(tmp_path):
         ChatType.GROUP, 1001, store.today(), ("reply",)
     )
     assert calls == 1
+    # 引用回复与 @ 是两种不同的点名，prompt 里要能区分。
+    assert "（引用回复你）" in brain.last_prompt
+    assert "（@了你）" not in brain.last_prompt
+
+
+async def test_at_bot_batch_marks_at(tmp_path):
+    service, store, brain, _ = build(tmp_path)
+
+    await service.handle(make_msg("在吗", message_id="m2", at_bot=True))
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert "（@了你）" in brain.last_prompt
+    assert "（引用回复你）" not in brain.last_prompt
+
+
+async def test_addressed_state_survives_service_restart(tmp_path):
+    service, store, brain, adapter = build(tmp_path)
+
+    await service.handle(make_msg("在吗", message_id="m2", at_bot=True))
+
+    # 模拟进程重启：新 Service 内存里没有任何点名记录，只能从库里读。
+    restarted = Service(
+        service.settings,
+        store,
+        brain,
+        adapter,
+        service.router,
+        "你是溟月",
+        injection=InjectionConfig(),
+    )
+    await restarted._run_batch(ChatType.GROUP, 1001)
+
+    calls, _ = store.usage_today_by_purpose(
+        ChatType.GROUP, 1001, store.today(), ("reply",)
+    )
+    assert calls == 1
     assert "（@了你）" in brain.last_prompt
 
 

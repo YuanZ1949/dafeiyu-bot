@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     is_bot INTEGER NOT NULL DEFAULT 0,
     timestamp INTEGER NOT NULL DEFAULT 0,
+    -- 点名语义要跨进程存活：批次靠它决定 purpose=reply 与 prompt 标记。
+    at_bot INTEGER NOT NULL DEFAULT 0,
+    reply_to_bot INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (chat_type, chat_id, message_id)
 );
@@ -113,6 +116,10 @@ CREATE TABLE IF NOT EXISTS delivered_messages (
 
 # 老库升级：SQLite 的 ALTER TABLE ADD COLUMN 必须带默认值（NOT NULL 也要给）。
 _MIGRATIONS: dict[str, dict[str, str]] = {
+    "messages": {
+        "at_bot": "INTEGER NOT NULL DEFAULT 0",
+        "reply_to_bot": "INTEGER NOT NULL DEFAULT 0",
+    },
     "brain_sessions": {
         "created_at": "TEXT",
         "delivered_count": "INTEGER NOT NULL DEFAULT 0",
@@ -209,8 +216,9 @@ class Store:
         cur = self._conn.execute(
             """
             INSERT OR IGNORE INTO messages
-                (chat_type, chat_id, message_id, user_id, nickname, content, is_bot, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (chat_type, chat_id, message_id, user_id, nickname, content, is_bot,
+                 timestamp, at_bot, reply_to_bot)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 m.chat_type.value,
@@ -221,6 +229,8 @@ class Store:
                 m.content,
                 int(m.is_bot),
                 m.timestamp,
+                int(m.at_bot),
+                int(m.reply_to_bot),
             ),
         )
         self._conn.commit()
@@ -498,6 +508,8 @@ class Store:
             content=r["content"],
             message_id=r["message_id"],
             is_bot=bool(r["is_bot"]),
+            at_bot=bool(r["at_bot"]),
+            reply_to_bot=bool(r["reply_to_bot"]),
             timestamp=r["timestamp"],
         )
 

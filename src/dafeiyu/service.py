@@ -33,6 +33,10 @@ FOLLOWUP_REPLY = "没查到什么有用的，本鱼先不瞎说了"
 TOOL_HINT_INTERVAL_SECONDS = 60.0
 # 轮换摘要的输入窗口（spec §9.2：最近 40 条）。
 ROTATION_WINDOW = 40
+# 批次被跳过的原因。error 与 record_usage(purpose="error") 同口径
+# （spec §8.4 原写作 failed，实现统一取 error，避免同一件事两个名字）。
+SKIP_BUDGET = "budget"
+SKIP_ERROR = "error"
 
 
 class Service:
@@ -63,8 +67,6 @@ class Service:
         self._scheduler_task: asyncio.Task | None = None
         self._locks: dict[tuple[ChatType, int], asyncio.Lock] = {}
         self._batch_locks: dict[tuple[ChatType, int], asyncio.Lock] = {}
-        # 点名消息的 id（store 不落 at_bot/reply_to_bot），批次据此决定 purpose 与标记。
-        self._addressed_ids: set[str] = set()
         # 轮换后的接续文本：成功投递才弹出，失败留到下一批重试。
         self._continuations: dict[tuple[ChatType, int], str] = {}
         self._hint_at: dict[tuple[ChatType, int], float] = {}
@@ -180,8 +182,6 @@ class Service:
             log.debug("skip %s/%s: %s", msg.chat_id, msg.message_id, reason)
             return
 
-        if addressed:
-            self._addressed_ids.add(msg.message_id)
         scheduler.note(msg, addressed=addressed)
 
     def _group_skip_reason(self, msg: Message, *, addressed: bool) -> str | None:
@@ -216,14 +216,13 @@ class Service:
             return
 
         ids = [m.message_id for m in batch]
-        addressed_ids = [mid for mid in ids if mid in self._addressed_ids]
+        addressed_ids = [m.message_id for m in batch if m.at_bot or m.reply_to_bot]
         addressed = bool(addressed_ids)
         current_id = addressed_ids[-1] if addressed_ids else ids[-1]
         key = (chat_type, chat_id)
 
         if not self._budget_for(chat_type, chat_id, addressed=addressed):
-            self.store.mark_skipped(chat_type, chat_id, ids, "budget")
-            self._addressed_ids.difference_update(ids)
+            self.store.mark_skipped(chat_type, chat_id, ids, SKIP_BUDGET)
             log.debug("批次跳过（预算）%s/%s", chat_id, current_id)
             return
 
@@ -241,8 +240,6 @@ class Service:
             batch,
             injection,
             continuation=self._continuations.get(key),
-            addressed=addressed,
-            current_id=current_id,
         )
 
         hint = self._tool_hint(chat_type, chat_id)
@@ -251,8 +248,7 @@ class Service:
         except BrainError as exc:
             # 失败也占一次调用额度；游标随 mark_skipped 推进，不重投（补话已经告诉用户了）。
             self.store.record_usage(chat_type, chat_id, "error", 0, 0)
-            self.store.mark_skipped(chat_type, chat_id, ids, "error")
-            self._addressed_ids.difference_update(ids)
+            self.store.mark_skipped(chat_type, chat_id, ids, SKIP_ERROR)
             log.warning("批次调用失败 %s/%s: %s", chat_id, current_id, exc)
             await self.adapter.send(
                 chat_type, chat_id, FOLLOWUP_REPLY if hint.sent else BRAIN_ERROR_REPLY
@@ -285,7 +281,6 @@ class Service:
             messages=len(batch),
             tokens=reply.prompt_tokens + reply.completion_tokens,
         )
-        self._addressed_ids.difference_update(ids)
         self._continuations.pop(key, None)
         self._check_workspace(chat_type, chat_id)
 
@@ -337,7 +332,11 @@ class Service:
         )
 
     def _tool_hint(self, chat_type: ChatType, chat_id: int):
-        """返回 on_tool 回调：每轮最多一次（brain 侧保证），同 chat 60s 内不重复。"""
+        """返回 on_tool 回调：每轮最多一次（brain 侧保证），同 chat 60s 内不重复。
+
+        节流时间戳是进程内状态：多实例部署时各算各的，最坏情况同一分钟内多发
+        一条提示语（提示语只是过渡消息，重复无害），因此不为此建表。
+        """
         key = (chat_type, chat_id)
 
         async def hint(tool: str) -> None:
