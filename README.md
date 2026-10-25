@@ -231,6 +231,7 @@ NapCat 已连接
 | 群消息完全没反应 | 机器人小号没进群；群在 blacklist；`groups.whitelist` 非空但没包含该群；看 `logs/dafeiyu.log` 里的 `reason` |
 | 回得很慢 | `DEEPSEEK_MODEL=deepseek-chat` 比 `deepseek-reasoner` 快很多；检查系统代理，httpx 已设 `trust_env=False` |
 | HTTP 429 | 触发限流：降低 `sample_rate`、调小 `budget.daily_calls`，或给账户充值 |
+| 记忆面板不更新、提示「配额暂停中」 | 账号级熔断：10 分钟内累计 3 次 429 或 provider 报 quota 后，摘要/印象暂停 1 小时，面板显示恢复时间；日志搜「429」可见触发原因 |
 | 回复被截断 | 这是设计行为：闲聊 120 字、技术问题 300 字，改 `config.yaml` 即可 |
 | 中文日志乱码 | 用 `scripts/start.ps1` 启动（已设 UTF-8），不要直接双击 python |
 
