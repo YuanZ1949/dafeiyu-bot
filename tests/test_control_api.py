@@ -14,6 +14,7 @@ from dafeiyu.brain.factory import mode_status
 from dafeiyu.config import load_settings
 from dafeiyu.control import BrainControl, create_app
 from dafeiyu.memory.store import Store
+from dafeiyu.models import ChatType
 from dafeiyu.runtime import RuntimeState
 
 YAML = """\
@@ -232,3 +233,54 @@ async def test_runtime_file_overrides_config_provider(tmp_path: Path) -> None:
     snapshot = control.snapshot()
     assert snapshot["provider"] == "local_model"
     assert snapshot["model"] == "saved-model"
+
+async def test_memory_endpoint_empty(tmp_path: Path) -> None:
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.get("/api/memory")
+        payload = await resp.json()
+    assert resp.status == 200
+    assert payload == {"summaries": [], "impressions": []}
+
+
+async def test_memory_endpoint_returns_store_rows(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    control.store.upsert_summary(ChatType.GROUP, 100, "2026-10-24", "昨天聊了钓鱼")
+    control.store.upsert_impression(ChatType.GROUP, 100, 42, "preference", "喜欢猫", 0.9)
+
+    async with running(app) as client:
+        resp = await client.get("/api/memory?limit=5")
+        payload = await resp.json()
+
+    assert resp.status == 200
+    summary = payload["summaries"][0]
+    assert summary["chat_type"] == "group"
+    assert summary["chat_id"] == 100
+    assert summary["date"] == "2026-10-24"
+    assert summary["content"] == "昨天聊了钓鱼"
+    impression = payload["impressions"][0]
+    assert impression["chat_type"] == "group"
+    assert impression["chat_id"] == 100
+    assert impression["subject_user_id"] == 42
+    assert impression["kind"] == "preference"
+    assert impression["content"] == "喜欢猫"
+    assert impression["confidence"] == 0.9
+
+
+async def test_memory_endpoint_reports_read_failure(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    control.store.close()
+
+    async with running(app) as client:
+        resp = await client.get("/api/memory")
+        payload = await resp.json()
+
+    assert resp.status == 500
+    assert "读取记忆失败" in payload["error"]
+
+
+async def test_memory_endpoint_rejects_bad_limit(tmp_path: Path) -> None:
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.get("/api/memory?limit=abc")
+    assert resp.status == 400

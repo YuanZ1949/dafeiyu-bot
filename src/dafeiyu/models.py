@@ -42,3 +42,12 @@ class Impression:
     content: str
     confidence: float
     updated_at: str = ""
+
+
+@dataclass
+class Summary:
+    chat_type: ChatType
+    chat_id: int
+    date: str
+    content: str
+    updated_at: str = ""

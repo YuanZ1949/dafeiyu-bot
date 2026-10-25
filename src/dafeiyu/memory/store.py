@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from dafeiyu.models import ChatType, Impression, Message
+from dafeiyu.models import ChatType, Impression, Message, Summary
 from dafeiyu.timeutil import today_shanghai
 
 _SCHEMA = """
@@ -694,6 +694,18 @@ class Store:
         ).fetchall()
         return [self._row_to_impression(r) for r in rows]
 
+    def recent_impressions(self, limit: int = 20) -> list[Impression]:
+        """跨会话的最近印象，仅供 dashboard 只读展示。"""
+        rows = self._conn.execute(
+            """
+            SELECT * FROM impressions
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [self._row_to_impression(r) for r in rows]
+
     @staticmethod
     def _row_to_impression(r: sqlite3.Row) -> Impression:
         return Impression(
@@ -725,6 +737,27 @@ class Store:
             (chat_type.value, chat_id, date),
         ).fetchone()
         return None if row is None else str(row["content"])
+
+    def recent_summaries(self, limit: int = 20) -> list[Summary]:
+        """跨会话的最近按日摘要，仅供 dashboard 只读展示。"""
+        rows = self._conn.execute(
+            """
+            SELECT chat_type, chat_id, date, content, updated_at FROM summaries
+            ORDER BY date DESC, updated_at DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [
+            Summary(
+                chat_type=ChatType(r["chat_type"]),
+                chat_id=r["chat_id"],
+                date=r["date"],
+                content=r["content"],
+                updated_at=r["updated_at"],
+            )
+            for r in rows
+        ]
 
     # ---- 轮换摘要（一次性接续，与按日 summaries 分开） --------------
     def add_session_summary(self, chat_type: ChatType, chat_id: int, content: str) -> None:

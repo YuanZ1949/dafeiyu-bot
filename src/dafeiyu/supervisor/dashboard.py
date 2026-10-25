@@ -182,6 +182,13 @@ def create_app(
         code, data = await bot_call("GET", "/api/brain/models", None, BOT_SWITCH_TIMEOUT)
         return web.json_response(data, status=code)
 
+    async def memory(request: web.Request) -> web.Response:
+        path = "/api/memory"
+        if request.query_string:
+            path = f"{path}?{request.query_string}"
+        code, data = await bot_call("GET", path)
+        return web.json_response(data, status=code)
+
     async def control(request: web.Request) -> web.Response:
         action = request.match_info["action"]
         if action not in ("start", "stop", "restart"):
@@ -228,6 +235,7 @@ def create_app(
     app.router.add_get("/api/brain", get_brain)
     app.router.add_post("/api/brain", post_brain)
     app.router.add_get("/api/brain/models", models)
+    app.router.add_get("/api/memory", memory)
     app.router.add_post("/api/control/{action}", control)
     app.router.add_post("/api/shutdown", shutdown)
     return app

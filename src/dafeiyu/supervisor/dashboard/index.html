@@ -72,6 +72,13 @@
   .st-external .dot { background: var(--accent); }
   .st-stopped .dot { background: #4b5563; }
   .kv { color: var(--muted); font-size: 12px; }
+  .mem-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .mem-col h3 { margin: 0 0 8px; font-size: 12px; color: var(--muted); font-weight: 600; }
+  .mem-list { display: grid; gap: 8px; max-height: 300px; overflow: auto; }
+  .mem-item { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--panel-2); }
+  .mem-meta { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  .mem-text { white-space: pre-wrap; word-break: break-word; }
+  .mem-empty { color: var(--muted); font-size: 12px; }
   .proc-name { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
   .proc-actions { margin-top: 10px; display: flex; gap: 6px; }
   .proc-actions .btn { padding: 4px 10px; font-size: 12px; }
@@ -137,6 +144,25 @@
     <div class="row" style="margin-top:12px">
       <button class="btn primary" id="btn-apply-brain">应用切换</button>
       <span class="kv" id="brain-hint"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="margin-bottom:10px">
+      <h2 style="margin:0">记忆</h2>
+      <span class="kv" id="memory-hint"></span>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn" id="btn-refresh-memory">刷新</button>
+    </div>
+    <div class="mem-grid">
+      <div class="mem-col">
+        <h3>按日摘要</h3>
+        <div class="mem-list" id="memory-summaries"></div>
+      </div>
+      <div class="mem-col">
+        <h3>群印象</h3>
+        <div class="mem-list" id="memory-impressions"></div>
+      </div>
     </div>
   </section>
 
@@ -354,6 +380,57 @@ async function refresh() {
   }
 }
 
+function chatLabel(item) {
+  const kind = item.chat_type === "group" ? "群" : "私聊";
+  return `${kind} ${item.chat_id}`;
+}
+
+function memItem(meta, text) {
+  const item = document.createElement("div");
+  item.className = "mem-item";
+  const head = document.createElement("div");
+  head.className = "mem-meta";
+  head.textContent = meta;
+  const body = document.createElement("div");
+  body.className = "mem-text";
+  body.textContent = text;
+  item.append(head, body);
+  return item;
+}
+
+function renderMemory(data) {
+  const summaries = (data && data.summaries) || [];
+  const impressions = (data && data.impressions) || [];
+  const summaryBox = $("memory-summaries");
+  const impressionBox = $("memory-impressions");
+
+  summaryBox.replaceChildren();
+  impressionBox.replaceChildren();
+  summaries.forEach((s) => {
+    summaryBox.appendChild(memItem(`${chatLabel(s)} · ${s.date}`, s.content));
+  });
+  impressions.forEach((i) => {
+    const subject = i.subject_user_id ? ` · 用户 ${i.subject_user_id}` : "";
+    const confidence = Math.round((i.confidence || 0) * 100);
+    impressionBox.appendChild(
+      memItem(`${chatLabel(i)} · ${i.kind}${subject} · ${confidence}%`, i.content)
+    );
+  });
+  if (!summaries.length) summaryBox.innerHTML = '<div class="mem-empty">库里还没有摘要</div>';
+  if (!impressions.length) impressionBox.innerHTML = '<div class="mem-empty">库里还没有印象</div>';
+  $("memory-hint").textContent = `摘要 ${summaries.length} 条 · 印象 ${impressions.length} 条`;
+}
+
+async function loadMemory() {
+  try {
+    renderMemory(await api("/api/memory?limit=30"));
+  } catch (err) {
+    $("memory-summaries").replaceChildren();
+    $("memory-impressions").replaceChildren();
+    $("memory-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
 async function doControl(act, target) {
   const label = { start: "启动", stop: "停止", restart: "重启" }[act] || act;
   const name = target === "all" ? "全部进程" : (PROC_TITLE[target] || target);
@@ -447,6 +524,7 @@ document.addEventListener("click", (ev) => {
 
 $("btn-refresh-models").addEventListener("click", loadModels);
 $("btn-apply-brain").addEventListener("click", applyBrain);
+$("btn-refresh-memory").addEventListener("click", loadMemory);
 $("model-select").addEventListener("change", (ev) => { selectedModel = ev.target.value; });
 $("btn-shutdown").addEventListener("click", async () => {
   if (!confirm("将停止 OpenCode / Bot / NapCat 三个进程并退出控制台，确定吗？")) return;
@@ -460,7 +538,9 @@ $("btn-shutdown").addEventListener("click", async () => {
 
 initTabs();
 refresh();
+loadMemory();
 setInterval(refresh, 2000);
+setInterval(loadMemory, 10000);
 </script>
 </body>
 </html>

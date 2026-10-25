@@ -108,6 +108,34 @@ class BrainControl:
         except Exception:
             log.debug("关闭旧 brain 失败", exc_info=True)
 
+    def memory_snapshot(self, limit: int = 20) -> dict[str, Any]:
+        """dashboard 只读记忆面板的数据源：最近摘要 + 最近印象。"""
+        limit = max(1, min(200, int(limit)))
+        return {
+            "summaries": [
+                {
+                    "chat_type": s.chat_type.value,
+                    "chat_id": s.chat_id,
+                    "date": s.date,
+                    "content": s.content,
+                    "updated_at": s.updated_at,
+                }
+                for s in self.store.recent_summaries(limit)
+            ],
+            "impressions": [
+                {
+                    "chat_type": i.chat_type.value,
+                    "chat_id": i.chat_id,
+                    "subject_user_id": i.subject_user_id,
+                    "kind": i.kind,
+                    "content": i.content,
+                    "confidence": i.confidence,
+                    "updated_at": i.updated_at,
+                }
+                for i in self.store.recent_impressions(limit)
+            ],
+        }
+
     async def list_models(self) -> list[str]:
         base = self.settings.local_model.base_url.rstrip("/")
         if not base:
@@ -186,11 +214,25 @@ def create_app(control: BrainControl, token: str = "") -> web.Application:
         except SwitchError as exc:
             return web.json_response({"error": exc.reason}, status=exc.status)
 
+    async def memory(request: web.Request) -> web.Response:
+        try:
+            limit = int(request.query.get("limit", "20"))
+        except ValueError:
+            return web.json_response({"error": "limit 必须是整数"}, status=400)
+        try:
+            return web.json_response(control.memory_snapshot(limit))
+        except Exception as exc:  # 读库失败不能把控制口打挂
+            log.warning("读取记忆失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取记忆失败：{exc.__class__.__name__}"}, status=500
+            )
+
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/brain", get_brain)
     app.router.add_post("/api/brain", post_brain)
     app.router.add_get("/api/brain/models", models)
+    app.router.add_get("/api/memory", memory)
     return app
 
 
