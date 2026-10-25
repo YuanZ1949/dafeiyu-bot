@@ -33,6 +33,12 @@ class TriggerConfig:
     mode: str = "rules"
     # 点名消息的硬上限：防抖一直被打断时，最多等这么久也必须回。
     addressed_max_wait_seconds: float = 30.0
+    # 非点名消息攒多久再回（批次窗口）。
+    batch_seconds: float = 45.0
+    # 点名后等群里说完再回；每来一条点名消息重新计时，但不突破上面的硬上限。
+    addressed_debounce_seconds: float = 8.0
+    # 两次非点名发言之间的最小间隔。
+    ambient_min_interval_seconds: float = 90.0
 
 
 @dataclass(frozen=True)
