@@ -11,9 +11,9 @@
 | 范围 | 结果 |
 | --- | --- |
 | 离线（MockTransport，不连 QQ） | 5 条完全通过（1 / 5 / 6 / 7 / 9），2 条部分通过（2 / 3） |
-| 真机（真实 opencode server + 真实模型，未连 QQ） | 2 条通过（4 / 8），1 条部分（3：事实 ✅ / 提示语 ❌），1 条被外部配额阻塞（2） |
-| 全量测试 | `393 passed in 81.14s`（Task 14 起点基线 386，新增 7 条） |
-| 发现缺陷 | 4 个已修（`/forget` 不删 session、supervisor 没注入隔离 env、`OPENCODE_CONFIG` 覆盖隔离、provider 错误死等 240s）+ 1 个未修（`on_tool` 提示语从不触发） |
+| 真机（真实 opencode server + 真实模型，未连 QQ） | 3 条通过（3 / 4 / 8），1 条被外部配额阻塞（2） |
+| 全量测试 | `394 passed in 83.43s`（Task 14 起点基线 386；含后续 on_tool 修复新增 1 条） |
+| 发现缺陷 | 5 个已修（`/forget` 不删 session、supervisor 没注入隔离 env、`OPENCODE_CONFIG` 覆盖隔离、provider 错误死等 240s、`on_tool` 提示语从不触发） |
 
 真机部分**未连 QQ**：直接对隔离后的 `opencode serve` 发真实 prompt，覆盖了权限、联网、记笔记三条；唯一必须进群才能判定的只剩「真实群消息 → 提示语时延」的场景差异（见第 3 条）。
 第 2 条（摘要/印象）被 provider 免费额度（429）挡住，属于外部阻塞，不是代码缺陷——但它顺带暴露了第 4 个缺陷（错误被吞成超时），已修。
@@ -87,22 +87,23 @@
 
 **退路**：等额度恢复，或把 `deepseek-qq` / `dafeiyu-memory` 的 `model:` 换成非 free 模型后重跑本步。落库与展示链路由离线用例保证，真机只差一次成功产出。
 
-### 3. 群里问联网问题：10 秒内先出提示语，最终回复引用页面事实 —— ⚠️ 部分通过（事实 ✅ / 提示语 ❌）
+### 3. 群里问联网问题：10 秒内先出提示语，最终回复引用页面事实 —— ✅ 通过（事实 ✅ / 提示语 ✅ 已修）
 
 真机执行（隔离 serve + 真实模型）：
 
 | 探针 | 耗时 | 工具 part | 提示语 | 回复内容 |
 | --- | --- | --- | --- | --- |
-| 单次 webfetch `https://httpbin.org/uuid` | 5.3s | `('tool','completed')` | 无 | 含真实 uuid `e34800e8-…`（无法凭记忆编出） |
-| 两次串行 webfetch `/delay/4` + `/uuid` | 12.5s | 两次 completed | 无 | 含 `url = https://httpbin.org/delay/4` 与 uuid `24a6e434-…` |
+| 单次 webfetch `https://httpbin.org/uuid` | 5.3s | `('tool','completed')` | 无（修复前） | 含真实 uuid `e34800e8-…`（无法凭记忆编出） |
+| 两次串行 webfetch `/delay/4` + `/uuid` | 12.5s | 两次 completed | 无（修复前） | 含 `url = https://httpbin.org/delay/4` 与 uuid `24a6e434-…` |
+| 单次 webfetch `/uuid`（修复后复跑） | 6.7s | `('tool','completed')` | **4.31s 触发** | 含真实 uuid `5af08450-…` |
 
-**事实引用：通过。** 两次都真抓了页面，返回值可核验。
+**事实引用：通过。** 三次都真抓了页面，返回值可核验。
 
-**10 秒内提示语：不通过——`on_tool` 在真实 server 上从不触发。** 两次探针 `marks=[]`，即使整个轮次长达 12.5 秒、中间有 4 秒阻塞的 webfetch。
+**10 秒内提示语：修复后通过。** 修复前两次探针 `marks=[]`，即使整个轮次长达 12.5 秒、中间有 4 秒阻塞的 webfetch。修复后复跑同一探针：`ON_TOOL webfetch 4.31` / `TOTAL 6.73`，提示语早于最终回复 2.4 秒。
 
 根因（`src/dafeiyu/brain/opencode_http.py` `_ask`）：`on_tool` 的检查在轮询循环**顶部**，用的是 `_wait` 之前的 messages；而 `_wait` 是长轮询，**阻塞到会话空闲才返回 204**。真实 server 下整个轮次往往在第一次 `_wait` 里就跑完，拿到 204 后重新拉一次 messages 直接 `return`，中途再也不检查 tool part。单元测试能过是因为 `FakeServer` 的 wait 每次只补一步并返回 200（未空闲），下一轮顶部检查才看得到 running 的 tool part——真实 server 不这样分次返回。
 
-**退路/建议修法**（未在本任务实施，属轮询策略的设计级改动）：给 `_wait` 加超时切片（如 `asyncio.wait_for(self._wait(sid), timeout=1.0)`，超时即继续循环），或改成 0.5s 轮询 `/message` 直到空闲。两者都能让 `on_tool` 在工具启动后 1 秒内触发，代价是每轮多几次轻量请求。
+**修复**：`_wait` 用 `asyncio.wait_for(..., timeout=WAIT_SLICE_SECONDS)`（2s）切片；切片超时视为「本轮还在跑」，直接回循环顶部重读 messages 并检查工具 part，不再额外 sleep（切片本身已经等过）。正常完成路径仍是 204 立即返回，时延不变。测试替身 `BlockingWaitServer`（`tests/test_ask_round.py`）忠实复现「阻塞到空闲才回 204」：修复前 RED（`marks=[]`）、修复后 GREEN。
 
 ### 4. 3 次对话内 `MEMORY.md` 出现模型自写条目 —— ✅ 通过（真机）
 
@@ -235,9 +236,9 @@
 
 **退路**：无需退路。正常轮次 `finish` 不是 `"error"`，行为不变。
 
-### `on_tool` 提示语在真实 server 上从不触发（未修）
+### `on_tool` 提示语在真实 server 上从不触发（已修）
 
-见第 3 条。已定位到 `_ask` 的长轮询结构，修法属轮询策略的设计级改动，需要单独任务 + 能忠实模拟「阻塞到空闲」的测试替身，本任务只记录不改。
+见第 3 条。`_ask` 的长轮询 `_wait` 现在按 2s 切片（`WAIT_SLICE_SECONDS`），超时即回循环顶部重读消息、检查工具 part。测试替身 `BlockingWaitServer` 复现真实语义（阻塞到空闲才回 204）：修复前 RED（`marks=[]`）、修复后 GREEN。真机复跑：`ON_TOOL webfetch 4.31` / `TOTAL 6.73`。
 
 ## 真机联调执行记录
 
@@ -271,7 +272,7 @@ GET /api/config
 ## 未验证项与风险
 
 - **第 2 条**：被 provider 免费额度挡住（429），成功产出未观测。落库/展示链路由离线用例保证，真机只差一次成功调用。
-- **第 3 条提示语**：真实 server 上 `on_tool` 从不触发（已定位到长轮询结构，未修）。「事实引用」已通过。
+- **第 3 条提示语**：已修并在真机复跑验证（4.31s 触发 / 6.73s 结束）；仍需进群确认 QQ 侧的发送时延。「事实引用」已通过。
 - **第 9 条真机复核**：未做，离线用例已覆盖审计与轮换逻辑。
 - **未连 QQ**：真实群消息的时延、`@` 识别、静音判定都走的是离线用例；`triggers.mode: model` 的批次链路只在 MockTransport 下跑过完整流程。
 - **隔离后的副作用**：bot 的 serve 不再加载全局 `dcp`（上下文裁剪）与 `retry-fast-fail`（provider 重试）。前者由 bot 自己的轮换替代，后者的职责部分由本任务新增的 `_round_error` 补上（只报错，不重试）。

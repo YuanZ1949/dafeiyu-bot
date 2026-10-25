@@ -522,7 +522,7 @@ memory:
 8. 权限实测：让它 read `.env` → 被拒；`shell` → 被拒；写 `data/bot-workspace/x.md` → 成功。
 9. 注入外来 synthetic → 日志命中 + 下一轮换 session。
 
-**实测（Task 14）**：全量 **393 passed**。第 1 / 5 / 6 / 7 / 9 条通过（离线）；第 4 / 8 条通过（真机）；第 3 条部分通过（真机：事实引用 ✅，5.3s / 12.5s 两次真抓 httpbin 返回真实 uuid；10 秒内提示语 ❌，`on_tool` 在真实 server 上从不触发）；第 2 条被 provider 免费额度阻塞（429 `provider.quota`，非代码缺陷）。共暴露 4 个真缺陷，均已修复：① 第 5 条首跑发现 `Service._forget_chat` 先 `store.forget_chat()` 清掉 session 映射，`brain.forget()` 随后查不到 id，**远端 session 从未被 DELETE**；② `manage_server: false` 时 supervisor 拉起 serve 没带隔离 env，隔离在生产路径完全没生效；③ `OPENCODE_CONFIG` 优先级高于 `XDG_CONFIG_HOME`，只设后者仍加载全局插件；④ `_ask` 只认「有非空文本」为完成，模型 `finish="error"` + `content: []` 时死等到 240s 超时、真实错误（配额/限流）被吞掉。另有 1 个未修：`on_tool` 的检查在长轮询 `_wait` 之前，真实 server 一轮跑完才返回，导致提示语永不触发——修法属轮询策略的设计级改动，需单独任务。明细见 `docs/superpowers/spikes/2026-10-24-e2e-acceptance.md`。
+**实测（Task 14）**：全量 **394 passed**。第 1 / 5 / 6 / 7 / 9 条通过（离线）；第 4 / 8 条通过（真机）；第 3 条通过（真机：事实引用 ✅，5.3s / 12.5s / 6.7s 三次真抓 httpbin 返回真实 uuid；10 秒内提示语 ✅，`_wait` 长轮询按 2s 切片后 4.31s 触发、6.73s 结束）；第 2 条被 provider 免费额度阻塞（429 `provider.quota`，非代码缺陷）。共暴露 5 个真缺陷，均已修复：① 第 5 条首跑发现 `Service._forget_chat` 先 `store.forget_chat()` 清掉 session 映射，`brain.forget()` 随后查不到 id，**远端 session 从未被 DELETE**；② `manage_server: false` 时 supervisor 拉起 serve 没带隔离 env，隔离在生产路径完全没生效；③ `OPENCODE_CONFIG` 优先级高于 `XDG_CONFIG_HOME`，只设后者仍加载全局插件；④ `_ask` 只认「有非空文本」为完成，模型 `finish="error"` + `content: []` 时死等到 240s 超时、真实错误（配额/限流）被吞掉；⑤ `on_tool` 的检查在长轮询 `_wait` 之前，真实 server 一轮跑完才返回，导致提示语永不触发——已用 `asyncio.wait_for` 2s 切片修复，并补了忠实模拟「阻塞到空闲」的测试替身 `BlockingWaitServer`。明细见 `docs/superpowers/spikes/2026-10-24-e2e-acceptance.md`。
 
 ## 15. 上线与回滚
 

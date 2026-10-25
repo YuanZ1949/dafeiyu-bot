@@ -1,7 +1,11 @@
 """Task 7：_ask 的本轮契约（RoundResult / 排序 / 结束 / token / 提示）。"""
 
+import asyncio
+import time
+
 import httpx
 
+from dafeiyu.brain import opencode_http
 from dafeiyu.brain.opencode_http import OpenCodeHttpBrain
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType
@@ -115,3 +119,91 @@ async def test_reply_uses_round_tokens() -> None:
 
     assert reply.reply == "结论是 X"
     assert (reply.prompt_tokens, reply.completion_tokens) == (200, 70)
+
+
+class BlockingWaitServer:
+    """真实 opencode 的 /wait 会一直挂到会话空闲才回 204。
+
+    ``FakeServer`` 的 wait 每次只补一步就回 200，等于抹掉了「阻塞期间客户端
+    拿不到新消息」这个事实，on_tool 用例因此假绿。这里按真实语义阻塞：
+    工具 part 在阻塞期间才出现，204 只在本轮跑完时返回。
+    """
+
+    def __init__(self, *, total: float = 0.3) -> None:
+        self.total = float(total)
+        self.messages: list[dict] = []
+        self.created = 1000.0
+        self.idle_at: float | None = None
+        self.tool_shown = False
+        self.finished = False
+        self.wait_calls = 0
+
+    def _stamp(self) -> float:
+        self.created += 10
+        return self.created
+
+    def _step(self, *, status: str, text: str) -> dict:
+        return {
+            "id": f"msg_a{len(self.messages)}",
+            "type": "assistant",
+            "time": {"created": self._stamp()},
+            "content": [
+                {"type": "tool", "name": "webfetch", "state": {"status": status}},
+                {"type": "text", "text": text},
+            ],
+        }
+
+    async def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path.endswith("/prompt"):
+            self.messages.append(
+                {"id": "msg_u", "type": "user", "time": {"created": self._stamp()}}
+            )
+            return httpx.Response(
+                200, json={"data": {"id": "msg_u", "time": {"created": self.created}}}
+            )
+        if request.method == "GET" and path.endswith("/message"):
+            return httpx.Response(200, json={"data": list(reversed(self.messages))})
+        if request.method == "POST" and path.endswith("/wait"):
+            self.wait_calls += 1
+            if not self.tool_shown:
+                self.tool_shown = True
+                self.messages.append(self._step(status="running", text="我先查一下"))
+            if self.idle_at is None:
+                self.idle_at = time.monotonic() + self.total
+            await asyncio.sleep(max(0.0, self.idle_at - time.monotonic()))
+            if not self.finished:
+                self.finished = True
+                self.messages.append(self._step(status="completed", text="结论是 X"))
+            return httpx.Response(204)
+        return httpx.Response(404, json={"message": "not found"})
+
+
+async def test_on_tool_fires_while_wait_blocks(monkeypatch) -> None:
+    """真实 /wait 会挂到本轮空闲；提示语必须在阻塞期间就触发。"""
+    server = BlockingWaitServer(total=0.3)
+    # 生产切片是 2s；测试里缩到 50ms，让同一段逻辑在毫秒级跑完。
+    monkeypatch.setattr(opencode_http, "WAIT_SLICE_SECONDS", 0.05, raising=False)
+    marks: list[tuple[str, bool]] = []
+
+    async def on_tool(name: str) -> None:
+        marks.append((name, server.finished))
+
+    store = Store(":memory:")
+    store.init_schema()
+    brain = OpenCodeHttpBrain(
+        base_url="http://opencode.test",
+        store=store,
+        password="",
+        timeout=2.0,
+        transport=httpx.MockTransport(server.handler),
+    )
+    try:
+        result = await brain._ask("s", "p", on_tool=on_tool)
+    finally:
+        await brain.aclose()
+
+    assert result.text == "结论是 X"
+    # 触发时本轮还没结束，且 wait 真的被切成了多次。
+    assert marks == [("webfetch", False)]
+    assert server.wait_calls > 1

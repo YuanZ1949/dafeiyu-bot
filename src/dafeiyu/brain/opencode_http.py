@@ -28,6 +28,8 @@ log = logging.getLogger(__name__)
 # OpenCode server 的 Basic 认证用户名固定，密码由 OPENCODE_SERVER_PASSWORD 决定。
 AUTH_USERNAME = "opencode"
 POLL_INTERVAL_SECONDS = 0.5
+# /wait 会一直挂到会话空闲才回 204；切成小片才能在中途看到工具 part。
+WAIT_SLICE_SECONDS = 2.0
 REQUEST_TIMEOUT_SECONDS = 15.0
 # 服务端 time.created 是毫秒（spike S2b）；本轮窗口只用它，禁止与 time.time() 混比。
 WINDOW_TOLERANCE_MS = 1000.0
@@ -302,7 +304,17 @@ class OpenCodeHttpBrain:
                 if tool is not None:
                     tool_fired = True
                     await on_tool(tool)
-            if await self._wait(session_id):
+            idle = False
+            sliced = False
+            try:
+                idle = await asyncio.wait_for(
+                    self._wait(session_id), timeout=WAIT_SLICE_SECONDS
+                )
+            except asyncio.TimeoutError:
+                # 服务端挂到会话空闲才回 204：切片超时说明本轮还在跑，
+                # 直接回到循环顶部重新读消息，工具 part 才能被看到。
+                sliced = True
+            if idle:
                 messages = await self._round_messages(session_id, since)
                 failure = self._round_error(messages)
                 if failure is not None:
@@ -327,7 +339,8 @@ class OpenCodeHttpBrain:
                 raise BrainError(
                     f"OpenCode 超时（{self.timeout:.0f} 秒），本条放弃"
                 )
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            if not sliced:
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     async def _round_messages(
         self, session_id: str, since: float
