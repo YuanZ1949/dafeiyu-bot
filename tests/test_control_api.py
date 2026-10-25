@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +16,7 @@ from dafeiyu.brain.client import BrainClient
 from dafeiyu.brain.factory import mode_status
 from dafeiyu.config import load_settings
 from dafeiyu.control import BrainControl, MemoryActions, create_app
-from dafeiyu.memory.store import Store
+from dafeiyu.memory.store import MAX_MEMORY_PAGE, Store
 from dafeiyu.models import ChatType
 from dafeiyu.runtime import RuntimeState
 from dafeiyu.workers.failure import MemoryPaused
@@ -227,6 +228,7 @@ async def test_memory_endpoint_empty(tmp_path: Path) -> None:
         "impression_total": 0,
         "summary_has_more": False,
         "impression_has_more": False,
+        "limit_max": MAX_MEMORY_PAGE,
     }
 
 
@@ -269,6 +271,7 @@ async def test_memory_endpoint_reports_totals_and_has_more(tmp_path: Path) -> No
         ).json()
 
     assert first["summary_total"] == 3
+    assert first["limit_max"] == MAX_MEMORY_PAGE
     assert len(first["summaries"]) == 2
     assert first["summary_has_more"] is True
     assert second["summary_has_more"] is False
@@ -534,3 +537,16 @@ async def test_delete_impression_rejects_bad_id(
     async with running(create_app(control, "", make_actions(control))) as client:
         resp = await client.delete(f"/api/memory/impressions/{impression_id}")
     assert resp.status == 400
+
+
+def test_dashboard_page_max_fallback_matches_backend() -> None:
+    """面板的兜底常量必须等于后端上限；正常路径以 limit_max 为准。"""
+    html = (
+        Path(__file__).resolve().parents[1]
+        / "src/dafeiyu/supervisor/dashboard/index.html"
+    ).read_text(encoding="utf-8")
+    match = re.search(r"MEMORY_PAGE_MAX_FALLBACK = (\d+)", html)
+    assert match, "面板缺少分页上限兜底常量"
+    assert int(match.group(1)) == MAX_MEMORY_PAGE
+    assert "data.limit_max" in html
+    assert "memoryPageMax" in html

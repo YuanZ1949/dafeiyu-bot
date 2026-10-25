@@ -442,15 +442,21 @@ function renderMemory(data) {
   $("memory-hint").textContent = totalShown
     ? `摘要 ${summaries.length}/${summaryTotal} · 印象 ${impressions.length}/${impressionTotal}`
     : `摘要 ${summaries.length} 条 · 印象 ${impressions.length} 条`;
+  // 分页上限以服务端 limit_max 为准；字段缺失（旧服务端）才用下面的兜底常量。
+  const limitMax = Number(data && data.limit_max);
+  if (Number.isFinite(limitMax) && limitMax > 0) memoryPageMax = limitMax;
+  if (memoryLimit > memoryPageMax) memoryLimit = memoryPageMax;
   const more =
     data && (data.summary_has_more || data.impression_has_more) !== undefined
       ? Boolean(data.summary_has_more || data.impression_has_more)
       : summaries.length >= memoryLimit || impressions.length >= memoryLimit;
-  $("btn-more-memory").disabled = !more || memoryLimit >= MEMORY_PAGE_MAX;
+  $("btn-more-memory").disabled = !more || memoryLimit >= memoryPageMax;
 }
 
 const MEMORY_PAGE = 30;
-const MEMORY_PAGE_MAX = 200;
+// 只在 /api/memory 没有 limit_max 的旧服务端上生效；正常路径读服务端字段。
+const MEMORY_PAGE_MAX_FALLBACK = 200;
+let memoryPageMax = MEMORY_PAGE_MAX_FALLBACK;
 let memoryLimit = MEMORY_PAGE;
 
 function memoryUrl() {
@@ -611,8 +617,8 @@ $("btn-refresh-memory").addEventListener("click", loadMemory);
 $("btn-summarize").addEventListener("click", triggerSummary);
 $("btn-extract").addEventListener("click", triggerExtract);
 $("btn-more-memory").addEventListener("click", () => {
-  if (memoryLimit >= MEMORY_PAGE_MAX) return;
-  memoryLimit = Math.min(MEMORY_PAGE_MAX, memoryLimit + MEMORY_PAGE);
+  if (memoryLimit >= memoryPageMax) return;
+  memoryLimit = Math.min(memoryPageMax, memoryLimit + MEMORY_PAGE);
   loadMemory();
 });
 $("memory-chat-filter").addEventListener("change", () => {

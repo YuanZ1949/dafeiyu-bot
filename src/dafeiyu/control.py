@@ -234,6 +234,8 @@ class BrainControl:
             "impression_total": impression_total,
             "summary_has_more": offset + len(summaries) < summary_total,
             "impression_has_more": offset + len(impressions) < impression_total,
+            # 分页上限的后端真值：面板据此禁用「显示更多」，不再各自写死 200。
+            "limit_max": MAX_MEMORY_PAGE,
         }
 
     async def list_models(self) -> list[str]:
