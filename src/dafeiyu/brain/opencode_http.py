@@ -35,6 +35,12 @@ WINDOW_TOLERANCE_MS = 1000.0
 TOOL_ACTIVE_STATES = {"pending", "running", "completed"}
 # 一轮正常对话只会出现这三类消息（spike S3：每轮都有 idle，漏掉它会每轮误判）。
 ALLOWED_MESSAGE_TYPES = {"user", "assistant", "idle"}
+# 工作区关闭时的会话级兜底：不改 agent 文件重启 opencode 也能收回全部工具。
+DENY_ALL_PERMISSIONS: list[dict[str, Any]] = [
+    {"action": "*", "resource": "*", "effect": "deny"}
+]
+# 旁路（摘要/印象）用的 agent：只有一条指令、全工具禁用，不与群聊 agent 共用。
+DEFAULT_MEMORY_AGENT = "dafeiyu-memory"
 
 
 class _UnknownSession(Exception):
@@ -95,12 +101,17 @@ class OpenCodeHttpBrain:
         project_dir: str = "",
         timeout: float = 90.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        memory_agent: str = DEFAULT_MEMORY_AGENT,
+        permissions: list[dict[str, Any]] | None = None,
     ) -> None:
         self.base_url = base_url.strip().rstrip("/")
         if not self.base_url:
             raise BrainError("未配置 opencode.server_url")
         self.store = store
         self.agent = agent.strip() or "deepseek-qq"
+        self.memory_agent = memory_agent.strip() or DEFAULT_MEMORY_AGENT
+        # None = 用 agent 文件里的权限；非 None 时下推到每个新 session。
+        self.permissions = permissions
         self.project_dir = project_dir.strip()
         self.timeout = float(timeout)
         if self.timeout <= 0:
@@ -169,7 +180,7 @@ class OpenCodeHttpBrain:
         self, text: str, *, purpose: str = "memory"
     ) -> tuple[str, int, int]:
         session_id = await self._create_session(
-            agent="dafeiyu-memory", title=f"mem:{purpose}"
+            agent=self.memory_agent, title=f"mem:{purpose}"
         )
         try:
             result = await self._ask(session_id, text)
@@ -254,8 +265,9 @@ class OpenCodeHttpBrain:
         agent_name = self.agent if agent is None else agent
         if agent_name:
             body["agent"] = agent_name
-        if permissions is not None:
-            body["permissions"] = permissions
+        effective = permissions if permissions is not None else self.permissions
+        if effective is not None:
+            body["permissions"] = effective
         if self.project_dir:
             body["location"] = {"directory": self.project_dir}
         payload = await self._request("POST", "/api/session", body=body)

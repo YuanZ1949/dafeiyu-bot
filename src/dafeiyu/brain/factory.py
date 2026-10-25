@@ -4,7 +4,7 @@ from typing import Any
 
 from .client import BrainClient
 from .opencode import OpenCodeBrain, resolve_opencode_bin
-from .opencode_http import OpenCodeHttpBrain
+from .opencode_http import DENY_ALL_PERMISSIONS, DEFAULT_MEMORY_AGENT, OpenCodeHttpBrain
 from ..config import ConfigError, Settings
 from ..memory.store import Store
 from ..runtime import RuntimeState
@@ -71,6 +71,7 @@ def build_brain(
     provider: str,
     model: str = "",
     server_url: str = "",
+    memory_agent: str = DEFAULT_MEMORY_AGENT,
 ) -> Any:
     provider = normalize_provider(provider)
     if provider == "opencode":
@@ -88,6 +89,10 @@ def build_brain(
                 agent=settings.opencode.agent,
                 project_dir=settings.opencode.project_dir,
                 timeout=settings.opencode.timeout_seconds,
+                memory_agent=memory_agent,
+                # 工作区关掉就下推会话级 deny：模型没有任何工具可用，
+                # 也不用改 agent 文件重启 opencode。
+                permissions=None if settings.workspace.enabled else DENY_ALL_PERMISSIONS,
             )
         try:
             bin_path = resolve_opencode_bin(settings.opencode.bin)

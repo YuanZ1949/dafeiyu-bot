@@ -377,11 +377,14 @@ class Service:
             self._continuations[(chat_type, chat_id)] = continuation
 
     def _check_workspace(self, chat_type: ChatType, chat_id: int) -> None:
-        """每轮结束后 stat 一次；超 64KB 保留尾部并留截断注释。"""
+        """每轮结束后 stat 一次；超上限保留尾部并留截断注释。"""
         if self.workspace is None:
             return
-        self.workspace.enforce_limit(self.workspace.global_path())
-        self.workspace.enforce_limit(self.workspace.chat_path(chat_type, chat_id))
+        limit = self.settings.workspace.max_file_bytes
+        self.workspace.enforce_limit(self.workspace.global_path(), max_bytes=limit)
+        self.workspace.enforce_limit(
+            self.workspace.chat_path(chat_type, chat_id), max_bytes=limit
+        )
 
     async def _ask_brain(self, msg: Message) -> BrainReply:
         """OpenCode 模式走会话接口；本地模式仍走原来的上下文拼装。"""

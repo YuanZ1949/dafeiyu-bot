@@ -79,6 +79,19 @@ class InjectionConfig:
 
 
 @dataclass(frozen=True)
+class WorkspaceConfig:
+    """长期记忆工作区。``dir`` 留空 = 关闭注入，并给 session 下全量 deny。"""
+
+    dir: str = "data/bot-workspace"
+    # 事后检查（不是硬拦截）：超限保留尾部并在首行插截断注释。
+    max_file_bytes: int = 65536
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.dir.strip())
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     level: str
     dir: str
@@ -172,6 +185,8 @@ class Settings:
     memory: MemoryConfig
     logging: LoggingConfig
     reasoning_effort: str = ""
+    injection: InjectionConfig = field(default_factory=InjectionConfig)
+    workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
     local_model: LocalModelConfig = field(default_factory=LocalModelConfig)
@@ -198,6 +213,56 @@ def _float(value: Any, field: str) -> float:
         return float(value)
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"{field} 必须是数字") from exc
+
+
+def _positive_int(value: Any, field: str, default: int) -> int:
+    got = _int(default if value is None else value, field)
+    if got < 1:
+        raise ConfigError(f"{field} 必须大于等于 1")
+    return got
+
+
+def _build_ambient_ratio(raw: dict[str, Any]) -> float:
+    ratio = _float(raw.get("ambient_ratio", 0.8), "budget.ambient_ratio")
+    if not 0 < ratio <= 1:
+        raise ConfigError("budget.ambient_ratio 必须在 (0, 1] 之间")
+    return ratio
+
+
+def _build_workspace(raw: dict[str, Any]) -> WorkspaceConfig:
+    return WorkspaceConfig(
+        dir=str(raw.get("dir", "data/bot-workspace") or "").strip(),
+        max_file_bytes=_positive_int(
+            raw.get("max_file_bytes"), "workspace.max_file_bytes", 65536
+        ),
+    )
+
+
+def _build_injection(
+    workspace_raw: dict[str, Any], memory_raw: dict[str, Any]
+) -> InjectionConfig:
+    """字符预算在 workspace 段（spec §12），开关在 memory 段。"""
+    return InjectionConfig(
+        memory_chars=_positive_int(
+            workspace_raw.get("memory_chars"), "workspace.memory_chars", 500
+        ),
+        summary_chars=_positive_int(
+            workspace_raw.get("summary_chars"), "workspace.summary_chars", 250
+        ),
+        impression_chars=_positive_int(
+            workspace_raw.get("impression_chars"), "workspace.impression_chars", 150
+        ),
+        inject_summaries=_bool(memory_raw.get("inject_summaries", True), "memory.inject_summaries"),
+        inject_impressions=_bool(
+            memory_raw.get("inject_impressions", True), "memory.inject_impressions"
+        ),
+    )
+
+
+def _bool(value: Any, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{field} 必须是布尔值")
+    return value
 
 
 def _int_set(value: Any, field: str) -> frozenset[int]:
@@ -236,11 +301,40 @@ def _build_triggers(raw: dict[str, Any]) -> TriggerConfig:
     keywords = raw.get("keywords", [])
     if not isinstance(keywords, list):
         raise ConfigError("triggers.keywords 必须是列表")
+    mode = str(raw.get("mode") or "rules").strip().casefold()
+    if mode not in ("rules", "model"):
+        raise ConfigError("triggers.mode 只能是 rules 或 model")
+    batch_seconds = _float(raw.get("batch_seconds", 45), "triggers.batch_seconds")
+    addressed_debounce = _float(
+        raw.get("addressed_debounce_seconds", 8),
+        "triggers.addressed_debounce_seconds",
+    )
+    addressed_max_wait = _float(
+        raw.get("addressed_max_wait_seconds", 30),
+        "triggers.addressed_max_wait_seconds",
+    )
+    ambient_min_interval = _float(
+        raw.get("ambient_min_interval_seconds", 90),
+        "triggers.ambient_min_interval_seconds",
+    )
+    for name, value in (
+        ("triggers.batch_seconds", batch_seconds),
+        ("triggers.addressed_debounce_seconds", addressed_debounce),
+        ("triggers.addressed_max_wait_seconds", addressed_max_wait),
+        ("triggers.ambient_min_interval_seconds", ambient_min_interval),
+    ):
+        if value <= 0:
+            raise ConfigError(f"{name} 必须大于 0")
     return TriggerConfig(
         cooldown_seconds=_int(raw.get("cooldown_seconds", 60), "triggers.cooldown_seconds"),
         sample_rate=sample_rate,
         quiet_hours=(str(quiet[0]), str(quiet[1])),
         keywords=tuple(str(k) for k in keywords),
+        mode=mode,
+        batch_seconds=batch_seconds,
+        addressed_debounce_seconds=addressed_debounce,
+        addressed_max_wait_seconds=addressed_max_wait,
+        ambient_min_interval_seconds=ambient_min_interval,
     )
 
 
@@ -421,6 +515,10 @@ def load_settings(
     if extract_every < 1:
         raise ConfigError("memory.extract_every 必须大于等于 1")
 
+    workspace_raw = raw.get("workspace") or {}
+    if not isinstance(workspace_raw, dict):
+        raise ConfigError("config.yaml 的 workspace 必须是映射")
+
     return Settings(
         api_key=api_key,
         base_url=env.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
@@ -441,12 +539,24 @@ def load_settings(
         budget=BudgetConfig(
             daily_calls=_int(budget_raw.get("daily_calls", 200), "budget.daily_calls"),
             daily_tokens=_int(budget_raw.get("daily_tokens", 300000), "budget.daily_tokens"),
+            ambient_ratio=_build_ambient_ratio(budget_raw),
         ),
         memory=MemoryConfig(
             window_size=window_size,
             impression_topk=_int(memory_raw.get("impression_topk", 5), "memory.impression_topk"),
             extract_every=extract_every,
+            rotation_messages=_positive_int(
+                memory_raw.get("rotation_messages"), "memory.rotation_messages", 60
+            ),
+            rotation_days=_positive_int(
+                memory_raw.get("rotation_days"), "memory.rotation_days", 7
+            ),
+            rotation_tokens=_positive_int(
+                memory_raw.get("rotation_tokens"), "memory.rotation_tokens", 40000
+            ),
         ),
+        injection=_build_injection(workspace_raw, memory_raw),
+        workspace=_build_workspace(workspace_raw),
         logging=LoggingConfig(
             level=str(logging_raw.get("level", "INFO")),
             dir=str(logging_raw.get("dir", "logs")),

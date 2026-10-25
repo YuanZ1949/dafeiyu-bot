@@ -407,6 +407,7 @@ S2 的判据从"二选一"改成"三条同时可观测"。
 - 真正的阻断只能靠独立配置目录。杠杆是 `XDG_CONFIG_HOME`（V2 文档；`OPENCODE_CONFIG` 不存在，v1 写错了），另有 `%ProgramData%\opencode` 也会被加载。
 - 代价：搬走配置目录会连带搬走 `opencode.jsonc`（bot 正继承的模型配置）和 `auth.json`（provider 凭据）。要么在隔离目录里重建一份最小配置 + 复制凭据，要么接受"检测 + 轮换"这一层。
 - 因此 **S6 的产出是一个选择题**，不是自动执行：能隔离且不丢凭据 → 隔离；需要复制凭据 → 交给你决定。
+- 实测（Task 13）：**本轮未隔离**，理由同上——隔离要搬 `opencode.jsonc` 与 `auth.json`，属于「需要你拍板」的分支，本轮没有替你选。兜底是 §11.3 的检测 + 轮换，加上工作区侧的 agent 权限与会话级 deny（`workspace.dir` 为空时下推全量 deny）。
 - 减少暴露面（同轮必做）：dashboard 若给 OpenCode session 深链，改为只读提示（避免一键把 bot 会话开进 TUI）。
 
 ### 11.5 验收（可观测）
