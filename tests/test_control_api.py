@@ -549,4 +549,5 @@ def test_dashboard_page_max_fallback_matches_backend() -> None:
     assert match, "面板缺少分页上限兜底常量"
     assert int(match.group(1)) == MAX_MEMORY_PAGE
     assert "data.limit_max" in html
+    assert "if (memoryLimit > memoryPageMax) memoryLimit = memoryPageMax;" in html
     assert "memoryPageMax" in html
