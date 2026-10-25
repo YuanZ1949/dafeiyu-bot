@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.timeutil import SHANGHAI, now_shanghai
+
+from .failure import FAILURE_BACKOFF_SECONDS, FailureBackoff, log_memory_failure
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +41,8 @@ async def summarize_chat(
     chat_type: ChatType,
     chat_id: int,
     date: str,
-) -> str:
+) -> str | None:
+    """返回摘要正文；当天没有消息返回 ""，模型调用失败返回 None。"""
     start_ts, end_ts = _day_bounds(date)
     messages = store.messages_between(chat_type, chat_id, start_ts, end_ts)
     if not messages:
@@ -57,9 +61,9 @@ async def summarize_chat(
                 SUMMARY_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=600
             )
             prompt_tokens = completion_tokens = 0
-    except Exception:  # noqa: BLE001 - 摘要失败不影响主链路
-        logger.warning("生成摘要失败：%s/%s %s", chat_type.value, chat_id, date, exc_info=True)
-        return ""
+    except Exception as exc:  # noqa: BLE001 - 摘要失败不影响主链路
+        log_memory_failure(logger, f"生成摘要 {date}", exc, chat_type, chat_id)
+        return None
 
     store.record_usage(chat_type, chat_id, "summary", prompt_tokens, completion_tokens)
     text = (raw or "").strip()[:MAX_SUMMARY_CHARS]
@@ -92,10 +96,8 @@ async def summarize_for_rotation(
                 ROTATION_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=600
             )
             prompt_tokens = completion_tokens = 0
-    except Exception:  # noqa: BLE001 - 摘要失败不影响主链路
-        logger.warning(
-            "生成轮换摘要失败：%s/%s", chat_type.value, chat_id, exc_info=True
-        )
+    except Exception as exc:  # noqa: BLE001 - 摘要失败不影响主链路
+        log_memory_failure(logger, "生成轮换摘要", exc, chat_type, chat_id)
         return ""
 
     store.record_usage(chat_type, chat_id, "summary", prompt_tokens, completion_tokens)
@@ -114,6 +116,8 @@ class SummaryScheduler:
         clock: Callable[[], datetime] = now_shanghai,
         hour: int = 4,
         brain_getter: Callable[[], Any] | None = None,
+        backoff_seconds: float = FAILURE_BACKOFF_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._store = store
         self._brain = brain
@@ -122,6 +126,8 @@ class SummaryScheduler:
         # dashboard 换脑只更新 Service.brain，拿不到 scheduler 手里的引用；
         # 有 getter 就每轮现取，避免摘要一直用旧 provider 的 client。
         self._brain_getter = brain_getter
+        # 失败后按 (会话, 日期) 退避，避免配额耗尽时每轮都重试同一份摘要。
+        self._backoff = FailureBackoff(backoff_seconds, monotonic)
 
     def _current_brain(self):
         return self._brain_getter() if self._brain_getter is not None else self._brain
@@ -135,11 +141,20 @@ class SummaryScheduler:
         start_ts, end_ts = _day_bounds(target)
         created = 0
         for chat_type, chat_id in self._store.active_chats_between(start_ts, end_ts):
+            key = (chat_type, chat_id, target)
             if self._store.get_summary(chat_type, chat_id, target):
+                self._backoff.mark_ok(key)
                 continue
-            if await summarize_chat(
+            if self._backoff.should_skip(key):
+                continue
+            text = await summarize_chat(
                 self._store, self._current_brain(), chat_type, chat_id, target
-            ):
+            )
+            if text is None:
+                self._backoff.mark_failed(key)
+                continue
+            self._backoff.mark_ok(key)
+            if text:
                 created += 1
         return created
 

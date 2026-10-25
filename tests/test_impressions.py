@@ -1,8 +1,10 @@
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
+from dafeiyu.brain.client import BrainError
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.workers.impressions import ImpressionWorker
@@ -119,4 +121,55 @@ async def test_missing_content_is_treated_as_empty(store: Store) -> None:
     worker = ImpressionWorker(store, brain, every=1)
     store.add_message(make_message(1))
     assert await worker.maybe_extract(CHAT, CHAT_ID) == 0
+
+
+async def test_provider_failure_warns_without_traceback(store: Store, caplog) -> None:
+    brain = FakeBrain(exc=BrainError("provider.quota: Free usage limit reached"))
+    worker = ImpressionWorker(store, brain, every=1)
+    store.add_message(make_message(1))
+
+    with caplog.at_level(logging.WARNING, logger="dafeiyu.workers.impressions"):
+        assert await worker.maybe_extract(CHAT, CHAT_ID) == 0
+
+    records = [r for r in caplog.records if "provider.quota" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].exc_info is None
+    assert records[0].levelno == logging.WARNING
+
+
+async def test_unexpected_failure_keeps_traceback(store: Store, caplog) -> None:
+    brain = FakeBrain(exc=RuntimeError("boom"))
+    worker = ImpressionWorker(store, brain, every=1)
+    store.add_message(make_message(1))
+
+    with caplog.at_level(logging.ERROR, logger="dafeiyu.workers.impressions"):
+        assert await worker.maybe_extract(CHAT, CHAT_ID) == 0
+
+    records = [r for r in caplog.records if "boom" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].exc_info is not None
+
+
+async def test_failure_cooldown_blocks_retry_until_expired(store: Store) -> None:
+    clock = {"t": 0.0}
+    brain = FakeBrain(exc=BrainError("provider.quota"))
+    worker = ImpressionWorker(
+        store,
+        brain,
+        every=1,
+        backoff_seconds=60,
+        monotonic=lambda: clock["t"],
+    )
+    store.add_message(make_message(1))
+    assert await worker.maybe_extract(CHAT, CHAT_ID) == 0
+    assert brain.calls == 1
+
+    store.add_message(make_message(2))
+    assert await worker.maybe_extract(CHAT, CHAT_ID) == 0
+    assert brain.calls == 1  # 冷却期内不再撞配额
+
+    clock["t"] = 61.0
+    assert await worker.maybe_extract(CHAT, CHAT_ID) == 0
+    assert brain.calls == 2  # 冷却过期后允许重试
+
 

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType
+
+from .failure import FAILURE_BACKOFF_SECONDS, FailureBackoff, log_memory_failure
 
 log = logging.getLogger(__name__)
 
@@ -66,15 +69,25 @@ def _valid_item(item: dict) -> tuple[int, str, str, float] | None:
 class ImpressionWorker:
     """每 N 条消息（按会话计数）异步抽取一次印象，避免拖慢回复主链路。"""
 
-    def __init__(self, store: Store, brain, every: int = 20) -> None:
+    def __init__(
+        self,
+        store: Store,
+        brain,
+        every: int = 20,
+        backoff_seconds: float = FAILURE_BACKOFF_SECONDS,
+        monotonic=time.monotonic,
+    ) -> None:
         self.store = store
         self.brain = brain
         self.every = max(1, every)
         self._last_count: dict[tuple[ChatType, int], int] = {}
+        self._backoff = FailureBackoff(backoff_seconds, monotonic)
 
     async def maybe_extract(self, chat_type: ChatType, chat_id: int) -> int:
         """按会话累计消息数触发；同一批消息不会重复抽取。"""
         key = (chat_type, chat_id)
+        if self._backoff.should_skip(key):
+            return 0
         count = self.store.count_messages(chat_type, chat_id)
         last = self._last_count.get(key, 0)
         if count < last:  # 会话被 /forget 清空过，重新开始计数
@@ -82,9 +95,15 @@ class ImpressionWorker:
         if count < last + self.every:
             return 0
         self._last_count[key] = count
-        return await self.extract(chat_type, chat_id)
+        added = await self.extract(chat_type, chat_id)
+        if added is None:
+            self._backoff.mark_failed(key)
+            return 0
+        self._backoff.mark_ok(key)
+        return added
 
-    async def extract(self, chat_type: ChatType, chat_id: int) -> int:
+    async def extract(self, chat_type: ChatType, chat_id: int) -> int | None:
+        """抽取并写入印象；调用失败返回 None，供上层决定是否退避。"""
         messages = self.store.recent_messages(chat_type, chat_id, MAX_SOURCE_MESSAGES)
         if not messages:
             return 0
@@ -105,9 +124,9 @@ class ImpressionWorker:
                     max_tokens=600,
                 )
                 prompt_tokens = completion_tokens = 0
-        except Exception:
-            log.exception("印象抽取调用失败 %s/%s", chat_type.value, chat_id)
-            return 0
+        except Exception as exc:
+            log_memory_failure(log, "印象抽取", exc, chat_type, chat_id)
+            return None
         self.store.record_usage(
             chat_type, chat_id, "impression", prompt_tokens, completion_tokens
         )
