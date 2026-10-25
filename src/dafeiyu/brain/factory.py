@@ -127,5 +127,6 @@ def build_brain(
             trust_env=False,
             max_tokens=settings.local_model.max_tokens,
             timeout=settings.local_model.timeout_seconds,
+            reasoning_effort=settings.local_model.reasoning_effort or None,
         )
     raise ConfigError(f"未知的大脑模式：{provider}")

@@ -134,6 +134,10 @@ class LocalModelConfig:
     max_tokens: int = 2048
     # 本地推理比云端慢，15s 默认超时对思考型模型不够。
     timeout_seconds: float = 60.0
+    # 思考型本地模型（如 qwen3.5）会把 token 预算全烧在 reasoning 上，
+    # 旁路调用（印象/摘要）600 token 内 content 恒空。置 "none" 关掉思考；
+    # 留空 = 不发该字段，保持对旧后端的兼容。
+    reasoning_effort: str = ""
 
 
 @dataclass(frozen=True)
@@ -381,6 +385,7 @@ def load_settings(
         timeout_seconds=_float(
             local_model_raw.get("timeout_seconds", 60.0), "local_model.timeout_seconds"
         ),
+        reasoning_effort=str(local_model_raw.get("reasoning_effort") or "").strip(),
     )
     if not local_model.base_url:
         raise ConfigError("local_model.base_url 不能为空")

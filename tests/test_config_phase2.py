@@ -129,6 +129,52 @@ def test_local_model_brain_uses_configured_max_tokens(tmp_path: Path) -> None:
         store.close()
 
 
+def test_local_model_reasoning_effort_defaults_and_overrides(tmp_path: Path) -> None:
+    default = load(tmp_path, "brain:\n  provider: local_model\n", env="BOT_QQ=10001\n")
+    assert default.local_model.reasoning_effort == ""
+
+    custom = load(
+        tmp_path,
+        "brain:\n  provider: local_model\nlocal_model:\n  reasoning_effort: none\n",
+        env="BOT_QQ=10001\n",
+    )
+    assert custom.local_model.reasoning_effort == "none"
+
+
+def test_local_model_brain_passes_reasoning_effort(tmp_path: Path) -> None:
+    from dafeiyu.brain.factory import build_brain
+    from dafeiyu.memory.store import Store
+
+    settings = load(
+        tmp_path,
+        "brain:\n  provider: local_model\nlocal_model:\n  reasoning_effort: none\n",
+        env="BOT_QQ=10001\n",
+    )
+    store = Store(tmp_path / "mem.db")
+    try:
+        brain = build_brain(settings, store, "local_model", model="qwen3.5-9b")
+        assert brain.reasoning_effort == "none"
+    finally:
+        store.close()
+
+
+def test_token_brain_does_not_inherit_local_reasoning_effort(tmp_path: Path) -> None:
+    from dafeiyu.brain.factory import build_brain
+    from dafeiyu.memory.store import Store
+
+    settings = load(
+        tmp_path,
+        "brain:\n  provider: token\nlocal_model:\n  reasoning_effort: none\n",
+        env="BOT_QQ=10001\nDEEPSEEK_API_KEY=sk-test\n",
+    )
+    store = Store(tmp_path / "mem.db")
+    try:
+        brain = build_brain(settings, store, "token")
+        assert brain.reasoning_effort is None
+    finally:
+        store.close()
+
+
 def test_unknown_provider_rejected(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="local_model"):
         load(tmp_path, "brain:\n  provider: gpt\n")

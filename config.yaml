@@ -52,6 +52,9 @@ local_model:
   max_tokens: 2048
   # 本地推理比云端慢
   timeout_seconds: 60
+  # qwen3.5 这类强思考模型会把 600 token 预算全烧在 reasoning 上，
+  # 旁路（印象/摘要）content 恒空。none = 关掉思考；留空 = 不发该字段。
+  reasoning_effort: none
 
 supervisor:
   dashboard:
