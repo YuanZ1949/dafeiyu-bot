@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from dafeiyu.memory.store import Store
-from dafeiyu.models import ChatType
+from dafeiyu.models import ChatType, Message
 from dafeiyu.timeutil import SHANGHAI, now_shanghai
 
 logger = logging.getLogger(__name__)
@@ -19,6 +19,12 @@ SUMMARY_SYSTEM = """你是群聊记录整理助手。请把给定日期的一段
 
 MAX_SUMMARY_CHARS = 200
 MAX_SOURCE_LINES = 400
+
+ROTATION_SYSTEM = """你是群聊记录整理助手。请把下面这段对话压缩成不超过 200 字的交接摘要，供换 session 后继续聊天：
+- 记下正在聊的话题、已达成的结论、称呼与梗
+- 用第三人称陈述，不评论、不发挥
+- 只输出摘要正文，不要标题、前缀或解释
+"""
 
 
 def _day_bounds(date: str) -> tuple[int, int]:
@@ -60,6 +66,43 @@ async def summarize_chat(
     if not text:
         return ""
     store.upsert_summary(chat_type, chat_id, date, text)
+    return text
+
+
+async def summarize_for_rotation(
+    brain,
+    store: Store,
+    chat_type: ChatType,
+    chat_id: int,
+    messages: list[Message],
+) -> str:
+    """换 session 前的一次性交接摘要；失败返回空串，调用方据此放弃轮换。"""
+    if not messages:
+        return ""
+    lines = [m.to_prompt_line() for m in messages][-MAX_SOURCE_LINES:]
+    prompt = "以下是需要交接的对话：\n" + "\n".join(lines)
+    detailed = getattr(brain, "complete_detailed", None)
+    try:
+        if detailed is not None:
+            raw, prompt_tokens, completion_tokens = await detailed(
+                ROTATION_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=600
+            )
+        else:
+            raw = await brain.complete(
+                ROTATION_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=600
+            )
+            prompt_tokens = completion_tokens = 0
+    except Exception:  # noqa: BLE001 - 摘要失败不影响主链路
+        logger.warning(
+            "生成轮换摘要失败：%s/%s", chat_type.value, chat_id, exc_info=True
+        )
+        return ""
+
+    store.record_usage(chat_type, chat_id, "summary", prompt_tokens, completion_tokens)
+    text = (raw or "").strip()[:MAX_SUMMARY_CHARS]
+    if not text:
+        return ""
+    store.add_session_summary(chat_type, chat_id, text)
     return text
 
 
