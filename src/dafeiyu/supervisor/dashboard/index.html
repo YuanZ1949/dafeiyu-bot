@@ -152,6 +152,12 @@
       <h2 style="margin:0">记忆</h2>
       <span class="kv" id="memory-hint"></span>
       <span class="spacer" style="flex:1"></span>
+      <select id="memory-chat-filter" title="按会话类型筛选">
+        <option value="">全部会话</option>
+        <option value="group">只看群聊</option>
+        <option value="private">只看私聊</option>
+      </select>
+      <button class="btn" id="btn-more-memory">显示更多</button>
       <button class="btn" id="btn-refresh-memory">刷新</button>
     </div>
     <div class="mem-grid">
@@ -421,9 +427,21 @@ function renderMemory(data) {
   $("memory-hint").textContent = `摘要 ${summaries.length} 条 · 印象 ${impressions.length} 条`;
 }
 
+const MEMORY_PAGE = 30;
+const MEMORY_PAGE_MAX = 200;
+let memoryLimit = MEMORY_PAGE;
+
+function memoryUrl() {
+  const params = new URLSearchParams({ limit: String(memoryLimit) });
+  const chatType = $("memory-chat-filter").value;
+  if (chatType) params.set("chat_type", chatType);
+  return `/api/memory?${params.toString()}`;
+}
+
 async function loadMemory() {
   try {
-    renderMemory(await api("/api/memory?limit=30"));
+    renderMemory(await api(memoryUrl()));
+    $("btn-more-memory").disabled = memoryLimit >= MEMORY_PAGE_MAX;
   } catch (err) {
     $("memory-summaries").replaceChildren();
     $("memory-impressions").replaceChildren();
@@ -525,6 +543,15 @@ document.addEventListener("click", (ev) => {
 $("btn-refresh-models").addEventListener("click", loadModels);
 $("btn-apply-brain").addEventListener("click", applyBrain);
 $("btn-refresh-memory").addEventListener("click", loadMemory);
+$("btn-more-memory").addEventListener("click", () => {
+  if (memoryLimit >= MEMORY_PAGE_MAX) return;
+  memoryLimit = Math.min(MEMORY_PAGE_MAX, memoryLimit + MEMORY_PAGE);
+  loadMemory();
+});
+$("memory-chat-filter").addEventListener("change", () => {
+  memoryLimit = MEMORY_PAGE;
+  loadMemory();
+});
 $("model-select").addEventListener("change", (ev) => { selectedModel = ev.target.value; });
 $("btn-shutdown").addEventListener("click", async () => {
   if (!confirm("将停止 OpenCode / Bot / NapCat 三个进程并退出控制台，确定吗？")) return;

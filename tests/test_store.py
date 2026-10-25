@@ -155,3 +155,35 @@ def test_persistence_across_reopen(tmp_path: Path) -> None:
         assert second.count_messages(ChatType.GROUP, 1) == 1
     finally:
         second.close()
+
+
+def test_recent_summaries_paginates_and_filters(store: Store) -> None:
+    store.upsert_summary(ChatType.GROUP, 1, "2026-10-24", "群 1 昨天")
+    store.upsert_summary(ChatType.GROUP, 1, "2026-10-23", "群 1 前天")
+    store.upsert_summary(ChatType.PRIVATE, 2, "2026-10-22", "私聊内容")
+
+    assert [s.content for s in store.recent_summaries(limit=10)] == [
+        "群 1 昨天",
+        "群 1 前天",
+        "私聊内容",
+    ]
+    assert [s.content for s in store.recent_summaries(limit=1, offset=1)] == ["群 1 前天"]
+    assert [s.chat_id for s in store.recent_summaries(limit=10, chat_type=ChatType.GROUP)] == [1, 1]
+    assert [
+        s.content
+        for s in store.recent_summaries(limit=10, chat_type=ChatType.PRIVATE, chat_id=2)
+    ] == ["私聊内容"]
+
+
+def test_recent_impressions_paginates_and_filters(store: Store) -> None:
+    store.upsert_impression(ChatType.GROUP, 1, 42, "fact", "喜欢猫", 0.9)
+    store.upsert_impression(ChatType.PRIVATE, 2, 43, "fact", "住杭州", 0.8)
+    store.upsert_impression(ChatType.GROUP, 3, 44, "nickname", "外号鱼片", 0.7)
+
+    assert [i.chat_id for i in store.recent_impressions(limit=10)] == [3, 2, 1]
+    assert [i.chat_id for i in store.recent_impressions(limit=1, offset=1)] == [2]
+    assert [i.chat_id for i in store.recent_impressions(limit=10, chat_type=ChatType.GROUP)] == [3, 1]
+    assert [
+        i.content
+        for i in store.recent_impressions(limit=10, chat_type=ChatType.GROUP, chat_id=1)
+    ] == ["喜欢猫"]

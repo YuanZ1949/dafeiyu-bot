@@ -17,7 +17,8 @@ from .brain.factory import (
     normalize_provider,
 )
 from .config import ConfigError, Settings
-from .memory.store import Store
+from .memory.store import MAX_MEMORY_PAGE, Store
+from .models import ChatType
 from .runtime import RuntimeState, load_runtime, save_runtime
 
 log = logging.getLogger(__name__)
@@ -31,6 +32,16 @@ class SwitchError(Exception):
         super().__init__(reason)
         self.status = status
         self.reason = reason
+
+
+def _query_int(request: web.Request, name: str, default: int) -> int:
+    raw = (request.query.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是整数") from exc
 
 
 class BrainControl:
@@ -108,9 +119,16 @@ class BrainControl:
         except Exception:
             log.debug("关闭旧 brain 失败", exc_info=True)
 
-    def memory_snapshot(self, limit: int = 20) -> dict[str, Any]:
+    def memory_snapshot(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        chat_type: ChatType | None = None,
+        chat_id: int | None = None,
+    ) -> dict[str, Any]:
         """dashboard 只读记忆面板的数据源：最近摘要 + 最近印象。"""
-        limit = max(1, min(200, int(limit)))
+        limit = max(1, min(MAX_MEMORY_PAGE, int(limit)))
+        offset = max(0, int(offset))
         return {
             "summaries": [
                 {
@@ -120,7 +138,9 @@ class BrainControl:
                     "content": s.content,
                     "updated_at": s.updated_at,
                 }
-                for s in self.store.recent_summaries(limit)
+                for s in self.store.recent_summaries(
+                    limit, offset, chat_type, chat_id
+                )
             ],
             "impressions": [
                 {
@@ -132,7 +152,9 @@ class BrainControl:
                     "confidence": i.confidence,
                     "updated_at": i.updated_at,
                 }
-                for i in self.store.recent_impressions(limit)
+                for i in self.store.recent_impressions(
+                    limit, offset, chat_type, chat_id
+                )
             ],
         }
 
@@ -216,11 +238,41 @@ def create_app(control: BrainControl, token: str = "") -> web.Application:
 
     async def memory(request: web.Request) -> web.Response:
         try:
-            limit = int(request.query.get("limit", "20"))
-        except ValueError:
-            return web.json_response({"error": "limit 必须是整数"}, status=400)
+            limit = _query_int(request, "limit", 20)
+            offset = _query_int(request, "offset", 0)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        if not 1 <= limit <= MAX_MEMORY_PAGE:
+            return web.json_response(
+                {"error": f"limit 必须在 1..{MAX_MEMORY_PAGE} 之间"}, status=400
+            )
+        if offset < 0:
+            return web.json_response({"error": "offset 不能为负数"}, status=400)
+
+        raw_chat_type = (request.query.get("chat_type") or "").strip()
+        chat_type: ChatType | None = None
+        if raw_chat_type:
+            try:
+                chat_type = ChatType(raw_chat_type)
+            except ValueError:
+                return web.json_response(
+                    {"error": "chat_type 必须是 group 或 private"}, status=400
+                )
+
+        chat_id: int | None = None
+        raw_chat_id = (request.query.get("chat_id") or "").strip()
+        if raw_chat_id:
+            try:
+                chat_id = int(raw_chat_id)
+            except ValueError:
+                return web.json_response({"error": "chat_id 必须是整数"}, status=400)
+            if chat_id <= 0:
+                return web.json_response({"error": "chat_id 必须是正整数"}, status=400)
+
         try:
-            return web.json_response(control.memory_snapshot(limit))
+            return web.json_response(
+                control.memory_snapshot(limit, offset, chat_type, chat_id)
+            )
         except Exception as exc:  # 读库失败不能把控制口打挂
             log.warning("读取记忆失败：%s", exc)
             return web.json_response(

@@ -8,6 +8,9 @@ from pathlib import Path
 from dafeiyu.models import ChatType, Impression, Message, Summary
 from dafeiyu.timeutil import today_shanghai
 
+# dashboard 只读面板单页上限，接口层同样按这个值校验。
+MAX_MEMORY_PAGE = 200
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,6 +171,25 @@ class SessionStats:
     delivered_count: int = 0
     token_estimate: int = 0
     created_at: str | None = None
+
+
+def _memory_scope(
+    chat_type: ChatType | None, chat_id: int | None
+) -> tuple[str, list[object]]:
+    """只读面板的会话过滤条件；两个参数都可为空。"""
+    clauses: list[str] = []
+    params: list[object] = []
+    if chat_type is not None:
+        clauses.append("chat_type = ?")
+        params.append(chat_type.value)
+    if chat_id is not None:
+        clauses.append("chat_id = ?")
+        params.append(int(chat_id))
+    return ("WHERE " + " AND ".join(clauses) if clauses else ""), params
+
+
+def _page_bounds(limit: int, offset: int) -> tuple[int, int]:
+    return max(1, min(MAX_MEMORY_PAGE, int(limit))), max(0, int(offset))
 
 
 class Store:
@@ -694,15 +716,24 @@ class Store:
         ).fetchall()
         return [self._row_to_impression(r) for r in rows]
 
-    def recent_impressions(self, limit: int = 20) -> list[Impression]:
-        """跨会话的最近印象，仅供 dashboard 只读展示。"""
+    def recent_impressions(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        chat_type: ChatType | None = None,
+        chat_id: int | None = None,
+    ) -> list[Impression]:
+        """跨会话的最近印象，仅供 dashboard 只读展示；可按会话过滤与分页。"""
+        scope, params = _memory_scope(chat_type, chat_id)
+        page, skip = _page_bounds(limit, offset)
         rows = self._conn.execute(
-            """
+            f"""
             SELECT * FROM impressions
+            {scope}
             ORDER BY updated_at DESC, id DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (max(1, int(limit)),),
+            (*params, page, skip),
         ).fetchall()
         return [self._row_to_impression(r) for r in rows]
 
@@ -738,15 +769,24 @@ class Store:
         ).fetchone()
         return None if row is None else str(row["content"])
 
-    def recent_summaries(self, limit: int = 20) -> list[Summary]:
-        """跨会话的最近按日摘要，仅供 dashboard 只读展示。"""
+    def recent_summaries(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        chat_type: ChatType | None = None,
+        chat_id: int | None = None,
+    ) -> list[Summary]:
+        """跨会话的最近按日摘要，仅供 dashboard 只读展示；可按会话过滤与分页。"""
+        scope, params = _memory_scope(chat_type, chat_id)
+        page, skip = _page_bounds(limit, offset)
         rows = self._conn.execute(
-            """
+            f"""
             SELECT chat_type, chat_id, date, content, updated_at FROM summaries
+            {scope}
             ORDER BY date DESC, updated_at DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (max(1, int(limit)),),
+            (*params, page, skip),
         ).fetchall()
         return [
             Summary(

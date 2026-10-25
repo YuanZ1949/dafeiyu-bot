@@ -71,6 +71,9 @@ async def test_index_serves_dashboard(tmp_path: Path) -> None:
     assert "/api/control/" in text
     assert "memory-summaries" in text
     assert "群印象" in text
+    assert "btn-more-memory" in text
+    assert "memory-chat-filter" in text
+    assert "MEMORY_PAGE_MAX" in text
 
 
 async def test_status_reports_processes_and_offline_brain(tmp_path: Path) -> None:
@@ -269,6 +272,36 @@ async def test_memory_proxies_bot_payload(tmp_path: Path) -> None:
         assert data["impressions"] == []
     finally:
         await bot_client.close()
+
+
+async def test_memory_proxy_forwards_pagination_and_filter(tmp_path: Path) -> None:
+    seen: dict[str, str] = {}
+
+    async def memory_endpoint(request: web.Request) -> web.Response:
+        seen.update(dict(request.query))
+        return web.json_response({"summaries": [], "impressions": []})
+
+    bot_app = web.Application()
+    bot_app.router.add_get("/api/memory", memory_endpoint)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    try:
+        app, _, _ = make_app(tmp_path, bot_url=url)
+        async with running(app) as client:
+            resp = await client.get(
+                "/api/memory?limit=5&offset=10&chat_type=group&chat_id=20001"
+            )
+        assert resp.status == 200
+    finally:
+        await bot_client.close()
+
+    assert seen == {
+        "limit": "5",
+        "offset": "10",
+        "chat_type": "group",
+        "chat_id": "20001",
+    }
 
 
 async def test_memory_reports_bot_offline(tmp_path: Path) -> None:

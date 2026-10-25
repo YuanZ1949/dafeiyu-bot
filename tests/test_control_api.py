@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from dafeiyu import control as control_module
@@ -284,3 +285,54 @@ async def test_memory_endpoint_rejects_bad_limit(tmp_path: Path) -> None:
     async with running(app) as client:
         resp = await client.get("/api/memory?limit=abc")
     assert resp.status == 400
+
+
+async def test_memory_endpoint_filters_by_chat_type_and_chat_id(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    control.store.upsert_impression(ChatType.GROUP, 100, 42, "fact", "群聊印象", 0.9)
+    control.store.upsert_impression(ChatType.PRIVATE, 200, 43, "fact", "私聊印象", 0.8)
+
+    async with running(app) as client:
+        resp = await client.get("/api/memory?limit=10&chat_type=private")
+        payload = await resp.json()
+        only_group = await client.get(
+            "/api/memory?limit=10&chat_type=group&chat_id=100"
+        )
+        group_payload = await only_group.json()
+
+    assert resp.status == 200
+    assert [i["content"] for i in payload["impressions"]] == ["私聊印象"]
+    assert [i["chat_id"] for i in group_payload["impressions"]] == [100]
+
+
+async def test_memory_endpoint_pages_with_offset(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    control.store.upsert_summary(ChatType.GROUP, 100, "2026-10-24", "最近一天")
+    control.store.upsert_summary(ChatType.GROUP, 100, "2026-10-23", "更早一天")
+
+    async with running(app) as client:
+        resp = await client.get("/api/memory?limit=1&offset=1")
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert [s["content"] for s in payload["summaries"]] == ["更早一天"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "limit=0",
+        "limit=201",
+        "offset=-1",
+        "offset=abc",
+        "chat_type=bad",
+        "chat_id=0",
+        "chat_id=abc",
+    ],
+)
+async def test_memory_endpoint_rejects_invalid_query(tmp_path: Path, query: str) -> None:
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.get(f"/api/memory?{query}")
+    assert resp.status == 400
+
