@@ -14,6 +14,9 @@ FAILURE_BACKOFF_SECONDS = 1800.0
 # 全局暂停一小时，到期自动再试；成功一次即解除。
 QUOTA_PAUSE_SECONDS = 3600.0
 QUOTA_KEY = "__quota__"
+# 有的 provider 只在 429 里写 rate limit，不写 quota。单次 429 可能是瞬时抖动，
+# 连续三次说明是账号级限流，按配额同样处理，别让 12 个会话各撞一遍。
+RATE_LIMIT_THRESHOLD = 3
 
 
 class MemoryPaused(Exception):
@@ -48,6 +51,17 @@ def is_quota_error(exc: BaseException | None) -> bool:
     if exc is None:
         return False
     return "quota" in str(exc).casefold()
+
+
+def is_rate_limit_error(exc: BaseException | None) -> bool:
+    """429 / rate limit 的文本识别；BrainError 没有 status 字段，只能看消息。"""
+    if exc is None:
+        return False
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    if status == 429:
+        return True
+    text = str(exc).casefold()
+    return "429" in text or "rate limit" in text or "too many requests" in text
 
 
 def _normalize_key(key: Hashable) -> Hashable:
@@ -89,12 +103,15 @@ class FailureBackoff:
         quota_seconds: float = QUOTA_PAUSE_SECONDS,
         persistence: Any | None = None,
         wall_clock: Callable[[], float] = time.time,
+        rate_limit_threshold: int = RATE_LIMIT_THRESHOLD,
     ) -> None:
         self._seconds = seconds
         self._quota_seconds = quota_seconds
         self._monotonic = monotonic
         self._wall_clock = wall_clock
         self._persistence = persistence
+        self._rate_limit_threshold = max(1, int(rate_limit_threshold))
+        self._rate_limit_streak = 0
         self._until: dict[Hashable, float] = {}
         if persistence is not None:
             # 库里存的是墙钟时间（跨进程可用），内存里算的是单调时钟（不受校时影响）。
@@ -142,13 +159,27 @@ class FailureBackoff:
         """配额熔断是否生效：生效时所有会话都不该再调模型。"""
         return self._active(QUOTA_KEY)
 
+    def _pause_quota(self) -> None:
+        self._remember(QUOTA_KEY, self._monotonic() + self._quota_seconds)
+
     def mark_failed(self, key: Hashable, exc: BaseException | None = None) -> None:
         if is_quota_error(exc):
-            self._remember(QUOTA_KEY, self._monotonic() + self._quota_seconds)
+            self._rate_limit_streak = 0
+            self._pause_quota()
             return
+        if is_rate_limit_error(exc):
+            self._rate_limit_streak += 1
+            if self._rate_limit_streak >= self._rate_limit_threshold:
+                # 连续 429：当成账号级限流，升级为全局暂停，不再让别的会话挨个撞。
+                self._rate_limit_streak = 0
+                self._pause_quota()
+                return
+        else:
+            self._rate_limit_streak = 0
         self._remember(key, self._monotonic() + self._seconds)
 
     def mark_ok(self, key: Hashable) -> None:
+        self._rate_limit_streak = 0
         self._forget(key)
         if key != QUOTA_KEY:
             self._forget(QUOTA_KEY)

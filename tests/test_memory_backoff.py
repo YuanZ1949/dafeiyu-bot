@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -163,3 +164,77 @@ async def test_impressions_stop_after_quota_error() -> None:
     assert brain.calls == 1
     assert worker._backoff.is_paused()
     store.close()
+
+
+RATE_LIMITED = BrainError("DeepSeek 限流（429），本条放弃")
+
+
+def test_rate_limit_detection() -> None:
+    from dafeiyu.workers.failure import is_rate_limit_error
+
+    assert is_rate_limit_error(BrainError("HTTP 429"))
+    assert is_rate_limit_error(BrainError("Too Many Requests"))
+    assert is_rate_limit_error(SimpleNamespace(status=429))
+    assert not is_rate_limit_error(BrainError("network down"))
+    assert not is_rate_limit_error(None)
+
+
+def test_single_429_only_cools_that_chat() -> None:
+    clock = Clock()
+    backoff = FailureBackoff(monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall)
+
+    backoff.mark_failed((ChatType.GROUP, 1), RATE_LIMITED)
+
+    assert not backoff.is_paused()
+    assert backoff.should_skip((ChatType.GROUP, 1))
+    assert not backoff.should_skip((ChatType.GROUP, 2))
+
+
+def test_three_consecutive_429_pause_globally(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    clock = Clock()
+    backoff = FailureBackoff(
+        monotonic=lambda: clock.mono,
+        wall_clock=lambda: clock.wall,
+        persistence=store,
+    )
+
+    backoff.mark_failed((ChatType.GROUP, 1), RATE_LIMITED)
+    backoff.mark_failed((ChatType.GROUP, 2), RATE_LIMITED)
+    assert not backoff.is_paused()
+
+    backoff.mark_failed((ChatType.GROUP, 3), RATE_LIMITED)
+
+    assert backoff.is_paused()
+    assert backoff.should_skip((ChatType.GROUP, 99))
+    assert "__quota__" in store.load_backoff()
+
+    clock.advance(QUOTA_PAUSE_SECONDS + 1)
+    assert not backoff.is_paused()
+    store.close()
+
+
+def test_success_resets_429_streak() -> None:
+    clock = Clock()
+    backoff = FailureBackoff(monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall)
+
+    backoff.mark_failed((ChatType.GROUP, 1), RATE_LIMITED)
+    backoff.mark_failed((ChatType.GROUP, 2), RATE_LIMITED)
+    backoff.mark_ok((ChatType.GROUP, 2))
+    backoff.mark_failed((ChatType.GROUP, 3), RATE_LIMITED)
+    backoff.mark_failed((ChatType.GROUP, 4), RATE_LIMITED)
+
+    assert not backoff.is_paused()
+
+
+def test_non_429_failure_resets_429_streak() -> None:
+    clock = Clock()
+    backoff = FailureBackoff(monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall)
+
+    backoff.mark_failed((ChatType.GROUP, 1), RATE_LIMITED)
+    backoff.mark_failed((ChatType.GROUP, 2), RATE_LIMITED)
+    backoff.mark_failed((ChatType.GROUP, 3), BrainError("network down"))
+    backoff.mark_failed((ChatType.GROUP, 4), RATE_LIMITED)
+    backoff.mark_failed((ChatType.GROUP, 5), RATE_LIMITED)
+
+    assert not backoff.is_paused()
