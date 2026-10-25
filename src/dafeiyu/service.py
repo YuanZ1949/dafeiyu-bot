@@ -501,12 +501,14 @@ class Service:
         )
 
     async def _forget_chat(self, msg: Message) -> None:
-        self.store.forget_chat(msg.chat_type, msg.chat_id)
+        # 先让 brain 删远端 session：它要读映射，而 forget_chat 会连映射一起清掉。
+        # 顺序反了的话远端 session 永远删不掉，历史还能从 server 侧翻出来。
         forget = getattr(self.brain, "forget", None)
         if forget is not None:
             result = forget(msg.chat_type, msg.chat_id)
             if inspect.isawaitable(result):
                 await result
+        self.store.forget_chat(msg.chat_type, msg.chat_id)
         await self.adapter.send(msg.chat_type, msg.chat_id, FORGET_REPLY)
 
     async def _run_command(self, msg: Message, name: str) -> bool:

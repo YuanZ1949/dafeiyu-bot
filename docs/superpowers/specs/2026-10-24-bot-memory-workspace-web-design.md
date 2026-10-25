@@ -521,6 +521,8 @@ memory:
 8. 权限实测：让它 read `.env` → 被拒；`shell` → 被拒；写 `data/bot-workspace/x.md` → 成功。
 9. 注入外来 synthetic → 日志命中 + 下一轮换 session。
 
+**实测（Task 14，离线部分）**：第 1 / 5 / 6 / 7 / 9 条已通过（`tests/test_e2e_batch.py` 4 条 + 既有用例，全量 390 passed），第 2 / 3 条机制已证、时延与真实模型待联调，第 4 / 8 条待真机。第 5 条首跑暴露真缺陷：`Service._forget_chat` 先 `store.forget_chat()` 清掉了 session 映射，`brain.forget()` 随后查不到 id，导致**远端 session 从未被 DELETE**；已调换为「先 brain.forget 再 store.forget_chat」，纯顺序修复、不改签名。明细见 `docs/superpowers/spikes/2026-10-24-e2e-acceptance.md`。
+
 ## 15. 上线与回滚
 
 **顺序**：S1–S7 spike → 单测 → 实现 → 本地联调 → 重启 supervisor（opencode + bot）→ 群内验收。
