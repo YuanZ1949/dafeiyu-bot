@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 from typing import Any
 
 from .brain.client import BrainError, BrainReply
 from .brain.persona import build_system_prompt
+from .config import InjectionConfig, Settings
+from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
 from .memory.context import build_context
 from .memory.store import Store
 from .memory.timeline import build_delivery
+from .memory.workspace import Workspace
 from .models import ChatType, Message
 from .router import Router, now_shanghai, parse_command
 from .sender import is_technical_question, shape_reply
-from .config import Settings
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +38,8 @@ class Service:
         router: Router,
         persona_text: str,
         impressions: Any = None,
+        workspace: Workspace | None = None,
+        injection: InjectionConfig | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -43,17 +48,54 @@ class Service:
         self.router = router
         self.persona_text = persona_text
         self.impressions = impressions
+        self.workspace = workspace
+        self.injection = injection
+        self.scheduler: BatchScheduler | None = None
+        self._scheduler_task: asyncio.Task | None = None
         self._locks: dict[tuple[ChatType, int], asyncio.Lock] = {}
 
     async def start(self) -> None:
+        self._start_scheduler()
         self.adapter.on_message(self.handle)
         await self.adapter.start()
 
     async def stop(self) -> None:
+        task = self._scheduler_task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            self._scheduler_task = None
         await self.adapter.stop()
         closer = getattr(self.brain, "aclose", None)
         if closer is not None:
             await closer()
+
+    async def drain(self) -> None:
+        """测试与停机用：把当前所有到期批次同步跑完。"""
+        if self.scheduler is not None:
+            await self.scheduler.drain()
+
+    def _uses_scheduler(self) -> bool:
+        """model 模式且大脑有会话接口才走批次；否则回落到 rules 同步路径。"""
+        return self.settings.triggers.mode == "model" and callable(
+            getattr(self.brain, "reply", None)
+        )
+
+    def _ensure_scheduler(self) -> BatchScheduler:
+        if self.scheduler is None:
+            self.scheduler = BatchScheduler(self.store, self.settings, self._run_batch)
+        return self.scheduler
+
+    def _start_scheduler(self) -> None:
+        if not self._uses_scheduler():
+            return
+        scheduler = self._ensure_scheduler()
+        now = int(now_shanghai().timestamp())
+        # 重启后只补最近 5 分钟的积压，避免把整夜消息一次灌进模型。
+        scheduler.resume(self.store.chats_with_pending(since_ts=now - 300))
+        if self._scheduler_task is None:
+            self._scheduler_task = asyncio.create_task(scheduler.run())
 
     def set_brain(self, brain: Any) -> Any:
         """原子换脑；返回旧实例，由调用方决定何时关闭。
@@ -88,15 +130,69 @@ class Service:
             if command is not None and await self._run_command(msg, command.name):
                 return
 
-            if msg.chat_type is ChatType.GROUP:
-                decision = self.router.should_handle(msg)
-                if not decision.call_model:
-                    log.debug("skip %s/%s: %s", msg.chat_id, msg.message_id, decision.reason)
-                    return
-            elif not self._private_budget_ok(msg):
-                return
+            if self._uses_scheduler():
+                await self._handle_batched(msg)
+            else:
+                await self._handle_sync(msg)
 
+    async def _handle_sync(self, msg: Message) -> None:
+        """rules 模式：规则判定通过就同步等模型（旧行为，回滚用）。"""
+        if msg.chat_type is ChatType.GROUP:
+            decision = self.router.should_handle(msg)
+            if not decision.call_model:
+                log.debug("skip %s/%s: %s", msg.chat_id, msg.message_id, decision.reason)
+                return
+        elif not self._private_budget_ok(msg):
+            return
+
+        await self._reply(msg)
+
+    async def _handle_batched(self, msg: Message) -> None:
+        """model 模式：只做判定与排队，绝不 await 模型（私聊除外）。"""
+        scheduler = self._ensure_scheduler()
+
+        if msg.chat_type is ChatType.PRIVATE:
+            # 私聊延迟敏感，不进批次窗口，但仍受双闸预算约束。
+            if not self._private_budget_ok(msg):
+                return
             await self._reply(msg)
+            return
+
+        addressed = self.router.is_addressed(msg)
+        reason = self._group_skip_reason(msg, addressed=addressed)
+        if reason is not None:
+            self.store.mark_skipped(msg.chat_type, msg.chat_id, [msg.message_id], reason)
+            log.debug("skip %s/%s: %s", msg.chat_id, msg.message_id, reason)
+            return
+
+        scheduler.note(msg, addressed=addressed)
+
+    def _group_skip_reason(self, msg: Message, *, addressed: bool) -> str | None:
+        if self.router.is_muted(msg.chat_type, msg.chat_id):
+            return "muted"
+        if self.router.is_quiet(msg.chat_type, msg.chat_id):
+            return "quiet"
+        if msg.chat_id in self.settings.groups.blacklist:
+            return "blacklist"
+        whitelist = self.settings.groups.whitelist
+        # 被点名的群一定排批，与 rules 模式「硬触发优先于白名单」一致。
+        if not addressed and whitelist and msg.chat_id not in whitelist:
+            return "whitelist"
+        return None
+
+    async def _run_batch(self, chat_type: ChatType, chat_id: int) -> None:
+        """定时器到点：把游标之后的未投递消息交给模型。
+
+        Task 12 会在这里补预算分层、三段注入、轮换与按用途记账；
+        现在先复用 _reply 的完整时间线投递，保证接线可用。
+        """
+        latest = self.store.recent_messages(chat_type, chat_id, 1)
+        if not latest:
+            return
+        batch = self.store.pending_batch(chat_type, chat_id, latest[0].message_id)
+        if not batch:
+            return
+        await self._reply(batch[-1])
 
     async def _ask_brain(self, msg: Message) -> BrainReply:
         """OpenCode 模式走会话接口；本地模式仍走原来的上下文拼装。"""

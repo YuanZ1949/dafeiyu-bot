@@ -41,7 +41,8 @@ class BatchScheduler:
         return window
 
     def _params(self) -> dict[str, float]:
-        t = self.cfg.trigger
+        # Settings 上叫 triggers；单测里传的是 SimpleNamespace(trigger=...)。
+        t = getattr(self.cfg, "triggers", None) or self.cfg.trigger
         return {
             "batch_seconds": t.batch_seconds,
             "debounce": t.addressed_debounce_seconds,
@@ -78,6 +79,26 @@ class BatchScheduler:
             window = self._window(chat_type, chat_id)
             if window.first_queued_at is None:
                 window.first_queued_at = now - 10**9
+
+    def pending_chats(self) -> list[ChatKey]:
+        """当前有排队消息的会话（按 chat 键排序），测试与观测用。"""
+        return sorted(
+            (
+                key
+                for key, window in self._windows.items()
+                if window.first_queued_at is not None
+            ),
+            key=lambda key: (key[0].value, key[1]),
+        )
+
+    async def drain(self) -> None:
+        """同步跑完当前所有到期批次（测试与停机用，不等下一拍）。"""
+        while True:
+            keys = self.tick()
+            if not keys:
+                return
+            for key in keys:
+                await self._flush(*key)
 
     async def run(self, interval: float = 0.5) -> None:
         while True:

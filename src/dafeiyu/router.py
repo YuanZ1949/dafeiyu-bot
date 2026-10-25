@@ -83,11 +83,15 @@ class Router:
         self._state(chat_type, chat_id).muted_until = None
 
     # ---- gates ----------------------------------------------------
-    def hard_trigger(self, msg: Message) -> bool:
+    def is_addressed(self, msg: Message) -> bool:
+        """被点名：@、引用回复、或正文里出现别名。批次模式用它决定防抖计时。"""
         if msg.at_bot or msg.reply_to_bot:
             return True
         text = msg.content.casefold()
         return any(alias.casefold() in text for alias in self.settings.persona.aliases)
+
+    def hard_trigger(self, msg: Message) -> bool:
+        return self.is_addressed(msg)
 
     def _in_quiet_hours(self, now: datetime) -> bool:
         start_s, end_s = self.settings.triggers.quiet_hours
@@ -105,14 +109,17 @@ class Router:
         hours, minutes = hhmm.split(":")
         return int(hours) * 60 + int(minutes)
 
+    def is_muted(self, chat_type: ChatType, chat_id: int, now: datetime | None = None) -> bool:
+        """只判 /闭嘴 的静音，不含夜间静音时段。"""
+        now = now or self.clock()
+        st = self._state(chat_type, chat_id)
+        return st.muted_until is not None and now < st.muted_until
+
     def is_quiet(
         self, chat_type: ChatType, chat_id: int, now: datetime | None = None
     ) -> bool:
         now = now or self.clock()
-        st = self._state(chat_type, chat_id)
-        if st.muted_until is not None and now < st.muted_until:
-            return True
-        return self._in_quiet_hours(now)
+        return self.is_muted(chat_type, chat_id, now) or self._in_quiet_hours(now)
 
     def rule_filter(self, msg: Message, now: datetime) -> tuple[bool, str]:
         st = self._state(msg.chat_type, msg.chat_id)
