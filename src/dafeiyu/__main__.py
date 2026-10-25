@@ -52,7 +52,13 @@ def build_workers(
     运行时才炸的 worker；HTTP 传输有，所以 opencode 也能跑旁路。
     """
     if not hasattr(brain, "complete_detailed"):
-        log.debug("brain=%s 不支持 complete_detailed，跳过摘要/印象旁路", provider)
+        # 静默跳过会让用户以为「记忆坏了」：把模式和缺失的方法说清楚。
+        log.warning(
+            "brain=%s（transport=%s）没有 complete_detailed，"
+            "摘要/印象旁路已跳过：记忆不会自动生成，面板只能看到历史数据",
+            provider,
+            getattr(settings.opencode, "transport", "-"),
+        )
         return Workers()
     # 两条旁路共用一份退避：配额熔断必须一次管住摘要与印象，且写入库跨重启存活。
     backoff = FailureBackoff(persistence=store)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -166,3 +167,20 @@ def test_build_brain_five_arg_call_still_works(tmp_path: Path) -> None:
         assert isinstance(brain, BrainClient)
     finally:
         store.close()
+
+
+def test_worker_wiring_warns_when_skipping(tmp_path: Path, caplog) -> None:
+    """跳过旁路必须说出来：用户不该靠面板空白去猜记忆为什么不涨。"""
+    settings = make_settings(tmp_path)
+    store = make_store()
+    try:
+        with caplog.at_level(logging.WARNING, logger="dafeiyu.__main__"):
+            workers = build_workers(settings, store, SimpleNamespace(), "opencode")
+    finally:
+        store.close()
+
+    assert workers.scheduler is None
+    text = caplog.text
+    assert "没有 complete_detailed" in text
+    assert "opencode" in text
+    assert f"transport={settings.opencode.transport}" in text
