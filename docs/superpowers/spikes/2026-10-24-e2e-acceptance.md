@@ -327,3 +327,66 @@ GET /api/config
 - **隔离后的副作用**：bot 的 serve 不再加载全局 `dcp`（上下文裁剪）与 `retry-fast-fail`（provider 重试）。前者由 bot 自己的轮换替代，后者的职责部分由本任务新增的 `_round_error` 补上（只报错，不重试）。
 - **`config_home` 的两种生效路径**都已有测试：`manage_server: true` 走 `_build_env()`，`false` 走 supervisor `build_specs`。真机只跑了后者的手工等价物（直接起 serve），supervisor 本身没启动过。
 - **模型可用性**：`opencode/deepseek-v4.1-flash-free` 的免费额度会周期性打满。长期跑群聊应换成有额度的模型，否则摘要/印象会静默降级（现在是明确报错 + 空结果）。
+
+## 2026-10-25 第二轮验收（真机 + dashboard 记忆面板）
+
+本轮契约见 `.tamako/contract.json`，五项逐条取证如下。
+
+### 1. `qwen/qwen3.5-9b` 记忆调用 ≤60s 且落库（✅）
+
+探针在临时库上走真实 LM Studio（`local_model.reasoning_effort: none`、`max_tokens: 2048`、`timeout_seconds: 60`），串行执行印象抽取与按日摘要：
+
+```
+impression_seconds=5.05
+summary_seconds=1.70
+impressions_added=3 rows=3
+  - 1001 nickname: 外号叫鱼片
+  - 1001 fact: 喜欢钓鱼
+  - 1002 preference: 怕虫子，不喜欢露营
+summary_len=100 stored=True
+usage_rows=2
+  - impression: prompt=266 completion=102
+  - summary: prompt=168 completion=76
+RESULT=PASS
+```
+
+结论：思考关闭后 9B 模型两次记忆调用分别 5.05s / 1.70s，均远低于 60s 硬上限；`impressions` / `summaries` / `usage` 三张表都有数据。
+
+### 2. dashboard 摘要/印象面板 + `GET /api/memory`（✅）
+
+- bot 控制口新增只读 `GET /api/memory?limit=N`（默认 20，上限 200）：`BrainControl.memory_snapshot()` 读 `Store.recent_summaries()` / `recent_impressions()`，跨会话按时间倒序。
+- dashboard 新增 `/api/memory` 代理（转发查询串、透传状态码）+ 只读面板「记忆」：左列按日摘要、右列群印象，10s 自动刷新，内容用 `textContent` 写入（模型产出的文本不当 HTML 解析）。
+- 测试三种情况：空库 `{"summaries": [], "impressions": []}`；有数据（摘要/印象字段逐项断言）；读失败（关闭 DB 后 500 + 「读取记忆失败」）。dashboard 侧另有代理透传与 bot 离线（502/504）两条。
+- 真机 HTTP：supervisor 运行中，`GET http://127.0.0.1:8787/api/memory?limit=3` → `200 {"summaries": [], "impressions": []}`（当前库确实为空，空库分支）。
+
+### 3. 解耦 + 全量回归（✅）
+
+`pytest -q` → **403 passed in 177.30s**（契约要求 > 394）。新增参数只挂在 `local_model` 上：
+
+- `test_token_brain_does_not_inherit_local_reasoning_effort`：`local_model.reasoning_effort: none` 时 token brain 的 `reasoning_effort is None`。
+- `test_local_model_reasoning_effort_defaults_and_overrides` / `test_local_model_brain_passes_reasoning_effort`：默认空串、可覆盖、能传到 client。
+
+### 4. supervisor + NapCat 真机群消息（✅）
+
+`scripts/start-all.ps1 -NoBrowser` 启动后：
+
+```
+opencode  running pid=16544 port=24310
+bot       running pid=33864 port=8788
+napcat    running pid=15648
+napcat: reachable=true logged_in=true qq=10001 nickname=：） gateway_connected=true
+```
+
+真实群 **20001** 的往返（取 `data/dafeiyu.db`）：
+
+| 消息 | id | 时间 | 内容摘要 |
+| --- | --- | --- | --- |
+| 群友 | 79 | 18:17:20 | 在吗 |
+| bot | 80 | 18:17:31 | 刚睡醒…… 在的在的…… |
+
+**时延 11s**（到达 → 发送落库）。同批日志里 `dafeiyu-memory` 在 18:16:37 因 `provider.quota`（free 额度）失败两次，属既有外部配额风险，主回复链路不受影响。
+
+### 5. 提交与工作区（✅）
+
+本轮 dashboard 记忆面板独立提交 `e03efb7 feat(dashboard): 只读记忆面板 + GET /api/memory 代理`；此前 local_model 参数在 `c5c5a9b`。收尾时 `git status --short` 为空。
+
