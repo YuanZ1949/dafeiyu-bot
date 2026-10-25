@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 from dafeiyu.models import ChatType, Impression, Message
@@ -70,8 +71,22 @@ CREATE TABLE IF NOT EXISTS brain_sessions (
     chat_id INTEGER NOT NULL,
     session_id TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT,
+    delivered_count INTEGER NOT NULL DEFAULT 0,
+    token_estimate INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (provider, chat_type, chat_id)
 );
+
+-- 轮换时产出的一次性接续摘要（与 summaries 的按日摘要分开存，避免互相覆盖）。
+CREATE TABLE IF NOT EXISTS session_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_session_summaries_chat
+    ON session_summaries (chat_type, chat_id, id);
 
 -- 会话型大脑（OpenCode）的投递记录：
 --   * delivered_cursors 是该群的「投递下限」，id 小于等于它的消息视为已归档，不再回溯；
@@ -90,9 +105,26 @@ CREATE TABLE IF NOT EXISTS delivered_messages (
     chat_id INTEGER NOT NULL,
     message_id TEXT NOT NULL,
     delivered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    skipped_reason TEXT,
     PRIMARY KEY (chat_type, chat_id, message_id)
 );
 """
+
+# 老库升级：SQLite 的 ALTER TABLE ADD COLUMN 必须带默认值（NOT NULL 也要给）。
+_MIGRATIONS: dict[str, dict[str, str]] = {
+    "brain_sessions": {
+        "created_at": "TEXT",
+        "delivered_count": "INTEGER NOT NULL DEFAULT 0",
+        "token_estimate": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "delivered_messages": {
+        "skipped_reason": "TEXT",
+    },
+}
+
+# brain_sessions 目前只有 opencode 这条路在用（token/local_model 没有 session 概念），
+# 所以会话统计接口不把 provider 暴露给调用方。
+_SESSION_PROVIDER = "opencode"
 
 _FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS impressions_fts USING fts5(
@@ -121,6 +153,15 @@ def _like_pattern(query: str) -> str:
     return f"%{escaped}%"
 
 
+@dataclass(frozen=True)
+class SessionStats:
+    """当前 session 已经吃掉多少：投递条数、token 估算、建立时间（ISO 日期）。"""
+
+    delivered_count: int = 0
+    token_estimate: int = 0
+    created_at: str | None = None
+
+
 class Store:
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
@@ -134,12 +175,26 @@ class Store:
 
     def init_schema(self) -> None:
         self._conn.executescript(_SCHEMA)
+        self._ensure_columns()
         try:
             self._conn.executescript(_FTS_SCHEMA)
             self._fts = True
         except sqlite3.OperationalError:
             self._fts = False
         self._conn.commit()
+
+    def _ensure_columns(self) -> None:
+        """给老库补列：CREATE TABLE IF NOT EXISTS 不会改已存在的表。"""
+        for table, columns in _MIGRATIONS.items():
+            info = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            if not info:
+                continue
+            existing = {row["name"] for row in info}
+            for name, decl in columns.items():
+                if name not in existing:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {decl}"
+                    )
 
     def close(self) -> None:
         self._conn.close()
@@ -391,6 +446,60 @@ class Store:
         )
         self._conn.commit()
 
+    # ---- session stats (轮换判据) ----------------------------------
+    def session_stats(self, chat_type: ChatType, chat_id: int) -> SessionStats:
+        row = self._conn.execute(
+            """
+            SELECT delivered_count, token_estimate, created_at FROM brain_sessions
+            WHERE provider = ? AND chat_type = ? AND chat_id = ?
+            """,
+            (_SESSION_PROVIDER, chat_type.value, chat_id),
+        ).fetchone()
+        if row is None:
+            return SessionStats()
+        return SessionStats(
+            delivered_count=int(row["delivered_count"]),
+            token_estimate=int(row["token_estimate"]),
+            created_at=None if row["created_at"] is None else str(row["created_at"]),
+        )
+
+    def bump_session_stats(
+        self, chat_type: ChatType, chat_id: int, *, messages: int, tokens: int
+    ) -> None:
+        """累计本轮投递：无行则建（created_at 只写这一次），有行则累加。"""
+        self._conn.execute(
+            """
+            INSERT INTO brain_sessions
+                (provider, chat_type, chat_id, session_id, created_at,
+                 delivered_count, token_estimate)
+            VALUES (?, ?, ?, '', ?, ?, ?)
+            ON CONFLICT (provider, chat_type, chat_id) DO UPDATE SET
+                delivered_count = brain_sessions.delivered_count + excluded.delivered_count,
+                token_estimate = brain_sessions.token_estimate + excluded.token_estimate
+            """,
+            (
+                _SESSION_PROVIDER,
+                chat_type.value,
+                chat_id,
+                today_shanghai(),
+                messages,
+                tokens,
+            ),
+        )
+        self._conn.commit()
+
+    def reset_session_stats(self, chat_type: ChatType, chat_id: int) -> None:
+        """轮换后清零；created_at 跟着新 session 重算。"""
+        self._conn.execute(
+            """
+            UPDATE brain_sessions
+            SET delivered_count = 0, token_estimate = 0, created_at = ?
+            WHERE provider = ? AND chat_type = ? AND chat_id = ?
+            """,
+            (today_shanghai(), _SESSION_PROVIDER, chat_type.value, chat_id),
+        )
+        self._conn.commit()
+
     def get_opencode_session(self, chat_type: ChatType, chat_id: int) -> str | None:
         return self.get_brain_session("opencode", chat_type, chat_id)
 
@@ -497,6 +606,28 @@ class Store:
         row = self._conn.execute(
             "SELECT content FROM summaries WHERE chat_type = ? AND chat_id = ? AND date = ?",
             (chat_type.value, chat_id, date),
+        ).fetchone()
+        return None if row is None else str(row["content"])
+
+    # ---- 轮换摘要（一次性接续，与按日 summaries 分开） --------------
+    def add_session_summary(self, chat_type: ChatType, chat_id: int, content: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO session_summaries (chat_type, chat_id, content)
+            VALUES (?, ?, ?)
+            """,
+            (chat_type.value, chat_id, content),
+        )
+        self._conn.commit()
+
+    def latest_session_summary(self, chat_type: ChatType, chat_id: int) -> str | None:
+        row = self._conn.execute(
+            """
+            SELECT content FROM session_summaries
+            WHERE chat_type = ? AND chat_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (chat_type.value, chat_id),
         ).fetchone()
         return None if row is None else str(row["content"])
 
