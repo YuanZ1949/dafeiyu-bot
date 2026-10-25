@@ -181,7 +181,7 @@ def test_at_bot_bypasses_whitelist_but_plain_message_does_not():
     settings = make_settings(groups=GroupsConfig(frozenset({777}), frozenset(), frozenset()))
     store = Store(":memory:")
     store.init_schema()
-    router = Router(settings, store)
+    router = Router(settings, store, clock=lambda: CLOCK)
 
     assert router.should_handle(msg("在吗", at_bot=True)).call_model is True
     assert router.should_handle(msg("在吗", message_id="m2")).call_model is False
@@ -190,12 +190,14 @@ def test_at_bot_bypasses_whitelist_but_plain_message_does_not():
 # ---- I2: token 预算与失败/旁路记账 ------------------------------------
 
 
-def test_budget_blocks_when_daily_tokens_exhausted():
+def test_budget_blocks_when_daily_tokens_exhausted(monkeypatch):
     settings = make_settings(budget=BudgetConfig(200, 100))
     store = Store(":memory:")
     store.init_schema()
+    # usage 的日期来自 Store.today()，必须和 Router 的 CLOCK 对齐，否则预算看不到今天。
+    monkeypatch.setattr("dafeiyu.memory.store.today_shanghai", lambda: CLOCK.date())
     store.record_usage(GROUP, 1, "reply", 60, 50)
-    router = Router(settings, store)
+    router = Router(settings, store, clock=lambda: CLOCK)
     decision = router.should_handle(msg("怎么办", message_id="m3"))
     assert decision.call_model is False
     assert decision.reason == "budget"

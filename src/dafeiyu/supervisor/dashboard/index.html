@@ -249,6 +249,7 @@
       <h2 style="margin:0">会话管理</h2>
       <span class="kv" id="sessions-hint"></span>
       <span class="spacer" style="flex:1"></span>
+      <button class="btn" id="btn-sessions-more" disabled>加载更多</button>
       <button class="btn" id="btn-refresh-sessions">刷新</button>
     </div>
     <div class="session-list" id="sessions"></div>
@@ -259,6 +260,7 @@
       <h2 style="margin:0">运行配置</h2>
       <span class="kv" id="config-hint">只读</span>
       <span class="spacer" style="flex:1"></span>
+      <button class="btn" id="btn-backup">下载备份</button>
       <button class="btn" id="btn-restart-bot">重启 Bot</button>
       <button class="btn" id="btn-refresh-config">刷新</button>
     </div>
@@ -687,6 +689,9 @@ async function loadUsage() {
 const SEARCH_PAGE = 20;
 let searchOffset = 0;
 let searchTotal = 0;
+const SESSIONS_PAGE = 50;
+let sessionsOffset = 0;
+let sessionsTotal = 0;
 
 async function searchMessages(append) {
   const q = $("search-q").value.trim();
@@ -719,12 +724,14 @@ async function searchMessages(append) {
   }
 }
 
-async function loadSessions() {
+async function loadSessions(append = false) {
   try {
-    const data = await api("/api/sessions");
+    if (!append) sessionsOffset = 0;
+    const data = await api(`/api/sessions?limit=${SESSIONS_PAGE}&offset=${sessionsOffset}`);
     const items = data.items || [];
+    sessionsTotal = Number(data.total || 0);
     const box = $("sessions");
-    box.replaceChildren();
+    if (!append) box.replaceChildren();
     items.forEach((s) => {
       const row = document.createElement("div");
       row.className = "session-row";
@@ -762,8 +769,11 @@ async function loadSessions() {
       row.append(who, meta, acts);
       box.appendChild(row);
     });
-    $("sessions-hint").textContent = `${items.length} 个会话`;
-    if (!items.length) box.innerHTML = '<div class="mem-empty">还没有会话记录</div>';
+    sessionsOffset += items.length;
+    const loaded = box.querySelectorAll(".session-row").length;
+    $("sessions-hint").textContent = `${loaded} / ${sessionsTotal} 个会话`;
+    if (!loaded) box.innerHTML = '<div class="mem-empty">还没有会话记录</div>';
+    $("btn-sessions-more").disabled = sessionsOffset >= sessionsTotal;
   } catch (err) {
     $("sessions-hint").textContent = `读取失败：${err.message}`;
   }
@@ -829,6 +839,33 @@ async function exportChat(session, format) {
   }
 }
 
+async function downloadBackup() {
+  try {
+    const resp = await fetch("/api/backup");
+    if (!resp.ok) {
+      let reason = `HTTP ${resp.status}`;
+      try {
+        const data = await resp.json();
+        reason = (data && data.error) || reason;
+      } catch (_) { /* 非 JSON 错误体 */ }
+      throw new Error(reason);
+    }
+    const blob = await resp.blob();
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `dafeiyu-backup-${stamp}.db`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    toast("已开始下载整库备份");
+  } catch (err) {
+    toast(`备份失败：${err.message}`, true);
+  }
+}
+
 async function loadConfig() {
   try {
     const c = await api("/api/config");
@@ -840,6 +877,7 @@ async function loadConfig() {
       ["冷却", `错误回复 ${c.cooldown.brain_error_seconds}s · 工具提示 ${c.cooldown.tool_hint_seconds}s`],
       ["限流", `${c.rate_limit.window_seconds / 60} 分钟内 ${c.rate_limit.threshold} 次 429 → 退避 ${c.rate_limit.backoff_seconds}s · 配额暂停 ${Math.round(c.rate_limit.quota_pause_seconds / 60)} 分钟`],
       ["预算", `每日 ${c.budget.daily_calls} 次 / ${fmtTokens(c.budget.daily_tokens)} token`],
+      ["记忆", `窗口 ${c.memory.window_size} 条 · 保留 ${c.memory.retention_days > 0 ? `${c.memory.retention_days} 天` : "永久"}`],
       ["网关", c.gateway.provider],
     ];
     $("config-body").innerHTML = rows
@@ -968,7 +1006,9 @@ $("search-q").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter") searchMessages(false);
 });
 $("btn-search-more").addEventListener("click", () => searchMessages(true));
-$("btn-refresh-sessions").addEventListener("click", loadSessions);
+$("btn-sessions-more").addEventListener("click", () => loadSessions(true));
+$("btn-refresh-sessions").addEventListener("click", () => loadSessions());
+$("btn-backup").addEventListener("click", downloadBackup);
 $("btn-refresh-config").addEventListener("click", loadConfig);
 $("btn-restart-bot").addEventListener("click", () => {
   if (confirm("重启 Bot 进程？正在处理的对话会中断。")) doControl("restart", "bot");

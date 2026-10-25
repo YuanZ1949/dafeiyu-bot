@@ -167,6 +167,7 @@ powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoQr
 | `memory.window_size` | `20` | 上下文窗口消息数 |
 | `memory.impression_topk` | `5` | 每次注入的群友印象条数 |
 | `memory.extract_every` | `20` | 每 N 条消息抽一次印象 |
+| `memory.retention_days` | `0` | 消息保留天数；`0` = 永久，`>0` 时每天清理更早的消息（摘要/印象保留） |
 
 ## 3. 启动
 
@@ -214,7 +215,32 @@ NapCat 已连接
 
 > `--type` 默认 `group`。群号和 QQ 号可能数字相同，所以必须区分。
 
-## 5. 测试
+## 5. 记忆面板
+
+`scripts/start.ps1` 启动后打开 <http://127.0.0.1:8787>（端口在 `config.yaml` 的
+`supervisor.dashboard.port`）。面板和 Bot 控制口默认都只监听本机，不对外网开放。
+
+面板上的卡片：
+
+- **进程 / 大脑 / 登录二维码**：查看 OpenCode、Bot、NapCat 状态，切换模型，扫码登录。
+- **记忆**：查看按日摘要与群印象，可按群聊/私聊筛选；填会话 ID 可手动生成摘要、抽取印象。
+- **用量**：最近 7/14/30 天的调用与 token 柱状图、Top 会话、最近错误。
+- **消息搜索**：跨会话按关键字搜索，结果分页加载。
+- **会话管理**：按最近活跃排序，分页加载。每行可以：
+  - **新建会话**：重置 OpenCode session 映射与会话内摘要；消息、按日摘要、印象、用量都保留；
+  - **软忘记**：删本会话的消息和 session 映射，保留按日摘要与印象；
+  - **彻底删除**：删远端 session + 本地消息、摘要、印象、用量，不可恢复；
+  - **导出 MD / JSON**：导出单会话记忆。
+- **运行配置**：只读展示当前模型、人设、冷却、限流、预算、记忆窗口与保留天数。
+  要改配置请编辑 `config.yaml` 后重启；面板提供「重启 Bot」和「下载备份」。
+
+**下载备份**会通过 SQLite backup API 生成一份一致性快照（`dafeiyu-backup-时间.db`），
+包含全部会话、摘要、印象、用量和 session 映射。恢复时先停服务，用备份文件替换
+`data/dafeiyu.db`，再启动即可。面板不自动删除旧备份，请自行管理文件。
+
+面板每 2–30 秒轮询一次状态；会话列表默认每页 50 条，点「加载更多」继续。
+
+## 6. 测试
 
 ```powershell
 .venv\Scripts\python -m pytest -q
@@ -222,7 +248,7 @@ NapCat 已连接
 
 全部用例不联网、不需要真实 QQ 账号：HTTP 用 `respx` 模拟，OneBot 事件用本地 fixture，WS 适配器起真实本地端口对打。
 
-## 6. 常见故障
+## 7. 常见故障
 
 | 现象 | 排查 |
 | --- | --- |
@@ -235,14 +261,14 @@ NapCat 已连接
 | 回复被截断 | 这是设计行为：闲聊 120 字、技术问题 300 字，改 `config.yaml` 即可 |
 | 中文日志乱码 | 用 `scripts/start.ps1` 启动（已设 UTF-8），不要直接双击 python |
 
-## 7. 隐私与风险
+## 8. 隐私与风险
 
 - 消息原文保存在本地 `data/dafeiyu.db`，不会上传到除 DeepSeek API 之外的任何地方。
 - 群友可以要求删除：`.venv\Scripts\dafeiyu-cli.exe forget --chat <群号>`。
 - **QQ 小号有被风控/封禁的风险**，本项目通过非官方协议端接入，请自行评估；不要用主号，不要高频刷屏。
 - 机器人说的话由模型生成，可能出错；涉及医疗、法律、财务等严肃问题时请以人为准。
 
-## 8. 目录
+## 9. 目录
 
 ```
 src/dafeiyu/

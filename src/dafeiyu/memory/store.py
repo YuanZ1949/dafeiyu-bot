@@ -251,6 +251,16 @@ class Store:
     def close(self) -> None:
         self._conn.close()
 
+    def backup_to(self, path: str | Path) -> None:
+        """用 SQLite backup API 写一致性快照（WAL 中已提交的内容也会带上）。"""
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        dest = sqlite3.connect(str(target))
+        try:
+            self._conn.backup(dest)
+        finally:
+            dest.close()
+
     @staticmethod
     def today() -> str:
         return today_shanghai()
@@ -348,6 +358,33 @@ class Store:
             (chat_type.value, chat_id),
         ).fetchone()
         return int(row["n"])
+
+    def prune_messages(self, before_ts: int) -> int:
+        """删除 timestamp 早于 cutoff 的消息；timestamp=0（未知时间）不动。
+
+        摘要与印象是独立表，保留；delivered_messages 里失去对应消息的孤儿行一并清掉，
+        避免投递记录比消息本体活得更久。返回删除的消息数。
+        """
+        if before_ts <= 0:
+            return 0
+        cur = self._conn.execute(
+            "DELETE FROM messages WHERE timestamp > 0 AND timestamp < ?",
+            (before_ts,),
+        )
+        deleted = max(cur.rowcount, 0)
+        self._conn.execute(
+            """
+            DELETE FROM delivered_messages
+            WHERE NOT EXISTS (
+                SELECT 1 FROM messages m
+                WHERE m.chat_type = delivered_messages.chat_type
+                  AND m.chat_id = delivered_messages.chat_id
+                  AND m.message_id = delivered_messages.message_id
+            )
+            """
+        )
+        self._conn.commit()
+        return deleted
 
     def search_messages(
         self,

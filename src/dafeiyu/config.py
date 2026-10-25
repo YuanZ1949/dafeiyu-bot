@@ -61,6 +61,8 @@ class MemoryConfig:
     window_size: int
     impression_topk: int
     extract_every: int
+    # 0 = 永久保留；>0 时由 retention_loop 每天清理更早的消息。
+    retention_days: int = 0
     # 会话轮换阈值（任一触发）；Task 13 才在 config.yaml 里显式暴露。
     rotation_messages: int = 60
     rotation_days: int = 7
@@ -225,6 +227,13 @@ def _float(value: Any, field: str) -> float:
         return float(value)
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"{field} 必须是数字") from exc
+
+
+def _non_negative_int(value: Any, field: str, default: int) -> int:
+    got = _int(default if value is None else value, field)
+    if got < 0:
+        raise ConfigError(f"{field} 必须大于等于 0")
+    return got
 
 
 def _positive_int(value: Any, field: str, default: int) -> int:
@@ -573,6 +582,9 @@ def load_settings(
             window_size=window_size,
             impression_topk=_int(memory_raw.get("impression_topk", 5), "memory.impression_topk"),
             extract_every=extract_every,
+            retention_days=_non_negative_int(
+                memory_raw.get("retention_days"), "memory.retention_days", 0
+            ),
             rotation_messages=_positive_int(
                 memory_raw.get("rotation_messages"), "memory.rotation_messages", 60
             ),

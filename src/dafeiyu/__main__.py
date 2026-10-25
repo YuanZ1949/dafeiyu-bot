@@ -25,6 +25,7 @@ from .runtime import load_runtime
 from .service import Service
 from .workers.failure import FailureBackoff, MemoryPaused
 from .workers.impressions import ImpressionWorker
+from .workers.retention import retention_loop
 from .workers.summary import SummaryScheduler, summary_loop
 
 log = logging.getLogger(__name__)
@@ -143,6 +144,7 @@ async def main() -> None:
     control_runner = None
     service_started = False
     summary_task: asyncio.Task | None = None
+    retention_task: asyncio.Task | None = None
 
     try:
         runtime = load_runtime()
@@ -211,6 +213,13 @@ async def main() -> None:
             if scheduler is not None
             else None
         )
+        retention_task = (
+            asyncio.create_task(
+                retention_loop(store, settings.memory.retention_days)
+            )
+            if settings.memory.retention_days > 0
+            else None
+        )
 
         await service.start()
         service_started = True
@@ -238,6 +247,10 @@ async def main() -> None:
             summary_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await summary_task
+        if retention_task is not None:
+            retention_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await retention_task
         if control_runner is not None:
             await control_runner.cleanup()
         if service_started and service is not None:

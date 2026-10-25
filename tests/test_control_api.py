@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -739,6 +740,32 @@ async def test_export_endpoint_validates_scope_and_format(tmp_path: Path) -> Non
         ).status == 400
 
 
+async def test_backup_endpoint_returns_openable_snapshot(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    _seed_message(control.store, "m1", "备份里的消息")
+    control.store.upsert_summary(ChatType.GROUP, 100, "2026-10-23", "备份里的摘要")
+
+    async with running(app) as client:
+        resp = await client.get("/api/backup")
+        body = await resp.read()
+        assert resp.status == 200
+        disposition = resp.headers["Content-Disposition"]
+        assert "attachment" in disposition
+        assert re.search(r'dafeiyu-backup-\d{8}-\d{6}\.db', disposition)
+
+    target = tmp_path / "snapshot.db"
+    target.write_bytes(body)
+    conn = sqlite3.connect(target)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT content FROM summaries").fetchone()[0]
+            == "备份里的摘要"
+        )
+    finally:
+        conn.close()
+
+
 async def test_sessions_endpoint_and_actions(tmp_path: Path) -> None:
     control, service, app = make_control(tmp_path)
     _seed_message(control.store, "m1", "群消息")
@@ -749,6 +776,15 @@ async def test_sessions_endpoint_and_actions(tmp_path: Path) -> None:
         payload = await (await client.get("/api/sessions")).json()
         assert [item["chat_id"] for item in payload["items"]] == [100, 200]
         assert payload["items"][0]["session_id"] == "ses_abc"
+        assert payload["total"] == 2
+
+        page = await (
+            await client.get("/api/sessions", params={"limit": "1", "offset": "1"})
+        ).json()
+        assert page["total"] == 2
+        assert page["limit"] == 1
+        assert page["offset"] == 1
+        assert [item["chat_id"] for item in page["items"]] == [200]
 
         new = await client.post("/api/sessions/group/100/new")
         assert new.status == 200
@@ -779,6 +815,9 @@ async def test_session_action_rejects_unknown(tmp_path: Path) -> None:
         assert (await client.post("/api/sessions/group/1/rotate")).status == 400
         assert (await client.post("/api/sessions/team/1/new")).status == 400
         assert (await client.delete("/api/sessions/group/abc")).status == 400
+        assert (await client.get("/api/sessions?limit=0")).status == 400
+        assert (await client.get("/api/sessions?limit=201")).status == 400
+        assert (await client.get("/api/sessions?offset=-1")).status == 400
 
 
 async def test_config_endpoint_has_thresholds_and_no_secrets(tmp_path: Path) -> None:
@@ -801,6 +840,7 @@ async def test_config_endpoint_has_thresholds_and_no_secrets(tmp_path: Path) -> 
         "quota_pause_seconds": 3600.0,
     }
     assert payload["budget"]["daily_calls"] == 200
+    assert payload["memory"] == {"window_size": 20, "retention_days": 0}
 
 
 def test_dashboard_exposes_new_panels() -> None:
@@ -814,15 +854,20 @@ def test_dashboard_exposes_new_panels() -> None:
         'id="search-q"',
         'id="btn-search-more"',
         'id="sessions"',
+        'id="btn-sessions-more"',
         'id="config-body"',
         'id="btn-restart-bot"',
+        'id="btn-backup"',
     ):
         assert anchor in html, f"面板缺少 {anchor}"
     assert "/api/usage?days=" in html
     assert "/api/memory/search?" in html
     assert "/api/memory/export?" in html
-    assert "/api/sessions" in html
+    assert "/api/sessions?limit=" in html
     assert "/api/config" in html
+    assert "/api/backup" in html
+    assert "loadSessions(true)" in html
+    assert "c.memory.retention_days" in html
     assert "URL.createObjectURL" in html
     assert "confirm(" in html
 

@@ -6,9 +6,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from conftest import TEST_CONFIG_YAML
 
@@ -234,6 +238,19 @@ async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
         config = await (await dash.get("/api/config")).json()
         assert config["brain"]["provider"] == "token"
         assert config["cooldown"]["brain_error_seconds"] == 30.0
+        assert config["memory"]["retention_days"] == 0
+
+        backup = await dash.get("/api/backup")
+        body = await backup.read()
+        assert backup.status == 200
+        assert "attachment" in backup.headers["Content-Disposition"]
+        snapshot = tmp_path / "dashboard-backup.db"
+        snapshot.write_bytes(body)
+        conn = sqlite3.connect(snapshot)
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
+        finally:
+            conn.close()
 
         # 新建 session：消息还在，映射没了。
         assert (await dash.post(f"/api/sessions/group/{GROUP_ID}/new")).status == 200
@@ -250,3 +267,58 @@ async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
         # 彻底删除：FakeService 无 forget_chat 时走 brain/store 兜底。
         assert (await dash.delete(f"/api/sessions/group/{GROUP_ID}")).status == 200
         assert store.count_summaries(ChatType.GROUP, GROUP_ID) == 0
+
+
+async def test_dashboard_proxy_waits_for_slow_delete_and_backup(tmp_path: Path) -> None:
+    """2 秒总超时不能套在删 session / 整库备份上：假 bot 慢 3 秒仍应成功。"""
+    config = tmp_path / "config.yaml"
+    config.write_text(YAML, encoding="utf-8")
+    env = tmp_path / "test.env"
+    env.write_text("BOT_QQ=10001\nDEEPSEEK_API_KEY=sk-test\n", encoding="utf-8")
+    settings = load_settings(env_file=env, config_file=config)
+
+    async def slow_delete(_: web.Request) -> web.Response:
+        await asyncio.sleep(3.0)
+        return web.json_response({"ok": True})
+
+    async def slow_backup(_: web.Request) -> web.Response:
+        await asyncio.sleep(3.0)
+        return web.Response(
+            body=b"snapshot-bytes",
+            headers={"Content-Disposition": 'attachment; filename="backup.db"'},
+        )
+
+    bot_app = web.Application()
+    bot_app.router.add_delete("/api/sessions/{chat_type}/{chat_id}", slow_delete)
+    bot_app.router.add_get("/api/backup", slow_backup)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    dash_client = None
+    try:
+        dash_app = create_dashboard_app(
+            FakeSupervisor(),
+            settings,
+            LogHub(tmp_path / "logs"),
+            tmp_path / "qrcode.png",
+            str(bot_client.server.make_url("/")).rstrip("/"),
+        )
+        dash_client = TestClient(TestServer(dash_app))
+        await dash_client.start_server()
+
+        started = time.monotonic()
+        deleted = await dash_client.delete("/api/sessions/group/1")
+        delete_elapsed = time.monotonic() - started
+        assert deleted.status == 200
+        assert delete_elapsed >= 2.8
+
+        started = time.monotonic()
+        backup = await dash_client.get("/api/backup")
+        backup_elapsed = time.monotonic() - started
+        assert backup.status == 200
+        assert await backup.read() == b"snapshot-bytes"
+        assert "attachment" in backup.headers["Content-Disposition"]
+        assert backup_elapsed >= 2.8
+    finally:
+        if dash_client is not None:
+            await dash_client.close()
+        await bot_client.close()

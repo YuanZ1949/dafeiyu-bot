@@ -115,6 +115,8 @@ memory:
   window_size: 20
   impression_topk: 3
   extract_every: 20
+  # 消息保留天数；0 = 永久保留。>0 时每天清理更早的消息（摘要与印象不受影响）。
+  retention_days: 0
   # 会话轮换阈值，任一满足即换 session。
   rotation_messages: 60
   rotation_days: 7

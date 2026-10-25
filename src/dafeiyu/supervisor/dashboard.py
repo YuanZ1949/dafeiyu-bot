@@ -19,6 +19,9 @@ log = logging.getLogger(__name__)
 QR_STALE_SECONDS = 130
 BOT_TIMEOUT = 2.0
 BOT_SWITCH_TIMEOUT = 20.0
+# 删远端 session 要等 OpenCode 收尾，换脑/导出/整库备份更慢，不能沿用 2 秒。
+BOT_DELETE_TIMEOUT = 20.0
+BOT_BACKUP_TIMEOUT = 30.0
 DASHBOARD_DIR = Path(__file__).with_name("dashboard")
 
 
@@ -93,10 +96,15 @@ def create_app(
         except aiohttp.ClientError as exc:
             return 502, {"error": f"bot 不可达：{exc.__class__.__name__}"}
 
-    async def bot_raw(method: str, path: str) -> tuple[int, bytes, dict[str, str]]:
-        """导出类接口要原样转发 body 与下载头，不能先解析成 JSON。"""
+    async def bot_raw(
+        method: str, path: str, timeout: float | None = None
+    ) -> tuple[int, bytes, dict[str, str]]:
+        """导出/备份类接口要原样转发 body 与下载头，不能先解析成 JSON。"""
+        kwargs: dict[str, Any] = {}
+        if timeout is not None:
+            kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
         try:
-            async with bot_session().request(method, path) as resp:
+            async with bot_session().request(method, path, **kwargs) as resp:
                 body = await resp.read()
                 headers = {}
                 for name in ("Content-Type", "Content-Disposition"):
@@ -257,16 +265,27 @@ def create_app(
         chat_type, chat_id, error = _session_target(request)
         if error is not None:
             return error
-        code, data = await bot_call("DELETE", f"/api/sessions/{chat_type}/{chat_id}")
+        code, data = await bot_call(
+            "DELETE",
+            f"/api/sessions/{chat_type}/{chat_id}",
+            timeout=BOT_DELETE_TIMEOUT,
+        )
         return web.json_response(data, status=code)
 
     async def memory_export(request: web.Request) -> web.Response:
         path = "/api/memory/export"
         if request.query_string:
             path = f"{path}?{request.query_string}"
-        status, body, headers = await bot_raw("GET", path)
+        status, body, headers = await bot_raw(
+            "GET", path, timeout=BOT_BACKUP_TIMEOUT
+        )
         return web.Response(body=body, status=status, headers=headers)
 
+    async def backup(_: web.Request) -> web.Response:
+        status, body, headers = await bot_raw(
+            "GET", "/api/backup", timeout=BOT_BACKUP_TIMEOUT
+        )
+        return web.Response(body=body, status=status, headers=headers)
 
     async def memory_summary(request: web.Request) -> web.Response:
         payload = await _json_body(request)
@@ -343,6 +362,7 @@ def create_app(
     app.router.add_post("/api/sessions/{chat_type}/{chat_id}/{action}", session_action)
     app.router.add_delete("/api/sessions/{chat_type}/{chat_id}", session_delete)
     app.router.add_get("/api/config", config)
+    app.router.add_get("/api/backup", backup)
     app.router.add_post("/api/memory/summaries", memory_summary)
     app.router.add_post("/api/memory/impressions", memory_impressions)
     app.router.add_delete(

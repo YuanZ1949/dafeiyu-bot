@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import os
+import tempfile
 import time
 from datetime import datetime, timedelta
 from typing import Any, Callable
@@ -490,8 +491,16 @@ class BrainControl:
             lines.append("（无）")
         return "\n".join(lines).rstrip() + "\n"
 
-    def sessions_snapshot(self) -> dict[str, Any]:
-        return {"items": self.store.chat_overview()}
+    def sessions_snapshot(self, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        # chat_overview 本身不做 SQL 分页（四表并集），这里只截断响应；
+        # 前端按 offset 加载更多，避免一次把所有会话塞进 15 秒轮询。
+        items = self.store.chat_overview()
+        return {
+            "items": items[offset : offset + limit],
+            "total": len(items),
+            "limit": limit,
+            "offset": offset,
+        }
 
     async def session_action(
         self, action: str, chat_type: ChatType, chat_id: int
@@ -550,6 +559,10 @@ class BrainControl:
                 "daily_calls": self.settings.budget.daily_calls,
                 "daily_tokens": self.settings.budget.daily_tokens,
                 "ambient_ratio": self.settings.budget.ambient_ratio,
+            },
+            "memory": {
+                "window_size": self.settings.memory.window_size,
+                "retention_days": self.settings.memory.retention_days,
             },
             "gateway": {"provider": self.settings.gateway.provider},
         }
@@ -805,9 +818,42 @@ def create_app(
             headers=headers,
         )
 
-    async def sessions(_: web.Request) -> web.Response:
+    async def backup(_: web.Request) -> web.Response:
+        """整库一致性快照。先写临时文件再读入内存，避免把半成品流给浏览器。"""
+        stamp = datetime.now(SHANGHAI).strftime("%Y%m%d-%H%M%S")
+        filename = f"dafeiyu-backup-{stamp}.db"
+        fd, tmp = tempfile.mkstemp(prefix="dafeiyu-backup-", suffix=".db")
+        os.close(fd)
         try:
-            return web.json_response(control.sessions_snapshot())
+            control.store.backup_to(tmp)
+            with open(tmp, "rb") as fh:
+                body = fh.read()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("备份数据库失败：%s", exc)
+            return web.json_response(
+                {"error": f"备份失败：{exc.__class__.__name__}"}, status=500
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+        return web.Response(
+            body=body,
+            content_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    async def sessions(request: web.Request) -> web.Response:
+        try:
+            limit = _query_int(request, "limit", 50)
+            offset = _query_int(request, "offset", 0)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        if not 1 <= limit <= 200:
+            return web.json_response({"error": "limit 必须在 1..200 之间"}, status=400)
+        if offset < 0:
+            return web.json_response({"error": "offset 不能为负数"}, status=400)
+        try:
+            return web.json_response(control.sessions_snapshot(limit, offset))
         except Exception as exc:  # noqa: BLE001
             log.warning("读取会话列表失败：%s", exc)
             return web.json_response(
@@ -872,6 +918,7 @@ def create_app(
     app.router.add_post("/api/sessions/{chat_type}/{chat_id}/{action}", session_action)
     app.router.add_delete("/api/sessions/{chat_type}/{chat_id}", delete_session)
     app.router.add_get("/api/config", config)
+    app.router.add_get("/api/backup", backup)
     return app
 
 
