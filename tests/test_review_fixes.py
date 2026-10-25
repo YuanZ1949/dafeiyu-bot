@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -24,6 +25,8 @@ from dafeiyu.workers.summary import SummaryScheduler, summary_loop
 
 GROUP = ChatType.GROUP
 NOW = 1_760_000_000
+# 固定白天时钟，避免凌晨运行时命中 Router 的 01:00-07:00 静默时段。
+CLOCK = datetime(2026, 10, 24, 12, 0, tzinfo=timezone(timedelta(hours=8)))
 
 
 def make_settings(**overrides) -> Settings:
@@ -108,7 +111,7 @@ def service(settings=None, brain=None, store=None, adapter=None, impressions=Non
     store.init_schema()
     brain = brain or FakeBrain()
     adapter = adapter or FakeAdapter()
-    router = Router(settings, store)
+    router = Router(settings, store, clock=lambda: CLOCK)
     svc = Service(
         settings, store, brain, adapter, router, "人设", impressions
     )

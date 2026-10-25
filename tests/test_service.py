@@ -20,6 +20,10 @@ from dafeiyu.service import BRAIN_ERROR_REPLY, FORGET_REPLY, Service
 
 SHANGHAI = timezone(timedelta(hours=8))
 
+# 固定白天时钟：Router 的静默时段（01:00-07:00）若跟着真实时钟走，
+# 测试在凌晨跑就会整批失败。显式注入时钟可让结果与运行时刻无关。
+NOON = datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI)
+
 
 def make_settings(**overrides) -> Settings:
     base = dict(
@@ -98,7 +102,7 @@ def build(tmp_path, brain=None, adapter=None, settings=None):
     settings = settings or make_settings()
     adapter = adapter or FakeAdapter()
     brain = brain or FakeBrain()
-    router = Router(settings, store)
+    router = Router(settings, store, clock=lambda: NOON)
     service = Service(settings, store, brain, adapter, router, "你是溟月 $max_chars $max_reply_chars_technical")
     return service, store, brain, adapter, router
 
