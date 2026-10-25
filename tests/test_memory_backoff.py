@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -182,6 +183,7 @@ def test_rate_limit_detection() -> None:
     assert is_rate_limit_error(BrainError("限流了，稍后再试", status=429))
     assert is_rate_limit_error(BrainError("Too Many Requests"))
     assert is_rate_limit_error(SimpleNamespace(status=429))
+    assert is_rate_limit_error(BrainError("boom", status="429"))  # 类型不严谨的 provider
     assert not is_rate_limit_error(BrainError("network down"))
     assert not is_rate_limit_error(None)
 
@@ -319,3 +321,35 @@ def test_429_events_expire_from_window_in_process() -> None:
     backoff.mark_failed((ChatType.GROUP, 3), RATE_LIMITED)
 
     assert not backoff.is_paused()
+
+
+def test_future_events_from_clock_skew_still_expire(tmp_path: Path) -> None:
+    """墙钟被往回拨时，事件时间会落在未来；夹到 now 才不会永不过期。"""
+    store = make_store(tmp_path)
+    clock = Clock()
+    store.save_rate_limits([clock.wall + 3600] * 2, clock.wall + 3600)
+
+    backoff = FailureBackoff(
+        monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall, persistence=store
+    )
+    clock.advance(RATE_LIMIT_WINDOW_SECONDS + 1)
+    backoff.mark_failed((ChatType.GROUP, 1), RATE_LIMITED)
+
+    assert not backoff.is_paused()
+
+
+def test_trip_logs_why_global_pause_started(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """误停时需要能从日志看出是「窗口内 429 累计」，不是配额或代码 bug。"""
+    clock = Clock()
+    backoff = FailureBackoff(monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall)
+
+    with caplog.at_level(logging.WARNING, logger="dafeiyu.workers.failure"):
+        for chat_id in (1, 2, 3):
+            backoff.mark_failed((ChatType.GROUP, chat_id), RATE_LIMITED)
+
+    assert backoff.is_paused()
+    trips = [r for r in caplog.records if "429" in r.getMessage()]
+    assert len(trips) == 1
+    assert "阈值 3" in trips[0].getMessage()

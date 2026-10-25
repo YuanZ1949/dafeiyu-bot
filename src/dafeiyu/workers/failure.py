@@ -8,6 +8,8 @@ from typing import Any, Callable, Hashable
 from dafeiyu.brain.client import BrainError
 from dafeiyu.models import ChatType
 
+log = logging.getLogger(__name__)
+
 # 配额/网络这类外部失败，短时间内重试只会继续撞墙，默认冷却半小时。
 FAILURE_BACKOFF_SECONDS = 1800.0
 # 429 多是瞬时限流：半小时太长，只让本会话歇五分钟。
@@ -62,8 +64,11 @@ def is_rate_limit_error(exc: BaseException | None) -> bool:
     if exc is None:
         return False
     status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
-    if status == 429:
-        return True
+    try:
+        if status is not None and int(status) == 429:
+            return True
+    except (TypeError, ValueError):
+        pass
     text = str(exc).casefold()
     return "429" in text or "rate limit" in text or "too many requests" in text
 
@@ -147,8 +152,9 @@ class FailureBackoff:
         except (TypeError, ValueError):
             return []
         now = self._wall_clock()
+        # 墙钟被往回调时，事件时间会落在「未来」；夹到 now，否则它会一直不过期。
         fresh = [
-            float(item)
+            min(float(item), now)
             for item in events
             if now - float(item) <= self._rate_limit_window
         ]
@@ -213,13 +219,21 @@ class FailureBackoff:
         if is_rate_limit_error(exc):
             now = self._wall_clock()
             self._rate_limit_events = [
-                at
+                min(at, now)
                 for at in self._rate_limit_events
                 if now - at <= self._rate_limit_window
             ]
             self._rate_limit_events.append(now)
             if len(self._rate_limit_events) >= self._rate_limit_threshold:
                 # 窗口内累计触顶：当成账号级限流，升级为全局暂停，不再让别的会话挨个撞。
+                log.warning(
+                    "%d 分钟内第 %d 次 429（阈值 %d），记忆任务暂停 %.0f 分钟：%s",
+                    self._rate_limit_window / 60,
+                    len(self._rate_limit_events),
+                    self._rate_limit_threshold,
+                    self._quota_seconds / 60,
+                    exc,
+                )
                 self._drop_events()
                 self._pause_quota()
                 return
