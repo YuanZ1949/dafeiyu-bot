@@ -17,9 +17,9 @@ RATE_LIMIT_BACKOFF_SECONDS = 300.0
 QUOTA_PAUSE_SECONDS = 3600.0
 QUOTA_KEY = "__quota__"
 # 有的 provider 只在 429 里写 rate limit，不写 quota。单次 429 可能是瞬时抖动，
-# 连续三次说明是账号级限流，按配额同样处理，别让 12 个会话各撞一遍。
+# 但 10 分钟内累计三次说明是账号级限流，按配额同样处理，别让 12 个会话各撞一遍。
+# 用「窗口内累计」而不是「连续」：多会话轮流撞、中间夹着成功，同样算限流。
 RATE_LIMIT_THRESHOLD = 3
-# 「连续」必须带时间窗：跨天残留的计数不该继续累加。
 RATE_LIMIT_WINDOW_SECONDS = 600.0
 
 
@@ -97,8 +97,8 @@ class FailureBackoff:
     (chat_type, chat_id)）。时间源可注入，便于测试。
 
     ``persistence`` 需要提供 ``load_backoff() / save_backoff(key, until) /
-    clear_backoff(key)``；传 Store 即可让退避跨进程重启存活。连续 429 计数
-    用可选的 ``load_rate_limit() / save_rate_limit(streak, updated) /
+    clear_backoff(key)``；传 Store 即可让退避跨进程重启存活。429 事件窗口
+    用可选的 ``load_rate_limits() / save_rate_limits(events, updated) /
     clear_rate_limit()``，缺这几个方法时只在内存里数。
     """
 
@@ -121,7 +121,7 @@ class FailureBackoff:
         self._wall_clock = wall_clock
         self._persistence = persistence
         self._rate_limit_threshold = max(1, int(rate_limit_threshold))
-        self._rate_limit_streak = 0
+        self._rate_limit_events: list[float] = []
         self._until: dict[Hashable, float] = {}
         if persistence is not None:
             # 库里存的是墙钟时间（跨进程可用），内存里算的是单调时钟（不受校时影响）。
@@ -135,35 +135,36 @@ class FailureBackoff:
                 if mono_until <= mono_now:
                     continue
                 self._until[_decode_key(raw)] = mono_until
-            self._rate_limit_streak = self._load_streak()
+            self._rate_limit_events = self._load_events()
 
-    def _load_streak(self) -> int:
-        """重启后接着数：只有落在窗口内的旧计数才算「连续」。"""
-        loader = getattr(self._persistence, "load_rate_limit", None)
+    def _load_events(self) -> list[float]:
+        """重启后接着数：只保留窗口内的 429 事件，过期的一并清掉。"""
+        loader = getattr(self._persistence, "load_rate_limits", None)
         if loader is None:
-            return 0
+            return []
         try:
-            streak, updated = loader()
+            events = list(loader())
         except (TypeError, ValueError):
-            return 0
-        if int(streak) <= 0:
-            return 0
-        if self._wall_clock() - float(updated) > self._rate_limit_window:
-            cleaner = getattr(self._persistence, "clear_rate_limit", None)
-            if cleaner is not None:
-                cleaner()
-            return 0
-        return int(streak)
+            return []
+        now = self._wall_clock()
+        fresh = [
+            float(item)
+            for item in events
+            if now - float(item) <= self._rate_limit_window
+        ]
+        if len(fresh) != len(events):
+            self._persist_events(fresh)
+        return fresh
 
-    def _save_streak(self) -> None:
-        saver = getattr(self._persistence, "save_rate_limit", None)
+    def _persist_events(self, events: list[float]) -> None:
+        saver = getattr(self._persistence, "save_rate_limits", None)
         if saver is not None:
-            saver(self._rate_limit_streak, self._wall_clock())
+            saver(events, self._wall_clock())
 
-    def _drop_streak(self) -> None:
-        if self._rate_limit_streak == 0:
+    def _drop_events(self) -> None:
+        if not self._rate_limit_events:
             return
-        self._rate_limit_streak = 0
+        self._rate_limit_events = []
         cleaner = getattr(self._persistence, "clear_rate_limit", None)
         if cleaner is not None:
             cleaner()
@@ -206,25 +207,30 @@ class FailureBackoff:
 
     def mark_failed(self, key: Hashable, exc: BaseException | None = None) -> None:
         if is_quota_error(exc):
-            self._drop_streak()
+            self._drop_events()
             self._pause_quota()
             return
         if is_rate_limit_error(exc):
-            self._rate_limit_streak += 1
-            self._save_streak()
-            if self._rate_limit_streak >= self._rate_limit_threshold:
-                # 连续 429：当成账号级限流，升级为全局暂停，不再让别的会话挨个撞。
-                self._drop_streak()
+            now = self._wall_clock()
+            self._rate_limit_events = [
+                at
+                for at in self._rate_limit_events
+                if now - at <= self._rate_limit_window
+            ]
+            self._rate_limit_events.append(now)
+            if len(self._rate_limit_events) >= self._rate_limit_threshold:
+                # 窗口内累计触顶：当成账号级限流，升级为全局暂停，不再让别的会话挨个撞。
+                self._drop_events()
                 self._pause_quota()
                 return
+            self._persist_events(self._rate_limit_events)
             # 429 是瞬时限流，本会话只短歇，不跟着吃满半小时。
             self._remember(key, self._monotonic() + self._rate_limit_seconds)
             return
-        self._drop_streak()
         self._remember(key, self._monotonic() + self._seconds)
 
     def mark_ok(self, key: Hashable) -> None:
-        self._drop_streak()
+        # 成功不清 429 事件：别的会话刚撞过的限流不会因为这一次成功就消失。
         self._forget(key)
         if key != QUOTA_KEY:
             self._forget(QUOTA_KEY)

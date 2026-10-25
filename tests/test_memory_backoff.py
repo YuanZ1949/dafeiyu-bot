@@ -150,7 +150,7 @@ async def test_scheduler_stops_after_quota_error() -> None:
     assert brain.calls == 1  # 第二个会话被全局熔断拦住
     assert scheduler._backoff.is_paused()
     assert "__quota__" in store.load_backoff()
-    assert store.load_rate_limit() == (0, 0.0)
+    assert store.load_rate_limits() == []
     store.close()
 
 
@@ -221,7 +221,8 @@ def test_three_consecutive_429_pause_globally(tmp_path: Path) -> None:
     store.close()
 
 
-def test_success_resets_429_streak() -> None:
+def test_success_does_not_erase_recent_429s() -> None:
+    """多会话轮流撞、中间夹一次成功，仍然算账号级限流。"""
     clock = Clock()
     backoff = FailureBackoff(monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall)
 
@@ -229,12 +230,11 @@ def test_success_resets_429_streak() -> None:
     backoff.mark_failed((ChatType.GROUP, 2), RATE_LIMITED)
     backoff.mark_ok((ChatType.GROUP, 2))
     backoff.mark_failed((ChatType.GROUP, 3), RATE_LIMITED)
-    backoff.mark_failed((ChatType.GROUP, 4), RATE_LIMITED)
 
-    assert not backoff.is_paused()
+    assert backoff.is_paused()
 
 
-def test_non_429_failure_resets_429_streak() -> None:
+def test_non_429_failure_does_not_erase_recent_429s() -> None:
     clock = Clock()
     backoff = FailureBackoff(monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall)
 
@@ -242,9 +242,8 @@ def test_non_429_failure_resets_429_streak() -> None:
     backoff.mark_failed((ChatType.GROUP, 2), RATE_LIMITED)
     backoff.mark_failed((ChatType.GROUP, 3), BrainError("network down"))
     backoff.mark_failed((ChatType.GROUP, 4), RATE_LIMITED)
-    backoff.mark_failed((ChatType.GROUP, 5), RATE_LIMITED)
 
-    assert not backoff.is_paused()
+    assert backoff.is_paused()
 
 
 def test_single_429_cools_only_five_minutes() -> None:
@@ -257,7 +256,7 @@ def test_single_429_cools_only_five_minutes() -> None:
     assert not backoff.should_skip((ChatType.GROUP, 1))
 
 
-def test_429_streak_survives_restart(tmp_path: Path) -> None:
+def test_429_events_survive_restart(tmp_path: Path) -> None:
     path = tmp_path / "streak.db"
     clock = Clock()
     store = Store(path)
@@ -267,7 +266,7 @@ def test_429_streak_survives_restart(tmp_path: Path) -> None:
     )
     first.mark_failed((ChatType.GROUP, 1), RATE_LIMITED)
     first.mark_failed((ChatType.GROUP, 2), RATE_LIMITED)
-    assert store.load_rate_limit()[0] == 2
+    assert len(store.load_rate_limits()) == 2
     store.close()
 
     clock.advance(30)
@@ -279,11 +278,11 @@ def test_429_streak_survives_restart(tmp_path: Path) -> None:
     second.mark_failed((ChatType.GROUP, 3), RATE_LIMITED)
 
     assert second.is_paused()
-    assert store.load_rate_limit() == (0, 0.0)
+    assert store.load_rate_limits() == []
     store.close()
 
 
-def test_stale_429_streak_is_discarded(tmp_path: Path) -> None:
+def test_stale_429_events_are_discarded(tmp_path: Path) -> None:
     path = tmp_path / "stale.db"
     clock = Clock()
     store = Store(path)
@@ -305,5 +304,18 @@ def test_stale_429_streak_is_discarded(tmp_path: Path) -> None:
     second.mark_failed((ChatType.GROUP, 4), RATE_LIMITED)
 
     assert not second.is_paused()
-    assert store.load_rate_limit()[0] == 2
+    assert len(store.load_rate_limits()) == 2
     store.close()
+
+
+def test_429_events_expire_from_window_in_process() -> None:
+    """进程内也要按窗口淘汰：昨天的两次不该跟今天的一次凑成三次。"""
+    clock = Clock()
+    backoff = FailureBackoff(monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall)
+
+    backoff.mark_failed((ChatType.GROUP, 1), RATE_LIMITED)
+    backoff.mark_failed((ChatType.GROUP, 2), RATE_LIMITED)
+    clock.advance(RATE_LIMIT_WINDOW_SECONDS + 1)
+    backoff.mark_failed((ChatType.GROUP, 3), RATE_LIMITED)
+
+    assert not backoff.is_paused()

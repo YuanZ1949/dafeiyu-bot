@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -71,10 +72,10 @@ CREATE TABLE IF NOT EXISTS memory_backoff (
     until REAL NOT NULL
 );
 
--- 连续 429 的账号级计数：跨重启保留，超过窗口即作废（只存一行）。
+-- 429 事件的墙钟时间（JSON 数组）：跨重启保留，窗口外的旧事件淘汰（只存一行）。
 CREATE TABLE IF NOT EXISTS memory_rate_limit (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    streak INTEGER NOT NULL DEFAULT 0,
+    events TEXT NOT NULL DEFAULT '[]',
     updated REAL NOT NULL DEFAULT 0
 );
 
@@ -147,6 +148,10 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
     },
     "usage": {
         "estimated": "INTEGER NOT NULL DEFAULT 0",
+    },
+    # 早期的 429 计数表用 streak 列；现在改存事件时间数组，老库补列即可。
+    "memory_rate_limit": {
+        "events": "TEXT NOT NULL DEFAULT '[]'",
     },
 }
 
@@ -885,23 +890,30 @@ class Store:
         self._conn.execute("DELETE FROM memory_backoff WHERE key = ?", (key,))
         self._conn.commit()
 
-    def load_rate_limit(self) -> tuple[int, float]:
-        """连续 429 计数（账号级单行）：返回 (streak, 最近一次 429 的墙钟时间)。"""
+    def load_rate_limits(self) -> list[float]:
+        """429 事件的墙钟时间戳（窗口裁剪由调用方做，库里只负责存）。"""
         row = self._conn.execute(
-            "SELECT streak, updated FROM memory_rate_limit WHERE id = 1"
+            "SELECT events FROM memory_rate_limit WHERE id = 1"
         ).fetchone()
         if row is None:
-            return 0, 0.0
-        return int(row["streak"]), float(row["updated"])
+            return []
+        try:
+            raw = json.loads(str(row["events"]))
+        except ValueError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [float(item) for item in raw if isinstance(item, (int, float))]
 
-    def save_rate_limit(self, streak: int, updated: float) -> None:
+    def save_rate_limits(self, events: Sequence[float], updated: float) -> None:
+        payload = json.dumps([round(float(item), 3) for item in events])
         self._conn.execute(
             """
-            INSERT INTO memory_rate_limit (id, streak, updated) VALUES (1, ?, ?)
+            INSERT INTO memory_rate_limit (id, events, updated) VALUES (1, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                streak = excluded.streak, updated = excluded.updated
+                events = excluded.events, updated = excluded.updated
             """,
-            (int(streak), float(updated)),
+            (payload, float(updated)),
         )
         self._conn.commit()
 
