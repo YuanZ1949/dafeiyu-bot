@@ -29,11 +29,21 @@ FALLBACK_REPLY = "本鱼刚刚游神了…你再说一遍？🐋"
 
 
 class BrainError(Exception):
-    """模型调用失败，或返回内容无法处理。"""
+    """模型调用失败，或返回内容无法处理。
+
+    ``status`` 是 HTTP 状态码（拿不到时 None）：配额/限流判定不该只靠文案，
+    provider 换个措辞就会让熔断失灵。
+    """
+
+    def __init__(self, message: str = "", status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class _Retryable(Exception):
-    pass
+    def __init__(self, message: str = "", status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -294,7 +304,9 @@ class BrainClient:
                 if attempt == 0:
                     await self._sleep(2)
                     continue
-                raise BrainError(f"DeepSeek 请求失败：{exc}") from exc
+                raise BrainError(
+                    f"DeepSeek 请求失败：{exc}", status=getattr(exc, "status", None)
+                ) from exc
 
         raise BrainError("DeepSeek 请求失败：未知原因")
 
@@ -307,11 +319,13 @@ class BrainClient:
             raise _Retryable(exc.__class__.__name__) from exc
 
         if resp.status_code == 429:
-            raise BrainError("DeepSeek 限流（429），本条放弃")
+            raise BrainError("DeepSeek 限流（429），本条放弃", status=429)
         if resp.status_code >= 500:
-            raise _Retryable(f"HTTP {resp.status_code}")
+            raise _Retryable(f"HTTP {resp.status_code}", status=resp.status_code)
         if resp.status_code >= 400:
-            raise BrainError(f"DeepSeek 返回 HTTP {resp.status_code}")
+            raise BrainError(
+                f"DeepSeek 返回 HTTP {resp.status_code}", status=resp.status_code
+            )
 
         try:
             data = resp.json()

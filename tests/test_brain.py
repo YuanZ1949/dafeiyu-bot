@@ -208,3 +208,15 @@ async def test_complete_returns_raw_content_without_json_instruction(client) -> 
     assert "speak" not in body["messages"][0]["content"]
     assert body["temperature"] == 0.2
     assert body["max_tokens"] == 600
+
+
+@respx.mock
+async def test_429_error_carries_status(client) -> None:
+    """限流判定不能只靠文案：BrainError 得把 HTTP 状态码带出来。"""
+    client, _ = client
+    respx.post(URL).mock(return_value=httpx.Response(429))
+
+    with pytest.raises(BrainError) as excinfo:
+        await client.decide("s", [])
+
+    assert excinfo.value.status == 429

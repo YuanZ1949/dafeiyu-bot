@@ -390,3 +390,10 @@ def test_parse_clean_json_does_not_warn(caplog: pytest.LogCaptureFixture) -> Non
 
     assert reply.reply == "好"
     assert not caplog.records
+
+
+def test_check_response_keeps_http_status() -> None:
+    response = httpx.Response(429, text="slow down")
+    with pytest.raises(BrainError) as excinfo:
+        OpenCodeHttpBrain._check_response(response)
+    assert excinfo.value.status == 429

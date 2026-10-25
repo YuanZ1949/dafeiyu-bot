@@ -455,13 +455,17 @@ class OpenCodeHttpBrain:
         if response.status_code in (401, 403):
             raise BrainError(
                 "OpenCode 服务拒绝认证：检查 opencode.server_password"
-                " 或环境变量 OPENCODE_SERVER_PASSWORD"
+                " 或环境变量 OPENCODE_SERVER_PASSWORD",
+                status=response.status_code,
             )
         if response.status_code == 404:
             raise _UnknownSession()
         if response.status_code >= 400:
             detail = response.text.strip().replace("\n", " ")[:200]
-            raise BrainError(f"OpenCode 返回 {response.status_code}：{detail}")
+            raise BrainError(
+                f"OpenCode 返回 {response.status_code}：{detail}",
+                status=response.status_code,
+            )
 
     async def _request(
         self,
