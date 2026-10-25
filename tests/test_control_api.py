@@ -555,6 +555,193 @@ async def test_delete_impression_rejects_bad_id(
     assert resp.status == 400
 
 
+async def test_patch_impression_updates_fields_and_fts(tmp_path: Path) -> None:
+    control, _, _ = make_control(tmp_path)
+    control.store.upsert_impression(
+        ChatType.GROUP, 100, 42, "preference", "喜欢猫", 0.5,
+        source_message_id="m1", source_excerpt="我喜欢猫",
+    )
+    impression = control.store.list_impressions(ChatType.GROUP, 100, topk=10)[0]
+
+    async with running(create_app(control, "", make_actions(control))) as client:
+        resp = await client.patch(
+            f"/api/memory/impressions/{impression.id}",
+            json={"content": "喜欢狗", "confidence": 0.92, "kind": "preference"},
+        )
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload["ok"] is True
+    assert payload["impression"]["id"] == impression.id
+    assert payload["impression"]["content"] == "喜欢狗"
+    assert payload["impression"]["confidence"] == 0.92
+    assert payload["impression"]["source_message_id"] == "m1"
+    assert [i.content for i in control.store.search_impressions(
+        ChatType.GROUP, 100, "喜欢狗", topk=10
+    )] == ["喜欢狗"]
+    assert control.store.search_impressions(ChatType.GROUP, 100, "喜欢猫", topk=10) == []
+
+
+async def test_patch_impression_validates_payload(tmp_path: Path) -> None:
+    control, _, _ = make_control(tmp_path)
+    control.store.upsert_impression(ChatType.GROUP, 100, 42, "fact", "住在杭州", 0.7)
+    control.store.upsert_impression(ChatType.GROUP, 100, 42, "fact", "养了一只猫", 0.7)
+    first = control.store.list_impressions(ChatType.GROUP, 100, topk=10)[0]
+    second = control.store.list_impressions(ChatType.GROUP, 100, topk=10)[1]
+
+    app = create_app(control, "", make_actions(control))
+    async with running(app) as client:
+        missing = await client.patch("/api/memory/impressions/999", json={"content": "x"})
+        bad_id = await client.patch("/api/memory/impressions/abc", json={"content": "x"})
+        empty = await client.patch(
+            f"/api/memory/impressions/{first.id}", json={"content": "  "}
+        )
+        too_long = await client.patch(
+            f"/api/memory/impressions/{first.id}", json={"content": "猫" * 201}
+        )
+        bad_confidence = await client.patch(
+            f"/api/memory/impressions/{first.id}", json={"confidence": 1.1}
+        )
+        bool_confidence = await client.patch(
+            f"/api/memory/impressions/{first.id}", json={"confidence": True}
+        )
+        bad_kind = await client.patch(
+            f"/api/memory/impressions/{first.id}", json={"kind": "topic"}
+        )
+        no_fields = await client.patch(
+            f"/api/memory/impressions/{first.id}", json={}
+        )
+        conflict = await client.patch(
+            f"/api/memory/impressions/{first.id}", json={"content": second.content}
+        )
+
+    assert missing.status == 404
+    assert bad_id.status == 400
+    assert empty.status == 400
+    assert too_long.status == 400
+    assert bad_confidence.status == 400
+    assert bool_confidence.status == 400
+    assert bad_kind.status == 400
+    assert no_fields.status == 400
+    assert conflict.status == 409
+    assert control.store.get_impression(first.id).content == first.content
+
+
+async def test_merge_impressions_keeps_earliest_and_max_confidence(tmp_path: Path) -> None:
+    control, _, _ = make_control(tmp_path)
+    control.store.upsert_impression(ChatType.GROUP, 100, 42, "fact", "住在杭州", 0.6)
+    control.store.upsert_impression(ChatType.GROUP, 100, 42, "fact", "养了一只猫", 0.9)
+    rows = control.store.list_impressions(ChatType.GROUP, 100, topk=10)
+    target_id = min(row.id for row in rows)
+
+    async with running(create_app(control, "", make_actions(control))) as client:
+        resp = await client.post(
+            "/api/memory/impressions/merge",
+            json={"ids": [row.id for row in rows], "content": "住在杭州，养了一只猫"},
+        )
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload["ok"] is True
+    assert payload["impression"]["id"] == target_id
+    assert payload["impression"]["content"] == "住在杭州，养了一只猫"
+    assert payload["impression"]["confidence"] == 0.9
+    assert control.store.count_impressions() == 1
+    assert control.store.search_impressions(
+        ChatType.GROUP, 100, "养了一只猫", topk=10
+    )[0].content == "住在杭州，养了一只猫"
+
+
+async def test_merge_impressions_rejects_bad_scope_and_conflict(tmp_path: Path) -> None:
+    control, _, _ = make_control(tmp_path)
+    control.store.upsert_impression(ChatType.GROUP, 100, 42, "fact", "A", 0.6)
+    control.store.upsert_impression(ChatType.GROUP, 100, 42, "fact", "B", 0.7)
+    control.store.upsert_impression(ChatType.GROUP, 100, 42, "fact", "D", 0.8)
+    control.store.upsert_impression(ChatType.GROUP, 100, 43, "fact", "C", 0.8)
+    rows = control.store.list_impressions(ChatType.GROUP, 100, topk=10)
+    by_content = {row.content: row.id for row in rows}
+
+    app = create_app(control, "", make_actions(control))
+    async with running(app) as client:
+        cross_subject = await client.post(
+            "/api/memory/impressions/merge",
+            json={"ids": [by_content["A"], by_content["C"]]},
+        )
+        missing = await client.post(
+            "/api/memory/impressions/merge",
+            json={"ids": [by_content["A"], 999]},
+        )
+        one = await client.post(
+            "/api/memory/impressions/merge",
+            json={"ids": [by_content["A"]]},
+        )
+        duplicate = await client.post(
+            "/api/memory/impressions/merge",
+            json={"ids": [by_content["A"], by_content["A"]]},
+        )
+        bad_id = await client.post(
+            "/api/memory/impressions/merge",
+            json={"ids": [by_content["A"], True]},
+        )
+        empty = await client.post(
+            "/api/memory/impressions/merge",
+            json={"ids": [by_content["A"], by_content["B"]], "content": ""},
+        )
+        conflict = await client.post(
+            "/api/memory/impressions/merge",
+            json={"ids": [by_content["A"], by_content["B"]], "content": "D"},
+        )
+
+    assert cross_subject.status == 400
+    assert missing.status == 404
+    assert one.status == 400
+    assert duplicate.status == 400
+    assert bad_id.status == 400
+    assert empty.status == 400
+    assert conflict.status == 409
+    assert control.store.count_impressions() == 4
+
+
+async def test_search_endpoint_returns_snippet(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    long_text = "闲聊" * 20 + "显卡驱动" + "收尾" * 20
+    _seed_message(control.store, "m1", long_text, timestamp=1_700_000_100)
+
+    async with running(app) as client:
+        resp = await client.get(
+            "/api/memory/search",
+            params={"q": "显卡驱动", "chat_type": "group", "chat_id": "100"},
+        )
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload["total"] == 1
+    item = payload["items"][0]
+    assert item["content"] == long_text
+    assert "显卡驱动" in item["snippet"]
+    assert item["snippet"].startswith("…")
+    assert item["snippet"].endswith("…")
+    assert len(item["snippet"]) < len(long_text)
+
+
+def test_dashboard_exposes_impression_edit_and_merge() -> None:
+    html = (
+        Path(__file__).resolve().parents[1]
+        / "src/dafeiyu/supervisor/dashboard/index.html"
+    ).read_text(encoding="utf-8")
+    for anchor in (
+        'id="btn-merge-impressions"',
+        "selectedImpressionIds",
+        "editImpression(i)",
+        "mergeSelectedImpressions",
+        "source_message_id",
+        "source_excerpt",
+        "不可撤销",
+        'method: "PATCH"',
+    ):
+        assert anchor in html, f"面板缺少 {anchor}"
+
+
 def test_dashboard_page_max_fallback_matches_backend() -> None:
     """面板的兜底常量必须等于后端上限；正常路径以 limit_max 为准。"""
     html = (

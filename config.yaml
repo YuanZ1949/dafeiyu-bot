@@ -123,6 +123,10 @@ memory:
   rotation_tokens: 40000
   inject_summaries: true
   inject_impressions: true
+  # 回复前按当前批次检索同会话旧消息，作为「相关旧记忆」注入；代码默认关，这里显式开启。
+  recall_enabled: true
+  recall_topk: 3
+  recall_chars: 300
 
 logging:
   level: INFO

@@ -182,6 +182,17 @@ async def test_cross_origin_post_is_rejected(tmp_path: Path) -> None:
     assert supervisor.calls == []
 
 
+async def test_cross_origin_patch_is_rejected(tmp_path: Path) -> None:
+    app, _, _ = make_app(tmp_path)
+    async with running(app) as client:
+        resp = await client.patch(
+            "/api/memory/impressions/1",
+            json={"content": "x"},
+            headers={"Origin": "http://evil.example"},
+        )
+    assert resp.status == 403
+
+
 async def test_logs_stream_rejects_unknown_source(tmp_path: Path) -> None:
     app, _, _ = make_app(tmp_path)
     async with running(app) as client:

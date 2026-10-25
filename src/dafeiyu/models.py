@@ -41,6 +41,8 @@ class Impression:
     kind: str
     content: str
     confidence: float
+    source_message_id: str = ""
+    source_excerpt: str = ""
     updated_at: str = ""
     id: int | None = None
 

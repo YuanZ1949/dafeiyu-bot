@@ -73,6 +73,32 @@ def test_env_overrides_yaml_and_applies_defaults(tmp_path: Path) -> None:
     assert s.persona.max_reply_chars == 120
 
 
+def test_recall_defaults_off_and_parses_switch(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    default = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+    assert default.injection.recall_enabled is False
+    assert default.injection.recall_topk == 3
+    assert default.injection.recall_chars == 300
+
+    custom = BASE_YAML.replace(
+        "  extract_every: 20",
+        "  extract_every: 20\n  recall_enabled: true\n  recall_topk: 5\n  recall_chars: 120",
+    )
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, custom))
+    assert s.injection.recall_enabled is True
+    assert s.injection.recall_topk == 5
+    assert s.injection.recall_chars == 120
+
+
+def test_recall_rejects_non_positive_numbers(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    bad = BASE_YAML.replace(
+        "  extract_every: 20", "  extract_every: 20\n  recall_topk: 0"
+    )
+    with pytest.raises(ConfigError, match="recall_topk"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, bad))
+
+
 def test_persona_prompt_file_defaults_empty_and_reads_yaml(tmp_path: Path) -> None:
     env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
     default = load_settings(env_file=env, config_file=write_yaml(tmp_path))

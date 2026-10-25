@@ -269,6 +269,45 @@ async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
         assert store.count_summaries(ChatType.GROUP, GROUP_ID) == 0
 
 
+async def test_dashboard_impression_edit_and_merge_proxy(tmp_path: Path) -> None:
+    group = ChatType.GROUP
+    async with boot(tmp_path) as (dash, store):
+        store.upsert_impression(group, GROUP_ID, 42, "preference", "喜欢狗", 0.5)
+        rows = [
+            row
+            for row in store.list_impressions(group, GROUP_ID, topk=100)
+            if row.subject_user_id == 42
+        ]
+        assert len(rows) == 2
+        edit_id = rows[0].id
+
+        edited = await dash.patch(
+            f"/api/memory/impressions/{edit_id}",
+            json={"content": "外号叫鱼片本人", "confidence": 0.95},
+        )
+        edited_payload = await edited.json()
+        assert edited.status == 200
+        assert edited_payload["impression"]["content"] == "外号叫鱼片本人"
+        assert store.get_impression(edit_id).content == "外号叫鱼片本人"
+
+        merged = await dash.post(
+            "/api/memory/impressions/merge",
+            json={"ids": [row.id for row in rows], "content": "鱼片喜欢狗"},
+        )
+        merged_payload = await merged.json()
+        assert merged.status == 200
+        assert merged_payload["impression"]["content"] == "鱼片喜欢狗"
+        assert merged_payload["impression"]["confidence"] == 0.95
+        assert merged_payload["impression"]["id"] == min(row.id for row in rows)
+        assert len(
+            [
+                row
+                for row in store.list_impressions(group, GROUP_ID, topk=100)
+                if row.subject_user_id == 42
+            ]
+        ) == 1
+
+
 async def test_dashboard_proxy_waits_for_slow_delete_and_backup(tmp_path: Path) -> None:
     """2 秒总超时不能套在删 session / 整库备份上：假 bot 慢 3 秒仍应成功。"""
     config = tmp_path / "config.yaml"

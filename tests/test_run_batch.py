@@ -149,6 +149,7 @@ def build(
     budget: BudgetConfig | None = None,
     memory: MemoryConfig | None = None,
     with_workspace: bool = False,
+    injection: InjectionConfig | None = None,
 ):
     store = Store(str(tmp_path / "t.db"))
     store.init_schema()
@@ -173,7 +174,7 @@ def build(
         router,
         "你是溟月",
         workspace=workspace,
-        injection=InjectionConfig(),
+        injection=injection or InjectionConfig(),
     )
 
     # 先钉一条「上线前」的消息当游标下限，这样 m0/m1 会一起进批次。
@@ -205,6 +206,34 @@ async def test_batch_marks_delivered_and_records_ambient(tmp_path):
     )
     assert calls == 1
     assert adapter.sent
+
+
+async def test_batch_injects_recalled_old_messages_when_enabled(tmp_path):
+    service, store, brain, _ = build(
+        tmp_path,
+        memory=MemoryConfig(1, 5, 20),
+        injection=InjectionConfig(recall_enabled=True),
+    )
+    store.add_message(make_msg("显卡驱动坏了", message_id="old"))
+    store.mark_delivered(ChatType.GROUP, 1001, "old")
+    store.add_message(make_msg("显卡驱动怎么装", message_id="new"))
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert "【相关旧记忆】" in brain.last_prompt
+    assert "显卡驱动坏了" in brain.last_prompt
+
+
+async def test_batch_does_not_inject_recalled_old_messages_by_default(tmp_path):
+    service, store, brain, _ = build(tmp_path, memory=MemoryConfig(1, 5, 20))
+    store.add_message(make_msg("显卡驱动坏了", message_id="old"))
+    store.mark_delivered(ChatType.GROUP, 1001, "old")
+    store.add_message(make_msg("显卡驱动怎么装", message_id="new"))
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert "【相关旧记忆】" not in brain.last_prompt
+    assert "显卡驱动坏了" not in brain.last_prompt
 
 
 async def test_budget_exhausted_skips_without_calling_brain(tmp_path):

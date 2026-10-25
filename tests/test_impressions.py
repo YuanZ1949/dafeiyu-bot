@@ -28,14 +28,22 @@ class FakeBrain:
         return self.response
 
 
-def make_message(i: int, chat_id: int = CHAT_ID, user_id: int = 123) -> Message:
+def make_message(
+    i: int,
+    chat_id: int = CHAT_ID,
+    user_id: int = 123,
+    *,
+    content: str | None = None,
+    is_bot: bool = False,
+) -> Message:
     return Message(
         chat_type=CHAT,
         chat_id=chat_id,
         user_id=user_id,
         nickname="鱼片",
-        content=f"消息 {i}",
+        content=f"消息 {i}" if content is None else content,
         message_id=f"m{i}",
+        is_bot=is_bot,
     )
 
 
@@ -97,6 +105,28 @@ async def test_duplicate_extraction_does_not_duplicate_rows(store: Store) -> Non
     assert await worker.maybe_extract(CHAT, CHAT_ID) == 1
     assert await worker.maybe_extract(CHAT, CHAT_ID) == 0
     assert len(store.list_impressions(CHAT, CHAT_ID, topk=10)) == 1
+
+
+async def test_extraction_records_latest_human_source(store: Store) -> None:
+    brain = FakeBrain(
+        json.dumps(
+            [{"user_id": 123, "kind": "fact", "content": "住在杭州", "confidence": 0.8}]
+        )
+    )
+    worker = ImpressionWorker(store, brain, every=1)
+    long_source = "杭州" + "补充" * 50
+    store.add_message(make_message(1, user_id=123, content="我先说一句"))
+    store.add_message(make_message(2, user_id=456, content="别人说的"))
+    store.add_message(make_message(3, user_id=123, content=long_source))
+    store.add_message(
+        make_message(4, user_id=123, content="bot 的最后一句", is_bot=True)
+    )
+
+    assert await worker.maybe_extract(CHAT, CHAT_ID) == 1
+    impression = store.list_impressions(CHAT, CHAT_ID, topk=10)[0]
+    assert impression.source_message_id == "m3"
+    assert impression.source_excerpt == long_source[:80]
+    assert len(impression.source_excerpt) == 80
 
 
 async def test_content_is_truncated_to_60_chars(store: Store) -> None:

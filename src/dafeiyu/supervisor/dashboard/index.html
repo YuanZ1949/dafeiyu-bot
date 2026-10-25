@@ -78,6 +78,7 @@
   .mem-item { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--panel-2); }
   .mem-meta { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
   .mem-text { white-space: pre-wrap; word-break: break-word; }
+  .mem-actions { display: flex; gap: 6px; margin-top: 6px; align-items: center; }
   .mem-empty { color: var(--muted); font-size: 12px; }
   .proc-name { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
   .proc-actions { margin-top: 10px; display: flex; gap: 6px; }
@@ -184,6 +185,7 @@
       <input id="memory-chat-id" type="number" min="1" placeholder="会话 ID" style="width:110px" title="手动触发用的会话 ID" />
       <button class="btn" id="btn-summarize">生成摘要</button>
       <button class="btn" id="btn-extract">抽取印象</button>
+      <button class="btn" id="btn-merge-impressions" disabled>合并所选</button>
       <button class="btn" id="btn-more-memory">显示更多</button>
       <button class="btn" id="btn-refresh-memory">刷新</button>
     </div>
@@ -513,16 +515,30 @@ function renderMemory(data) {
   impressions.forEach((i) => {
     const subject = i.subject_user_id ? ` · 用户 ${i.subject_user_id}` : "";
     const confidence = Math.round((i.confidence || 0) * 100);
+    const source = i.source_message_id ? ` · 来源 ${i.source_message_id}` : "";
     const item = memItem(
-      `${chatLabel(i)} · ${i.kind}${subject} · ${confidence}%`,
+      `${chatLabel(i)} · ${i.kind}${subject} · ${confidence}%${source}`,
       i.content
     );
+    if (i.source_excerpt) item.title = `来源消息：${i.source_excerpt}`;
     if (i.id) {
+      const actions = document.createElement("div");
+      actions.className = "mem-actions";
+      const pick = document.createElement("input");
+      pick.type = "checkbox";
+      pick.value = String(i.id);
+      pick.title = "选择后合并";
+      pick.addEventListener("change", updateMergeButton);
+      const edit = document.createElement("button");
+      edit.className = "btn";
+      edit.textContent = "编辑";
+      edit.addEventListener("click", () => editImpression(i));
       const remove = document.createElement("button");
       remove.className = "btn";
       remove.textContent = "删除";
       remove.addEventListener("click", () => deleteImpression(i.id));
-      item.appendChild(remove);
+      actions.append(pick, edit, remove);
+      item.appendChild(actions);
     }
     impressionBox.appendChild(item);
   });
@@ -556,6 +572,7 @@ function renderMemory(data) {
       ? Boolean(data.summary_has_more || data.impression_has_more)
       : summaries.length >= memoryLimit || impressions.length >= memoryLimit;
   $("btn-more-memory").disabled = !more || memoryLimit >= memoryPageMax;
+  updateMergeButton();
 }
 
 const MEMORY_PAGE = 30;
@@ -622,6 +639,59 @@ async function deleteImpression(id) {
     loadMemory();
   } catch (err) {
     toast(`删除失败：${err.message}`, true);
+  }
+}
+
+function selectedImpressionIds() {
+  return Array.from(
+    document.querySelectorAll("#memory-impressions input[type=checkbox]:checked")
+  ).map((box) => Number(box.value)).filter((id) => Number.isInteger(id) && id > 0);
+}
+
+function updateMergeButton() {
+  const button = $("btn-merge-impressions");
+  if (button) button.disabled = selectedImpressionIds().length < 2;
+}
+
+async function editImpression(impression) {
+  const next = prompt(`修改印象 #${impression.id} 的内容`, impression.content);
+  if (next === null) return;
+  const content = next.trim();
+  if (!content) { toast("印象内容不能为空", true); return; }
+  try {
+    await api(`/api/memory/impressions/${impression.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ content }),
+    });
+    toast("已保存");
+    loadMemory();
+  } catch (err) {
+    toast(`保存失败：${err.message}`, true);
+  }
+}
+
+async function mergeSelectedImpressions() {
+  const ids = selectedImpressionIds();
+  if (ids.length < 2) { toast("至少勾选两条印象", true); return; }
+  const first = document.querySelector(
+    `#memory-impressions input[type=checkbox][value="${ids[0]}"]`
+  );
+  const suggested = first ? first.closest(".mem-item").querySelector(".mem-text").textContent : "";
+  const next = prompt("合并后的内容（留空沿用第一条）", suggested);
+  if (next === null) return;
+  const payload = { ids };
+  const content = next.trim();
+  if (content) payload.content = content;
+  if (!confirm(`合并 ${ids.length} 条印象？其余 ${ids.length - 1} 条将被删除，且不可撤销。`)) return;
+  try {
+    await api("/api/memory/impressions/merge", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    toast(`已合并 ${ids.length} 条印象`);
+    loadMemory();
+  } catch (err) {
+    toast(`合并失败：${err.message}`, true);
   }
 }
 
@@ -711,7 +781,7 @@ async function searchMessages(append) {
     items.forEach((m) => {
       box.appendChild(memItem(
         `${chatName(m.chat_type, m.chat_id)} · ${m.at || "—"} · ${m.is_bot ? "大肥鱼" : m.nickname}`,
-        m.content
+        m.snippet || m.content
       ));
     });
     searchTotal = data.total || 0;
@@ -986,6 +1056,7 @@ $("btn-apply-brain").addEventListener("click", applyBrain);
 $("btn-refresh-memory").addEventListener("click", loadMemory);
 $("btn-summarize").addEventListener("click", triggerSummary);
 $("btn-extract").addEventListener("click", triggerExtract);
+$("btn-merge-impressions").addEventListener("click", mergeSelectedImpressions);
 $("btn-more-memory").addEventListener("click", () => {
   if (memoryLimit >= memoryPageMax) return;
   memoryLimit = Math.min(memoryPageMax, memoryLimit + MEMORY_PAGE);

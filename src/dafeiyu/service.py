@@ -231,13 +231,29 @@ class Service:
 
         await self._maybe_rotate(chat_type, chat_id)
 
+        injection_cfg = self.injection or InjectionConfig()
+        recall_queries = [
+            message.content
+            for message in batch
+            if not message.is_bot and message.content.strip()
+        ][-3:]
+        exclude_ids = {message.message_id for message in batch}
+        if injection_cfg.recall_enabled:
+            exclude_ids.update(
+                message.message_id
+                for message in self.store.recent_messages(
+                    chat_type, chat_id, self.settings.memory.window_size
+                )
+            )
         injection = build_injection(
             self.store,
             self.workspace,
             chat_type,
             chat_id,
-            self.injection or InjectionConfig(),
+            injection_cfg,
             today=now_shanghai().date().isoformat(),
+            recall_queries=recall_queries,
+            exclude_ids=exclude_ids,
         )
         prompt = build_batch_prompt(
             batch,

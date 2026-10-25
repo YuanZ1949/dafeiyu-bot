@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from dafeiyu.brain.tokens import resolve_usage
 from dafeiyu.memory.store import Store
-from dafeiyu.models import ChatType
+from dafeiyu.models import ChatType, Message
 
 from .failure import FAILURE_BACKOFF_SECONDS, FailureBackoff, log_memory_failure
 
@@ -121,6 +121,10 @@ class ImpressionWorker:
             return 0
 
         lines = "\n".join(f"{m.user_id}|{m.nickname}: {m.content}" for m in messages)
+        latest_by_user: dict[int, Message] = {}
+        for message in messages:
+            if not message.is_bot:
+                latest_by_user[message.user_id] = message
         brain = self._current_brain()
         detailed = getattr(brain, "complete_detailed", None)
         try:
@@ -167,8 +171,16 @@ class ImpressionWorker:
             if key not in existing:
                 existing.add(key)
                 added += 1
+            source = latest_by_user.get(user_id)
             self.store.upsert_impression(
-                chat_type, chat_id, user_id, kind, content, confidence
+                chat_type,
+                chat_id,
+                user_id,
+                kind,
+                content,
+                confidence,
+                source_message_id=source.message_id if source else "",
+                source_excerpt=source.content[:80] if source else "",
             )
         self._backoff.mark_ok((chat_type, chat_id))
         return added

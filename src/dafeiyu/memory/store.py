@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS impressions (
     kind TEXT NOT NULL,
     content TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 0.5,
+    -- 来源只记最近一条同用户消息，删消息后仍能看出这条印象从哪来。
+    source_message_id TEXT NOT NULL DEFAULT '',
+    source_excerpt TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (chat_type, chat_id, subject_user_id, kind, content)
 );
@@ -146,6 +149,10 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
     "delivered_messages": {
         "skipped_reason": "TEXT",
     },
+    "impressions": {
+        "source_message_id": "TEXT NOT NULL DEFAULT ''",
+        "source_excerpt": "TEXT NOT NULL DEFAULT ''",
+    },
     "usage": {
         "estimated": "INTEGER NOT NULL DEFAULT 0",
     },
@@ -159,7 +166,7 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
 # 所以会话统计接口不把 provider 暴露给调用方。
 _SESSION_PROVIDER = "opencode"
 
-_FTS_SCHEMA = """
+_IMPRESSION_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS impressions_fts USING fts5(
     content,
     content='impressions',
@@ -177,6 +184,28 @@ CREATE TRIGGER IF NOT EXISTS impressions_au AFTER UPDATE ON impressions BEGIN
     INSERT INTO impressions_fts (impressions_fts, rowid, content)
         VALUES ('delete', old.id, old.content);
     INSERT INTO impressions_fts (rowid, content) VALUES (new.id, new.content);
+END;
+"""
+
+# 消息检索用 trigram：中文 3 字以上可做子串匹配；1-2 字由调用方回落 LIKE。
+_MESSAGE_FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='id',
+    tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts (rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts (messages_fts, rowid, content)
+        VALUES ('delete', old.id, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts (messages_fts, rowid, content)
+        VALUES ('delete', old.id, old.content);
+    INSERT INTO messages_fts (rowid, content) VALUES (new.id, new.content);
 END;
 """
 
@@ -224,15 +253,40 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._fts = False
+        self._messages_fts = False
 
     def init_schema(self) -> None:
         self._conn.executescript(_SCHEMA)
         self._ensure_columns()
         try:
-            self._conn.executescript(_FTS_SCHEMA)
+            self._conn.executescript(_IMPRESSION_FTS_SCHEMA)
             self._fts = True
         except sqlite3.OperationalError:
             self._fts = False
+
+        # messages_fts 是独立脚本：老 SQLite 不支持 trigram 时不能把印象 FTS 一起拖死。
+        existed = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'"
+        ).fetchone()
+        try:
+            self._conn.executescript(_MESSAGE_FTS_SCHEMA)
+            self._messages_fts = True
+            if not existed:
+                self._conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+            else:
+                indexed = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM messages_fts"
+                ).fetchone()
+                total = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM messages"
+                ).fetchone()
+                if int(indexed["n"] or 0) == 0 and int(total["n"] or 0) > 0:
+                    # 上一次迁移中途失败留下的空索引，补一次回填。
+                    self._conn.execute(
+                        "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
+                    )
+        except sqlite3.OperationalError:
+            self._messages_fts = False
         self._conn.commit()
 
     def _ensure_columns(self) -> None:
@@ -394,7 +448,167 @@ class Store:
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[int, list[Message]]:
-        """跨会话内容模糊搜索，最新在前；LIKE 通配符已转义，总数不受分页影响。"""
+        """跨会话内容搜索，最新/相关度优先；LIKE 通配符已转义。"""
+        total, hits = self.search_message_hits(query, chat_type, chat_id, limit, offset)
+        return total, [message for message, _ in hits]
+
+    def search_message_hits(
+        self,
+        query: str,
+        chat_type: ChatType | None = None,
+        chat_id: int | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[int, list[tuple[Message, str]]]:
+        """返回 (总数, [(消息, 命中摘录)])。
+
+        3 字以上优先走 trigram FTS + bm25；1-2 字（trigram 无法索引）或 FTS
+        不可用时回落 LIKE。FTS 查不到时也回落一次，避免分词边界导致漏召回。
+        """
+        query = (query or "").strip()
+        if not query:
+            return 0, []
+        page, skip = _page_bounds(limit, offset)
+        if self._messages_fts and len(query) >= 3:
+            phrase = '"' + query.replace('"', '""') + '"'
+            clauses: list[str] = []
+            params: list[object] = []
+            if chat_type is not None:
+                clauses.append("m.chat_type = ?")
+                params.append(chat_type.value)
+            if chat_id is not None:
+                clauses.append("m.chat_id = ?")
+                params.append(int(chat_id))
+            where = " AND ".join(["messages_fts MATCH ?", *clauses])
+            try:
+                total_row = self._conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS total
+                    FROM messages_fts
+                    JOIN messages m ON m.id = messages_fts.rowid
+                    WHERE {where}
+                    """,
+                    (phrase, *params),
+                ).fetchone()
+                total = int(total_row["total"] or 0)
+                if total:
+                    rows = self._conn.execute(
+                        f"""
+                        SELECT m.*
+                        FROM messages_fts
+                        JOIN messages m ON m.id = messages_fts.rowid
+                        WHERE {where}
+                        ORDER BY bm25(messages_fts), m.id DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (phrase, *params, page, skip),
+                    ).fetchall()
+                    return total, [
+                        (self._row_to_message(r), self._snippet(r["content"], query))
+                        for r in rows
+                    ]
+            except sqlite3.OperationalError:
+                pass
+        return self._search_messages_like(query, chat_type, chat_id, page, skip)
+
+    def search_message_terms(
+        self,
+        terms: Sequence[str],
+        chat_type: ChatType | None = None,
+        chat_id: int | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[int, list[tuple[Message, str]]]:
+        """用多个词项做 OR 检索：一次 FTS 查询覆盖整句，适合召回长问句。"""
+        cleaned: list[str] = []
+        for raw in terms:
+            term = (raw or "").strip()
+            if term and term not in cleaned:
+                cleaned.append(term)
+        if not cleaned:
+            return 0, []
+        page, skip = _page_bounds(limit, offset)
+
+        if self._messages_fts:
+            match = " OR ".join('"' + term.replace('"', '""') + '"' for term in cleaned)
+            clauses: list[str] = []
+            params: list[object] = []
+            if chat_type is not None:
+                clauses.append("m.chat_type = ?")
+                params.append(chat_type.value)
+            if chat_id is not None:
+                clauses.append("m.chat_id = ?")
+                params.append(int(chat_id))
+            where = " AND ".join(["messages_fts MATCH ?", *clauses])
+            try:
+                total_row = self._conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS total
+                    FROM messages_fts
+                    JOIN messages m ON m.id = messages_fts.rowid
+                    WHERE {where}
+                    """,
+                    (match, *params),
+                ).fetchone()
+                total = int(total_row["total"] or 0)
+                if total:
+                    rows = self._conn.execute(
+                        f"""
+                        SELECT m.*
+                        FROM messages_fts
+                        JOIN messages m ON m.id = messages_fts.rowid
+                        WHERE {where}
+                        ORDER BY bm25(messages_fts), m.id DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (match, *params, page, skip),
+                    ).fetchall()
+                    return total, [
+                        (self._row_to_message(r), self._snippet_for_terms(r["content"], cleaned))
+                        for r in rows
+                    ]
+            except sqlite3.OperationalError:
+                pass
+
+        scope, params = _memory_scope(chat_type, chat_id)
+        clause = f"{scope} AND" if scope else "WHERE"
+        likes = " OR ".join("content LIKE ? ESCAPE '\\'" for _ in cleaned)
+        condition = f"{clause} ({likes})"
+        like_params = [_like_pattern(term) for term in cleaned]
+        total_row = self._conn.execute(
+            f"SELECT COUNT(*) AS total FROM messages {condition}",
+            (*params, *like_params),
+        ).fetchone()
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM messages
+            {condition}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, *like_params, page, skip),
+        ).fetchall()
+        return int(total_row["total"] or 0), [
+            (self._row_to_message(r), self._snippet_for_terms(r["content"], cleaned))
+            for r in rows
+        ]
+
+    @classmethod
+    def _snippet_for_terms(cls, content: str, terms: Sequence[str]) -> str:
+        folded = (content or "").casefold()
+        for term in terms:
+            if term.casefold() in folded:
+                return cls._snippet(content, term)
+        return cls._snippet(content, terms[0] if terms else "")
+
+    def _search_messages_like(
+        self,
+        query: str,
+        chat_type: ChatType | None,
+        chat_id: int | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[int, list[tuple[Message, str]]]:
         scope, params = _memory_scope(chat_type, chat_id)
         needle = _like_pattern(query)
         clause = f"{scope} AND" if scope else "WHERE"
@@ -403,7 +617,6 @@ class Store:
             f"SELECT COUNT(*) AS total FROM messages {condition}",
             (*params, needle),
         ).fetchone()
-        page, skip = _page_bounds(limit, offset)
         rows = self._conn.execute(
             f"""
             SELECT * FROM messages
@@ -411,9 +624,28 @@ class Store:
             ORDER BY id DESC
             LIMIT ? OFFSET ?
             """,
-            (*params, needle, page, skip),
+            (*params, needle, limit, offset),
         ).fetchall()
-        return int(total_row["total"] or 0), [self._row_to_message(r) for r in rows]
+        return int(total_row["total"] or 0), [
+            (self._row_to_message(r), self._snippet(r["content"], query)) for r in rows
+        ]
+
+    @staticmethod
+    def _snippet(content: str, query: str, radius: int = 30) -> str:
+        text = (content or "").strip()
+        if not text:
+            return ""
+        needle = query.strip()
+        index = text.casefold().find(needle.casefold()) if needle else -1
+        if index < 0:
+            return text[: radius * 2] + ("…" if len(text) > radius * 2 else "")
+        start = max(0, index - radius)
+        end = min(len(text), index + len(needle) + radius)
+        return (
+            ("…" if start > 0 else "")
+            + text[start:end]
+            + ("…" if end < len(text) else "")
+        )
 
     # ---- delivery cursors -----------------------------------------
     def _row_id(self, chat_type: ChatType, chat_id: int, message_id: str) -> int | None:
@@ -747,18 +979,118 @@ class Store:
         kind: str,
         content: str,
         confidence: float,
+        source_message_id: str = "",
+        source_excerpt: str = "",
     ) -> None:
         self._conn.execute(
             """
             INSERT INTO impressions
-                (chat_type, chat_id, subject_user_id, kind, content, confidence)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (chat_type, chat_id, subject_user_id, kind, content, confidence,
+                 source_message_id, source_excerpt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (chat_type, chat_id, subject_user_id, kind, content)
-            DO UPDATE SET confidence = excluded.confidence, updated_at = datetime('now')
+            DO UPDATE SET
+                confidence = excluded.confidence,
+                updated_at = datetime('now'),
+                source_message_id = CASE
+                    WHEN excluded.source_message_id <> ''
+                    THEN excluded.source_message_id
+                    ELSE impressions.source_message_id
+                END,
+                source_excerpt = CASE
+                    WHEN excluded.source_excerpt <> ''
+                    THEN excluded.source_excerpt
+                    ELSE impressions.source_excerpt
+                END
             """,
-            (chat_type.value, chat_id, subject_user_id or 0, kind, content, confidence),
+            (
+                chat_type.value,
+                chat_id,
+                subject_user_id or 0,
+                kind,
+                content,
+                confidence,
+                source_message_id,
+                source_excerpt,
+            ),
         )
         self._conn.commit()
+
+    def get_impression(self, impression_id: int) -> Impression | None:
+        row = self._conn.execute(
+            "SELECT * FROM impressions WHERE id = ?", (int(impression_id),)
+        ).fetchone()
+        return None if row is None else self._row_to_impression(row)
+
+    def update_impression(
+        self,
+        impression_id: int,
+        *,
+        content: str | None = None,
+        confidence: float | None = None,
+        kind: str | None = None,
+    ) -> Impression | None:
+        """编辑一条印象；返回更新后的行，id 不存在时返回 None。"""
+        sets: list[str] = []
+        params: list[object] = []
+        if content is not None:
+            sets.append("content = ?")
+            params.append(content)
+        if confidence is not None:
+            sets.append("confidence = ?")
+            params.append(float(confidence))
+        if kind is not None:
+            sets.append("kind = ?")
+            params.append(kind)
+        if not sets:
+            return self.get_impression(impression_id)
+        sets.append("updated_at = datetime('now')")
+        cur = self._conn.execute(
+            f"UPDATE impressions SET {', '.join(sets)} WHERE id = ?",
+            (*params, int(impression_id)),
+        )
+        self._conn.commit()
+        if cur.rowcount <= 0:
+            return None
+        return self.get_impression(impression_id)
+
+    def merge_impressions(
+        self, impression_ids: Sequence[int], content: str | None = None
+    ) -> Impression | None:
+        """把同一会话、同一主体的多条印象合并到最早的一条。
+
+        调用方负责把 content 校验为非空；跨会话/跨主体合并没有语义，直接拒绝。
+        """
+        ids = list(dict.fromkeys(int(i) for i in impression_ids))
+        if len(ids) < 2:
+            raise ValueError("至少选择两条印象")
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"SELECT * FROM impressions WHERE id IN ({placeholders}) ORDER BY id ASC",
+            ids,
+        ).fetchall()
+        if len(rows) != len(ids):
+            return None
+        first = rows[0]
+        scope = (first["chat_type"], first["chat_id"], first["subject_user_id"])
+        if any(
+            (r["chat_type"], r["chat_id"], r["subject_user_id"]) != scope for r in rows
+        ):
+            raise ValueError("只能合并同一会话、同一主体的印象")
+        merged_content = (content or first["content"]).strip()
+        confidence = max(float(r["confidence"]) for r in rows)
+        target = self.update_impression(
+            int(first["id"]), content=merged_content, confidence=confidence
+        )
+        if target is None:
+            return None
+        others = [int(r["id"]) for r in rows[1:]]
+        self._conn.execute(
+            f"DELETE FROM impressions WHERE id IN ({','.join('?' for _ in others)})",
+            others,
+        )
+        self._conn.commit()
+        return self.get_impression(int(first["id"]))
 
     def delete_impression(self, impression_id: int) -> bool:
         cur = self._conn.execute(
@@ -850,6 +1182,8 @@ class Store:
             kind=r["kind"],
             content=r["content"],
             confidence=r["confidence"],
+            source_message_id=r["source_message_id"] or "",
+            source_excerpt=r["source_excerpt"] or "",
             updated_at=r["updated_at"],
             id=r["id"],
         )

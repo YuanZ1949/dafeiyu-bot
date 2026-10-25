@@ -71,13 +71,17 @@ class MemoryConfig:
 
 @dataclass(frozen=True)
 class InjectionConfig:
-    """opencode 分支的三段前缀预算，单位是字符数（不是 token）。"""
+    """opencode 分支的注入预算，单位是字符数（不是 token）。"""
 
     memory_chars: int = 500
     summary_chars: int = 250
     impression_chars: int = 150
     inject_summaries: bool = True
     inject_impressions: bool = True
+    # 默认关闭：相关旧记忆会改变 prompt，升级后要显式打开。
+    recall_enabled: bool = False
+    recall_topk: int = 3
+    recall_chars: int = 300
 
 
 @dataclass(frozen=True)
@@ -276,6 +280,15 @@ def _build_injection(
         inject_summaries=_bool(memory_raw.get("inject_summaries", True), "memory.inject_summaries"),
         inject_impressions=_bool(
             memory_raw.get("inject_impressions", True), "memory.inject_impressions"
+        ),
+        recall_enabled=_bool(
+            memory_raw.get("recall_enabled", False), "memory.recall_enabled"
+        ),
+        recall_topk=_positive_int(
+            memory_raw.get("recall_topk"), "memory.recall_topk", 3
+        ),
+        recall_chars=_positive_int(
+            memory_raw.get("recall_chars"), "memory.recall_chars", 300
         ),
     )
 

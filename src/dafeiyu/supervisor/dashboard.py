@@ -27,7 +27,7 @@ DASHBOARD_DIR = Path(__file__).with_name("dashboard")
 
 @web.middleware
 async def _same_origin(request: web.Request, handler):
-    if request.method in ("POST", "PUT", "DELETE"):
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
         origin = request.headers.get("Origin")
         host = request.headers.get("Host")
         if origin and host and origin.split("//", 1)[-1] != host:
@@ -301,6 +301,25 @@ def create_app(
         code, data = await bot_call("POST", "/api/memory/impressions", payload)
         return web.json_response(data, status=code)
 
+    async def memory_impression_update(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        impression_id = request.match_info["impression_id"]
+        code, data = await bot_call(
+            "PATCH", f"/api/memory/impressions/{impression_id}", payload
+        )
+        return web.json_response(data, status=code)
+
+    async def memory_impression_merge(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call(
+            "POST", "/api/memory/impressions/merge", payload
+        )
+        return web.json_response(data, status=code)
+
     async def memory_impression_delete(request: web.Request) -> web.Response:
         impression_id = request.match_info["impression_id"]
         code, data = await bot_call(
@@ -365,6 +384,10 @@ def create_app(
     app.router.add_get("/api/backup", backup)
     app.router.add_post("/api/memory/summaries", memory_summary)
     app.router.add_post("/api/memory/impressions", memory_impressions)
+    app.router.add_patch(
+        "/api/memory/impressions/{impression_id}", memory_impression_update
+    )
+    app.router.add_post("/api/memory/impressions/merge", memory_impression_merge)
     app.router.add_delete(
         "/api/memory/impressions/{impression_id}", memory_impression_delete
     )

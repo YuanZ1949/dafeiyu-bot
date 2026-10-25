@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import os
+import sqlite3
 import tempfile
 import time
 from datetime import datetime, timedelta
@@ -40,6 +41,31 @@ log = logging.getLogger(__name__)
 
 CLOSE_DELAY_SECONDS = 30.0
 MODEL_PROBE_TIMEOUT = 3.0
+MAX_IMPRESSION_CHARS = 200
+IMPRESSION_KINDS = {"nickname", "preference", "fact"}
+
+
+def _parse_impression_id(raw: str) -> tuple[int | None, web.Response | None]:
+    try:
+        impression_id = int(raw)
+    except ValueError:
+        return None, web.json_response({"error": "印象 id 必须是整数"}, status=400)
+    if impression_id <= 0:
+        return None, web.json_response({"error": "印象 id 必须是正整数"}, status=400)
+    return impression_id, None
+
+
+def _parse_impression_content(value: Any) -> tuple[str | None, web.Response | None]:
+    if not isinstance(value, str):
+        return None, web.json_response({"error": "content 必须是字符串"}, status=400)
+    content = value.strip()
+    if not content:
+        return None, web.json_response({"error": "content 不能为空"}, status=400)
+    if len(content) > MAX_IMPRESSION_CHARS:
+        return None, web.json_response(
+            {"error": f"content 不能超过 {MAX_IMPRESSION_CHARS} 字"}, status=400
+        )
+    return content, None
 
 
 class MemoryActions:
@@ -205,6 +231,21 @@ def _message_json(message: Any) -> dict[str, Any]:
     }
 
 
+def _impression_json(impression: Any) -> dict[str, Any]:
+    return {
+        "id": impression.id,
+        "chat_type": impression.chat_type.value,
+        "chat_id": impression.chat_id,
+        "subject_user_id": impression.subject_user_id,
+        "kind": impression.kind,
+        "content": impression.content,
+        "confidence": impression.confidence,
+        "source_message_id": impression.source_message_id,
+        "source_excerpt": impression.source_excerpt,
+        "updated_at": impression.updated_at,
+    }
+
+
 class BrainControl:
     """运行时换脑的唯一写入点。"""
 
@@ -309,6 +350,8 @@ class BrainControl:
                 "kind": i.kind,
                 "content": i.content,
                 "confidence": i.confidence,
+                "source_message_id": i.source_message_id,
+                "source_excerpt": i.source_excerpt,
                 "updated_at": i.updated_at,
             }
             for i in self.store.recent_impressions(limit, offset, chat_type, chat_id)
@@ -405,7 +448,7 @@ class BrainControl:
         limit: int = 20,
         offset: int = 0,
     ) -> dict[str, Any]:
-        total, messages = self.store.search_messages(
+        total, hits = self.store.search_message_hits(
             query, chat_type, chat_id, limit, offset
         )
         return {
@@ -413,7 +456,10 @@ class BrainControl:
             "total": total,
             "limit": limit,
             "offset": offset,
-            "items": [_message_json(m) for m in messages],
+            "items": [
+                {**_message_json(message), "snippet": snippet}
+                for message, snippet in hits
+            ],
         }
 
     def export_snapshot(
@@ -443,6 +489,8 @@ class BrainControl:
                     "kind": impression.kind,
                     "content": impression.content,
                     "confidence": impression.confidence,
+                    "source_message_id": impression.source_message_id,
+                    "source_excerpt": impression.source_excerpt,
                     "updated_at": impression.updated_at,
                 }
                 for impression in impressions
@@ -483,9 +531,10 @@ class BrainControl:
         lines.extend(["", "## 印象", ""])
         for impression in bundle["impressions"]:
             subject = impression["subject_user_id"] or "-"
+            source = impression.get("source_message_id") or "-"
             lines.append(
                 f"- [{impression['kind']}] {impression['content']}"
-                f"（主体 {subject}，置信度 {impression['confidence']}）"
+                f"（主体 {subject}，置信度 {impression['confidence']}，来源 {source}）"
             )
         if not bundle["impressions"]:
             lines.append("（无）")
@@ -710,16 +759,89 @@ def create_app(
             return web.json_response({"error": "抽取印象失败，详见日志"}, status=502)
         return web.json_response({"ok": True, "added": added})
 
+    async def patch_impression(request: web.Request) -> web.Response:
+        impression_id, error = _parse_impression_id(
+            request.match_info.get("impression_id", "")
+        )
+        if error is not None:
+            return error
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        content: str | None = None
+        confidence: float | None = None
+        kind: str | None = None
+        if "content" in payload:
+            content, error = _parse_impression_content(payload["content"])
+            if error is not None:
+                return error
+        if "confidence" in payload:
+            raw = payload["confidence"]
+            if isinstance(raw, bool):
+                return web.json_response({"error": "confidence 必须是 0..1 的数字"}, status=400)
+            try:
+                confidence = float(raw)
+            except (TypeError, ValueError):
+                return web.json_response({"error": "confidence 必须是 0..1 的数字"}, status=400)
+            if not 0 <= confidence <= 1:
+                return web.json_response({"error": "confidence 必须在 0..1 之间"}, status=400)
+        if "kind" in payload:
+            raw_kind = payload["kind"]
+            if not isinstance(raw_kind, str) or raw_kind not in IMPRESSION_KINDS:
+                return web.json_response(
+                    {"error": "kind 只能是 nickname、preference 或 fact"}, status=400
+                )
+            kind = raw_kind
+        if content is None and confidence is None and kind is None:
+            return web.json_response({"error": "至少提供 content/confidence/kind 之一"}, status=400)
+        try:
+            impression = control.store.update_impression(
+                impression_id, content=content, confidence=confidence, kind=kind
+            )
+        except sqlite3.IntegrityError:
+            return web.json_response({"error": "已存在相同内容/类型/主体的印象"}, status=409)
+        if impression is None:
+            return web.json_response({"error": "印象不存在"}, status=404)
+        return web.json_response({"ok": True, "impression": _impression_json(impression)})
+
+    async def merge_impressions(request: web.Request) -> web.Response:
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        raw_ids = payload.get("ids")
+        if not isinstance(raw_ids, list) or len(raw_ids) < 2:
+            return web.json_response({"error": "ids 至少需要两条印象"}, status=400)
+        ids: list[int] = []
+        for raw in raw_ids:
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+                return web.json_response({"error": "ids 必须是正整数列表"}, status=400)
+            if raw not in ids:
+                ids.append(raw)
+        if len(ids) < 2:
+            return web.json_response({"error": "ids 至少需要两条不同的印象"}, status=400)
+        content: str | None = None
+        if "content" in payload:
+            content, error = _parse_impression_content(payload["content"])
+            if error is not None:
+                return error
+        try:
+            impression = control.store.merge_impressions(ids, content)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except sqlite3.IntegrityError:
+            return web.json_response({"error": "合并后的内容与已有印象重复"}, status=409)
+        if impression is None:
+            return web.json_response({"error": "有印象不存在"}, status=404)
+        return web.json_response({"ok": True, "impression": _impression_json(impression)})
+
     async def delete_impression(request: web.Request) -> web.Response:
         if memory_actions is None:
             return web.json_response({"error": "记忆操作未启用"}, status=503)
-        raw = request.match_info.get("impression_id", "")
-        try:
-            impression_id = int(raw)
-        except ValueError:
-            return web.json_response({"error": "印象 id 必须是整数"}, status=400)
-        if impression_id <= 0:
-            return web.json_response({"error": "印象 id 必须是正整数"}, status=400)
+        impression_id, error = _parse_impression_id(
+            request.match_info.get("impression_id", "")
+        )
+        if error is not None:
+            return error
         try:
             deleted = memory_actions.delete_impression(impression_id)
         except Exception as exc:  # noqa: BLE001
@@ -908,6 +1030,10 @@ def create_app(
     app.router.add_get("/api/memory", memory)
     app.router.add_post("/api/memory/summaries", post_summary)
     app.router.add_post("/api/memory/impressions", post_impressions)
+    app.router.add_patch(
+        "/api/memory/impressions/{impression_id}", patch_impression
+    )
+    app.router.add_post("/api/memory/impressions/merge", merge_impressions)
     app.router.add_delete(
         "/api/memory/impressions/{impression_id}", delete_impression
     )
