@@ -13,6 +13,7 @@ from pathlib import Path
 
 from ..brain.client import BrainError
 from ..brain.opencode import resolve_opencode_bin
+from ..brain.runtime_config import server_env
 from ..config import ConfigError, Settings, load_settings
 from .dashboard import serve
 from .logs import LogHub
@@ -138,6 +139,10 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
     control_port = settings.supervisor.control_port
 
     specs: dict[str, ProcSpec] = {}
+    # 真正拉起 serve 的是 supervisor（bot 侧 manage_server=false），
+    # 所以配置隔离必须在这里注入；留空时 server_env 返回 None，保持软回滚。
+    opencode_env: dict[str, str] = {"OPENCODE_DB": str(db_path), "NO_COLOR": "1"}
+    opencode_env.update(server_env(settings.opencode.config_home) or {})
     specs["opencode"] = ProcSpec(
         name="opencode",
         command=[
@@ -149,7 +154,7 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
             str(settings.opencode.port),
         ],
         cwd=str(REPO_ROOT),
-        env={"OPENCODE_DB": str(db_path), "NO_COLOR": "1"},
+        env=opencode_env,
         ready_url=f"http://{settings.opencode.host}:{settings.opencode.port}/api/info",
         creationflags=CREATE_NO_WINDOW,
     )

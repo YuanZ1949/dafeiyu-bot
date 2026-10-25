@@ -1,5 +1,6 @@
 import base64
 import json
+import time
 
 import httpx
 import pytest
@@ -36,6 +37,7 @@ class FakeServer:
         unit: float = 1.0,
         missing_tokens: bool = False,
         steps: list[tuple[str, str]] | None = None,
+        error: dict | None = None,
     ) -> None:
         self.answer = answer
         self.complete = complete
@@ -44,6 +46,7 @@ class FakeServer:
         self.unit = float(unit)
         self.missing_tokens = missing_tokens
         self.steps = list(steps) if steps is not None else None
+        self.error = error
         self.pending_steps = list(self.steps[1:]) if self.steps else []
         self.known = {"ses_old"}
         self.messages: dict[str, list[dict]] = {"ses_old": []}
@@ -194,6 +197,9 @@ class FakeServer:
                     entry["time"]["completed"] = created + 5
                 if not self.missing_tokens:
                     entry["tokens"] = {"input": 100, "output": 35}
+                if self.error is not None:
+                    entry["finish"] = "error"
+                    entry["error"] = self.error
                 self.messages[sid].append(entry)
             else:
                 self._append_step(sid, self.steps[0])
@@ -283,6 +289,24 @@ async def test_reply_raises_when_assistant_has_no_text(store: Store) -> None:
     with pytest.raises(BrainError, match="超时"):
         await brain.reply(ChatType.PRIVATE, 42, "在吗")
     await brain.aclose()
+
+
+async def test_reply_surfaces_provider_error_without_waiting(store: Store) -> None:
+    server = FakeServer(
+        text_parts=[],
+        error={"type": "provider.quota", "message": "Free usage limit reached"},
+    )
+    brain = make_brain(store, server, timeout=2.0)
+    started = time.monotonic()
+    with pytest.raises(BrainError) as excinfo:
+        await brain.reply(ChatType.PRIVATE, 42, "在吗")
+    elapsed = time.monotonic() - started
+    await brain.aclose()
+
+    message = str(excinfo.value)
+    assert "provider.quota" in message
+    assert "Free usage limit reached" in message
+    assert elapsed < 1.0
 
 
 async def test_auth_header_is_basic_opencode(store: Store) -> None:

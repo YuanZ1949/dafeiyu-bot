@@ -409,6 +409,7 @@ S2 的判据从"二选一"改成"三条同时可观测"。
 - 因此 **S6 的产出是一个选择题**，不是自动执行：能隔离且不丢凭据 → 隔离；需要复制凭据 → 交给你决定。
 - 实测（Task 13）：**本轮未隔离**；兜底是 §11.3 的检测 + 轮换，加上工作区侧的 agent 权限与会话级 deny（`workspace.dir` 为空时下推全量 deny）。
 - 实测修正（Task 13.1）：上面「要搬 `auth.json`」的成本判断**不成立**。本机 `opencode debug paths` 显示 `config` 与 `data` 分离，`auth.json` 在 data 目录（`~/.local/share/opencode/auth.json`），不在配置目录；那 15 个外来 agent 来自 `plugins`（`yzOpencode` / `OpencodeLiberation` / `oceanus` 等），配置里既没有 `agents:` 段也没有 agents 目录。所以只隔离 `XDG_CONFIG_HOME` 就能去掉全局插件 / MCP / 外来 agent，**不需要复制凭据**。
+- 实测（Task 14 真机）：隔离要**两处**都修才真正生效。① `manage_server: false` 时 serve 由 supervisor 拉起，`build_specs` 原本只传 `OPENCODE_DB` / `NO_COLOR`，隔离在真实部署路径里完全没生效（自管路径的测试是绿的，掩盖了这一点）；② 运行环境里的 `OPENCODE_CONFIG` **优先级高于** `XDG_CONFIG_HOME`，只设后者时全局插件照常加载（启动日志可见 `[oceanus]` 预热）。现在 `server_env()` 同时返回 `XDG_CONFIG_HOME` 与 `OPENCODE_CONFIG`，两条路径都接上。生效证据：`GET /api/config` 只返回隔离目录的 `opencode.jsonc`（`plugins: []`）加仓库自己的 `.opencode`，启动日志无 `[oceanus]`。注意 `GET /api/agent` 返回 `{"data": []}`，**不是** agent 列表，不能用来证明隔离。
 - 已实现（Task 13.1）：新增 `opencode.config_home`（留空 = 软回滚），bot 的 `OpenCodeServer` 子进程用 `env={"XDG_CONFIG_HOME": <abs>}` 指向 `data/opencode-runtime/config`；该目录下的 `opencode/opencode.jsonc` 由 `ensure_isolated_config` 幂等生成（`$schema` + 钉住 model + `plugins: []`）。只作用于 bot 子进程，不改用户全局配置，也不影响日常 opencode。
 - 被否的方案：仓库级 `.opencode/opencode.jsonc`。同一仓库也是开发目录，仓库级 `policies` 会连带禁掉开发会话自己的 MCP / 插件。
 - 仍待真机确认（Task 14）：隔离后模型与凭据是否可用；全局插件是否真是 §11.1 污染的来源（污染文本与 OmO 自动续跑的措辞高度吻合，尚未验证）。
@@ -521,7 +522,7 @@ memory:
 8. 权限实测：让它 read `.env` → 被拒；`shell` → 被拒；写 `data/bot-workspace/x.md` → 成功。
 9. 注入外来 synthetic → 日志命中 + 下一轮换 session。
 
-**实测（Task 14，离线部分）**：第 1 / 5 / 6 / 7 / 9 条已通过（`tests/test_e2e_batch.py` 4 条 + 既有用例，全量 390 passed），第 2 / 3 条机制已证、时延与真实模型待联调，第 4 / 8 条待真机。第 5 条首跑暴露真缺陷：`Service._forget_chat` 先 `store.forget_chat()` 清掉了 session 映射，`brain.forget()` 随后查不到 id，导致**远端 session 从未被 DELETE**；已调换为「先 brain.forget 再 store.forget_chat」，纯顺序修复、不改签名。明细见 `docs/superpowers/spikes/2026-10-24-e2e-acceptance.md`。
+**实测（Task 14）**：全量 **393 passed**。第 1 / 5 / 6 / 7 / 9 条通过（离线）；第 4 / 8 条通过（真机）；第 3 条部分通过（真机：事实引用 ✅，5.3s / 12.5s 两次真抓 httpbin 返回真实 uuid；10 秒内提示语 ❌，`on_tool` 在真实 server 上从不触发）；第 2 条被 provider 免费额度阻塞（429 `provider.quota`，非代码缺陷）。共暴露 4 个真缺陷，均已修复：① 第 5 条首跑发现 `Service._forget_chat` 先 `store.forget_chat()` 清掉 session 映射，`brain.forget()` 随后查不到 id，**远端 session 从未被 DELETE**；② `manage_server: false` 时 supervisor 拉起 serve 没带隔离 env，隔离在生产路径完全没生效；③ `OPENCODE_CONFIG` 优先级高于 `XDG_CONFIG_HOME`，只设后者仍加载全局插件；④ `_ask` 只认「有非空文本」为完成，模型 `finish="error"` + `content: []` 时死等到 240s 超时、真实错误（配额/限流）被吞掉。另有 1 个未修：`on_tool` 的检查在长轮询 `_wait` 之前，真实 server 一轮跑完才返回，导致提示语永不触发——修法属轮询策略的设计级改动，需单独任务。明细见 `docs/superpowers/spikes/2026-10-24-e2e-acceptance.md`。
 
 ## 15. 上线与回滚
 

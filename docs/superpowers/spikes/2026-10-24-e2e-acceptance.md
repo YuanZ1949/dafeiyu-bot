@@ -11,11 +11,12 @@
 | 范围 | 结果 |
 | --- | --- |
 | 离线（MockTransport，不连 QQ） | 5 条完全通过（1 / 5 / 6 / 7 / 9），2 条部分通过（2 / 3） |
-| 真机（真实 opencode server + NapCat + 模型） | 2 条待放行（4 / 8），另 2 条的剩余部分（2 / 3）同批验证 |
-| 全量测试 | `390 passed in 95.78s`（基线 386，新增 `tests/test_e2e_batch.py` 4 条） |
-| 发现缺陷 | 1 个：`/forget` 不删远端 session（已修，见「偏差与修复」） |
+| 真机（真实 opencode server + 真实模型，未连 QQ） | 2 条通过（4 / 8），1 条部分（3：事实 ✅ / 提示语 ❌），1 条被外部配额阻塞（2） |
+| 全量测试 | `393 passed in 81.14s`（Task 14 起点基线 386，新增 7 条） |
+| 发现缺陷 | 4 个已修（`/forget` 不删 session、supervisor 没注入隔离 env、`OPENCODE_CONFIG` 覆盖隔离、provider 错误死等 240s）+ 1 个未修（`on_tool` 提示语从不触发） |
 
-离线可判定的部分全部通过；剩余 4 条必须连真实 server / QQ / 模型才能判定，操作步骤见文末「真机联调清单」。
+真机部分**未连 QQ**：直接对隔离后的 `opencode serve` 发真实 prompt，覆盖了权限、联网、记笔记三条；唯一必须进群才能判定的只剩「真实群消息 → 提示语时延」的场景差异（见第 3 条）。
+第 2 条（摘要/印象）被 provider 免费额度（429）挡住，属于外部阻塞，不是代码缺陷——但它顺带暴露了第 4 个缺陷（错误被吞成超时），已修。
 
 ## 验收明细
 
@@ -30,8 +31,10 @@
 实际输出：
 
 ```
-390 passed in 95.78s (0:01:35)
+393 passed in 81.14s (0:01:21)
 ```
+
+393 = Task 13.1 基线 386 + 本任务新增 7（e2e 4 + supervisor 隔离 2 + provider 错误 fail-fast 1）。
 
 覆盖归属（文件级映射，逐条断言见测试源码）：
 
@@ -55,7 +58,7 @@
 | 16 `/forget`（清库 / DELETE / 保留笔记） | `test_service.py`、`test_brain_complete.py`、`test_e2e_batch.py` |
 | 17 跨群越权（无 glob/grep allow、read 限工作区） | `test_config_agents.py` |
 
-### 2. 摘要与印象真跑一次，`summaries` / `impressions` 行数 > 0，dashboard 可见 —— ⚠️ 部分通过
+### 2. 摘要与印象真跑一次，`summaries` / `impressions` 行数 > 0，dashboard 可见 —— 🔒 外部阻塞（provider 配额）
 
 离线已证（落库与展示链路）：
 
@@ -64,22 +67,78 @@
 - `test_review_fixes.py`(16)：摘要循环定期执行直到停止、印象 worker 记账、印象按消息数而非回复数计。
 - `test_supervisor_dashboard.py`(16)：dashboard 读取侧。
 
-缺口：没有一条用例跑真实模型产出摘要/印象。**待真机**：见清单第 2 步。
+真机执行（2026-10-25，隔离 serve）：
 
-### 3. 群里问联网问题：10 秒内先出提示语，最终回复引用页面事实 —— ⚠️ 部分通过
+```
+[impressions] written=0 rows=0 sample=[]
+[summary] len=0 stored=None
+```
 
-离线已证（机制，非时延）：
+原因不是代码：`dafeiyu-memory` 的 assistant 消息以 `finish="error"` 结束，内容为空：
 
-- `test_ask_round.py`(7)：tool part 出现 → `on_tool` 回调一次；同 chat 60s 内不重复。
-- `test_run_batch.py`(9)：`speak=false` 且本轮已发过提示 → 补一条 `FOLLOWUP_REPLY`。
+```json
+{"type":"assistant","agent":"dafeiyu-memory","content":[],"finish":"error",
+ "error":{"type":"provider.quota",
+          "message":"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go",
+          "status":429}}
+```
 
-缺口：真实 10 秒时延与「回复引用页面事实」依赖真实模型 + 外网。**待真机**：见清单第 3 步。
+同一时刻 `deepseek-qq` 用同一个模型能正常返回（`finish=stop`），所以是**该模型免费额度被打满**，不是 agent 配置错、也不是模型不可用。`summary.py` 捕获异常后打印「生成摘要失败」并返回空串，`ImpressionWorker` 写入 0 行——降级行为符合设计。
 
-### 4. 3 次对话内 `MEMORY.md` 出现模型自写条目 —— 🔒 待放行
+**退路**：等额度恢复，或把 `deepseek-qq` / `dafeiyu-memory` 的 `model:` 换成非 free 模型后重跑本步。落库与展示链路由离线用例保证，真机只差一次成功产出。
+
+### 3. 群里问联网问题：10 秒内先出提示语，最终回复引用页面事实 —— ⚠️ 部分通过（事实 ✅ / 提示语 ❌）
+
+真机执行（隔离 serve + 真实模型）：
+
+| 探针 | 耗时 | 工具 part | 提示语 | 回复内容 |
+| --- | --- | --- | --- | --- |
+| 单次 webfetch `https://httpbin.org/uuid` | 5.3s | `('tool','completed')` | 无 | 含真实 uuid `e34800e8-…`（无法凭记忆编出） |
+| 两次串行 webfetch `/delay/4` + `/uuid` | 12.5s | 两次 completed | 无 | 含 `url = https://httpbin.org/delay/4` 与 uuid `24a6e434-…` |
+
+**事实引用：通过。** 两次都真抓了页面，返回值可核验。
+
+**10 秒内提示语：不通过——`on_tool` 在真实 server 上从不触发。** 两次探针 `marks=[]`，即使整个轮次长达 12.5 秒、中间有 4 秒阻塞的 webfetch。
+
+根因（`src/dafeiyu/brain/opencode_http.py` `_ask`）：`on_tool` 的检查在轮询循环**顶部**，用的是 `_wait` 之前的 messages；而 `_wait` 是长轮询，**阻塞到会话空闲才返回 204**。真实 server 下整个轮次往往在第一次 `_wait` 里就跑完，拿到 204 后重新拉一次 messages 直接 `return`，中途再也不检查 tool part。单元测试能过是因为 `FakeServer` 的 wait 每次只补一步并返回 200（未空闲），下一轮顶部检查才看得到 running 的 tool part——真实 server 不这样分次返回。
+
+**退路/建议修法**（未在本任务实施，属轮询策略的设计级改动）：给 `_wait` 加超时切片（如 `asyncio.wait_for(self._wait(sid), timeout=1.0)`，超时即继续循环），或改成 0.5s 轮询 `/message` 直到空闲。两者都能让 `on_tool` 在工具启动后 1 秒内触发，代价是每轮多几次轻量请求。
+
+### 4. 3 次对话内 `MEMORY.md` 出现模型自写条目 —— ✅ 通过（真机）
 
 判定口径按 spec：断言日志里 `read` / `edit` 工具调用 ≥1 次；若 3 轮为 0，再看权限拒绝记录与 tool 调用次数（可观测，不靠模型心情）。
 
-离线只能证配置侧：`test_config_agents.py` 断言 agent 文件里 `data/bot-workspace/**` 有 `read`/`edit` allow、通配 deny 在前、`glob`/`grep` 不在 allow 里。
+真机执行（隔离 serve，会话 99101，一轮内让它先读再写）：
+
+```
+[tools] 9.2s reply='TOOL_OK'
+[tools] parts=[('edit', 'completed'), ('read', 'completed')]
+```
+
+`data/bot-workspace/MEMORY.md` 新增模型自写条目（「验证：example.com 的主标题是 Example Domain」等两行）。`read` 与 `edit` 都是 `completed`，不是被拒后自说自话。
+
+离线配置侧另有 `test_config_agents.py` 断言：`data/bot-workspace/**` 有 `read`/`edit` allow、通配 deny 在前、`glob`/`grep` 不在 allow 里。
+
+### 8. 权限实测：read `.env` 被拒、`shell` 被拒、写 `data/bot-workspace/x.md` 成功 —— ✅ 通过（真机）
+
+真机执行（隔离 serve + 真实模型 + 真实工具执行）：
+
+| 探针 | 结果 | 耗时 | 备注 |
+| --- | --- | --- | --- |
+| 读仓库根的环境文件 | `DENIED` | 5.8s / 5.0s（两次） | 模型报告无法读取，无工具成功记录 |
+| `shell` 执行 `echo hi` | `DENIED` | 2.1s / 3.5s（两次） | agent 文件没有 shell allow |
+| 写 `data/bot-workspace/verify.md` | `WRITE_OK` | 7.0s / 6.4s（两次） | 文件落盘，内容「验证条目 e2e-2026」 |
+
+三次探针各用独立 chat_id（99001–99005）隔离上下文，避免上一轮的工具结果影响判断。
+
+### 9. 注入外来 synthetic → 日志命中 + 下一轮换 session —— ✅ 通过（离线）
+
+用例：
+
+- `tests/test_brain_complete.py::test_audit_flags_synthetic_and_ignores_normal_round`：外来 `synthetic` 命中、正常轮次 0 误报。
+- `tests/test_brain_complete.py::test_reply_rotates_on_foreign_message`：命中后 `reset_session`，下一轮重建。
+
+真机复核未做（需要 bot 进程持有真实会话再注入）；这条的判定不依赖模型行为，离线用例直接覆盖审计与轮换逻辑，风险低。
 
 ### 5. `/forget` 后：SQLite 记忆为 0，笔记仍在，session 已删除 —— ✅ 通过（修复后）
 
@@ -142,22 +201,79 @@
 
 **退路**：无需退路。修复是纯顺序调整，不改变任何对外签名；旧行为（不删远端）没有依赖方。
 
-## 真机联调清单（待放行）
+### supervisor 拉起的 serve 没带隔离 env（真机发现并修复）
 
-按顺序执行，每步记实际输出：
+**现象**：`opencode.manage_server: false`——生产路径是 supervisor 拉起 `opencode serve`，bot 只当客户端。而 `supervisor/main.py` 的 `specs["opencode"]` 只带了 `OPENCODE_DB` / `NO_COLOR`，**Task 13.1 的隔离在真实部署里完全没生效**，尽管 `_build_env()` 那条路径的测试是绿的（测试只覆盖了 `manage_server: true` 的自管路径）。
 
-1. **启动**：`python -m dafeiyu`（或 supervisor dashboard 启动 bot）。
-   - 确认 opencode 子进程的 `XDG_CONFIG_HOME` 指向 `data/opencode-runtime/config`（`opencode debug paths` 同法验证）。
-   - 确认 `GET /api/agent` 只剩 `deepseek-qq` / `dafeiyu-memory` + 内置（Compaction/Summary/Title），不再出现 `Tamako` / `oceanus` / `sisyphus` / `prometheus`（S6 隔离的真机确认）。
-2. **第 2 条**：连 NapCat 后在群里聊够 `memory.extract_every` 条，或手动触发一次摘要/印象；查
-   `sqlite3 data/dafeiyu.db "select count(*) from summaries; select count(*) from impressions;"`，再开 dashboard 看得到。
-3. **第 3 条**：群里 @ 机器人发一个真实 URL（如 `https://example.com`），计时看 10 秒内是否先出提示语，最终回复是否引用页面事实。
-4. **第 4 条**：3 轮对话后看 `data/bot-workspace/MEMORY.md` 是否出现模型自写条目，并查日志里 `read`/`edit` 工具调用次数。
-5. **第 8 条**：让机器人 read `.env`（应被拒）、执行 `shell`（应被拒）、写 `data/bot-workspace/x.md`（应成功），记录权限拒绝日志。
-6. **第 9 条**（真机复核）：向 bot 的 session 注入一条外来 synthetic，确认日志命中且下一轮换 session。
+**修复**（`src/dafeiyu/supervisor/main.py`）：`build_specs` 先构造 `opencode_env`，再 `update(server_env(settings.opencode.config_home) or {})`。
+
+**验证**：`tests/test_supervisor_specs.py` 新增 2 条（带/不带 `config_home`），8 passed。
+
+**退路**：`config_home: ""` 时两个变量都不注入，行为回到改动前。
+
+### `OPENCODE_CONFIG` 盖过 `XDG_CONFIG_HOME`（真机发现并修复）
+
+**现象**：按上一条修好后，隔离 serve 的日志里**仍然**出现 `[oceanus] CBM daemon 预热就绪` / `[oceanus] agent-browser 探测`——全局插件照常加载，`plugins: []` 没被读到。
+
+**根因**：运行环境里存在 `OPENCODE_CONFIG=C:\Users\yuan\.config\opencode\opencode.jsonc`，它**优先级高于** `XDG_CONFIG_HOME`。只设 `XDG_CONFIG_HOME` 不足以隔离。
+
+**修复**（`src/dafeiyu/brain/runtime_config.py`）：`server_env()` 同时返回两个键——`XDG_CONFIG_HOME=<root>` 和 `OPENCODE_CONFIG=<root>/opencode/opencode.jsonc`。
+
+**验证**：隔离 serve 重启后 `GET /api/config` 只返回一个 document（`data/opencode-runtime/config/opencode/opencode.jsonc`，`plugins: []`）加上仓库自己的 `.opencode`；日志里不再出现 `[oceanus]`。
+
+**退路**：`config_home: ""` → `server_env()` 返回 `None`，两个变量都不覆盖，回落到启动环境。
+
+### provider 错误被吞成 240 秒超时（真机发现并修复）
+
+**现象**：摘要/印象每次都要等满 `timeout_seconds: 240` 才报「OpenCode 超时」，看起来像模型慢或 agent 配置错。
+
+**根因**：`_ask` 的完成判据 `_round_finished` 要求最后一条 assistant 有非空 text。模型因配额被拒时返回 `finish="error"` + `content: []`，条件永远不满足 → 死等到超时，真实错误（`provider.quota` / 429）被丢掉。这正是被隔离掉的 `retry-fast-fail` 插件以前负责的事。
+
+**修复**（`src/dafeiyu/brain/opencode_http.py`）：新增 `_round_error()`，在 `_wait` 返回后、`_round_finished` 之前检查最后一条 assistant 的 `finish == "error"`，抛 `BrainError("OpenCode 调用失败（{type}）：{message}")`。
+
+**验证**：`test_reply_surfaces_provider_error_without_waiting`（RED 时异常文本是「OpenCode 超时（2 秒）」）→ 16 passed；真机 traceback 指向 `opencode_http.py:309`，配额原文直接出现在日志里。
+
+**退路**：无需退路。正常轮次 `finish` 不是 `"error"`，行为不变。
+
+### `on_tool` 提示语在真实 server 上从不触发（未修）
+
+见第 3 条。已定位到 `_ask` 的长轮询结构，修法属轮询策略的设计级改动，需要单独任务 + 能忠实模拟「阻塞到空闲」的测试替身，本任务只记录不改。
+
+## 真机联调执行记录
+
+**已执行（2026-10-25，未连 QQ）**：手工以隔离 env 启动 `opencode serve`（`XDG_CONFIG_HOME` + `OPENCODE_CONFIG` 指向 `data/opencode-runtime/config`，独立 `OPENCODE_DB=data/opencode-verify.db`，端口 24310，Basic 认证），再用 `OpenCodeHttpBrain` 直接发真实 prompt。
+
+隔离生效证据：
+
+```
+GET /api/config
+→ [{"type":"document",
+    "path":"...\\data\\opencode-runtime\\config\\opencode\\opencode.jsonc",
+    "info":{"$schema":"https://opencode.ai/config.json",
+            "model":{"providerID":"opencode","model":"deepseek-v4.1-flash-free"},
+            "plugins":[]}}]
+启动日志：无 [oceanus] / 无全局 MCP 预热
+```
+
+注：`GET /api/agent` 返回 `{"data": []}`，**不是** agent 列表，不能用它证明隔离——证据用 `/api/config` 与启动日志。
+
+| 步骤 | 状态 | 结果 |
+| --- | --- | --- |
+| 1 启动 + 隔离确认 | ✅ | 见上 |
+| 2 摘要/印象真跑 | 🔒 | provider 免费额度 429，见第 2 条 |
+| 3 联网 + 提示语 | ⚠️ | 事实 ✅（5.3s / 12.5s，真 uuid）、提示语 ❌，见第 3 条 |
+| 4 `MEMORY.md` 自写 | ✅ | `read`/`edit` 均 completed，见第 4 条 |
+| 5 权限三项 | ✅ | 拒 / 拒 / 成，见第 8 条 |
+| 6 synthetic 真机复核 | 未做 | 离线已覆盖，风险低 |
+
+**仍需进群才能补的**：真实群消息下的提示语时延（第 3 条缺口）——但它已经被证明是「从不触发」而非「超过 10 秒」，进群也只会得到同样的否定结论，先修代码再验更划算。
 
 ## 未验证项与风险
 
-- 第 2/3/4/8 条的真机部分未跑，结论不成立前不应视为验收完成。
-- 隔离配置（Task 13.1）后的模型认证、工具权限只做过路径级验证，没跑过真实请求。
-- §11.1 的污染根因（OmO/yzOpencode 自动续跑）仍是推测；真机跑一轮无污染即可反证。
+- **第 2 条**：被 provider 免费额度挡住（429），成功产出未观测。落库/展示链路由离线用例保证，真机只差一次成功调用。
+- **第 3 条提示语**：真实 server 上 `on_tool` 从不触发（已定位到长轮询结构，未修）。「事实引用」已通过。
+- **第 9 条真机复核**：未做，离线用例已覆盖审计与轮换逻辑。
+- **未连 QQ**：真实群消息的时延、`@` 识别、静音判定都走的是离线用例；`triggers.mode: model` 的批次链路只在 MockTransport 下跑过完整流程。
+- **隔离后的副作用**：bot 的 serve 不再加载全局 `dcp`（上下文裁剪）与 `retry-fast-fail`（provider 重试）。前者由 bot 自己的轮换替代，后者的职责部分由本任务新增的 `_round_error` 补上（只报错，不重试）。
+- **`config_home` 的两种生效路径**都已有测试：`manage_server: true` 走 `_build_env()`，`false` 走 supervisor `build_specs`。真机只跑了后者的手工等价物（直接起 serve），supervisor 本身没启动过。
+- **模型可用性**：`opencode/deepseek-v4.1-flash-free` 的免费额度会周期性打满。长期跑群聊应换成有额度的模型，否则摘要/印象会静默降级（现在是明确报错 + 空结果）。

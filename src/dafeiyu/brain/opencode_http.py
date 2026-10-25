@@ -304,6 +304,9 @@ class OpenCodeHttpBrain:
                     await on_tool(tool)
             if await self._wait(session_id):
                 messages = await self._round_messages(session_id, since)
+                failure = self._round_error(messages)
+                if failure is not None:
+                    raise BrainError(failure)
                 if self._round_finished(messages):
                     prompt_tokens = 0
                     completion_tokens = 0
@@ -340,6 +343,26 @@ class OpenCodeHttpBrain:
             m.get("type") == "assistant" and _join_text(m).strip()
             for m in messages
         )
+
+    @staticmethod
+    def _round_error(messages: list[dict[str, Any]]) -> str | None:
+        """本轮最后一条 assistant 以 error 收尾时，返回可直接抛出的原因。
+
+        模型侧失败（配额、限流、鉴权）在 opencode 里表现为 ``finish: "error"``
+        且 content 为空；不认这个标记的话只能等到超时，真实原因会被吞掉。
+        """
+        for message in reversed(messages):
+            if message.get("type") != "assistant":
+                continue
+            if message.get("finish") != "error":
+                return None
+            error = message.get("error") or {}
+            kind = str(error.get("type") or "unknown")
+            detail = str(error.get("message") or "").strip()
+            if detail:
+                return f"OpenCode 调用失败（{kind}）：{detail}"
+            return f"OpenCode 调用失败（{kind}）"
+        return None
 
     @staticmethod
     def _answer(messages: list[dict[str, Any]]) -> str:

@@ -50,7 +50,12 @@ def ensure_isolated_config(config_home: str | Path) -> Path:
 
 
 def server_env(config_home: str | Path | None) -> dict[str, str] | None:
-    """给 ``OpenCodeServer`` 的 env；留空返回 None（沿用启动环境）。"""
+    """给 ``OpenCodeServer`` 的 env；留空返回 None（沿用启动环境）。
+
+    两个变量都要给：实测 ``OPENCODE_CONFIG`` 的优先级高于 ``XDG_CONFIG_HOME``，
+    只改后者的话，父进程环境里带过来的全局 opencode.jsonc 仍会被读进来，
+    全局插件（以及它们注册的外来 agent）照常加载。
+    """
 
     raw = str(config_home or "").strip()
     if not raw:
@@ -59,4 +64,7 @@ def server_env(config_home: str | Path | None) -> dict[str, str] | None:
         root = ensure_isolated_config(raw)
     except OSError as exc:
         raise ConfigError(f"opencode.config_home 无法创建：{raw}（{exc}）") from exc
-    return {"XDG_CONFIG_HOME": str(root)}
+    return {
+        "XDG_CONFIG_HOME": str(root),
+        "OPENCODE_CONFIG": str(root / "opencode" / "opencode.jsonc"),
+    }

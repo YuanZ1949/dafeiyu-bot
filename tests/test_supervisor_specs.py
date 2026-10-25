@@ -86,3 +86,33 @@ def test_napcat_without_password_keeps_inherited_env(tmp_path: Path) -> None:
 def test_invalid_quick_password_md5_rejected(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="quick_password_md5"):
         build(tmp_path, ENV + "NAPCAT_QUICK_PASSWORD_MD5=not-a-md5\n")
+
+
+def test_opencode_spec_carries_isolated_config_home(tmp_path: Path) -> None:
+    """真正拉起 serve 的是 supervisor（bot 侧 manage_server=false），
+    隔离的 XDG_CONFIG_HOME 必须在这里注入，否则 Task 13.1 形同虚设。"""
+    cfg = tmp_path / "cfg"
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        BASE + f"\nopencode:\n  config_home: {cfg.as_posix()}\n", encoding="utf-8"
+    )
+    env_file = tmp_path / "test.env"
+    env_file.write_text(ENV, encoding="utf-8")
+    settings = load_settings(env_file=env_file, config_file=config)
+
+    specs = build_specs(settings, "token-abc")
+
+    assert (specs["opencode"].env or {})["XDG_CONFIG_HOME"] == str(cfg.resolve())
+    assert (specs["opencode"].env or {})["OPENCODE_CONFIG"] == str(
+        cfg.resolve() / "opencode" / "opencode.jsonc"
+    )
+    assert (cfg / "opencode" / "opencode.jsonc").exists()
+
+
+def test_opencode_spec_without_config_home_keeps_inherited_env(tmp_path: Path) -> None:
+    """没配 config_home 就不要塞，保持软回滚（沿用启动环境的配置）。"""
+    _settings, specs = build(tmp_path)
+
+    env = specs["opencode"].env or {}
+    assert "XDG_CONFIG_HOME" not in env
+    assert "OPENCODE_CONFIG" not in env

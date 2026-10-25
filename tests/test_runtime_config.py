@@ -68,8 +68,14 @@ def test_server_env_empty_means_inherit() -> None:
 def test_server_env_points_xdg_config_home(tmp_path: Path) -> None:
     env = server_env(tmp_path / "cfg")
 
-    assert env == {"XDG_CONFIG_HOME": str((tmp_path / "cfg").resolve())}
-    assert (tmp_path / "cfg" / "opencode" / "opencode.jsonc").is_file()
+    root = (tmp_path / "cfg").resolve()
+    assert env == {
+        "XDG_CONFIG_HOME": str(root),
+        # 实测：OPENCODE_CONFIG 的优先级高于 XDG_CONFIG_HOME，只改 XDG 的话
+        # 全局 opencode.jsonc 仍会被读进来（全局插件照常加载）。
+        "OPENCODE_CONFIG": str(root / "opencode" / "opencode.jsonc"),
+    }
+    assert (root / "opencode" / "opencode.jsonc").is_file()
 
 
 def test_server_env_wraps_oserror(
@@ -85,15 +91,17 @@ def test_server_env_wraps_oserror(
 
 
 def test_server_build_env_carries_xdg_config_home(tmp_path: Path) -> None:
-    home = ensure_isolated_config(tmp_path / "cfg")
+    env = server_env(tmp_path / "cfg") or {}
     server = OpenCodeServer(
         "opencode.exe",
         str(tmp_path),
         "data/bot.db",
-        env={"XDG_CONFIG_HOME": str(home)},
+        env=env,
     )
 
-    assert server._build_env()["XDG_CONFIG_HOME"] == str(home)
+    built = server._build_env()
+    assert built["XDG_CONFIG_HOME"] == env["XDG_CONFIG_HOME"]
+    assert built["OPENCODE_CONFIG"] == env["OPENCODE_CONFIG"]
 
 
 # ---- 配置解析 -------------------------------------------------------------
