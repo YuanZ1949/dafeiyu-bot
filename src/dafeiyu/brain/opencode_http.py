@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -24,6 +26,10 @@ from .client import BrainError, BrainReply, parse_brain_reply
 AUTH_USERNAME = "opencode"
 POLL_INTERVAL_SECONDS = 0.5
 REQUEST_TIMEOUT_SECONDS = 15.0
+# 服务端 time.created 是毫秒（spike S2b）；本轮窗口只用它，禁止与 time.time() 混比。
+WINDOW_TOLERANCE_MS = 1000.0
+# 工具 part 只在活跃状态提示；error 不提示，用户不该等一个已失败的抓取。
+TOOL_ACTIVE_STATES = {"pending", "running", "completed"}
 
 
 class _UnknownSession(Exception):
@@ -48,8 +54,22 @@ def _created(message: dict[str, Any]) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
-def _completed(message: dict[str, Any]) -> bool:
-    return "completed" in (message.get("time") or {})
+@dataclass(frozen=True)
+class RoundResult:
+    """一轮对话的结构化结果：最终文本、token 与时间窗（服务端毫秒）。"""
+
+    text: str
+    prompt_tokens: int
+    completion_tokens: int
+    since: float
+    until: float
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 class OpenCodeHttpBrain:
@@ -114,7 +134,7 @@ class OpenCodeHttpBrain:
         for attempt in (0, 1):
             try:
                 sid = session_id or await self._create_session()
-                answer = await self._ask(sid, prompt)
+                result = await self._ask(sid, prompt)
             except _UnknownSession:
                 # session 被删或数据库重置：清映射，新开一个再试一次。
                 self.store.clear_opencode_session(chat_type, chat_id)
@@ -123,9 +143,13 @@ class OpenCodeHttpBrain:
                     raise BrainError("OpenCode session 已失效，重建后仍失败") from None
                 continue
             self.store.set_opencode_session(chat_type, chat_id, sid)
-            if not answer.strip():
+            if not result.text.strip():
                 raise BrainError("OpenCode 没有返回文本")
-            return parse_brain_reply(answer, prompt_tokens=0, completion_tokens=0)
+            return parse_brain_reply(
+                result.text,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+            )
 
         raise BrainError("OpenCode 调用失败：session 重建失败")
 
@@ -142,7 +166,12 @@ class OpenCodeHttpBrain:
             raise BrainError("OpenCode 没有返回 session id")
         return sid
 
-    async def _ask(self, session_id: str, prompt: str) -> str:
+    async def _ask(
+        self,
+        session_id: str,
+        prompt: str,
+        on_tool: Callable[[str], Awaitable[None]] | None = None,
+    ) -> RoundResult:
         baseline = await self._latest_created(session_id)
         payload = await self._request(
             "POST",
@@ -151,23 +180,103 @@ class OpenCodeHttpBrain:
         )
         data = payload.get("data") or {}
         prompt_time = _created(data) if isinstance(data, dict) else 0.0
-        since = max(baseline, prompt_time - 1.0)
+        since = max(baseline, prompt_time - WINDOW_TOLERANCE_MS)
         deadline = time.monotonic() + self.timeout
+        tool_fired = False
 
         while True:
-            for message in await self._messages(session_id):
-                if message.get("type") != "assistant":
-                    continue
-                if not _completed(message) or _created(message) < since:
-                    continue
-                answer = _join_text(message)
-                if answer.strip():
-                    return answer
+            messages = await self._round_messages(session_id, since)
+            if on_tool is not None and not tool_fired:
+                tool = self._first_tool(messages)
+                if tool is not None:
+                    tool_fired = True
+                    await on_tool(tool)
+            if await self._wait(session_id):
+                messages = await self._round_messages(session_id, since)
+                if self._round_finished(messages):
+                    prompt_tokens = 0
+                    completion_tokens = 0
+                    for message in messages:
+                        if message.get("type") != "assistant":
+                            continue
+                        used_in, used_out = self._usage(message)
+                        prompt_tokens += used_in
+                        completion_tokens += used_out
+                    return RoundResult(
+                        text=self._answer(messages),
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        since=since,
+                        until=max((_created(m) for m in messages), default=since),
+                    )
             if time.monotonic() >= deadline:
                 raise BrainError(
                     f"OpenCode 超时（{self.timeout:.0f} 秒），本条放弃"
                 )
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    async def _round_messages(
+        self, session_id: str, since: float
+    ) -> list[dict[str, Any]]:
+        """本轮消息，按 created 升序——服务端默认倒序，顺序不可信。"""
+        messages = await self._messages(session_id)
+        current = [m for m in messages if _created(m) > since]
+        current.sort(key=_created)
+        return current
+
+    def _round_finished(self, messages: list[dict[str, Any]]) -> bool:
+        return any(
+            m.get("type") == "assistant" and _join_text(m).strip()
+            for m in messages
+        )
+
+    @staticmethod
+    def _answer(messages: list[dict[str, Any]]) -> str:
+        answer = ""
+        for message in messages:
+            if message.get("type") != "assistant":
+                continue
+            text = _join_text(message)
+            if text.strip():
+                answer = text
+        return answer
+
+    @staticmethod
+    def _first_tool(messages: list[dict[str, Any]]) -> str | None:
+        for message in messages:
+            if message.get("type") != "assistant":
+                continue
+            for part in message.get("content") or []:
+                if not isinstance(part, dict) or part.get("type") != "tool":
+                    continue
+                if part.get("name") != "webfetch":
+                    continue
+                state = part.get("state") or {}
+                if state.get("status") in TOOL_ACTIVE_STATES:
+                    return "webfetch"
+        return None
+
+    @staticmethod
+    def _usage(message: dict[str, Any]) -> tuple[int, int]:
+        tokens = message.get("tokens")
+        if not isinstance(tokens, dict):
+            return (0, 0)
+        return (_as_int(tokens.get("input")), _as_int(tokens.get("output")))
+
+    async def _wait(self, session_id: str) -> bool:
+        """等本轮结束：204 表示会话空闲。等待自身超时按「未空闲」继续轮询。"""
+        try:
+            response = await self._client.post(
+                f"/api/experimental/session/{session_id}/wait"
+            )
+        except httpx.TimeoutException:
+            return False
+        except httpx.HTTPError as exc:
+            raise BrainError(
+                f"OpenCode 服务不可达：{exc.__class__.__name__}"
+            ) from exc
+        self._check_response(response)
+        return response.status_code == 204
 
     async def _latest_created(self, session_id: str) -> float:
         messages = await self._messages(session_id)
@@ -183,6 +292,19 @@ class OpenCodeHttpBrain:
         if not isinstance(data, list):
             return []
         return [item for item in data if isinstance(item, dict)]
+
+    @staticmethod
+    def _check_response(response: httpx.Response) -> None:
+        if response.status_code in (401, 403):
+            raise BrainError(
+                "OpenCode 服务拒绝认证：检查 opencode.server_password"
+                " 或环境变量 OPENCODE_SERVER_PASSWORD"
+            )
+        if response.status_code == 404:
+            raise _UnknownSession()
+        if response.status_code >= 400:
+            detail = response.text.strip().replace("\n", " ")[:200]
+            raise BrainError(f"OpenCode 返回 {response.status_code}：{detail}")
 
     async def _request(
         self,
@@ -200,16 +322,7 @@ class OpenCodeHttpBrain:
             raise BrainError(
                 f"OpenCode 服务不可达：{exc.__class__.__name__}"
             ) from exc
-        if response.status_code in (401, 403):
-            raise BrainError(
-                "OpenCode 服务拒绝认证：检查 opencode.server_password"
-                " 或环境变量 OPENCODE_SERVER_PASSWORD"
-            )
-        if response.status_code == 404:
-            raise _UnknownSession()
-        if response.status_code >= 400:
-            detail = response.text.strip().replace("\n", " ")[:200]
-            raise BrainError(f"OpenCode 返回 {response.status_code}：{detail}")
+        self._check_response(response)
         try:
             payload = response.json()
         except ValueError as exc:

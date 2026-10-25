@@ -18,17 +18,32 @@ def store() -> Store:
 
 
 class FakeServer:
-    """按 opencode v2 的形状回应：message 列表倒序（最新在前）。"""
+    """按 opencode v2 的形状回应：message 列表默认倒序（最新在前）。
+
+    ``steps`` 模式模拟多步生成：prompt 只落下第一步，其余步骤在第一次
+    ``wait`` 时补齐；每条 assistant 都带一个 ``webfetch`` tool part，
+    供 on_tool 用例使用。
+    """
 
     def __init__(
         self,
         answer: str = '{"speak": true, "reply": "在群聊卖萌", "reason": "ok"}',
         complete: bool = True,
         text_parts: list[dict] | None = None,
+        *,
+        order: str = "desc",
+        unit: float = 1.0,
+        missing_tokens: bool = False,
+        steps: list[tuple[str, str]] | None = None,
     ) -> None:
         self.answer = answer
         self.complete = complete
         self.text_parts = text_parts
+        self.order = order
+        self.unit = float(unit)
+        self.missing_tokens = missing_tokens
+        self.steps = list(steps) if steps is not None else None
+        self.pending_steps = list(self.steps[1:]) if self.steps else []
         self.known = {"ses_old"}
         self.messages: dict[str, list[dict]] = {"ses_old": []}
         self.missing: set[str] = set()
@@ -36,6 +51,41 @@ class FakeServer:
         self.calls: list[tuple[str, str]] = []
         self.auth: list[str] = []
         self.created = 1000.0
+
+    def _stamp(self) -> float:
+        self.created += 10
+        return self.created * self.unit
+
+    def _append_user(self, sid: str) -> float:
+        created = self._stamp()
+        self.messages[sid].append(
+            {"id": "msg_u", "type": "user", "time": {"created": created}}
+        )
+        return created
+
+    def _append_step(self, sid: str, step: tuple[str, str]) -> None:
+        text, status = step
+        tool_status = "completed" if status == "done" else status
+        created = self._stamp()
+        entry = {
+            "id": f"msg_a{len(self.messages[sid])}",
+            "type": "assistant",
+            "time": {"created": created},
+            "content": [
+                {"type": "text", "text": text},
+                {"type": "tool", "name": "webfetch", "state": {"status": tool_status}},
+            ],
+        }
+        if status == "done":
+            entry["time"]["completed"] = created + 5
+        if not self.missing_tokens:
+            entry["tokens"] = {"input": 100, "output": 35}
+        self.messages[sid].append(entry)
+
+    def _idle(self) -> bool:
+        if not self.complete or self.pending_steps:
+            return False
+        return self.steps is None or self.steps[-1][1] == "done"
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -48,40 +98,58 @@ class FakeServer:
             return httpx.Response(200, json={"data": {"id": "ses_new"}})
 
         parts = path.strip("/").split("/")
+
+        if (
+            len(parts) >= 5
+            and parts[1] == "experimental"
+            and parts[2] == "session"
+            and parts[4] == "wait"
+        ):
+            wait_sid = parts[3]
+            if wait_sid in self.missing or wait_sid not in self.known:
+                return httpx.Response(404, json={"message": "SessionNotFound"})
+            if self.pending_steps:
+                self._append_step(wait_sid, self.pending_steps.pop(0))
+            if self._idle():
+                return httpx.Response(204)
+            return httpx.Response(200, json={"data": {}})
+
         sid = parts[2] if len(parts) > 2 else ""
         if sid in self.missing or sid not in self.known:
             return httpx.Response(404, json={"message": "SessionNotFound"})
 
         if len(parts) > 3 and parts[3] == "prompt":
-            self.prompts.append(httpx.Response(200).json if False else _body_text(request))
-            self.created += 10
-            user_created = self.created
-            self.messages[sid].append(
-                {"id": "msg_u", "type": "user", "time": {"created": user_created}}
-            )
-            self.created += 10
-            content = (
-                self.text_parts
-                if self.text_parts is not None
-                else [{"type": "text", "text": self.answer}]
-            )
-            entry = {
-                "id": "msg_a",
-                "type": "assistant",
-                "time": {"created": self.created},
-                "content": content,
-            }
-            if self.complete:
-                entry["time"]["completed"] = self.created + 5
-            self.messages[sid].append(entry)
+            self.prompts.append(_body_text(request))
+            user_created = self._append_user(sid)
+            if self.steps is None:
+                content = (
+                    self.text_parts
+                    if self.text_parts is not None
+                    else [{"type": "text", "text": self.answer}]
+                )
+                created = self._stamp()
+                entry = {
+                    "id": "msg_a",
+                    "type": "assistant",
+                    "time": {"created": created},
+                    "content": content,
+                }
+                if self.complete:
+                    entry["time"]["completed"] = created + 5
+                if not self.missing_tokens:
+                    entry["tokens"] = {"input": 100, "output": 35}
+                self.messages[sid].append(entry)
+            else:
+                self._append_step(sid, self.steps[0])
             return httpx.Response(
                 200, json={"data": {"id": "msg_u", "time": {"created": user_created}}}
             )
 
         if len(parts) > 3 and parts[3] == "message":
-            return httpx.Response(
-                200, json={"data": list(reversed(self.messages[sid]))}
-            )
+            items = list(self.messages[sid])
+            if self.order != "asc":
+                items.reverse()
+            return httpx.Response(200, json={"data": items})
 
         return httpx.Response(404, json={"message": "not found"})
 
