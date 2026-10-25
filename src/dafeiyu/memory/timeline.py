@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from dafeiyu.memory.store import Store
@@ -15,6 +16,8 @@ from dafeiyu.timeutil import SHANGHAI
 
 TIMELINE_LIMIT = 20
 TIMELINE_HINT = "以上是自你上次开口以来的新消息，按时间顺序排列；现在回应最后一条。"
+BATCH_HEADER = "—— 以下是自你上次开口以来的新消息 ——"
+CONTINUATION_HEADER = "【接续】"
 EMPTY_CONTENT = "（无文字内容）"
 
 
@@ -63,3 +66,37 @@ def build_delivery(
 
 def build_prompt(store: Store, msg: Message, limit: int = TIMELINE_LIMIT) -> str:
     return build_delivery(store, msg, limit)[0]
+
+
+def build_batch_prompt(
+    messages: list[Message],
+    injection: str,
+    *,
+    continuation: str | None = None,
+    addressed: bool = False,
+    current_id: str | None = None,
+) -> str:
+    """批次 prompt：注入段 →（接续）→ 新消息时间线。
+
+    三段注入必须留在最前、时间线留在最后（模型对末尾更敏感）。store 不保存
+    at_bot/reply_to_bot，批次里只知道「这一批被点名了」，因此给 current_id
+    那一条补一个 @ 标记，模型才知道话是对它说的。
+    """
+    parts: list[str] = []
+    if injection.strip():
+        parts.append(injection.strip())
+    if continuation:
+        parts.append(f"{CONTINUATION_HEADER}\n{continuation}")
+
+    if messages:
+        lines = [BATCH_HEADER]
+        for msg in messages:
+            current = None
+            if addressed and current_id is not None and msg.message_id == current_id:
+                current = replace(msg, at_bot=True)
+            lines.append(format_message_line(msg, current=current))
+        if len(messages) > 1:
+            lines.append(TIMELINE_HINT)
+        parts.append("\n".join(lines))
+
+    return "\n\n".join(parts)

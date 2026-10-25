@@ -74,7 +74,9 @@ class FakeOpenCodeBrain:
     def reply_calls(self) -> int:
         return len(self.calls)
 
-    async def reply(self, chat_type: ChatType, chat_id: int, text: str) -> BrainReply:
+    async def reply(
+        self, chat_type: ChatType, chat_id: int, text: str, *, on_tool=None
+    ) -> BrainReply:
         self.calls.append((chat_type, chat_id, text))
         if self.delay:
             await asyncio.sleep(self.delay)

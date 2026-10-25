@@ -61,6 +61,10 @@ class MemoryConfig:
     window_size: int
     impression_topk: int
     extract_every: int
+    # 会话轮换阈值（任一触发）；Task 13 才在 config.yaml 里显式暴露。
+    rotation_messages: int = 60
+    rotation_days: int = 7
+    rotation_tokens: int = 40000
 
 
 @dataclass(frozen=True)

@@ -203,6 +203,8 @@ class OpenCodeHttpBrain:
         chat_type: ChatType,
         chat_id: int,
         text: str,
+        *,
+        on_tool: Callable[[str], Awaitable[None]] | None = None,
     ) -> BrainReply:
         prompt = text.strip()
         if not prompt:
@@ -212,7 +214,7 @@ class OpenCodeHttpBrain:
         for attempt in (0, 1):
             try:
                 sid = session_id or await self._create_session()
-                result = await self._ask(sid, prompt)
+                result = await self._ask(sid, prompt, on_tool=on_tool)
             except _UnknownSession:
                 # session 被删或数据库重置：清映射，新开一个再试一次。
                 self.store.clear_opencode_session(chat_type, chat_id)

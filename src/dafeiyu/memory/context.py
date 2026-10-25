@@ -140,7 +140,7 @@ def _clip(text: str, limit: int) -> str:
 
 def build_injection(
     store: Store,
-    workspace: Workspace,
+    workspace: Workspace | None,
     chat_type: ChatType,
     chat_id: int,
     cfg: InjectionConfig,
@@ -151,14 +151,19 @@ def build_injection(
 
     每段独立截断、空段整段省略；时间线由 timeline.build_delivery 追加在最后。
     记忆段带数据边界行：笔记是模型自己写的，下一轮又进 prompt，必须当作不可信输入。
+    workspace 为 None（`workspace.dir: ""`）时只关掉长期记忆段，摘要与印象照常注入。
     """
     parts: list[str] = []
 
     # 500 字预算分给全局笔记与本会话笔记各一半，避免两份文件各自吃满预算。
     global_chars = max(0, cfg.memory_chars) // 2
     chat_chars = max(0, cfg.memory_chars) - global_chars
-    memory = workspace.read_for(
-        chat_type, chat_id, global_chars=global_chars, chat_chars=chat_chars
+    memory = (
+        ""
+        if workspace is None
+        else workspace.read_for(
+            chat_type, chat_id, global_chars=global_chars, chat_chars=chat_chars
+        )
     )
     if memory:
         parts.append(f"{INJECTION_MEMORY_HEADER}\n{INJECTION_BOUNDARY}\n{memory}")
@@ -182,12 +187,3 @@ def build_injection(
             parts.append(f"{INJECTION_IMPRESSION_HEADER}\n{block}")
 
     return "\n\n".join(parts)
-
-
-def _clip(text: str, limit: int) -> str:
-    text = text.strip()
-    if limit <= 0:
-        return ''
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1] + '...'
