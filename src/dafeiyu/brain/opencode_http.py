@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from ..memory.store import Store
 from ..models import ChatType
 from .client import BrainError, BrainReply, parse_brain_reply
 
+log = logging.getLogger(__name__)
+
 # OpenCode server 的 Basic 认证用户名固定，密码由 OPENCODE_SERVER_PASSWORD 决定。
 AUTH_USERNAME = "opencode"
 POLL_INTERVAL_SECONDS = 0.5
@@ -30,6 +33,8 @@ REQUEST_TIMEOUT_SECONDS = 15.0
 WINDOW_TOLERANCE_MS = 1000.0
 # 工具 part 只在活跃状态提示；error 不提示，用户不该等一个已失败的抓取。
 TOOL_ACTIVE_STATES = {"pending", "running", "completed"}
+# 一轮正常对话只会出现这三类消息（spike S3：每轮都有 idle，漏掉它会每轮误判）。
+ALLOWED_MESSAGE_TYPES = {"user", "assistant", "idle"}
 
 
 class _UnknownSession(Exception):
@@ -118,7 +123,80 @@ class OpenCodeHttpBrain:
         await self._client.aclose()
 
     async def forget(self, chat_type: ChatType, chat_id: int) -> None:
+        """删掉远端 session 再清映射：/forget 之后不该留下可被翻出来的历史。"""
+        session_id = self.store.get_opencode_session(chat_type, chat_id)
+        if session_id:
+            try:
+                await self._request("DELETE", f"/api/session/{session_id}")
+            except _UnknownSession:
+                pass  # 远端已经没有了，映射照样清
         self.store.clear_opencode_session(chat_type, chat_id)
+
+    def reset_session(self, chat_type: ChatType, chat_id: int) -> None:
+        """只断开映射；远端 session 由轮换流程决定何时废弃。"""
+        self.store.clear_opencode_session(chat_type, chat_id)
+
+    async def complete(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 400,
+        temperature: float = 0.2,
+    ) -> str:
+        text, _, _ = await self.complete_detailed(
+            system, messages, max_tokens=max_tokens, temperature=temperature
+        )
+        return text
+
+    async def complete_detailed(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 400,
+        temperature: float = 0.2,
+    ) -> tuple[str, int, int]:
+        """一次性补全：走临时 session，用完即删，不污染任何聊天。
+
+        ``max_tokens``/``temperature`` 只为兼容旧接口：prompt 只收文本，
+        无法在客户端侧生效。
+        """
+        prompt = f"{system}\n\n" + "\n".join(
+            f"{m['role']}: {m['content']}" for m in messages
+        )
+        return await self._temp_session(prompt, purpose="complete")
+
+    async def _temp_session(
+        self, text: str, *, purpose: str = "memory"
+    ) -> tuple[str, int, int]:
+        session_id = await self._create_session(
+            agent="dafeiyu-memory", title=f"mem:{purpose}"
+        )
+        try:
+            result = await self._ask(session_id, text)
+            return (result.text, result.prompt_tokens, result.completion_tokens)
+        finally:
+            try:
+                await self._request("DELETE", f"/api/session/{session_id}")
+            except Exception:  # noqa: BLE001 - 清理失败不该影响旁路结果
+                log.debug("临时 session 删除失败：%s", session_id, exc_info=True)
+
+    async def _audit_round(
+        self, session_id: str, since: float, until: float
+    ) -> list[str]:
+        """找出本轮窗口里不该出现的消息（外部注入 / 别的进程写的）。
+
+        正常一轮只有 user/assistant/idle，且 user 一定落在本轮窗口内。
+        命中说明这个 session 被别的东西动过，继续用它会把上下文串味。
+        """
+        messages = await self._messages(session_id, limit=50)
+        hits: list[str] = []
+        for message in messages:
+            kind = message.get("type")
+            if kind not in ALLOWED_MESSAGE_TYPES:
+                hits.append(str(message.get("id") or ""))
+            elif kind == "user" and not (since <= _created(message) <= until):
+                hits.append(str(message.get("id") or ""))
+        return hits
 
     async def reply(
         self,
@@ -145,6 +223,16 @@ class OpenCodeHttpBrain:
             self.store.set_opencode_session(chat_type, chat_id, sid)
             if not result.text.strip():
                 raise BrainError("OpenCode 没有返回文本")
+            foreign = await self._audit_round(sid, result.since, result.until)
+            if foreign:
+                # 不 raise：这一轮的回复已经拿到了，先把答案给用户，
+                # 再把这个被污染的 session 丢掉，下一轮重新开一个。
+                log.warning(
+                    "OpenCode session %s 出现外来消息 %s，已重置该会话",
+                    sid,
+                    foreign,
+                )
+                self.store.clear_opencode_session(chat_type, chat_id)
             return parse_brain_reply(
                 result.text,
                 prompt_tokens=result.prompt_tokens,
@@ -153,10 +241,19 @@ class OpenCodeHttpBrain:
 
         raise BrainError("OpenCode 调用失败：session 重建失败")
 
-    async def _create_session(self) -> str:
-        body: dict[str, Any] = {"title": "dafeiyu"}
-        if self.agent:
-            body["agent"] = self.agent
+    async def _create_session(
+        self,
+        *,
+        agent: str | None = None,
+        title: str = "dafeiyu",
+        permissions: list[dict[str, Any]] | None = None,
+    ) -> str:
+        body: dict[str, Any] = {"title": title}
+        agent_name = self.agent if agent is None else agent
+        if agent_name:
+            body["agent"] = agent_name
+        if permissions is not None:
+            body["permissions"] = permissions
         if self.project_dir:
             body["location"] = {"directory": self.project_dir}
         payload = await self._request("POST", "/api/session", body=body)
@@ -282,11 +379,13 @@ class OpenCodeHttpBrain:
         messages = await self._messages(session_id)
         return max((_created(m) for m in messages), default=0.0)
 
-    async def _messages(self, session_id: str) -> list[dict[str, Any]]:
+    async def _messages(
+        self, session_id: str, *, limit: int = 30
+    ) -> list[dict[str, Any]]:
         payload = await self._request(
             "GET",
             f"/api/session/{session_id}/message",
-            params={"limit": 30},
+            params={"limit": limit},
         )
         data = payload.get("data")
         if not isinstance(data, list):

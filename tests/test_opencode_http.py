@@ -1,4 +1,5 @@
 import base64
+import json
 
 import httpx
 import pytest
@@ -51,6 +52,8 @@ class FakeServer:
         self.calls: list[tuple[str, str]] = []
         self.auth: list[str] = []
         self.created = 1000.0
+        self.created_with: dict = {}
+        self.delete_missing: set[str] = set()
 
     def _stamp(self) -> float:
         self.created += 10
@@ -87,17 +90,70 @@ class FakeServer:
             return False
         return self.steps is None or self.steps[-1][1] == "done"
 
+    @property
+    def last_created(self) -> float:
+        values = [
+            float((m.get("time") or {}).get("created") or 0)
+            for items in self.messages.values()
+            for m in items
+        ]
+        return max(values, default=self.created)
+
+    def _slot(self, sid: str) -> list[dict]:
+        self.known.add(sid)
+        return self.messages.setdefault(sid, [])
+
+    def inject_synthetic(self, sid: str, text: str, *, created: float | None = None) -> None:
+        """模拟 POST /synthetic 塞进来的消息：type 不在白名单内。"""
+        stamp = self.last_created + 1 if created is None else created
+        self._slot(sid).append(
+            {
+                "id": "msg_syn",
+                "type": "synthetic",
+                "time": {"created": stamp},
+                "content": [{"type": "text", "text": text}],
+            }
+        )
+
+    def inject_user(self, sid: str, text: str, *, created: float) -> None:
+        """窗口外的 user 消息：type 合法，但时间戳不属于本轮。"""
+        self._slot(sid).append(
+            {
+                "id": "msg_out",
+                "type": "user",
+                "time": {"created": created},
+                "content": [{"type": "text", "text": text}],
+            }
+        )
+
+    def inject_normal_round(self, sid: str) -> None:
+        """一轮完全正常的会话：user / assistant / idle 都在窗口内。"""
+        items = self._slot(sid)
+        for kind in ("user", "assistant", "idle"):
+            items.append(
+                {"id": f"msg_{kind}", "type": kind, "time": {"created": self._stamp()}}
+            )
+
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         self.calls.append((request.method, path))
         self.auth.append(request.headers.get("authorization", ""))
 
         if path == "/api/session" and request.method == "POST":
+            self.created_with = json.loads(request.content.decode("utf-8") or "{}")
             self.known.add("ses_new")
             self.messages["ses_new"] = []
             return httpx.Response(200, json={"data": {"id": "ses_new"}})
 
         parts = path.strip("/").split("/")
+
+        if request.method == "DELETE" and len(parts) == 3 and parts[1] == "session":
+            sid = parts[2]
+            if sid in self.delete_missing or sid not in self.known:
+                return httpx.Response(404, json={"message": "SessionNotFound"})
+            self.known.discard(sid)
+            self.messages.pop(sid, None)
+            return httpx.Response(200, json={"data": {}})
 
         if (
             len(parts) >= 5
