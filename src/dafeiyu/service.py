@@ -5,11 +5,13 @@ import contextlib
 import inspect
 import logging
 import time
-from typing import Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from .brain.client import BrainError, BrainReply
 from .brain.persona import build_system_prompt, os_probability_hint
 from .budget import BudgetAction
+from .commands import CommandRegistry, CommandSpec
 from .config import InjectionConfig, Settings
 from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
@@ -19,13 +21,18 @@ from .memory.store import Store
 from .memory.timeline import build_batch_prompt, build_delivery
 from .memory.workspace import Workspace
 from .models import ChatType, Message
-from .router import Router, now_shanghai, parse_command
+from .router import Router, now_shanghai
 from .sender import is_technical_question, shape_reply
+from .workers.failure import QUOTA_KEY
 from .workers.summary import summarize_for_rotation
+
+if TYPE_CHECKING:
+    from .supervisor.audit import AuditLog
 
 log = logging.getLogger(__name__)
 
 SHUTUP_MINUTES = 60
+ADMIN_ONLY_REPLY = "这个命令只有管理员能用。"
 FORGET_REPLY = "记忆清空了，本鱼失忆中……🫧"
 BRAIN_ERROR_REPLY = "本鱼刚刚和大脑断线了…你过一会儿再问我？🐋"
 TOOL_HINT_REPLY = "本鱼去网上查一下，稍等…"
@@ -40,9 +47,6 @@ ROTATION_WINDOW = 40
 # （spec §8.4 原写作 failed，实现统一取 error，避免同一件事两个名字）。
 SKIP_BUDGET = "budget"
 SKIP_ERROR = "error"
-
-_GROUP_COMMANDS = frozenset({"闭嘴", "shutup", "醒来", "wake", "forget"})
-_PRIVATE_COMMANDS = frozenset({"stats", "forget"})
 
 _REASON_TEXT = {
     "self": "机器人自己的消息",
@@ -99,6 +103,7 @@ class Service:
         impressions: Any = None,
         workspace: Workspace | None = None,
         injection: InjectionConfig | None = None,
+        audit: AuditLog | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -110,6 +115,10 @@ class Service:
         self.impressions = impressions
         self.workspace = workspace
         self.injection = injection
+        self.audit = audit
+        self.commands = CommandRegistry()
+        self._command_clock: Callable[[], float] = time.monotonic
+        self._command_last: dict[tuple[str, str, int], float] = {}
         self.scheduler: BatchScheduler | None = None
         self._scheduler_task: asyncio.Task | None = None
         self._locks: dict[tuple[ChatType, int], asyncio.Lock] = {}
@@ -192,9 +201,11 @@ class Service:
             if msg.reply_to_bot:
                 self.router.note_reply(msg.chat_type, msg.chat_id)
 
-            command = parse_command(msg.content)
-            if command is not None and await self._run_command(msg, command.name):
-                return
+            matched = self.commands.match(msg.content, msg.chat_type)
+            if matched is not None:
+                spec, args = matched
+                if await self._run_command(msg, spec, args):
+                    return
 
             if self._uses_scheduler():
                 await self._handle_batched(msg)
@@ -280,29 +291,24 @@ class Service:
                 mode_note=mode_note,
             )
 
-        command = parse_command(msg.content)
-        if command is not None:
-            names = (
-                _GROUP_COMMANDS
-                if msg.chat_type is ChatType.GROUP
-                else _PRIVATE_COMMANDS
+        matched = self.commands.match(msg.content, msg.chat_type)
+        if matched is not None:
+            spec = matched[0]
+            checks = [
+                self._check("self", "pass", "普通用户消息"),
+                self._check("command", "pass", f"/{spec.name} 会走命令分支"),
+                self._check("model", "skipped", "命令分支已接管，不会进入模型"),
+            ]
+            return self._explain_result(
+                msg,
+                verdict="command",
+                reason="command",
+                mode=mode,
+                checks=checks,
+                metrics=metrics,
+                hard_source=hard_source,
+                mode_note=mode_note,
             )
-            if command.name.casefold() in names:
-                checks = [
-                    self._check("self", "pass", "普通用户消息"),
-                    self._check("command", "pass", f"/{command.name} 会走命令分支"),
-                    self._check("model", "skipped", "命令分支已接管，不会进入模型"),
-                ]
-                return self._explain_result(
-                    msg,
-                    verdict="command",
-                    reason="command",
-                    mode=mode,
-                    checks=checks,
-                    metrics=metrics,
-                    hard_source=hard_source,
-                    mode_note=mode_note,
-                )
 
         if msg.chat_type is ChatType.PRIVATE:
             return self._explain_private(
@@ -1086,37 +1092,223 @@ class Service:
         await self.forget_chat(msg.chat_type, msg.chat_id)
         await self.adapter.send(msg.chat_type, msg.chat_id, FORGET_REPLY)
 
-    async def _run_command(self, msg: Message, name: str) -> bool:
-        cmd = name.casefold()
-        if msg.chat_type is ChatType.GROUP:
-            if cmd not in ("闭嘴", "shutup", "醒来", "wake", "forget"):
-                return False
-            if msg.user_id not in self.settings.groups.admins:
+    async def _run_command(self, msg: Message, spec: CommandSpec, args: str) -> bool:
+        """权限 → 冷却 → 分发 → 审计；所有分支都返回「命令分支已接管」。"""
+        is_admin = msg.user_id in self.settings.groups.admins
+        private_forget = spec.name == "forget" and msg.chat_type is ChatType.PRIVATE
+        if spec.admin_only and not is_admin and not private_forget:
+            if msg.chat_type is ChatType.GROUP:
+                # 群内保持原有静默行为，避免在群里公开点名权限问题。
                 log.info(
-                    "非管理员尝试执行群指令 %s/%s: user=%s cmd=%s",
+                    "非管理员尝试执行管理员命令 %s/%s: user=%s cmd=%s",
                     msg.chat_id,
                     msg.message_id,
                     msg.user_id,
-                    cmd,
+                    spec.name,
                 )
                 return True
-            if cmd == "forget":
-                await self._forget_chat(msg)
-                return True
-            if cmd in ("闭嘴", "shutup"):
-                self.router.quiet(msg.chat_type, msg.chat_id, SHUTUP_MINUTES)
-            else:
-                self.router.wake(msg.chat_type, msg.chat_id)
+            await self.adapter.send(msg.chat_type, msg.chat_id, ADMIN_ONLY_REPLY)
             return True
 
-        if cmd == "stats":
-            today = now_shanghai().date().isoformat()
-            calls, tokens = self.store.usage_today(msg.chat_type, msg.chat_id, today)
-            await self.adapter.send(
-                msg.chat_type, msg.chat_id, f"今天被叫了 {calls} 次，吃了 {tokens} 个 token。🐋"
-            )
-            return True
-        if cmd == "forget":
+        cooldown = self._command_cooldown(spec, msg.chat_type)
+        if cooldown > 0:
+            if msg.chat_type is ChatType.GROUP:
+                key = (spec.name, "group", msg.chat_id)
+            else:
+                key = (spec.name, "private", msg.user_id)
+            now = self._command_clock()
+            last = self._command_last.get(key)
+            if last is not None and now - last < cooldown:
+                return True
+            # 实际执行前记录，失败重试也要等冷却，避免刷屏。
+            self._command_last[key] = now
+
+        if spec.name == "help":
+            await self._cmd_help(msg, is_admin=is_admin)
+        elif spec.name == "stats":
+            await self._cmd_stats(msg)
+        elif spec.name == "status":
+            await self._cmd_status(msg)
+        elif spec.name == "budget":
+            await self._cmd_budget(msg)
+        elif spec.name == "forget":
             await self._forget_chat(msg)
-            return True
-        return False
+        elif spec.name == "shutup":
+            self.router.quiet(msg.chat_type, msg.chat_id, SHUTUP_MINUTES)
+        elif spec.name == "wake":
+            self.router.wake(msg.chat_type, msg.chat_id)
+        else:
+            return False
+
+        if spec.admin_only:
+            self._write_command_audit(msg, spec)
+        return True
+
+    @staticmethod
+    def _command_cooldown(spec: CommandSpec, chat_type: ChatType) -> int:
+        # 私聊延迟敏感：统计命令固定 5 秒，其余沿用注册表配置。
+        if spec.name == "stats" and chat_type is ChatType.PRIVATE:
+            return 5
+        return spec.cooldown_seconds
+
+    def _write_command_audit(self, msg: Message, spec: CommandSpec) -> None:
+        if self.audit is None:
+            return
+        try:
+            self.audit.write(
+                "command.admin",
+                actor=str(msg.user_id),
+                target=f"/{spec.name}",
+                detail={
+                    "chat_type": msg.chat_type.value,
+                    "chat_id": msg.chat_id,
+                    "user_id": msg.user_id,
+                },
+            )
+        except Exception:
+            log.warning("命令审计写入失败：%s", spec.name, exc_info=True)
+
+    async def _cmd_help(self, msg: Message, *, is_admin: bool) -> None:
+        text = self.commands.help_text(msg.chat_type, is_admin=is_admin)
+        await self.adapter.send(msg.chat_type, msg.chat_id, text)
+
+    async def _cmd_stats(self, msg: Message) -> None:
+        today = now_shanghai().date().isoformat()
+        budget = self.settings.budget
+        local = self.store.usage_between(
+            today,
+            today,
+            purposes=("reply", "ambient"),
+            chat_type=msg.chat_type,
+            chat_id=msg.chat_id,
+        )
+        global_today = self.store.usage_global_today(today)
+        lines = [
+            "今日统计：",
+            (
+                f"本会话 calls：{local.calls} 次，剩余："
+                f"{self._remaining_text(local.calls, budget.daily_calls)}"
+            ),
+            (
+                f"本会话 tokens：{local.tokens}，剩余："
+                f"{self._remaining_text(local.tokens, budget.daily_tokens)}"
+            ),
+            (
+                f"全局今日 calls：{global_today.calls} 次，剩余："
+                f"{self._remaining_text(global_today.calls, budget.global_daily_calls)}"
+            ),
+            (
+                f"全局今日 tokens：{global_today.tokens}，剩余："
+                f"{self._remaining_text(global_today.tokens, budget.global_daily_tokens)}"
+            ),
+        ]
+        await self.adapter.send(msg.chat_type, msg.chat_id, "\n".join(lines))
+
+    async def _cmd_status(self, msg: Message) -> None:
+        connected = bool(getattr(self.adapter, "connected", False))
+
+        def count(name: str) -> int:
+            scheduler = self.scheduler
+            if scheduler is None:
+                return 0
+            value = getattr(scheduler, name, 0)
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:  # noqa: BLE001 - 计数失败只降级为 0
+                    return 0
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+
+        try:
+            quota_until = self.store.load_backoff().get(QUOTA_KEY)
+        except Exception as exc:  # noqa: BLE001 - 状态命令不能因读库失败而中断
+            log.warning("读取配额状态失败：%s", exc)
+            quota_until = None
+        paused = bool(quota_until and float(quota_until) > time.time())
+        if paused:
+            remaining = max(0, int(float(quota_until) - time.time()))
+            quota_text = f"暂停中（剩余 {remaining} 秒）"
+        else:
+            quota_text = "正常"
+
+        decision = self.budget_guard.evaluate(
+            msg.chat_type,
+            msg.chat_id,
+            addressed=True,
+            purpose="reply",
+        )
+        action_text = {
+            BudgetAction.ALLOW.value: "正常",
+            BudgetAction.DEGRADE.value: "降级",
+            BudgetAction.DENY.value: "已限流",
+        }.get(decision.action.value, decision.action.value)
+        uptime = int(time.monotonic() - self._started_at)
+        lines = [
+            "运行状态：",
+            f"网关：{'已连接' if connected else '未连接'}",
+            f"调度：待投 {count('pending_count')}，进行中 {count('inflight_count')}",
+            f"配额：{quota_text}",
+            f"预算：{decision.action.value}（{action_text}）",
+            f"已运行：{uptime} 秒",
+        ]
+        await self.adapter.send(msg.chat_type, msg.chat_id, "\n".join(lines))
+
+    async def _cmd_budget(self, msg: Message) -> None:
+        report = self.budget_guard.report(msg.chat_type, msg.chat_id)
+        per_chat = report.per_chat
+        global_daily = report.global_daily
+        monthly = report.monthly
+        cost = report.cost
+        cost_limit = float(cost["cost_limit"])
+        cost_text = (
+            "未启用"
+            if cost_limit <= 0
+            else f"{float(cost['cost']):.4f}/{cost_limit:.4f} {cost['currency']}"
+        )
+        warnings = (
+            "、".join(
+                f"{item.get('scope')} {float(item.get('ratio', 0)):.0%}"
+                f"（{item.get('calls')}/{item.get('limit')}）"
+                for item in report.warnings
+            )
+            or "无"
+        )
+        lines = [
+            "预算报告：",
+            (
+                f"本会话：calls "
+                f"{self._used_limit_text(per_chat['calls'], per_chat['daily_calls'])}，"
+                f"tokens "
+                f"{self._used_limit_text(per_chat['tokens'], per_chat['daily_tokens'])}"
+            ),
+            (
+                f"全局今日：calls "
+                f"{self._used_limit_text(global_daily['calls'], global_daily['limit_calls'])}，"
+                f"tokens "
+                f"{self._used_limit_text(global_daily['tokens'], global_daily['limit_tokens'])}"
+            ),
+            (
+                f"月度：calls "
+                f"{self._used_limit_text(monthly['calls'], monthly['limit_calls'])}，"
+                f"tokens "
+                f"{self._used_limit_text(monthly['tokens'], monthly['limit_tokens'])}"
+            ),
+            f"费用：{cost_text}（估算：{'是' if cost['estimated'] else '否'}）",
+            f"预警：{warnings}",
+        ]
+        await self.adapter.send(msg.chat_type, msg.chat_id, "\n".join(lines))
+
+    @staticmethod
+    def _remaining_text(used: int, limit: int) -> str:
+        if limit <= 0:
+            return "未启用"
+        return str(max(0, int(limit) - int(used)))
+
+    @staticmethod
+    def _used_limit_text(used: int, limit: int) -> str:
+        if limit <= 0:
+            return "未启用"
+        return f"{int(used)}/{int(limit)}"

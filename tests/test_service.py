@@ -1,4 +1,5 @@
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -15,8 +16,9 @@ from dafeiyu.config import (
 )
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
-from dafeiyu.router import Router, now_shanghai
+from dafeiyu.router import Router, TriggerDecision, now_shanghai
 from dafeiyu.service import BRAIN_ERROR_REPLY, FORGET_REPLY, Service
+from dafeiyu.workers.failure import QUOTA_KEY
 
 SHANGHAI = timezone(timedelta(hours=8))
 
@@ -96,14 +98,22 @@ def make_msg(chat_id=1001, user_id=2002, content="@溟月 在吗", message_id="m
     )
 
 
-def build(tmp_path, brain=None, adapter=None, settings=None):
+def build(tmp_path, brain=None, adapter=None, settings=None, audit=None):
     store = Store(str(tmp_path / "t.db"))
     store.init_schema()
     settings = settings or make_settings()
     adapter = adapter or FakeAdapter()
     brain = brain or FakeBrain()
     router = Router(settings, store, clock=lambda: NOON)
-    service = Service(settings, store, brain, adapter, router, "你是溟月 $max_chars $max_reply_chars_technical")
+    service = Service(
+        settings,
+        store,
+        brain,
+        adapter,
+        router,
+        "你是溟月 $max_chars $max_reply_chars_technical",
+        audit=audit,
+    )
     return service, store, brain, adapter, router
 
 
@@ -401,3 +411,321 @@ async def test_forget_group_requires_admin(tmp_path):
     assert store.get_opencode_session(ChatType.GROUP, 1001) == "ses_group"
     assert brain.forgotten == []
     assert adapter.sent == []
+
+
+class FakeAudit:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    def write(self, action: str, **kwargs):
+        self.events.append((action, kwargs))
+        return {}
+
+
+class BrokenAudit:
+    def write(self, action: str, **kwargs):
+        raise RuntimeError("disk full")
+
+
+async def test_non_admin_group_budget_is_silent_and_not_audited(tmp_path):
+    audit = FakeAudit()
+    service, _, brain, adapter, _ = build(tmp_path, audit=audit)
+    msg = make_msg(user_id=99, content="/budget", message_id="b0")
+    matched = service.commands.match(msg.content, msg.chat_type)
+    assert matched is not None
+
+    handled = await service._run_command(msg, *matched)
+
+    assert handled is True
+    assert adapter.sent == []
+    assert brain.calls == 0
+    assert audit.events == []
+
+
+async def test_admin_budget_reports_and_writes_audit(tmp_path):
+    audit = FakeAudit()
+    service, store, brain, adapter, _ = build(tmp_path, audit=audit)
+    store.record_usage(ChatType.GROUP, 1001, "reply", 120, 80)
+
+    await service.handle(make_msg(content="/budget", message_id="b1"))
+
+    assert brain.calls == 0
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0][2]
+    assert "全局" in text
+    assert "月度" in text
+
+    assert len(audit.events) == 1
+    action, kwargs = audit.events[0]
+    assert action == "command.admin"
+    assert kwargs["target"] == "/budget"
+    assert kwargs["actor"] == "2002"
+    detail = kwargs["detail"]
+    assert detail == {"chat_type": "group", "chat_id": 1001, "user_id": 2002}
+    assert "阿鱼" not in repr(detail)
+
+
+async def test_stats_group_has_usage_and_no_cost_words(tmp_path):
+    audit = FakeAudit()
+    service, store, brain, adapter, _ = build(tmp_path, audit=audit)
+    store.record_usage(ChatType.GROUP, 1001, "reply", 120, 80)
+
+    await service.handle(make_msg(user_id=99, content="/stats", message_id="st1"))
+
+    assert brain.calls == 0
+    text = adapter.sent[0][2]
+    assert "calls" in text
+    assert "tokens" in text
+    assert "剩余" in text
+    assert "元" not in text
+    assert "¥" not in text
+    # /stats 不是管理员命令，不写审计。
+    assert audit.events == []
+
+
+async def test_help_cooldown_blocks_repeat_within_five_seconds(tmp_path):
+    service, _, brain, adapter, _ = build(tmp_path)
+    now = {"value": 1000.0}
+    service._command_clock = lambda: now["value"]
+
+    await service.handle(make_msg(content="/help", message_id="h1"))
+    assert len(adapter.sent) == 1
+
+    now["value"] += 1
+    await service.handle(make_msg(content="/help", message_id="h2"))
+    assert len(adapter.sent) == 1
+
+    now["value"] += 4
+    await service.handle(make_msg(content="/help", message_id="h3"))
+    assert len(adapter.sent) == 2
+    assert brain.calls == 0
+
+
+async def test_stats_cooldown_is_sixty_seconds_in_group(tmp_path):
+    service, _, _, adapter, _ = build(tmp_path)
+    now = {"value": 2000.0}
+    service._command_clock = lambda: now["value"]
+
+    await service.handle(make_msg(user_id=99, content="/stats", message_id="sg1"))
+    assert len(adapter.sent) == 1
+
+    now["value"] += 59
+    await service.handle(make_msg(user_id=99, content="/stats", message_id="sg2"))
+    assert len(adapter.sent) == 1
+
+    now["value"] += 1
+    await service.handle(make_msg(user_id=99, content="/stats", message_id="sg3"))
+    assert len(adapter.sent) == 2
+
+
+async def test_stats_cooldown_is_five_seconds_in_private(tmp_path):
+    service, _, _, adapter, _ = build(tmp_path)
+    now = {"value": 3000.0}
+    service._command_clock = lambda: now["value"]
+
+    def private_msg(message_id: str) -> Message:
+        return make_msg(
+            chat_type=ChatType.PRIVATE,
+            chat_id=2002,
+            user_id=2002,
+            content="/stats",
+            message_id=message_id,
+        )
+
+    await service.handle(private_msg("sp1"))
+    assert len(adapter.sent) == 1
+
+    now["value"] += 4
+    await service.handle(private_msg("sp2"))
+    assert len(adapter.sent) == 1
+
+    now["value"] += 1
+    await service.handle(private_msg("sp3"))
+    assert len(adapter.sent) == 2
+
+
+async def test_status_private_non_admin_replies_with_fixed_hint(tmp_path):
+    service, _, brain, adapter, _ = build(tmp_path)
+
+    await service.handle(
+        make_msg(
+            chat_type=ChatType.PRIVATE,
+            chat_id=99,
+            user_id=99,
+            content="/status",
+            message_id="ps1",
+        )
+    )
+
+    assert brain.calls == 0
+    assert adapter.sent == [(ChatType.PRIVATE, 99, "这个命令只有管理员能用。")]
+
+
+async def test_status_reports_live_state_without_model_name(tmp_path):
+    service, store, brain, adapter, _ = build(tmp_path)
+    service.adapter.connected = True
+    store.save_backoff(QUOTA_KEY, time.time() + 60)
+
+    await service.handle(make_msg(content="/status", message_id="stt1"))
+
+    text = adapter.sent[0][2]
+    assert brain.calls == 0
+    assert "网关" in text
+    assert "已连接" in text
+    assert "待投" in text
+    assert "配额" in text
+    assert "暂停" in text
+    assert "预算" in text
+    assert "秒" in text
+    assert "deepseek-chat" not in text
+
+
+async def test_help_replies_in_group_and_private_with_scope_filter(tmp_path):
+    service, _, brain, adapter, _ = build(tmp_path)
+
+    await service.handle(make_msg(user_id=99, content="/help", message_id="help-g"))
+    group_text = adapter.sent[-1][2]
+    assert "/stats" in group_text
+    assert "/budget" not in group_text
+    assert "/status" not in group_text
+    assert "/forget" not in group_text
+
+    await service.handle(
+        make_msg(
+            chat_type=ChatType.PRIVATE,
+            chat_id=99,
+            user_id=99,
+            content="/help",
+            message_id="help-p",
+        )
+    )
+    private_text = adapter.sent[-1][2]
+    assert "/forget" in private_text
+    assert "/budget" not in private_text
+    assert brain.calls == 0
+
+
+async def test_help_is_not_audited_even_for_admin(tmp_path):
+    audit = FakeAudit()
+    service, _, _, adapter, _ = build(tmp_path, audit=audit)
+
+    await service.handle(make_msg(content="/help", message_id="help-a"))
+
+    assert len(adapter.sent) == 1
+    assert audit.events == []
+
+
+async def test_private_forget_allows_non_admin(tmp_path):
+    service, store, _, adapter, _ = build(tmp_path)
+    store.add_message(
+        make_msg(
+            chat_type=ChatType.PRIVATE,
+            chat_id=99,
+            user_id=99,
+            content="记住我",
+            message_id="pf0",
+        )
+    )
+
+    await service.handle(
+        make_msg(
+            chat_type=ChatType.PRIVATE,
+            chat_id=99,
+            user_id=99,
+            content="/forget",
+            message_id="pf1",
+        )
+    )
+
+    assert store.count_messages(ChatType.PRIVATE, 99) == 0
+    assert adapter.sent[-1] == (ChatType.PRIVATE, 99, FORGET_REPLY)
+
+
+async def test_unknown_and_wrong_scope_slash_fall_through_to_model(tmp_path):
+    service, _, brain, adapter, _ = build(tmp_path)
+
+    await service.handle(
+        make_msg(
+            chat_type=ChatType.PRIVATE,
+            chat_id=2002,
+            user_id=2002,
+            content="/nope",
+            message_id="pp1",
+        )
+    )
+    # shutup 只允许群聊；私聊应当继续走模型，而不是被命令分支吞掉。
+    await service.handle(
+        make_msg(
+            chat_type=ChatType.PRIVATE,
+            chat_id=2002,
+            user_id=2002,
+            content="/shutup",
+            message_id="pp2",
+        )
+    )
+
+    assert brain.calls == 2
+    assert len(adapter.sent) == 2
+
+
+async def test_unknown_group_slash_reaches_router(tmp_path, monkeypatch):
+    service, _, _, _, _ = build(tmp_path)
+    seen: list[str] = []
+
+    def should_handle(msg):
+        seen.append(msg.content)
+        return TriggerDecision(False, False, "sample_skip")
+
+    monkeypatch.setattr(service.router, "should_handle", should_handle)
+
+    await service.handle(make_msg(content="/nope", message_id="pp3"))
+
+    assert seen == ["/nope"]
+
+
+async def test_audit_failure_does_not_block_admin_command(tmp_path):
+    service, _, _, adapter, _ = build(tmp_path, audit=BrokenAudit())
+
+    await service.handle(make_msg(content="/budget", message_id="ab1"))
+
+    assert len(adapter.sent) == 1
+    assert "全局" in adapter.sent[0][2]
+
+
+@pytest.mark.parametrize(
+    ("content", "chat_type", "chat_id", "user_id"),
+    [
+        ("/help", ChatType.GROUP, 1001, 2002),
+        ("/预算", ChatType.GROUP, 1001, 2002),
+        ("/status", ChatType.PRIVATE, 99, 99),
+        ("/stats", ChatType.GROUP, 1001, 99),
+    ],
+)
+def test_explain_trigger_recognizes_registry_commands(
+    tmp_path, content, chat_type, chat_id, user_id
+):
+    service, _, _, _, _ = build(tmp_path)
+
+    result = service.explain_trigger(
+        make_msg(
+            chat_type=chat_type,
+            chat_id=chat_id,
+            user_id=user_id,
+            content=content,
+            message_id="ex1",
+        ),
+        now=NOON,
+    )
+
+    assert result["verdict"] == "command"
+    assert result["reason"] == "command"
+
+
+def test_explain_trigger_unknown_slash_is_not_a_command(tmp_path):
+    service, _, _, _, _ = build(tmp_path)
+
+    result = service.explain_trigger(
+        make_msg(content="/nope", message_id="ex2"), now=NOON, seed=1
+    )
+
+    assert result["verdict"] != "command"

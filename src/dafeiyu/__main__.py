@@ -23,6 +23,7 @@ from .models import ChatType
 from .router import Router
 from .runtime import load_runtime
 from .service import Service
+from .supervisor.audit import AuditLog
 from .workers.failure import FailureBackoff, MemoryPaused
 from .workers.impressions import ImpressionWorker
 from .workers.retention import retention_loop
@@ -191,6 +192,12 @@ async def main() -> None:
                 workspace.ensure()
             except OSError as exc:
                 raise ConfigError(f"工作区目录创建失败：{exc}") from exc
+        # bot 与 supervisor 追加写同一份 JSONL；写失败由 AuditLog 自身吞掉。
+        audit = AuditLog(
+            Path(settings.audit.path),
+            max_bytes=settings.audit.max_bytes,
+            backups=settings.audit.backups,
+        )
         service = Service(
             settings,
             store,
@@ -200,6 +207,7 @@ async def main() -> None:
             persona_text,
             workspace=workspace,
             injection=settings.injection,
+            audit=audit,
         )
 
         # 旁路要在 service 建好之后接，brain_getter 才能在 dashboard 换脑时跟上。
