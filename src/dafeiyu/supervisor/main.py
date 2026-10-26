@@ -9,16 +9,27 @@ import signal
 import subprocess
 import sys
 import webbrowser
+from datetime import datetime
 from pathlib import Path
+from typing import Callable
+
+import aiohttp
 
 from ..brain.client import BrainError
 from ..brain.opencode import resolve_opencode_bin
 from ..brain.runtime_config import server_env
 from ..config import ConfigError, Settings, load_settings
+from ..timeutil import now_shanghai
+from .alerts import AlertChannel, AlertManager, QQAdminChannel, WebhookChannel
+from .audit import AuditLog
+from .backup import BackupManager
 from .dashboard import serve
+from .health import HealthMonitor
 from .logs import LogHub
 from .manager import ProcSpec, Supervisor, pid_alive, port_owner
 from .napcat_login import NapCatLogin, load_webui_auth
+from .ops import OpsServices
+from .restore import RestoreService
 
 log = logging.getLogger(__name__)
 
@@ -191,6 +202,164 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
     return specs
 
 
+def _repo_path(value: str | Path) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return REPO_ROOT / path
+
+
+async def _bot_ready(bot_url: str, token: str, timeout: float = 5.0) -> bool:
+    """恢复后的就绪判据与 health 卡一致：detail 返回 200 且 ok=True。"""
+    url = f"{bot_url.rstrip('/')}/api/health/detail"
+    headers = {"X-Control-Token": token} if token else {}
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("ok") is True
+
+
+def build_ops(
+    settings: Settings,
+    supervisor: Supervisor,
+    logs: LogHub,
+    bot_url: str,
+    token: str,
+    napcat_login: NapCatLogin | None = None,
+) -> OpsServices:
+    """按 audit → backup → restore → health → alerts 的顺序装配运维服务。"""
+    audit = AuditLog(
+        _repo_path(settings.audit.path),
+        max_bytes=settings.audit.max_bytes,
+        backups=settings.audit.backups,
+    )
+    db_path = _repo_path(settings.db_path)
+    backups = BackupManager(
+        db_path,
+        _repo_path(settings.backup.dir),
+        daily_keep=settings.backup.daily_keep,
+        weekly_keep=settings.backup.weekly_keep,
+        max_total_gb=settings.backup.max_total_gb,
+        audit=audit,
+    )
+
+    async def ready_check() -> bool:
+        return await _bot_ready(bot_url, token)
+
+    restore = RestoreService(
+        db_path=db_path,
+        backups=backups,
+        supervisor=supervisor,
+        audit=audit,
+        ready_check=ready_check,
+        ready_timeout=float(settings.opencode.startup_timeout_seconds),
+    )
+    health = HealthMonitor(
+        supervisor=supervisor,
+        settings=settings,
+        bot_url=bot_url,
+        token=token,
+        backups=backups,
+        napcat_login=napcat_login,
+    )
+
+    alerts: AlertManager | None = None
+    if settings.alerts.enabled:
+        channels: list[AlertChannel] = []
+        if settings.alerts.qq_admin:
+            channels.append(QQAdminChannel(bot_url, token))
+        webhook = settings.alerts.webhook
+        if webhook.url:
+            channels.append(WebhookChannel(webhook.url, webhook.format))
+        alerts = AlertManager(
+            settings.alerts,
+            _repo_path("data/alert-state.json"),
+            channels,
+            audit=audit,
+        )
+        logs.write("supervisor", f"告警已启用：{len(channels)} 个通道")
+    else:
+        logs.write("supervisor", "告警未启用（alerts.enabled=false）")
+    logs.write("supervisor", f"备份目录：{backups.backup_dir}")
+
+    return OpsServices(
+        health=health,
+        alerts=alerts,
+        backups=backups,
+        restore=restore,
+        audit=audit,
+    )
+
+
+async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=max(0.0, seconds))
+    except asyncio.TimeoutError:
+        pass
+
+
+async def alert_loop(
+    ops: OpsServices,
+    settings: Settings,
+    stop: asyncio.Event,
+    *,
+    interval: float | None = None,
+) -> None:
+    if ops.alerts is None:
+        return
+    delay = float(settings.alerts.check_seconds if interval is None else interval)
+    while not stop.is_set():
+        try:
+            snapshot = await ops.health.snapshot()
+            await ops.alerts.evaluate(snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 巡检失败不能把 supervisor 带崩
+            log.warning("告警巡检失败：%s", exc)
+        await _sleep_or_stop(stop, delay)
+
+
+def backup_due(
+    now: datetime, schedule_hour: int, last_scheduled_date: str | None
+) -> bool:
+    return (
+        now.hour == int(schedule_hour)
+        and last_scheduled_date != now.date().isoformat()
+    )
+
+
+async def backup_loop(
+    ops: OpsServices,
+    settings: Settings,
+    stop: asyncio.Event,
+    *,
+    interval: float = 60.0,
+    clock: Callable[[], datetime] | None = None,
+) -> None:
+    if ops.backups is None:
+        return
+    tick = clock or now_shanghai
+    while not stop.is_set():
+        now = tick()
+        last_date = ops.backups.last_scheduled_date()
+        if backup_due(now, settings.backup.schedule_hour, last_date):
+            try:
+                manifest = await ops.backups.create("scheduled")
+                log.info("定时备份完成：%s", manifest.filename)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 失败由告警规则接管
+                log.warning("定时备份失败：%s", exc)
+        await _sleep_or_stop(stop, interval)
+
+
 def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop: asyncio.Event) -> None:
     def request() -> None:
         stop.set()
@@ -282,6 +451,22 @@ async def run() -> int:
     async def request_shutdown() -> None:
         stop.set()
 
+    napcat_login = NapCatLogin(load_webui_auth())
+    try:
+        ops = build_ops(
+            settings,
+            supervisor,
+            logs,
+            bot_url,
+            token,
+            napcat_login=napcat_login,
+        )
+    except OSError as exc:
+        logs.write("supervisor", f"运维服务初始化失败：{exc}")
+        _eprint(f"[大肥鱼] 运维服务初始化失败：{exc}")
+        _clear_pid()
+        return 1
+
     runner = await serve(
         supervisor,
         settings,
@@ -290,7 +475,8 @@ async def run() -> int:
         bot_url,
         token=token,
         on_shutdown=request_shutdown,
-        napcat_login=NapCatLogin(load_webui_auth()),
+        napcat_login=napcat_login,
+        ops=ops,
     )
 
     url = (
@@ -302,10 +488,21 @@ async def run() -> int:
         with contextlib.suppress(Exception):
             loop.run_in_executor(None, webbrowser.open, url)
 
+    tasks: list[asyncio.Task[None]] = []
+    if settings.alerts.enabled:
+        tasks.append(asyncio.create_task(alert_loop(ops, settings, stop), name="alert-loop"))
+    if settings.backup.enabled:
+        tasks.append(asyncio.create_task(backup_loop(ops, settings, stop), name="backup-loop"))
+
     try:
         await supervisor.start_all()
         await stop.wait()
     finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         logs.write("supervisor", "正在关闭所有进程…")
         try:
             await asyncio.wait_for(supervisor.shutdown(), timeout=45)
@@ -316,6 +513,8 @@ async def run() -> int:
             await asyncio.wait_for(runner.cleanup(), timeout=15)
         except asyncio.TimeoutError:
             logs.write("supervisor", "dashboard 关闭超时，强制退出")
+        with contextlib.suppress(Exception):
+            await ops.health.close()
         _clear_pid()
         logs.write("supervisor", "已退出")
     return 0

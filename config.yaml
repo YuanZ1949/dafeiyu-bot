@@ -134,3 +134,46 @@ memory:
 logging:
   level: INFO
   dir: logs
+
+# 运维（分册 A）：健康巡检、告警、备份、审计。
+# alerts 默认关闭：不开就不建 AlertManager，也不发任何外呼。
+alerts:
+  enabled: false
+  # 巡检间隔（秒），5-3600。
+  check_seconds: 30
+  # 同一告警重复通知间隔（秒），>=300；disk_low 另有 12h 下限。
+  repeat_seconds: 21600
+  webhook:
+    # 留空 = 不启用 webhook 通道。
+    url: ""
+    format: generic  # generic | ntfy | wecom | dingtalk
+  # QQ 管理员号：非 0 时通过 bot 的 /api/notify/admin 发私聊告警。
+  qq_admin: 0
+  rules:
+    bot_down_seconds: 120
+    napcat_down_seconds: 180
+    opencode_down_seconds: 120
+    quota_pause: true
+    disk_free_percent: 10
+    reply_error_window_seconds: 900
+    reply_error_count: 3
+
+# 备份默认开启，只写本地目录；手动/恢复前备份不受保留策略清理。
+backup:
+  enabled: true
+  dir: data/backups
+  # scheduled 备份按天保留 N 份，另按周（周日 04:00 那批）保留 N 份。
+  daily_keep: 7
+  weekly_keep: 4
+  # 每天这个整点后第一次巡检触发 scheduled 备份。
+  schedule_hour: 4
+  # 备份目录总大小上限；超限从最旧的 scheduled 开始删，至少保留 3 份。
+  max_total_gb: 20
+  # 恢复上传上限（MB），超限返回 413。
+  max_upload_mb: 512
+
+# append-only JSONL 审计；超过 max_bytes 轮转，保留 backups 份历史。
+audit:
+  path: data/audit.jsonl
+  max_bytes: 10485760
+  backups: 3

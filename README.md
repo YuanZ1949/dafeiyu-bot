@@ -266,12 +266,46 @@ NapCat 已连接
   预算 / 静默 / 冷却 / 采样指标和最终是否会进入模型。不会写消息、调模型、消耗预算或改调度器。
 - **日志**：按 supervisor / opencode / bot / napcat 分来源实时查看，支持级别与关键字筛选、
   暂停/继续、加载行数切换、清屏和下载当前日志文件。清屏只影响页面视图，不删除磁盘日志。
+- **健康 / 告警 / 备份**：聚合 bot、OpenCode、NapCat、网关、磁盘与备份状态；查看告警事件并发送
+  测试告警；手动备份、下载、删除、上传恢复，以及最近的操作审计。
 - **运行配置**：只读展示当前模型、人设、冷却、限流、预算、记忆窗口与保留天数。
   要改配置请编辑 `config.yaml` 后重启；面板提供「重启 Bot」和「下载备份」。
 
-**下载备份**会通过 SQLite backup API 生成一份一致性快照（`dafeiyu-backup-时间.db`），
-包含全部会话、摘要、印象、用量和 session 映射。恢复时先停服务，用备份文件替换
-`data/dafeiyu.db`，再启动即可。面板不自动删除旧备份，请自行管理文件。
+### 运维 runbook（健康 / 告警 / 备份 / 恢复 / 审计）
+
+**健康**：`GET /api/health/detail`（需控制口令）返回 `ok`、三个进程状态、bot 的网关/额度/错误
+统计、NapCat 登录状态、磁盘可用率和备份状态。`ok=false` 时先看哪个子项是 `failed` 或
+`connected=false`；健康探测失败只降级字段，不会打断 supervisor。面板健康卡每 10 秒刷新，
+页面隐藏时暂停。
+
+**告警**：默认关闭。要启用，把 `alerts.enabled` 改成 `true`，并按需填
+`alerts.webhook.url`（`format`: generic / ntfy / wecom / dingtalk）和 `alerts.qq_admin`
+（通过 bot 私聊管理员；`bot_down` 不会走这条通道）。规则阈值在 `alerts.rules`：
+进程掉线分别等待 120/180/120 秒，磁盘低于 10%，回复错误 15 分钟内 3 次，额度熔断，
+以及备份失败。同一告警默认 6 小时重复一次，恢复需要连续两次巡检确认；单轮超过 5 条会合并
+成一条 `alert_flood`。状态存 `data/alert-state.json`，删掉它等于清空未恢复事件。
+面板「测试告警」只发送一条 `test` 消息，不写入 firing 状态。
+
+**备份**：默认开启，只写本地 `backup.dir`（默认 `data/backups`）。每天 `schedule_hour`
+（默认 04:00）后的第一次巡检生成一份 `scheduled` 备份；每天保留 `daily_keep` 份，周日那批
+额外按 `weekly_keep` 周保留，总量超过 `max_total_gb` 时从最旧的 scheduled 开始删，至少留 3 份。
+手动备份和恢复前备份不会被自动清理，需要手工删。每次备份会校验 SQLite 完整性、`user_version`
+和必需表，并写同名 `.json` manifest（大小、sha256、schema 版本）。备份失败只记日志和
+`backups.last_error_at`，由告警规则接手，不影响 bot。
+
+**恢复**：面板上传 `.db` → 校验文件 → 自动生成 `pre-restore` 备份 → 停 bot → 替换
+`data/dafeiyu.db` 并清掉 `-wal`/`-shm` → 启动 bot → 等 `/api/health/detail` 返回 `ok=true`。
+上传前必须输入 `RESTORE` 确认，最大 `backup.max_upload_mb`。任一步失败会自动停 bot、用
+pre-restore 备份回滚并写审计；回滚失败会留下 pre-restore 文件供手工恢复，按审计里的
+`backup.restore` 记录处理。**恢复只覆盖 `data/dafeiyu.db`，不恢复 OpenCode 自己的数据库**
+（`data/opencode-bot.db`），也不恢复 `.env`、NapCat 票据和人设文件。
+
+**审计**：append-only JSONL，默认 `data/audit.jsonl`，超过 `audit.max_bytes` 轮转为 `.1/.2/.3`。
+记录登录/登出、告警触发与恢复、备份创建/删除、恢复结果、进程启停和 shutdown。审计写入失败
+只记 supervisor 日志，不阻塞操作。面板审计列表按时间倒序，受限 `limit` 1–200。
+
+**收尾检查**：关掉 supervisor 后确认 `data/` 下没有 `.tmp` 残留；`git status --short`
+应只剩源码/文档改动，`data/`、`logs/`、`.tamako/` 都不应出现在版本库。
 
 面板每 2–30 秒轮询一次状态；会话列表默认每页 50 条，点「加载更多」继续。
 
