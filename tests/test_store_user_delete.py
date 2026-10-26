@@ -63,6 +63,8 @@ def test_delete_user_messages_removes_only_that_users_rows(store: Store) -> None
     before_impressions = store.count_impressions(ChatType.GROUP, 100)
     assert before_messages == 5
     assert _delivered_ids(store) == {"u7-a", "u7-b", "u7-c", "u8-a"}
+    hits, _ = store.search_message_hits("用户7的第一条", ChatType.GROUP, 100, 10)
+    assert hits == 1
 
     deleted = store.delete_user_messages(ChatType.GROUP, 100, 7)
 
@@ -75,6 +77,10 @@ def test_delete_user_messages_removes_only_that_users_rows(store: Store) -> None
     # 聚合表保留：摘要与印象无法可靠归因，不在本操作范围内。
     assert store.count_summaries(ChatType.GROUP, 100) == before_summaries
     assert store.count_impressions(ChatType.GROUP, 100) == before_impressions
+    # FTS 触发器必须同步清掉正文，否则隐私删除后仍能检索到原文。
+    hits, rows = store.search_message_hits("用户7的第一条", ChatType.GROUP, 100, 10)
+    assert hits == 0
+    assert rows == []
 
 
 def test_delete_user_messages_is_idempotent(store: Store) -> None:

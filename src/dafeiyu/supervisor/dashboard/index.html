@@ -386,13 +386,17 @@
     </div>
     <form class="row" id="delete-user-form" style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">
       <span class="kv" style="min-width:84px">按用户删除</span>
+      <select id="delete-user-chat-type" title="会话类型">
+        <option value="group">群聊</option>
+        <option value="private">私聊</option>
+      </select>
       <input id="delete-user-chat-id" type="number" min="1" placeholder="会话 ID" style="width:110px" />
       <input id="delete-user-id" type="number" min="1" placeholder="用户 QQ 号" style="width:140px" />
       <input id="delete-user-confirm" placeholder="输入 DELETE_USER 确认" style="width:190px" />
       <button class="btn danger" type="submit" id="btn-delete-user">删除该用户消息</button>
       <span class="kv" id="delete-user-status"></span>
     </form>
-    <div class="kv" style="margin-top:6px">只删除该用户在本会话的原始消息；摘要与印象等聚合数据可能仍保留痕迹，操作不可撤销。</div>
+    <div class="kv" style="margin-top:6px">只删除该用户在本会话的原始消息；摘要与印象等聚合数据可能仍保留痕迹，操作不可撤销。如需彻底重建，请联系管理员执行 /forget。</div>
   </section>
 
   <section class="card">
@@ -1354,8 +1358,13 @@ async function deleteUserMessages(event) {
     toast("请输入 DELETE_USER 确认", true);
     return;
   }
-  const chatType = $("memory-chat-filter").value || "group";
-  if (!confirm(`确认删除用户 ${userId} 在会话 ${chatId} 的原始消息？此操作不可撤销。`)) {
+  const chatType = $("delete-user-chat-type").value;
+  if (chatType !== "group" && chatType !== "private") {
+    toast("请选择会话类型", true);
+    return;
+  }
+  const typeLabel = chatType === "group" ? "群聊" : "私聊";
+  if (!confirm(`确认删除${typeLabel} ${chatId} 中用户 ${userId} 的原始消息？此操作不可撤销。`)) {
     return;
   }
   try {
