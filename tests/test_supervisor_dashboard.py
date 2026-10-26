@@ -884,3 +884,41 @@ async def test_rotate_token_serializes_concurrent_requests(
     assert supervisor.restarted == ["bot", "bot"]
     assert holder.value
 
+
+async def test_index_has_per_user_delete_controls(tmp_path: Path) -> None:
+    app, _, _ = make_app(tmp_path)
+    async with running(app) as client:
+        resp = await client.get("/")
+        text = await resp.text()
+
+    assert resp.status == 200
+    for anchor in (
+        "delete-user-form",
+        "delete-user-id",
+        "delete-user-confirm",
+        "btn-delete-user",
+    ):
+        assert f'id="{anchor}"' in text, anchor
+    assert "只删除该用户" in text
+    assert "摘要" in text and "印象" in text and "痕迹" in text
+    assert "deleteUserMessages" in text
+    assert 'method: "DELETE"' in text
+    assert 'confirm: "DELETE_USER"' in text
+    assert "/api/memory/${chatType}/${chatId}/user/${userId}" in text
+    assert '$("delete-user-form").addEventListener("submit", deleteUserMessages)' in text
+
+
+async def test_index_audit_rows_render_expandable_details(tmp_path: Path) -> None:
+    app, _, _ = make_app(tmp_path)
+    async with running(app) as client:
+        resp = await client.get("/")
+        text = await resp.text()
+
+    assert resp.status == 200
+    assert 'createElement("details")' in text
+    assert "<pre" in text
+    assert "JSON.stringify(row.detail, null, 2)" in text
+    assert "暂无审计记录" in text
+    # 审计内容一律走 textContent，避免 detail 里的 HTML 被当标签执行。
+    assert "summary.textContent" in text
+    assert "pre.textContent" in text

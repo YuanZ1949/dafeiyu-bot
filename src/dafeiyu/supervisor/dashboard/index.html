@@ -384,6 +384,15 @@
         <div class="mem-list" id="memory-impressions"></div>
       </div>
     </div>
+    <form class="row" id="delete-user-form" style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">
+      <span class="kv" style="min-width:84px">按用户删除</span>
+      <input id="delete-user-chat-id" type="number" min="1" placeholder="会话 ID" style="width:110px" />
+      <input id="delete-user-id" type="number" min="1" placeholder="用户 QQ 号" style="width:140px" />
+      <input id="delete-user-confirm" placeholder="输入 DELETE_USER 确认" style="width:190px" />
+      <button class="btn danger" type="submit" id="btn-delete-user">删除该用户消息</button>
+      <span class="kv" id="delete-user-status"></span>
+    </form>
+    <div class="kv" style="margin-top:6px">只删除该用户在本会话的原始消息；摘要与印象等聚合数据可能仍保留痕迹，操作不可撤销。</div>
   </section>
 
   <section class="card">
@@ -1018,6 +1027,22 @@ async function refreshAlerts() {
   }
 }
 
+function auditItem(row) {
+  const details = document.createElement("details");
+  details.className = "mem-item";
+  details.innerHTML =
+    '<summary class="mem-meta"></summary>' +
+    '<div class="audit-meta kv"></div>' +
+    '<pre class="audit-detail"></pre>';
+  const summary = details.querySelector("summary");
+  summary.textContent = `${row.ts || ""} · ${row.action || ""} · ${row.actor || ""}`;
+  details.querySelector(".audit-meta").textContent =
+    [row.target, row.result, row.ip].filter(Boolean).join(" · ") || "—";
+  const pre = details.querySelector("pre");
+  pre.textContent = JSON.stringify(row.detail, null, 2);
+  return details;
+}
+
 async function refreshAudit() {
   try {
     const data = await api("/api/audit?limit=30");
@@ -1029,9 +1054,7 @@ async function refreshAudit() {
       return;
     }
     items.forEach((row) => {
-      const meta = `${row.ts || ""} · ${row.action || ""} · ${row.actor || ""}`;
-      const detail = [row.target, row.result, row.ip].filter(Boolean).join(" · ");
-      box.appendChild(memItem(meta, detail || "—"));
+      box.appendChild(auditItem(row));
     });
   } catch (err) {
     $("audit-list").replaceChildren(memItem("—", `读取失败：${err.message}`));
@@ -1313,6 +1336,41 @@ function memoryTarget() {
   if (!Number.isInteger(chatId) || chatId <= 0) throw new Error("请先填会话 ID");
   const chatType = $("memory-chat-filter").value || "group";
   return { chat_type: chatType, chat_id: chatId };
+}
+
+async function deleteUserMessages(event) {
+  if (event) event.preventDefault();
+  const chatId = Number($("delete-user-chat-id").value);
+  const userId = Number($("delete-user-id").value);
+  if (!Number.isInteger(chatId) || chatId <= 0) {
+    toast("请先填会话 ID", true);
+    return;
+  }
+  if (!Number.isInteger(userId) || userId <= 0) {
+    toast("请填用户 QQ 号", true);
+    return;
+  }
+  if ($("delete-user-confirm").value.trim() !== "DELETE_USER") {
+    toast("请输入 DELETE_USER 确认", true);
+    return;
+  }
+  const chatType = $("memory-chat-filter").value || "group";
+  if (!confirm(`确认删除用户 ${userId} 在会话 ${chatId} 的原始消息？此操作不可撤销。`)) {
+    return;
+  }
+  try {
+    const data = await api(`/api/memory/${chatType}/${chatId}/user/${userId}`, {
+      method: "DELETE",
+      body: JSON.stringify({ confirm: "DELETE_USER" }),
+    });
+    const deleted = Number(data.deleted_messages) || 0;
+    $("delete-user-status").textContent = `已删除 ${deleted} 条消息`;
+    toast(`已删除 ${deleted} 条消息`);
+    loadMemory();
+  } catch (err) {
+    $("delete-user-status").textContent = `删除失败：${err.message}`;
+    toast(`删除失败：${err.message}`, true);
+  }
 }
 
 async function triggerSummary() {
@@ -2182,6 +2240,7 @@ $("btn-backup-now").addEventListener("click", createBackup);
 $("btn-backup-restore").addEventListener("click", restoreBackup);
 $("btn-rotate-token").addEventListener("click", rotateControlToken);
 $("btn-refresh-memory").addEventListener("click", loadMemory);
+$("delete-user-form").addEventListener("submit", deleteUserMessages);
 $("btn-summarize").addEventListener("click", triggerSummary);
 $("btn-extract").addEventListener("click", triggerExtract);
 $("btn-merge-impressions").addEventListener("click", mergeSelectedImpressions);

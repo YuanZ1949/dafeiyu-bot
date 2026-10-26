@@ -554,6 +554,35 @@ class Store:
         self._conn.commit()
         return deleted
 
+    def delete_user_messages(
+        self, chat_type: ChatType, chat_id: int, user_id: int
+    ) -> int:
+        """按用户删除某会话的原始消息，并清理对应投递记录。
+
+        摘要/印象等聚合表无法可靠归因，保留不动；消息与 delivered_messages
+        在同一事务内删除，返回删除的消息行数（不含投递行）。
+        """
+        with self._conn:
+            self._conn.execute(
+                """
+                DELETE FROM delivered_messages
+                WHERE chat_type = ? AND chat_id = ?
+                  AND message_id IN (
+                      SELECT message_id FROM messages
+                      WHERE chat_type = ? AND chat_id = ? AND user_id = ?
+                  )
+                """,
+                (chat_type.value, chat_id, chat_type.value, chat_id, int(user_id)),
+            )
+            cur = self._conn.execute(
+                """
+                DELETE FROM messages
+                WHERE chat_type = ? AND chat_id = ? AND user_id = ?
+                """,
+                (chat_type.value, chat_id, int(user_id)),
+            )
+        return max(cur.rowcount, 0)
+
     def search_messages(
         self,
         query: str,

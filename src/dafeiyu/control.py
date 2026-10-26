@@ -235,6 +235,42 @@ def _path_target(
     return chat_type, chat_id, None
 
 
+def _positive_path_int(
+    request: web.Request, name: str, label: str
+) -> tuple[int | None, web.Response | None]:
+    raw = request.match_info.get(name, "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return None, web.json_response(
+            {"error": f"{label} 必须是整数"}, status=400
+        )
+    if value <= 0:
+        return None, web.json_response(
+            {"error": f"{label} 必须是正整数"}, status=400
+        )
+    return value, None
+
+
+def _user_target(
+    request: web.Request,
+) -> tuple[ChatType | None, int | None, int | None, web.Response | None]:
+    raw_type = request.match_info.get("chat_type", "")
+    try:
+        chat_type = ChatType(raw_type)
+    except ValueError:
+        return None, None, None, web.json_response(
+            {"error": "chat_type 必须是 group 或 private"}, status=400
+        )
+    chat_id, error = _positive_path_int(request, "chat_id", "chat_id")
+    if error is not None:
+        return None, None, None, error
+    user_id, error = _positive_path_int(request, "user_id", "user_id")
+    if error is not None:
+        return None, None, None, error
+    return chat_type, chat_id, user_id, None
+
+
 def _fmt_ts(timestamp: int | None) -> str:
     if not timestamp:
         return ""
@@ -1212,6 +1248,28 @@ def create_app(
             return web.json_response({"error": "印象不存在"}, status=404)
         return web.json_response({"ok": True, "deleted": impression_id})
 
+    async def delete_user_messages(request: web.Request) -> web.Response:
+        chat_type, chat_id, user_id, error = _user_target(request)
+        if error is not None:
+            return error
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        if str(payload.get("confirm") or "") != "DELETE_USER":
+            return web.json_response(
+                {"error": "confirm 必须是 DELETE_USER"}, status=400
+            )
+        try:
+            deleted = control.store.delete_user_messages(
+                chat_type, chat_id, user_id
+            )
+        except Exception as exc:  # noqa: BLE001 - 不把 SQL/内部细节回给调用方
+            log.warning("按用户删除消息失败：%s", exc)
+            return web.json_response(
+                {"error": "删除消息失败，请查看日志"}, status=500
+            )
+        return web.json_response({"ok": True, "deleted_messages": deleted})
+
     async def usage(request: web.Request) -> web.Response:
         try:
             days = _query_int(request, "days", 7)
@@ -1465,6 +1523,10 @@ def create_app(
     app.router.add_post("/api/memory/impressions/merge", merge_impressions)
     app.router.add_delete(
         "/api/memory/impressions/{impression_id}", delete_impression
+    )
+    app.router.add_delete(
+        "/api/memory/{chat_type}/{chat_id}/user/{user_id}",
+        delete_user_messages,
     )
     app.router.add_get("/api/usage", usage)
     app.router.add_get("/api/budget", budget)

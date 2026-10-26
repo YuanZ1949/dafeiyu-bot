@@ -687,6 +687,19 @@ def create_app(
             )
         return chat_type, chat_id, None
 
+    def _memory_user_target(
+        request: web.Request,
+    ) -> tuple[str, str, str, web.Response | None]:
+        chat_type, chat_id, error = _session_target(request)
+        if error is not None:
+            return "", "", "", error
+        user_id = request.match_info.get("user_id", "")
+        if not user_id.isdigit() or int(user_id) <= 0:
+            return "", "", "", web.json_response(
+                {"error": "user_id 必须是正整数"}, status=400
+            )
+        return chat_type, chat_id, user_id, None
+
     async def session_action(request: web.Request) -> web.Response:
         chat_type, chat_id, error = _session_target(request)
         if error is not None:
@@ -770,6 +783,44 @@ def create_app(
         impression_id = request.match_info["impression_id"]
         code, data = await bot_call(
             "DELETE", f"/api/memory/impressions/{impression_id}"
+        )
+        return web.json_response(data, status=code)
+
+    async def memory_user_delete(request: web.Request) -> web.Response:
+        chat_type, chat_id, user_id, error = _memory_user_target(request)
+        if error is not None:
+            return error
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        if str(payload.get("confirm") or "") != "DELETE_USER":
+            return web.json_response(
+                {"error": "confirm 必须是 DELETE_USER"}, status=400
+            )
+        code, data = await bot_call(
+            "DELETE",
+            f"/api/memory/{chat_type}/{chat_id}/user/{user_id}",
+            {"confirm": "DELETE_USER"},
+            timeout=BOT_DELETE_TIMEOUT,
+        )
+        if not 200 <= code < 300:
+            return web.json_response(data, status=code)
+        raw_deleted = data.get("deleted_messages") if isinstance(data, dict) else 0
+        deleted = (
+            int(raw_deleted)
+            if isinstance(raw_deleted, int) and not isinstance(raw_deleted, bool)
+            else 0
+        )
+        write_audit(
+            request,
+            "memory.user_delete",
+            target=f"{chat_type}/{chat_id}/user/{user_id}",
+            detail={
+                "deleted_messages": deleted,
+                "chat_type": chat_type,
+                "chat_id": int(chat_id),
+                "user_id": int(user_id),
+            },
         )
         return web.json_response(data, status=code)
 
@@ -939,6 +990,10 @@ def create_app(
     app.router.add_post("/api/memory/impressions/merge", memory_impression_merge)
     app.router.add_delete(
         "/api/memory/impressions/{impression_id}", memory_impression_delete
+    )
+    app.router.add_delete(
+        "/api/memory/{chat_type}/{chat_id}/user/{user_id}",
+        memory_user_delete,
     )
     app.router.add_post("/api/control/{action}", control)
     app.router.add_post("/api/control-token/rotate", rotate_control_token)

@@ -1114,3 +1114,89 @@ async def test_budget_endpoint_rejects_invalid_scope(
         data = await resp.json()
     assert resp.status == 400
     assert data["error"]
+
+async def test_delete_user_messages_requires_delete_user_confirm(
+    tmp_path: Path,
+) -> None:
+    control, _, app = make_control(tmp_path)
+    _seed_message(control.store, "m1", "保留", user_id=7)
+
+    async with running(app) as client:
+        missing = await client.delete("/api/memory/group/100/user/7")
+        wrong = await client.delete(
+            "/api/memory/group/100/user/7", json={"confirm": "DELETE"}
+        )
+
+    assert missing.status == 400
+    assert wrong.status == 400
+    assert control.store.count_messages(ChatType.GROUP, 100) == 1
+
+
+async def test_delete_user_messages_returns_count_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    control, _, app = make_control(tmp_path)
+    _seed_message(control.store, "m1", "用户7一", user_id=7)
+    _seed_message(control.store, "m2", "用户7二", user_id=7)
+    _seed_message(control.store, "m3", "用户8", user_id=8)
+
+    async with running(app) as client:
+        first = await client.delete(
+            "/api/memory/group/100/user/7", json={"confirm": "DELETE_USER"}
+        )
+        first_data = await first.json()
+        second = await client.delete(
+            "/api/memory/group/100/user/7", json={"confirm": "DELETE_USER"}
+        )
+        second_data = await second.json()
+
+    assert first.status == 200
+    assert first_data == {"ok": True, "deleted_messages": 2}
+    assert second.status == 200
+    assert second_data == {"ok": True, "deleted_messages": 0}
+    assert control.store.count_messages(ChatType.GROUP, 100) == 1
+    remaining = control.store.recent_messages(ChatType.GROUP, 100, 10)
+    assert [message.user_id for message in remaining] == [8]
+
+
+async def test_delete_user_messages_rejects_invalid_target(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    _seed_message(control.store, "m1", "保留", user_id=7)
+
+    async with running(app) as client:
+        results = [
+            await client.delete(
+                "/api/memory/channel/100/user/7", json={"confirm": "DELETE_USER"}
+            ),
+            await client.delete(
+                "/api/memory/group/0/user/7", json={"confirm": "DELETE_USER"}
+            ),
+            await client.delete(
+                "/api/memory/group/100/user/0", json={"confirm": "DELETE_USER"}
+            ),
+        ]
+
+    assert [resp.status for resp in results] == [400, 400, 400]
+    assert control.store.count_messages(ChatType.GROUP, 100) == 1
+
+
+async def test_delete_user_messages_hides_store_errors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, _, app = make_control(tmp_path)
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("no such column: secret_sql")
+
+    monkeypatch.setattr(control.store, "delete_user_messages", boom)
+
+    async with running(app) as client:
+        resp = await client.delete(
+            "/api/memory/group/100/user/7", json={"confirm": "DELETE_USER"}
+        )
+        data = await resp.json()
+
+    assert resp.status == 500
+    assert "secret_sql" not in data["error"]
+    assert "sqlite" not in data["error"].lower()
+    assert "删除" in data["error"]

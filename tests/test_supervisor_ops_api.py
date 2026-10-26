@@ -414,6 +414,198 @@ async def test_budget_proxies_bot_payload_after_login(tmp_path: Path) -> None:
     assert {"per_chat", "global_daily", "monthly", "cost", "warnings"} <= set(data)
 
 
+async def _start_user_delete_bot(handler):
+    bot_app = web.Application()
+    bot_app.router.add_delete(
+        "/api/memory/{chat_type}/{chat_id}/user/{user_id}", handler
+    )
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    return bot_client, url
+
+
+async def test_user_delete_missing_confirm_does_not_call_bot(tmp_path: Path) -> None:
+    calls: list[dict] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        calls.append(dict(request.match_info))
+        return web.json_response({"ok": True, "deleted_messages": 0})
+
+    bot_client, url = await _start_user_delete_bot(handler)
+    try:
+        app, _supervisor, _ops, audit = make_app(tmp_path, bot_url=url)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            no_body = await client.delete("/api/memory/group/100/user/7")
+            empty_body = await client.delete(
+                "/api/memory/group/100/user/7", json={}
+            )
+        finally:
+            await client.close()
+    finally:
+        await bot_client.close()
+
+    assert no_body.status == 400
+    assert empty_body.status == 400
+    assert calls == []
+    assert all(row["action"] != "memory.user_delete" for row in audit.query(20))
+
+
+async def test_user_delete_wrong_confirm_does_not_call_bot(tmp_path: Path) -> None:
+    calls: list[dict] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        calls.append(dict(request.match_info))
+        return web.json_response({"ok": True, "deleted_messages": 1})
+
+    bot_client, url = await _start_user_delete_bot(handler)
+    try:
+        app, _supervisor, _ops, audit = make_app(tmp_path, bot_url=url)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            resp = await client.delete(
+                "/api/memory/group/100/user/7", json={"confirm": "delete_user"}
+            )
+            data = await resp.json()
+        finally:
+            await client.close()
+    finally:
+        await bot_client.close()
+
+    assert resp.status == 400
+    assert "DELETE_USER" in data["error"]
+    assert calls == []
+    assert all(row["action"] != "memory.user_delete" for row in audit.query(20))
+
+
+async def test_user_delete_forwards_confirmation_and_writes_audit(
+    tmp_path: Path,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def handler(request: web.Request) -> web.Response:
+        seen["method"] = request.method
+        seen["path"] = request.path
+        seen["body"] = await request.json()
+        # 即使 bot 多返回内容，审计也不该抄进去。
+        return web.json_response(
+            {
+                "ok": True,
+                "deleted_messages": 3,
+                "content": "不能进审计的消息正文",
+                "nickname": "不能进审计的昵称",
+            }
+        )
+
+    bot_client, url = await _start_user_delete_bot(handler)
+    try:
+        app, _supervisor, _ops, audit = make_app(tmp_path, bot_url=url)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            resp = await client.delete(
+                "/api/memory/group/100/user/7", json={"confirm": "DELETE_USER"}
+            )
+            data = await resp.json()
+        finally:
+            await client.close()
+    finally:
+        await bot_client.close()
+
+    assert resp.status == 200
+    assert data["ok"] is True
+    assert data["deleted_messages"] == 3
+    assert seen == {
+        "method": "DELETE",
+        "path": "/api/memory/group/100/user/7",
+        "body": {"confirm": "DELETE_USER"},
+    }
+
+    rows = [row for row in audit.query(20) if row["action"] == "memory.user_delete"]
+    assert len(rows) == 1
+    assert rows[0]["target"] == "group/100/user/7"
+    assert rows[0]["detail"] == {
+        "deleted_messages": 3,
+        "chat_type": "group",
+        "chat_id": 100,
+        "user_id": 7,
+    }
+    raw_audit = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+    assert "不能进审计的消息正文" not in raw_audit
+    assert "不能进审计的昵称" not in raw_audit
+
+
+async def test_user_delete_passes_bot_error_without_success_audit(
+    tmp_path: Path,
+) -> None:
+    async def handler(_: web.Request) -> web.Response:
+        return web.json_response({"error": "删除失败：数据库忙"}, status=409)
+
+    bot_client, url = await _start_user_delete_bot(handler)
+    try:
+        app, _supervisor, _ops, audit = make_app(tmp_path, bot_url=url)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            resp = await client.delete(
+                "/api/memory/group/100/user/7", json={"confirm": "DELETE_USER"}
+            )
+            data = await resp.json()
+        finally:
+            await client.close()
+    finally:
+        await bot_client.close()
+
+    assert resp.status == 409
+    assert data == {"error": "删除失败：数据库忙"}
+    assert all(row["action"] != "memory.user_delete" for row in audit.query(20))
+
+
+async def test_user_delete_rejects_invalid_target_before_calling_bot(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        calls.append(dict(request.match_info))
+        return web.json_response({"ok": True, "deleted_messages": 0})
+
+    bot_client, url = await _start_user_delete_bot(handler)
+    try:
+        app, _supervisor, _ops, _audit = make_app(tmp_path, bot_url=url)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            results = [
+                await client.delete(
+                    "/api/memory/channel/100/user/7",
+                    json={"confirm": "DELETE_USER"},
+                ),
+                await client.delete(
+                    "/api/memory/group/0/user/7",
+                    json={"confirm": "DELETE_USER"},
+                ),
+                await client.delete(
+                    "/api/memory/group/100/user/0",
+                    json={"confirm": "DELETE_USER"},
+                ),
+                await client.delete(
+                    "/api/memory/group/100/user/-1",
+                    json={"confirm": "DELETE_USER"},
+                ),
+            ]
+        finally:
+            await client.close()
+    finally:
+        await bot_client.close()
+
+    assert [resp.status for resp in results] == [400, 400, 400, 400]
+    assert calls == []
+
+
 async def test_budget_passes_bot_error_status(tmp_path: Path) -> None:
     async def budget_endpoint(_: web.Request) -> web.Response:
         return web.json_response({"error": "chat_type 必须是 group 或 private"}, status=400)
