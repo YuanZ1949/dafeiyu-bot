@@ -1433,6 +1433,20 @@ function budgetRatio(used, limit) {
   return (Number(used) || 0) / denominator;
 }
 
+function budgetCount(value) {
+  return String(Math.trunc(Number(value) || 0));
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[char]));
+}
+
 function budgetFillClass(ratio) {
   const percent = ratio * 100;
   if (percent >= 100) return "bad";
@@ -1444,7 +1458,7 @@ function budgetFillClass(ratio) {
 function budgetSubRow(name, used, limit, usedText, limitText, emptyText) {
   const ratio = budgetRatio(used, limit);
   if (ratio === null) {
-    return `<div class="budget-label"><span>${name}</span><span class="budget-muted">${emptyText}</span></div>`;
+    return `<div class="budget-label"><span>${name}</span><span class="budget-muted">${usedText} / ${emptyText}</span></div>`;
   }
   const width = Math.min(100, Math.max(0, ratio * 100));
   const percent = Math.round(ratio * 100);
@@ -1458,13 +1472,20 @@ function budgetGroup(label, rows) {
   return `<div class="budget-name">${label}</div>${rows}`;
 }
 
+function resetBudget(message) {
+  $("budget-chat").textContent = message;
+  ["budget-global", "budget-monthly", "budget-cost", "budget-warnings"].forEach(
+    (id) => { $(id).replaceChildren(); }
+  );
+}
+
 function renderBudget(data) {
   const chat = data.per_chat || {};
-  const chatCalls = Number(chat.calls) || 0;
+  const chatCalls = budgetCount(chat.calls);
   const chatTokens = Number(chat.tokens) || 0;
   const dailyCalls = Number(chat.daily_calls) || 0;
   const dailyTokens = Number(chat.daily_tokens) || 0;
-  const callsNote = dailyCalls > 0 ? `（上限 ${dailyCalls}）` : "（未启用）";
+  const callsNote = dailyCalls > 0 ? `（上限 ${budgetCount(dailyCalls)}）` : "（未启用）";
   const tokensNote = dailyTokens > 0 ? `（上限 ${fmtTokens(dailyTokens)}）` : "（未启用）";
   $("budget-chat").innerHTML =
     `${chatName(data.chat_type, data.chat_id)} · 本会话今日 ` +
@@ -1473,20 +1494,21 @@ function renderBudget(data) {
   const global = data.global_daily || {};
   $("budget-global").innerHTML = budgetGroup(
     "全局日用量",
-    budgetSubRow("调用", global.calls, global.limit_calls, fmtTokens(global.calls), fmtTokens(global.limit_calls), "未启用") +
+    budgetSubRow("调用", global.calls, global.limit_calls, budgetCount(global.calls), budgetCount(global.limit_calls), "未启用") +
     budgetSubRow("Token", global.tokens, global.limit_tokens, fmtTokens(global.tokens), fmtTokens(global.limit_tokens), "未启用")
   );
 
   const monthly = data.monthly || {};
   $("budget-monthly").innerHTML = budgetGroup(
     "月度用量",
-    budgetSubRow("调用", monthly.calls, monthly.limit_calls, fmtTokens(monthly.calls), fmtTokens(monthly.limit_calls), "未启用") +
+    budgetSubRow("调用", monthly.calls, monthly.limit_calls, budgetCount(monthly.calls), budgetCount(monthly.limit_calls), "未启用") +
     budgetSubRow("Token", monthly.tokens, monthly.limit_tokens, fmtTokens(monthly.tokens), fmtTokens(monthly.limit_tokens), "未启用")
   );
 
   const cost = data.cost || {};
-  const currency = cost.currency || "CNY";
-  const money = (value) => `${(Number(value) || 0).toFixed(2)} ${currency}`;
+  const rawCurrency = String(cost.currency || "").toUpperCase();
+  const currency = /^[A-Z]{3,8}$/.test(rawCurrency) ? rawCurrency : "CNY";
+  const money = (value) => `${(Number(value) || 0).toFixed(2)} ${escapeHtml(currency)}`;
   $("budget-cost").innerHTML = budgetGroup(
     "月度费用（估算）",
     budgetSubRow("费用", cost.cost, cost.cost_limit, money(cost.cost), money(cost.cost_limit), "未设上限")
@@ -1497,7 +1519,7 @@ function renderBudget(data) {
     ? warnings.map((warning) => {
         const ratio = Number(warning.ratio) || 0;
         const cls = ratio >= 1 ? " bad" : "";
-        return `<span class="budget-tag${cls}">${warning.scope} ${Math.round(ratio * 100)}%</span>`;
+        return `<span class="budget-tag${cls}">${escapeHtml(warning.scope || "unknown")} ${Math.round(ratio * 100)}%</span>`;
       }).join("")
     : '<span class="budget-muted">暂无预算预警</span>';
 }
@@ -1507,7 +1529,7 @@ async function loadBudget() {
   const rawId = $("budget-chat-id").value.trim();
   const chatId = Number(rawId);
   if (!rawId || !Number.isInteger(chatId) || chatId <= 0) {
-    $("budget-chat").textContent = "填写正整数会话 ID 后刷新";
+    resetBudget("填写正整数会话 ID 后刷新");
     return;
   }
   try {
@@ -1516,7 +1538,7 @@ async function loadBudget() {
     );
     renderBudget(data);
   } catch (err) {
-    $("budget-chat").textContent = `预算读取失败：${err.message}`;
+    resetBudget(`预算读取失败：${err.message}`);
   }
 }
 let searchOffset = 0;

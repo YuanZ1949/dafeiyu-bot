@@ -137,6 +137,12 @@ async def test_index_has_budget_card_and_loader(tmp_path: Path) -> None:
     assert "loadBudget" in text
     assert "budgetFillClass" in text
     assert "Math.min(100" in text
+    assert "${usedText} / ${emptyText}" in text
+    assert "resetBudget(" in text
+    assert "budgetCount(global.calls)" in text
+    assert "fmtTokens(global.tokens)" in text
+    assert "escapeHtml(" in text
+    assert "/^[A-Z]{3,8}$/" in text
     assert '$("btn-budget-refresh").addEventListener("click", loadBudget)' in text
     assert '$("budget-chat-type").addEventListener("change", loadBudget)' in text
     assert '$("budget-chat-id").addEventListener("change", loadBudget)' in text
