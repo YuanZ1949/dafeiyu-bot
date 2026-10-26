@@ -168,6 +168,15 @@ powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoQr
 | `groups.admins` | `[]` | 允许执行 `/闭嘴`、`/醒来` 的 QQ 号 |
 | `budget.daily_calls` | `200` | 每群每天最多调用模型次数 |
 | `budget.daily_tokens` | `300000` | 每群每天 token 上限 |
+| `budget.global_daily_calls` | `0` | 所有会话合计每日调用上限；`0` = 未启用 |
+| `budget.global_daily_tokens` | `0` | 所有会话合计每日 token 上限；`0` = 未启用 |
+| `budget.monthly_calls` | `0` | 所有会话合计自然月调用上限（上海时区）；`0` = 未启用 |
+| `budget.monthly_tokens` | `0` | 所有会话合计自然月 token 上限；`0` = 未启用 |
+| `budget.monthly_cost_limit` | `0` | 月度费用上限；`0` = 不限制，`>0` 时必须填单价 |
+| `budget.price_input_per_million` | `0` | 输入 token 单价（每百万 token，按 `currency`） |
+| `budget.price_output_per_million` | `0` | 输出 token 单价（每百万 token，按 `currency`） |
+| `budget.warning_ratios` | `[0.5, 0.8, 1.0]` | 额度预警比例；每天每档最多告警一次 |
+| `budget.on_exceed` | `degrade` | 超限动作：`degrade` 只停非点名回复、`stop` 全停、`notify` 只告警不拦截 |
 | `memory.window_size` | `20` | 上下文窗口消息数 |
 | `memory.impression_topk` | `5` | 每次注入的群友印象条数 |
 | `memory.extract_every` | `20` | 每 N 条消息抽一次印象 |
@@ -175,6 +184,13 @@ powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoQr
 | `memory.recall_enabled` | `false` | 回复前按当前批次检索同会话旧消息，注入「相关旧记忆」；代码默认关，`config.yaml` 示例已显式开启 |
 | `memory.recall_topk` | `3` | 相关旧记忆最多注入几条 |
 | `memory.recall_chars` | `300` | 相关旧记忆段落的字符预算 |
+
+预算分四层：每群每日、全局每日、自然月、月度费用。所有 `0` 都表示「未启用/不限制」。
+`degrade` 会保留 @/引用/叫名字的回复，只停普通插话；`stop` 连点名也不回；`notify`
+只发告警不拦截。月度费用超限是硬拒绝，即使 `on_exceed=notify` 也不会放行。
+费用按「token 数 × 单价」估算，不是账单金额；要准确成本请以服务商账单为准。
+`warning_ratios` 命中 50%/80%/100% 时各告警一次，由 supervisor 做 24 小时去重，
+告警 detail 只包含计数与限额，不包含消息正文。
 
 ## 3. 启动
 
@@ -202,14 +218,26 @@ NapCat 已连接
 - 引用她的消息继续问 —— 必回
 - 其他消息 —— 她按规则 + 模型判断决定要不要插话
 - 被规则跳过的消息不会丢：下次接话时会把这些漏掉的消息按 `[时:分] 昵称：内容` 的时间线一起交给模型
-- `/闭嘴`（或 `/shutup`）—— 本群静默 60 分钟（仅 `groups.admins` 里的 QQ 可用）
-- `/醒来`（或 `/wake`）—— 解除静默（仅 `groups.admins` 里的 QQ 可用）
+- `/闭嘴`（或 `/shutup`）—— 本群静音 60 分钟（仅 `groups.admins` 可用）
+- `/醒来`（或 `/wake`）—— 解除静音（仅 `groups.admins` 可用）
 
 私聊：
 
-- 直接说话即可（不受冷却、白名单、静默限制，仍受每日预算限制）
-- `/stats` —— 今天被叫了几次、吃了多少 token
-- `/forget` —— 清空这个私聊的记忆
+- 直接说话即可（不受冷却、白名单、静默限制，仍受预算限制）
+
+命令（群聊/私聊都可用，权限和冷却不同）：
+
+| 命令 | 群聊 | 私聊 | 冷却 | 说明 |
+| --- | --- | --- | --- | --- |
+| `/help` `/帮助` | 所有人 | 所有人 | 5 秒 | 按当前身份只列出可用命令 |
+| `/stats` `/统计` | 所有人 | 所有人 | 群 60 秒 / 私聊 5 秒 | 今日全局 + 当前会话调用/token；群内不显示费用 |
+| `/status` `/状态` | 仅管理员 | 仅管理员 | 30 秒 | 网关、调度、配额、预算状态与运行时长 |
+| `/budget` `/预算` | 仅管理员 | 仅管理员 | 30 秒 | 全局/月度/本会话预算与费用估算 |
+| `/forget` | 仅管理员 | 所有人 | 无 | 清空当前会话全部记忆（消息、摘要、印象、用量与会话映射，不可撤销） |
+
+群内非管理员执行管理员命令会被静默忽略（不回复、不写审计）；私聊非管理员会收到
+「这个命令只有管理员能用。」。管理员命令成功后写 `command.admin` 审计（actor 为 QQ 号，
+detail 只含会话类型/ID 与用户 ID，不含正文）。冷却按「群 + 群号」或「私聊 + 用户」分别计算。
 
 命令行（服务不用停）：
 
@@ -253,7 +281,11 @@ NapCat 已连接
 - **进程 / 大脑 / 登录二维码**：查看 OpenCode、Bot、NapCat 状态，切换模型，扫码登录。
 - **记忆**：查看按日摘要与群印象，可按群聊/私聊筛选；填会话 ID 可手动生成摘要、抽取印象。
   每条印象可编辑内容/置信度/类型、查看来源消息摘录，勾选多条后可合并；编辑与合并都会同步更新搜索索引。
+  卡片底部可按「会话类型 + 会话 ID + 用户 QQ」删除该用户的原始消息（需输入 `DELETE_USER`），
+  摘要与印象等聚合数据会保留。
 - **用量**：最近 7/14/30 天的调用与 token 柱状图、Top 会话、最近错误。
+- **预算**：全局今日、月度、当前会话的调用/token/费用估算与预警状态；只读，修改请改
+  `config.yaml` 后重启。
 - **消息搜索**：跨会话按关键字搜索，结果分页加载并显示命中摘录；3 字以上中文走 trigram FTS，1–2 字自动回落 LIKE。
   命中项可点「定位」打开对应会话时间线并高亮该消息。
 - **会话管理**：按最近活跃排序，分页加载。每行可以：
@@ -268,6 +300,10 @@ NapCat 已连接
   暂停/继续、加载行数切换、清屏和下载当前日志文件。清屏只影响页面视图，不删除磁盘日志。
 - **健康 / 告警 / 备份**：聚合 bot、OpenCode、NapCat、网关、磁盘与备份状态；查看告警事件并发送
   测试告警；手动备份、下载、删除、上传恢复，以及最近的操作审计。
+- **安全 / 口令轮换**：控制口令保存在 `data/supervisor.token`，启动时自动收紧 ACL
+  （Windows `icacls`、POSIX `0600`，失败只告警不阻断启动）。输入 `ROTATE` 后生成新口令，
+  同步更新 bot 环境变量与健康探测，并重启 bot 一次；任一步失败会回滚旧口令并写审计。
+  轮换完成后旧口令返回 401，新口令返回 200。
 - **运行配置**：只读展示当前模型、人设、冷却、限流、预算、记忆窗口与保留天数。
   要改配置请编辑 `config.yaml` 后重启；面板提供「重启 Bot」和「下载备份」。
 
@@ -300,9 +336,26 @@ pre-restore 备份回滚并写审计；回滚失败会留下 pre-restore 文件�
 `backup.restore` 记录处理。**恢复只覆盖 `data/dafeiyu.db`，不恢复 OpenCode 自己的数据库**
 （`data/opencode-bot.db`），也不恢复 `.env`、NapCat 票据和人设文件。
 
+**安全与口令**：控制口令由 supervisor 首次启动生成到 `data/supervisor.token`，并尽量收紧为
+仅当前用户可读写；加固失败只写 warning。bot 与 supervisor 通过 `X-Control-Token` 校验，
+dashboard 每次请求动态读取当前口令。轮换必须输入 `ROTATE`；成功后更新 bot 环境变量、
+健康探测口令并重启 bot 一次，失败会回滚内存、磁盘和环境变量，旧口令继续可用。
+不要手工编辑 token 文件；需要更换时用面板轮换或删除该文件后重启（会重新生成）。
+破坏性操作各有独立确认串：轮换 `ROTATE`、备份恢复 `RESTORE`、会话删除 `DELETE`、
+按用户删除 `DELETE_USER`；缺失或拼错一律 400，不会执行。
+
+**日志与脱敏**：`LogHub.write` 与 `AuditLog.write` 共用 `supervisor/redact.py` 的规则。
+`Set-Cookie`、`Authorization`、`X-Control-Token` 整行替换为 `头名: ***`；`Bearer` 令牌、
+`key: value` / `key=value` / 环境变量赋值 / JSON 字段中的 `api_key`、`password`、`passwd`、
+`secret`、`private_key`、`access_key`、`token` 等只保留键名、值替换为 `***`。
+中文「token 用量」「token 上限」不含分隔符，不会被误伤。脱敏是字符串规则，不解析任意
+自由文本语义；如果把密钥写进不存在键名的散文里，仍可能漏过，日志里不要手写密钥。
+
 **审计**：append-only JSONL，默认 `data/audit.jsonl`，超过 `audit.max_bytes` 轮转为 `.1/.2/.3`。
-记录登录/登出、告警触发与恢复、备份创建/删除、恢复结果、进程启停和 shutdown。审计写入失败
-只记 supervisor 日志，不阻塞操作。面板审计列表按时间倒序，受限 `limit` 1–200。
+记录登录/登出、告警触发与恢复、备份创建/删除、恢复结果、进程启停、shutdown、口令轮换
+（`token.rotate`）、管理员命令（`command.admin`）和按用户删除（`memory.user_delete`）。
+审计 detail 只写结构化元数据，不记录消息正文或昵称；写入失败只记 supervisor 日志，
+不阻塞操作。面板审计列表按时间倒序，受限 `limit` 1–200；每行可展开查看格式化后的 detail。
 
 **收尾检查**：关掉 supervisor 后确认 `data/` 下没有 `.tmp` 残留；`git status --short`
 应只剩源码/文档改动，`data/`、`logs/`、`.tamako/` 都不应出现在版本库。
@@ -336,7 +389,16 @@ pre-restore 备份回滚并写审计；回滚失败会留下 pre-restore 文件�
 ## 8. 隐私与风险
 
 - 消息原文保存在本地 `data/dafeiyu.db`，不会上传到除 DeepSeek API 之外的任何地方。
-- 群友可以要求删除：`.venv\Scripts\dafeiyu-cli.exe forget --chat <群号>`。
+- **按用户删除**：面板「记忆」卡片底部选择会话类型、填会话 ID 和用户 QQ，再输入
+  `DELETE_USER`。它只删除该用户在该会话的原始消息，以及这些消息对应的
+  `delivered_messages` 投递记录；其他用户的消息、按日摘要、印象和会话摘要都会保留。
+  删除不可撤销，并写 `memory.user_delete` 审计（只记数量与会话/用户 ID，不记正文）。
+  因为摘要和印象是聚合数据，仍可能保留该用户信息的痕迹；需要更彻底地重建整个会话时，
+  用 `/forget`（群内管理员）或下面的 CLI。
+- **整会话删除**：`.venv\Scripts\dafeiyu-cli.exe forget --chat <群号>`；私聊需加
+  `--type private`。这会清空该会话的消息、摘要、印象、用量与会话映射，请先确认范围。
+- 删除是逻辑删除；SQLite 的自由页、WAL 或操作系统缓存中可能短时间保留旧字节。
+  对介质级清除有要求时，应在停机后对 `data/dafeiyu.db` 做安全擦除或重建。
 - **QQ 小号有被风控/封禁的风险**，本项目通过非官方协议端接入，请自行评估；不要用主号，不要高频刷屏。
 - 机器人说的话由模型生成，可能出错；涉及医疗、法律、财务等严肃问题时请以人为准。
 
