@@ -98,10 +98,26 @@ groups:
   admins: []
 
 budget:
+  # 每群每日硬上限：必须 > 0；用完后点名也不回。
   daily_calls: 200
   daily_tokens: 300000
   # 非点名消息能动的额度比例；点名的回复永远优先。
   ambient_ratio: 0.8
+  # 所有会话合计的每日上限（0 = 未启用）。
+  global_daily_calls: 0
+  global_daily_tokens: 0
+  # 所有会话合计的自然月上限（0 = 未启用；按上海时区划分月份）。
+  monthly_calls: 0
+  monthly_tokens: 0
+  # 月度费用上限（0 = 不限制）。> 0 时必须填下面的单价，按百万 token 估算。
+  monthly_cost_limit: 0
+  currency: CNY
+  price_input_per_million: 0
+  price_output_per_million: 0
+  # 额度用到这些比例时预警；每项取值 0–1，升序去重。
+  warning_ratios: [0.5, 0.8, 1.0]
+  # 超限动作：degrade = 只停非点名回复；stop = 全部停用；notify = 只告警不拦截。
+  on_exceed: degrade
 
 # 长期记忆工作区：模型自己的笔记，只有 data/bot-workspace/ 可读写。
 # dir 留空 = 关闭工作区与注入（软回滚），同时给 session 下全量 deny。

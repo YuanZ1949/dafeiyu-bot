@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import json
 import sqlite3
 from collections.abc import Sequence
@@ -13,6 +14,8 @@ from dafeiyu.timeutil import today_shanghai
 MAX_MEMORY_PAGE = 200
 # 时间线单页上限；首屏默认小一些，避免一次把长会话全塞给浏览器。
 MAX_TIMELINE_PAGE = 200
+# 预算只统计对话用途：摘要/批评测/记忆提取不属于对话预算。
+_BUDGET_PURPOSES: tuple[str, ...] = ("reply", "ambient")
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,8 @@ CREATE TABLE IF NOT EXISTS usage (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_usage_chat_date ON usage (chat_type, chat_id, date);
+-- 全局/月度预算按日期扫全表，单独建索引（老库 init_schema 时自动补上）。
+CREATE INDEX IF NOT EXISTS idx_usage_date ON usage (date);
 
 -- 记忆旁路的失败冷却与配额熔断；存到库里才能跨进程重启存活。
 CREATE TABLE IF NOT EXISTS memory_backoff (
@@ -225,6 +230,20 @@ END;
 def _like_pattern(query: str) -> str:
     escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
+
+
+@dataclass(frozen=True)
+class UsageTotals:
+    """区间内的用量合计；``estimated`` 表示区间内是否含推算值。"""
+
+    calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    estimated: bool = False
+
+    @property
+    def tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
 
 
 @dataclass(frozen=True)
@@ -1512,6 +1531,71 @@ class Store:
             (start_date, end_date),
         ).fetchone()
         return int(row["calls"]), int(row["tokens"])
+
+    def usage_between(
+        self,
+        start_date: str,
+        end_date: str,
+        *,
+        purposes: Sequence[str] | None = None,
+        chat_type: ChatType | None = None,
+        chat_id: int | None = None,
+    ) -> UsageTotals:
+        """日期闭区间内的用量合计；``purposes=None`` 表示所有用途。
+
+        WHERE 只动态拼结构，值一律走参数绑定。
+        """
+        clauses = ["date >= ?", "date <= ?"]
+        params: list[object] = [start_date, end_date]
+        if purposes is not None:
+            names = [str(name) for name in purposes]
+            if not names:
+                return UsageTotals(calls=0, prompt_tokens=0, completion_tokens=0)
+            placeholders = ", ".join("?" for _ in names)
+            clauses.append(f"purpose IN ({placeholders})")
+            params.extend(names)
+        if chat_type is not None:
+            clauses.append("chat_type = ?")
+            params.append(chat_type.value)
+        if chat_id is not None:
+            clauses.append("chat_id = ?")
+            params.append(int(chat_id))
+        where = " AND ".join(clauses)
+        row = self._conn.execute(
+            f"""
+            SELECT COUNT(*) AS calls,
+                   COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                   COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                   COALESCE(MAX(estimated), 0) AS estimated
+            FROM usage
+            WHERE {where}
+            """,
+            tuple(params),
+        ).fetchone()
+        return UsageTotals(
+            calls=int(row["calls"] or 0),
+            prompt_tokens=int(row["prompt_tokens"] or 0),
+            completion_tokens=int(row["completion_tokens"] or 0),
+            estimated=bool(row["estimated"]),
+        )
+
+    def usage_global_today(self, date: str) -> UsageTotals:
+        """所有会话当天的对话用量（预算口径：只要 reply/ambient）。"""
+        return self.usage_between(date, date, purposes=_BUDGET_PURPOSES)
+
+    def usage_month(self, month: str) -> UsageTotals:
+        """自然月对话用量；``month`` 形如 ``2026-10``（上海时区口径）。"""
+        try:
+            year_text, month_text = month.split("-", 1)
+            year, mon = int(year_text), int(month_text)
+            if not 1 <= mon <= 12:
+                raise ValueError
+        except (AttributeError, ValueError) as exc:
+            raise ValueError(f"月份格式必须为 YYYY-MM：{month}") from exc
+        last_day = calendar.monthrange(year, mon)[1]
+        start = f"{year:04d}-{mon:02d}-01"
+        end = f"{year:04d}-{mon:02d}-{last_day:02d}"
+        return self.usage_between(start, end, purposes=_BUDGET_PURPOSES)
 
     def error_stats(self, window_seconds: int) -> dict[str, Any]:
         """窗口内 brain 错误次数与最后一次时间（上海时区 ISO 串）。"""

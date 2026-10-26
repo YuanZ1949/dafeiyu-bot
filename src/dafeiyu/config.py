@@ -55,6 +55,21 @@ class BudgetConfig:
     daily_tokens: int
     # 非点名消息可动用的额度比例；点名的回复永远优先。
     ambient_ratio: float = 0.8
+    # 全局每日上限（所有会话合计）；0 = 未启用。
+    global_daily_calls: int = 0
+    global_daily_tokens: int = 0
+    # 自然月上限（所有会话合计）；0 = 未启用。
+    monthly_calls: int = 0
+    monthly_tokens: int = 0
+    # 月度费用上限；0 = 不限制。单价按百万 token 估算。
+    monthly_cost_limit: float = 0.0
+    currency: str = "CNY"
+    price_input_per_million: float = 0.0
+    price_output_per_million: float = 0.0
+    # 额度用到这些比例时发预警；升序去重，每项 0 < r <= 1。
+    warning_ratios: tuple[float, ...] = (0.5, 0.8, 1.0)
+    # 超限动作：degrade = 只停非点名回复；stop = 全部停用；notify = 只告警。
+    on_exceed: str = "degrade"
 
 
 @dataclass(frozen=True)
@@ -324,6 +339,85 @@ def _build_ambient_ratio(raw: dict[str, Any]) -> float:
     if not 0 < ratio <= 1:
         raise ConfigError("budget.ambient_ratio 必须在 (0, 1] 之间")
     return ratio
+
+
+def _build_warning_ratios(raw: dict[str, Any]) -> tuple[float, ...]:
+    values = raw.get("warning_ratios", [0.5, 0.8, 1.0])
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ConfigError("budget.warning_ratios 必须是非空列表")
+    ratios: list[float] = []
+    for value in values:
+        ratio = _float(value, "budget.warning_ratios")
+        if not 0 < ratio <= 1:
+            raise ConfigError("budget.warning_ratios 的每一项都必须在 (0, 1] 之间")
+        ratios.append(ratio)
+    return tuple(sorted(set(ratios)))
+
+
+def _build_budget(raw: dict[str, Any]) -> BudgetConfig:
+    """预算段：daily 是每群硬上限，其余为 0 表示未启用。"""
+    daily_calls = _int(raw.get("daily_calls", 200), "budget.daily_calls")
+    if daily_calls < 1:
+        raise ConfigError("budget.daily_calls 必须大于 0")
+    daily_tokens = _int(raw.get("daily_tokens", 300000), "budget.daily_tokens")
+    if daily_tokens < 1:
+        raise ConfigError("budget.daily_tokens 必须大于 0")
+
+    global_daily_calls = _non_negative_int(
+        raw.get("global_daily_calls"), "budget.global_daily_calls", 0
+    )
+    global_daily_tokens = _non_negative_int(
+        raw.get("global_daily_tokens"), "budget.global_daily_tokens", 0
+    )
+    monthly_calls = _non_negative_int(raw.get("monthly_calls"), "budget.monthly_calls", 0)
+    monthly_tokens = _non_negative_int(
+        raw.get("monthly_tokens"), "budget.monthly_tokens", 0
+    )
+
+    monthly_cost_limit = _float(
+        raw.get("monthly_cost_limit", 0.0), "budget.monthly_cost_limit"
+    )
+    price_input = _float(
+        raw.get("price_input_per_million", 0.0), "budget.price_input_per_million"
+    )
+    price_output = _float(
+        raw.get("price_output_per_million", 0.0), "budget.price_output_per_million"
+    )
+    if monthly_cost_limit < 0:
+        raise ConfigError("budget.monthly_cost_limit 必须大于等于 0")
+    if price_input < 0:
+        raise ConfigError("budget.price_input_per_million 必须大于等于 0")
+    if price_output < 0:
+        raise ConfigError("budget.price_output_per_million 必须大于等于 0")
+    if monthly_cost_limit > 0 and price_input <= 0 and price_output <= 0:
+        raise ConfigError(
+            "budget.monthly_cost_limit 大于 0 时，"
+            "price_input_per_million 与 price_output_per_million 至少要有一个大于 0"
+        )
+
+    on_exceed = str(raw.get("on_exceed", "degrade") or "").strip().casefold()
+    if on_exceed not in ("degrade", "stop", "notify"):
+        raise ConfigError("budget.on_exceed 只能是 degrade、stop 或 notify")
+
+    currency = str(raw.get("currency", "CNY") or "").strip()
+    if not currency:
+        raise ConfigError("budget.currency 不能为空")
+
+    return BudgetConfig(
+        daily_calls=daily_calls,
+        daily_tokens=daily_tokens,
+        ambient_ratio=_build_ambient_ratio(raw),
+        global_daily_calls=global_daily_calls,
+        global_daily_tokens=global_daily_tokens,
+        monthly_calls=monthly_calls,
+        monthly_tokens=monthly_tokens,
+        monthly_cost_limit=monthly_cost_limit,
+        currency=currency,
+        price_input_per_million=price_input,
+        price_output_per_million=price_output,
+        warning_ratios=_build_warning_ratios(raw),
+        on_exceed=on_exceed,
+    )
 
 
 def _build_alerts(raw: dict[str, Any]) -> AlertsConfig:
@@ -802,11 +896,7 @@ def load_settings(
             blacklist=_int_set(_section(raw, "groups").get("blacklist"), "groups.blacklist"),
             admins=_int_set(_section(raw, "groups").get("admins"), "groups.admins"),
         ),
-        budget=BudgetConfig(
-            daily_calls=_int(budget_raw.get("daily_calls", 200), "budget.daily_calls"),
-            daily_tokens=_int(budget_raw.get("daily_tokens", 300000), "budget.daily_tokens"),
-            ambient_ratio=_build_ambient_ratio(budget_raw),
-        ),
+        budget=_build_budget(budget_raw),
         memory=MemoryConfig(
             window_size=window_size,
             impression_topk=_int(memory_raw.get("impression_topk", 5), "memory.impression_topk"),
