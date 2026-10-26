@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from dafeiyu.supervisor.auth import COOKIE_NAME, DashboardAuth
@@ -116,7 +117,7 @@ async def test_unauthenticated_page_redirects_and_api_returns_401(
             assert resp.status == 401, path
             assert await resp.json() == {"error": "unauthorized"}, path
 
-        for path in ("/api/control/stop", "/api/auth/logout"):
+        for path in ("/api/control/stop", "/api/auth/logout", "/api/debug/trigger"):
             resp = await client.post(path, json={"target": "all"})
             assert resp.status == 401, path
         assert supervisor.calls == []
@@ -176,6 +177,46 @@ async def test_login_sets_secure_cookie_and_grants_access(tmp_path: Path) -> Non
         assert control.status == 200
     finally:
         await client.close()
+
+
+async def test_authenticated_backup_is_proxied(tmp_path: Path) -> None:
+    async def backup(_: web.Request) -> web.Response:
+        return web.Response(
+            body=b"snapshot-bytes",
+            headers={"Content-Disposition": 'attachment; filename="backup.db"'},
+        )
+
+    bot_app = web.Application()
+    bot_app.router.add_get("/api/backup", backup)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    dash_client = None
+    try:
+        bot_url = str(bot_client.server.make_url("/")).rstrip("/")
+        app = create_app(
+            FakeSupervisor(),
+            settings=None,
+            logs=LogHub(tmp_path / "logs"),
+            qr_path=tmp_path / "qrcode.png",
+            bot_url=bot_url,
+            auth=make_auth(),
+        )
+        dash_client = TestClient(TestServer(app))
+        await dash_client.start_server()
+
+        login = await dash_client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": PASSWORD},
+        )
+        assert login.status == 204
+        resp = await dash_client.get("/api/backup")
+        assert resp.status == 200
+        assert await resp.read() == b"snapshot-bytes"
+        assert "attachment" in resp.headers["Content-Disposition"]
+    finally:
+        if dash_client is not None:
+            await dash_client.close()
+        await bot_client.close()
 
 
 async def test_wrong_password_is_rate_limited(tmp_path: Path) -> None:
