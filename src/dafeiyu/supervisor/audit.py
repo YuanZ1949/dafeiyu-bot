@@ -31,7 +31,8 @@ FIELDS = (
 _SENSITIVE_KEY = re.compile(
     r"(?i)^(?:[a-z0-9]+[-_])*"
     r"(?:authorization|set[-_]cookie|x[-_]control[-_]token"
-    r"|api[-_]?key|apikey|password|passwd|secret|token)$"
+    r"|api[-_]?key|apikey|(?:secret|private|access)[-_]?key"
+    r"|password|passwd|secret|token)$"
 )
 
 

@@ -51,6 +51,19 @@ def test_loghub_redacts_json_event_line(tmp_path: Path) -> None:
     assert "sk-live-9" not in disk
 
 
+def test_loghub_redacts_sse_events(tmp_path: Path) -> None:
+    """SSE 订阅队列拿到的也是同一份脱敏文本。"""
+    hub = LogHub(tmp_path / "logs")
+    queue = hub.subscribe("bot")
+
+    hub.write("bot", "Authorization: Bearer abc")
+
+    seq, entry = queue.get_nowait()
+    assert seq == 1
+    assert "Authorization: ***" in entry
+    assert "abc" not in entry
+
+
 def test_audit_detail_is_redacted_recursively(tmp_path: Path) -> None:
     audit = AuditLog(tmp_path / "audit.jsonl")
     audit.write(
@@ -67,6 +80,47 @@ def test_audit_detail_is_redacted_recursively(tmp_path: Path) -> None:
     assert detail["note"] == "token 用量"
     assert detail["nested"]["Authorization"] == "***"
     assert detail["nested"]["items"] == ["api_key: ***", 3]
+
+
+def test_audit_sensitive_key_object_is_masked_whole(tmp_path: Path) -> None:
+    """敏感键的值即使是嵌套对象也整体打码（fail-closed，宁可丢结构）。"""
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    audit.write("ops.test", detail={"token": {"sub": "abc", "exp": 1}})
+
+    assert audit.query()[0]["detail"] == {"token": "***"}
+
+
+def test_audit_prefixed_and_compound_keys_are_masked(tmp_path: Path) -> None:
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    audit.write(
+        "ops.test",
+        detail={
+            "DEEPSEEK_API_KEY": "sk-live-1",
+            "napcat_token": "abc",
+            "secret_key": "abc",
+            "private_key": "abc",
+            "access_key": "abc",
+        },
+    )
+
+    detail = audit.query()[0]["detail"]
+    assert set(detail.values()) == {"***"}
+
+
+def test_audit_token_usage_keys_are_not_masked(tmp_path: Path) -> None:
+    """描述性键不带凭据语义，保持原样。"""
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    audit.write(
+        "ops.test",
+        detail={"token_usage": 1234, "note": "token 用量", "token_usage_note": "abc"},
+    )
+
+    detail = audit.query()[0]["detail"]
+    assert detail == {
+        "token_usage": 1234,
+        "note": "token 用量",
+        "token_usage_note": "abc",
+    }
 
 
 def test_audit_sanitize_runs_before_redaction(tmp_path: Path) -> None:

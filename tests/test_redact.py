@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from dafeiyu.supervisor.redact import redact
@@ -24,6 +26,45 @@ def test_redact_secrets(raw: str, expected: str) -> None:
 
 def test_redact_keeps_chinese_token_usage() -> None:
     assert redact("今日 token 用量 1234") == "今日 token 用量 1234"
+
+
+def test_redact_keeps_token_usage_key_unchanged() -> None:
+    """token_usage 是描述性键，不是凭据。"""
+    assert redact("token_usage: 1234") == "token_usage: 1234"
+
+
+def test_redact_prefixed_credentials() -> None:
+    """带前缀的凭据键不能漏：\\b 被下划线挡住的老问题。"""
+    assert redact("DEEPSEEK_API_KEY: sk-live-1") == "DEEPSEEK_API_KEY: ***"
+    assert redact("my_api_key: sk-live-1") == "my_api_key: ***"
+    assert redact("SECRET_KEY=abc") == "SECRET_KEY=***"
+    assert redact("my_private_key: abc") == "my_private_key: ***"
+    assert redact("ACCESS_KEY=abc") == "ACCESS_KEY=***"
+
+
+def test_redact_prefixed_credentials_in_json() -> None:
+    assert redact('{"DEEPSEEK_API_KEY": "sk-live-1"}') == '{"DEEPSEEK_API_KEY": "***"}'
+    assert redact("{'my_api_key': 'sk-live-1'}") == "{'my_api_key': '***'}"
+    assert (
+        redact('{"my_private_key": "abc", "n": 1}')
+        == '{"my_private_key": "***", "n": 1}'
+    )
+
+
+def test_redact_canonicalizes_lowercase_security_headers() -> None:
+    """三个安全头输出规范头名，其余键名不归一化。"""
+    assert redact("set-cookie: sid=abc; HttpOnly") == "Set-Cookie: ***"
+    assert redact("x-control-token: s3cret") == "X-Control-Token: ***"
+
+
+def test_redact_json_unterminated_value_terminates_fast() -> None:
+    """回归：引号值分支曾指数回溯（200 个反斜杠 + 无闭合引号会挂死）。"""
+    raw = '{"token": "' + "\\" * 200
+    started = time.perf_counter()
+    out = redact(raw)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.5, f"redact 耗时 {elapsed:.3f}s"
+    assert out == raw  # 没有闭合引号，无法安全判定值边界 → 原样返回
 
 
 def test_redact_preserves_original_key_case() -> None:

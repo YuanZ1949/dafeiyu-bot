@@ -16,11 +16,15 @@ from __future__ import annotations
 import re
 
 # 整行型规则：值可以含空格、分号、等号，一路吃到行尾（保留行终止符）。
+# 头名后的空白只用 [ \t]*（不能用 \s*，否则可能跨行吃到下一行）。
 _HEADER_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"(?im)^([ \t]*)set-cookie\s*:[^\r\n]*"), r"\1Set-Cookie: ***"),
-    (re.compile(r"(?im)^([ \t]*)authorization\s*:[^\r\n]*"), r"\1Authorization: ***"),
+    (re.compile(r"(?im)^([ \t]*)set-cookie[ \t]*:[^\r\n]*"), r"\1Set-Cookie: ***"),
     (
-        re.compile(r"(?im)^([ \t]*)x-control-token\s*:[^\r\n]*"),
+        re.compile(r"(?im)^([ \t]*)authorization[ \t]*:[^\r\n]*"),
+        r"\1Authorization: ***",
+    ),
+    (
+        re.compile(r"(?im)^([ \t]*)x-control-token[ \t]*:[^\r\n]*"),
         r"\1X-Control-Token: ***",
     ),
 )
@@ -28,9 +32,13 @@ _HEADER_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
 # 行内规则：Bearer 令牌、key: value / key=value、大写环境变量键。
 _INLINE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?im)(Bearer\s+)[A-Za-z0-9._~+/=-]+"), r"\1***"),
+    # 前置边界用 (?<![A-Za-z0-9])：\b 在 ``DEEPSEEK_API_KEY`` 里被下划线挡住，
+    # 会漏掉带前缀的凭据；这里只禁止「紧贴字母数字」，允许 ``_`` / ``-`` 前缀。
     (
         re.compile(
-            r"(?im)\b(api[_-]?key|apikey|password|passwd|secret|token)\b"
+            r"(?im)(?<![A-Za-z0-9])"
+            r"(api[_-]?key|apikey|(?:secret|private|access)[-_]?key"
+            r"|password|passwd|secret|token)\b"
             r"(\s*[:=]\s*)([^\s,;]+)"
         ),
         r"\1\2***",
@@ -42,11 +50,14 @@ _INLINE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         r"\1\2***",
     ),
     # JSON 形态："token": "sk-1"（opencode 事件流常见）；引号与结构保持原样。
+    # 引号值分支必须互斥（\\. 与 [^"\\\n]），否则 ``(?:\\.|[^\n])*?`` 会指数回溯。
     (
         re.compile(
-            r'(?im)(["\'](?:api[-_]?key|apikey|password|passwd|secret|token'
+            r'(?im)(["\'](?:[A-Za-z0-9]+[-_])*'
+            r"(?:api[-_]?key|apikey|(?:secret|private|access)[-_]?key"
+            r"|password|passwd|secret|token"
             r'|authorization|set-cookie|x-control-token)["\']\s*:\s*)'
-            r'(["\'])(?:\\.|[^\n])*?\2'
+            r'(["\'])(?:\\.|[^"\\\n])*?\2'
         ),
         r"\1\2***\2",
     ),
