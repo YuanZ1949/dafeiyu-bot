@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Collection
 from http import HTTPStatus
@@ -148,6 +149,10 @@ class QQAdapter:
         self._echo = count(1)
         self._tasks: set[asyncio.Task[None]] = set()
         self._bound_port = port
+        # 只记录时间戳，供健康快照使用；不保留消息内容。
+        self.last_event_at: float | None = None
+        self.last_disconnect_at: float | None = None
+        self.last_send_at: float | None = None
 
     @property
     def port(self) -> int:
@@ -204,6 +209,7 @@ class QQAdapter:
         finally:
             self._pending.pop(echo, None)
 
+        self.last_send_at = time.time()
         message_id = data.get("message_id")
         if message_id is not None:
             try:
@@ -230,6 +236,7 @@ class QQAdapter:
         except ConnectionClosed:
             pass
         finally:
+            self.last_disconnect_at = time.time()
             if self._ws is ws:
                 self._ws = None
             self._fail_pending(GatewayError("QQ 网关连接已断开"))
@@ -248,6 +255,7 @@ class QQAdapter:
             event = parse_event(data, self._bot_qq, self.bot_message_ids)
             if event is None or self._handler is None:
                 return
+            self.last_event_at = time.time()
             task = asyncio.create_task(self._run_handler(event))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)

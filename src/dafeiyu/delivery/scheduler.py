@@ -91,6 +91,14 @@ class BatchScheduler:
             key=lambda key: (key[0].value, key[1]),
         )
 
+    def pending_count(self) -> int:
+        """排队中的会话数（健康快照用；语义与 pending_chats 一致）。"""
+        return len(self.pending_chats())
+
+    def inflight_count(self) -> int:
+        """正在投递的会话数。"""
+        return len(self._inflight)
+
     async def drain(self) -> None:
         """同步跑完当前所有到期批次（测试与停机用，不等下一拍）。"""
         while True:

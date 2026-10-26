@@ -22,12 +22,13 @@ from .brain.factory import (
     mode_status,
     normalize_provider,
 )
+from . import __version__
 from .config import ConfigError, Settings
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
 from .models import ChatType, Message
 from .runtime import RuntimeState, load_runtime, save_runtime
 from .service import BRAIN_ERROR_COOLDOWN_SECONDS, TOOL_HINT_INTERVAL_SECONDS
-from .timeutil import SHANGHAI
+from .timeutil import SHANGHAI, now_shanghai
 from .workers.failure import (
     QUOTA_KEY,
     QUOTA_PAUSE_SECONDS,
@@ -45,6 +46,26 @@ MAX_IMPRESSION_CHARS = 200
 MAX_DEBUG_MESSAGE_CHARS = 2000
 MAX_DEBUG_NICKNAME_CHARS = 40
 IMPRESSION_KINDS = {"nickname", "preference", "fact"}
+# 进程启动时刻：健康快照的 uptime 基准。
+PROCESS_STARTED_AT = time.monotonic()
+# 健康快照里「最近错误」的统计窗口。
+ERROR_STATS_WINDOW_SECONDS = 3600
+# 运维通知：正文上限与进程内最小间隔。
+MAX_NOTIFY_CHARS = 1000
+MAX_DEDUPE_KEY_CHARS = 64
+NOTIFY_MIN_INTERVAL_SECONDS = 10.0
+
+
+def _iso_ts(timestamp: Any) -> str | None:
+    """秒级时间戳 → 上海时区 ISO；没有时间戳时返回 None。"""
+    if not timestamp:
+        return None
+    try:
+        return datetime.fromtimestamp(float(timestamp), SHANGHAI).isoformat(
+            timespec="seconds"
+        )
+    except (TypeError, ValueError, OSError):
+        return None
 
 
 def _parse_impression_id(raw: str) -> tuple[int | None, web.Response | None]:
@@ -268,6 +289,7 @@ class BrainControl:
         self.runtime_path = runtime_path
         self.runtime: RuntimeState = load_runtime(runtime_path)
         self._lock = asyncio.Lock()
+        self._last_notify_at: float | None = None
 
     def snapshot(self) -> dict[str, Any]:
         provider = current_provider(self.settings, self.runtime)
@@ -282,6 +304,115 @@ class BrainControl:
             "model": model,
             "modes": mode_status(self.settings, self.runtime),
             "gateway_connected": bool(getattr(self.adapter, "connected", False)),
+        }
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """给 supervisor 与 dashboard 用的不可变健康快照。
+
+        只含计数与时间戳，不含消息正文、昵称、token、API Key。
+        读库失败时 ``ok=False`` 并记录时间，绝不把异常抛给探活方。
+        """
+        generated_at = now_shanghai().isoformat(timespec="seconds")
+        state = self.snapshot()
+
+        memory: dict[str, Any] = {
+            "db_path": "",
+            "db_bytes": 0,
+            "wal_bytes": 0,
+            "message_count": 0,
+            "schema_version": 0,
+        }
+        errors: dict[str, Any] = {"recent_count": 0, "last_error_at": None}
+        today_calls = 0
+        today_tokens = 0
+        quota_until: float | None = None
+        ok = True
+        try:
+            stats = self.store.db_stats()
+            memory = {
+                "db_path": str(stats.get("db_path") or ""),
+                "db_bytes": int(stats.get("db_bytes") or 0),
+                "wal_bytes": int(stats.get("wal_bytes") or 0),
+                "message_count": int(stats.get("message_count") or 0),
+                "schema_version": int(stats.get("schema_version") or 0),
+            }
+            today = self.store.today()
+            today_calls, today_tokens = self.store.usage_totals(today, today)
+            recent = self.store.error_stats(ERROR_STATS_WINDOW_SECONDS)
+            errors = {
+                "recent_count": int(recent.get("count") or 0),
+                "last_error_at": recent.get("last_at"),
+            }
+            quota_until = self.store.load_backoff().get(QUOTA_KEY)
+        except Exception as exc:  # noqa: BLE001 - 探活不能因读库失败而 500
+            ok = False
+            errors["last_error_at"] = generated_at
+            log.warning("读取健康快照统计失败：%s", exc)
+
+        quota_paused = bool(quota_until and float(quota_until) > time.time())
+        scheduler = getattr(self.service, "scheduler", None)
+
+        def _count(name: str) -> int:
+            counter = getattr(scheduler, name, None)
+            if not callable(counter):
+                return 0
+            try:
+                return int(counter())
+            except Exception:  # noqa: BLE001 - 计数失败只降级为 0
+                return 0
+
+        last_event_at = _iso_ts(getattr(self.adapter, "last_event_at", None))
+        return {
+            "ok": ok,
+            "generated_at": generated_at,
+            "uptime_seconds": round(time.monotonic() - PROCESS_STARTED_AT, 1),
+            "version": __version__,
+            "gateway": {
+                "connected": bool(getattr(self.adapter, "connected", False)),
+                "last_event_at": last_event_at,
+                "last_disconnect_at": _iso_ts(
+                    getattr(self.adapter, "last_disconnect_at", None)
+                ),
+            },
+            "traffic": {
+                "last_message_at": last_event_at,
+                "last_reply_at": _iso_ts(getattr(self.adapter, "last_send_at", None)),
+            },
+            "scheduler": {
+                "pending_chats": _count("pending_count"),
+                "inflight_chats": _count("inflight_count"),
+            },
+            "budget": {
+                "per_chat": {
+                    "calls": today_calls,
+                    "tokens": today_tokens,
+                    "daily_calls": self.settings.budget.daily_calls,
+                    "daily_tokens": self.settings.budget.daily_tokens,
+                },
+                # 分册 B 才落地全局/月度/费用预算，A 先保留占位结构。
+                "global_daily": {
+                    "calls": 0,
+                    "tokens": 0,
+                    "limit_calls": 0,
+                    "limit_tokens": 0,
+                },
+                "monthly": {
+                    "calls": 0,
+                    "tokens": 0,
+                    "limit_calls": 0,
+                    "limit_tokens": 0,
+                    "cost": 0.0,
+                    "cost_limit": 0.0,
+                },
+                "warnings": [],
+            },
+            "quota": {
+                "paused_until": float(quota_until) if quota_paused else None,
+                "reason": "额度熔断" if quota_paused else "",
+            },
+            "brain": {"provider": state["provider"], "model": state["model"]},
+            "memory": memory,
+            "errors": errors,
         }
 
     def explain_trigger(
@@ -703,6 +834,54 @@ def create_app(
 
     async def health(_: web.Request) -> web.Response:
         return web.json_response({"ok": True})
+
+    async def health_detail(_: web.Request) -> web.Response:
+        return web.json_response(control.health_snapshot())
+
+    async def notify_admin(request: web.Request) -> web.Response:
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        raw_text = payload.get("text")
+        if not isinstance(raw_text, str):
+            return web.json_response({"error": "text 必须是字符串"}, status=400)
+        text = raw_text.strip()
+        if not text:
+            return web.json_response({"error": "text 不能为空"}, status=400)
+        if len(text) > MAX_NOTIFY_CHARS:
+            return web.json_response(
+                {"error": f"text 不能超过 {MAX_NOTIFY_CHARS} 字"}, status=400
+            )
+        dedupe_key = payload.get("dedupe_key", "")
+        if not isinstance(dedupe_key, str):
+            return web.json_response(
+                {"error": "dedupe_key 必须是字符串"}, status=400
+            )
+        if len(dedupe_key) > MAX_DEDUPE_KEY_CHARS:
+            return web.json_response(
+                {"error": f"dedupe_key 不能超过 {MAX_DEDUPE_KEY_CHARS} 字"}, status=400
+            )
+
+        admins = sorted(control.settings.groups.admins)
+        if not admins:
+            return web.json_response({"error": "未配置管理员"}, status=503)
+        if not bool(getattr(control.adapter, "connected", False)):
+            return web.json_response({"error": "QQ 网关未连接"}, status=503)
+        now = time.monotonic()
+        last = control._last_notify_at
+        if last is not None and now - last < NOTIFY_MIN_INTERVAL_SECONDS:
+            return web.json_response(
+                {"error": "通知过于频繁，请稍后再试"}, status=429
+            )
+
+        target = admins[0]
+        try:
+            await control.adapter.send(ChatType.PRIVATE, target, text)
+        except Exception as exc:  # noqa: BLE001 - 发送失败回 503，不打断告警循环
+            log.warning("管理员通知发送失败：%s", exc)
+            return web.json_response({"error": "管理员通知发送失败"}, status=503)
+        control._last_notify_at = now
+        return web.json_response({"ok": True, "target": target})
 
     async def status(_: web.Request) -> web.Response:
         return web.json_response(control.snapshot())
@@ -1215,6 +1394,8 @@ def create_app(
             )
 
     app.router.add_get("/api/health", health)
+    app.router.add_get("/api/health/detail", health_detail)
+    app.router.add_post("/api/notify/admin", notify_admin)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/brain", get_brain)
     app.router.add_post("/api/brain", post_brain)

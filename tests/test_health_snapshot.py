@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+import json
+from contextlib import asynccontextmanager
+from dataclasses import replace
+from pathlib import Path
+
+from aiohttp.test_utils import TestClient, TestServer
+from conftest import TEST_CONFIG_YAML
+
+from dafeiyu.config import load_settings
+from dafeiyu.control import BrainControl, create_app
+from dafeiyu.memory.store import Store
+from dafeiyu.models import ChatType, Message
+
+
+class FakeBrain:
+    async def aclose(self) -> None:
+        pass
+
+
+class FakeService:
+    def __init__(self) -> None:
+        self.brain = FakeBrain()
+        self.scheduler = None
+
+    def set_brain(self, brain):
+        previous = self.brain
+        self.brain = brain
+        return previous
+
+
+class FakeAdapter:
+    def __init__(self) -> None:
+        self.connected = True
+        self.sent: list[tuple[ChatType, int, str]] = []
+
+    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> None:
+        self.sent.append((chat_type, chat_id, text))
+
+
+@asynccontextmanager
+async def running(app):
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        yield client
+    finally:
+        await client.close()
+
+
+def make_settings(tmp_path: Path, admins: frozenset[int] = frozenset()):
+    config = tmp_path / "config.yaml"
+    config.write_text(TEST_CONFIG_YAML, encoding="utf-8")
+    env = tmp_path / "test.env"
+    env.write_text("BOT_QQ=10001\nDEEPSEEK_API_KEY=sk-test\n", encoding="utf-8")
+    settings = load_settings(env_file=env, config_file=config)
+    if admins:
+        settings = replace(
+            settings, groups=replace(settings.groups, admins=admins)
+        )
+    return settings
+
+
+def make_control(tmp_path: Path, admins: frozenset[int] = frozenset(), token: str = ""):
+    settings = make_settings(tmp_path, admins)
+    store = Store(tmp_path / "test.db")
+    store.init_schema()
+    service = FakeService()
+    adapter = FakeAdapter()
+    control = BrainControl(
+        settings,
+        store,
+        service,
+        adapter,
+        runtime_path=str(tmp_path / "runtime.json"),
+    )
+    return control, adapter, store, create_app(control, token)
+
+
+def test_health_snapshot_shape_and_no_secrets(tmp_path: Path) -> None:
+    control, adapter, store, _app = make_control(tmp_path)
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id=100,
+            user_id=1,
+            nickname="secret-nick",
+            content="hello-secret",
+            message_id="m1",
+            timestamp=1,
+        )
+    )
+    adapter.last_event_at = 1_700_000_000
+    adapter.last_send_at = 1_700_000_100
+
+    snapshot = control.health_snapshot()
+
+    assert snapshot["ok"] is True
+    assert snapshot["version"]
+    assert snapshot["gateway"]["connected"] is True
+    assert snapshot["gateway"]["last_event_at"].startswith("2023-")
+    assert snapshot["traffic"]["last_reply_at"].startswith("2023-")
+    assert snapshot["memory"]["message_count"] == 1
+    assert snapshot["quota"]["reason"] == ""
+    assert set(snapshot["budget"]) >= {"per_chat", "global_daily", "monthly", "warnings"}
+
+    text = json.dumps(snapshot, ensure_ascii=False)
+    assert "hello-secret" not in text
+    assert "secret-nick" not in text
+    assert "sk-test" not in text
+
+
+def test_health_snapshot_db_failure_is_reported(tmp_path: Path, monkeypatch) -> None:
+    control, _adapter, store, _app = make_control(tmp_path)
+
+    def boom():
+        raise RuntimeError("db broken")
+
+    monkeypatch.setattr(store, "db_stats", boom)
+    snapshot = control.health_snapshot()
+
+    assert snapshot["ok"] is False
+    assert snapshot["errors"]["last_error_at"]
+
+
+def test_health_snapshot_counts_scheduler(tmp_path: Path) -> None:
+    control, _adapter, _store, _app = make_control(tmp_path)
+
+    class Scheduler:
+        def pending_count(self):
+            return 3
+
+        def inflight_count(self):
+            return 1
+
+    control.service.scheduler = Scheduler()
+    snapshot = control.health_snapshot()
+    assert snapshot["scheduler"] == {"pending_chats": 3, "inflight_chats": 1}
+
+
+async def test_health_detail_requires_token(tmp_path: Path) -> None:
+    _control, _adapter, _store, app = make_control(tmp_path, token="t")
+    async with running(app) as client:
+        resp = await client.get("/api/health")
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True}
+
+        resp = await client.get("/api/health/detail")
+        assert resp.status == 401
+
+        resp = await client.get(
+            "/api/health/detail", headers={"X-Control-Token": "t"}
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["ok"] is True
+        assert "gateway" in data
+
+
+async def test_notify_admin_sends_to_first_admin(tmp_path: Path) -> None:
+    _control, adapter, _store, app = make_control(
+        tmp_path, admins=frozenset({12345}), token="t"
+    )
+    headers = {"X-Control-Token": "t"}
+    async with running(app) as client:
+        resp = await client.post(
+            "/api/notify/admin", json={"text": "告警", "dedupe_key": "bot_down"}, headers=headers
+        )
+        assert resp.status == 200
+        assert adapter.sent == [(ChatType.PRIVATE, 12345, "告警")]
+
+
+async def test_notify_admin_validates_payload_and_limits(tmp_path: Path) -> None:
+    _control, adapter, _store, app = make_control(
+        tmp_path, admins=frozenset({12345}), token="t"
+    )
+    headers = {"X-Control-Token": "t"}
+    async with running(app) as client:
+        assert (
+            await client.post("/api/notify/admin", json={}, headers=headers)
+        ).status == 400
+        assert (
+            await client.post(
+                "/api/notify/admin", json={"text": "x" * 1001}, headers=headers
+            )
+        ).status == 400
+
+        assert (
+            await client.post(
+                "/api/notify/admin", json={"text": "a"}, headers=headers
+            )
+        ).status == 200
+        assert (
+            await client.post(
+                "/api/notify/admin", json={"text": "b"}, headers=headers
+            )
+        ).status == 429
+        assert len(adapter.sent) == 1
+
+
+async def test_notify_admin_unavailable_without_admin_or_gateway(
+    tmp_path: Path,
+) -> None:
+    _control, adapter, _store, app = make_control(tmp_path, token="t")
+    headers = {"X-Control-Token": "t"}
+    async with running(app) as client:
+        assert (
+            await client.post("/api/notify/admin", json={"text": "a"}, headers=headers)
+        ).status == 503
+
+    (tmp_path / "second").mkdir()
+    control, adapter, _store, app = make_control(
+        tmp_path / "second", admins=frozenset({1}), token="t"
+    )
+    adapter.connected = False
+    async with running(app) as client:
+        assert (
+            await client.post("/api/notify/admin", json={"text": "a"}, headers=headers)
+        ).status == 503
