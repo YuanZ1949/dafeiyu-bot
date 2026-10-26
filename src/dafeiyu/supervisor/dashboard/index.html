@@ -140,6 +140,73 @@
   .session-row .meta { color: var(--muted); font-size: 12px; flex: 1; min-width: 180px; }
   .session-row .acts { display: flex; gap: 6px; flex-wrap: wrap; }
   .session-row .btn { padding: 4px 9px; font-size: 12px; }
+  body.timeline-open { overflow: hidden; }
+  .drawer-backdrop {
+    position: fixed; inset: 0; z-index: 15;
+    background: rgba(0, 0, 0, .55);
+  }
+  .timeline-drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; z-index: 20;
+    width: min(960px, 96vw); display: flex; flex-direction: column;
+    background: var(--bg); border-left: 1px solid var(--line);
+    box-shadow: -16px 0 40px rgba(0, 0, 0, .45);
+  }
+  .timeline-drawer[hidden], .drawer-backdrop[hidden] { display: none; }
+  .timeline-head {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 14px 18px; border-bottom: 1px solid var(--line);
+  }
+  .timeline-head h2 { margin: 0; font-size: 15px; }
+  .timeline-head .spacer { flex: 1; }
+  .timeline-metrics {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+    gap: 8px; padding: 12px 18px; border-bottom: 1px solid var(--line);
+  }
+  .timeline-metric {
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px;
+    background: var(--panel);
+  }
+  .timeline-metric .label { color: var(--muted); font-size: 11px; }
+  .timeline-metric .value { font-weight: 600; margin-top: 2px; }
+  .timeline-toolbar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 9px 18px; border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .timeline-body {
+    flex: 1; overflow: auto; padding: 14px 18px;
+    display: grid; align-content: start; gap: 8px;
+  }
+  .timeline-date {
+    color: var(--muted); font-size: 12px; text-align: center;
+    padding: 6px 0 2px; border-bottom: 1px dashed var(--line);
+  }
+  .timeline-msg {
+    border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 8px 10px; background: var(--panel-2);
+    max-width: 88%;
+  }
+  .timeline-msg.bot {
+    margin-left: auto; border-left-color: var(--ok); background: #16221c;
+  }
+  .timeline-msg.hit {
+    outline: 2px solid var(--warn); background: #2a2413;
+    transition: background .3s;
+  }
+  .timeline-msg-head {
+    display: flex; align-items: baseline; gap: 8px;
+    color: var(--muted); font-size: 12px; margin-bottom: 4px;
+  }
+  .timeline-msg-head b { color: var(--text); font-weight: 600; }
+  .timeline-msg-text { white-space: pre-wrap; word-break: break-word; }
+  .timeline-flags { color: var(--warn); font-size: 11px; margin-top: 5px; }
+  .timeline-context {
+    border-top: 1px solid var(--line); padding: 10px 18px 16px;
+    max-height: 34vh; overflow: auto; background: var(--panel);
+  }
+  .timeline-context summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  .timeline-context h3 { font-size: 12px; color: var(--muted); margin: 10px 0 6px; }
+  .timeline-context .mem-list { max-height: none; }
   .cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 6px 18px; }
   .cfg-grid b { color: var(--text); font-weight: 600; }
 </style>
@@ -292,6 +359,29 @@
   </section>
 </main>
 
+<div class="drawer-backdrop" id="timeline-backdrop" hidden></div>
+<aside class="timeline-drawer" id="timeline-drawer" hidden aria-label="会话时间线">
+  <div class="timeline-head">
+    <div>
+      <h2 id="timeline-title">会话时间线</h2>
+      <div class="kv" id="timeline-subtitle">只读 · 消息与记忆上下文</div>
+    </div>
+    <span class="spacer"></span>
+    <button class="btn" id="btn-timeline-close">关闭</button>
+  </div>
+  <div class="timeline-metrics" id="timeline-metrics"></div>
+  <div class="timeline-toolbar">
+    <button class="btn" id="btn-timeline-earlier" disabled>加载更早</button>
+    <button class="btn" id="btn-timeline-latest">回到最新</button>
+    <span class="kv" id="timeline-hint"></span>
+  </div>
+  <div class="timeline-body" id="timeline-messages"></div>
+  <details class="timeline-context" open>
+    <summary>会话摘要 / 按日摘要 / 印象</summary>
+    <div id="timeline-context"></div>
+  </details>
+</aside>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -308,6 +398,12 @@ let selectedProvider = null;
 let selectedModel = "";
 let currentSource = "bot";
 let eventSource = null;
+
+const TIMELINE_PAGE = 50;
+let timelineTarget = null;
+let timelineNextBefore = null;
+let timelineHasMore = false;
+let timelineReq = 0;
 
 const $ = (id) => document.getElementById(id);
 
@@ -779,10 +875,23 @@ async function searchMessages(append) {
     const box = $("search-results");
     if (!append) box.replaceChildren();
     items.forEach((m) => {
-      box.appendChild(memItem(
+      const item = memItem(
         `${chatName(m.chat_type, m.chat_id)} · ${m.at || "—"} · ${m.is_bot ? "大肥鱼" : m.nickname}`,
         m.snippet || m.content
+      );
+      const actions = document.createElement("div");
+      actions.className = "mem-actions";
+      const locate = document.createElement("button");
+      locate.className = "btn";
+      locate.textContent = "定位";
+      locate.title = "在时间线中查看这条消息";
+      locate.addEventListener("click", () => openTimeline(
+        { chat_type: m.chat_type, chat_id: m.chat_id },
+        m.message_id
       ));
+      actions.appendChild(locate);
+      item.appendChild(actions);
+      box.appendChild(item);
     });
     searchTotal = data.total || 0;
     searchOffset = (append ? searchOffset : 0) + items.length;
@@ -831,6 +940,7 @@ async function loadSessions(append = false) {
         btn.addEventListener("click", onClick);
         acts.appendChild(btn);
       };
+      add("查看时间线", "", () => openTimeline(s));
       add("新建会话", "", () => sessionAction(s, "new", "只清 session 映射，消息和摘要都会保留。继续？"));
       add("软忘记", "", () => sessionAction(s, "forget", "将清空该会话的消息和映射，保留摘要与印象。继续？"));
       add("彻底删除", "danger", () => hardDeleteSession(s));
@@ -1010,6 +1120,200 @@ async function applyBrain() {
   }
 }
 
+function timelineDay(timestamp) {
+  if (!timestamp) return "未知日期";
+  return new Date(timestamp * 1000).toLocaleDateString("zh-CN");
+}
+
+function renderTimelineMessages(messages) {
+  const fragment = document.createDocumentFragment();
+  let lastDay = "";
+  messages.forEach((m) => {
+    const day = timelineDay(m.timestamp);
+    if (day !== lastDay) {
+      const sep = document.createElement("div");
+      sep.className = "timeline-date";
+      sep.textContent = day;
+      fragment.appendChild(sep);
+      lastDay = day;
+    }
+    const item = document.createElement("div");
+    item.className = `timeline-msg${m.is_bot ? " bot" : ""}`;
+    item.dataset.messageId = m.message_id || "";
+    const head = document.createElement("div");
+    head.className = "timeline-msg-head";
+    const who = document.createElement("b");
+    who.textContent = m.is_bot ? "大肥鱼" : (m.nickname || "未知用户");
+    const at = document.createElement("span");
+    at.textContent = m.at || "—";
+    head.append(who, at);
+    const text = document.createElement("div");
+    text.className = "timeline-msg-text";
+    text.textContent = m.content || "";
+    item.append(head, text);
+    const flags = [];
+    if (m.at_bot) flags.push("点名");
+    if (m.reply_to_bot) flags.push("回复大肥鱼");
+    if (flags.length) {
+      const flag = document.createElement("div");
+      flag.className = "timeline-flags";
+      flag.textContent = flags.join(" · ");
+      item.appendChild(flag);
+    }
+    fragment.appendChild(item);
+  });
+  return fragment;
+}
+
+function renderTimelineMetrics(data) {
+  const chat = data.chat || {};
+  const usage = data.usage || {};
+  const session = data.session || {};
+  const metrics = [
+    ["消息", chat.message_total ?? 0],
+    ["摘要", chat.summary_total ?? 0],
+    ["印象", chat.impression_total ?? 0],
+    ["今日调用", `${usage.calls ?? 0} 次`],
+    ["今日 token", fmtTokens(usage.tokens || 0)],
+    ["累计投递", session.delivered_count ?? 0],
+    ["token 估算", fmtTokens(session.token_estimate || 0)],
+  ];
+  $("timeline-metrics").replaceChildren(
+    ...metrics.map(([label, value]) => {
+      const item = document.createElement("div");
+      item.className = "timeline-metric";
+      const name = document.createElement("div");
+      name.className = "label";
+      name.textContent = label;
+      const text = document.createElement("div");
+      text.className = "value";
+      text.textContent = String(value);
+      item.append(name, text);
+      return item;
+    })
+  );
+}
+
+function renderTimelineContext(data) {
+  const box = $("timeline-context");
+  box.replaceChildren();
+  const addBlock = (title, items) => {
+    const heading = document.createElement("h3");
+    heading.textContent = title;
+    box.appendChild(heading);
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "mem-empty";
+      empty.textContent = "暂无";
+      box.appendChild(empty);
+      return;
+    }
+    const list = document.createElement("div");
+    list.className = "mem-list";
+    items.forEach((item) => list.appendChild(item));
+    box.appendChild(list);
+  };
+
+  const summaryItems = [];
+  if (data.session_summary) {
+    summaryItems.push(memItem("跨轮会话摘要", data.session_summary));
+  }
+  addBlock("会话摘要", summaryItems);
+  addBlock(
+    "按日摘要",
+    (data.summaries || []).map((s) => memItem(s.date, s.content))
+  );
+  addBlock(
+    "印象",
+    (data.impressions || []).map((i) => {
+      const confidence = Math.round((i.confidence || 0) * 100);
+      const source = i.source_message_id ? ` · 来源 ${i.source_message_id}` : "";
+      return memItem(`${i.kind} · ${confidence}%${source}`, i.content);
+    })
+  );
+}
+
+async function loadTimeline({ append = false, anchor = null, scroll = "bottom" } = {}) {
+  if (!timelineTarget) return;
+  if (append && !timelineNextBefore) return;
+  const req = ++timelineReq;
+  const params = new URLSearchParams({ limit: String(TIMELINE_PAGE) });
+  if (append) params.set("before", String(timelineNextBefore));
+  else if (anchor) params.set("anchor", anchor);
+
+  const path =
+    `/api/sessions/${timelineTarget.chat_type}/${timelineTarget.chat_id}/timeline` +
+    `?${params.toString()}`;
+  try {
+    const data = await api(path);
+    if (req !== timelineReq) return;
+    const messages = data.messages || [];
+    const box = $("timeline-messages");
+    if (append) {
+      const previousHeight = box.scrollHeight;
+      box.prepend(renderTimelineMessages(messages));
+      box.scrollTop += box.scrollHeight - previousHeight;
+    } else {
+      box.replaceChildren(renderTimelineMessages(messages));
+      if (!messages.length) {
+        box.innerHTML = '<div class="mem-empty">这个会话还没有消息</div>';
+      }
+    }
+
+    timelineNextBefore = data.next_before ?? null;
+    timelineHasMore = Boolean(data.has_more);
+    $("btn-timeline-earlier").disabled = !timelineHasMore;
+    renderTimelineMetrics(data);
+    renderTimelineContext(data);
+    $("timeline-hint").textContent =
+      `本页 ${messages.length} 条 · 会话共 ${(data.chat || {}).message_total ?? 0} 条`;
+
+    if (!append && anchor && !data.anchor_found) {
+      toast("没有找到这条消息，已显示最新消息", true);
+    }
+    if (!append && anchor && data.anchor_found) {
+      const hit = box.querySelector(`[data-message-id="${CSS.escape(anchor)}"]`);
+      if (hit) {
+        hit.classList.add("hit");
+        hit.scrollIntoView({ block: "center" });
+        setTimeout(() => hit.classList.remove("hit"), 3000);
+        return;
+      }
+    }
+    if (!append && scroll === "bottom") box.scrollTop = box.scrollHeight;
+  } catch (err) {
+    if (req !== timelineReq) return;
+    $("timeline-hint").textContent = `读取失败：${err.message}`;
+    toast(`读取时间线失败：${err.message}`, true);
+  }
+}
+
+async function openTimeline(session, anchorMessageId = null) {
+  timelineTarget = session;
+  timelineNextBefore = null;
+  timelineHasMore = false;
+  const drawer = $("timeline-drawer");
+  drawer.hidden = false;
+  $("timeline-backdrop").hidden = false;
+  document.body.classList.add("timeline-open");
+  $("timeline-title").textContent = `会话时间线 · ${chatName(session.chat_type, session.chat_id)}`;
+  $("timeline-subtitle").textContent = "只读 · 消息与记忆上下文";
+  $("timeline-messages").replaceChildren();
+  $("timeline-metrics").replaceChildren();
+  $("timeline-context").replaceChildren();
+  $("timeline-hint").textContent = "加载中…";
+  $("btn-timeline-earlier").disabled = true;
+  await loadTimeline({ anchor: anchorMessageId, scroll: "bottom" });
+}
+
+function closeTimeline() {
+  timelineReq += 1;
+  timelineTarget = null;
+  $("timeline-drawer").hidden = true;
+  $("timeline-backdrop").hidden = true;
+  document.body.classList.remove("timeline-open");
+}
+
 function setLogSource(source) {
   currentSource = source;
   document.querySelectorAll("#log-tabs .tab").forEach((el) => {
@@ -1092,6 +1396,19 @@ $("btn-shutdown").addEventListener("click", async () => {
   } catch (err) {
     toast(`退出失败：${err.message}`, true);
   }
+});
+$("btn-timeline-close").addEventListener("click", closeTimeline);
+$("timeline-backdrop").addEventListener("click", closeTimeline);
+$("btn-timeline-earlier").addEventListener("click", () => {
+  loadTimeline({ append: true, scroll: "none" });
+});
+$("btn-timeline-latest").addEventListener("click", () => {
+  timelineNextBefore = null;
+  timelineHasMore = false;
+  loadTimeline({ scroll: "bottom" });
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && !$("timeline-drawer").hidden) closeTimeline();
 });
 
 initTabs();

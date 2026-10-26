@@ -74,6 +74,12 @@ async def test_index_serves_dashboard(tmp_path: Path) -> None:
     assert "btn-more-memory" in text
     assert "memory-chat-filter" in text
     assert "MEMORY_PAGE_MAX" in text
+    assert "timeline-drawer" in text
+    assert "查看时间线" in text
+    assert "btn-timeline-earlier" in text
+    assert "timeline-metrics" in text
+    assert "openTimeline" in text
+    assert "定位" in text
 
 
 async def test_status_reports_processes_and_offline_brain(tmp_path: Path) -> None:

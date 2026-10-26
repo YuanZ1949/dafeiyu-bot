@@ -23,7 +23,7 @@ from .brain.factory import (
     normalize_provider,
 )
 from .config import ConfigError, Settings
-from .memory.store import MAX_MEMORY_PAGE, Store
+from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
 from .models import ChatType
 from .runtime import RuntimeState, load_runtime, save_runtime
 from .service import BRAIN_ERROR_COOLDOWN_SECONDS, TOOL_HINT_INTERVAL_SECONDS
@@ -226,6 +226,8 @@ def _message_json(message: Any) -> dict[str, Any]:
         "nickname": message.nickname,
         "content": message.content,
         "is_bot": message.is_bot,
+        "at_bot": message.at_bot,
+        "reply_to_bot": message.reply_to_bot,
         "timestamp": message.timestamp,
         "at": _fmt_ts(message.timestamp),
     }
@@ -460,6 +462,57 @@ class BrainControl:
                 {**_message_json(message), "snippet": snippet}
                 for message, snippet in hits
             ],
+        }
+
+    def timeline_snapshot(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        limit: int = 50,
+        before: int | None = None,
+        anchor_message_id: str | None = None,
+    ) -> dict[str, Any]:
+        """会话时间线：消息分页 + 会话指标 + 摘要/印象/用量，全部只读。"""
+        page = self.store.messages_page(
+            chat_type,
+            chat_id,
+            limit=limit,
+            before=before,
+            anchor_message_id=anchor_message_id,
+        )
+        today = self.store.today()
+        calls, tokens = self.store.usage_today(chat_type, chat_id, today)
+        stats = self.store.session_stats(chat_type, chat_id)
+        summaries = self.store.recent_summaries(20, 0, chat_type, chat_id)
+        impressions = self.store.list_impressions(chat_type, chat_id, topk=50)
+        return {
+            "chat": {
+                "chat_type": chat_type.value,
+                "chat_id": chat_id,
+                "message_total": self.store.count_messages(chat_type, chat_id),
+                "summary_total": self.store.count_summaries(chat_type, chat_id),
+                "impression_total": self.store.count_impressions(chat_type, chat_id),
+            },
+            "messages": [_message_json(message) for message in page.messages],
+            "has_more": page.has_more,
+            "next_before": page.next_before,
+            "anchor_found": page.anchor_found,
+            "session_summary": self.store.latest_session_summary(chat_type, chat_id),
+            "summaries": [
+                {
+                    "date": summary.date,
+                    "content": summary.content,
+                    "updated_at": summary.updated_at,
+                }
+                for summary in summaries
+            ],
+            "impressions": [_impression_json(item) for item in impressions],
+            "usage": {"date": today, "calls": calls, "tokens": tokens},
+            "session": {
+                "delivered_count": stats.delivered_count,
+                "token_estimate": stats.token_estimate,
+                "created_at": stats.created_at,
+            },
         }
 
     def export_snapshot(
@@ -982,6 +1035,57 @@ def create_app(
                 {"error": f"读取会话失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def timeline(request: web.Request) -> web.Response:
+        chat_type, chat_id, error = _path_target(request)
+        if error is not None:
+            return error
+        try:
+            limit = _query_int(request, "limit", 50)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        if not 1 <= limit <= MAX_TIMELINE_PAGE:
+            return web.json_response(
+                {"error": f"limit 必须在 1..{MAX_TIMELINE_PAGE} 之间"}, status=400
+            )
+
+        before: int | None = None
+        raw_before = (request.query.get("before") or "").strip()
+        if raw_before:
+            try:
+                before = int(raw_before)
+            except ValueError:
+                return web.json_response({"error": "before 必须是整数"}, status=400)
+            if before <= 0:
+                return web.json_response({"error": "before 必须是正整数"}, status=400)
+
+        anchor: str | None = None
+        if "anchor" in request.query:
+            anchor = (request.query.get("anchor") or "").strip()
+            if not anchor:
+                return web.json_response({"error": "anchor 不能为空"}, status=400)
+            if len(anchor) > 200:
+                return web.json_response({"error": "anchor 不能超过 200 字"}, status=400)
+
+        if before is not None and anchor is not None:
+            return web.json_response(
+                {"error": "before 与 anchor 不能同时使用"}, status=400
+            )
+        try:
+            return web.json_response(
+                control.timeline_snapshot(
+                    chat_type,
+                    chat_id,
+                    limit=limit,
+                    before=before,
+                    anchor_message_id=anchor,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取会话时间线失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取时间线失败：{exc.__class__.__name__}"}, status=500
+            )
+
     async def session_action(request: web.Request) -> web.Response:
         chat_type, chat_id, error = _path_target(request)
         if error is not None:
@@ -1041,6 +1145,9 @@ def create_app(
     app.router.add_get("/api/memory/search", search_messages)
     app.router.add_get("/api/memory/export", export_memory)
     app.router.add_get("/api/sessions", sessions)
+    app.router.add_get(
+        "/api/sessions/{chat_type}/{chat_id}/timeline", timeline
+    )
     app.router.add_post("/api/sessions/{chat_type}/{chat_id}/{action}", session_action)
     app.router.add_delete("/api/sessions/{chat_type}/{chat_id}", delete_session)
     app.router.add_get("/api/config", config)

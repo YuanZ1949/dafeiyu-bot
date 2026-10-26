@@ -11,6 +11,18 @@ from dafeiyu.timeutil import today_shanghai
 
 # dashboard 只读面板单页上限，接口层同样按这个值校验。
 MAX_MEMORY_PAGE = 200
+# 时间线单页上限；首屏默认小一些，避免一次把长会话全塞给浏览器。
+MAX_TIMELINE_PAGE = 200
+
+
+@dataclass(frozen=True)
+class MessagePage:
+    """按自增 id 游标分页的消息页；next_before 可直接传给下一次请求。"""
+
+    messages: list[Message]
+    has_more: bool
+    next_before: int | None
+    anchor_found: bool
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -382,6 +394,63 @@ class Store:
             (chat_type.value, chat_id, int(anchor["id"]), limit),
         ).fetchall()
         return [self._row_to_message(r) for r in reversed(rows)]
+
+    def messages_page(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        limit: int = 50,
+        before: int | None = None,
+        anchor_message_id: str | None = None,
+    ) -> MessagePage:
+        """按数据库自增 id 分页，返回时间正序的一页。
+
+        - before：只取 id 小于该游标的更早消息；游标来自上一页的 next_before。
+        - anchor_message_id：以命中的消息结尾取一页；找不到时回落最新一页并置
+          anchor_found=False，方便前端提示后仍能展示内容。
+        """
+        limit = max(1, min(int(limit), MAX_TIMELINE_PAGE))
+        anchor_found = False
+        anchor_id: int | None = None
+        if anchor_message_id:
+            anchor = self._conn.execute(
+                """
+                SELECT id FROM messages
+                WHERE chat_type = ? AND chat_id = ? AND message_id = ?
+                """,
+                (chat_type.value, chat_id, anchor_message_id),
+            ).fetchone()
+            if anchor is not None:
+                anchor_id = int(anchor["id"])
+                anchor_found = True
+
+        clauses = ["chat_type = ?", "chat_id = ?"]
+        params: list[object] = [chat_type.value, chat_id]
+        if anchor_id is not None:
+            clauses.append("id <= ?")
+            params.append(anchor_id)
+        elif before is not None:
+            clauses.append("id < ?")
+            params.append(int(before))
+
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM messages
+            WHERE {' AND '.join(clauses)}
+            ORDER BY id DESC LIMIT ?
+            """,
+            (*params, limit + 1),
+        ).fetchall()
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+        next_before = int(rows[-1]["id"]) if has_more and rows else None
+        return MessagePage(
+            messages=[self._row_to_message(row) for row in reversed(rows)],
+            has_more=has_more,
+            next_before=next_before,
+            anchor_found=anchor_found,
+        )
 
     def messages_between(
         self, chat_type: ChatType, chat_id: int, start_ts: int, end_ts: int

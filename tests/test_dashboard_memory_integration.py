@@ -192,6 +192,29 @@ async def boot(tmp_path: Path):
         store.close()
 
 
+async def test_dashboard_timeline_proxy_end_to_end(tmp_path: Path) -> None:
+    async with boot(tmp_path) as (dash, store):
+        resp = await dash.get(
+            f"/api/sessions/group/{GROUP_ID}/timeline?limit=1"
+        )
+        data = await resp.json()
+        assert resp.status == 200
+        assert [m["content"] for m in data["messages"]] == ["第二条：钓鱼"]
+        assert data["has_more"] is True
+        assert data["chat"]["message_total"] == 2
+
+        anchored = await (
+            await dash.get(
+                f"/api/sessions/group/{GROUP_ID}/timeline?limit=1&anchor=m0"
+            )
+        ).json()
+        assert [m["content"] for m in anchored["messages"]] == ["第一条：显卡"]
+        assert anchored["anchor_found"] is True
+
+        bad = await dash.get(f"/api/sessions/group/{GROUP_ID}/timeline?limit=0")
+        assert bad.status == 400
+
+
 async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
     async with boot(tmp_path) as (dash, store):
         usage = await (await dash.get("/api/usage?days=7")).json()

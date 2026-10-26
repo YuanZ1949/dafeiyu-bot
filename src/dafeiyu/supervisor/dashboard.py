@@ -261,6 +261,14 @@ def create_app(
         )
         return web.json_response(data, status=code)
 
+    async def session_timeline(request: web.Request) -> web.Response:
+        chat_type, chat_id, error = _session_target(request)
+        if error is not None:
+            return error
+        return await proxy_get(
+            request, f"/api/sessions/{chat_type}/{chat_id}/timeline"
+        )
+
     async def session_delete(request: web.Request) -> web.Response:
         chat_type, chat_id, error = _session_target(request)
         if error is not None:
@@ -378,6 +386,9 @@ def create_app(
     app.router.add_get("/api/memory/search", memory_search)
     app.router.add_get("/api/memory/export", memory_export)
     app.router.add_get("/api/sessions", sessions)
+    app.router.add_get(
+        "/api/sessions/{chat_type}/{chat_id}/timeline", session_timeline
+    )
     app.router.add_post("/api/sessions/{chat_type}/{chat_id}/{action}", session_action)
     app.router.add_delete("/api/sessions/{chat_type}/{chat_id}", session_delete)
     app.router.add_get("/api/config", config)
