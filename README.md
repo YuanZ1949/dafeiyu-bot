@@ -188,7 +188,7 @@ powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoQr
 
 预算分四层：每群每日、全局每日、自然月、月度费用。所有 `0` 都表示「未启用/不限制」。
 `degrade` 会保留 @/引用/叫名字的回复，只停普通插话；`stop` 连点名也不回；`notify`
-只发告警不拦截。月度费用超限是硬拒绝，即使 `on_exceed=notify` 也不会放行。
+只发告警不拦截。月度费用达到上限即硬拒绝，即使 `on_exceed=notify` 也不会放行。
 费用按「token 数 × 单价」估算，不是账单金额；要准确成本请以服务商账单为准。
 `warning_ratios` 取值 `(0, 1]`；全局日/月度/费用命中 50%/80%/100% 时各告警一次，
 由 supervisor 做 24 小时去重，告警 detail 只包含计数与限额，不包含消息正文。
@@ -241,6 +241,8 @@ NapCat 已连接
 群内非管理员执行管理员命令会被静默忽略（不回复、不写审计）；私聊非管理员会收到
 「这个命令只有管理员能用。」。管理员命令成功后写 `command.admin` 审计（actor 为 QQ 号，
 detail 只含会话类型/ID 与用户 ID，不含正文）。冷却按「群 + 群号」或「私聊 + 用户」分别计算。
+命令同样受 `groups.blacklist` / `groups.whitelist` 约束：黑名单群静默；whitelist 非空时
+只有名单内的群能使用命令。
 
 命令行（服务不用停）：
 

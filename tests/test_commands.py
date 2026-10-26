@@ -56,18 +56,6 @@ def test_case_insensitive_command_and_alias(registry: CommandRegistry) -> None:
     assert upper_alias is not None and upper_alias[0].name == "help"
 
 
-def test_is_known_accepts_with_or_without_slash_and_checks_scope(
-    registry: CommandRegistry,
-) -> None:
-    assert registry.is_known("/stats", ChatType.GROUP)
-    assert registry.is_known("stats", ChatType.PRIVATE)
-    assert registry.is_known("统计", ChatType.PRIVATE)
-    assert registry.is_known("/帮助", ChatType.GROUP)
-    assert not registry.is_known("shutup", ChatType.PRIVATE)
-    assert registry.is_known("shutup", ChatType.GROUP)
-    assert not registry.is_known("/nope", ChatType.GROUP)
-
-
 def test_help_text_hides_admin_commands_for_non_admin(
     registry: CommandRegistry,
 ) -> None:

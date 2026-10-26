@@ -109,14 +109,6 @@ class CommandRegistry:
             return None
         return spec, " ".join(parsed.args)
 
-    def is_known(self, name: str, chat_type: ChatType) -> bool:
-        token = name.strip().removeprefix("/")
-        token = token.split(maxsplit=1)[0] if token else ""
-        if not token:
-            return False
-        spec = self._lookup.get(token.casefold())
-        return spec is not None and chat_type in spec.scopes
-
     def help_text(self, chat_type: ChatType, *, is_admin: bool) -> str:
         available: list[CommandSpec] = []
         admin_commands: list[CommandSpec] = []

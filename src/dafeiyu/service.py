@@ -54,7 +54,7 @@ _REASON_TEXT = {
     "muted": "群聊已静音",
     "quiet": "夜间静默",
     "blacklist": "群在黑名单",
-    "budget": "每日预算已用完",
+    "budget": "预算已用完",
     "hard": "被点名",
     "whitelist": "群不在白名单",
     "duplicate": "冷却窗口内重复",
@@ -65,6 +65,14 @@ _REASON_TEXT = {
     "sample_skip": "随机抽样未命中",
     "batch": "已进入批次，等待模型判定",
     "private": "私聊预算通过，直接调用模型",
+}
+
+_BUDGET_SCOPE_TEXT = {
+    "per_chat": "本会话每日预算已用完",
+    "global_daily": "全局日预算已用完",
+    "monthly": "月度预算已用完",
+    "cost": "月度费用已达上限",
+    "storage_error": "预算读取失败，暂时按降级处理",
 }
 
 _VERDICT_TEXT = {
@@ -359,7 +367,7 @@ class Service:
                 "verdict": verdict,
                 "verdict_text": _VERDICT_TEXT[verdict],
                 "reason": reason,
-                "reason_text": _REASON_TEXT.get(reason, reason),
+                "reason_text": self._reason_text(reason, result.get("metrics", {})),
                 "mode": mode,
                 "configured_mode": self.settings.triggers.mode,
                 "chat_type": msg.chat_type.value,
@@ -698,6 +706,13 @@ class Service:
         return ""
 
     @staticmethod
+    def _reason_text(reason: str, metrics: dict[str, Any]) -> str:
+        if reason == "budget":
+            scope = str(metrics.get("budget_scope") or "")
+            return _BUDGET_SCOPE_TEXT.get(scope, _REASON_TEXT["budget"])
+        return _REASON_TEXT.get(reason, reason)
+
+    @staticmethod
     def _check(key: str, status: str, detail: str) -> dict[str, str]:
         return {
             "key": key,
@@ -722,7 +737,7 @@ class Service:
             "verdict": verdict,
             "verdict_text": _VERDICT_TEXT[verdict],
             "reason": reason,
-            "reason_text": _REASON_TEXT.get(reason, reason),
+            "reason_text": self._reason_text(reason, metrics),
             "mode": mode,
             "configured_mode": self.settings.triggers.mode,
             "chat_type": msg.chat_type.value,

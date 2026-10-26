@@ -144,6 +144,7 @@ def test_explain_trigger_private_budget_blocks(tmp_path: Path) -> None:
 
     assert result["verdict"] == "skip"
     assert result["reason"] == "budget"
+    assert result["reason_text"] == "本会话每日预算已用完"
     assert result["mode"] == "rules"
     assert router._states == {}
 
@@ -161,6 +162,7 @@ def test_explain_trigger_private_budget_guard_deny(tmp_path: Path, monkeypatch) 
 
     assert result["verdict"] == "skip"
     assert result["reason"] == "budget"
+    assert result["reason_text"] == "全局日预算已用完"
     assert result["metrics"]["budget_action"] == "deny"
     assert result["metrics"]["budget_scope"] == "global_daily"
     budget_check = next(c for c in result["checks"] if c["key"] == "budget")
@@ -202,10 +204,26 @@ def test_explain_trigger_model_budget_guard_deny(tmp_path: Path, monkeypatch) ->
 
     assert result["verdict"] == "skip"
     assert result["reason"] == "budget"
+    assert result["reason_text"] == "本会话每日预算已用完"
     assert result["metrics"]["budget_action"] == "deny"
     assert result["metrics"]["budget_scope"] == "per_chat"
     budget_check = next(c for c in result["checks"] if c["key"] == "budget")
     assert budget_check["status"] == "blocked"
+
+
+def test_explain_trigger_model_cost_scope_text(tmp_path: Path, monkeypatch) -> None:
+    service, _, _ = make_service(tmp_path, mode="model", brain=BatchBrain())
+    monkeypatch.setattr(
+        service.budget_guard,
+        "evaluate",
+        lambda *a, **k: BudgetDecision(BudgetAction.DENY, "budget_cost", "cost"),
+    )
+
+    result = service.explain_trigger(make_msg("随便聊聊"), now=NOON)
+
+    assert result["reason"] == "budget"
+    assert result["reason_text"] == "月度费用已达上限"
+    assert result["metrics"]["budget_scope"] == "cost"
 
 
 def test_explain_trigger_model_budget_guard_degrade_ambient(
@@ -224,6 +242,7 @@ def test_explain_trigger_model_budget_guard_degrade_ambient(
 
     assert result["verdict"] == "skip"
     assert result["reason"] == "budget"
+    assert result["reason_text"] == "全局日预算已用完"
     assert result["metrics"]["budget_scope"] == "global_daily"
     budget_check = next(c for c in result["checks"] if c["key"] == "budget")
     assert budget_check["status"] == "blocked"

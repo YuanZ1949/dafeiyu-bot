@@ -158,6 +158,19 @@ def test_monthly_cost_is_hard_stop_even_notify(store):
     assert d.action is BudgetAction.DENY and d.scope == "cost"
 
 
+def test_monthly_cost_equal_limit_is_hard_stop(store):
+    g = make_guard(
+        store,
+        daily_tokens=1_000_000,
+        on_exceed="notify",
+        monthly_cost_limit=1.0,
+        price_input_per_million=2.0,
+    )
+    usage(store, date=TODAY, prompt=500_000)
+    d = g.evaluate(ChatType.GROUP, 1, addressed=True, purpose="reply", now=NOW)
+    assert d.action is BudgetAction.DENY and d.scope == "cost"
+
+
 def test_warnings_do_not_change_action(store):
     g = make_guard(
         store, daily_calls=10, daily_tokens=1000, warning_ratios=(0.5, 0.8)

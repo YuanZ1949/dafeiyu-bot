@@ -280,8 +280,8 @@ class BudgetGuard:
                 consider(BudgetAction.ALLOW, "budget_monthly", "monthly")
                 extra.append(("monthly", "1.0"))
 
-        # 4. 月度费用：硬停用，不受 on_exceed 影响。
-        if config.monthly_cost_limit > 0 and cost > config.monthly_cost_limit:
+        # 4. 月度费用：到达上限即硬停，不受 on_exceed 影响。
+        if config.monthly_cost_limit > 0 and cost >= config.monthly_cost_limit:
             consider(BudgetAction.DENY, "budget_cost", "cost")
 
         return action, reason, scope, tuple(extra)
