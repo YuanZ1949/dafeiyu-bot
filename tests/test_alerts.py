@@ -1,0 +1,368 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from dafeiyu.config import AlertsConfig
+from dafeiyu.supervisor.alerts import (
+    AlertManager,
+    Incident,
+    QQAdminChannel,
+    WebhookChannel,
+)
+
+
+class Clock:
+    def __init__(self, now: float = 1_700_000_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class FakeChannel:
+    def __init__(self) -> None:
+        self.sent: list[tuple[Incident, str]] = []
+
+    async def send(self, incident: Incident, event: str) -> None:
+        self.sent.append((incident, event))
+
+
+class ExplodingChannel:
+    async def send(self, incident: Incident, event: str) -> None:
+        raise RuntimeError("channel down")
+
+
+def base_snapshot(**overrides):
+    snapshot = {
+        "ok": True,
+        "processes": {
+            "bot": {"status": "running", "restart_count": 0},
+            "opencode": {"status": "running", "restart_count": 0},
+            "napcat": {"status": "running", "restart_count": 0},
+        },
+        "bot": {
+            "ok": True,
+            "gateway": {"connected": True},
+            "quota": {"paused_until": None},
+            "errors": {"recent_count": 0},
+        },
+        "napcat": {"logged_in": True},
+        "disk": {"free_percent": 50.0},
+        "backups": {"last_success_at": "2026-10-26T03:00:00+08:00", "last_error_at": None},
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+def down_snapshot():
+    snapshot = base_snapshot()
+    snapshot["bot"]["ok"] = False
+    return snapshot
+
+
+def manager(tmp_path: Path, clock: Clock, channel, *, cfg: AlertsConfig | None = None):
+    return AlertManager(
+        cfg or AlertsConfig(),
+        tmp_path / "alert-state.json",
+        [channel],
+        clock=clock,
+    )
+
+
+async def fire_bot_down(mgr: AlertManager, clock: Clock):
+    await mgr.evaluate(down_snapshot())
+    clock.advance(121)
+    await mgr.evaluate(down_snapshot())
+
+
+async def test_pending_then_firing(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+
+    await mgr.evaluate(down_snapshot())
+    assert channel.sent == []
+    assert mgr.summary()["firing"] == 0
+
+    clock.advance(121)
+    await mgr.evaluate(down_snapshot())
+    assert channel.sent[0][1] == "firing"
+    assert channel.sent[0][0].rule == "bot_down"
+    assert mgr.summary()["firing"] == 1
+
+
+async def test_pending_clears_when_condition_disappears(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+
+    await mgr.evaluate(down_snapshot())
+    await mgr.evaluate(base_snapshot())
+    clock.advance(600)
+    await mgr.evaluate(down_snapshot())
+
+    assert channel.sent == []
+    assert mgr.summary()["firing"] == 0
+
+
+async def test_recovery_needs_two_checks(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    await fire_bot_down(mgr, clock)
+    assert mgr.summary()["firing"] == 1
+
+    await mgr.evaluate(base_snapshot())
+    assert mgr.summary()["firing"] == 1
+
+    await mgr.evaluate(base_snapshot())
+    assert channel.sent[-1][1] == "resolved"
+    assert mgr.summary()["firing"] == 0
+    assert mgr.summary()["resolved_24h"] == 1
+
+
+async def test_repeat_is_deduped(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    await fire_bot_down(mgr, clock)
+
+    clock.advance(21600 - 1)
+    await mgr.evaluate(down_snapshot())
+    assert [event for _, event in channel.sent] == ["firing"]
+
+    clock.advance(1)
+    await mgr.evaluate(down_snapshot())
+    assert [event for _, event in channel.sent] == ["firing", "firing"]
+    assert mgr.summary()["firing"] == 1
+
+
+async def test_channel_failure_does_not_raise(tmp_path: Path) -> None:
+    clock = Clock()
+    mgr = AlertManager(
+        AlertsConfig(),
+        tmp_path / "alert-state.json",
+        [ExplodingChannel()],
+        clock=clock,
+    )
+    snapshot = base_snapshot()
+    snapshot["processes"]["bot"]["status"] = "failed"
+
+    await mgr.evaluate(snapshot)
+
+    assert mgr.summary()["firing"] == 1
+    assert (tmp_path / "alert-state.json").exists()
+
+
+async def test_all_eight_rules_activate(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["processes"]["bot"]["status"] = "failed"
+    snapshot["processes"]["opencode"]["status"] = "failed"
+    snapshot["processes"]["napcat"]["status"] = "failed"
+    snapshot["bot"]["gateway"]["connected"] = False
+    snapshot["bot"]["quota"]["paused_until"] = clock.now + 60
+    snapshot["bot"]["errors"]["recent_count"] = 3
+    snapshot["disk"]["free_percent"] = 5.0
+    snapshot["backups"] = {
+        "last_success_at": "2026-10-26T03:00:00+08:00",
+        "last_error_at": "2026-10-26T04:00:00+08:00",
+    }
+
+    await mgr.evaluate(snapshot)
+    clock.advance(200)
+    await mgr.evaluate(snapshot)
+
+    rules = {incident.rule for incident, _event in channel.sent}
+    assert rules == {
+        "process_failed",
+        "bot_down",
+        "opencode_down",
+        "napcat_down",
+        "quota_pause",
+        "reply_errors",
+        "disk_low",
+        "backup_failed",
+    }
+
+
+async def test_restart_burst_triggers_process_failed(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+
+    await mgr.evaluate(base_snapshot())
+    snapshot = base_snapshot()
+    snapshot["processes"]["bot"]["restart_count"] = 2
+    await mgr.evaluate(snapshot)
+    assert channel.sent == []
+
+    snapshot["processes"]["bot"]["restart_count"] = 3
+    await mgr.evaluate(snapshot)
+    assert channel.sent[0][0].rule == "process_failed"
+
+
+async def test_events_and_retention(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    await fire_bot_down(mgr, clock)
+    await mgr.evaluate(base_snapshot())
+    await mgr.evaluate(base_snapshot())
+
+    events = mgr.events()
+    assert events[0]["status"] == "resolved"
+    clock.advance(1)
+    assert mgr.events(include_resolved_hours=0) == []
+
+    clock.advance(24 * 3600 + 1)
+    await mgr.evaluate(base_snapshot())
+    assert mgr.events() == []
+
+
+async def test_state_is_persisted_and_reloaded(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    path = tmp_path / "alert-state.json"
+    mgr = manager(tmp_path, clock, channel)
+    await fire_bot_down(mgr, clock)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert set(raw) == {"incidents", "since", "recover"}
+    assert "bot_down" in raw["incidents"]
+
+    second_channel = FakeChannel()
+    restored = AlertManager(AlertsConfig(), path, [second_channel], clock=clock)
+    assert restored.summary()["firing"] == 1
+    await restored.evaluate(down_snapshot())
+    assert second_channel.sent == []
+
+
+async def test_send_test_does_not_persist(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+
+    result = await mgr.send_test()
+
+    assert result == {"sent": 1, "failed": 0}
+    assert channel.sent[0][1] == "test"
+    assert mgr.summary()["firing"] == 0
+    assert mgr.events() == []
+
+
+def test_webhook_payload_formats() -> None:
+    incident = Incident(
+        id="bot_down",
+        rule="bot_down",
+        severity="critical",
+        status="firing",
+        fingerprint="bot_down",
+        title="bot 不在线",
+        detail="连续 120 秒健康检查失败",
+        first_seen_at="2026-10-26T12:00:00+08:00",
+        last_seen_at="2026-10-26T12:02:00+08:00",
+    )
+    generic = WebhookChannel("https://example.com/hook").payload(incident, "firing")
+    assert generic["version"] == 1
+    assert generic["event"] == "firing"
+    assert generic["service"] == "dafeiyu"
+    assert generic["incident"]["rule"] == "bot_down"
+
+    ntfy = WebhookChannel("https://example.com", format="ntfy").payload(
+        incident, "firing"
+    )
+    assert "bot 不在线" in ntfy["text"]
+
+    wecom = WebhookChannel("https://example.com", format="wecom").payload(
+        incident, "firing"
+    )
+    assert wecom["msgtype"] == "text"
+    assert "bot 不在线" in wecom["text"]["content"]
+
+
+class StubResponse:
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+
+class StubSession:
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
+        self.calls: list[tuple[str, dict]] = []
+
+    def post(self, url: str, **kwargs):
+        self.calls.append((url, kwargs))
+        return StubResponse(self.status)
+
+
+async def test_qq_admin_channel_skips_bot_down() -> None:
+    session = StubSession()
+    channel = QQAdminChannel("http://127.0.0.1:1", "t", session=session)
+    incident = Incident(
+        id="bot_down",
+        rule="bot_down",
+        severity="critical",
+        status="firing",
+        fingerprint="bot_down",
+        title="bot 不在线",
+        detail="",
+        first_seen_at="",
+        last_seen_at="",
+    )
+
+    await channel.send(incident, "firing")
+    assert session.calls == []
+
+
+async def test_qq_admin_channel_posts_notify() -> None:
+    session = StubSession()
+    channel = QQAdminChannel("http://127.0.0.1:1/", "secret", session=session)
+    incident = Incident(
+        id="disk_low",
+        rule="disk_low",
+        severity="warning",
+        status="firing",
+        fingerprint="disk_low",
+        title="磁盘空间不足",
+        detail="剩余 5%",
+        first_seen_at="",
+        last_seen_at="",
+    )
+
+    await channel.send(incident, "firing")
+
+    url, kwargs = session.calls[0]
+    assert url == "http://127.0.0.1:1/api/notify/admin"
+    assert kwargs["headers"]["X-Control-Token"] == "secret"
+    assert "磁盘空间不足" in kwargs["json"]["text"]
+    assert kwargs["json"]["dedupe_key"] == "disk_low"
+
+
+async def test_qq_admin_channel_raises_on_error_status() -> None:
+    channel = QQAdminChannel("http://127.0.0.1:1", session=StubSession(status=503))
+    incident = Incident(
+        id="disk_low",
+        rule="disk_low",
+        severity="warning",
+        status="firing",
+        fingerprint="disk_low",
+        title="磁盘空间不足",
+        detail="",
+        first_seen_at="",
+        last_seen_at="",
+    )
+    with pytest.raises(Exception):
+        await channel.send(incident, "firing")

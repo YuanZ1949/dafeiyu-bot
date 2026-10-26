@@ -338,7 +338,14 @@ class BrainControl:
             }
             today = self.store.today()
             today_calls, today_tokens = self.store.usage_totals(today, today)
-            recent = self.store.error_stats(ERROR_STATS_WINDOW_SECONDS)
+            window = int(
+                getattr(
+                    self.settings.alerts.rules,
+                    "reply_error_window_seconds",
+                    ERROR_STATS_WINDOW_SECONDS,
+                )
+            )
+            recent = self.store.error_stats(window)
             errors = {
                 "recent_count": int(recent.get("count") or 0),
                 "last_error_at": recent.get("last_at"),
