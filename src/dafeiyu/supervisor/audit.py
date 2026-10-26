@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable
+
+from ..timeutil import now_shanghai
+
+log = logging.getLogger(__name__)
+
+FIELDS = (
+    "id",
+    "ts",
+    "actor",
+    "action",
+    "target",
+    "result",
+    "detail",
+    "request_id",
+    "ip",
+)
+
+
+class AuditLog:
+    """append-only JSONL 审计；写入失败只记日志，不阻塞主操作。"""
+
+    def __init__(
+        self,
+        path: Path,
+        max_bytes: int = 10 * 1024 * 1024,
+        backups: int = 3,
+        sanitize: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self.max_bytes = max(1, int(max_bytes))
+        self.backups = max(1, int(backups))
+        self.sanitize = sanitize
+        self._clock = clock or now_shanghai
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning("审计目录创建失败：%s", exc)
+
+    def write(
+        self,
+        action: str,
+        *,
+        actor: str = "system",
+        target: str = "",
+        result: str = "ok",
+        detail: dict[str, Any] | None = None,
+        request_id: str = "",
+        ip: str = "",
+    ) -> dict[str, Any]:
+        payload = dict(detail or {})
+        if self.sanitize is not None:
+            try:
+                payload = self.sanitize(payload)
+            except Exception:  # sanitize 坏了不能把审计写死
+                log.warning("审计 detail 脱敏失败", exc_info=True)
+        event = {
+            "id": str(uuid.uuid4()),
+            "ts": self._clock().isoformat(timespec="seconds"),
+            "actor": actor,
+            "action": action,
+            "target": target,
+            "result": result,
+            "detail": payload,
+            "request_id": request_id,
+            "ip": ip,
+        }
+        try:
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            log.warning("审计写入失败：%s", exc)
+            return event
+        self._rotate()
+        return event
+
+    def query(self, limit: int = 50, before: str | None = None) -> list[dict[str, Any]]:
+        limit = max(1, min(200, int(limit)))
+        rows: list[dict[str, Any]] = []
+        for file in self._files():
+            try:
+                lines = file.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                row = {name: raw.get(name, _default(name)) for name in FIELDS}
+                ts = str(row["ts"] or "")
+                if before and ts >= before:
+                    continue
+                rows.append(row)
+        rows.sort(key=lambda row: str(row["ts"]), reverse=True)
+        return rows[:limit]
+
+    def _files(self) -> list[Path]:
+        files = [self.path]
+        for index in range(1, self.backups + 1):
+            candidate = self.path.with_name(f"{self.path.name}.{index}")
+            if candidate.exists():
+                files.append(candidate)
+        return files
+
+    def _rotate(self) -> None:
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return
+        if size < self.max_bytes:
+            return
+        oldest = self.path.with_name(f"{self.path.name}.{self.backups}")
+        try:
+            if oldest.exists():
+                oldest.unlink()
+            for index in range(self.backups - 1, 0, -1):
+                source = self.path.with_name(f"{self.path.name}.{index}")
+                if source.exists():
+                    os.replace(source, self.path.with_name(f"{self.path.name}.{index + 1}"))
+            os.replace(self.path, self.path.with_name(f"{self.path.name}.1"))
+            self.path.touch()
+        except OSError as exc:
+            log.warning("审计轮转失败：%s", exc)
+
+
+def _default(name: str) -> Any:
+    if name == "detail":
+        return {}
+    return ""
