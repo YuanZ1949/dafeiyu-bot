@@ -110,6 +110,9 @@ async def test_index_serves_dashboard(tmp_path: Path) -> None:
     assert "debug-result" in text
     assert "debug-checks" in text
     assert "debug-metrics" in text
+    assert "btn-logout" in text
+    assert "loadAuthSession" in text
+    assert "redirectToLogin" in text
 
 
 async def test_status_reports_processes_and_offline_brain(tmp_path: Path) -> None:

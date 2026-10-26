@@ -74,6 +74,9 @@ Copy-Item .env.example .env
 | `NAPCAT_WS_PORT` | | `8080` | 监听端口，需与 NapCat 里填的一致 |
 | `NAPCAT_WS_TOKEN` | | 空 | 与 NapCat 的 Token 一致 |
 | `DAFEIYU_DB_PATH` | | `data/dafeiyu.db` | SQLite 路径 |
+| `DAFEIYU_DASHBOARD_USER` | | `admin` | 控制台登录用户名 |
+| `DAFEIYU_DASHBOARD_PASSWORD` | 非本机访问时 ✅ | 空 | 控制台登录密码，至少 12 位 |
+| `DAFEIYU_DASHBOARD_SESSION_HOURS` | | `168` | 登录有效期（小时，1–720） |
 
 ### 接本机 LM Studio（可选，零 API 费用）
 
@@ -223,6 +226,27 @@ NapCat 已连接
 
 `scripts/start.ps1` 启动后打开 <http://127.0.0.1:8787>（端口在 `config.yaml` 的
 `supervisor.dashboard.port`）。面板和 Bot 控制口默认都只监听本机，不对外网开放。
+
+### 局域网 / VPN 访问与登录
+
+默认 `supervisor.dashboard.host: 127.0.0.1`，本机访问免登录。要让手机或其他设备访问：
+
+1. 把 `supervisor.dashboard.host` 改成 `0.0.0.0` 或本机局域网地址；
+2. 在 `.env` 里设置至少 12 位的 `DAFEIYU_DASHBOARD_PASSWORD`（用户名默认 `admin`）；
+3. 重启 supervisor。
+
+`supervisor.dashboard.auth` 三档：
+
+- `auto`（默认）：绑定 loopback 时免登录，绑定 `0.0.0.0` / 局域网地址时强制登录；
+- `on`：始终登录，即使只绑本机；
+- `off`：只允许绑定 loopback，非 loopback 会拒绝启动。
+
+登录成功后使用 HttpOnly、SameSite=Strict 的签名 Cookie，进程重启后旧会话失效；同一 IP
+连续 5 次密码错误会锁定 5 分钟。面板右上角有「退出登录」，会话过期或未登录时页面会跳到登录页。
+
+> 本项目不内置 TLS。外网访问请走 WireGuard/Tailscale 等 VPN，或在前面放 Caddy/Nginx 做
+> HTTPS 反代；否则 HTTP 下的密码和 Cookie 可能被同网段嗅探。反代时记得转发
+> `X-Forwarded-Proto: https`，这样会话 Cookie 会自动带 `Secure`。
 
 面板上的卡片：
 

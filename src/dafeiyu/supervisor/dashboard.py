@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import json
 import logging
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
 
 from ..config import Settings
+from .auth import COOKIE_NAME, DashboardAuth, safe_next_path
 from .logs import SOURCES, LogHub
 from .manager import Supervisor
 from .napcat_login import NapCatLogin
@@ -35,17 +38,65 @@ async def _same_origin(request: web.Request, handler):
     return await handler(request)
 
 
+AUTH_KEY: web.AppKey[DashboardAuth] = web.AppKey("dashboard_auth", DashboardAuth)
+
+
+def _wants_html(request: web.Request) -> bool:
+    if request.path == "/" or request.path.endswith(".html"):
+        return True
+    if request.path.startswith("/api/"):
+        return False
+    return "text/html" in request.headers.get("Accept", "")
+
+
+@web.middleware
+async def _auth_middleware(request: web.Request, handler):
+    auth = request.app.get(AUTH_KEY)
+    if auth is None or not auth.enabled or auth.is_public(request.path):
+        return await handler(request)
+    if auth.verify_cookie(request.cookies.get(COOKIE_NAME, "")):
+        return await handler(request)
+    if _wants_html(request):
+        next_path = request.rel_url.raw_path
+        if request.rel_url.raw_query_string:
+            next_path = f"{next_path}?{request.rel_url.raw_query_string}"
+        raise web.HTTPFound(f"/login?next={quote(next_path, safe='')}")
+    return web.json_response({"error": "unauthorized"}, status=401)
+
+
+def _auth_from_settings(settings: Settings | None) -> DashboardAuth:
+    if settings is None:
+        return DashboardAuth(enabled=False, username="", password="")
+    dashboard = settings.supervisor.dashboard
+    return DashboardAuth(
+        enabled=dashboard.auth_required,
+        username=dashboard.username,
+        password=dashboard.password,
+        session_seconds=dashboard.session_hours * 3600,
+    )
+
+
+def _is_https(request: web.Request) -> bool:
+    if request.secure:
+        return True
+    forwarded = request.headers.get("X-Forwarded-Proto", "")
+    return forwarded.split(",", 1)[0].strip().lower() == "https"
+
+
 def create_app(
     supervisor: Supervisor,
-    settings: Settings,
+    settings: Settings | None,
     logs: LogHub,
     qr_path: Path,
     bot_url: str,
     token: str = "",
     on_shutdown: Callable[[], Awaitable[None]] | None = None,
     napcat_login: NapCatLogin | None = None,
+    auth: DashboardAuth | None = None,
 ) -> web.Application:
-    app = web.Application(middlewares=[_same_origin])
+    app = web.Application(middlewares=[_same_origin, _auth_middleware])
+    auth_config = auth or _auth_from_settings(settings)
+    app[AUTH_KEY] = auth_config
     closing = asyncio.Event()
 
     async def _mark_closing(_: web.Application) -> None:
@@ -119,6 +170,74 @@ def create_app(
         except aiohttp.ClientError as exc:
             message = f'{{"error":"bot 不可达：{exc.__class__.__name__}"}}'
             return 502, message.encode("utf-8"), {"Content-Type": "application/json"}
+
+    async def favicon(_: web.Request) -> web.Response:
+        return web.Response(status=204)
+
+    async def login_page(request: web.Request) -> web.Response:
+        if not auth_config.enabled:
+            raise web.HTTPFound("/")
+        if auth_config.verify_cookie(request.cookies.get(COOKIE_NAME, "")):
+            raise web.HTTPFound("/")
+        next_path = safe_next_path(request.query.get("next", ""))
+        body = (DASHBOARD_DIR / "login.html").read_text(encoding="utf-8")
+        body = body.replace("__NEXT__", html_lib.escape(next_path, quote=True))
+        return web.Response(
+            text=body,
+            content_type="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def login_submit(request: web.Request) -> web.Response:
+        if not auth_config.enabled:
+            return web.json_response({"error": "登录未启用"}, status=400)
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        ip = request.remote or "unknown"
+        if auth_config.is_rate_limited(ip):
+            return web.json_response(
+                {"error": "尝试次数过多，请 5 分钟后再试"}, status=429
+            )
+        username = str(payload.get("username") or "")
+        password = str(payload.get("password") or "")
+        if not auth_config.verify_credentials(username, password):
+            auth_config.record_failure(ip)
+            return web.json_response({"error": "用户名或密码错误"}, status=401)
+        auth_config.clear_failures(ip)
+        response = web.Response(
+            status=204, headers={"Cache-Control": "no-store"}
+        )
+        response.set_cookie(
+            COOKIE_NAME,
+            auth_config.issue_cookie(),
+            max_age=auth_config.session_seconds,
+            httponly=True,
+            samesite="Strict",
+            secure=_is_https(request),
+            path="/",
+        )
+        return response
+
+    async def logout(_: web.Request) -> web.Response:
+        response = web.Response(
+            status=204, headers={"Cache-Control": "no-store"}
+        )
+        response.del_cookie(COOKIE_NAME, path="/")
+        return response
+
+    async def session_info(_: web.Request) -> web.Response:
+        if not auth_config.enabled:
+            return web.json_response(
+                {"enabled": False, "authenticated": False, "user": ""}
+            )
+        return web.json_response(
+            {
+                "enabled": True,
+                "authenticated": True,
+                "user": auth_config.username,
+            }
+        )
 
     async def index(_: web.Request) -> web.Response:
         return web.FileResponse(DASHBOARD_DIR / "index.html")
@@ -416,6 +535,11 @@ def create_app(
         return web.json_response({"ok": True, "message": "正在关闭所有进程"})
 
     app.router.add_get("/", index)
+    app.router.add_get("/favicon.ico", favicon)
+    app.router.add_get("/login", login_page)
+    app.router.add_post("/api/auth/login", login_submit)
+    app.router.add_post("/api/auth/logout", logout)
+    app.router.add_get("/api/auth/session", session_info)
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/logs/stream", logs_stream)

@@ -259,6 +259,7 @@
   <button class="btn" data-act="start" data-target="all">全部启动</button>
   <button class="btn" data-act="restart" data-target="all">全部重启</button>
   <button class="btn danger" data-act="stop" data-target="all">全部停止</button>
+  <button class="btn" id="btn-logout" hidden>退出登录</button>
   <button class="btn danger" id="btn-shutdown">退出控制台</button>
 </header>
 
@@ -522,11 +523,21 @@ function toast(message, isError = false) {
   toast._timer = setTimeout(() => el.classList.remove("show"), 3200);
 }
 
+function redirectToLogin() {
+  if (location.pathname === "/login") return;
+  const next = location.pathname + location.search;
+  location.replace(`/login?next=${encodeURIComponent(next)}`);
+}
+
 async function api(path, options = {}) {
   const resp = await fetch(path, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
+  if (resp.status === 401) {
+    redirectToLogin();
+    throw new Error("登录已过期");
+  }
   let data = null;
   try { data = await resp.json(); } catch (_) { data = null; }
   if (!resp.ok) {
@@ -534,6 +545,21 @@ async function api(path, options = {}) {
     throw new Error(reason);
   }
   return data;
+}
+
+async function loadAuthSession() {
+  try {
+    const data = await api("/api/auth/session");
+    if (!data || !data.enabled) return;
+    const button = $("btn-logout");
+    button.hidden = false;
+    button.addEventListener("click", async () => {
+      try {
+        await api("/api/auth/logout", { method: "POST", body: "{}" });
+      } catch (_) { /* api() 已处理 401 */ }
+      location.replace("/login");
+    });
+  } catch (_) { /* api() 已在 401 时跳转 */ }
 }
 
 async function runTriggerDebug() {
@@ -1199,6 +1225,7 @@ async function exportChat(session, format) {
   });
   try {
     const resp = await fetch(`/api/memory/export?${params.toString()}`);
+    if (resp.status === 401) { redirectToLogin(); return; }
     if (!resp.ok) {
       let reason = `HTTP ${resp.status}`;
       try {
@@ -1225,6 +1252,7 @@ async function exportChat(session, format) {
 async function downloadBackup() {
   try {
     const resp = await fetch("/api/backup");
+    if (resp.status === 401) { redirectToLogin(); return; }
     if (!resp.ok) {
       let reason = `HTTP ${resp.status}`;
       try {
@@ -1728,6 +1756,7 @@ document.addEventListener("keydown", (ev) => {
 });
 
 initTabs();
+loadAuthSession();
 refresh();
 loadMemory();
 loadUsage();

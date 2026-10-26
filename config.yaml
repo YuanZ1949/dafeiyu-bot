@@ -65,6 +65,9 @@ supervisor:
     host: 127.0.0.1
     port: 8787
     open_browser: true
+    # auto：绑定 loopback 时免登录，绑定 0.0.0.0/局域网地址时强制登录。
+    # on：始终登录；off：只允许绑定 loopback。非 loopback + off 会拒绝启动。
+    auth: auto
   control:
     host: 127.0.0.1
     port: 8788

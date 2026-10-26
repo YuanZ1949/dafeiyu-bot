@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>大肥鱼控制台 · 登录</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --panel-2: #1e2230;
+    --line: #2a3040;
+    --text: #dfe4ee;
+    --muted: #8b93a7;
+    --bad: #f87171;
+    --accent: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    background: radial-gradient(circle at 50% 0%, #1b2436 0, var(--bg) 55%);
+    color: var(--text);
+    font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  .login-card {
+    width: min(380px, calc(100vw - 32px));
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 28px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, .35);
+  }
+  h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  .sub { margin: 6px 0 22px; color: var(--muted); font-size: 12px; }
+  label { display: grid; gap: 6px; margin-bottom: 14px; color: var(--muted); font-size: 12px; }
+  input {
+    width: 100%;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    padding: 9px 10px;
+    font: inherit;
+  }
+  input:focus { outline: 1px solid var(--accent); }
+  button {
+    width: 100%;
+    margin-top: 4px;
+    background: #1d4ed8;
+    color: #fff;
+    border: 1px solid #1d4ed8;
+    border-radius: 7px;
+    padding: 9px 12px;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
+  }
+  button:hover { background: #2563eb; }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  .error { min-height: 20px; margin-top: 12px; color: var(--bad); font-size: 12px; }
+  .foot { margin-top: 18px; color: var(--muted); font-size: 11px; }
+</style>
+</head>
+<body>
+<main class="login-card">
+  <h1>大肥鱼控制台</h1>
+  <p class="sub">这个控制台可以从局域网/VPN 访问，请先登录。</p>
+  <form id="login-form">
+    <input id="login-next" type="hidden" value="__NEXT__" />
+    <label>
+      用户名
+      <input id="login-user" name="username" autocomplete="username" autofocus required />
+    </label>
+    <label>
+      密码
+      <input id="login-password" name="password" type="password" autocomplete="current-password" required />
+    </label>
+    <button id="login-submit" type="submit">登录</button>
+    <div class="error" id="login-error" role="alert"></div>
+  </form>
+  <div class="foot">连续 5 次失败会临时锁定 5 分钟。远程访问请走 VPN 或 TLS 反代。</div>
+</main>
+<script>
+const form = document.getElementById("login-form");
+const button = document.getElementById("login-submit");
+const error = document.getElementById("login-error");
+const nextInput = document.getElementById("login-next");
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  error.textContent = "";
+  button.disabled = true;
+  try {
+    const response = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: document.getElementById("login-user").value,
+        password: document.getElementById("login-password").value,
+      }),
+    });
+    if (response.status === 204) {
+      location.replace(nextInput.value || "/");
+      return;
+    }
+    let data = null;
+    try { data = await response.json(); } catch (_) { data = null; }
+    if (response.status === 429) {
+      error.textContent = "尝试次数过多，请 5 分钟后再试";
+    } else if (response.status === 401) {
+      error.textContent = "用户名或密码错误";
+    } else {
+      error.textContent = (data && data.error) || `登录失败（HTTP ${response.status}）`;
+    }
+  } catch (_) {
+    error.textContent = "无法连接控制台，请检查服务是否在运行";
+  } finally {
+    button.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

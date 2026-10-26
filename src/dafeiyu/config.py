@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -170,11 +171,34 @@ class RestartConfig:
     max_failures: int = 5
 
 
+def is_loopback_host(host: str) -> bool:
+    value = (host or "").strip().strip("[]").casefold()
+    if value == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
 @dataclass(frozen=True)
 class DashboardConfig:
     host: str = "127.0.0.1"
     port: int = 8787
     open_browser: bool = True
+    # auto：loopback 免登录，非 loopback 强制登录；on：始终登录；off：只允许 loopback。
+    auth: str = "auto"
+    username: str = "admin"
+    password: str = field(default="", repr=False)
+    session_hours: int = 7 * 24
+
+    @property
+    def auth_required(self) -> bool:
+        if self.auth == "on":
+            return True
+        if self.auth == "off":
+            return False
+        return not is_loopback_host(self.host)
 
 
 @dataclass(frozen=True)
@@ -520,10 +544,38 @@ def load_settings(
     dash_raw = supervisor_raw.get("dashboard") or {}
     if not isinstance(dash_raw, dict):
         raise ConfigError("supervisor.dashboard 必须是映射")
+    dash_host = str(dash_raw.get("host") or "127.0.0.1").strip()
     dash_port = _int(dash_raw.get("port", 8787), "supervisor.dashboard.port")
     open_browser = dash_raw.get("open_browser", True)
     if not isinstance(open_browser, bool):
         raise ConfigError("supervisor.dashboard.open_browser 必须是布尔值")
+    dash_auth_raw = dash_raw.get("auth", "auto")
+    if isinstance(dash_auth_raw, bool):
+        # YAML 1.1 会把裸 on/off 解析成布尔值。
+        dash_auth_raw = "on" if dash_auth_raw else "off"
+    dash_auth = str(dash_auth_raw or "auto").strip().casefold()
+    if dash_auth not in ("auto", "on", "off"):
+        raise ConfigError("supervisor.dashboard.auth 只能是 auto、on 或 off")
+    dash_user = str(env.get("DAFEIYU_DASHBOARD_USER", "admin")).strip() or "admin"
+    dash_password = str(env.get("DAFEIYU_DASHBOARD_PASSWORD", "")).strip()
+    dash_session_hours = _int(
+        env.get("DAFEIYU_DASHBOARD_SESSION_HOURS", 7 * 24),
+        "DAFEIYU_DASHBOARD_SESSION_HOURS",
+    )
+    if not 1 <= dash_session_hours <= 24 * 30:
+        raise ConfigError("DAFEIYU_DASHBOARD_SESSION_HOURS 必须在 1-720 之间")
+    if dash_auth == "off" and not is_loopback_host(dash_host):
+        raise ConfigError(
+            "supervisor.dashboard.auth=off 只允许绑定 loopback；"
+            "非 loopback 必须开启登录"
+        )
+    dash_auth_required = dash_auth == "on" or (
+        dash_auth == "auto" and not is_loopback_host(dash_host)
+    )
+    if dash_auth_required and len(dash_password) < 12:
+        raise ConfigError(
+            "开启 dashboard 登录时 DAFEIYU_DASHBOARD_PASSWORD 至少 12 位"
+        )
     ctrl_raw = supervisor_raw.get("control") or {}
     if not isinstance(ctrl_raw, dict):
         raise ConfigError("supervisor.control 必须是映射")
@@ -638,9 +690,13 @@ def load_settings(
         ),
         supervisor=SupervisorConfig(
             dashboard=DashboardConfig(
-                host=str(dash_raw.get("host") or "127.0.0.1").strip(),
+                host=dash_host,
                 port=dash_port,
                 open_browser=open_browser,
+                auth=dash_auth,
+                username=dash_user,
+                password=dash_password,
+                session_hours=dash_session_hours,
             ),
             control_host=str(ctrl_raw.get("host") or "127.0.0.1").strip(),
             control_port=ctrl_port,
