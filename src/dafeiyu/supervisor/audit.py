@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from ..timeutil import now_shanghai
+from .redact import redact
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +24,14 @@ FIELDS = (
     "detail",
     "request_id",
     "ip",
+)
+
+# detail 的键名本身就能说明值是凭据：按「最后一段」匹配，兼容 napcat_token、
+# DEEPSEEK_API_KEY 这类带前缀的键；token_usage 这种描述性键不在此列。
+_SENSITIVE_KEY = re.compile(
+    r"(?i)^(?:[a-z0-9]+[-_])*"
+    r"(?:authorization|set[-_]cookie|x[-_]control[-_]token"
+    r"|api[-_]?key|apikey|password|passwd|secret|token)$"
 )
 
 
@@ -63,6 +73,8 @@ class AuditLog:
                 payload = self.sanitize(payload)
             except Exception:  # sanitize 坏了不能把审计写死
                 log.warning("审计 detail 脱敏失败", exc_info=True)
+        # sanitize 之后再对字符串值递归脱敏，结构（dict / list / tuple）保持不变。
+        payload = _redact_value(payload)
         event = {
             "id": str(uuid.uuid4()),
             "ts": self._clock().isoformat(timespec="seconds"),
@@ -136,6 +148,30 @@ class AuditLog:
             self.path.touch()
         except OSError as exc:
             log.warning("审计轮转失败：%s", exc)
+
+
+def _redact_value(value: Any, key: str = "") -> Any:
+    """递归脱敏 detail：敏感键整体打码，其余字符串值走文本规则。
+
+    键名（``token`` / ``password`` / ``Authorization`` / ``DEEPSEEK_API_KEY``
+    之类）本身就能说明值是凭据，哪怕值里没有 ``key=value`` 形状也要打码；
+    普通键（如 ``note``）只做文本替换，``token 用量`` 这类中文文案保持原样。
+    结构（dict / list / tuple）保持不变。
+    """
+    if key and _SENSITIVE_KEY.match(key.strip()):
+        return "***"
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {
+            item_key: _redact_value(item, item_key if isinstance(item_key, str) else "")
+            for item_key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_value(item) for item in value)
+    return value
 
 
 def _default(name: str) -> Any:

@@ -7,6 +7,8 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
+from .redact import redact
+
 log = logging.getLogger(__name__)
 
 SOURCES = ("supervisor", "opencode", "bot", "napcat")
@@ -55,13 +57,15 @@ class LogHub:
                 log.debug("启动轮转 %s 失败：%s", target, exc)
 
     def write(self, source: str, text: str) -> None:
+        # 入口一次脱敏：环 / 落盘 / SSE 共用同一份文本，避免三处规则漂移。
+        text = redact(str(text))
         if source not in self._buffers:
             self._buffers[source] = deque(maxlen=self.ring)
             self._subscribers[source] = set()
             self._seqs[source] = 0
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         seq = self._seqs[source]
-        for raw in str(text).splitlines():
+        for raw in text.splitlines():
             line = raw.rstrip()
             if not line:
                 continue
@@ -75,7 +79,7 @@ class LogHub:
                 except asyncio.QueueFull:
                     pass
         self._seqs[source] = seq
-        self._append_file(source, str(text))
+        self._append_file(source, text)
 
     def _append_file(self, source: str, text: str) -> None:
         target = self.dir / f"{source}.log"
