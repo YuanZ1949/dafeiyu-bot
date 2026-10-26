@@ -199,3 +199,165 @@ def test_validate_rejects_newer_schema(tmp_path: Path) -> None:
     ok, reason = validate_database(db)
     assert ok is False
     assert "版本" in reason
+
+
+# ---- restore ---------------------------------------------------------------
+
+class FakeSupervisor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.fail_start = 0
+        self.fail_stop = False
+
+    async def stop(self, name: str) -> None:
+        self.calls.append(("stop", name))
+        if self.fail_stop:
+            raise RuntimeError("stop failed")
+
+    async def start(self, name: str) -> None:
+        self.calls.append(("start", name))
+        if self.fail_start > 0:
+            self.fail_start -= 1
+            raise RuntimeError("start failed")
+
+
+async def make_restore(tmp_path: Path, supervisor=None, ready=True):
+    from dafeiyu.supervisor.restore import RestoreService
+
+    db = tmp_path / "dafeiyu.db"
+    store = make_db(db)
+    add_message(store, "v1")
+    store.close()
+    backups = BackupManager(db, tmp_path / "backups", clock=FakeClock())
+    service = RestoreService(
+        db_path=db,
+        backups=backups,
+        supervisor=supervisor or FakeSupervisor(),
+        ready_check=lambda: _ready(ready),
+    )
+    return service, db, backups
+
+
+async def _ready(value: bool) -> bool:
+    return value
+
+
+def rows(path: Path) -> list[str]:
+    with sqlite3.connect(path) as conn:
+        return [row[0] for row in conn.execute("SELECT content FROM messages ORDER BY id")]
+
+
+async def test_restore_replaces_db_and_returns_summary(tmp_path: Path) -> None:
+    from dafeiyu.supervisor.restore import RestoreService
+
+    db = tmp_path / "dafeiyu.db"
+    store = make_db(db)
+    add_message(store, "v1")
+    store.close()
+    supervisor = FakeSupervisor()
+    backups = BackupManager(db, tmp_path / "backups", clock=FakeClock())
+    service = RestoreService(
+        db_path=db,
+        backups=backups,
+        supervisor=supervisor,
+        ready_check=lambda: _ready(True),
+    )
+
+    upload = tmp_path / "upload.db"
+    upload.write_bytes((tmp_path / "backups" / (await backups.create()).filename).read_bytes())
+    store = Store(db)
+    store.init_schema()
+    add_message(store, "v2")
+    store.close()
+
+    result = await service.restore(upload, actor="dashboard:admin@127.0.0.1")
+
+    assert result["ok"] is True
+    assert result["bot_started"] is True
+    assert rows(db) == ["v1"]
+    assert supervisor.calls == [("stop", "bot"), ("start", "bot")]
+    assert result["pre_restore_backup"].endswith("-pre-restore.db")
+    assert (tmp_path / "backups" / result["pre_restore_backup"]).exists()
+
+
+async def test_corrupt_upload_leaves_db_unchanged(tmp_path: Path) -> None:
+    from dafeiyu.supervisor.restore import RestoreError
+
+    service, db, _backups = await make_restore(tmp_path)
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    bad = tmp_path / "bad.db"
+    bad.write_bytes(b"not sqlite")
+
+    with pytest.raises(RestoreError) as exc:
+        await service.restore(bad, actor="test")
+
+    assert exc.value.stage == "validate"
+    assert exc.value.status == 400
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+    assert service.supervisor.calls == []
+
+
+async def test_start_failure_rolls_back(tmp_path: Path) -> None:
+    from dafeiyu.supervisor.restore import RestoreError
+
+    db = tmp_path / "dafeiyu.db"
+    store = make_db(db)
+    add_message(store, "v1")
+    store.close()
+    supervisor = FakeSupervisor()
+    backups = BackupManager(db, tmp_path / "backups", clock=FakeClock())
+    from dafeiyu.supervisor.restore import RestoreService
+
+    service = RestoreService(
+        db_path=db,
+        backups=backups,
+        supervisor=supervisor,
+        ready_check=lambda: _ready(True),
+    )
+    upload = tmp_path / "upload.db"
+    upload.write_bytes((tmp_path / "backups" / (await backups.create()).filename).read_bytes())
+    store = Store(db)
+    store.init_schema()
+    add_message(store, "v2")
+    store.close()
+
+    supervisor.fail_start = 1
+    with pytest.raises(RestoreError) as exc:
+        await service.restore(upload, actor="test")
+
+    assert exc.value.stage == "health"
+    assert rows(db) == ["v1", "v2"]
+    assert supervisor.calls[-1] == ("start", "bot")
+
+
+async def test_concurrent_restore_is_rejected(tmp_path: Path) -> None:
+    from dafeiyu.supervisor.restore import RestoreError
+
+    service, _db, _backups = await make_restore(tmp_path)
+    async with service._lock:
+        with pytest.raises(RestoreError) as exc:
+            await service.restore(tmp_path / "x.db", actor="test")
+    assert exc.value.status == 409
+
+
+async def test_stop_failure_does_not_touch_db(tmp_path: Path) -> None:
+    from dafeiyu.supervisor.restore import RestoreError
+
+    db = tmp_path / "dafeiyu.db"
+    store = make_db(db)
+    add_message(store, "v1")
+    store.close()
+    supervisor = FakeSupervisor()
+    supervisor.fail_stop = True
+    backups = BackupManager(db, tmp_path / "backups", clock=FakeClock())
+    from dafeiyu.supervisor.restore import RestoreService
+
+    service = RestoreService(db_path=db, backups=backups, supervisor=supervisor)
+    upload = tmp_path / "upload.db"
+    upload.write_bytes((tmp_path / "backups" / (await backups.create()).filename).read_bytes())
+
+    with pytest.raises(RestoreError) as exc:
+        await service.restore(upload, actor="test")
+
+    assert exc.value.stage == "stop"
+    assert rows(db) == ["v1"]
