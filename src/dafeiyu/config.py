@@ -233,6 +233,7 @@ class AlertRulesConfig:
     disk_free_percent: int = 10
     reply_error_window_seconds: int = 900
     reply_error_count: int = 3
+    budget_warning: bool = True
 
 
 @dataclass(frozen=True)
@@ -479,6 +480,9 @@ def _build_alerts(raw: dict[str, Any]) -> AlertsConfig:
         reply_error_window_seconds=reply_error_window,
         reply_error_count=_positive_int(
             rules_raw.get("reply_error_count"), "alerts.rules.reply_error_count", 3
+        ),
+        budget_warning=_bool(
+            rules_raw.get("budget_warning", True), "alerts.rules.budget_warning"
         ),
     )
     return AlertsConfig(

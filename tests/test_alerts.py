@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from dafeiyu.config import AlertsConfig
+from dafeiyu.config import AlertRulesConfig, AlertsConfig
 from dafeiyu.supervisor.alerts import (
     AlertManager,
     Incident,
     QQAdminChannel,
     WebhookChannel,
 )
+from dafeiyu.supervisor.audit import AuditLog
 
 
 class Clock:
@@ -254,6 +256,87 @@ async def test_send_test_does_not_persist(tmp_path: Path) -> None:
     assert result == {"sent": 1, "failed": 0}
     assert channel.sent[0][1] == "test"
     assert mgr.summary()["firing"] == 0
+    assert mgr.events() == []
+
+
+async def test_budget_warning_alerts_and_repeats_after_24h(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot(
+        budget={
+            "warnings": [
+                {"scope": "global_daily", "ratio": 0.8, "calls": 8, "limit": 10}
+            ]
+        }
+    )
+
+    await mgr.evaluate(snapshot)
+    assert len(channel.sent) == 1
+    incident, event = channel.sent[0]
+    assert event == "firing"
+    assert incident.rule == "budget_warning:global_daily:0.8"
+    assert incident.fingerprint == "budget_warning:global_daily:0.8"
+    assert incident.severity == "warning"
+    assert incident.data == {"calls": 8, "limit": 10}
+
+    clock.advance(86400 - 1)
+    await mgr.evaluate(snapshot)
+    assert len(channel.sent) == 1
+
+    clock.advance(1)
+    await mgr.evaluate(snapshot)
+    assert len(channel.sent) == 2
+    assert channel.sent[1][1] == "firing"
+    assert channel.sent[1][0].rule == "budget_warning:global_daily:0.8"
+
+
+async def test_budget_warning_audit_has_only_calls_and_limit(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    mgr = AlertManager(
+        AlertsConfig(),
+        tmp_path / "alert-state.json",
+        [channel],
+        audit=audit,
+        clock=clock,
+    )
+    snapshot = base_snapshot(
+        budget={
+            "warnings": [
+                {"scope": "global_daily", "ratio": 0.8, "calls": 8, "limit": 10}
+            ]
+        }
+    )
+
+    await mgr.evaluate(snapshot)
+
+    rows = [row for row in audit.query(limit=20) if row["action"] == "budget.warning"]
+    assert len(rows) == 1
+    assert rows[0]["target"] == "global_daily:0.8"
+    assert rows[0]["detail"] == {"calls": 8, "limit": 10}
+
+
+async def test_budget_warning_can_be_disabled(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    cfg = replace(
+        AlertsConfig(),
+        rules=replace(AlertRulesConfig(), budget_warning=False),
+    )
+    mgr = manager(tmp_path, clock, channel, cfg=cfg)
+    snapshot = base_snapshot(
+        budget={
+            "warnings": [
+                {"scope": "global_daily", "ratio": 0.8, "calls": 8, "limit": 10}
+            ]
+        }
+    )
+
+    await mgr.evaluate(snapshot)
+
+    assert channel.sent == []
     assert mgr.events() == []
 
 

@@ -173,6 +173,7 @@ alerts:
     disk_free_percent: 10
     reply_error_window_seconds: 900
     reply_error_count: 3
+    budget_warning: true
 
 # 备份默认开启，只写本地目录；手动/恢复前备份不受保留策略清理。
 backup:

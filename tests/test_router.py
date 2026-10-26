@@ -4,6 +4,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from dafeiyu.memory.store import UsageTotals
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Command, Router, parse_command
 
@@ -38,6 +39,23 @@ class FakeStore:
     def usage_today(self, chat_type: ChatType, chat_id: int, today: str) -> tuple[int, int]:
         return self.calls, self.tokens
 
+    def usage_between(
+        self,
+        start_date: str,
+        end_date: str,
+        *,
+        purposes=None,
+        chat_type=None,
+        chat_id=None,
+    ) -> UsageTotals:
+        return UsageTotals(self.calls, 0, self.tokens)
+
+    def usage_global_today(self, date: str) -> UsageTotals:
+        return UsageTotals(0, 0, 0)
+
+    def usage_month(self, month: str) -> UsageTotals:
+        return UsageTotals(0, 0, 0)
+
     def recent_messages(self, chat_type: ChatType, chat_id: int, limit: int) -> list[Message]:
         return self.msgs[-limit:]
 
@@ -60,7 +78,21 @@ def make_settings(
             keywords=keywords,
         ),
         groups=SimpleNamespace(whitelist=frozenset(whitelist), blacklist=frozenset(blacklist)),
-        budget=SimpleNamespace(daily_calls=daily_calls, daily_tokens=1000),
+        budget=SimpleNamespace(
+            daily_calls=daily_calls,
+            daily_tokens=1000,
+            ambient_ratio=0.8,
+            global_daily_calls=0,
+            global_daily_tokens=0,
+            monthly_calls=0,
+            monthly_tokens=0,
+            monthly_cost_limit=0.0,
+            currency="CNY",
+            price_input_per_million=0.0,
+            price_output_per_million=0.0,
+            warning_ratios=(0.5, 0.8, 1.0),
+            on_exceed="degrade",
+        ),
     )
 
 
@@ -267,6 +299,9 @@ def test_explain_hard_trigger_has_ordered_checks_and_alias_source() -> None:
         "muted",
         "blacklist",
         "budget",
+        "budget_global",
+        "budget_monthly",
+        "budget_cost",
         "hard",
         "whitelist",
         "quiet",

@@ -111,6 +111,71 @@ def test_health_snapshot_shape_and_no_secrets(tmp_path: Path) -> None:
     assert "sk-test" not in text
 
 
+def test_health_snapshot_budget_report(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    settings = replace(
+        settings,
+        budget=replace(
+            settings.budget,
+            global_daily_calls=100,
+            monthly_calls=200,
+            monthly_cost_limit=10.0,
+            price_input_per_million=1.0,
+            price_output_per_million=2.0,
+        ),
+    )
+    store = Store(tmp_path / "test.db")
+    store.init_schema()
+    store.record_usage(ChatType.GROUP, 100, "reply", 1_000_000, 500_000)
+    control = BrainControl(
+        settings,
+        store,
+        FakeService(),
+        FakeAdapter(),
+        runtime_path=str(tmp_path / "runtime.json"),
+    )
+
+    snapshot = control.health_snapshot()
+    budget = snapshot["budget"]
+
+    assert budget["per_chat"]["calls"] == 1
+    assert budget["per_chat"]["tokens"] == 1_500_000
+    assert budget["global_daily"] == {
+        "calls": 1,
+        "tokens": 1_500_000,
+        "limit_calls": 100,
+        "limit_tokens": 0,
+    }
+    assert budget["monthly"]["calls"] == 1
+    assert budget["monthly"]["limit_calls"] == 200
+    assert budget["cost"]["cost"] == 2.0
+    assert budget["cost"]["cost_limit"] == 10.0
+    assert budget["cost"]["currency"] == "CNY"
+    assert isinstance(budget["warnings"], list)
+    assert all(isinstance(item, dict) for item in budget["warnings"])
+
+
+def test_health_snapshot_budget_storage_error_keeps_shape(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, _adapter, store, _app = make_control(tmp_path)
+
+    def boom(_date):
+        raise RuntimeError("db broken")
+
+    monkeypatch.setattr(store, "usage_global_today", boom)
+    snapshot = control.health_snapshot()
+
+    budget = snapshot["budget"]
+    assert set(budget) == {"per_chat", "global_daily", "monthly", "cost", "warnings"}
+    assert budget["global_daily"]["calls"] == 0
+    assert budget["monthly"]["calls"] == 0
+    assert budget["cost"]["cost"] == 0.0
+    assert budget["warnings"] == [
+        {"scope": "storage_error", "ratio": 1.0, "calls": 0, "limit": 0}
+    ]
+
+
 def test_health_snapshot_db_failure_is_reported(tmp_path: Path, monkeypatch) -> None:
     control, _adapter, store, _app = make_control(tmp_path)
 

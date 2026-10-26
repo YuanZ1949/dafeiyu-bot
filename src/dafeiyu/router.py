@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from dafeiyu.budget import BudgetAction, BudgetGuard
 from dafeiyu.config import Settings
 from dafeiyu.models import ChatType, Message
 from dafeiyu.timeutil import SHANGHAI, now_shanghai  # noqa: F401 - 兼容旧导入路径
@@ -19,6 +20,11 @@ class TriggerDecision:
     call_model: bool
     hard: bool
     reason: str
+
+    @property
+    def handle(self) -> bool:
+        """兼容调试输出：是否放行。"""
+        return self.call_model
 
 
 @dataclass(frozen=True)
@@ -51,7 +57,10 @@ _CHECK_LABELS = {
     "self": "自身消息",
     "muted": "静音",
     "blacklist": "群黑名单",
-    "budget": "今日预算",
+    "budget": "每日预算",
+    "budget_global": "全局日预算",
+    "budget_monthly": "月度预算",
+    "budget_cost": "月度费用",
     "hard": "硬触发",
     "whitelist": "群白名单",
     "quiet": "夜间静默",
@@ -85,6 +94,23 @@ def _check_detail(
             f"{metrics['usage_calls']}/{metrics['daily_calls']} 次，"
             f"{metrics['usage_tokens']}/{metrics['daily_tokens']} token"
         )
+    if key == "budget_global":
+        return (
+            f"{metrics['global_calls']}/{metrics['global_limit_calls']} 次，"
+            f"{metrics['global_tokens']}/{metrics['global_limit_tokens']} token"
+        )
+    if key == "budget_monthly":
+        return (
+            f"{metrics['monthly_calls']}/{metrics['monthly_limit_calls']} 次，"
+            f"{metrics['monthly_tokens']}/{metrics['monthly_limit_tokens']} token"
+        )
+    if key == "budget_cost":
+        limit = metrics["monthly_cost_limit"]
+        currency = metrics["currency"]
+        used = metrics["monthly_cost"]
+        if limit <= 0:
+            return f"{used:.2f} {currency}，未设上限"
+        return f"{used:.2f}/{limit:.2f} {currency}"
     if key == "hard":
         labels = {"at": "@ 机器人", "reply": "引用回复", "alias": "正文别名"}
         return labels.get(source or "", "未点名")
@@ -122,9 +148,11 @@ class Router:
     rng: random.Random | None = None
     _states: dict[tuple[ChatType, int], _ChatState] = field(default_factory=dict, init=False)
     _rng: random.Random = field(init=False, repr=False)
+    budget_guard: BudgetGuard = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._rng = self.rng if self.rng is not None else random.Random()
+        self.budget_guard = BudgetGuard(self.store, self.settings.budget)
 
     # ---- state ----------------------------------------------------
     def _state(self, chat_type: ChatType, chat_id: int) -> _ChatState:
@@ -262,23 +290,26 @@ class Router:
 
         st = self._state(msg.chat_type, msg.chat_id)
         now = self.clock()
-        key = (msg.chat_type, msg.chat_id)
 
         if st.muted_until is not None and now < st.muted_until:
             return TriggerDecision(False, False, "muted")
         if msg.chat_id in self.settings.groups.blacklist:
             return TriggerDecision(False, False, "blacklist")
 
-        calls, tokens = self.store.usage_today(
-            msg.chat_type, msg.chat_id, now.date().isoformat()
+        hard = self.hard_trigger(msg)
+        budget = self.budget_guard.evaluate(
+            msg.chat_type,
+            msg.chat_id,
+            addressed=hard,
+            purpose="reply" if hard else "ambient",
+            now=now,
         )
-        if calls >= self.settings.budget.daily_calls:
+        if budget.action is BudgetAction.DENY or (
+            budget.action is BudgetAction.DEGRADE and not hard
+        ):
             return TriggerDecision(False, False, "budget")
-        if tokens >= self.settings.budget.daily_tokens:
-            return TriggerDecision(False, False, "budget")
-
         # 硬触发（@/引用/别名）优先于白名单：被点名的群一定回。
-        if self.hard_trigger(msg):
+        if hard:
             return TriggerDecision(True, True, "hard")
 
         if self.settings.groups.whitelist and msg.chat_id not in self.settings.groups.whitelist:
@@ -336,11 +367,58 @@ class Router:
             "whitelist_empty": not bool(self.settings.groups.whitelist),
         }
 
+        hard = probe.hard_trigger(msg)
+        budget_decision = probe.budget_guard.evaluate(
+            msg.chat_type,
+            msg.chat_id,
+            addressed=hard,
+            purpose="reply" if hard else "ambient",
+            now=now,
+        )
+        budget_cfg = self.settings.budget
+        metrics.update(
+            {
+                "global_calls": 0,
+                "global_tokens": 0,
+                "global_limit_calls": budget_cfg.global_daily_calls,
+                "global_limit_tokens": budget_cfg.global_daily_tokens,
+                "monthly_calls": 0,
+                "monthly_tokens": 0,
+                "monthly_limit_calls": budget_cfg.monthly_calls,
+                "monthly_limit_tokens": budget_cfg.monthly_tokens,
+                "monthly_cost": 0.0,
+                "monthly_cost_limit": budget_cfg.monthly_cost_limit,
+                "currency": budget_cfg.currency,
+                "budget_action": budget_decision.action.value,
+                "budget_scope": budget_decision.scope,
+                "warnings": list(budget_decision.warnings),
+            }
+        )
+        try:
+            report = probe.budget_guard.report(
+                msg.chat_type, msg.chat_id, now=now
+            )
+        except Exception:  # noqa: BLE001 - explain 不能因读库失败而中断
+            report = None
+        if report is not None:
+            metrics.update(
+                {
+                    "global_calls": report.global_daily["calls"],
+                    "global_tokens": report.global_daily["tokens"],
+                    "monthly_calls": report.monthly["calls"],
+                    "monthly_tokens": report.monthly["tokens"],
+                    "monthly_cost": report.cost["cost"],
+                }
+            )
+
         keys = [
             "self",
             "muted",
             "blacklist",
             "budget",
+            "budget_global",
+            "budget_monthly",
+            "budget_cost",
             "hard",
             "whitelist",
             "quiet",

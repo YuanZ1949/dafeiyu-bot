@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -39,6 +39,7 @@ class Incident:
     resolved_at: str | None = None
     notify_count: int = 0
     last_notified_at: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class Condition:
     severity: str
     title: str
     detail: str
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 class AlertChannelError(Exception):
@@ -68,6 +70,23 @@ def _parse_ts(value: Any) -> float:
         return datetime.fromisoformat(str(value)).timestamp()
     except ValueError:
         return 0.0
+
+
+_BUDGET_SCOPES = frozenset({"per_chat", "global_daily", "monthly", "cost"})
+_BUDGET_SCOPE_LABELS = {
+    "per_chat": "会话日额度",
+    "global_daily": "全局日额度",
+    "monthly": "月度额度",
+    "cost": "月度费用",
+}
+
+
+def _ratio_text(value: Any) -> str:
+    """指纹里的比例保持 0.8 / 1.0 这种稳定写法。"""
+    try:
+        return str(float(value))
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _format_text(incident: Incident, event: str) -> str:
@@ -305,6 +324,35 @@ class AlertManager:
             conditions["backup_failed"] = Condition(
                 True, "warning", "备份失败", "最近一次备份未成功"
             )
+
+        budget = snapshot.get("budget") or {}
+        if rules.budget_warning and isinstance(budget, dict):
+            warnings = budget.get("warnings") or []
+            if isinstance(warnings, list):
+                for warning in warnings:
+                    if not isinstance(warning, dict):
+                        continue
+                    scope = str(warning.get("scope") or "").strip()
+                    if scope not in _BUDGET_SCOPES:
+                        continue
+                    try:
+                        ratio = float(warning.get("ratio", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    ratio_text = _ratio_text(ratio)
+                    calls = warning.get("calls", 0)
+                    limit = warning.get("limit", 0)
+                    detail = (
+                        f"{_BUDGET_SCOPE_LABELS[scope]}达到 {ratio_text}"
+                        f"（{calls}/{limit}）"
+                    )
+                    conditions[f"budget_warning:{scope}:{ratio_text}"] = Condition(
+                        True,
+                        "warning",
+                        "预算预警",
+                        detail,
+                        {"calls": calls, "limit": limit},
+                    )
         return conditions
 
     def _pending_seconds(self, rule: str) -> int:
@@ -316,6 +364,8 @@ class AlertManager:
         }.get(rule, 0)
 
     def _repeat_seconds(self, rule: str) -> int:
+        if rule.startswith("budget_warning:"):
+            return 86400
         if rule == "disk_low":
             return max(DISK_REPEAT_SECONDS, int(self.cfg.repeat_seconds))
         return int(self.cfg.repeat_seconds)
@@ -352,6 +402,7 @@ class AlertManager:
             incident.severity = condition.severity
             incident.title = condition.title
             incident.detail = condition.detail
+            incident.data = dict(condition.data)
             incident.last_seen_at = _iso(now)
 
             if incident.status == "pending":
@@ -386,6 +437,7 @@ class AlertManager:
                 detail=condition.detail,
                 first_seen_at=_iso(started),
                 last_seen_at=_iso(now),
+                data=dict(condition.data),
             )
             if now - started >= self._pending_seconds(fingerprint):
                 incident.status = "firing"
@@ -446,6 +498,17 @@ class AlertManager:
                         "severity": incident.severity,
                     },
                 )
+                if event == "firing" and incident.rule.startswith("budget_warning:"):
+                    # 预算审计只记用量与上限，绝不带消息正文。
+                    self.audit.write(
+                        "budget.warning",
+                        actor="system",
+                        target=incident.rule.split(":", 1)[1],
+                        detail={
+                            "calls": incident.data.get("calls", 0),
+                            "limit": incident.data.get("limit", 0),
+                        },
+                    )
 
     # ---- 查询 -----------------------------------------------------
     def events(self, include_resolved_hours: int = 24) -> list[dict[str, Any]]:

@@ -23,6 +23,7 @@ from .brain.factory import (
     normalize_provider,
 )
 from . import __version__
+from .budget import BudgetGuard
 from .config import ConfigError, Settings
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
 from .models import ChatType, Message
@@ -290,6 +291,7 @@ class BrainControl:
         self.runtime: RuntimeState = load_runtime(runtime_path)
         self._lock = asyncio.Lock()
         self._last_notify_at: float | None = None
+        self.budget_guard = BudgetGuard(store, settings.budget)
 
     def snapshot(self) -> dict[str, Any]:
         provider = current_provider(self.settings, self.runtime)
@@ -369,6 +371,46 @@ class BrainControl:
                 return 0
 
         last_event_at = _iso_ts(getattr(self.adapter, "last_event_at", None))
+        budget: dict[str, Any] = {
+            "per_chat": {
+                "calls": today_calls,
+                "tokens": today_tokens,
+                "daily_calls": self.settings.budget.daily_calls,
+                "daily_tokens": self.settings.budget.daily_tokens,
+            },
+            "global_daily": {
+                "calls": 0,
+                "tokens": 0,
+                "limit_calls": self.settings.budget.global_daily_calls,
+                "limit_tokens": self.settings.budget.global_daily_tokens,
+            },
+            "monthly": {
+                "calls": 0,
+                "tokens": 0,
+                "limit_calls": self.settings.budget.monthly_calls,
+                "limit_tokens": self.settings.budget.monthly_tokens,
+            },
+            "cost": {
+                "cost": 0.0,
+                "cost_limit": self.settings.budget.monthly_cost_limit,
+                "currency": self.settings.budget.currency,
+                "estimated": False,
+            },
+            "warnings": [],
+        }
+        try:
+            report = self.budget_guard.report(ChatType.GROUP, 0)
+        except Exception as exc:  # noqa: BLE001 - 健康快照必须保持可用
+            budget["warnings"] = [
+                {"scope": "storage_error", "ratio": 1.0, "calls": 0, "limit": 0}
+            ]
+            log.warning("读取预算快照失败：%s", exc)
+        else:
+            budget["global_daily"] = dict(report.global_daily)
+            budget["monthly"] = dict(report.monthly)
+            budget["cost"] = dict(report.cost)
+            budget["warnings"] = [dict(item) for item in report.warnings]
+
         return {
             "ok": ok,
             "generated_at": generated_at,
@@ -389,30 +431,7 @@ class BrainControl:
                 "pending_chats": _count("pending_count"),
                 "inflight_chats": _count("inflight_count"),
             },
-            "budget": {
-                "per_chat": {
-                    "calls": today_calls,
-                    "tokens": today_tokens,
-                    "daily_calls": self.settings.budget.daily_calls,
-                    "daily_tokens": self.settings.budget.daily_tokens,
-                },
-                # 分册 B 才落地全局/月度/费用预算，A 先保留占位结构。
-                "global_daily": {
-                    "calls": 0,
-                    "tokens": 0,
-                    "limit_calls": 0,
-                    "limit_tokens": 0,
-                },
-                "monthly": {
-                    "calls": 0,
-                    "tokens": 0,
-                    "limit_calls": 0,
-                    "limit_tokens": 0,
-                    "cost": 0.0,
-                    "cost_limit": 0.0,
-                },
-                "warnings": [],
-            },
+            "budget": budget,
             "quota": {
                 "paused_until": float(quota_until) if quota_paused else None,
                 "reason": "额度熔断" if quota_paused else "",

@@ -9,6 +9,7 @@ from typing import Any
 
 from .brain.client import BrainError, BrainReply
 from .brain.persona import build_system_prompt, os_probability_hint
+from .budget import BudgetAction
 from .config import InjectionConfig, Settings
 from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
@@ -78,7 +79,7 @@ _CHECK_LABELS = {
     "hard": "硬触发",
     "whitelist": "群白名单",
     "batch": "进入批次",
-    "budget": "今日预算",
+    "budget": "每日预算",
     "model": "模型路径",
     "private": "私聊直回",
 }
@@ -104,6 +105,7 @@ class Service:
         self.brain = brain
         self.adapter = adapter
         self.router = router
+        self.budget_guard = router.budget_guard
         self.persona_text = persona_text
         self.impressions = impressions
         self.workspace = workspace
@@ -112,6 +114,7 @@ class Service:
         self._scheduler_task: asyncio.Task | None = None
         self._locks: dict[tuple[ChatType, int], asyncio.Lock] = {}
         self._batch_locks: dict[tuple[ChatType, int], asyncio.Lock] = {}
+        self._started_at = time.monotonic()
         # 轮换后的接续文本：成功投递才弹出，失败留到下一批重试。
         self._continuations: dict[tuple[ChatType, int], str] = {}
         self._hint_at: dict[tuple[ChatType, int], float] = {}
@@ -747,21 +750,17 @@ class Service:
 
     def _budget_for(self, chat_type: ChatType, chat_id: int, *, addressed: bool) -> bool:
         """80/20 预算分层：非点名只能用 ambient 额度，点名可用剩下的全部。"""
-        budget = self.settings.budget
-        today = now_shanghai().date().isoformat()
-        calls, tokens = self.store.usage_today_by_purpose(
-            chat_type, chat_id, today, ("reply", "ambient")
+        decision = self.budget_guard.evaluate(
+            chat_type,
+            chat_id,
+            addressed=addressed,
+            purpose="reply" if addressed else "ambient",
+            now=now_shanghai(),
         )
-        if calls >= budget.daily_calls or tokens >= budget.daily_tokens:
+        if decision.action is BudgetAction.DENY:
             return False
-        if addressed:
-            return True
-        ambient_calls, ambient_tokens = self.store.usage_today_by_purpose(
-            chat_type, chat_id, today, ("ambient",)
-        )
-        return (
-            ambient_calls < budget.daily_calls * budget.ambient_ratio
-            and ambient_tokens < budget.daily_tokens * budget.ambient_ratio
+        return not (
+            decision.action is BudgetAction.DEGRADE and not addressed
         )
 
     def _tool_hint(self, chat_type: ChatType, chat_id: int):
@@ -939,12 +938,15 @@ class Service:
         asyncio.create_task(run())
 
     def _private_budget_ok(self, msg: Message) -> bool:
-        today = now_shanghai().date().isoformat()
-        calls, tokens = self.store.usage_today(msg.chat_type, msg.chat_id, today)
-        return (
-            calls < self.settings.budget.daily_calls
-            and tokens < self.settings.budget.daily_tokens
+        # 私聊视为点名：存储读失败时只降级不拦死。
+        decision = self.budget_guard.evaluate(
+            msg.chat_type,
+            msg.chat_id,
+            addressed=True,
+            purpose="reply",
+            now=now_shanghai(),
         )
+        return decision.action is not BudgetAction.DENY
 
     async def forget_chat(self, chat_type: ChatType, chat_id: int) -> None:
         """硬忘记：先删远端 session（它要读映射），再清本地全部数据。
