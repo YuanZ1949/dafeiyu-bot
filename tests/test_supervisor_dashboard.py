@@ -98,6 +98,18 @@ async def test_index_serves_dashboard(tmp_path: Path) -> None:
     assert "btn-log-clear" in text
     assert "btn-log-download" in text
     assert "LOG_MAX_LINES" in text
+    assert "trigger-debug" in text
+    assert "debug-chat-type" in text
+    assert "debug-chat-id" in text
+    assert "debug-user-id" in text
+    assert "debug-nickname" in text
+    assert "debug-content" in text
+    assert "debug-at-bot" in text
+    assert "debug-reply-bot" in text
+    assert "btn-debug-trigger" in text
+    assert "debug-result" in text
+    assert "debug-checks" in text
+    assert "debug-metrics" in text
 
 
 async def test_status_reports_processes_and_offline_brain(tmp_path: Path) -> None:

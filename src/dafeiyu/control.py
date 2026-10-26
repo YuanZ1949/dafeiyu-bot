@@ -24,7 +24,7 @@ from .brain.factory import (
 )
 from .config import ConfigError, Settings
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
-from .models import ChatType
+from .models import ChatType, Message
 from .runtime import RuntimeState, load_runtime, save_runtime
 from .service import BRAIN_ERROR_COOLDOWN_SECONDS, TOOL_HINT_INTERVAL_SECONDS
 from .timeutil import SHANGHAI
@@ -42,6 +42,8 @@ log = logging.getLogger(__name__)
 CLOSE_DELAY_SECONDS = 30.0
 MODEL_PROBE_TIMEOUT = 3.0
 MAX_IMPRESSION_CHARS = 200
+MAX_DEBUG_MESSAGE_CHARS = 2000
+MAX_DEBUG_NICKNAME_CHARS = 40
 IMPRESSION_KINDS = {"nickname", "preference", "fact"}
 
 
@@ -281,6 +283,14 @@ class BrainControl:
             "modes": mode_status(self.settings, self.runtime),
             "gateway_connected": bool(getattr(self.adapter, "connected", False)),
         }
+
+    def explain_trigger(
+        self, msg: Message, *, seed: int | None = None
+    ) -> dict[str, Any]:
+        explain = getattr(self.service, "explain_trigger", None)
+        if not callable(explain):
+            raise NotImplementedError("当前服务不支持触发调试")
+        return explain(msg, seed=seed)
 
     async def switch(self, provider: str, model: str = "") -> dict[str, Any]:
         target = normalize_provider(provider)
@@ -716,6 +726,84 @@ def create_app(
         except SwitchError as exc:
             return web.json_response({"error": exc.reason}, status=exc.status)
 
+    async def debug_trigger(request: web.Request) -> web.Response:
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        chat_type, chat_id, error = _chat_target(payload)
+        if error is not None:
+            return error
+
+        raw_content = payload.get("content")
+        if not isinstance(raw_content, str):
+            return web.json_response({"error": "content 必须是字符串"}, status=400)
+        content = raw_content.strip()
+        if not content:
+            return web.json_response({"error": "content 不能为空"}, status=400)
+        if len(content) > MAX_DEBUG_MESSAGE_CHARS:
+            return web.json_response(
+                {"error": f"content 不能超过 {MAX_DEBUG_MESSAGE_CHARS} 字"},
+                status=400,
+            )
+
+        raw_user_id = payload.get("user_id")
+        if isinstance(raw_user_id, bool):
+            return web.json_response({"error": "user_id 必须是正整数"}, status=400)
+        try:
+            user_id = int(raw_user_id)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "user_id 必须是正整数"}, status=400)
+        if user_id <= 0:
+            return web.json_response({"error": "user_id 必须是正整数"}, status=400)
+
+        raw_nickname = payload.get("nickname", "调试用户")
+        if not isinstance(raw_nickname, str):
+            return web.json_response({"error": "nickname 必须是字符串"}, status=400)
+        nickname = raw_nickname.strip() or "调试用户"
+        if len(nickname) > MAX_DEBUG_NICKNAME_CHARS:
+            return web.json_response(
+                {"error": f"nickname 不能超过 {MAX_DEBUG_NICKNAME_CHARS} 字"},
+                status=400,
+            )
+
+        flags: dict[str, bool] = {}
+        for field in ("at_bot", "reply_to_bot"):
+            value = payload.get(field, False)
+            if not isinstance(value, bool):
+                return web.json_response(
+                    {"error": f"{field} 必须是布尔值"}, status=400
+                )
+            flags[field] = value
+
+        seed = payload.get("seed")
+        if seed is not None:
+            if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+                return web.json_response(
+                    {"error": "seed 必须是非负整数"}, status=400
+                )
+
+        msg = Message(
+            chat_type=chat_type,
+            chat_id=chat_id,
+            user_id=user_id,
+            nickname=nickname,
+            content=content,
+            message_id=f"debug-{time.time_ns()}",
+            segments=[],
+            at_bot=flags["at_bot"],
+            reply_to_bot=flags["reply_to_bot"],
+            timestamp=int(time.time()),
+        )
+        try:
+            return web.json_response(control.explain_trigger(msg, seed=seed))
+        except NotImplementedError as exc:
+            return web.json_response({"error": str(exc)}, status=503)
+        except Exception as exc:  # 调试器读失败不能把控制口打挂
+            log.warning("触发调试失败：%s", exc)
+            return web.json_response(
+                {"error": f"触发调试失败：{exc.__class__.__name__}"}, status=500
+            )
+
     async def models(_: web.Request) -> web.Response:
         try:
             return web.json_response({"models": await control.list_models()})
@@ -1131,6 +1219,7 @@ def create_app(
     app.router.add_get("/api/brain", get_brain)
     app.router.add_post("/api/brain", post_brain)
     app.router.add_get("/api/brain/models", models)
+    app.router.add_post("/api/debug/trigger", debug_trigger)
     app.router.add_get("/api/memory", memory)
     app.router.add_post("/api/memory/summaries", post_summary)
     app.router.add_post("/api/memory/impressions", post_impressions)

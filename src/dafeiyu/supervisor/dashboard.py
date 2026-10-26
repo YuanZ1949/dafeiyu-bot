@@ -266,6 +266,13 @@ def create_app(
     async def sessions(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/sessions")
 
+    async def debug_trigger(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call("POST", "/api/debug/trigger", payload)
+        return web.json_response(data, status=code)
+
     async def config(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/config")
 
@@ -422,6 +429,7 @@ def create_app(
     app.router.add_get("/api/memory/search", memory_search)
     app.router.add_get("/api/memory/export", memory_export)
     app.router.add_get("/api/sessions", sessions)
+    app.router.add_post("/api/debug/trigger", debug_trigger)
     app.router.add_get(
         "/api/sessions/{chat_type}/{chat_id}/timeline", session_timeline
     )

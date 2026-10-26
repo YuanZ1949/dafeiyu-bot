@@ -40,6 +40,49 @@ ROTATION_WINDOW = 40
 SKIP_BUDGET = "budget"
 SKIP_ERROR = "error"
 
+_GROUP_COMMANDS = frozenset({"闭嘴", "shutup", "醒来", "wake", "forget"})
+_PRIVATE_COMMANDS = frozenset({"stats", "forget"})
+
+_REASON_TEXT = {
+    "self": "机器人自己的消息",
+    "command": "命中内置命令",
+    "muted": "群聊已静音",
+    "quiet": "夜间静默",
+    "blacklist": "群在黑名单",
+    "budget": "今日预算已用完",
+    "hard": "被点名",
+    "whitelist": "群不在白名单",
+    "duplicate": "冷却窗口内重复",
+    "question": "命中提问规则",
+    "cooldown": "机器人刚说过话",
+    "hot": "群聊正热",
+    "sample": "随机抽样命中",
+    "sample_skip": "随机抽样未命中",
+    "batch": "已进入批次，等待模型判定",
+    "private": "私聊预算通过，直接调用模型",
+}
+
+_VERDICT_TEXT = {
+    "model": "会进入模型",
+    "batch": "会进入批次，等待模型判定",
+    "skip": "不会进入模型",
+    "command": "会走命令分支",
+}
+
+_CHECK_LABELS = {
+    "self": "自身消息",
+    "command": "内置命令",
+    "muted": "静音",
+    "quiet": "夜间静默",
+    "blacklist": "群黑名单",
+    "hard": "硬触发",
+    "whitelist": "群白名单",
+    "batch": "进入批次",
+    "budget": "今日预算",
+    "model": "模型路径",
+    "private": "私聊直回",
+}
+
 
 class Service:
     """把网关、路由、记忆、模型和发送串成一条链路。"""
@@ -199,6 +242,376 @@ class Service:
         if not addressed and whitelist and msg.chat_id not in whitelist:
             return "whitelist"
         return None
+
+    # ---- trigger debugger -----------------------------------------
+    def explain_trigger(
+        self,
+        msg: Message,
+        *,
+        now: Any = None,
+        seed: int | None = None,
+    ) -> dict[str, Any]:
+        """只读推演一条消息会走哪条路径；不写消息、不调模型、不动调度器。"""
+        now = now or now_shanghai()
+        configured_mode = self.settings.triggers.mode
+        mode = "model" if self._uses_scheduler() else "rules"
+        mode_note = None
+        if configured_mode == "model" and mode == "rules":
+            mode_note = "配置为 model，但大脑没有 reply 接口，按 rules 路径判定"
+        hard_source = self.router.addressed_source(msg)
+        metrics = self._usage_metrics(msg.chat_type, msg.chat_id, now)
+
+        if msg.is_bot:
+            checks = [
+                self._check("self", "blocked", "机器人自己的消息，直接忽略"),
+                self._check("model", "skipped", "自身消息不会进入模型"),
+            ]
+            return self._explain_result(
+                msg,
+                verdict="skip",
+                reason="self",
+                mode=mode,
+                checks=checks,
+                metrics=metrics,
+                hard_source=hard_source,
+                mode_note=mode_note,
+            )
+
+        command = parse_command(msg.content)
+        if command is not None:
+            names = (
+                _GROUP_COMMANDS
+                if msg.chat_type is ChatType.GROUP
+                else _PRIVATE_COMMANDS
+            )
+            if command.name.casefold() in names:
+                checks = [
+                    self._check("self", "pass", "普通用户消息"),
+                    self._check("command", "pass", f"/{command.name} 会走命令分支"),
+                    self._check("model", "skipped", "命令分支已接管，不会进入模型"),
+                ]
+                return self._explain_result(
+                    msg,
+                    verdict="command",
+                    reason="command",
+                    mode=mode,
+                    checks=checks,
+                    metrics=metrics,
+                    hard_source=hard_source,
+                    mode_note=mode_note,
+                )
+
+        if msg.chat_type is ChatType.PRIVATE:
+            return self._explain_private(
+                msg,
+                now=now,
+                mode=mode,
+                mode_note=mode_note,
+                hard_source=hard_source,
+                metrics=metrics,
+            )
+        if mode == "model":
+            return self._explain_model_group(
+                msg,
+                now=now,
+                seed=seed,
+                mode_note=mode_note,
+                hard_source=hard_source,
+            )
+        return self._explain_rules(
+            msg, now=now, seed=seed, mode=mode, mode_note=mode_note
+        )
+
+    def _explain_rules(
+        self,
+        msg: Message,
+        *,
+        now: Any,
+        seed: int | None,
+        mode: str,
+        mode_note: str | None,
+    ) -> dict[str, Any]:
+        result = self.router.explain(msg, now=now, seed=seed)
+        verdict = "model" if result["decision"]["call_model"] else "skip"
+        reason = result["decision"]["reason"]
+        result.update(
+            {
+                "verdict": verdict,
+                "verdict_text": _VERDICT_TEXT[verdict],
+                "reason": reason,
+                "reason_text": _REASON_TEXT.get(reason, reason),
+                "mode": mode,
+                "configured_mode": self.settings.triggers.mode,
+                "chat_type": msg.chat_type.value,
+                "chat_id": msg.chat_id,
+                "user_id": msg.user_id,
+            }
+        )
+        if mode_note:
+            result["mode_note"] = mode_note
+        return result
+
+    def _explain_private(
+        self,
+        msg: Message,
+        *,
+        now: Any,
+        mode: str,
+        mode_note: str | None,
+        hard_source: str | None,
+        metrics: dict[str, Any],
+    ) -> dict[str, Any]:
+        ok = (
+            metrics["usage_calls"] < metrics["daily_calls"]
+            and metrics["usage_tokens"] < metrics["daily_tokens"]
+        )
+        metrics["budget_ok"] = ok
+        reason = "private" if ok else "budget"
+        checks = [
+            self._check("self", "pass", "普通用户消息"),
+            self._check(
+                "budget",
+                "pass" if ok else "blocked",
+                f"{metrics['usage_calls']}/{metrics['daily_calls']} 次，"
+                f"{metrics['usage_tokens']}/{metrics['daily_tokens']} token",
+            ),
+            self._check(
+                "private",
+                "pass" if ok else "skipped",
+                "私聊直接调用模型" if ok else "预算已用完",
+            ),
+        ]
+        return self._explain_result(
+            msg,
+            verdict="model" if ok else "skip",
+            reason=reason,
+            mode=mode,
+            checks=checks,
+            metrics=metrics,
+            hard_source=hard_source,
+            mode_note=mode_note,
+        )
+
+    def _explain_model_group(
+        self,
+        msg: Message,
+        *,
+        now: Any,
+        seed: int | None,
+        mode_note: str | None,
+        hard_source: str | None,
+    ) -> dict[str, Any]:
+        probe = self.router.clone(now=now, seed=seed)
+        if msg.reply_to_bot:
+            probe.note_reply(msg.chat_type, msg.chat_id)
+        source = probe.addressed_source(msg)
+        addressed = source is not None
+
+        reason = None
+        if probe.is_muted(msg.chat_type, msg.chat_id):
+            reason = "muted"
+        elif probe.is_quiet(msg.chat_type, msg.chat_id):
+            reason = "quiet"
+        elif msg.chat_id in self.settings.groups.blacklist:
+            reason = "blacklist"
+        elif (
+            not addressed
+            and self.settings.groups.whitelist
+            and msg.chat_id not in self.settings.groups.whitelist
+        ):
+            reason = "whitelist"
+
+        metrics = self._usage_metrics(msg.chat_type, msg.chat_id, now)
+        metrics.update(self._ambient_budget_metrics(msg, now, addressed=addressed))
+        st = probe._state(msg.chat_type, msg.chat_id)
+        muted_left = (
+            max(0.0, (st.muted_until - now).total_seconds())
+            if st.muted_until is not None
+            else 0.0
+        )
+        cooldown = self.settings.triggers.cooldown_seconds
+        cooldown_left = (
+            max(0.0, cooldown - (now - st.last_bot_spoke).total_seconds())
+            if st.last_bot_spoke is not None
+            else 0.0
+        )
+        metrics.update(
+            {
+                "muted_remaining_seconds": round(muted_left, 3),
+                "cooldown_remaining_seconds": round(cooldown_left, 3),
+                "no_reply_streak": st.no_reply_streak,
+                "quiet_hours": list(self.settings.triggers.quiet_hours),
+                "in_quiet_hours": self.router._in_quiet_hours(now),
+            }
+        )
+
+        keys = [
+            "self",
+            "muted",
+            "quiet",
+            "blacklist",
+            "hard",
+            "whitelist",
+            "batch",
+            "budget",
+        ]
+        stop_key = reason or "batch"
+        stop_index = keys.index(stop_key)
+        checks = []
+        for index, key in enumerate(keys):
+            if key == "budget":
+                status = "info"
+            elif key == "hard":
+                status = "pass" if addressed else "info"
+            elif index < stop_index:
+                status = "pass"
+            elif index == stop_index:
+                status = "pass" if key == "batch" else "blocked"
+            else:
+                status = "skipped"
+            checks.append(self._check(key, status, self._model_detail(key, msg, metrics, source, status)))
+
+        return self._explain_result(
+            msg,
+            verdict="batch" if reason is None else "skip",
+            reason=reason or "batch",
+            mode="model",
+            checks=checks,
+            metrics=metrics,
+            hard_source=source or hard_source,
+            mode_note=mode_note,
+        )
+
+    def _usage_metrics(
+        self, chat_type: ChatType, chat_id: int, now: Any
+    ) -> dict[str, Any]:
+        calls, tokens = self.store.usage_today(
+            chat_type, chat_id, now.date().isoformat()
+        )
+        return {
+            "usage_calls": calls,
+            "usage_tokens": tokens,
+            "daily_calls": self.settings.budget.daily_calls,
+            "daily_tokens": self.settings.budget.daily_tokens,
+        }
+
+    def _ambient_budget_metrics(
+        self, msg: Message, now: Any, *, addressed: bool
+    ) -> dict[str, Any]:
+        budget = self.settings.budget
+        today = now.date().isoformat()
+        ambient_calls, ambient_tokens = self.store.usage_today_by_purpose(
+            msg.chat_type, msg.chat_id, today, ("ambient",)
+        )
+        total_calls, total_tokens = self.store.usage_today(
+            msg.chat_type, msg.chat_id, today
+        )
+        ambient_limit_calls = budget.daily_calls * budget.ambient_ratio
+        ambient_limit_tokens = budget.daily_tokens * budget.ambient_ratio
+        ok = total_calls < budget.daily_calls and total_tokens < budget.daily_tokens
+        if not addressed:
+            ok = (
+                ok
+                and ambient_calls < ambient_limit_calls
+                and ambient_tokens < ambient_limit_tokens
+            )
+        return {
+            "ambient_calls": ambient_calls,
+            "ambient_tokens": ambient_tokens,
+            "ambient_ratio": budget.ambient_ratio,
+            "budget_ok": ok,
+            "budget_addressed": addressed,
+        }
+
+    def _model_detail(
+        self,
+        key: str,
+        msg: Message,
+        metrics: dict[str, Any],
+        source: str | None,
+        status: str,
+    ) -> str:
+        if key == "self":
+            return "普通用户消息" if status != "blocked" else "机器人自己的消息"
+        if key == "muted":
+            left = metrics["muted_remaining_seconds"]
+            return f"剩余 {int(left)} 秒" if left > 0 else "未静音"
+        if key == "quiet":
+            start, end = metrics["quiet_hours"]
+            return (
+                f"静默时段 {start}–{end}"
+                if metrics["in_quiet_hours"]
+                else "不在静默时段"
+            )
+        if key == "blacklist":
+            return "命中黑名单" if status == "blocked" else "不在黑名单"
+        if key == "hard":
+            labels = {"at": "@ 机器人", "reply": "引用回复", "alias": "正文别名"}
+            return labels.get(source or "", "未点名")
+        if key == "whitelist":
+            if not self.settings.groups.whitelist:
+                return "白名单为空"
+            return "群不在白名单" if status == "blocked" else "群在白名单"
+        if key == "batch":
+            return (
+                "通过 gate，进入批次；预算在批次投递前检查"
+                if status == "pass"
+                else "前序 gate 已拦下"
+            )
+        if key == "budget":
+            if not metrics["budget_ok"]:
+                return "当前额度不足，批次投递时会被跳过"
+            if metrics["budget_addressed"]:
+                return (
+                    f"点名消息可用总额度；已用 {metrics['usage_calls']}/"
+                    f"{metrics['daily_calls']} 次"
+                )
+            limit = metrics["daily_calls"] * metrics["ambient_ratio"]
+            return (
+                f"普通消息受 {metrics['ambient_ratio']:.0%} 额度限制；"
+                f"ambient 已用 {metrics['ambient_calls']}/{limit:.0f} 次"
+            )
+        return ""
+
+    @staticmethod
+    def _check(key: str, status: str, detail: str) -> dict[str, str]:
+        return {
+            "key": key,
+            "label": _CHECK_LABELS.get(key, key),
+            "status": status,
+            "detail": detail,
+        }
+
+    def _explain_result(
+        self,
+        msg: Message,
+        *,
+        verdict: str,
+        reason: str,
+        mode: str,
+        checks: list[dict[str, str]],
+        metrics: dict[str, Any],
+        hard_source: str | None,
+        mode_note: str | None,
+    ) -> dict[str, Any]:
+        result = {
+            "verdict": verdict,
+            "verdict_text": _VERDICT_TEXT[verdict],
+            "reason": reason,
+            "reason_text": _REASON_TEXT.get(reason, reason),
+            "mode": mode,
+            "configured_mode": self.settings.triggers.mode,
+            "chat_type": msg.chat_type.value,
+            "chat_id": msg.chat_id,
+            "user_id": msg.user_id,
+            "addressed": hard_source is not None,
+            "hard_source": hard_source,
+            "checks": checks,
+            "metrics": metrics,
+        }
+        if mode_note:
+            result["mode_note"] = mode_note
+        return result
 
     async def _run_batch(self, chat_type: ChatType, chat_id: int) -> None:
         """定时器到点：取批 → 预算 → 轮换 → 注入 prompt → 调模型 → 发送/静默 → 记账。

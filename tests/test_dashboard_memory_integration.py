@@ -44,6 +44,16 @@ class FakeService:
         self.brain = brain
         return previous
 
+    def explain_trigger(self, msg, *, seed=None):
+        return {
+            "verdict": "model",
+            "mode": "rules",
+            "reason": "hard",
+            "message": {"content": msg.content},
+            "checks": [],
+            "metrics": {},
+        }
+
 
 class FakeAdapter:
     connected = True
@@ -212,6 +222,38 @@ async def test_dashboard_timeline_proxy_end_to_end(tmp_path: Path) -> None:
         assert anchored["anchor_found"] is True
 
         bad = await dash.get(f"/api/sessions/group/{GROUP_ID}/timeline?limit=0")
+        assert bad.status == 400
+
+
+async def test_dashboard_trigger_debug_proxy_end_to_end(tmp_path: Path) -> None:
+    async with boot(tmp_path) as (dash, store):
+        resp = await dash.post(
+            "/api/debug/trigger",
+            json={
+                "chat_type": "group",
+                "chat_id": GROUP_ID,
+                "user_id": 42,
+                "nickname": "鱼片",
+                "content": "大肥鱼在吗",
+                "at_bot": True,
+            },
+        )
+        data = await resp.json()
+
+        assert resp.status == 200
+        assert data["verdict"] == "model"
+        assert data["message"]["content"] == "大肥鱼在吗"
+        assert store.count_messages(ChatType.GROUP, GROUP_ID) == 2
+
+        bad = await dash.post(
+            "/api/debug/trigger",
+            json={
+                "chat_type": "group",
+                "chat_id": GROUP_ID,
+                "user_id": 42,
+                "content": "",
+            },
+        )
         assert bad.status == 400
 
 

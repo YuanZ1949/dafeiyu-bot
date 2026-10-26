@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import copy
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Callable
+from typing import Any, Callable
 
 from dafeiyu.config import Settings
 from dafeiyu.models import ChatType, Message
@@ -46,6 +47,73 @@ class _ChatState:
     last_prompt_at: datetime | None = None
 
 
+_CHECK_LABELS = {
+    "self": "自身消息",
+    "muted": "静音",
+    "blacklist": "群黑名单",
+    "budget": "今日预算",
+    "hard": "硬触发",
+    "whitelist": "群白名单",
+    "quiet": "夜间静默",
+    "duplicate": "重复消息",
+    "question": "提问",
+    "cooldown": "冷却",
+    "hot": "热聊",
+    "sample": "随机抽样",
+}
+
+
+def _check_detail(
+    key: str,
+    msg: Message,
+    st: _ChatState,
+    metrics: dict[str, Any],
+    source: str | None,
+    status: str,
+) -> str:
+    if status == "skipped":
+        return "前序判定已结束，未执行"
+    if key == "self":
+        return "机器人自己的消息" if msg.is_bot else "普通用户消息"
+    if key == "muted":
+        left = metrics["muted_remaining_seconds"]
+        return f"剩余 {int(left)} 秒" if left > 0 else "未静音"
+    if key == "blacklist":
+        return "命中黑名单" if status == "blocked" else "不在黑名单"
+    if key == "budget":
+        return (
+            f"{metrics['usage_calls']}/{metrics['daily_calls']} 次，"
+            f"{metrics['usage_tokens']}/{metrics['daily_tokens']} token"
+        )
+    if key == "hard":
+        labels = {"at": "@ 机器人", "reply": "引用回复", "alias": "正文别名"}
+        return labels.get(source or "", "未点名")
+    if key == "whitelist":
+        if metrics.get("whitelist_empty"):
+            return "白名单为空"
+        return "群在白名单" if status != "blocked" else "群不在白名单"
+    if key == "quiet":
+        start, end = metrics["quiet_hours"]
+        return f"静默时段 {start}–{end}" if metrics["in_quiet_hours"] else "不在静默时段"
+    if key == "duplicate":
+        return "与上次内容重复" if status == "blocked" else "无重复"
+    if key == "question":
+        return "命中提问规则" if status == "pass" else "不是提问"
+    if key == "cooldown":
+        left = metrics["cooldown_remaining_seconds"]
+        return f"剩余 {int(left)} 秒" if left > 0 else "不在冷却"
+    if key == "hot":
+        return "60 秒内消息充足" if status == "pass" else "热度不足"
+    if key == "sample":
+        rate = metrics["effective_sample_rate"]
+        if status == "pass":
+            return f"抽样率 {rate:.0%}，命中"
+        if status == "blocked":
+            return f"抽样率 {rate:.0%}，未命中"
+        return f"抽样率 {rate:.0%}，未执行"
+    return ""
+
+
 @dataclass
 class Router:
     settings: Settings
@@ -82,13 +150,35 @@ class Router:
     def wake(self, chat_type: ChatType, chat_id: int) -> None:
         self._state(chat_type, chat_id).muted_until = None
 
+    def clone(
+        self, *, now: datetime | None = None, seed: int | None = None
+    ) -> "Router":
+        """复制一份路由状态用于只读推演，绝不改真实状态和真实 RNG。"""
+        probe = Router(
+            settings=self.settings,
+            store=self.store,
+            clock=(lambda: now) if now is not None else self.clock,
+            rng=random.Random(seed) if seed is not None else random.Random(),
+        )
+        probe._states = copy.deepcopy(self._states)
+        return probe
+
     # ---- gates ----------------------------------------------------
+    def addressed_source(self, msg: Message) -> str | None:
+        """返回点名来源：at / reply / alias；未点名为 None。"""
+        if msg.at_bot:
+            return "at"
+        if msg.reply_to_bot:
+            return "reply"
+        text = msg.content.casefold()
+        for alias in self.settings.persona.aliases:
+            if alias and alias.casefold() in text:
+                return "alias"
+        return None
+
     def is_addressed(self, msg: Message) -> bool:
         """被点名：@、引用回复、或正文里出现别名。批次模式用它决定防抖计时。"""
-        if msg.at_bot or msg.reply_to_bot:
-            return True
-        text = msg.content.casefold()
-        return any(alias.casefold() in text for alias in self.settings.persona.aliases)
+        return self.addressed_source(msg) is not None
 
     def hard_trigger(self, msg: Message) -> bool:
         return self.is_addressed(msg)
@@ -196,6 +286,101 @@ class Router:
 
         ok, reason = self.rule_filter(msg, now)
         return TriggerDecision(ok, False, reason)
+
+    def explain(
+        self, msg: Message, *, now: datetime | None = None, seed: int | None = None
+    ) -> dict[str, Any]:
+        """只读推演 rules 模式的一条消息，返回判定、有序检查和可观察指标。"""
+        now = now or self.clock()
+        probe = self.clone(now=now, seed=seed)
+        if msg.reply_to_bot:
+            # 真实 handle() 在进 gate 前会先 note_reply，推演必须镜像这一步。
+            probe.note_reply(msg.chat_type, msg.chat_id)
+
+        decision = probe.should_handle(msg)
+        source = probe.addressed_source(msg)
+        st = probe._state(msg.chat_type, msg.chat_id)
+        calls, tokens = self.store.usage_today(
+            msg.chat_type, msg.chat_id, now.date().isoformat()
+        )
+        cooldown = self.settings.triggers.cooldown_seconds
+        muted_left = 0.0
+        if st.muted_until is not None:
+            muted_left = max(0.0, (st.muted_until - now).total_seconds())
+        cooldown_left = 0.0
+        if st.last_bot_spoke is not None:
+            cooldown_left = max(0.0, cooldown - (now - st.last_bot_spoke).total_seconds())
+        downshift_left = 0.0
+        if st.downshift_until is not None:
+            downshift_left = max(0.0, (st.downshift_until - now).total_seconds())
+        base_rate = self.settings.triggers.sample_rate
+        effective_rate = base_rate / 2 if downshift_left > 0 else base_rate
+        metrics: dict[str, Any] = {
+            "usage_calls": calls,
+            "usage_tokens": tokens,
+            "daily_calls": self.settings.budget.daily_calls,
+            "daily_tokens": self.settings.budget.daily_tokens,
+            "muted_remaining_seconds": round(muted_left, 3),
+            "cooldown_remaining_seconds": round(cooldown_left, 3),
+            "downshift_remaining_seconds": round(downshift_left, 3),
+            "last_prompt_age_seconds": (
+                round((now - st.last_prompt_at).total_seconds(), 3)
+                if st.last_prompt_at is not None
+                else None
+            ),
+            "no_reply_streak": st.no_reply_streak,
+            "quiet_hours": list(self.settings.triggers.quiet_hours),
+            "in_quiet_hours": self._in_quiet_hours(now),
+            "sample_rate": base_rate,
+            "effective_sample_rate": effective_rate,
+            "whitelist_empty": not bool(self.settings.groups.whitelist),
+        }
+
+        keys = [
+            "self",
+            "muted",
+            "blacklist",
+            "budget",
+            "hard",
+            "whitelist",
+            "quiet",
+            "duplicate",
+            "question",
+            "cooldown",
+            "hot",
+            "sample",
+        ]
+        stop_key = "sample" if decision.reason == "sample_skip" else decision.reason
+        stop_index = keys.index(stop_key) if stop_key in keys else len(keys)
+        positive = {"hard", "question", "hot", "sample"}
+        checks: list[dict[str, str]] = []
+        for index, key in enumerate(keys):
+            if index < stop_index:
+                status = "info" if key == "hard" and source is None else "pass"
+            elif index == stop_index:
+                status = "pass" if stop_key in positive else "blocked"
+            else:
+                status = "skipped"
+            checks.append(
+                {
+                    "key": key,
+                    "label": _CHECK_LABELS[key],
+                    "status": status,
+                    "detail": _check_detail(key, msg, st, metrics, source, status),
+                }
+            )
+
+        return {
+            "decision": {
+                "call_model": decision.call_model,
+                "hard": decision.hard,
+                "reason": decision.reason,
+            },
+            "addressed": source is not None,
+            "hard_source": source,
+            "checks": checks,
+            "metrics": metrics,
+        }
 
     # ---- helpers --------------------------------------------------
     def _is_question(self, text: str) -> bool:

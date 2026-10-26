@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -248,6 +249,111 @@ def test_quiet_hours_wrap_across_midnight() -> None:
     assert router.is_quiet(ChatType.GROUP, 1, clock()) is True
     clock.dt = datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI)
     assert router.is_quiet(ChatType.GROUP, 1, clock()) is False
+
+
+def test_explain_hard_trigger_has_ordered_checks_and_alias_source() -> None:
+    router, _, _ = make_router()
+    result = router.explain(msg("大肥鱼你在干嘛"))
+
+    assert result["decision"] == {
+        "call_model": True,
+        "hard": True,
+        "reason": "hard",
+    }
+    assert result["addressed"] is True
+    assert result["hard_source"] == "alias"
+    assert [check["key"] for check in result["checks"]] == [
+        "self",
+        "muted",
+        "blacklist",
+        "budget",
+        "hard",
+        "whitelist",
+        "quiet",
+        "duplicate",
+        "question",
+        "cooldown",
+        "hot",
+        "sample",
+    ]
+    by_key = {check["key"]: check["status"] for check in result["checks"]}
+    assert by_key["hard"] == "pass"
+    assert by_key["whitelist"] == "skipped"
+    assert result["metrics"]["sample_rate"] == 0.05
+
+
+def test_explain_budget_marks_hard_check_skipped() -> None:
+    router, store, _ = make_router(daily_calls=200)
+    store.calls = 200
+
+    result = router.explain(msg(at=True))
+
+    assert result["decision"]["reason"] == "budget"
+    by_key = {check["key"]: check["status"] for check in result["checks"]}
+    assert by_key["budget"] == "blocked"
+    assert by_key["hard"] == "skipped"
+
+
+def test_explain_does_not_mutate_real_state_or_rng() -> None:
+    class CountingRng:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def random(self) -> float:
+            self.calls += 1
+            return 0.99
+
+    router, _, clock = make_router(sample_rate=0.9, rng=0.99)
+    rng = CountingRng()
+    router._rng = rng
+    state = router._state(ChatType.GROUP, 1)
+    state.last_prompt = "旧问题"
+    state.last_prompt_at = clock.dt
+    state.no_reply_streak = 2
+    before = copy.deepcopy(router._states)
+
+    result = router.explain(msg("新问题？"), now=clock.dt, seed=3)
+
+    assert result["decision"]["reason"] == "question"
+    assert router._states == before
+    assert rng.calls == 0
+
+
+def test_explain_simulates_reply_reset_on_clone() -> None:
+    router, _, clock = make_router()
+    for _ in range(3):
+        router.note_no_reply(ChatType.GROUP, 1)
+    before = copy.deepcopy(router._states)
+
+    result = router.explain(msg("继续", reply=True), now=clock.dt, seed=0)
+
+    assert result["decision"]["hard"] is True
+    assert result["hard_source"] == "reply"
+    assert result["metrics"]["no_reply_streak"] == 0
+    assert router._states == before
+
+
+def test_explain_quiet_reason_reports_quiet_metrics() -> None:
+    router, _, clock = make_router()
+    clock.dt = datetime(2026, 10, 24, 2, 0, tzinfo=SHANGHAI)
+
+    result = router.explain(msg("随便聊聊"), now=clock.dt)
+
+    assert result["decision"]["reason"] == "quiet"
+    assert result["metrics"]["in_quiet_hours"] is True
+    by_key = {check["key"]: check["status"] for check in result["checks"]}
+    assert by_key["quiet"] == "blocked"
+
+
+def test_explain_sample_is_reproducible_with_seed() -> None:
+    router, _, clock = make_router(sample_rate=0.5, rng=0.99)
+
+    first = router.explain(msg("普通消息"), now=clock.dt, seed=1)
+    second = router.explain(msg("普通消息"), now=clock.dt, seed=1)
+
+    assert first["decision"]["reason"] == "sample"
+    assert first["decision"] == second["decision"]
+    assert first["metrics"] == second["metrics"]
 
 
 def test_mute_and_wake() -> None:

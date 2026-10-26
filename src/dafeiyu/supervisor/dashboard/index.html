@@ -143,6 +143,42 @@
   .session-row .meta { color: var(--muted); font-size: 12px; flex: 1; min-width: 180px; }
   .session-row .acts { display: flex; gap: 6px; flex-wrap: wrap; }
   .session-row .btn { padding: 4px 9px; font-size: 12px; }
+  .debug-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
+  .debug-form label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+  .debug-form input, .debug-form select, .debug-form textarea { width: 100%; }
+  .debug-form textarea {
+    resize: vertical; min-height: 54px;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+    font: inherit;
+  }
+  .debug-wide { grid-column: 1 / -1; }
+  .debug-switches { margin-top: 10px; gap: 16px; color: var(--muted); font-size: 12px; }
+  .debug-switches label { display: inline-flex; align-items: center; gap: 5px; }
+  .debug-verdict {
+    margin-top: 12px; padding: 9px 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel-2); font-weight: 600;
+  }
+  .debug-verdict.model { border-color: var(--ok); }
+  .debug-verdict.batch { border-color: var(--warn); }
+  .debug-verdict.skip { border-color: var(--bad); }
+  .debug-verdict.command { border-color: var(--accent); }
+  .debug-checks { display: grid; gap: 6px; margin-top: 10px; }
+  .debug-check {
+    display: flex; gap: 8px; align-items: flex-start; padding: 6px 8px;
+    border-left: 2px solid var(--line); border-radius: 4px;
+    background: var(--panel-2); font-size: 12px;
+  }
+  .debug-check.pass { border-left-color: var(--ok); }
+  .debug-check.blocked { border-left-color: var(--bad); }
+  .debug-check.info { border-left-color: var(--accent); }
+  .debug-check.skipped { opacity: .55; }
+  .debug-check .st { flex: 0 0 48px; color: var(--muted); }
+  .debug-check .detail { color: var(--muted); margin-left: auto; text-align: right; }
+  .debug-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; margin-top: 10px; }
+  .debug-metric { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; background: var(--panel-2); font-size: 12px; }
+  .debug-metric .label { color: var(--muted); }
+  .debug-metric .value { font-weight: 600; margin-top: 2px; }
   body.timeline-open { overflow: hidden; }
   .drawer-backdrop {
     position: fixed; inset: 0; z-index: 15;
@@ -327,6 +363,46 @@
     <div class="session-list" id="sessions"></div>
   </section>
 
+  <section class="card" id="trigger-debug">
+    <div class="row" style="margin-bottom:10px">
+      <h2 style="margin:0">触发规则调试器</h2>
+      <span class="kv" id="debug-hint">只读模拟 · 不会发送到会话</span>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn primary" id="btn-debug-trigger">模拟判定</button>
+    </div>
+    <div class="debug-form">
+      <label>会话类型
+        <select id="debug-chat-type">
+          <option value="group">群聊</option>
+          <option value="private">私聊</option>
+        </select>
+      </label>
+      <label>会话 ID
+        <input id="debug-chat-id" type="number" min="1" value="1" />
+      </label>
+      <label>用户 ID
+        <input id="debug-user-id" type="number" min="1" value="2" />
+      </label>
+      <label>昵称
+        <input id="debug-nickname" maxlength="40" value="调试用户" />
+      </label>
+      <label class="debug-wide">消息
+        <textarea id="debug-content" rows="2" placeholder="输入一条模拟消息，例如：大肥鱼在吗"></textarea>
+      </label>
+    </div>
+    <div class="row debug-switches">
+      <label><input type="checkbox" id="debug-at-bot" /> @ 机器人</label>
+      <label><input type="checkbox" id="debug-reply-bot" /> 引用回复机器人</label>
+      <span class="kv">不写消息、不调模型、不消耗预算/冷却、不动调度器</span>
+    </div>
+    <div id="debug-result" hidden>
+      <div class="debug-verdict" id="debug-verdict"></div>
+      <div class="kv" id="debug-reason" style="margin-top:6px"></div>
+      <div class="debug-checks" id="debug-checks"></div>
+      <div class="debug-metrics" id="debug-metrics"></div>
+    </div>
+  </section>
+
   <section class="card">
     <div class="row" style="margin-bottom:10px">
       <h2 style="margin:0">运行配置</h2>
@@ -457,6 +533,103 @@ async function api(path, options = {}) {
     throw new Error(reason);
   }
   return data;
+}
+
+async function runTriggerDebug() {
+  const content = $("debug-content").value.trim();
+  if (!content) {
+    toast("先输入一条模拟消息", true);
+    return;
+  }
+  const payload = {
+    chat_type: $("debug-chat-type").value,
+    chat_id: Number($("debug-chat-id").value),
+    user_id: Number($("debug-user-id").value),
+    nickname: $("debug-nickname").value.trim() || "调试用户",
+    content,
+    at_bot: $("debug-at-bot").checked,
+    reply_to_bot: $("debug-reply-bot").checked,
+  };
+  const button = $("btn-debug-trigger");
+  button.disabled = true;
+  try {
+    const data = await api("/api/debug/trigger", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    renderTriggerDebug(data);
+  } catch (err) {
+    toast(`判定失败：${err.message}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderTriggerDebug(data) {
+  $("debug-result").hidden = false;
+  const verdict = $("debug-verdict");
+  verdict.className = `debug-verdict ${data.verdict || ""}`;
+  verdict.textContent = data.verdict_text || data.verdict || "未知判定";
+  const reasonParts = [
+    data.reason_text || data.reason || "",
+    data.hard_source ? `点名来源：${{ at: "@", reply: "引用", alias: "别名" }[data.hard_source] || data.hard_source}` : "",
+    data.mode ? `路径：${data.mode}` : "",
+    data.configured_mode ? `配置：${data.configured_mode}` : "",
+    data.mode_note || "",
+  ].filter(Boolean);
+  $("debug-reason").textContent = reasonParts.join(" · ");
+
+  const checks = $("debug-checks");
+  checks.replaceChildren();
+  (data.checks || []).forEach((check) => {
+    const row = document.createElement("div");
+    row.className = `debug-check ${check.status || ""}`;
+    const status = document.createElement("span");
+    status.className = "st";
+    status.textContent = {
+      pass: "通过",
+      blocked: "拦截",
+      info: "信息",
+      skipped: "跳过",
+    }[check.status] || check.status || "";
+    const label = document.createElement("span");
+    label.textContent = check.label || check.key || "";
+    const detail = document.createElement("span");
+    detail.className = "detail";
+    detail.textContent = check.detail || "";
+    row.append(status, label, detail);
+    checks.append(row);
+  });
+
+  const metrics = $("debug-metrics");
+  metrics.replaceChildren();
+  const m = data.metrics || {};
+  const items = [
+    ["调用", `${m.usage_calls ?? "—"}/${m.daily_calls ?? "—"}`],
+    ["Token", `${m.usage_tokens ?? "—"}/${m.daily_tokens ?? "—"}`],
+    ["静音剩余", `${m.muted_remaining_seconds ?? 0}s`],
+    ["冷却剩余", `${m.cooldown_remaining_seconds ?? 0}s`],
+    ["连续未回", m.no_reply_streak ?? "—"],
+    ["静默时段", (m.quiet_hours || []).join("–") || "—"],
+    ["抽样率", m.effective_sample_rate !== undefined
+      ? `${Math.round(m.effective_sample_rate * 100)}%`
+      : (m.sample_rate !== undefined ? `${Math.round(m.sample_rate * 100)}%` : "—")],
+  ];
+  if (m.budget_ok !== undefined) {
+    items.push(["预算预判", m.budget_ok ? "够用" : "不足"]);
+  }
+  items.forEach(([labelText, valueText]) => {
+    const item = document.createElement("div");
+    item.className = "debug-metric";
+    const label = document.createElement("div");
+    label.className = "label";
+    label.textContent = labelText;
+    const value = document.createElement("div");
+    value.className = "value";
+    value.textContent = valueText;
+    item.append(label, value);
+    metrics.append(item);
+  });
 }
 
 function fmtUptime(seconds) {
@@ -1498,6 +1671,13 @@ $("search-q").addEventListener("keydown", (ev) => {
 $("btn-search-more").addEventListener("click", () => searchMessages(true));
 $("btn-sessions-more").addEventListener("click", () => loadSessions(true));
 $("btn-refresh-sessions").addEventListener("click", () => loadSessions());
+$("btn-debug-trigger").addEventListener("click", runTriggerDebug);
+$("debug-content").addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    runTriggerDebug();
+  }
+});
 $("btn-backup").addEventListener("click", downloadBackup);
 $("btn-refresh-config").addEventListener("click", loadConfig);
 $("btn-restart-bot").addEventListener("click", () => {
