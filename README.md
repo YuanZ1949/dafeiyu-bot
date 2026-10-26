@@ -173,6 +173,7 @@ powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoQr
 | `budget.monthly_calls` | `0` | 所有会话合计自然月调用上限（上海时区）；`0` = 未启用 |
 | `budget.monthly_tokens` | `0` | 所有会话合计自然月 token 上限；`0` = 未启用 |
 | `budget.monthly_cost_limit` | `0` | 月度费用上限；`0` = 不限制，`>0` 时必须填单价 |
+| `budget.currency` | `CNY` | 费用展示币种；不做汇率换算 |
 | `budget.price_input_per_million` | `0` | 输入 token 单价（每百万 token，按 `currency`） |
 | `budget.price_output_per_million` | `0` | 输出 token 单价（每百万 token，按 `currency`） |
 | `budget.warning_ratios` | `[0.5, 0.8, 1.0]` | 额度预警比例；每天每档最多告警一次 |
@@ -189,8 +190,10 @@ powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoQr
 `degrade` 会保留 @/引用/叫名字的回复，只停普通插话；`stop` 连点名也不回；`notify`
 只发告警不拦截。月度费用超限是硬拒绝，即使 `on_exceed=notify` 也不会放行。
 费用按「token 数 × 单价」估算，不是账单金额；要准确成本请以服务商账单为准。
-`warning_ratios` 命中 50%/80%/100% 时各告警一次，由 supervisor 做 24 小时去重，
-告警 detail 只包含计数与限额，不包含消息正文。
+`warning_ratios` 取值 `(0, 1]`；全局日/月度/费用命中 50%/80%/100% 时各告警一次，
+由 supervisor 做 24 小时去重，告警 detail 只包含计数与限额，不包含消息正文。
+当前会话的 per-chat 额度在 `/budget` 和面板预算卡显示；单群预警不进入 supervisor
+告警通道。`alerts.rules.budget_warning` 可单独关闭预算预警。
 
 ## 3. 启动
 
@@ -302,8 +305,8 @@ detail 只含会话类型/ID 与用户 ID，不含正文）。冷却按「群 + 
   测试告警；手动备份、下载、删除、上传恢复，以及最近的操作审计。
 - **安全 / 口令轮换**：控制口令保存在 `data/supervisor.token`，启动时自动收紧 ACL
   （Windows `icacls`、POSIX `0600`，失败只告警不阻断启动）。输入 `ROTATE` 后生成新口令，
-  同步更新 bot 环境变量与健康探测，并重启 bot 一次；任一步失败会回滚旧口令并写审计。
-  轮换完成后旧口令返回 401，新口令返回 200。
+  同步更新 bot 环境变量与健康探测，并重启 bot 一次；任一步失败会回滚旧口令、尽力重新启动
+  bot 并写审计。轮换完成后旧口令返回 401，新口令返回 200。
 - **运行配置**：只读展示当前模型、人设、冷却、限流、预算、记忆窗口与保留天数。
   要改配置请编辑 `config.yaml` 后重启；面板提供「重启 Bot」和「下载备份」。
 
@@ -318,7 +321,7 @@ detail 只含会话类型/ID 与用户 ID，不含正文）。冷却按「群 + 
 `alerts.webhook.url`（`format`: generic / ntfy / wecom / dingtalk）和 `alerts.qq_admin`
 （通过 bot 私聊管理员；`bot_down` 不会走这条通道）。规则阈值在 `alerts.rules`：
 进程掉线分别等待 120/180/120 秒，磁盘低于 10%，回复错误 15 分钟内 3 次，额度熔断，
-以及备份失败。同一告警默认 6 小时重复一次，恢复需要连续两次巡检确认；单轮超过 5 条会合并
+以及备份失败。同一告警默认 6 小时重复一次（预算预警为 24 小时），恢复需要连续两次巡检确认；单轮超过 5 条会合并
 成一条 `alert_flood`。状态存 `data/alert-state.json`，删掉它等于清空未恢复事件。
 面板「测试告警」只发送一条 `test` 消息，不写入 firing 状态。
 
@@ -339,7 +342,8 @@ pre-restore 备份回滚并写审计；回滚失败会留下 pre-restore 文件�
 **安全与口令**：控制口令由 supervisor 首次启动生成到 `data/supervisor.token`，并尽量收紧为
 仅当前用户可读写；加固失败只写 warning。bot 与 supervisor 通过 `X-Control-Token` 校验，
 dashboard 每次请求动态读取当前口令。轮换必须输入 `ROTATE`；成功后更新 bot 环境变量、
-健康探测口令并重启 bot 一次，失败会回滚内存、磁盘和环境变量，旧口令继续可用。
+健康探测口令并重启 bot 一次，失败会回滚内存、磁盘和环境变量，旧口令继续可用，并尽力
+重新启动 bot。
 不要手工编辑 token 文件；需要更换时用面板轮换或删除该文件后重启（会重新生成）。
 破坏性操作各有独立确认串：轮换 `ROTATE`、备份恢复 `RESTORE`、会话删除 `DELETE`、
 按用户删除 `DELETE_USER`；缺失或拼错一律 400，不会执行。
@@ -352,6 +356,8 @@ dashboard 每次请求动态读取当前口令。轮换必须输入 `ROTATE`；�
 自由文本语义；如果把密钥写进不存在键名的散文里，仍可能漏过，日志里不要手写密钥。
 
 **审计**：append-only JSONL，默认 `data/audit.jsonl`，超过 `audit.max_bytes` 轮转为 `.1/.2/.3`。
+bot 与 supervisor 会写同一文件，写入和轮转通过 `.audit.jsonl.lock` 跨进程串行，避免并发轮转
+覆盖归档。
 记录登录/登出、告警触发与恢复、备份创建/删除、恢复结果、进程启停、shutdown、口令轮换
 （`token.rotate`）、管理员命令（`command.admin`）和按用户删除（`memory.user_delete`）。
 审计 detail 只写结构化元数据，不记录消息正文或昵称；写入失败只记 supervisor 日志，
@@ -397,7 +403,7 @@ dashboard 每次请求动态读取当前口令。轮换必须输入 `ROTATE`；�
   用 `/forget`（群内管理员）或下面的 CLI。
 - **整会话删除**：`.venv\Scripts\dafeiyu-cli.exe forget --chat <群号>`；私聊需加
   `--type private`。这会清空该会话的消息、摘要、印象、用量与会话映射，请先确认范围。
-- 删除是逻辑删除；SQLite 的自由页、WAL 或操作系统缓存中可能短时间保留旧字节。
+- 删除会移除数据库行，但不做介质级擦除；SQLite 的自由页、WAL 或操作系统缓存中可能短时间保留旧字节。
   对介质级清除有要求时，应在停机后对 `data/dafeiyu.db` 做安全擦除或重建。
 - **QQ 小号有被风控/封禁的风险**，本项目通过非官方协议端接入，请自行评估；不要用主号，不要高频刷屏。
 - 机器人说的话由模型生成，可能出错；涉及医疗、法律、财务等严肃问题时请以人为准。

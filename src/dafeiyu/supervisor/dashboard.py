@@ -898,12 +898,14 @@ def create_app(
                 if health is not None:
                     health.token = old_health
 
+            restart_attempted = False
             try:
                 new = control_token.rotate()
                 env["DAFEIYU_CONTROL_TOKEN"] = new
                 if health is not None:
                     health.token = new
                 # 只有 bot 用新环境重启；NapCat / OpenCode 不动，且只调用一次。
+                restart_attempted = True
                 await supervisor.restart("bot")
             except asyncio.CancelledError:
                 # 取消也必须留审计并回滚，但不能吞掉取消信号。
@@ -919,6 +921,13 @@ def create_app(
             except Exception as exc:  # noqa: BLE001 - 失败要回滚并返回 500
                 rollback()
                 log.critical("control token 轮换失败：%s", exc)
+                if restart_attempted:
+                    # restart 是 stop+start；start 失败时 bot 会停在停止状态。
+                    # 旧口令已回滚，尽力用旧环境把 bot 拉回来。
+                    try:
+                        await supervisor.start("bot")
+                    except Exception as recovery_exc:  # noqa: BLE001
+                        log.critical("control token 回滚后 bot 恢复失败：%s", recovery_exc)
                 write_audit(
                     request,
                     "token.rotate",

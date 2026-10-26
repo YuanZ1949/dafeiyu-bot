@@ -4,10 +4,13 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ..timeutil import now_shanghai
 from .redact import redact
@@ -88,12 +91,14 @@ class AuditLog:
             "ip": ip,
         }
         try:
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+            # bot 与 supervisor 会写同一份 JSONL；写入和轮转必须跨进程串行，
+            # 否则两侧同时轮转可能覆盖对方刚归档的文件。
+            with _audit_lock(self.path):
+                with self.path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+                self._rotate()
         except OSError as exc:
             log.warning("审计写入失败：%s", exc)
-            return event
-        self._rotate()
         return event
 
     def query(self, limit: int = 50, before: str | None = None) -> list[dict[str, Any]]:
@@ -149,6 +154,51 @@ class AuditLog:
             self.path.touch()
         except OSError as exc:
             log.warning("审计轮转失败：%s", exc)
+
+
+@contextmanager
+def _audit_lock(path: Path) -> Iterator[None]:
+    """对审计文件加跨进程排他锁；拿不到锁时退化为无锁写入。"""
+    lock_path = path.with_name(f".{path.name}.lock")
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0))
+    except OSError as exc:
+        log.warning("审计锁文件打开失败，降级为无锁写入：%s", exc)
+        yield
+        return
+    locked = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    time.sleep(0.01)
+            if not locked:
+                log.warning("审计锁等待超时，降级为无锁写入")
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+        yield
+    finally:
+        if locked:
+            try:
+                if os.name == "nt":
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
 
 
 def _redact_value(value: Any, key: str = "") -> Any:

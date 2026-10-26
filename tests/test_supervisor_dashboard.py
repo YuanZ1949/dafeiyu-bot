@@ -753,6 +753,7 @@ async def test_rotate_token_restart_failure_rolls_back(
     assert supervisor.specs["bot"].env["DAFEIYU_CONTROL_TOKEN"] == old
     assert ops.health.token == old
     assert supervisor.restarted == ["bot"]
+    assert ("start", "bot") in supervisor.calls
     assert still_old.status == 200
 
     rows = [row for row in audit.query(20) if row["action"] == "token.rotate"]

@@ -203,6 +203,8 @@ class Service:
 
             matched = self.commands.match(msg.content, msg.chat_type)
             if matched is not None:
+                if not self._command_allowed(msg):
+                    return
                 spec, args = matched
                 if await self._run_command(msg, spec, args):
                     return
@@ -243,6 +245,15 @@ class Service:
             return
 
         scheduler.note(msg, addressed=addressed)
+
+    def _command_allowed(self, msg: Message) -> bool:
+        """命令也必须遵守群黑名单/白名单，避免黑名单群查询统计或探活。"""
+        if msg.chat_type is not ChatType.GROUP:
+            return True
+        if msg.chat_id in self.settings.groups.blacklist:
+            return False
+        whitelist = self.settings.groups.whitelist
+        return not whitelist or msg.chat_id in whitelist
 
     def _group_skip_reason(self, msg: Message, *, addressed: bool) -> str | None:
         if self.router.is_muted(msg.chat_type, msg.chat_id):

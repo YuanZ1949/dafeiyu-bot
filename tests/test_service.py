@@ -465,6 +465,35 @@ async def test_admin_budget_reports_and_writes_audit(tmp_path):
     assert "阿鱼" not in repr(detail)
 
 
+async def test_blacklisted_group_commands_are_silent(tmp_path):
+    settings = make_settings(
+        groups=GroupsConfig(frozenset(), frozenset({1001}), frozenset({2002}))
+    )
+    service, _, brain, adapter, _ = build(tmp_path, settings=settings)
+
+    await service.handle(make_msg(content="/help", message_id="bl1"))
+    await service.handle(make_msg(content="/stats", message_id="bl2"))
+
+    assert brain.calls == 0
+    assert adapter.sent == []
+
+
+async def test_non_whitelisted_group_commands_are_silent(tmp_path):
+    settings = make_settings(
+        groups=GroupsConfig(frozenset({2001}), frozenset(), frozenset({2002}))
+    )
+    service, _, brain, adapter, _ = build(tmp_path, settings=settings)
+
+    await service.handle(make_msg(content="/help", message_id="wl1"))
+    await service.handle(
+        make_msg(chat_id=2001, content="/help", message_id="wl2")
+    )
+
+    assert brain.calls == 0
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0][1] == 2001
+
+
 async def test_stats_group_has_usage_and_no_cost_words(tmp_path):
     audit = FakeAudit()
     service, store, brain, adapter, _ = build(tmp_path, audit=audit)
