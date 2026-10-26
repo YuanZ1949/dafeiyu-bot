@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import secrets
 import signal
 import subprocess
 import sys
@@ -23,6 +22,7 @@ from ..timeutil import now_shanghai
 from .alerts import AlertChannel, AlertManager, QQAdminChannel, WebhookChannel
 from .audit import AuditLog
 from .backup import BackupManager
+from .control_token import TOKEN_PATH, ControlToken
 from .dashboard import serve
 from .health import HealthMonitor
 from .logs import LogHub
@@ -36,7 +36,6 @@ log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[3]
 QR_PATH = REPO_ROOT / "vendor" / "napcat" / "napcat" / "cache" / "qrcode.png"
 NAPCAT_DIR = REPO_ROOT / "vendor" / "napcat"
-TOKEN_PATH = REPO_ROOT / "data" / "supervisor.token"
 PID_PATH = REPO_ROOT / "data" / "supervisor.pid"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -72,17 +71,8 @@ def setup_logging(settings: Settings, logs: LogHub) -> None:
 
 
 def load_or_create_token(path: Path = TOKEN_PATH) -> str:
-    with contextlib.suppress(OSError):
-        existing = path.read_text(encoding="utf-8").strip()
-        if existing:
-            return existing
-    token = secrets.token_urlsafe(24)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(token, encoding="utf-8")
-    except OSError as exc:
-        log.warning("控制口令无法写入 %s：%s（本次仅内存生效）", path, exc)
-    return token
+    """兼容包装：内部统一走 ControlToken，已有文件也会加固 ACL。"""
+    return ControlToken(path).load_or_create()
 
 
 def _console_python() -> str:
@@ -403,9 +393,10 @@ async def run() -> int:
     logs = LogHub(Path(settings.logging.dir) / "supervisor")
     setup_logging(settings, logs)
 
-    token = load_or_create_token()
+    holder = ControlToken(TOKEN_PATH)
+    holder.load_or_create()
     try:
-        specs = build_specs(settings, token)
+        specs = build_specs(settings, holder.value)
     except ConfigError as exc:
         logs.write("supervisor", f"启动失败：{exc}")
         _eprint(f"[大肥鱼] {exc}")
@@ -458,7 +449,7 @@ async def run() -> int:
             supervisor,
             logs,
             bot_url,
-            token,
+            holder.value,
             napcat_login=napcat_login,
         )
     except OSError as exc:
@@ -473,10 +464,11 @@ async def run() -> int:
         logs,
         QR_PATH,
         bot_url,
-        token=token,
+        token=lambda: holder.value,
         on_shutdown=request_shutdown,
         napcat_login=napcat_login,
         ops=ops,
+        control_token=holder,
     )
 
     url = (

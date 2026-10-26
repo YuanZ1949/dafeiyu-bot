@@ -42,6 +42,7 @@ class HealthMonitor:
         self.supervisor = supervisor
         self.settings = settings
         self.bot_url = (bot_url or "").rstrip("/")
+        # 轮换 control token 后 dashboard 会直接更新这个属性，下一次探活立即用新值。
         self.token = token
         self.backups = backups
         self.napcat_login = napcat_login

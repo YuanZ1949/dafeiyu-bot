@@ -331,6 +331,18 @@
     <div class="mem-list" id="audit-list" style="max-height:220px"></div>
   </section>
 
+  <section class="card" id="security-card">
+    <div class="row" style="margin-bottom:10px">
+      <h2 style="margin:0">安全</h2>
+      <span class="kv" id="rotate-token-status">轮换控制口令会立即重启 Bot，旧口令立即失效</span>
+    </div>
+    <div class="row">
+      <input id="rotate-token-confirm" placeholder="输入 ROTATE 确认" style="width:180px" />
+      <button class="btn danger" id="btn-rotate-token">轮换控制口令</button>
+    </div>
+    <div class="kv" style="margin-top:8px">轮换后 Bot 会用新口令重启；任一步失败会保留旧口令。</div>
+  </section>
+
   <section class="card">
     <h2>大脑模式</h2>
     <div class="mode-list" id="modes"></div>
@@ -1071,6 +1083,35 @@ async function createBackup() {
     await refreshBackups();
   } catch (err) {
     toast(`备份失败：${err.message}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function rotateControlToken() {
+  const input = $("rotate-token-confirm");
+  const status = $("rotate-token-status");
+  if (input.value.trim() !== "ROTATE") {
+    status.textContent = "请输入 ROTATE 确认轮换";
+    return;
+  }
+  if (!confirm("轮换控制口令会立即重启 Bot，正在处理的对话会中断。确定继续吗？")) return;
+
+  const button = $("btn-rotate-token");
+  button.disabled = true;
+  status.textContent = "正在轮换…";
+  try {
+    await api("/api/control-token/rotate", {
+      method: "POST",
+      body: JSON.stringify({ confirm: input.value.trim() }),
+    });
+    input.value = "";
+    status.textContent = "已轮换，bot 已重启";
+    toast("已轮换，bot 已重启");
+    await refreshHealth();
+  } catch (err) {
+    status.textContent = `轮换失败：${err.message}`;
+    toast(`轮换失败：${err.message}`, true);
   } finally {
     button.disabled = false;
   }
@@ -2139,6 +2180,7 @@ $("btn-test-alert").addEventListener("click", sendTestAlert);
 $("btn-refresh-backups").addEventListener("click", refreshBackups);
 $("btn-backup-now").addEventListener("click", createBackup);
 $("btn-backup-restore").addEventListener("click", restoreBackup);
+$("btn-rotate-token").addEventListener("click", rotateControlToken);
 $("btn-refresh-memory").addEventListener("click", loadMemory);
 $("btn-summarize").addEventListener("click", triggerSummary);
 $("btn-extract").addEventListener("click", triggerExtract);

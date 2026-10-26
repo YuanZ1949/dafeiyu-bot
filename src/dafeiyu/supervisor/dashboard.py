@@ -17,6 +17,7 @@ from aiohttp import web
 from ..config import Settings
 from .auth import COOKIE_NAME, DashboardAuth, safe_next_path
 from .backup import REASONS, BackupError
+from .control_token import ControlToken
 from .logs import SOURCES, LogHub
 from .manager import Supervisor
 from .napcat_login import NapCatLogin
@@ -97,11 +98,12 @@ def create_app(
     logs: LogHub,
     qr_path: Path,
     bot_url: str,
-    token: str = "",
+    token: str | Callable[[], str] = "",
     on_shutdown: Callable[[], Awaitable[None]] | None = None,
     napcat_login: NapCatLogin | None = None,
     auth: DashboardAuth | None = None,
     ops: OpsServices | None = None,
+    control_token: ControlToken | None = None,
 ) -> web.Application:
     app = web.Application(middlewares=[_same_origin, _auth_middleware])
     auth_config = auth or _auth_from_settings(settings)
@@ -142,16 +144,25 @@ def create_app(
     def ops_unavailable() -> web.Response:
         return web.json_response({"error": "运维服务未启用"}, status=503)
 
+    token_provider: Callable[[], str] = (
+        token if callable(token) else (lambda: token)
+    )
+
+    def control_headers() -> dict[str, str]:
+        value = token_provider()
+        return {"X-Control-Token": value} if value else {}
+
     # 复用同一个 aiohttp 会话：httpx 会为每个 Client 构 SSLContext，
     # 在 Windows 上会阻塞事件循环数秒，绝不能每次请求新建。
     session: dict[str, aiohttp.ClientSession] = {}
 
     def bot_session() -> aiohttp.ClientSession:
         if "client" not in session:
+            # token 每次请求动态取（见 control_headers），这里不能写死默认 header，
+            # 否则轮换后旧 token 会一直跟着复用会话。
             session["client"] = aiohttp.ClientSession(
                 base_url=bot_url,
                 timeout=aiohttp.ClientTimeout(total=BOT_TIMEOUT),
-                headers={"X-Control-Token": token} if token else {},
             )
         return session["client"]
 
@@ -173,7 +184,9 @@ def create_app(
             # 用 BOT_TIMEOUT 会误报超时，实际却切换成功了。
             kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
         try:
-            async with bot_session().request(method, path, **kwargs) as resp:
+            async with bot_session().request(
+                method, path, headers=control_headers(), **kwargs
+            ) as resp:
                 status = resp.status
                 try:
                     data = await resp.json(content_type=None)
@@ -193,7 +206,9 @@ def create_app(
         if timeout is not None:
             kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
         try:
-            async with bot_session().request(method, path, **kwargs) as resp:
+            async with bot_session().request(
+                method, path, headers=control_headers(), **kwargs
+            ) as resp:
                 body = await resp.read()
                 headers = {}
                 for name in ("Content-Type", "Content-Disposition"):
@@ -798,6 +813,62 @@ def create_app(
             )
         return web.json_response(result, status=207 if errors else 200)
 
+    async def rotate_control_token(request: web.Request) -> web.Response:
+        if control_token is None:
+            return ops_unavailable()
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        if str(payload.get("confirm") or "") != "ROTATE":
+            return web.json_response({"error": "confirm 必须是 ROTATE"}, status=400)
+
+        spec = supervisor.specs.get("bot")
+        env = getattr(spec, "env", None)
+        if not isinstance(env, dict):
+            return web.json_response(
+                {"error": "bot 进程未配置控制口令，无法轮换"}, status=500
+            )
+
+        old = control_token.value
+        old_env = env.get("DAFEIYU_CONTROL_TOKEN", old)
+        health = ops.health if ops is not None else None
+        old_health = health.token if health is not None else ""
+        try:
+            new = control_token.rotate()
+            env["DAFEIYU_CONTROL_TOKEN"] = new
+            if health is not None:
+                health.token = new
+            # 只有 bot 用新环境重启；NapCat / OpenCode 不动，且只调用一次。
+            await supervisor.restart("bot")
+        except Exception as exc:  # noqa: BLE001 - 失败要回滚并返回 500
+            if old:
+                try:
+                    control_token.set(old)
+                except Exception as rollback_exc:  # noqa: BLE001
+                    log.critical("control token 回滚写盘失败：%s", rollback_exc)
+            env["DAFEIYU_CONTROL_TOKEN"] = old_env
+            if health is not None:
+                health.token = old_health
+            log.critical("control token 轮换失败：%s", exc)
+            write_audit(
+                request,
+                "token.rotate",
+                target="control",
+                result="error",
+                detail={"restarted": False},
+            )
+            return web.json_response(
+                {"error": f"轮换失败：{exc}"}, status=500
+            )
+
+        write_audit(
+            request,
+            "token.rotate",
+            target="control",
+            detail={"restarted": True},
+        )
+        return web.json_response({"ok": True, "restarted": True})
+
     async def shutdown(request: web.Request) -> web.Response:
         if on_shutdown is None:
             return web.json_response({"error": "不支持退出"}, status=400)
@@ -852,6 +923,7 @@ def create_app(
         "/api/memory/impressions/{impression_id}", memory_impression_delete
     )
     app.router.add_post("/api/control/{action}", control)
+    app.router.add_post("/api/control-token/rotate", rotate_control_token)
     app.router.add_post("/api/shutdown", shutdown)
     return app
 
@@ -891,10 +963,11 @@ async def serve(
     logs: LogHub,
     qr_path: Path,
     bot_url: str,
-    token: str = "",
+    token: str | Callable[[], str] = "",
     on_shutdown: Callable[[], Awaitable[None]] | None = None,
     napcat_login: NapCatLogin | None = None,
     ops: OpsServices | None = None,
+    control_token: ControlToken | None = None,
 ) -> web.AppRunner:
     app = create_app(
         supervisor,
@@ -906,6 +979,7 @@ async def serve(
         on_shutdown,
         napcat_login,
         ops=ops,
+        control_token=control_token,
     )
     runner = web.AppRunner(app, access_log=None, shutdown_timeout=5.0)
     await runner.setup()

@@ -7,16 +7,24 @@ from pathlib import Path
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from dafeiyu.supervisor import control_token
+from dafeiyu.supervisor.audit import AuditLog
+from dafeiyu.supervisor.auth import DashboardAuth
+from dafeiyu.supervisor.control_token import ControlToken
 from dafeiyu.supervisor.dashboard import create_app
 from dafeiyu.supervisor.logs import LogHub
+from dafeiyu.supervisor.manager import ProcSpec
+from dafeiyu.supervisor.ops import OpsServices
 
 BOT_URL = "http://127.0.0.1:1"
+PASSWORD = "correct-horse"
 
 
 class FakeSupervisor:
     def __init__(self) -> None:
         self.specs = {"opencode": object(), "bot": object(), "napcat": object()}
         self.calls: list[tuple[str, str]] = []
+        self.restarted: list[str] = []
         self._status = [
             {"name": "opencode", "status": "running", "pid": 11, "port": 24310},
             {"name": "bot", "status": "stopped", "pid": None, "port": 8788},
@@ -34,6 +42,7 @@ class FakeSupervisor:
 
     async def restart(self, name):
         self.calls.append(("restart", name))
+        self.restarted.append(name)
 
 
 @asynccontextmanager
@@ -505,3 +514,265 @@ async def test_memory_reports_bot_offline(tmp_path: Path) -> None:
 
     assert resp.status in (502, 504)  # Windows 上连 127.0.0.1:1 可能超时而不是立刻拒绝
     assert "bot" in data["error"]
+
+
+class RotateSupervisor(FakeSupervisor):
+    def __init__(self, token: str = "old-token") -> None:
+        super().__init__()
+        self.specs = {
+            "opencode": object(),
+            "bot": ProcSpec(
+                name="bot",
+                command=[],
+                env={"DAFEIYU_CONTROL_TOKEN": token},
+            ),
+            "napcat": object(),
+        }
+
+
+class FakeHealth:
+    def __init__(self, token: str = "") -> None:
+        self.token = token
+
+    async def snapshot(self) -> dict:
+        return {"ok": True, "token": self.token}
+
+
+def make_auth(enabled: bool = True) -> DashboardAuth:
+    return DashboardAuth(
+        enabled=enabled,
+        username="admin",
+        password=PASSWORD,
+        session_seconds=3600,
+        secret=b"test-secret-32-bytes-long-000000",
+    )
+
+
+async def login(client: TestClient) -> None:
+    resp = await client.post(
+        "/api/auth/login", json={"username": "admin", "password": PASSWORD}
+    )
+    assert resp.status == 204
+
+
+def make_rotate_app(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    auth: DashboardAuth | None = None,
+    token: str = "old-token",
+    supervisor=None,
+    bot_url: str = BOT_URL,
+):
+    monkeypatch.setattr(control_token, "harden_token_file", lambda _path: None)
+    supervisor = supervisor or RotateSupervisor(token)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    health = FakeHealth(token)
+    ops = OpsServices(health=health, audit=audit)
+    holder = ControlToken(tmp_path / "control.token")
+    holder.set(token)
+    app = create_app(
+        supervisor,
+        settings=None,
+        logs=LogHub(tmp_path / "logs"),
+        qr_path=tmp_path / "qrcode.png",
+        bot_url=bot_url,
+        token=lambda: holder.value,
+        auth=auth or make_auth(False),
+        ops=ops,
+        control_token=holder,
+    )
+    return app, supervisor, ops, audit, holder
+
+
+async def test_rotate_token_requires_login(tmp_path: Path, monkeypatch) -> None:
+    app, supervisor, _ops, _audit, holder = make_rotate_app(
+        tmp_path, monkeypatch, auth=make_auth(True)
+    )
+    async with running(app) as client:
+        resp = await client.post(
+            "/api/control-token/rotate", json={"confirm": "ROTATE"}
+        )
+
+    assert resp.status == 401
+    assert supervisor.calls == []
+    assert holder.value == "old-token"
+
+
+async def test_rotate_token_rejects_wrong_confirm(tmp_path: Path, monkeypatch) -> None:
+    app, supervisor, ops, audit, holder = make_rotate_app(
+        tmp_path, monkeypatch, auth=make_auth(True)
+    )
+    async with running(app) as client:
+        await login(client)
+        resp = await client.post(
+            "/api/control-token/rotate", json={"confirm": "rotate"}
+        )
+        data = await resp.json()
+
+    assert resp.status == 400
+    assert "ROTATE" in data["error"]
+    assert supervisor.calls == []
+    assert holder.value == "old-token"
+    assert ops.health.token == "old-token"
+    assert all(row["action"] != "token.rotate" for row in audit.query(20))
+
+
+async def test_rotate_token_updates_env_health_and_restarts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app, supervisor, ops, audit, holder = make_rotate_app(
+        tmp_path, monkeypatch, auth=make_auth(True)
+    )
+    async with running(app) as client:
+        await login(client)
+        resp = await client.post(
+            "/api/control-token/rotate", json={"confirm": "ROTATE"}
+        )
+        data = await resp.json()
+
+    assert resp.status == 200
+    assert data == {"ok": True, "restarted": True}
+    new = holder.value
+    assert new and new != "old-token"
+    assert supervisor.specs["bot"].env["DAFEIYU_CONTROL_TOKEN"] == new
+    assert ops.health.token == new
+    assert supervisor.restarted == ["bot"]
+    assert supervisor.calls == [("restart", "bot")]
+    assert (tmp_path / "control.token").read_text(encoding="utf-8") == new
+
+    rows = [row for row in audit.query(20) if row["action"] == "token.rotate"]
+    assert len(rows) == 1
+    assert rows[0]["target"] == "control"
+    assert rows[0]["detail"] == {"restarted": True}
+    assert new not in (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+
+
+async def test_rotate_token_switches_dashboard_bot_header(
+    tmp_path: Path, monkeypatch
+) -> None:
+    supervisor = RotateSupervisor()
+    seen: list[str] = []
+
+    async def brain_endpoint(request: web.Request) -> web.Response:
+        expected = supervisor.specs["bot"].env["DAFEIYU_CONTROL_TOKEN"]
+        token = request.headers.get("X-Control-Token", "")
+        seen.append(token)
+        if token != expected:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response({"ok": True})
+
+    bot_app = web.Application()
+    bot_app.router.add_get("/api/brain", brain_endpoint)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    try:
+        app, _supervisor, _ops, _audit, holder = make_rotate_app(
+            tmp_path,
+            monkeypatch,
+            supervisor=supervisor,
+            auth=make_auth(True),
+            bot_url=url,
+        )
+        async with running(app) as client:
+            await login(client)
+            before = await client.get("/api/brain")
+            assert before.status == 200
+            old = holder.value
+
+            rotated = await client.post(
+                "/api/control-token/rotate", json={"confirm": "ROTATE"}
+            )
+            assert rotated.status == 200
+            new = holder.value
+            assert new != old
+
+            after = await client.get("/api/brain")
+            assert after.status == 200
+
+            direct_old = await bot_client.get(
+                "/api/brain", headers={"X-Control-Token": old}
+            )
+            direct_new = await bot_client.get(
+                "/api/brain", headers={"X-Control-Token": new}
+            )
+    finally:
+        await bot_client.close()
+
+    assert direct_old.status == 401
+    assert direct_new.status == 200
+    assert seen[:2] == [old, new]
+
+
+async def test_rotate_token_restart_failure_rolls_back(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class FailingRestartSupervisor(RotateSupervisor):
+        async def restart(self, name):
+            self.restarted.append(name)
+            raise RuntimeError("重启失败")
+
+    supervisor = FailingRestartSupervisor()
+
+    async def brain_endpoint(request: web.Request) -> web.Response:
+        if request.headers.get("X-Control-Token") != "old-token":
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response({"ok": True})
+
+    bot_app = web.Application()
+    bot_app.router.add_get("/api/brain", brain_endpoint)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    try:
+        app, _supervisor, ops, audit, holder = make_rotate_app(
+            tmp_path,
+            monkeypatch,
+            supervisor=supervisor,
+            auth=make_auth(True),
+            bot_url=url,
+        )
+        old = holder.value
+        async with running(app) as client:
+            await login(client)
+            resp = await client.post(
+                "/api/control-token/rotate", json={"confirm": "ROTATE"}
+            )
+            data = await resp.json()
+            still_old = await client.get("/api/brain")
+    finally:
+        await bot_client.close()
+
+    assert resp.status == 500
+    assert "重启失败" in data["error"]
+    assert holder.value == old
+    assert (tmp_path / "control.token").read_text(encoding="utf-8") == old
+    assert supervisor.specs["bot"].env["DAFEIYU_CONTROL_TOKEN"] == old
+    assert ops.health.token == old
+    assert supervisor.restarted == ["bot"]
+    assert still_old.status == 200
+
+    rows = [row for row in audit.query(20) if row["action"] == "token.rotate"]
+    assert len(rows) == 1
+    assert rows[0]["result"] == "error"
+    assert rows[0]["detail"] == {"restarted": False}
+
+
+async def test_index_has_security_rotate_controls(tmp_path: Path) -> None:
+    app, _, _ = make_app(tmp_path)
+    async with running(app) as client:
+        text = await (await client.get("/")).text()
+
+    for anchor in (
+        "btn-rotate-token",
+        "rotate-token-confirm",
+        "rotate-token-status",
+    ):
+        assert f'id="{anchor}"' in text, anchor
+    assert "/api/control-token/rotate" in text
+    assert "rotateControlToken" in text
+    assert '$("btn-rotate-token").addEventListener("click", rotateControlToken)' in text
+    assert "已轮换，bot 已重启" in text
+    assert "轮换" in text and "重启" in text
+
