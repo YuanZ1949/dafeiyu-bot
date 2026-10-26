@@ -155,6 +155,7 @@
   .debug-wide { grid-column: 1 / -1; }
   .debug-switches { margin-top: 10px; gap: 16px; color: var(--muted); font-size: 12px; }
   .debug-switches label { display: inline-flex; align-items: center; gap: 5px; }
+  .debug-note { margin-top: 8px; font-size: 12px; }
   .debug-verdict {
     margin-top: 12px; padding: 9px 12px; border-radius: 8px;
     border: 1px solid var(--line); background: var(--panel-2); font-weight: 600;
@@ -172,7 +173,7 @@
   .debug-check.pass { border-left-color: var(--ok); }
   .debug-check.blocked { border-left-color: var(--bad); }
   .debug-check.info { border-left-color: var(--accent); }
-  .debug-check.skipped { opacity: .55; }
+  .debug-check.skipped { color: var(--muted); border-left-style: dashed; }
   .debug-check .st { flex: 0 0 48px; color: var(--muted); }
   .debug-check .detail { color: var(--muted); margin-left: auto; text-align: right; }
   .debug-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; margin-top: 10px; }
@@ -393,8 +394,8 @@
     <div class="row debug-switches">
       <label><input type="checkbox" id="debug-at-bot" /> @ 机器人</label>
       <label><input type="checkbox" id="debug-reply-bot" /> 引用回复机器人</label>
-      <span class="kv">不写消息、不调模型、不消耗预算/冷却、不动调度器</span>
     </div>
+    <div class="kv debug-note">不写消息、不调模型、不消耗预算/冷却、不动调度器</div>
     <div id="debug-result" hidden>
       <div class="debug-verdict" id="debug-verdict"></div>
       <div class="kv" id="debug-reason" style="margin-top:6px"></div>
