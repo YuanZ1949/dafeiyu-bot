@@ -1345,8 +1345,8 @@ function closeTimeline() {
 
 function logLevelOf(line) {
   const text = String(line).toUpperCase();
-  if (/(ERROR|CRITICAL|FATAL)/.test(text)) return "error";
-  if (/(WARN|WARNING)/.test(text)) return "warn";
+  if (/\b(ERROR|CRITICAL|FATAL)\b/.test(text)) return "error";
+  if (/\bWARN(?:ING)?\b/.test(text)) return "warn";
   return "info";
 }
 

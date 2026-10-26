@@ -30,10 +30,13 @@ class LogHub:
         self.ring = ring
         self.max_bytes = max_bytes
         self.backups = backups
-        self._buffers: dict[str, deque[str]] = {s: deque(maxlen=ring) for s in SOURCES}
-        self._subscribers: dict[str, set[asyncio.Queue[str]]] = {
+        self._buffers: dict[str, deque[tuple[int, str]]] = {
+            s: deque(maxlen=ring) for s in SOURCES
+        }
+        self._subscribers: dict[str, set[asyncio.Queue[tuple[int, str]]]] = {
             s: set() for s in SOURCES
         }
+        self._seqs: dict[str, int] = {s: 0 for s in SOURCES}
         self._rotate_existing()
 
     def _rotate_existing(self) -> None:
@@ -55,18 +58,23 @@ class LogHub:
         if source not in self._buffers:
             self._buffers[source] = deque(maxlen=self.ring)
             self._subscribers[source] = set()
+            self._seqs[source] = 0
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        seq = self._seqs[source]
         for raw in str(text).splitlines():
             line = raw.rstrip()
             if not line:
                 continue
+            seq += 1
             entry = f"{stamp} [{source}] {line}"
-            self._buffers[source].append(entry)
+            event = (seq, entry)
+            self._buffers[source].append(event)
             for queue in list(self._subscribers[source]):
                 try:
-                    queue.put_nowait(entry)
+                    queue.put_nowait(event)
                 except asyncio.QueueFull:
                     pass
+        self._seqs[source] = seq
         self._append_file(source, str(text))
 
     def _append_file(self, source: str, text: str) -> None:
@@ -98,7 +106,7 @@ class LogHub:
             raise ValueError(f"未知日志来源：{source}")
         return self.dir / f"{source}.log"
 
-    def tail(self, source: str, limit: int = 200) -> list[str]:
+    def tail_events(self, source: str, limit: int = 200) -> list[tuple[int, str]]:
         buffer = self._buffers.get(source)
         if buffer is None:
             return []
@@ -106,12 +114,24 @@ class LogHub:
             return []
         return list(buffer)[-limit:]
 
-    def subscribe(self, source: str) -> asyncio.Queue[str]:
-        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self.ring)
+    def tail(self, source: str, limit: int = 200) -> list[str]:
+        return [line for _, line in self.tail_events(source, limit)]
+
+    def events_after(self, source: str, seq: int) -> list[tuple[int, str]]:
+        buffer = self._buffers.get(source)
+        if buffer is None:
+            return []
+        return [(event_seq, line) for event_seq, line in buffer if event_seq > seq]
+
+    def last_seq(self, source: str) -> int:
+        return self._seqs.get(source, 0)
+
+    def subscribe(self, source: str) -> asyncio.Queue[tuple[int, str]]:
+        queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue(maxsize=self.ring)
         self._subscribers.setdefault(source, set()).add(queue)
         return queue
 
-    def unsubscribe(self, source: str, queue: asyncio.Queue[str]) -> None:
+    def unsubscribe(self, source: str, queue: asyncio.Queue[tuple[int, str]]) -> None:
         bucket = self._subscribers.get(source)
         if bucket is not None:
             bucket.discard(queue)

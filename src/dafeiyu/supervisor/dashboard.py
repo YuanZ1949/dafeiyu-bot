@@ -162,6 +162,15 @@ def create_app(
             tail = max(1, min(2000, int(request.query.get("tail", "200"))))
         except ValueError:
             tail = 200
+        last_event_id = request.headers.get("Last-Event-ID", "").strip()
+        try:
+            after_seq = int(last_event_id) if last_event_id else None
+        except ValueError:
+            after_seq = None
+        if after_seq is not None and after_seq > logs.last_seq(source):
+            # 服务重启后序号会从 1 重新开始；旧页面带着更大的 Last-Event-ID
+            # 重连时不能继续等更大的序号，否则会永远收不到新日志。
+            after_seq = None
 
         response = web.StreamResponse(
             headers={
@@ -172,41 +181,49 @@ def create_app(
             }
         )
         await response.prepare(request)
-        for line in logs.tail(source, tail):
-            await response.write(_sse(line))
         queue = logs.subscribe(source)
+        initial = (
+            logs.tail_events(source, tail)
+            if after_seq is None
+            else logs.events_after(source, after_seq)
+        )
+        last_sent = after_seq or 0
         idle = 0
         try:
+            for seq, line in initial:
+                await response.write(_sse(line, seq))
+                last_sent = seq
             while not closing.is_set():
                 try:
-                    line = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    seq, line = await asyncio.wait_for(queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     idle += 1
                     if idle >= 15:
                         await response.write(b": ping\n\n")
                         idle = 0
                     continue
+                if seq <= last_sent:
+                    continue
                 idle = 0
-                await response.write(_sse(line))
+                await response.write(_sse(line, seq))
+                last_sent = seq
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
             logs.unsubscribe(source, queue)
         return response
 
-    async def logs_download(request: web.Request) -> web.Response:
+    async def logs_download(request: web.Request) -> web.StreamResponse:
         source = request.query.get("source", "bot")
         if source not in SOURCES:
             return web.json_response({"error": f"未知日志来源：{source}"}, status=400)
         path = logs.log_path(source)
         if not path.is_file():
             return web.json_response({"error": "日志文件不存在"}, status=404)
-        body = await asyncio.to_thread(path.read_bytes)
-        return web.Response(
-            body=body,
-            content_type="text/plain",
-            charset="utf-8",
+        return web.FileResponse(
+            path,
             headers={
+                "Content-Type": "text/plain; charset=utf-8",
                 "Content-Disposition": f'attachment; filename="{source}.log"',
                 "Cache-Control": "no-store",
             },
@@ -442,8 +459,9 @@ def _qr_meta(path: Path) -> dict[str, Any]:
     }
 
 
-def _sse(line: str) -> bytes:
-    return f"data: {json.dumps(line, ensure_ascii=False)}\n\n".encode("utf-8")
+def _sse(line: str, event_id: int | None = None) -> bytes:
+    prefix = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{prefix}data: {json.dumps(line, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 async def _json_body(request: web.Request) -> dict | None:

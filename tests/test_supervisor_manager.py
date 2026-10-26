@@ -140,12 +140,29 @@ def test_log_hub_tail_and_subscribe(tmp_path: Path) -> None:
     tail = hub.tail("bot")
     assert len(tail) == 2
     assert "line1" in tail[0]
-    assert queue.get_nowait().endswith("line1")
-    assert queue.get_nowait().endswith("line2")
+    first_seq, first_line = queue.get_nowait()
+    second_seq, second_line = queue.get_nowait()
+    assert (first_seq, second_seq) == (1, 2)
+    assert first_line.endswith("line1")
+    assert second_line.endswith("line2")
 
     hub.unsubscribe("bot", queue)
     hub.write("bot", "line3")
     assert queue.empty()
+
+
+def test_log_hub_events_after_uses_sequence(tmp_path: Path) -> None:
+    hub = LogHub(tmp_path / "logs")
+    hub.write("bot", "line1\nline2\nline3")
+
+    events = hub.tail_events("bot", 2)
+    assert [seq for seq, _ in events] == [2, 3]
+    assert events[0][1].endswith("line2")
+    assert events[1][1].endswith("line3")
+    assert [seq for seq, _ in hub.events_after("bot", 1)] == [2, 3]
+    assert hub.events_after("bot", 3) == []
+    assert hub.tail_events("unknown", 5) == []
+    assert hub.events_after("unknown", 0) == []
 
 
 def test_log_hub_tail_limits(tmp_path: Path) -> None:

@@ -46,6 +46,17 @@ async def running(app):
         await client.close()
 
 
+async def read_sse_event(response) -> list[str]:
+    lines: list[str] = []
+    while True:
+        raw = await asyncio.wait_for(response.content.readline(), timeout=2.0)
+        assert raw, "SSE 连接提前结束"
+        text = raw.decode("utf-8").rstrip("\r\n")
+        if not text:
+            return lines
+        lines.append(text)
+
+
 def make_app(tmp_path: Path, supervisor=None, qr: Path | None = None, on_shutdown=None, bot_url: str = BOT_URL):
     supervisor = supervisor or FakeSupervisor()
     hub = LogHub(tmp_path / "logs")
@@ -211,6 +222,81 @@ async def test_logs_stream_rejects_unknown_source(tmp_path: Path) -> None:
     async with running(app) as client:
         resp = await client.get("/api/logs/stream?source=mysql")
     assert resp.status == 400
+
+
+async def test_logs_stream_ids_and_reconnect_resume(tmp_path: Path) -> None:
+    app, _, hub = make_app(tmp_path)
+    hub.write("bot", "one\ntwo")
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        first = await client.get("/api/logs/stream?source=bot&tail=2")
+        first_events = [await read_sse_event(first) for _ in range(2)]
+        first_ids = [int(event[0].removeprefix("id: ")) for event in first_events]
+        assert first_ids == [1, 2]
+        assert "one" in first_events[0][1]
+        assert "two" in first_events[1][1]
+        first.close()
+
+        hub.write("bot", "three\nfour")
+        second = await client.get(
+            "/api/logs/stream?source=bot&tail=200",
+            headers={"Last-Event-ID": str(first_ids[-1])},
+        )
+        resumed = [await read_sse_event(second) for _ in range(2)]
+        resumed_ids = [int(event[0].removeprefix("id: ")) for event in resumed]
+        assert resumed_ids == [3, 4]
+        assert "three" in resumed[0][1]
+        assert "four" in resumed[1][1]
+        assert all("one" not in event[1] for event in resumed)
+
+        hub.write("bot", "five")
+        live = await read_sse_event(second)
+        assert live[0] == "id: 5"
+        assert "five" in live[1]
+        second.close()
+    finally:
+        await client.close()
+
+
+async def test_logs_stream_resets_stale_last_event_id(tmp_path: Path) -> None:
+    app, _, hub = make_app(tmp_path)
+    hub.write("bot", "one\ntwo")
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        resp = await client.get(
+            "/api/logs/stream?source=bot&tail=2",
+            headers={"Last-Event-ID": "999"},
+        )
+        events = [await read_sse_event(resp) for _ in range(2)]
+        assert [int(event[0].removeprefix("id: ")) for event in events] == [1, 2]
+
+        hub.write("bot", "three")
+        live = await read_sse_event(resp)
+        assert live[0] == "id: 3"
+        assert "three" in live[1]
+        resp.close()
+    finally:
+        await client.close()
+
+
+async def test_logs_download_streams_without_read_bytes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app, _, hub = make_app(tmp_path)
+    hub.write("bot", "streamed-line")
+
+    def fail_read_bytes(self):
+        raise AssertionError("下载不应把整个日志文件读入内存")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    async with running(app) as client:
+        resp = await client.get("/api/logs/download?source=bot")
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert "streamed-line" in body
 
 
 async def test_logs_download_returns_current_file_as_attachment(
