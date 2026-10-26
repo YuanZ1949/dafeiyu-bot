@@ -43,6 +43,16 @@ def _delivered_ids(store: Store) -> set[str]:
     return {str(row["message_id"]) for row in rows}
 
 
+def _fts_hits(store: Store, query: str) -> int:
+    if not store._messages_fts:
+        return 0
+    row = store._conn.execute(
+        "SELECT COUNT(*) AS n FROM messages_fts WHERE messages_fts MATCH ?",
+        (f'"{query}"',),
+    ).fetchone()
+    return int(row["n"])
+
+
 def _seed(store: Store) -> None:
     store.add_message(make_msg("u7-a", user_id=7, content="用户7的第一条"))
     store.add_message(make_msg("u7-b", user_id=7, content="用户7的第二条"))
@@ -65,6 +75,7 @@ def test_delete_user_messages_removes_only_that_users_rows(store: Store) -> None
     assert _delivered_ids(store) == {"u7-a", "u7-b", "u7-c", "u8-a"}
     hits, _ = store.search_message_hits("用户7的第一条", ChatType.GROUP, 100, 10)
     assert hits == 1
+    assert _fts_hits(store, "用户7的第一条") == 1
 
     deleted = store.delete_user_messages(ChatType.GROUP, 100, 7)
 
@@ -81,6 +92,8 @@ def test_delete_user_messages_removes_only_that_users_rows(store: Store) -> None
     hits, rows = store.search_message_hits("用户7的第一条", ChatType.GROUP, 100, 10)
     assert hits == 0
     assert rows == []
+    # 直接查索引本体，避免 JOIN messages 掩盖触发器缺失导致的孤儿索引行。
+    assert _fts_hits(store, "用户7的第一条") == 0
 
 
 def test_delete_user_messages_is_idempotent(store: Store) -> None:
