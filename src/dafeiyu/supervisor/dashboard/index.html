@@ -102,6 +102,9 @@
   #qr.empty { display: none; }
   #qr-placeholder { width: 180px; height: 180px; border: 1px dashed var(--line); border-radius: 8px; display: grid; place-items: center; color: var(--muted); font-size: 12px; text-align: center; padding: 8px; }
   .log-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .log-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .log-toolbar input { width: 220px; }
+  .log-toolbar select { min-width: 130px; }
   .tab { padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); cursor: pointer; font-size: 12px; color: var(--muted); }
   .tab.active { color: var(--text); border-color: var(--accent); background: var(--panel-2); }
   pre#logs {
@@ -355,6 +358,24 @@
   <section class="card">
     <h2>日志</h2>
     <div class="log-head" id="log-tabs"></div>
+    <div class="log-toolbar">
+      <select id="log-level" title="按文本中的级别关键字筛选">
+        <option value="">全部级别</option>
+        <option value="error">ERROR</option>
+        <option value="warn">WARNING</option>
+        <option value="info">INFO</option>
+      </select>
+      <input id="log-filter" placeholder="关键字筛选…" />
+      <select id="log-lines" title="重新连接时加载最近多少行">
+        <option value="200">200 行</option>
+        <option value="1000">1000 行</option>
+        <option value="2000">2000 行</option>
+      </select>
+      <button class="btn" id="btn-log-pause">暂停</button>
+      <button class="btn" id="btn-log-clear">清屏</button>
+      <button class="btn" id="btn-log-download">下载当前日志</button>
+      <span class="kv" id="log-hint"></span>
+    </div>
     <pre id="logs"></pre>
   </section>
 </main>
@@ -404,6 +425,14 @@ let timelineTarget = null;
 let timelineNextBefore = null;
 let timelineHasMore = false;
 let timelineReq = 0;
+
+const LOG_MAX_LINES = 5000;
+let logLines = [];
+let logPaused = false;
+let logPending = 0;
+let logFollow = true;
+let logRenderTimer = null;
+let logFilterTimer = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -1314,23 +1343,109 @@ function closeTimeline() {
   document.body.classList.remove("timeline-open");
 }
 
+function logLevelOf(line) {
+  const text = String(line).toUpperCase();
+  if (/(ERROR|CRITICAL|FATAL)/.test(text)) return "error";
+  if (/(WARN|WARNING)/.test(text)) return "warn";
+  return "info";
+}
+
+function renderLogLines() {
+  logRenderTimer = null;
+  const pre = $("logs");
+  const level = $("log-level").value;
+  const keyword = $("log-filter").value.trim().toLowerCase();
+  const lines = logLines.filter((line) => {
+    if (level && logLevelOf(line) !== level) return false;
+    if (keyword && !line.toLowerCase().includes(keyword)) return false;
+    return true;
+  });
+  pre.textContent = lines.join("\n");
+  if (logFollow) pre.scrollTop = pre.scrollHeight;
+  if (logPaused) {
+    $("log-hint").textContent = `已暂停 · ${logPending} 行待显示`;
+    return;
+  }
+  let hint = `${lines.length}/${logLines.length} 行`;
+  if (level || keyword) hint += " · 已筛选";
+  $("log-hint").textContent = hint;
+}
+
+function scheduleLogRender() {
+  if (logRenderTimer !== null) return;
+  logRenderTimer = setTimeout(() => {
+    logRenderTimer = null;
+    renderLogLines();
+  }, 50);
+}
+
+function appendLogLine(line) {
+  logLines.push(line);
+  if (logLines.length > LOG_MAX_LINES) {
+    logLines.splice(0, logLines.length - LOG_MAX_LINES);
+  }
+  if (logPaused) {
+    logPending += 1;
+    $("log-hint").textContent = `已暂停 · ${logPending} 行待显示`;
+    return;
+  }
+  scheduleLogRender();
+}
+
+function toggleLogPause() {
+  logPaused = !logPaused;
+  $("btn-log-pause").textContent = logPaused ? "继续" : "暂停";
+  if (!logPaused) {
+    logPending = 0;
+    logFollow = true;
+    renderLogLines();
+  } else {
+    $("log-hint").textContent = "已暂停 · 新日志会继续接收";
+  }
+}
+
+function clearLogs() {
+  logLines = [];
+  logPending = 0;
+  renderLogLines();
+  toast("已清空当前视图，不影响日志文件");
+}
+
+function downloadLog() {
+  const link = document.createElement("a");
+  link.href = `/api/logs/download?source=${encodeURIComponent(currentSource)}`;
+  link.download = `${currentSource}.log`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  toast(`已开始下载 ${currentSource}.log`);
+}
+
 function setLogSource(source) {
   currentSource = source;
   document.querySelectorAll("#log-tabs .tab").forEach((el) => {
     el.classList.toggle("active", el.dataset.source === source);
   });
   if (eventSource) eventSource.close();
-  const pre = $("logs");
-  pre.textContent = "";
-  eventSource = new EventSource(`/api/logs/stream?source=${encodeURIComponent(source)}&tail=200`);
-  eventSource.onmessage = (ev) => {
-    pre.textContent += ev.data + "\n";
-    if (pre.scrollTop + pre.clientHeight > pre.scrollHeight - 60) {
-      pre.scrollTop = pre.scrollHeight;
-    }
-  };
+  if (logRenderTimer !== null) {
+    clearTimeout(logRenderTimer);
+    logRenderTimer = null;
+  }
+  logLines = [];
+  logPending = 0;
+  logPaused = false;
+  logFollow = true;
+  $("btn-log-pause").textContent = "暂停";
+  $("logs").textContent = "";
+  $("log-hint").textContent = "连接中…";
+
+  const tail = Number($("log-lines").value) || 200;
+  eventSource = new EventSource(
+    `/api/logs/stream?source=${encodeURIComponent(source)}&tail=${tail}`
+  );
+  eventSource.onmessage = (ev) => appendLogLine(ev.data);
   eventSource.onerror = () => {
-    pre.textContent += "[控制台] 日志流断开，正在重连…\n";
+    appendLogLine("[控制台] 日志流断开，正在重连…");
   };
 }
 
@@ -1406,6 +1521,26 @@ $("btn-timeline-latest").addEventListener("click", () => {
   timelineNextBefore = null;
   timelineHasMore = false;
   loadTimeline({ scroll: "bottom" });
+});
+$("btn-log-pause").addEventListener("click", toggleLogPause);
+$("btn-log-clear").addEventListener("click", clearLogs);
+$("btn-log-download").addEventListener("click", downloadLog);
+$("log-level").addEventListener("change", () => {
+  logFollow = true;
+  scheduleLogRender();
+});
+$("log-filter").addEventListener("input", () => {
+  if (logFilterTimer !== null) clearTimeout(logFilterTimer);
+  logFilterTimer = setTimeout(() => {
+    logFilterTimer = null;
+    logFollow = true;
+    scheduleLogRender();
+  }, 200);
+});
+$("log-lines").addEventListener("change", () => setLogSource(currentSource));
+$("logs").addEventListener("scroll", () => {
+  const pre = $("logs");
+  logFollow = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 40;
 });
 document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape" && !$("timeline-drawer").hidden) closeTimeline();

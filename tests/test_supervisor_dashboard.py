@@ -80,6 +80,13 @@ async def test_index_serves_dashboard(tmp_path: Path) -> None:
     assert "timeline-metrics" in text
     assert "openTimeline" in text
     assert "定位" in text
+    assert "log-level" in text
+    assert "log-filter" in text
+    assert "log-lines" in text
+    assert "btn-log-pause" in text
+    assert "btn-log-clear" in text
+    assert "btn-log-download" in text
+    assert "LOG_MAX_LINES" in text
 
 
 async def test_status_reports_processes_and_offline_brain(tmp_path: Path) -> None:
@@ -204,6 +211,38 @@ async def test_logs_stream_rejects_unknown_source(tmp_path: Path) -> None:
     async with running(app) as client:
         resp = await client.get("/api/logs/stream?source=mysql")
     assert resp.status == 400
+
+
+async def test_logs_download_returns_current_file_as_attachment(
+    tmp_path: Path,
+) -> None:
+    app, _, hub = make_app(tmp_path)
+    hub.write("bot", "第一行\n第二行")
+    async with running(app) as client:
+        resp = await client.get("/api/logs/download?source=bot")
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert resp.content_type == "text/plain"
+    assert resp.charset == "utf-8"
+    assert "attachment" in resp.headers["Content-Disposition"]
+    assert 'filename="bot.log"' in resp.headers["Content-Disposition"]
+    assert "第一行" in body
+    assert "第二行" in body
+
+
+async def test_logs_download_rejects_unknown_source_and_missing_file(
+    tmp_path: Path,
+) -> None:
+    app, _, _ = make_app(tmp_path)
+    async with running(app) as client:
+        unknown = await client.get("/api/logs/download?source=mysql")
+        traversal = await client.get("/api/logs/download?source=../bot")
+        missing = await client.get("/api/logs/download?source=bot")
+
+    assert unknown.status == 400
+    assert traversal.status == 400
+    assert missing.status == 404
 
 
 async def test_shutdown_invokes_callback(tmp_path: Path) -> None:

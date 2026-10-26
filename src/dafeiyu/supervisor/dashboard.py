@@ -194,6 +194,24 @@ def create_app(
             logs.unsubscribe(source, queue)
         return response
 
+    async def logs_download(request: web.Request) -> web.Response:
+        source = request.query.get("source", "bot")
+        if source not in SOURCES:
+            return web.json_response({"error": f"未知日志来源：{source}"}, status=400)
+        path = logs.log_path(source)
+        if not path.is_file():
+            return web.json_response({"error": "日志文件不存在"}, status=404)
+        body = await asyncio.to_thread(path.read_bytes)
+        return web.Response(
+            body=body,
+            content_type="text/plain",
+            charset="utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{source}.log"',
+                "Cache-Control": "no-store",
+            },
+        )
+
     async def get_brain(_: web.Request) -> web.Response:
         code, data = await bot_call("GET", "/api/brain")
         return web.json_response(data, status=code)
@@ -377,6 +395,7 @@ def create_app(
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/logs/stream", logs_stream)
+    app.router.add_get("/api/logs/download", logs_download)
     app.router.add_get("/api/qr/image", qr_image)
     app.router.add_get("/api/brain", get_brain)
     app.router.add_post("/api/brain", post_brain)

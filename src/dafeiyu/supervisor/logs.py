@@ -92,6 +92,12 @@ class LogHub:
         with contextlib.suppress(OSError):
             target.replace(target.with_name(f"{target.name}.1"))
 
+    def log_path(self, source: str) -> Path:
+        """当前来源的日志文件路径；来源必须先过 SOURCES 白名单。"""
+        if source not in SOURCES:
+            raise ValueError(f"未知日志来源：{source}")
+        return self.dir / f"{source}.log"
+
     def tail(self, source: str, limit: int = 200) -> list[str]:
         buffer = self._buffers.get(source)
         if buffer is None:
