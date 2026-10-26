@@ -210,6 +210,51 @@ class SupervisorConfig:
 
 
 @dataclass(frozen=True)
+class AlertRulesConfig:
+    bot_down_seconds: int = 120
+    napcat_down_seconds: int = 180
+    opencode_down_seconds: int = 120
+    quota_pause: bool = True
+    disk_free_percent: int = 10
+    reply_error_window_seconds: int = 900
+    reply_error_count: int = 3
+
+
+@dataclass(frozen=True)
+class WebhookConfig:
+    url: str = ""
+    format: str = "generic"
+
+
+@dataclass(frozen=True)
+class AlertsConfig:
+    enabled: bool = False
+    check_seconds: int = 30
+    repeat_seconds: int = 21600
+    webhook: WebhookConfig = field(default_factory=WebhookConfig)
+    qq_admin: int = 0
+    rules: AlertRulesConfig = field(default_factory=AlertRulesConfig)
+
+
+@dataclass(frozen=True)
+class BackupConfig:
+    enabled: bool = True
+    dir: str = "data/backups"
+    daily_keep: int = 7
+    weekly_keep: int = 4
+    schedule_hour: int = 4
+    max_total_gb: int = 20
+    max_upload_mb: int = 512
+
+
+@dataclass(frozen=True)
+class AuditConfig:
+    path: str = "data/audit.jsonl"
+    max_bytes: int = 10485760
+    backups: int = 3
+
+
+@dataclass(frozen=True)
 class Settings:
     api_key: str
     base_url: str
@@ -234,6 +279,9 @@ class Settings:
     local_model: LocalModelConfig = field(default_factory=LocalModelConfig)
     napcat: NapCatConfig = field(default_factory=NapCatConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
+    alerts: AlertsConfig = field(default_factory=AlertsConfig)
+    backup: BackupConfig = field(default_factory=BackupConfig)
+    audit: AuditConfig = field(default_factory=AuditConfig)
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -276,6 +324,122 @@ def _build_ambient_ratio(raw: dict[str, Any]) -> float:
     if not 0 < ratio <= 1:
         raise ConfigError("budget.ambient_ratio 必须在 (0, 1] 之间")
     return ratio
+
+
+def _build_alerts(raw: dict[str, Any]) -> AlertsConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("config.yaml 的 alerts 必须是映射")
+    enabled = _bool(raw.get("enabled", False), "alerts.enabled")
+    check_seconds = _int(raw.get("check_seconds", 30), "alerts.check_seconds")
+    if not 5 <= check_seconds <= 3600:
+        raise ConfigError("alerts.check_seconds 必须在 5-3600 之间")
+    repeat_seconds = _int(raw.get("repeat_seconds", 21600), "alerts.repeat_seconds")
+    if repeat_seconds < 300:
+        raise ConfigError("alerts.repeat_seconds 必须大于等于 300")
+
+    webhook_raw = raw.get("webhook") or {}
+    if not isinstance(webhook_raw, dict):
+        raise ConfigError("alerts.webhook 必须是映射")
+    webhook_format = str(webhook_raw.get("format") or "generic").strip().casefold()
+    if webhook_format not in ("generic", "ntfy", "wecom", "dingtalk"):
+        raise ConfigError(
+            "alerts.webhook.format 只能是 generic、ntfy、wecom 或 dingtalk"
+        )
+    webhook = WebhookConfig(
+        url=str(webhook_raw.get("url") or "").strip(),
+        format=webhook_format,
+    )
+
+    qq_admin = _non_negative_int(raw.get("qq_admin"), "alerts.qq_admin", 0)
+    rules_raw = raw.get("rules") or {}
+    if not isinstance(rules_raw, dict):
+        raise ConfigError("alerts.rules 必须是映射")
+    disk_free_percent = _int(
+        rules_raw.get("disk_free_percent", 10), "alerts.rules.disk_free_percent"
+    )
+    if not 1 <= disk_free_percent <= 50:
+        raise ConfigError("alerts.rules.disk_free_percent 必须在 1-50 之间")
+    reply_error_window = _positive_int(
+        rules_raw.get("reply_error_window_seconds"),
+        "alerts.rules.reply_error_window_seconds",
+        900,
+    )
+    if reply_error_window < 60:
+        raise ConfigError("alerts.rules.reply_error_window_seconds 必须大于等于 60")
+    rules = AlertRulesConfig(
+        bot_down_seconds=_positive_int(
+            rules_raw.get("bot_down_seconds"), "alerts.rules.bot_down_seconds", 120
+        ),
+        napcat_down_seconds=_positive_int(
+            rules_raw.get("napcat_down_seconds"), "alerts.rules.napcat_down_seconds", 180
+        ),
+        opencode_down_seconds=_positive_int(
+            rules_raw.get("opencode_down_seconds"),
+            "alerts.rules.opencode_down_seconds",
+            120,
+        ),
+        quota_pause=_bool(
+            rules_raw.get("quota_pause", True), "alerts.rules.quota_pause"
+        ),
+        disk_free_percent=disk_free_percent,
+        reply_error_window_seconds=reply_error_window,
+        reply_error_count=_positive_int(
+            rules_raw.get("reply_error_count"), "alerts.rules.reply_error_count", 3
+        ),
+    )
+    return AlertsConfig(
+        enabled=enabled,
+        check_seconds=check_seconds,
+        repeat_seconds=repeat_seconds,
+        webhook=webhook,
+        qq_admin=qq_admin,
+        rules=rules,
+    )
+
+
+def _build_backup(raw: dict[str, Any]) -> BackupConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("config.yaml 的 backup 必须是映射")
+    backup_dir = str(raw.get("dir", "data/backups") or "").strip()
+    if not backup_dir:
+        raise ConfigError("backup.dir 不能为空")
+    schedule_hour = _int(raw.get("schedule_hour", 4), "backup.schedule_hour")
+    if not 0 <= schedule_hour <= 23:
+        raise ConfigError("backup.schedule_hour 必须在 0-23 之间")
+    max_total_gb = _int(raw.get("max_total_gb", 20), "backup.max_total_gb")
+    if not 1 <= max_total_gb <= 1024:
+        raise ConfigError("backup.max_total_gb 必须在 1-1024 之间")
+    max_upload_mb = _int(raw.get("max_upload_mb", 512), "backup.max_upload_mb")
+    if not 1 <= max_upload_mb <= 4096:
+        raise ConfigError("backup.max_upload_mb 必须在 1-4096 之间")
+    return BackupConfig(
+        enabled=_bool(raw.get("enabled", True), "backup.enabled"),
+        dir=backup_dir,
+        daily_keep=_non_negative_int(
+            raw.get("daily_keep"), "backup.daily_keep", 7
+        ),
+        weekly_keep=_non_negative_int(
+            raw.get("weekly_keep"), "backup.weekly_keep", 4
+        ),
+        schedule_hour=schedule_hour,
+        max_total_gb=max_total_gb,
+        max_upload_mb=max_upload_mb,
+    )
+
+
+def _build_audit(raw: dict[str, Any]) -> AuditConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("config.yaml 的 audit 必须是映射")
+    path = str(raw.get("path", "data/audit.jsonl") or "").strip()
+    if not path:
+        raise ConfigError("audit.path 不能为空")
+    max_bytes = _int(raw.get("max_bytes", 10485760), "audit.max_bytes")
+    if max_bytes < 1048576:
+        raise ConfigError("audit.max_bytes 必须大于等于 1048576")
+    backups = _int(raw.get("backups", 3), "audit.backups")
+    if backups < 1:
+        raise ConfigError("audit.backups 必须大于等于 1")
+    return AuditConfig(path=path, max_bytes=max_bytes, backups=backups)
 
 
 def _build_workspace(raw: dict[str, Any]) -> WorkspaceConfig:
@@ -704,4 +868,7 @@ def load_settings(
                 backoff_seconds=backoff, max_failures=max_failures
             ),
         ),
+        alerts=_build_alerts(raw.get("alerts") or {}),
+        backup=_build_backup(raw.get("backup") or {}),
+        audit=_build_audit(raw.get("audit") or {}),
     )

@@ -256,6 +256,8 @@ def _page_bounds(limit: int, offset: int) -> tuple[int, int]:
 
 
 class Store:
+    SCHEMA_VERSION = 1
+
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
         if self.path != ":memory:":
@@ -268,6 +270,11 @@ class Store:
         self._messages_fts = False
 
     def init_schema(self) -> None:
+        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > self.SCHEMA_VERSION:
+            raise RuntimeError(
+                f"数据库版本 {version} 高于程序支持版本 {self.SCHEMA_VERSION}"
+            )
         self._conn.executescript(_SCHEMA)
         self._ensure_columns()
         try:
@@ -299,7 +306,26 @@ class Store:
                     )
         except sqlite3.OperationalError:
             self._messages_fts = False
+        if version < self.SCHEMA_VERSION:
+            self._conn.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
         self._conn.commit()
+
+    def db_stats(self) -> dict[str, Any]:
+        """健康快照用的轻量库统计；不读消息正文。"""
+        memory = self.path == ":memory:"
+        db_path = Path(self.path)
+        db_bytes = db_path.stat().st_size if not memory and db_path.exists() else 0
+        wal = Path(f"{self.path}-wal")
+        wal_bytes = wal.stat().st_size if not memory and wal.exists() else 0
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()
+        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        return {
+            "db_path": self.path,
+            "db_bytes": db_bytes,
+            "wal_bytes": wal_bytes,
+            "message_count": int(row["n"] or 0),
+            "schema_version": version,
+        }
 
     def _ensure_columns(self) -> None:
         """给老库补列：CREATE TABLE IF NOT EXISTS 不会改已存在的表。"""
@@ -1473,6 +1499,36 @@ class Store:
             (chat_type.value, chat_id, today, *names),
         ).fetchone()
         return int(row["calls"]), int(row["tokens"])
+
+    def usage_totals(self, start_date: str, end_date: str) -> tuple[int, int]:
+        """日期闭区间内的全会话用量，供健康快照使用。"""
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS calls,
+                   COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens
+            FROM usage
+            WHERE date >= ? AND date <= ?
+            """,
+            (start_date, end_date),
+        ).fetchone()
+        return int(row["calls"]), int(row["tokens"])
+
+    def error_stats(self, window_seconds: int) -> dict[str, Any]:
+        """窗口内 brain 错误次数与最后一次时间（上海时区 ISO 串）。"""
+        if window_seconds <= 0:
+            return {"count": 0, "last_at": None}
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS n,
+                   strftime('%Y-%m-%dT%H:%M:%S', MAX(created_at), '+8 hours')
+                       || '+08:00' AS last_at
+            FROM usage
+            WHERE purpose = 'error' AND created_at >= datetime('now', ?)
+            """,
+            (f"-{int(window_seconds)} seconds",),
+        ).fetchone()
+        last_at = row["last_at"] if row else None
+        return {"count": int(row["n"] or 0) if row else 0, "last_at": last_at}
 
     def usage_series(self, start_date: str, end_date: str) -> list[dict[str, object]]:
         """按日落库的用量聚合；缺日由调用方补齐。"""
