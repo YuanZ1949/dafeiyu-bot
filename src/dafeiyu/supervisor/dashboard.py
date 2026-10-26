@@ -109,6 +109,8 @@ def create_app(
     auth_config = auth or _auth_from_settings(settings)
     app[AUTH_KEY] = auth_config
     closing = asyncio.Event()
+    # 每个 app 独立一把锁，避免跨事件循环复用；只保护 token 轮换关键区。
+    rotate_lock = asyncio.Lock()
 
     async def _mark_closing(_: web.Application) -> None:
         closing.set()
@@ -829,45 +831,61 @@ def create_app(
                 {"error": "bot 进程未配置控制口令，无法轮换"}, status=500
             )
 
-        old = control_token.value
-        old_env = env.get("DAFEIYU_CONTROL_TOKEN", old)
-        health = ops.health if ops is not None else None
-        old_health = health.token if health is not None else ""
-        try:
-            new = control_token.rotate()
-            env["DAFEIYU_CONTROL_TOKEN"] = new
-            if health is not None:
-                health.token = new
-            # 只有 bot 用新环境重启；NapCat / OpenCode 不动，且只调用一次。
-            await supervisor.restart("bot")
-        except Exception as exc:  # noqa: BLE001 - 失败要回滚并返回 500
-            if old:
+        async with rotate_lock:
+            old = control_token.value
+            old_env = env.get("DAFEIYU_CONTROL_TOKEN", old)
+            health = ops.health if ops is not None else None
+            old_health = health.token if health is not None else ""
+
+            def rollback() -> None:
+                # 即使 old 为空也要尝试回写，避免 holder / 磁盘 / env / health 分裂。
                 try:
                     control_token.set(old)
                 except Exception as rollback_exc:  # noqa: BLE001
                     log.critical("control token 回滚写盘失败：%s", rollback_exc)
-            env["DAFEIYU_CONTROL_TOKEN"] = old_env
-            if health is not None:
-                health.token = old_health
-            log.critical("control token 轮换失败：%s", exc)
+                env["DAFEIYU_CONTROL_TOKEN"] = old_env
+                if health is not None:
+                    health.token = old_health
+
+            try:
+                new = control_token.rotate()
+                env["DAFEIYU_CONTROL_TOKEN"] = new
+                if health is not None:
+                    health.token = new
+                # 只有 bot 用新环境重启；NapCat / OpenCode 不动，且只调用一次。
+                await supervisor.restart("bot")
+            except asyncio.CancelledError:
+                # 取消也必须留审计并回滚，但不能吞掉取消信号。
+                rollback()
+                write_audit(
+                    request,
+                    "token.rotate",
+                    target="control",
+                    result="error",
+                    detail={"restarted": False},
+                )
+                raise
+            except Exception as exc:  # noqa: BLE001 - 失败要回滚并返回 500
+                rollback()
+                log.critical("control token 轮换失败：%s", exc)
+                write_audit(
+                    request,
+                    "token.rotate",
+                    target="control",
+                    result="error",
+                    detail={"restarted": False},
+                )
+                return web.json_response(
+                    {"error": f"轮换失败：{exc}"}, status=500
+                )
+
             write_audit(
                 request,
                 "token.rotate",
                 target="control",
-                result="error",
-                detail={"restarted": False},
+                detail={"restarted": True},
             )
-            return web.json_response(
-                {"error": f"轮换失败：{exc}"}, status=500
-            )
-
-        write_audit(
-            request,
-            "token.rotate",
-            target="control",
-            detail={"restarted": True},
-        )
-        return web.json_response({"ok": True, "restarted": True})
+            return web.json_response({"ok": True, "restarted": True})
 
     async def shutdown(request: web.Request) -> web.Response:
         if on_shutdown is None:

@@ -4,6 +4,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import aiohttp
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -775,4 +777,110 @@ async def test_index_has_security_rotate_controls(tmp_path: Path) -> None:
     assert '$("btn-rotate-token").addEventListener("click", rotateControlToken)' in text
     assert "已轮换，bot 已重启" in text
     assert "轮换" in text and "重启" in text
+
+
+async def test_rotate_token_write_failure_rolls_back(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app, supervisor, ops, audit, holder = make_rotate_app(
+        tmp_path, monkeypatch, auth=make_auth(True)
+    )
+    old = holder.value
+
+    def failing_rotate() -> str:
+        raise OSError("磁盘已满")
+
+    monkeypatch.setattr(holder, "rotate", failing_rotate)
+
+    async with running(app) as client:
+        await login(client)
+        resp = await client.post(
+            "/api/control-token/rotate", json={"confirm": "ROTATE"}
+        )
+        data = await resp.json()
+
+    assert resp.status == 500
+    assert "磁盘已满" in data["error"]
+    assert supervisor.restarted == []
+    assert holder.value == old
+    assert (tmp_path / "control.token").read_text(encoding="utf-8") == old
+    assert supervisor.specs["bot"].env["DAFEIYU_CONTROL_TOKEN"] == old
+    assert ops.health.token == old
+
+    rows = [row for row in audit.query(20) if row["action"] == "token.rotate"]
+    assert len(rows) == 1
+    assert rows[0]["result"] == "error"
+    assert rows[0]["detail"] == {"restarted": False}
+    assert old not in (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+
+
+async def test_rotate_token_cancellation_is_audited(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class CancelledRestartSupervisor(RotateSupervisor):
+        async def restart(self, name):
+            self.restarted.append(name)
+            raise asyncio.CancelledError()
+
+    supervisor = CancelledRestartSupervisor()
+    app, _supervisor, ops, audit, holder = make_rotate_app(
+        tmp_path, monkeypatch, auth=make_auth(True), supervisor=supervisor
+    )
+    old = holder.value
+
+    with pytest.raises((asyncio.CancelledError, aiohttp.ClientError)):
+        async with running(app) as client:
+            await login(client)
+            await client.post(
+                "/api/control-token/rotate", json={"confirm": "ROTATE"}
+            )
+
+    assert supervisor.restarted == ["bot"]
+    assert holder.value == old
+    assert supervisor.specs["bot"].env["DAFEIYU_CONTROL_TOKEN"] == old
+    assert ops.health.token == old
+
+    rows = [row for row in audit.query(20) if row["action"] == "token.rotate"]
+    assert len(rows) == 1
+    assert rows[0]["result"] == "error"
+    assert rows[0]["detail"] == {"restarted": False}
+
+
+async def test_rotate_token_serializes_concurrent_requests(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class SlowRestartSupervisor(RotateSupervisor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def restart(self, name):
+            self.restarted.append(name)
+            self.entered.set()
+            await self.release.wait()
+
+    supervisor = SlowRestartSupervisor()
+    app, _supervisor, _ops, _audit, holder = make_rotate_app(
+        tmp_path, monkeypatch, auth=make_auth(True), supervisor=supervisor
+    )
+
+    async with running(app) as client:
+        await login(client)
+        first = asyncio.create_task(
+            client.post("/api/control-token/rotate", json={"confirm": "ROTATE"})
+        )
+        await asyncio.wait_for(supervisor.entered.wait(), timeout=2.0)
+        second = asyncio.create_task(
+            client.post("/api/control-token/rotate", json={"confirm": "ROTATE"})
+        )
+        await asyncio.sleep(0.1)
+        assert supervisor.restarted == ["bot"]  # 第二个请求被锁挡住，尚未重启
+        supervisor.release.set()
+        first_resp, second_resp = await asyncio.gather(first, second)
+
+    assert first_resp.status == 200
+    assert second_resp.status == 200
+    assert supervisor.restarted == ["bot", "bot"]
+    assert holder.value
 

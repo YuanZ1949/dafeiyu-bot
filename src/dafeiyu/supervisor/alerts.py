@@ -643,15 +643,21 @@ class QQAdminChannel:
     def __init__(
         self,
         bot_url: str,
-        token: str = "",
+        token: str | Callable[[], str] = "",
         *,
         session: aiohttp.ClientSession | None = None,
         timeout: float = 5.0,
     ) -> None:
         self.bot_url = (bot_url or "").rstrip("/")
+        # token 可以是字符串，也可以是运行期 provider；后者在每次发送时解析，
+        # 保证 control token 轮换后告警通道不会继续用旧值。
         self.token = token
         self._session = session
         self.timeout = timeout
+
+    def _resolve_token(self) -> str:
+        value = self.token
+        return value() if callable(value) else value
 
     async def send(self, incident: Incident, event: str) -> None:
         # bot 自己掉线时这条通道必然失败，默认只走 webhook。
@@ -671,7 +677,8 @@ class QQAdminChannel:
         self, session: aiohttp.ClientSession, payload: dict[str, Any]
     ) -> None:
         url = f"{self.bot_url}/api/notify/admin"
-        headers = {"X-Control-Token": self.token} if self.token else {}
+        token = self._resolve_token()
+        headers = {"X-Control-Token": token} if token else {}
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with session.post(
             url, json=payload, headers=headers, timeout=timeout

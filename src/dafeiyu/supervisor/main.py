@@ -221,10 +221,16 @@ def build_ops(
     supervisor: Supervisor,
     logs: LogHub,
     bot_url: str,
-    token: str,
+    token: str | Callable[[], str],
     napcat_login: NapCatLogin | None = None,
 ) -> OpsServices:
     """按 audit → backup → restore → health → alerts 的顺序装配运维服务。"""
+
+    def _current_token() -> str:
+        value = token() if callable(token) else token
+        return value or ""
+
+    initial_token = _current_token()
     audit = AuditLog(
         _repo_path(settings.audit.path),
         max_bytes=settings.audit.max_bytes,
@@ -241,7 +247,8 @@ def build_ops(
     )
 
     async def ready_check() -> bool:
-        return await _bot_ready(bot_url, token)
+        # 恢复流程会在轮换后继续跑，必须每次探测都取当前 token。
+        return await _bot_ready(bot_url, _current_token())
 
     restore = RestoreService(
         db_path=db_path,
@@ -255,7 +262,7 @@ def build_ops(
         supervisor=supervisor,
         settings=settings,
         bot_url=bot_url,
-        token=token,
+        token=initial_token,
         backups=backups,
         napcat_login=napcat_login,
     )
@@ -264,6 +271,7 @@ def build_ops(
     if settings.alerts.enabled:
         channels: list[AlertChannel] = []
         if settings.alerts.qq_admin:
+            # 传原始 token：字符串按旧行为冻结，callable 则在每次发送时解析。
             channels.append(QQAdminChannel(bot_url, token))
         webhook = settings.alerts.webhook
         if webhook.url:
@@ -449,7 +457,7 @@ async def run() -> int:
             supervisor,
             logs,
             bot_url,
-            holder.value,
+            lambda: holder.value,
             napcat_login=napcat_login,
         )
     except OSError as exc:

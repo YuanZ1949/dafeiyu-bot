@@ -8,7 +8,12 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from dafeiyu.config import load_settings
-from dafeiyu.supervisor.alerts import AlertManager, QQAdminChannel, WebhookChannel
+from dafeiyu.supervisor.alerts import (
+    AlertManager,
+    Incident,
+    QQAdminChannel,
+    WebhookChannel,
+)
 from dafeiyu.supervisor.backup import BackupError
 from dafeiyu.supervisor.logs import LogHub
 from dafeiyu.supervisor.ops import OpsServices
@@ -338,3 +343,81 @@ async def test_ready_check_rejects_unhealthy_bot(tmp_path: Path, monkeypatch) ->
         assert await ops.restore.ready_check() is False  # type: ignore[misc]
     finally:
         await client.close()
+
+
+class StubResponse:
+    status = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+
+class StubSession:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def post(self, url: str, **kwargs):
+        self.calls.append((url, kwargs))
+        return StubResponse()
+
+
+async def test_ops_consumers_use_live_token_after_rotation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """轮换后恢复就绪探测和 QQ 管理员告警都必须立即使用新 token。"""
+    main_module = _isolate_repo(monkeypatch, tmp_path)
+    settings = make_settings(tmp_path, alerts_enabled=True, qq_admin=42)
+    current = {"value": "old-token"}
+    seen: list[str] = []
+
+    async def fake_ready(url: str, token: str, timeout: float = 5.0) -> bool:
+        seen.append(token)
+        return True
+
+    monkeypatch.setattr(main_module, "_bot_ready", fake_ready)
+
+    ops = main_module.build_ops(
+        settings,
+        FakeSupervisor(),
+        _ops_dir(tmp_path),
+        "http://127.0.0.1:1",
+        lambda: current["value"],
+    )
+
+    assert ops.health.token == "old-token"
+    assert ops.restore is not None
+    assert await ops.restore.ready_check() is True  # type: ignore[misc]
+    assert seen == ["old-token"]
+
+    current["value"] = "new-token"
+
+    assert await ops.restore.ready_check() is True  # type: ignore[misc]
+    assert seen == ["old-token", "new-token"]
+
+    assert ops.alerts is not None
+    channel = next(
+        item for item in ops.alerts.channels if isinstance(item, QQAdminChannel)
+    )
+    session = StubSession()
+    channel._session = session  # type: ignore[attr-defined]
+    incident = Incident(
+        id="disk_low",
+        rule="disk_low",
+        severity="warning",
+        status="firing",
+        fingerprint="disk_low",
+        title="磁盘空间不足",
+        detail="剩余 5%",
+        first_seen_at="",
+        last_seen_at="",
+    )
+
+    await channel.send(incident, "firing")
+    assert session.calls[0][1]["headers"]["X-Control-Token"] == "new-token"
+
+    current["value"] = "third-token"
+    await channel.send(incident, "firing")
+    assert session.calls[1][1]["headers"]["X-Control-Token"] == "third-token"

@@ -484,3 +484,29 @@ async def test_qq_admin_channel_raises_on_error_status() -> None:
     )
     with pytest.raises(Exception):
         await channel.send(incident, "firing")
+
+
+async def test_qq_admin_channel_resolves_callable_token_at_send_time() -> None:
+    current = {"value": "old-token"}
+    session = StubSession()
+    channel = QQAdminChannel(
+        "http://127.0.0.1:1", lambda: current["value"], session=session
+    )
+    incident = Incident(
+        id="disk_low",
+        rule="disk_low",
+        severity="warning",
+        status="firing",
+        fingerprint="disk_low",
+        title="磁盘空间不足",
+        detail="",
+        first_seen_at="",
+        last_seen_at="",
+    )
+
+    await channel.send(incident, "firing")
+    current["value"] = "new-token"
+    await channel.send(incident, "firing")
+
+    assert session.calls[0][1]["headers"]["X-Control-Token"] == "old-token"
+    assert session.calls[1][1]["headers"]["X-Control-Token"] == "new-token"
