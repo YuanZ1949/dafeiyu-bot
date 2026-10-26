@@ -50,7 +50,7 @@ _REASON_TEXT = {
     "muted": "群聊已静音",
     "quiet": "夜间静默",
     "blacklist": "群在黑名单",
-    "budget": "今日预算已用完",
+    "budget": "每日预算已用完",
     "hard": "被点名",
     "whitelist": "群不在白名单",
     "duplicate": "冷却窗口内重复",
@@ -364,10 +364,9 @@ class Service:
         hard_source: str | None,
         metrics: dict[str, Any],
     ) -> dict[str, Any]:
-        ok = (
-            metrics["usage_calls"] < metrics["daily_calls"]
-            and metrics["usage_tokens"] < metrics["daily_tokens"]
-        )
+        decision = self._budget_decision(msg, now, addressed=True)
+        metrics.update(self._decision_metrics(decision))
+        ok = decision.action is not BudgetAction.DENY
         metrics["budget_ok"] = ok
         reason = "private" if ok else "budget"
         checks = [
@@ -375,8 +374,7 @@ class Service:
             self._check(
                 "budget",
                 "pass" if ok else "blocked",
-                f"{metrics['usage_calls']}/{metrics['daily_calls']} 次，"
-                f"{metrics['usage_tokens']}/{metrics['daily_tokens']} token",
+                self._budget_detail(decision, metrics, addressed=True),
             ),
             self._check(
                 "private",
@@ -425,7 +423,14 @@ class Service:
             reason = "whitelist"
 
         metrics = self._usage_metrics(msg.chat_type, msg.chat_id, now)
-        metrics.update(self._ambient_budget_metrics(msg, now, addressed=addressed))
+        decision = self._budget_decision(msg, now, addressed=addressed)
+        metrics.update(
+            self._ambient_budget_metrics(
+                msg, now, addressed=addressed, decision=decision
+            )
+        )
+        if reason is None and self._budget_blocked(decision, addressed):
+            reason = "budget"
         st = probe._state(msg.chat_type, msg.chat_id)
         muted_left = (
             max(0.0, (st.muted_until - now).total_seconds())
@@ -463,7 +468,7 @@ class Service:
         checks = []
         for index, key in enumerate(keys):
             if key == "budget":
-                status = "info"
+                status = "blocked" if reason == "budget" else "info"
             elif key == "hard":
                 status = "pass" if addressed else "info"
             elif index < stop_index:
@@ -488,43 +493,137 @@ class Service:
     def _usage_metrics(
         self, chat_type: ChatType, chat_id: int, now: Any
     ) -> dict[str, Any]:
-        calls, tokens = self.store.usage_today(
-            chat_type, chat_id, now.date().isoformat()
+        budget = self.settings.budget
+        metrics: dict[str, Any] = {
+            "usage_calls": 0,
+            "usage_tokens": 0,
+            "daily_calls": budget.daily_calls,
+            "daily_tokens": budget.daily_tokens,
+            "global_calls": 0,
+            "global_tokens": 0,
+            "global_limit_calls": budget.global_daily_calls,
+            "global_limit_tokens": budget.global_daily_tokens,
+            "monthly_calls": 0,
+            "monthly_tokens": 0,
+            "monthly_limit_calls": budget.monthly_calls,
+            "monthly_limit_tokens": budget.monthly_tokens,
+            "monthly_cost": 0.0,
+            "monthly_cost_limit": budget.monthly_cost_limit,
+            "currency": budget.currency,
+        }
+        try:
+            report = self.budget_guard.report(chat_type, chat_id, now=now)
+        except Exception:  # noqa: BLE001 - explain 不能因读库失败而中断
+            return metrics
+        metrics.update(
+            {
+                "usage_calls": report.per_chat["calls"],
+                "usage_tokens": report.per_chat["tokens"],
+                "global_calls": report.global_daily["calls"],
+                "global_tokens": report.global_daily["tokens"],
+                "monthly_calls": report.monthly["calls"],
+                "monthly_tokens": report.monthly["tokens"],
+                "monthly_cost": report.cost["cost"],
+            }
         )
+        return metrics
+
+    def _budget_decision(
+        self, msg: Message, now: Any, *, addressed: bool
+    ):
+        return self.budget_guard.evaluate(
+            msg.chat_type,
+            msg.chat_id,
+            addressed=addressed,
+            purpose="reply" if addressed else "ambient",
+            now=now,
+        )
+
+    @staticmethod
+    def _budget_blocked(decision, addressed: bool) -> bool:
+        return decision.action is BudgetAction.DENY or (
+            decision.action is BudgetAction.DEGRADE and not addressed
+        )
+
+    @staticmethod
+    def _decision_metrics(decision) -> dict[str, Any]:
         return {
-            "usage_calls": calls,
-            "usage_tokens": tokens,
-            "daily_calls": self.settings.budget.daily_calls,
-            "daily_tokens": self.settings.budget.daily_tokens,
+            "budget_action": decision.action.value,
+            "budget_scope": decision.scope,
+            "budget_reason": decision.reason,
+            "budget_warnings": list(decision.warnings),
         }
 
+    @staticmethod
+    def _budget_detail(decision, metrics: dict[str, Any], *, addressed: bool) -> str:
+        return Service._budget_detail_text(
+            decision.action.value,
+            decision.scope,
+            metrics,
+            addressed=addressed,
+        )
+
+    @staticmethod
+    def _budget_detail_text(
+        action: str,
+        scope: str,
+        metrics: dict[str, Any],
+        *,
+        addressed: bool,
+    ) -> str:
+        if scope == "storage_error":
+            return "预算检查读库失败，按降级处理"
+        scope_labels = {
+            "per_chat": "每日预算",
+            "global_daily": "全局日预算",
+            "monthly": "月度预算",
+            "cost": "月度费用",
+        }
+        if action == BudgetAction.DENY.value:
+            label = scope_labels.get(scope, "每日预算")
+            return f"{label}已用完，本次不会调用模型"
+        if action == BudgetAction.DEGRADE.value:
+            if addressed:
+                return "全局/月度额度已超限，点名消息仍可继续"
+            return "当前额度不足，批次投递时会被跳过"
+        if addressed:
+            return (
+                f"点名消息可用总额度；已用 {metrics['usage_calls']}/"
+                f"{metrics['daily_calls']} 次"
+            )
+        limit = metrics["daily_calls"] * metrics["ambient_ratio"]
+        return (
+            f"普通消息受 {metrics['ambient_ratio']:.0%} 额度限制；"
+            f"ambient 已用 {metrics['ambient_calls']}/{limit:.0f} 次"
+        )
+
     def _ambient_budget_metrics(
-        self, msg: Message, now: Any, *, addressed: bool
+        self,
+        msg: Message,
+        now: Any,
+        *,
+        addressed: bool,
+        decision=None,
     ) -> dict[str, Any]:
         budget = self.settings.budget
+        if decision is None:
+            decision = self._budget_decision(msg, now, addressed=addressed)
         today = now.date().isoformat()
-        ambient_calls, ambient_tokens = self.store.usage_today_by_purpose(
-            msg.chat_type, msg.chat_id, today, ("ambient",)
-        )
-        total_calls, total_tokens = self.store.usage_today(
-            msg.chat_type, msg.chat_id, today
-        )
-        ambient_limit_calls = budget.daily_calls * budget.ambient_ratio
-        ambient_limit_tokens = budget.daily_tokens * budget.ambient_ratio
-        ok = total_calls < budget.daily_calls and total_tokens < budget.daily_tokens
-        if not addressed:
-            ok = (
-                ok
-                and ambient_calls < ambient_limit_calls
-                and ambient_tokens < ambient_limit_tokens
+        try:
+            ambient_calls, ambient_tokens = self.store.usage_today_by_purpose(
+                msg.chat_type, msg.chat_id, today, ("ambient",)
             )
-        return {
+        except Exception:  # noqa: BLE001 - 展示用数据失败不影响 explain
+            ambient_calls, ambient_tokens = 0, 0
+        metrics = {
             "ambient_calls": ambient_calls,
             "ambient_tokens": ambient_tokens,
             "ambient_ratio": budget.ambient_ratio,
-            "budget_ok": ok,
+            "budget_ok": not self._budget_blocked(decision, addressed),
             "budget_addressed": addressed,
         }
+        metrics.update(self._decision_metrics(decision))
+        return metrics
 
     def _model_detail(
         self,
@@ -563,7 +662,12 @@ class Service:
             )
         if key == "budget":
             if not metrics["budget_ok"]:
-                return "当前额度不足，批次投递时会被跳过"
+                return self._budget_detail_text(
+                    metrics["budget_action"],
+                    metrics["budget_scope"],
+                    metrics,
+                    addressed=metrics["budget_addressed"],
+                )
             if metrics["budget_addressed"]:
                 return (
                     f"点名消息可用总额度；已用 {metrics['usage_calls']}/"
@@ -640,9 +744,16 @@ class Service:
         current_id = addressed_ids[-1] if addressed_ids else ids[-1]
         key = (chat_type, chat_id)
 
-        if not self._budget_for(chat_type, chat_id, addressed=addressed):
+        budget = self._chat_budget_decision(chat_type, chat_id, addressed=addressed)
+        if not self._budget_allows(budget, addressed):
             self.store.mark_skipped(chat_type, chat_id, ids, SKIP_BUDGET)
-            log.debug("批次跳过（预算）%s/%s", chat_id, current_id)
+            log.debug(
+                "批次跳过（预算）%s/%s scope=%s reason=%s",
+                chat_id,
+                current_id,
+                budget.scope,
+                budget.reason,
+            )
             return
 
         await self._maybe_rotate(chat_type, chat_id)
@@ -748,19 +859,30 @@ class Service:
             self._store_bot_chunks(batch[-1], sent)
         return sent
 
-    def _budget_for(self, chat_type: ChatType, chat_id: int, *, addressed: bool) -> bool:
-        """80/20 预算分层：非点名只能用 ambient 额度，点名可用剩下的全部。"""
-        decision = self.budget_guard.evaluate(
+    def _chat_budget_decision(
+        self, chat_type: ChatType, chat_id: int, *, addressed: bool
+    ):
+        return self.budget_guard.evaluate(
             chat_type,
             chat_id,
             addressed=addressed,
             purpose="reply" if addressed else "ambient",
             now=now_shanghai(),
         )
+
+    @staticmethod
+    def _budget_allows(decision, addressed: bool) -> bool:
         if decision.action is BudgetAction.DENY:
             return False
         return not (
             decision.action is BudgetAction.DEGRADE and not addressed
+        )
+
+    def _budget_for(self, chat_type: ChatType, chat_id: int, *, addressed: bool) -> bool:
+        """80/20 预算分层：非点名只能用 ambient 额度，点名可用剩下的全部。"""
+        return self._budget_allows(
+            self._chat_budget_decision(chat_type, chat_id, addressed=addressed),
+            addressed,
         )
 
     def _tool_hint(self, chat_type: ChatType, chat_id: int):

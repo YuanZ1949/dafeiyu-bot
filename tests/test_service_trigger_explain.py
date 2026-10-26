@@ -7,6 +7,7 @@ from pathlib import Path
 
 from test_service import FakeAdapter, FakeBrain, make_settings
 
+from dafeiyu.budget import BudgetAction, BudgetDecision
 from dafeiyu.config import BudgetConfig
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
@@ -131,10 +132,10 @@ def test_explain_trigger_model_mute_blocks_even_addressed(tmp_path: Path) -> Non
 
 def test_explain_trigger_private_budget_blocks(tmp_path: Path) -> None:
     service, store, router = make_service(tmp_path, mode="rules")
-    service.settings = replace(
-        service.settings,
-        budget=BudgetConfig(1, service.settings.budget.daily_tokens),
-    )
+    budget = BudgetConfig(1, service.settings.budget.daily_tokens)
+    service.settings = replace(service.settings, budget=budget)
+    router.settings = service.settings
+    service.budget_guard.config = budget
     store.record_usage(ChatType.PRIVATE, 2002, "reply", 1, 1)
 
     result = service.explain_trigger(
@@ -145,6 +146,108 @@ def test_explain_trigger_private_budget_blocks(tmp_path: Path) -> None:
     assert result["reason"] == "budget"
     assert result["mode"] == "rules"
     assert router._states == {}
+
+
+def test_explain_trigger_private_budget_guard_deny(tmp_path: Path, monkeypatch) -> None:
+    service, _, _ = make_service(tmp_path, mode="rules")
+
+    def deny(chat_type, chat_id, *, addressed, purpose, now=None):
+        return BudgetDecision(BudgetAction.DENY, "budget_global_daily", "global_daily")
+
+    monkeypatch.setattr(service.budget_guard, "evaluate", deny)
+    result = service.explain_trigger(
+        make_msg("你好", chat_type=ChatType.PRIVATE, chat_id=2002)
+    )
+
+    assert result["verdict"] == "skip"
+    assert result["reason"] == "budget"
+    assert result["metrics"]["budget_action"] == "deny"
+    assert result["metrics"]["budget_scope"] == "global_daily"
+    budget_check = next(c for c in result["checks"] if c["key"] == "budget")
+    assert budget_check["status"] == "blocked"
+
+
+def test_explain_trigger_private_budget_guard_degrade(tmp_path: Path, monkeypatch) -> None:
+    service, _, _ = make_service(tmp_path, mode="rules")
+    monkeypatch.setattr(
+        service.budget_guard,
+        "evaluate",
+        lambda *a, **k: BudgetDecision(
+            BudgetAction.DEGRADE, "budget_global_daily", "global_daily"
+        ),
+    )
+
+    result = service.explain_trigger(
+        make_msg("你好", chat_type=ChatType.PRIVATE, chat_id=2002)
+    )
+
+    assert result["verdict"] == "model"
+    assert result["reason"] == "private"
+    assert result["metrics"]["budget_action"] == "degrade"
+    budget_check = next(c for c in result["checks"] if c["key"] == "budget")
+    assert budget_check["status"] == "pass"
+
+
+def test_explain_trigger_model_budget_guard_deny(tmp_path: Path, monkeypatch) -> None:
+    service, _, _ = make_service(tmp_path, mode="model", brain=BatchBrain())
+    monkeypatch.setattr(
+        service.budget_guard,
+        "evaluate",
+        lambda *a, **k: BudgetDecision(
+            BudgetAction.DENY, "budget_per_chat", "per_chat"
+        ),
+    )
+
+    result = service.explain_trigger(make_msg("随便聊聊"), now=NOON)
+
+    assert result["verdict"] == "skip"
+    assert result["reason"] == "budget"
+    assert result["metrics"]["budget_action"] == "deny"
+    assert result["metrics"]["budget_scope"] == "per_chat"
+    budget_check = next(c for c in result["checks"] if c["key"] == "budget")
+    assert budget_check["status"] == "blocked"
+
+
+def test_explain_trigger_model_budget_guard_degrade_ambient(
+    tmp_path: Path, monkeypatch
+) -> None:
+    service, _, _ = make_service(tmp_path, mode="model", brain=BatchBrain())
+    monkeypatch.setattr(
+        service.budget_guard,
+        "evaluate",
+        lambda *a, **k: BudgetDecision(
+            BudgetAction.DEGRADE, "budget_global_daily", "global_daily"
+        ),
+    )
+
+    result = service.explain_trigger(make_msg("随便聊聊"), now=NOON)
+
+    assert result["verdict"] == "skip"
+    assert result["reason"] == "budget"
+    assert result["metrics"]["budget_scope"] == "global_daily"
+    budget_check = next(c for c in result["checks"] if c["key"] == "budget")
+    assert budget_check["status"] == "blocked"
+
+
+def test_explain_trigger_model_budget_guard_degrade_hard_still_batch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    service, _, _ = make_service(tmp_path, mode="model", brain=BatchBrain())
+    monkeypatch.setattr(
+        service.budget_guard,
+        "evaluate",
+        lambda *a, **k: BudgetDecision(
+            BudgetAction.DEGRADE, "budget_global_daily", "global_daily"
+        ),
+    )
+
+    result = service.explain_trigger(make_msg("在吗", at=True), now=NOON)
+
+    assert result["verdict"] == "batch"
+    assert result["reason"] == "batch"
+    assert result["metrics"]["budget_action"] == "degrade"
+    budget_check = next(c for c in result["checks"] if c["key"] == "budget")
+    assert budget_check["status"] == "info"
 
 
 def test_explain_trigger_known_command_is_not_executed(tmp_path: Path) -> None:

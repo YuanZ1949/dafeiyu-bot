@@ -394,6 +394,15 @@ class AlertManager:
                 continue
 
             if incident.status == "resolved":
+                if incident.rule.startswith("budget_warning:"):
+                    last_notified = _parse_ts(incident.last_notified_at)
+                    if (
+                        last_notified
+                        and now - last_notified
+                        < self._repeat_seconds(incident.rule)
+                    ):
+                        # 24h 内回落再上升：保留已恢复记录，静默到窗口结束。
+                        continue
                 # 已恢复的规则再次触发：开始一轮新的 pending/firing。
                 self._incidents.pop(fingerprint, None)
                 continue

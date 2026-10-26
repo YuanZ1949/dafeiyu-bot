@@ -113,6 +113,106 @@ def test_explain_lists_three_new_checks(env) -> None:
     assert data["metrics"]["budget_action"] in {"allow", "degrade", "deny"}
 
 
+def test_explain_blames_per_chat_scope(env) -> None:
+    build, store = env
+    router = build(daily_calls=2)
+    usage(store, calls=2)
+
+    data = router.explain(msg())
+    by_key = {check["key"]: check["status"] for check in data["checks"]}
+
+    assert data["metrics"]["budget_scope"] == "per_chat"
+    assert by_key["budget"] == "blocked"
+    assert by_key["budget_global"] == "skipped"
+
+
+def test_explain_blames_global_scope(env) -> None:
+    build, store = env
+    router = build(global_daily_calls=10)
+    usage(store, calls=10)
+
+    data = router.explain(msg())
+    by_key = {check["key"]: check["status"] for check in data["checks"]}
+
+    assert data["metrics"]["budget_scope"] == "global_daily"
+    assert by_key["budget"] == "pass"
+    assert by_key["budget_global"] == "blocked"
+    assert by_key["budget_monthly"] == "skipped"
+
+
+def test_explain_blames_monthly_scope(env) -> None:
+    build, store = env
+    router = build(monthly_calls=10)
+    usage(store, calls=10)
+
+    data = router.explain(msg())
+    by_key = {check["key"]: check["status"] for check in data["checks"]}
+
+    assert data["metrics"]["budget_scope"] == "monthly"
+    assert by_key["budget_global"] == "pass"
+    assert by_key["budget_monthly"] == "blocked"
+    assert by_key["budget_cost"] == "skipped"
+
+
+def test_explain_blames_cost_scope(env) -> None:
+    build, store = env
+    router = build(
+        daily_tokens=10_000_000,
+        monthly_cost_limit=1.0,
+        price_input_per_million=2.0,
+    )
+    usage(store, calls=1, tokens=1_000_000)
+
+    data = router.explain(msg())
+    by_key = {check["key"]: check["status"] for check in data["checks"]}
+
+    assert data["metrics"]["budget_scope"] == "cost"
+    assert by_key["budget_monthly"] == "pass"
+    assert by_key["budget_cost"] == "blocked"
+
+
+def test_explain_storage_error_has_clear_detail(env, monkeypatch) -> None:
+    build, store = env
+    router = build()
+
+    def boom(_date):
+        raise RuntimeError("db broken")
+
+    monkeypatch.setattr(store, "usage_global_today", boom)
+
+    data = router.explain(msg())
+    by_key = {check["key"]: check for check in data["checks"]}
+
+    assert data["metrics"]["budget_action"] == "degrade"
+    assert data["metrics"]["budget_scope"] == "storage_error"
+    assert by_key["budget"]["status"] == "blocked"
+    assert "读库失败" in by_key["budget"]["detail"]
+
+
+def test_explain_per_chat_detail_only_counts_reply_and_ambient(env) -> None:
+    build, store = env
+    router = build()
+    usage(store, purpose="summary", calls=5, tokens=900)
+    usage(store, purpose="reply", calls=1, tokens=100)
+
+    data = router.explain(msg())
+
+    assert data["metrics"]["usage_calls"] == 1
+    assert data["metrics"]["usage_tokens"] == 100
+    assert "1/200" in data["checks"][3]["detail"]
+
+
+def test_explain_disabled_limits_render_unlimited(env) -> None:
+    build, _store = env
+    router = build()
+
+    data = router.explain(msg())
+    by_key = {check["key"]: check for check in data["checks"]}
+
+    assert by_key["budget_global"]["detail"] == "未设上限"
+    assert by_key["budget_monthly"]["detail"] == "未设上限"
+
+
 def test_explain_reports_global_and_monthly_metrics(env) -> None:
     build, store = env
     router = build(

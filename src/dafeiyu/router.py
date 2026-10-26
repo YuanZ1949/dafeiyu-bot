@@ -72,6 +72,23 @@ _CHECK_LABELS = {
 }
 
 
+def _limit_detail(
+    used_calls: int,
+    limit_calls: int,
+    used_tokens: int,
+    limit_tokens: int,
+) -> str:
+    """按已启用的维度展示；全部为 0 时明确说“未设上限”。"""
+    if limit_calls <= 0 and limit_tokens <= 0:
+        return "未设上限"
+    parts: list[str] = []
+    if limit_calls > 0:
+        parts.append(f"{used_calls}/{limit_calls} 次")
+    if limit_tokens > 0:
+        parts.append(f"{used_tokens}/{limit_tokens} token")
+    return "，".join(parts)
+
+
 def _check_detail(
     key: str,
     msg: Message,
@@ -90,19 +107,27 @@ def _check_detail(
     if key == "blacklist":
         return "命中黑名单" if status == "blocked" else "不在黑名单"
     if key == "budget":
-        return (
-            f"{metrics['usage_calls']}/{metrics['daily_calls']} 次，"
-            f"{metrics['usage_tokens']}/{metrics['daily_tokens']} token"
+        if metrics.get("budget_scope") == "storage_error":
+            return "预算检查读库失败，按降级处理"
+        return _limit_detail(
+            metrics["usage_calls"],
+            metrics["daily_calls"],
+            metrics["usage_tokens"],
+            metrics["daily_tokens"],
         )
     if key == "budget_global":
-        return (
-            f"{metrics['global_calls']}/{metrics['global_limit_calls']} 次，"
-            f"{metrics['global_tokens']}/{metrics['global_limit_tokens']} token"
+        return _limit_detail(
+            metrics["global_calls"],
+            metrics["global_limit_calls"],
+            metrics["global_tokens"],
+            metrics["global_limit_tokens"],
         )
     if key == "budget_monthly":
-        return (
-            f"{metrics['monthly_calls']}/{metrics['monthly_limit_calls']} 次，"
-            f"{metrics['monthly_tokens']}/{metrics['monthly_limit_tokens']} token"
+        return _limit_detail(
+            metrics["monthly_calls"],
+            metrics["monthly_limit_calls"],
+            metrics["monthly_tokens"],
+            metrics["monthly_limit_tokens"],
         )
     if key == "budget_cost":
         limit = metrics["monthly_cost_limit"]
@@ -403,6 +428,8 @@ class Router:
         if report is not None:
             metrics.update(
                 {
+                    "usage_calls": report.per_chat["calls"],
+                    "usage_tokens": report.per_chat["tokens"],
                     "global_calls": report.global_daily["calls"],
                     "global_tokens": report.global_daily["tokens"],
                     "monthly_calls": report.monthly["calls"],
@@ -429,6 +456,14 @@ class Router:
             "sample",
         ]
         stop_key = "sample" if decision.reason == "sample_skip" else decision.reason
+        if stop_key == "budget":
+            # 归因到真正触发预算的层级，而不是一律怪每日预算。
+            stop_key = {
+                "per_chat": "budget",
+                "global_daily": "budget_global",
+                "monthly": "budget_monthly",
+                "cost": "budget_cost",
+            }.get(metrics.get("budget_scope", ""), "budget")
         stop_index = keys.index(stop_key) if stop_key in keys else len(keys)
         positive = {"hard", "question", "hot", "sample"}
         checks: list[dict[str, str]] = []

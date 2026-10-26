@@ -291,6 +291,41 @@ async def test_budget_warning_alerts_and_repeats_after_24h(tmp_path: Path) -> No
     assert channel.sent[1][0].rule == "budget_warning:global_daily:0.8"
 
 
+async def test_budget_warning_resolved_rerise_suppressed_for_24h(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot(
+        budget={
+            "warnings": [
+                {"scope": "monthly", "ratio": 0.8, "calls": 8, "limit": 10}
+            ]
+        }
+    )
+
+    await mgr.evaluate(snapshot)
+    assert channel.sent[0][0].rule == "budget_warning:monthly:0.8"
+
+    # 回落 → 两次巡检确认恢复
+    await mgr.evaluate(base_snapshot())
+    await mgr.evaluate(base_snapshot())
+    assert [event for _, event in channel.sent] == ["firing", "resolved"]
+
+    # 24h 内再次超过同一阈值：不得重复告警
+    clock.advance(3600)
+    await mgr.evaluate(snapshot)
+    assert [event for _, event in channel.sent] == ["firing", "resolved"]
+    assert mgr.summary()["firing"] == 0
+
+    # 距上次通知满 24h 后才重新告警
+    clock.advance(86400 - 3600)
+    await mgr.evaluate(snapshot)
+    assert [event for _, event in channel.sent] == ["firing", "resolved", "firing"]
+    assert channel.sent[-1][0].rule == "budget_warning:monthly:0.8"
+
+
 async def test_budget_warning_audit_has_only_calls_and_limit(tmp_path: Path) -> None:
     clock = Clock()
     channel = FakeChannel()
