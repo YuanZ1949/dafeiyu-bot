@@ -134,6 +134,30 @@
   .bar-seg.err { background: var(--bad); }
   .bar-label { color: var(--muted); font-size: 10px; text-align: center; white-space: nowrap; overflow: hidden; }
   .usage-totals { margin-top: 8px; justify-content: space-between; }
+  .budget-panel { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+  .budget-head { margin-bottom: 6px; }
+  .budget-head h3 { margin: 0; font-size: 12px; color: var(--muted); font-weight: 600; }
+  .budget-chat { font-size: 12px; color: var(--muted); margin: 6px 0 2px; }
+  .budget-chat b { color: var(--text); font-weight: 600; }
+  .budget-metric { margin-top: 8px; }
+  .budget-name { font-size: 12px; color: var(--text); }
+  .budget-sub { margin-top: 4px; }
+  .budget-label { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--muted); }
+  .budget-track {
+    margin-top: 3px; height: 6px; border-radius: 999px;
+    background: var(--panel-2); border: 1px solid var(--line); overflow: hidden;
+  }
+  .budget-fill { height: 100%; border-radius: 999px; background: var(--accent); transition: width .2s; }
+  .budget-fill.warn { background: var(--warn); }
+  .budget-fill.hot { background: #fb923c; }
+  .budget-fill.bad { background: var(--bad); }
+  .budget-muted { font-size: 11px; color: var(--muted); }
+  .budget-warnings { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .budget-tag {
+    font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    background: rgba(251, 191, 36, .12); border: 1px solid var(--warn); color: var(--warn);
+  }
+  .budget-tag.bad { background: rgba(248, 113, 113, .12); border-color: var(--bad); color: var(--bad); }
   .session-list { display: grid; gap: 8px; max-height: 360px; overflow: auto; }
   .session-row {
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -366,6 +390,24 @@
       <div>
         <div class="usage-bars" id="usage-bars"></div>
         <div class="row kv usage-totals" id="usage-totals"></div>
+        <div class="budget-panel" id="budget-panel">
+          <div class="row budget-head">
+            <h3>预算</h3>
+            <span class="kv">估算 · 上海时区</span>
+            <span style="flex:1"></span>
+            <select id="budget-chat-type" title="会话类型" style="min-width:100px">
+              <option value="group">群聊</option>
+              <option value="private">私聊</option>
+            </select>
+            <input id="budget-chat-id" type="number" min="1" value="1" style="width:110px" title="会话 ID" />
+            <button class="btn" id="btn-budget-refresh">刷新</button>
+          </div>
+          <div class="budget-chat" id="budget-chat">填写会话 ID 后加载预算</div>
+          <div class="budget-metric" id="budget-global"></div>
+          <div class="budget-metric" id="budget-monthly"></div>
+          <div class="budget-metric" id="budget-cost"></div>
+          <div class="budget-warnings" id="budget-warnings"></div>
+        </div>
       </div>
       <div>
         <h3 style="font-size:12px;color:var(--muted);margin:0 0 6px">回复最多的会话</h3>
@@ -1384,6 +1426,99 @@ async function loadUsage() {
 }
 
 const SEARCH_PAGE = 20;
+
+function budgetRatio(used, limit) {
+  const denominator = Number(limit) || 0;
+  if (denominator <= 0) return null;
+  return (Number(used) || 0) / denominator;
+}
+
+function budgetFillClass(ratio) {
+  const percent = ratio * 100;
+  if (percent >= 100) return "bad";
+  if (percent >= 80) return "hot";
+  if (percent >= 50) return "warn";
+  return "";
+}
+
+function budgetSubRow(name, used, limit, usedText, limitText, emptyText) {
+  const ratio = budgetRatio(used, limit);
+  if (ratio === null) {
+    return `<div class="budget-label"><span>${name}</span><span class="budget-muted">${emptyText}</span></div>`;
+  }
+  const width = Math.min(100, Math.max(0, ratio * 100));
+  const percent = Math.round(ratio * 100);
+  return `<div class="budget-sub">
+    <div class="budget-label"><span>${name}</span><span>${usedText} / ${limitText} · ${percent}%</span></div>
+    <div class="budget-track"><div class="budget-fill ${budgetFillClass(ratio)}" style="width:${width}%"></div></div>
+  </div>`;
+}
+
+function budgetGroup(label, rows) {
+  return `<div class="budget-name">${label}</div>${rows}`;
+}
+
+function renderBudget(data) {
+  const chat = data.per_chat || {};
+  const chatCalls = Number(chat.calls) || 0;
+  const chatTokens = Number(chat.tokens) || 0;
+  const dailyCalls = Number(chat.daily_calls) || 0;
+  const dailyTokens = Number(chat.daily_tokens) || 0;
+  const callsNote = dailyCalls > 0 ? `（上限 ${dailyCalls}）` : "（未启用）";
+  const tokensNote = dailyTokens > 0 ? `（上限 ${fmtTokens(dailyTokens)}）` : "（未启用）";
+  $("budget-chat").innerHTML =
+    `${chatName(data.chat_type, data.chat_id)} · 本会话今日 ` +
+    `调用 <b>${chatCalls}</b> 次${callsNote} · Token <b>${fmtTokens(chatTokens)}</b>${tokensNote}`;
+
+  const global = data.global_daily || {};
+  $("budget-global").innerHTML = budgetGroup(
+    "全局日用量",
+    budgetSubRow("调用", global.calls, global.limit_calls, fmtTokens(global.calls), fmtTokens(global.limit_calls), "未启用") +
+    budgetSubRow("Token", global.tokens, global.limit_tokens, fmtTokens(global.tokens), fmtTokens(global.limit_tokens), "未启用")
+  );
+
+  const monthly = data.monthly || {};
+  $("budget-monthly").innerHTML = budgetGroup(
+    "月度用量",
+    budgetSubRow("调用", monthly.calls, monthly.limit_calls, fmtTokens(monthly.calls), fmtTokens(monthly.limit_calls), "未启用") +
+    budgetSubRow("Token", monthly.tokens, monthly.limit_tokens, fmtTokens(monthly.tokens), fmtTokens(monthly.limit_tokens), "未启用")
+  );
+
+  const cost = data.cost || {};
+  const currency = cost.currency || "CNY";
+  const money = (value) => `${(Number(value) || 0).toFixed(2)} ${currency}`;
+  $("budget-cost").innerHTML = budgetGroup(
+    "月度费用（估算）",
+    budgetSubRow("费用", cost.cost, cost.cost_limit, money(cost.cost), money(cost.cost_limit), "未设上限")
+  );
+
+  const warnings = data.warnings || [];
+  $("budget-warnings").innerHTML = warnings.length
+    ? warnings.map((warning) => {
+        const ratio = Number(warning.ratio) || 0;
+        const cls = ratio >= 1 ? " bad" : "";
+        return `<span class="budget-tag${cls}">${warning.scope} ${Math.round(ratio * 100)}%</span>`;
+      }).join("")
+    : '<span class="budget-muted">暂无预算预警</span>';
+}
+
+async function loadBudget() {
+  const chatType = $("budget-chat-type").value;
+  const rawId = $("budget-chat-id").value.trim();
+  const chatId = Number(rawId);
+  if (!rawId || !Number.isInteger(chatId) || chatId <= 0) {
+    $("budget-chat").textContent = "填写正整数会话 ID 后刷新";
+    return;
+  }
+  try {
+    const data = await api(
+      `/api/budget?chat_type=${encodeURIComponent(chatType)}&chat_id=${chatId}`
+    );
+    renderBudget(data);
+  } catch (err) {
+    $("budget-chat").textContent = `预算读取失败：${err.message}`;
+  }
+}
 let searchOffset = 0;
 let searchTotal = 0;
 const SESSIONS_PAGE = 50;
@@ -2001,6 +2136,9 @@ $("usage-days").addEventListener("change", (ev) => {
   usageDays = Number(ev.target.value) || 7;
   loadUsage();
 });
+$("btn-budget-refresh").addEventListener("click", loadBudget);
+$("budget-chat-type").addEventListener("change", loadBudget);
+$("budget-chat-id").addEventListener("change", loadBudget);
 $("btn-search").addEventListener("click", () => searchMessages(false));
 $("search-q").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter") searchMessages(false);
@@ -2071,6 +2209,7 @@ refreshAlerts();
 refreshBackups();
 loadMemory();
 loadUsage();
+loadBudget();
 loadSessions();
 loadConfig();
 setInterval(refresh, 2000);
@@ -2079,6 +2218,7 @@ setInterval(() => { if (!document.hidden) refreshAlerts(); }, 10000);
 setInterval(() => { if (!document.hidden) refreshBackups(); }, 30000);
 setInterval(loadMemory, 10000);
 setInterval(loadUsage, 30000);
+setInterval(loadBudget, 30000);
 setInterval(loadSessions, 15000);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aiohttp import FormData
+from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from dafeiyu.supervisor.audit import AuditLog
@@ -126,6 +126,7 @@ def make_app(
     *,
     ops: OpsServices | None = None,
     auth: DashboardAuth | None = None,
+    bot_url: str = "http://127.0.0.1:1",
 ):
     supervisor = FakeSupervisor()
     audit = AuditLog(tmp_path / "audit.jsonl")
@@ -143,7 +144,7 @@ def make_app(
         settings=None,
         logs=LogHub(tmp_path / "logs"),
         qr_path=tmp_path / "qrcode.png",
-        bot_url="http://127.0.0.1:1",
+        bot_url=bot_url,
         auth=auth or make_auth(False),
         ops=ops,
     )
@@ -162,7 +163,13 @@ async def test_ops_routes_require_auth(tmp_path: Path) -> None:
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
-        for path in ("/api/health/detail", "/api/backups", "/api/alerts", "/api/audit"):
+        for path in (
+            "/api/health/detail",
+            "/api/backups",
+            "/api/alerts",
+            "/api/audit",
+            "/api/budget?chat_type=group&chat_id=1",
+        ):
             resp = await client.get(path)
             assert resp.status == 401, path
         assert (await client.post("/api/alerts/test")).status == 401
@@ -343,3 +350,90 @@ async def test_login_and_logout_are_audited(tmp_path: Path) -> None:
         assert any(row["result"] == "ok" for row in failures)
     finally:
         await client.close()
+
+
+async def test_budget_proxies_bot_payload_after_login(tmp_path: Path) -> None:
+    payload = {
+        "chat_type": "group",
+        "chat_id": 1,
+        "per_chat": {
+            "calls": 2,
+            "tokens": 900,
+            "daily_calls": 200,
+            "daily_tokens": 300000,
+        },
+        "global_daily": {
+            "calls": 5,
+            "tokens": 1200,
+            "limit_calls": 0,
+            "limit_tokens": 0,
+        },
+        "monthly": {
+            "calls": 9,
+            "tokens": 4000,
+            "limit_calls": 0,
+            "limit_tokens": 0,
+        },
+        "cost": {
+            "cost": 0.01,
+            "cost_limit": 0.0,
+            "currency": "CNY",
+            "estimated": True,
+        },
+        "warnings": [{"scope": "per_chat", "ratio": 0.5, "calls": 100, "limit": 200}],
+    }
+    seen: dict[str, str] = {}
+
+    async def budget_endpoint(request: web.Request) -> web.Response:
+        seen.update(dict(request.query))
+        return web.json_response(payload)
+
+    bot_app = web.Application()
+    bot_app.router.add_get("/api/budget", budget_endpoint)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    try:
+        app, _supervisor, _ops, _audit = make_app(
+            tmp_path, auth=make_auth(True), bot_url=url
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            await login(client)
+            resp = await client.get("/api/budget?chat_type=group&chat_id=1")
+            data = await resp.json()
+        finally:
+            await client.close()
+    finally:
+        await bot_client.close()
+
+    assert resp.status == 200
+    assert seen == {"chat_type": "group", "chat_id": "1"}
+    assert data == payload
+    assert {"per_chat", "global_daily", "monthly", "cost", "warnings"} <= set(data)
+
+
+async def test_budget_passes_bot_error_status(tmp_path: Path) -> None:
+    async def budget_endpoint(_: web.Request) -> web.Response:
+        return web.json_response({"error": "chat_type 必须是 group 或 private"}, status=400)
+
+    bot_app = web.Application()
+    bot_app.router.add_get("/api/budget", budget_endpoint)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    try:
+        app, _supervisor, _ops, _audit = make_app(tmp_path, bot_url=url)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            resp = await client.get("/api/budget?chat_type=channel&chat_id=1")
+            data = await resp.json()
+        finally:
+            await client.close()
+    finally:
+        await bot_client.close()
+
+    assert resp.status == 400
+    assert "chat_type" in data["error"]

@@ -115,6 +115,36 @@ async def test_index_serves_dashboard(tmp_path: Path) -> None:
     assert "redirectToLogin" in text
 
 
+async def test_index_has_budget_card_and_loader(tmp_path: Path) -> None:
+    app, _, _ = make_app(tmp_path)
+    async with running(app) as client:
+        resp = await client.get("/")
+        text = await resp.text()
+
+    assert resp.status == 200
+    for anchor in (
+        "budget-panel",
+        "budget-global",
+        "budget-monthly",
+        "budget-cost",
+        "budget-warnings",
+        "budget-chat-type",
+        "budget-chat-id",
+        "btn-budget-refresh",
+    ):
+        assert f'id="{anchor}"' in text, anchor
+    assert "/api/budget" in text
+    assert "loadBudget" in text
+    assert "budgetFillClass" in text
+    assert "Math.min(100" in text
+    assert '$("btn-budget-refresh").addEventListener("click", loadBudget)' in text
+    assert '$("budget-chat-type").addEventListener("change", loadBudget)' in text
+    assert '$("budget-chat-id").addEventListener("change", loadBudget)' in text
+    assert "估算" in text
+    assert "未启用" in text
+    assert "未设上限" in text
+
+
 async def test_status_reports_processes_and_offline_brain(tmp_path: Path) -> None:
     app, _, _ = make_app(tmp_path)
     async with running(app) as client:

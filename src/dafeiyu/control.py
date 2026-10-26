@@ -441,6 +441,19 @@ class BrainControl:
             "errors": errors,
         }
 
+    def budget_snapshot(self, chat_type: ChatType, chat_id: int) -> dict[str, Any]:
+        """单会话预算报告，字段与健康快照的 budget 一致并附带会话标识。"""
+        report = self.budget_guard.report(chat_type, chat_id)
+        return {
+            "chat_type": chat_type.value,
+            "chat_id": chat_id,
+            "per_chat": dict(report.per_chat),
+            "global_daily": dict(report.global_daily),
+            "monthly": dict(report.monthly),
+            "cost": dict(report.cost),
+            "warnings": [dict(item) for item in report.warnings],
+        }
+
     def explain_trigger(
         self, msg: Message, *, seed: int | None = None
     ) -> dict[str, Any]:
@@ -1214,6 +1227,22 @@ def create_app(
                 {"error": f"读取用量失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def budget(request: web.Request) -> web.Response:
+        chat_type, chat_id, error = _query_scope(request)
+        if error is not None:
+            return error
+        if chat_type is None or chat_id is None:
+            return web.json_response(
+                {"error": "预算查询需要同时指定 chat_type 和 chat_id"}, status=400
+            )
+        try:
+            return web.json_response(control.budget_snapshot(chat_type, chat_id))
+        except Exception as exc:  # noqa: BLE001 - 读库失败不能把控制口打挂
+            log.warning("读取预算失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取预算失败：{exc.__class__.__name__}"}, status=500
+            )
+
     async def search_messages(request: web.Request) -> web.Response:
         query = (request.query.get("q") or "").strip()
         if not query:
@@ -1438,6 +1467,7 @@ def create_app(
         "/api/memory/impressions/{impression_id}", delete_impression
     )
     app.router.add_get("/api/usage", usage)
+    app.router.add_get("/api/budget", budget)
     app.router.add_get("/api/memory/search", search_messages)
     app.router.add_get("/api/memory/export", export_memory)
     app.router.add_get("/api/sessions", sessions)

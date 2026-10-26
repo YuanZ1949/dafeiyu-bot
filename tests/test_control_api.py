@@ -1067,3 +1067,50 @@ def test_dashboard_usage_bars_scale_by_max() -> None:
     assert "Math.max(1, ...series.map" in html
     assert "bar-seg err" in html
     assert "usage-totals" in html
+
+
+async def test_budget_endpoint_returns_report(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    control.store.record_usage(ChatType.GROUP, 100, "reply", 1200, 800)
+
+    async with running(app) as client:
+        resp = await client.get("/api/budget?chat_type=group&chat_id=100")
+        data = await resp.json()
+
+    assert resp.status == 200
+    assert data["chat_type"] == "group"
+    assert data["chat_id"] == 100
+    assert data["per_chat"]["calls"] == 1
+    assert data["per_chat"]["tokens"] == 2000
+    assert {
+        "per_chat",
+        "global_daily",
+        "monthly",
+        "cost",
+        "warnings",
+    } <= set(data)
+    assert data["global_daily"]["calls"] == 1
+    assert data["monthly"]["tokens"] == 2000
+    assert data["cost"]["currency"]
+    assert isinstance(data["warnings"], list)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "chat_type=channel&chat_id=1",
+        "chat_type=group&chat_id=abc",
+        "chat_type=group&chat_id=0",
+        "chat_type=group",
+        "chat_id=1",
+    ],
+)
+async def test_budget_endpoint_rejects_invalid_scope(
+    tmp_path: Path, query: str
+) -> None:
+    _control, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.get(f"/api/budget?{query}")
+        data = await resp.json()
+    assert resp.status == 400
+    assert data["error"]
