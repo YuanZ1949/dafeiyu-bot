@@ -266,6 +266,47 @@
 <main>
   <section class="grid-3" id="processes"></section>
 
+  <section class="card" id="health-card">
+    <div class="row" style="margin-bottom:10px">
+      <h2 style="margin:0">健康总览</h2>
+      <span class="pill st-stopped" id="health-state"><span class="dot"></span>加载中</span>
+      <span class="kv" id="health-hint"></span>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn" id="btn-refresh-health">刷新</button>
+    </div>
+    <div class="grid-3" id="health-processes"></div>
+    <div class="kv cfg-grid" id="health-body"></div>
+  </section>
+
+  <section class="card" id="alerts-card">
+    <div class="row" style="margin-bottom:10px">
+      <h2 style="margin:0">告警事件</h2>
+      <span class="kv" id="alerts-hint">暂无活动事件</span>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn" id="btn-test-alert">测试告警</button>
+      <button class="btn" id="btn-refresh-alerts">刷新</button>
+    </div>
+    <div class="mem-list" id="alerts-list" style="max-height:260px"></div>
+  </section>
+
+  <section class="card" id="backups-card">
+    <div class="row" style="margin-bottom:10px">
+      <h2 style="margin:0">备份与恢复</h2>
+      <span class="kv" id="backups-hint"></span>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn primary" id="btn-backup-now">立即备份</button>
+      <button class="btn" id="btn-refresh-backups">刷新</button>
+    </div>
+    <div class="row" style="margin-bottom:10px">
+      <input id="backup-restore-file" type="file" accept=".db,application/octet-stream" />
+      <input id="backup-restore-confirm" placeholder="输入 RESTORE 确认" style="width:180px" />
+      <button class="btn" id="btn-backup-restore">上传并恢复</button>
+    </div>
+    <div class="mem-list" id="backup-list" style="max-height:220px"></div>
+    <h3 style="font-size:12px;color:var(--muted);margin:12px 0 6px">审计日志</h3>
+    <div class="mem-list" id="audit-list" style="max-height:220px"></div>
+  </section>
+
   <section class="card">
     <h2>大脑模式</h2>
     <div class="mode-list" id="modes"></div>
@@ -805,6 +846,267 @@ async function refresh() {
   } catch (err) {
     $("hub-state").className = "pill st-failed";
     $("hub-state").innerHTML = '<span class="dot"></span>控制台异常';
+  }
+}
+
+function fmtBytes(bytes) {
+  if (bytes === null || bytes === undefined) return "—";
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = value;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size.toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+function healthKv(label, value) {
+  const item = document.createElement("div");
+  const key = document.createElement("b");
+  key.textContent = label;
+  item.append(key, document.createTextNode(`：${value}`));
+  return item;
+}
+
+function renderHealth(data) {
+  const ok = !!data.ok;
+  const stateEl = $("health-state");
+  stateEl.className = `pill st-${ok ? "running" : "failed"}`;
+  stateEl.innerHTML = `<span class="dot"></span>${ok ? "健康" : "异常"}`;
+  $("health-hint").textContent =
+    `${data.generated_at || "—"} · 运行 ${fmtUptime(data.uptime_seconds)} · v${data.version || "—"}`;
+
+  const procBox = $("health-processes");
+  procBox.replaceChildren();
+  Object.entries(data.processes || {}).forEach(([name, proc]) => {
+    const card = document.createElement("div");
+    card.className = "card";
+    const title = document.createElement("div");
+    title.className = "proc-name";
+    title.textContent = PROC_TITLE[name] || name;
+    const st = (proc && proc.status) || "stopped";
+    const pill = document.createElement("span");
+    pill.className = `pill st-${st}`;
+    pill.innerHTML = '<span class="dot"></span>';
+    pill.append(STATUS_TEXT[st] || st);
+    card.append(title, pill);
+    procBox.append(card);
+  });
+
+  const gateway = data.gateway || {};
+  const traffic = data.traffic || {};
+  const scheduler = data.scheduler || {};
+  const quota = data.quota || {};
+  const memory = data.memory || {};
+  const disk = data.disk || {};
+  const backups = data.backups || {};
+  const alerts = data.alerts || {};
+  const rows = [
+    ["QQ 网关", gateway.connected ? "已连接" : "未连接"],
+    ["最后消息", traffic.last_message_at || "—"],
+    ["最后回复", traffic.last_reply_at || "—"],
+    ["待投批次", `${scheduler.pending_chats ?? 0} 排队 / ${scheduler.inflight_chats ?? 0} 投递中`],
+    ["配额", quota.paused_until ? "暂停中" : "正常"],
+    [
+      "磁盘",
+      disk.free_percent === null || disk.free_percent === undefined
+        ? "不可用"
+        : `剩余 ${disk.free_percent}%（${fmtBytes(disk.free_bytes)} 可用）`,
+    ],
+    [
+      "备份",
+      backups.last_error_at
+        ? `失败于 ${backups.last_error_at}`
+        : `${backups.count ?? 0} 份 · 上次成功 ${backups.last_success_at || "—"}`,
+    ],
+    ["消息库", `${memory.message_count ?? 0} 条 · ${fmtBytes(memory.db_bytes)}`],
+    ["告警", `活动 ${alerts.firing ?? 0} · 24h 恢复 ${alerts.resolved_24h ?? 0}`],
+  ];
+  const body = $("health-body");
+  body.replaceChildren();
+  rows.forEach(([label, value]) => body.append(healthKv(label, value)));
+}
+
+async function refreshHealth() {
+  try {
+    renderHealth(await api("/api/health/detail"));
+  } catch (err) {
+    $("health-state").className = "pill st-failed";
+    $("health-state").innerHTML = '<span class="dot"></span>异常';
+    $("health-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+async function refreshAlerts() {
+  try {
+    const data = await api("/api/alerts");
+    const events = data.events || [];
+    const summary = data.summary || {};
+    $("alerts-hint").textContent = events.length
+      ? `活动 ${summary.firing ?? 0} · 24 小时内恢复 ${summary.resolved_24h ?? 0}`
+      : "暂无活动事件";
+    const box = $("alerts-list");
+    box.replaceChildren();
+    if (!events.length) {
+      box.appendChild(memItem("—", "暂无活动事件"));
+      return;
+    }
+    events.forEach((ev) => {
+      const status = ev.status === "resolved" ? "已恢复" : "告警";
+      const meta = `${status} · ${ev.severity || "info"} · ${ev.last_seen_at || ev.first_seen_at || ""}`;
+      box.appendChild(memItem(meta, `${ev.title || ev.rule}\n${ev.detail || ""}`));
+    });
+  } catch (err) {
+    $("alerts-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+async function refreshAudit() {
+  try {
+    const data = await api("/api/audit?limit=30");
+    const box = $("audit-list");
+    box.replaceChildren();
+    const items = data.items || [];
+    if (!items.length) {
+      box.appendChild(memItem("—", "暂无审计记录"));
+      return;
+    }
+    items.forEach((row) => {
+      const meta = `${row.ts || ""} · ${row.action || ""} · ${row.actor || ""}`;
+      const detail = [row.target, row.result, row.ip].filter(Boolean).join(" · ");
+      box.appendChild(memItem(meta, detail || "—"));
+    });
+  } catch (err) {
+    $("audit-list").replaceChildren(memItem("—", `读取失败：${err.message}`));
+  }
+}
+
+async function refreshBackups() {
+  try {
+    const data = await api("/api/backups");
+    const status = data.status || {};
+    const items = data.backups || [];
+    $("backups-hint").textContent =
+      `共 ${items.length} 份 · 上次成功 ${status.last_success_at || "—"}` +
+      (status.last_error_at ? ` · 上次失败 ${status.last_error_at}` : "") +
+      (status.running ? " · 备份中" : "");
+    const box = $("backup-list");
+    box.replaceChildren();
+    if (!items.length) {
+      box.appendChild(memItem("—", "暂无备份"));
+    }
+    items.forEach((backup) => {
+      const meta = `${backup.created_at} · ${backup.reason} · ${fmtBytes(backup.size_bytes)} · schema v${backup.schema_version}`;
+      const item = memItem(meta, backup.filename);
+      const actions = document.createElement("div");
+      actions.className = "mem-actions";
+      const remove = document.createElement("button");
+      remove.className = "btn";
+      remove.textContent = "删除";
+      remove.addEventListener("click", () => deleteBackup(backup.id, backup.filename));
+      actions.append(remove);
+      item.append(actions);
+      box.append(item);
+    });
+  } catch (err) {
+    $("backups-hint").textContent = `读取失败：${err.message}`;
+  }
+  await refreshAudit();
+}
+
+async function createBackup() {
+  const button = $("btn-backup-now");
+  button.disabled = true;
+  try {
+    const data = await api("/api/backups", {
+      method: "POST",
+      body: JSON.stringify({ reason: "manual" }),
+    });
+    toast(`备份完成：${(data.backup && data.backup.filename) || "已生成"}`);
+    await refreshBackups();
+  } catch (err) {
+    toast(`备份失败：${err.message}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function deleteBackup(id, filename) {
+  if (!confirm(`删除备份 ${filename}？此操作不可撤销。`)) return;
+  try {
+    await api(`/api/backups/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      body: JSON.stringify({ confirm: "DELETE" }),
+    });
+    toast("备份已删除");
+    await refreshBackups();
+  } catch (err) {
+    toast(`删除失败：${err.message}`, true);
+  }
+}
+
+async function apiUpload(path, form) {
+  const resp = await fetch(path, { method: "POST", body: form });
+  if (resp.status === 401) {
+    redirectToLogin();
+    throw new Error("登录已过期");
+  }
+  let data = null;
+  try { data = await resp.json(); } catch (_) { data = null; }
+  if (!resp.ok) {
+    const reason = (data && (data.error || data.stage)) || `HTTP ${resp.status}`;
+    throw new Error(reason);
+  }
+  return data;
+}
+
+async function restoreBackup() {
+  const fileInput = $("backup-restore-file");
+  const confirmInput = $("backup-restore-confirm");
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) {
+    toast("先选择一个备份文件", true);
+    return;
+  }
+  if (confirmInput.value.trim() !== "RESTORE") {
+    toast("请输入 RESTORE 确认恢复", true);
+    return;
+  }
+  if (!confirm("恢复期间会停止 Bot 并替换数据库，确定继续吗？")) return;
+
+  const form = new FormData();
+  form.append("file", file);
+  form.append("confirm", "RESTORE");
+  const button = $("btn-backup-restore");
+  button.disabled = true;
+  try {
+    const data = await apiUpload("/api/backups/restore", form);
+    toast(data.result && data.result.ok === false ? "恢复完成但启动失败，见日志" : "恢复完成");
+    fileInput.value = "";
+    confirmInput.value = "";
+    await refreshHealth();
+    await refreshBackups();
+  } catch (err) {
+    toast(`恢复失败：${err.message}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function sendTestAlert() {
+  const button = $("btn-test-alert");
+  button.disabled = true;
+  try {
+    const data = await api("/api/alerts/test", { method: "POST", body: "{}" });
+    toast(`测试告警：成功 ${data.sent ?? 0}，失败 ${data.failed ?? 0}`);
+    await refreshAlerts();
+  } catch (err) {
+    toast(`测试告警失败：${err.message}`, true);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -1674,6 +1976,12 @@ document.addEventListener("click", (ev) => {
 
 $("btn-refresh-models").addEventListener("click", loadModels);
 $("btn-apply-brain").addEventListener("click", applyBrain);
+$("btn-refresh-health").addEventListener("click", refreshHealth);
+$("btn-refresh-alerts").addEventListener("click", refreshAlerts);
+$("btn-test-alert").addEventListener("click", sendTestAlert);
+$("btn-refresh-backups").addEventListener("click", refreshBackups);
+$("btn-backup-now").addEventListener("click", createBackup);
+$("btn-backup-restore").addEventListener("click", restoreBackup);
 $("btn-refresh-memory").addEventListener("click", loadMemory);
 $("btn-summarize").addEventListener("click", triggerSummary);
 $("btn-extract").addEventListener("click", triggerExtract);
@@ -1758,14 +2066,26 @@ document.addEventListener("keydown", (ev) => {
 initTabs();
 loadAuthSession();
 refresh();
+refreshHealth();
+refreshAlerts();
+refreshBackups();
 loadMemory();
 loadUsage();
 loadSessions();
 loadConfig();
 setInterval(refresh, 2000);
+setInterval(() => { if (!document.hidden) refreshHealth(); }, 10000);
+setInterval(() => { if (!document.hidden) refreshAlerts(); }, 10000);
+setInterval(() => { if (!document.hidden) refreshBackups(); }, 30000);
 setInterval(loadMemory, 10000);
 setInterval(loadUsage, 30000);
 setInterval(loadSessions, 15000);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  refreshHealth();
+  refreshAlerts();
+  refreshBackups();
+});
 </script>
 </body>
 </html>

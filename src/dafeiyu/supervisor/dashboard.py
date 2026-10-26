@@ -4,6 +4,9 @@ import asyncio
 import html as html_lib
 import json
 import logging
+import os
+import tempfile
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
@@ -13,9 +16,12 @@ from aiohttp import web
 
 from ..config import Settings
 from .auth import COOKIE_NAME, DashboardAuth, safe_next_path
+from .backup import REASONS, BackupError
 from .logs import SOURCES, LogHub
 from .manager import Supervisor
 from .napcat_login import NapCatLogin
+from .ops import OpsServices
+from .restore import RestoreError
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +31,8 @@ BOT_SWITCH_TIMEOUT = 20.0
 # 删远端 session 要等 OpenCode 收尾，换脑/导出/整库备份更慢，不能沿用 2 秒。
 BOT_DELETE_TIMEOUT = 20.0
 BOT_BACKUP_TIMEOUT = 30.0
+MAX_AUDIT_LIMIT = 200
+DEFAULT_MAX_UPLOAD_MB = 512
 DASHBOARD_DIR = Path(__file__).with_name("dashboard")
 
 
@@ -93,6 +101,7 @@ def create_app(
     on_shutdown: Callable[[], Awaitable[None]] | None = None,
     napcat_login: NapCatLogin | None = None,
     auth: DashboardAuth | None = None,
+    ops: OpsServices | None = None,
 ) -> web.Application:
     app = web.Application(middlewares=[_same_origin, _auth_middleware])
     auth_config = auth or _auth_from_settings(settings)
@@ -103,6 +112,35 @@ def create_app(
         closing.set()
 
     app.on_shutdown.append(_mark_closing)
+
+    def audit_actor(request: web.Request, username: str = "") -> str:
+        user = username or (
+            auth_config.username if auth_config.enabled else "local"
+        )
+        return f"dashboard:{user}@{request.remote or 'unknown'}"
+
+    def write_audit(
+        request: web.Request,
+        action: str,
+        *,
+        actor: str = "",
+        target: str = "",
+        result: str = "ok",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        if ops is None or ops.audit is None:
+            return
+        ops.audit.write(
+            action,
+            actor=actor or audit_actor(request),
+            target=target,
+            result=result,
+            detail=detail,
+            ip=request.remote or "",
+        )
+
+    def ops_unavailable() -> web.Response:
+        return web.json_response({"error": "运维服务未启用"}, status=503)
 
     # 复用同一个 aiohttp 会话：httpx 会为每个 Client 构 SSLContext，
     # 在 Windows 上会阻塞事件循环数秒，绝不能每次请求新建。
@@ -196,6 +234,12 @@ def create_app(
             return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
         ip = request.remote or "unknown"
         if auth_config.is_rate_limited(ip):
+            write_audit(
+                request,
+                "auth.login",
+                result="error",
+                detail={"reason": "rate_limited"},
+            )
             return web.json_response(
                 {"error": "尝试次数过多，请 5 分钟后再试"}, status=429
             )
@@ -203,8 +247,21 @@ def create_app(
         password = str(payload.get("password") or "")
         if not auth_config.verify_credentials(username, password):
             auth_config.record_failure(ip)
+            write_audit(
+                request,
+                "auth.login",
+                actor=audit_actor(request, username or "anonymous"),
+                result="error",
+                detail={"reason": "bad_credentials", "username": username[:64]},
+            )
             return web.json_response({"error": "用户名或密码错误"}, status=401)
         auth_config.clear_failures(ip)
+        write_audit(
+            request,
+            "auth.login",
+            actor=audit_actor(request, username),
+            target=username,
+        )
         response = web.Response(
             status=204, headers={"Cache-Control": "no-store"}
         )
@@ -219,7 +276,8 @@ def create_app(
         )
         return response
 
-    async def logout(_: web.Request) -> web.Response:
+    async def logout(request: web.Request) -> web.Response:
+        write_audit(request, "auth.logout")
         response = web.Response(
             status=204, headers={"Cache-Control": "no-store"}
         )
@@ -244,6 +302,205 @@ def create_app(
 
     async def health(_: web.Request) -> web.Response:
         return web.json_response({"ok": True})
+
+    async def health_detail(_: web.Request) -> web.Response:
+        if ops is None:
+            return ops_unavailable()
+        try:
+            snapshot = await ops.health.snapshot()
+        except Exception as exc:  # noqa: BLE001 - 探活失败回错误，不打挂 dashboard
+            log.warning("读取健康快照失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取健康快照失败：{exc.__class__.__name__}"}, status=500
+            )
+        if not isinstance(snapshot, dict):
+            snapshot = {"ok": False, "error": "健康快照格式异常"}
+        alerts = (
+            ops.alerts.summary()
+            if ops.alerts is not None
+            else {"firing": 0, "resolved_24h": 0}
+        )
+        return web.json_response({**snapshot, "alerts": alerts})
+
+    async def alerts(request: web.Request) -> web.Response:
+        if ops is None or ops.alerts is None:
+            return ops_unavailable()
+        try:
+            return web.json_response(
+                {
+                    "events": ops.alerts.events(),
+                    "summary": ops.alerts.summary(),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取告警失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取告警失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def alerts_test(_: web.Request) -> web.Response:
+        if ops is None or ops.alerts is None:
+            return ops_unavailable()
+        try:
+            result = await ops.alerts.send_test()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("测试告警失败：%s", exc)
+            return web.json_response(
+                {"error": f"测试告警失败：{exc.__class__.__name__}"}, status=500
+            )
+        return web.json_response({"ok": True, **result})
+
+    async def backups(request: web.Request) -> web.Response:
+        if ops is None or ops.backups is None:
+            return ops_unavailable()
+        if request.method == "GET":
+            try:
+                items = [asdict(item) for item in ops.backups.list()]
+                return web.json_response(
+                    {"backups": items, "status": ops.backups.status()}
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("读取备份列表失败：%s", exc)
+                return web.json_response(
+                    {"error": f"读取备份失败：{exc.__class__.__name__}"}, status=500
+                )
+
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        reason = str(payload.get("reason") or "manual")
+        if reason not in REASONS:
+            return web.json_response(
+                {"error": f"reason 只能是 {'、'.join(REASONS)}"}, status=400
+            )
+        try:
+            manifest = await ops.backups.create(reason)
+        except BackupError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("创建备份失败：%s", exc)
+            return web.json_response(
+                {"error": f"创建备份失败：{exc.__class__.__name__}"}, status=500
+            )
+        write_audit(
+            request,
+            "backup.create",
+            target=manifest.id,
+            detail={"reason": manifest.reason, "filename": manifest.filename},
+        )
+        return web.json_response({"ok": True, "backup": asdict(manifest)})
+
+    async def delete_backup(request: web.Request) -> web.Response:
+        if ops is None or ops.backups is None:
+            return ops_unavailable()
+        payload = await _json_body(request)
+        if payload is not None:
+            confirm = str(payload.get("confirm") or "")
+            if confirm and confirm != "DELETE":
+                return web.json_response(
+                    {"error": "confirm 必须是 DELETE"}, status=400
+                )
+        backup_id = request.match_info.get("backup_id", "")
+        try:
+            ops.backups.delete(backup_id)
+        except BackupError as exc:
+            message = str(exc)
+            status = 404 if "不存在" in message else 400
+            return web.json_response({"error": message}, status=status)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("删除备份失败：%s", exc)
+            return web.json_response(
+                {"error": f"删除备份失败：{exc.__class__.__name__}"}, status=500
+            )
+        write_audit(request, "backup.delete", target=backup_id)
+        return web.json_response({"ok": True, "deleted": backup_id})
+
+    async def restore_backup(request: web.Request) -> web.Response:
+        if ops is None or ops.restore is None:
+            return ops_unavailable()
+        max_upload_mb = (
+            settings.backup.max_upload_mb if settings is not None else DEFAULT_MAX_UPLOAD_MB
+        )
+        max_bytes = max(1, int(max_upload_mb)) * 1024 * 1024
+        upload_path: Path | None = None
+        confirm = ""
+        too_large = False
+        try:
+            try:
+                reader = await request.multipart()
+            except Exception:  # noqa: BLE001 - 非 multipart 请求按 400 处理
+                return web.json_response({"error": "请求必须是 multipart 表单"}, status=400)
+            async for part in reader:
+                if part.name == "file":
+                    fd, tmp = tempfile.mkstemp(prefix="dafeiyu-restore-", suffix=".db")
+                    upload_path = Path(tmp)
+                    with os.fdopen(fd, "wb") as fh:
+                        while True:
+                            chunk = await part.read_chunk()
+                            if not chunk:
+                                break
+                            if fh.tell() + len(chunk) > max_bytes:
+                                too_large = True
+                                break
+                            fh.write(chunk)
+                    if too_large:
+                        break
+                elif part.name == "confirm":
+                    confirm = (await part.text()).strip()
+        finally:
+            if too_large and upload_path is not None:
+                upload_path.unlink(missing_ok=True)
+                upload_path = None
+        if too_large:
+            return web.json_response(
+                {"error": f"上传文件不能超过 {max_upload_mb} MB"}, status=413
+            )
+        if upload_path is None:
+            return web.json_response({"error": "缺少备份文件"}, status=400)
+        if confirm != "RESTORE":
+            upload_path.unlink(missing_ok=True)
+            return web.json_response(
+                {"error": "confirm 必须是 RESTORE"}, status=400
+            )
+        try:
+            result = await ops.restore.restore(
+                upload_path,
+                actor=audit_actor(request),
+                ip=request.remote or "",
+                request_id=request.headers.get("X-Request-Id", ""),
+            )
+        except RestoreError as exc:
+            return web.json_response(
+                {"error": str(exc), "stage": exc.stage}, status=exc.status
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("恢复数据库失败：%s", exc)
+            return web.json_response(
+                {"error": f"恢复失败：{exc.__class__.__name__}"}, status=500
+            )
+        finally:
+            upload_path.unlink(missing_ok=True)
+        return web.json_response({"ok": True, "result": result})
+
+    async def audit_log(request: web.Request) -> web.Response:
+        if ops is None or ops.audit is None:
+            return ops_unavailable()
+        try:
+            limit = max(
+                1, min(MAX_AUDIT_LIMIT, int(request.query.get("limit", "50")))
+            )
+        except ValueError:
+            return web.json_response({"error": "limit 必须是整数"}, status=400)
+        before = (request.query.get("before") or "").strip() or None
+        try:
+            return web.json_response(
+                {"items": ops.audit.query(limit=limit, before=before)}
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取审计失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取审计失败：{exc.__class__.__name__}"}, status=500
+            )
 
     async def status(_: web.Request) -> web.Response:
         brain_task = asyncio.create_task(bot_call("GET", "/api/brain"))
@@ -525,11 +782,23 @@ def create_app(
         }
         if errors:
             result["errors"] = errors
+        for name in names:
+            failure = next(
+                (item for item in errors if item.startswith(f"{name}:")), ""
+            )
+            write_audit(
+                request,
+                f"process.{action}",
+                target=name,
+                result="error" if failure else "ok",
+                detail={"error": failure} if failure else None,
+            )
         return web.json_response(result, status=207 if errors else 200)
 
-    async def shutdown(_: web.Request) -> web.Response:
+    async def shutdown(request: web.Request) -> web.Response:
         if on_shutdown is None:
             return web.json_response({"error": "不支持退出"}, status=400)
+        write_audit(request, "shutdown", target="all")
         loop = asyncio.get_running_loop()
         loop.call_later(0.3, lambda: asyncio.create_task(on_shutdown()))
         return web.json_response({"ok": True, "message": "正在关闭所有进程"})
@@ -541,6 +810,14 @@ def create_app(
     app.router.add_post("/api/auth/logout", logout)
     app.router.add_get("/api/auth/session", session_info)
     app.router.add_get("/api/health", health)
+    app.router.add_get("/api/health/detail", health_detail)
+    app.router.add_get("/api/alerts", alerts)
+    app.router.add_post("/api/alerts/test", alerts_test)
+    app.router.add_get("/api/backups", backups)
+    app.router.add_post("/api/backups", backups)
+    app.router.add_post("/api/backups/restore", restore_backup)
+    app.router.add_delete("/api/backups/{backup_id}", delete_backup)
+    app.router.add_get("/api/audit", audit_log)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/logs/stream", logs_stream)
     app.router.add_get("/api/logs/download", logs_download)
@@ -613,9 +890,18 @@ async def serve(
     token: str = "",
     on_shutdown: Callable[[], Awaitable[None]] | None = None,
     napcat_login: NapCatLogin | None = None,
+    ops: OpsServices | None = None,
 ) -> web.AppRunner:
     app = create_app(
-        supervisor, settings, logs, qr_path, bot_url, token, on_shutdown, napcat_login
+        supervisor,
+        settings,
+        logs,
+        qr_path,
+        bot_url,
+        token,
+        on_shutdown,
+        napcat_login,
+        ops=ops,
     )
     runner = web.AppRunner(app, access_log=None, shutdown_timeout=5.0)
     await runner.setup()
