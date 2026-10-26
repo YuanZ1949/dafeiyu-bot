@@ -465,7 +465,7 @@ git commit -m "feat: redact secrets in logs and audit detail"
 
 - [ ] **Step 1: 写失败测试**
 
-`tests/test_control_token.py`：用 `tmp_path`；monkeypatch `subprocess.run` 记录 Windows icacls 参数，断言 `/inheritance:r` 与 `:(R,W)`；POSIX 分支 monkeypatch `os.chmod` 断言 0o600；写盘失败（monkeypatch `Path.write_text` 抛 OSError）时 `rotate()` 抛错且 `value` 仍为旧值；`set(old)` 可恢复。
+`tests/test_control_token.py`：用 `tmp_path`；monkeypatch `subprocess.run` 记录 Windows icacls 参数，断言 `/inheritance:r` 与 `:(R,W)`；POSIX 分支 monkeypatch `os.chmod` 断言 0o600；预置旧 token 文件后 `load_or_create()` 仍触发 ACL 加固且内容不变；写盘失败（monkeypatch `Path.write_text` 抛 OSError）时 `rotate()` 抛错且 `value` 仍为旧值；`set(old)` 可恢复。
 
 `tests/test_supervisor_dashboard.py` 增加：未登录 POST rotate → 401；登录但 confirm 错 → 400 且 token 不变；成功时 `supervisor.specs["bot"].env["DAFEIYU_CONTROL_TOKEN"] == new`、`ops.health.token == new`、`supervisor.restarted == ["bot"]`、audit 有 `token.rotate`；用本地 aiohttp 假 bot 校验请求头：轮换后新 token 返回 200、旧 token 返回 401；restart 抛错 → 500、token 恢复旧值、bot 只调用一次 restart、旧 token 仍可用；HTML 含三个轮换锚点且按钮绑定 POST。
 
@@ -480,7 +480,7 @@ Expected: FAIL，模块不存在 / 路由 404。
 
 `main.py`：`holder = ControlToken(TOKEN_PATH); holder.load_or_create()`；`build_specs(settings, holder.value)`；`serve(..., token=lambda: holder.value, control_token=holder)`；`build_ops` 仍传初始 token 给 HealthMonitor。
 
-`dashboard.py`：`token_provider = token if callable(token) else (lambda: token)`；`bot_session` 不再设默认 header，`bot_call/bot_raw` 每次请求加 `headers={"X-Control-Token": token_provider()}`；`serve` 透传 `control_token`。rotate handler 校验 confirm → `old=holder.value; new=holder.rotate()` → 更新 `supervisor.specs["bot"].env` 与 `ops.health.token` → `await supervisor.restart("bot")`；异常时 `holder.set(old)`、恢复 env/health、写失败审计、500。成功写 `token.rotate`。HTML 在 backups 卡后追加“安全”小卡：说明轮换会重启 bot、输入 `ROTATE` 的确认框与按钮，成功后显示 `已轮换，bot 已重启`；失败显示返回错误。
+`dashboard.py`：`token_provider = token if callable(token) else (lambda: token)`；`bot_session` 不再设默认 header，`bot_call/bot_raw` 每次请求加 `headers={"X-Control-Token": token_provider()}`；`serve` 透传 `control_token`。rotate handler 校验 confirm → `old=holder.value; new=holder.rotate()` → 更新 `supervisor.specs["bot"].env` 与 `ops.health.token` → `await supervisor.restart("bot")`；异常时 `holder.set(old)`、恢复 env/health、`log.critical("control token 轮换失败：%s", exc)`、写失败审计、500。成功写 `token.rotate`。HTML 在 backups 卡后追加“安全”小卡：说明轮换会重启 bot、输入 `ROTATE` 的确认框与按钮，成功后显示 `已轮换，bot 已重启`；失败显示返回错误。
 
 - [ ] **Step 4: 运行确认通过**
 
@@ -500,7 +500,8 @@ git commit -m "feat: add control token acl and rotation"
 
 **Files:**
 - Create: `src/dafeiyu/commands.py`
-- Modify: `src/dafeiyu/service.py:43-44`（删旧集合）、`service.py:192-194`（命令分支）、`service.py:280-302`（explain）、`service.py:965-998`（`_run_command`）
+- Modify: `src/dafeiyu/service.py:43-44`（删旧集合）、`service.py:90-113`（`__init__` 注入 audit）、`service.py:192-194`（命令分支）、`service.py:280-302`（explain）、`service.py:965-998`（`_run_command`）
+- Modify: `src/dafeiyu/__main__.py:194`（构造 `AuditLog` 并传给 Service）
 - Create: `tests/test_commands.py`
 - Test: `tests/test_service.py`
 
@@ -509,6 +510,7 @@ git commit -m "feat: add control token acl and rotation"
   - `@dataclass(frozen=True) class CommandSpec: name:str; aliases:frozenset[str]; scopes:frozenset[ChatType]; admin_only:bool; cooldown_seconds:int; help:str`
   - `class CommandRegistry: match(self, text:str) -> tuple[CommandSpec,str]|None; is_known(self, name:str, chat_type:ChatType) -> bool; help_text(self, chat_type:ChatType, *, is_admin:bool) -> str`
   - `Service.commands: CommandRegistry`；`Service._command_clock: Callable[[], float]`（默认 `time.monotonic`）。
+  - `Service.__init__(..., audit: AuditLog | None = None)`；`__main__.py` 用 `AuditLog(Path(settings.audit.path), max_bytes=settings.audit.max_bytes, backups=settings.audit.backups)` 构造并传入，写失败由 AuditLog 自身吞掉。
 - 命令表：`/help`（帮助，双端，5s）、`/stats`（统计，群 60s / 私 5s）、`/status`（状态，admin，30s）、`/budget`（预算，admin，30s）、`/闭嘴|shutup`、`/醒来|wake`、`/forget`。
 
 - [ ] **Step 1: 写失败测试**
@@ -531,7 +533,7 @@ def test_help_text_hides_admin_commands_for_non_admin(registry):
     assert "/budget" in registry.help_text(ChatType.PRIVATE, is_admin=True)
 ```
 
-`tests/test_service.py` 增加：群内非管理员 `/budget` 不回复、返回 True；管理员 `/budget` 回复含“全局”与“月度”；`/stats` 群内回复不含“元/¥”；同一命令 1 秒内第二次被冷却拦截；私聊 `/status` 非管理员回复“这个命令只有管理员能用。”；`/help` 在群/私聊均回复。
+`tests/test_service.py` 增加：群内非管理员 `/budget` 不回复、返回 True；管理员 `/budget` 回复含“全局”与“月度”且传入的假 audit 收到 `command.admin` target `/budget`；`/stats` 群内回复不含“元/¥”；同一命令 1 秒内第二次被冷却拦截；私聊 `/status` 非管理员回复“这个命令只有管理员能用。”；`/help` 在群/私聊均回复。
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -549,7 +551,8 @@ Expected: FAIL，模块不存在 / 命令未识别。
 - `/stats`：`usage_global_today` 与当前 chat 的 `usage_between`，剩余量 = limit - used（0 显示“未启用”）；群内不显示费用。
 - `/status`：gateway connected、scheduler pending、quota、`budget_guard.evaluate(...).action`、uptime 秒；不输出模型名。
 - `/budget`：`budget_guard.report(msg.chat_type, msg.chat_id)`，输出 per-chat/global/monthly/cost 与 warnings。
-- 命令执行成功时写审计 `command.admin`（仅 admin_only 命令），target `/<name>`，detail `{chat_type,chat_id,user_id}`。
+- 命令执行成功时写审计 `command.admin`（仅 admin_only 命令且 `self.audit` 存在），target `/<name>`，detail `{chat_type,chat_id,user_id}`。
+- `__main__.py` 构造 `AuditLog` 并传给 Service；bot 与 supervisor 追加写同一 JSONL，写入失败只 warning。
 
 `explain` 的 command 分支改用 `self.commands.is_known(command.name, msg.chat_type)`，并保留“/help 只识别不执行”。
 
@@ -561,7 +564,7 @@ Expected: PASS。
 - [ ] **Step 5: 提交**
 
 ```bash
-git add src/dafeiyu/commands.py src/dafeiyu/service.py tests/test_commands.py tests/test_service.py
+git add src/dafeiyu/commands.py src/dafeiyu/service.py src/dafeiyu/__main__.py tests/test_commands.py tests/test_service.py
 git commit -m "feat: add command registry and admin commands"
 ```
 
