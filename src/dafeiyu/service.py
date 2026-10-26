@@ -1140,7 +1140,8 @@ class Service:
         else:
             return False
 
-        if spec.admin_only:
+        # 私聊非管理员 /forget 是显式放行，不应被记成管理员命令。
+        if spec.admin_only and is_admin:
             self._write_command_audit(msg, spec)
         return True
 

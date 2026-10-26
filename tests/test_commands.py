@@ -4,6 +4,7 @@ import pytest
 
 from dafeiyu.commands import CommandRegistry
 from dafeiyu.models import ChatType
+from dafeiyu.service import SHUTUP_MINUTES
 
 
 @pytest.fixture
@@ -108,3 +109,23 @@ def test_help_text_private_admin_lists_budget_and_forget(
     assert "/budget" in text
     assert "/status" in text
     assert "/forget" in text
+
+
+def test_help_text_shutup_matches_service_duration(
+    registry: CommandRegistry,
+) -> None:
+    text = registry.help_text(ChatType.GROUP, is_admin=True)
+    assert f"静音 {SHUTUP_MINUTES} 分钟" in text
+
+
+def test_help_text_private_admin_puts_forget_in_available_line(
+    registry: CommandRegistry,
+) -> None:
+    text = registry.help_text(ChatType.PRIVATE, is_admin=True)
+    lines = text.splitlines()
+    available = next(line for line in lines if line.startswith("可用命令："))
+    admin = next(line for line in lines if line.startswith("管理员："))
+    assert "/forget" in available
+    assert "/forget" not in admin
+    assert "/budget" in admin
+    assert "/status" in admin

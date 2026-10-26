@@ -66,7 +66,7 @@ _COMMANDS: tuple[CommandSpec, ...] = (
         scopes=frozenset({_GROUP}),
         admin_only=True,
         cooldown_seconds=0,
-        help="静音 30 分钟",
+        help="静音 60 分钟",
     ),
     CommandSpec(
         name="wake",
@@ -125,11 +125,11 @@ class CommandRegistry:
                 continue
             if not spec.admin_only:
                 available.append(spec)
+            elif spec.name == "forget" and chat_type is ChatType.PRIVATE:
+                # 私聊 /forget 对所有人生效（含管理员），放在可用命令里。
+                available.append(spec)
             elif is_admin:
                 admin_commands.append(spec)
-            elif spec.name == "forget" and chat_type is ChatType.PRIVATE:
-                # 私聊 /forget 对所有人生效，帮助里必须能看到。
-                available.append(spec)
 
         lines = ["可用命令：" + self._format(available)]
         if admin_commands:

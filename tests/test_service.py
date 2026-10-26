@@ -544,6 +544,46 @@ async def test_stats_cooldown_is_five_seconds_in_private(tmp_path):
     assert len(adapter.sent) == 2
 
 
+async def test_help_cooldown_is_isolated_by_group_chat_id(tmp_path):
+    service, _, _, adapter, _ = build(tmp_path)
+    service._command_clock = lambda: 4000.0
+
+    await service.handle(
+        make_msg(user_id=99, chat_id=1001, content="/help", message_id="ci-g1")
+    )
+    await service.handle(
+        make_msg(user_id=99, chat_id=1002, content="/help", message_id="ci-g2")
+    )
+
+    assert len(adapter.sent) == 2
+
+
+async def test_help_cooldown_is_isolated_by_private_user_id(tmp_path):
+    service, _, _, adapter, _ = build(tmp_path)
+    service._command_clock = lambda: 5000.0
+
+    for user_id, message_id in ((99, "ci-p1"), (98, "ci-p2")):
+        await service.handle(
+            make_msg(
+                chat_type=ChatType.PRIVATE,
+                chat_id=user_id,
+                user_id=user_id,
+                content="/help",
+                message_id=message_id,
+            )
+        )
+
+    assert len(adapter.sent) == 2
+
+
+async def test_zero_cooldown_command_does_not_record_state(tmp_path):
+    service, _, _, _, _ = build(tmp_path)
+
+    await service.handle(make_msg(content="/闭嘴", message_id="zc1"))
+
+    assert service._command_last == {}
+
+
 async def test_status_private_non_admin_replies_with_fixed_hint(tmp_path):
     service, _, brain, adapter, _ = build(tmp_path)
 
@@ -578,6 +618,23 @@ async def test_status_reports_live_state_without_model_name(tmp_path):
     assert "预算" in text
     assert "秒" in text
     assert "deepseek-chat" not in text
+
+
+async def test_status_reads_scheduler_attribute_and_callable_counts(tmp_path):
+    class FakeScheduler:
+        pending_count = 2
+
+        def inflight_count(self) -> int:
+            return 3
+
+    service, _, _, adapter, _ = build(tmp_path)
+    service.scheduler = FakeScheduler()
+
+    await service.handle(make_msg(content="/status", message_id="stt2"))
+
+    text = adapter.sent[0][2]
+    assert "待投 2" in text
+    assert "进行中 3" in text
 
 
 async def test_help_replies_in_group_and_private_with_scope_filter(tmp_path):
@@ -615,8 +672,9 @@ async def test_help_is_not_audited_even_for_admin(tmp_path):
     assert audit.events == []
 
 
-async def test_private_forget_allows_non_admin(tmp_path):
-    service, store, _, adapter, _ = build(tmp_path)
+async def test_private_forget_allows_non_admin_without_admin_audit(tmp_path):
+    audit = FakeAudit()
+    service, store, _, adapter, _ = build(tmp_path, audit=audit)
     store.add_message(
         make_msg(
             chat_type=ChatType.PRIVATE,
@@ -639,6 +697,43 @@ async def test_private_forget_allows_non_admin(tmp_path):
 
     assert store.count_messages(ChatType.PRIVATE, 99) == 0
     assert adapter.sent[-1] == (ChatType.PRIVATE, 99, FORGET_REPLY)
+    assert audit.events == []
+
+
+async def test_private_admin_forget_writes_admin_audit(tmp_path):
+    audit = FakeAudit()
+    service, store, _, adapter, _ = build(tmp_path, audit=audit)
+    store.add_message(
+        make_msg(
+            chat_type=ChatType.PRIVATE,
+            chat_id=2002,
+            user_id=2002,
+            content="记住我",
+            message_id="pfa0",
+        )
+    )
+
+    await service.handle(
+        make_msg(
+            chat_type=ChatType.PRIVATE,
+            chat_id=2002,
+            user_id=2002,
+            content="/forget",
+            message_id="pfa1",
+        )
+    )
+
+    assert store.count_messages(ChatType.PRIVATE, 2002) == 0
+    assert adapter.sent[-1] == (ChatType.PRIVATE, 2002, FORGET_REPLY)
+    assert len(audit.events) == 1
+    action, kwargs = audit.events[0]
+    assert action == "command.admin"
+    assert kwargs["target"] == "/forget"
+    assert kwargs["detail"] == {
+        "chat_type": "private",
+        "chat_id": 2002,
+        "user_id": 2002,
+    }
 
 
 async def test_unknown_and_wrong_scope_slash_fall_through_to_model(tmp_path):
