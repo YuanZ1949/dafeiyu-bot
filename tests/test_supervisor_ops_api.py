@@ -190,10 +190,17 @@ async def test_ops_routes_503_without_services(tmp_path: Path) -> None:
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
-        for path in ("/api/health/detail", "/api/backups", "/api/alerts", "/api/audit"):
+        for path in ("/api/health/detail", "/api/backups", "/api/audit"):
             resp = await client.get(path)
             assert resp.status == 503, path
             assert (await resp.json())["error"] == "运维服务未启用"
+        # /api/alerts 特例：未启用时回 200 + enabled:false，避免面板轮询刷 console 网络错误
+        resp = await client.get("/api/alerts")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["enabled"] is False
+        assert data["events"] == []
+        assert data["summary"] == {"firing": 0, "resolved_24h": 0}
     finally:
         await client.close()
 
@@ -221,6 +228,7 @@ async def test_alerts_endpoints(tmp_path: Path) -> None:
         listed = await client.get("/api/alerts")
         assert listed.status == 200
         data = await listed.json()
+        assert data["enabled"] is True
         assert data["events"][0]["rule"] == "bot_down"
         assert data["summary"]["firing"] == 1
 

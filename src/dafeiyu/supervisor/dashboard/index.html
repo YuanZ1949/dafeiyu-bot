@@ -16,27 +16,67 @@
     --warn: #fbbf24;
     --bad: #f87171;
     --accent: #60a5fa;
+    /* 主题色 token：这些色值只允许在 :root 出现，其它地方一律引用变量 */
+    --accent-hot: #1d4ed8;
+    --danger-deep: #7f1d1d;
+    --stopped-deep: #4b5563;
+    --surface-deep: #0b0d12;
+    --toast-deep: #1f2937;
+    --mode-active: #1b2436;
+    --bubble-ok: #16221c;
+    --bubble-warn: #2a2413;
+    --hot: #fb923c;
+    --tag-warn-bg: rgba(251, 191, 36, .12);
+    --tag-bad-bg: rgba(248, 113, 113, .12);
+    --overlay: rgba(0, 0, 0, .55);
+    --drawer-shadow: rgba(0, 0, 0, .45);
+    /* 字号阶梯：16 / 14 / 12 / 11 四级 */
+    --fs-lg: 16px;
+    --fs-md: 14px;
+    --fs-sm: 12px;
+    --fs-xs: 11px;
+    /* 列表高度 token，消掉 max-height 魔法数字 */
+    --list-h-sm: 110px;
+    --list-h-md: 220px;
+    --list-h-lg: 260px;
+    --list-h-xl: 340px;
+    --list-h-mem: 300px;
+    --list-h-sessions: 360px;
+    /* 固定宽度 token */
+    --w-id: 110px;
+    --w-sid: 130px;
+    --w-user: 140px;
+    --w-token: 180px;
+    --w-confirm: 190px;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body {
     margin: 0;
     background: var(--bg);
     color: var(--text);
-    font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    font: var(--fs-md)/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   }
   header {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 12px;
-    padding: 14px 20px;
+    padding: 16px 20px;
     border-bottom: 1px solid var(--line);
     background: var(--panel);
     position: sticky;
     top: 0;
     z-index: 5;
   }
-  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
-  header .spacer { flex: 1; }
+  header h1 { font-size: var(--fs-lg); margin: 0; font-weight: 600; }
+  .spacer { flex: 1; }
+  .global-banner {
+    padding: 10px 20px;
+    background: var(--danger-deep); color: var(--text);
+    border-bottom: 1px solid var(--line);
+    font-size: var(--fs-sm);
+  }
   .btn {
     background: var(--panel-2);
     color: var(--text);
@@ -44,25 +84,50 @@
     border-radius: 6px;
     padding: 6px 12px;
     cursor: pointer;
-    font-size: 13px;
+    font-size: var(--fs-md);
   }
   .btn:hover { border-color: var(--accent); }
-  .btn.primary { background: #1d4ed8; border-color: #1d4ed8; }
-  .btn.danger { background: #7f1d1d; border-color: #7f1d1d; }
-  .btn:disabled { opacity: .45; cursor: not-allowed; }
-  main { padding: 16px 20px 40px; display: grid; gap: 16px; max-width: 1400px; }
+  .btn.primary { background: var(--accent-hot); border-color: var(--accent-hot); }
+  .btn.danger { background: var(--danger-deep); border-color: var(--danger-deep); }
+  .btn:disabled { opacity: .7; cursor: not-allowed; }
+.btn[data-busy="1"] { opacity: .55; pointer-events: none; cursor: progress; }
+  main { margin: 0 auto; padding: 16px 20px 40px; display: grid; gap: 16px; max-width: 1400px; }
+  @media (min-width: 1280px) {
+    main { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+    .span-full { grid-column: 1 / -1; }
+  }
   .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
   .card {
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 10px;
-    padding: 14px;
+    padding: 16px;
   }
-  .card h2 { margin: 0 0 10px; font-size: 13px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  .card h2 { margin: 0; font-size: var(--fs-md); color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  .card > h2 { margin: 0 0 12px; }
+  .card h3 { margin: 0; font-size: var(--fs-sm); color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  .card > h3 { margin: 0 0 8px; }
+  .card > h3.gap-top { margin: 12px 0 8px; }
+  .card-head { margin-bottom: 12px; }
+  .card-toolbar { margin-bottom: 12px; }
   .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .w-id { width: var(--w-id); }
+  .w-sid { width: var(--w-sid); }
+  .w-user { width: var(--w-user); }
+  .w-token { width: var(--w-token); }
+  .w-confirm { width: var(--w-confirm); }
+  .w-label { min-width: 88px; }
+  .grow { flex: 1; min-width: 200px; }
+  .select-compact { min-width: 100px; }
+  .mt-2 { margin-top: 8px; }
+  .mt-3 { margin-top: 12px; }
+  .list-h-sm { max-height: var(--list-h-sm); }
+  .list-h-md { max-height: var(--list-h-md); }
+  .list-h-lg { max-height: var(--list-h-lg); }
+  .list-h-xl { max-height: var(--list-h-xl); }
   .pill {
     display: inline-flex; align-items: center; gap: 6px;
-    padding: 2px 9px; border-radius: 999px; font-size: 12px;
+    padding: 2px 8px; border-radius: 999px; font-size: var(--fs-sm);
     background: var(--panel-2); border: 1px solid var(--line);
   }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
@@ -70,53 +135,77 @@
   .st-starting .dot, .st-restarting .dot { background: var(--warn); }
   .st-failed .dot { background: var(--bad); }
   .st-external .dot { background: var(--accent); }
-  .st-stopped .dot { background: #4b5563; }
-  .kv { color: var(--muted); font-size: 12px; }
+  .st-stopped .dot { background: var(--stopped-deep); }
+  .st-offline { border-color: var(--hot); }
+  .st-offline .dot { background: var(--hot); }
+  .kv { color: var(--muted); font-size: var(--fs-sm); }
   .mem-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
-  .mem-col h3 { margin: 0 0 8px; font-size: 12px; color: var(--muted); font-weight: 600; }
-  .mem-list { display: grid; gap: 8px; max-height: 300px; overflow: auto; }
-  .mem-item { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--panel-2); }
-  .mem-meta { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  .mem-list { display: grid; gap: 8px; max-height: var(--list-h-mem); overflow: auto; }
+  .mem-item { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; background: var(--panel-2); }
+  .mem-meta { color: var(--muted); font-size: var(--fs-sm); margin-bottom: 4px; }
   .mem-text { white-space: pre-wrap; word-break: break-word; }
-  .mem-actions { display: flex; gap: 6px; margin-top: 6px; align-items: center; }
-  .mem-empty { color: var(--muted); font-size: 12px; }
-  .proc-name { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
-  .proc-actions { margin-top: 10px; display: flex; gap: 6px; }
-  .proc-actions .btn { padding: 4px 10px; font-size: 12px; }
+  .mem-actions { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+  .mem-empty { color: var(--muted); font-size: var(--fs-sm); padding: 8px 4px; white-space: pre-line; }
+  .alert-item { border-left-width: 3px; border-left-style: solid; }
+  .alert-item.sev-critical { border-left-color: var(--bad); }
+  .alert-item.sev-warning { border-left-color: var(--warn); }
+  .alert-item.sev-info { border-left-color: var(--accent); }
+  .alert-item.is-resolved { opacity: .55; }
+  .alert-badge {
+    display: inline-block; margin-right: 6px; padding: 0 8px; border-radius: 999px;
+    border: 1px solid var(--line); font-size: var(--fs-xs);
+  }
+  .alert-badge.firing { border-color: var(--bad); color: var(--bad); }
+  .alert-badge.resolved { color: var(--muted); }
+  .audit-meta { margin-bottom: 8px; }
+  .audit-detail {
+    margin: 0; padding: 8px 12px; overflow: auto; max-height: 240px;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+    font: var(--fs-sm)/1.5 Consolas, "Cascadia Mono", monospace;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .proc-name { font-weight: 600; font-size: var(--fs-lg); margin-bottom: 4px; }
+  .proc-meta { margin-top: 8px; }
+  .proc-actions { margin-top: 12px; display: flex; gap: 8px; }
+  .proc-actions .btn { padding: 4px 12px; font-size: var(--fs-sm); }
   .mode-list { display: grid; gap: 8px; }
   .mode {
-    display: flex; align-items: center; gap: 10px;
-    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+    display: flex; align-items: center; gap: 12px; width: 100%;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
     cursor: pointer; background: var(--panel-2);
+    font: inherit; color: inherit; text-align: left;
   }
-  .mode.active { border-color: var(--accent); background: #1b2436; }
-  .mode.disabled { opacity: .5; cursor: not-allowed; }
+  .mode.active { border-color: var(--accent); background: var(--mode-active); }
+  .mode.disabled { opacity: .7; cursor: not-allowed; }
   .mode .label { font-weight: 600; }
-  .mode .reason { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .mode .reason { color: var(--muted); font-size: var(--fs-sm); margin-left: auto; }
   select {
     background: var(--panel-2); color: var(--text);
     border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-width: 180px;
   }
-  #qr-wrap { display: flex; gap: 14px; align-items: center; }
+  #qr-wrap { display: flex; gap: 16px; align-items: center; }
   #qr { width: 180px; height: 180px; object-fit: contain; background: #fff; border-radius: 8px; }
   #qr.empty { display: none; }
-  #qr-placeholder { width: 180px; height: 180px; border: 1px dashed var(--line); border-radius: 8px; display: grid; place-items: center; color: var(--muted); font-size: 12px; text-align: center; padding: 8px; }
+  #qr-placeholder { width: 180px; height: 180px; border: 1px dashed var(--line); border-radius: 8px; display: grid; place-items: center; color: var(--muted); font-size: var(--fs-sm); text-align: center; padding: 8px; }
   .log-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .log-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
   .log-toolbar input { width: 220px; }
   .log-toolbar select { min-width: 130px; }
-  .tab { padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); cursor: pointer; font-size: 12px; color: var(--muted); }
+  .tab {
+    padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); cursor: pointer;
+    font: inherit; font-size: var(--fs-sm); color: var(--muted); background: none;
+  }
   .tab.active { color: var(--text); border-color: var(--accent); background: var(--panel-2); }
   pre#logs {
     margin: 0; height: 320px; overflow: auto;
-    background: #0b0d12; border: 1px solid var(--line); border-radius: 8px;
-    padding: 10px; font: 12px/1.55 Consolas, "Cascadia Mono", monospace;
+    background: var(--surface-deep); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px; font: var(--fs-sm)/1.55 Consolas, "Cascadia Mono", monospace;
     white-space: pre-wrap; word-break: break-all;
   }
   .toast {
     position: fixed; right: 20px; bottom: 20px; max-width: 380px;
-    background: #1f2937; border: 1px solid var(--line); border-left: 3px solid var(--accent);
-    padding: 10px 14px; border-radius: 8px; font-size: 13px; opacity: 0;
+    background: var(--toast-deep); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    padding: 12px 16px; border-radius: 8px; font-size: var(--fs-md); opacity: 0;
     transition: opacity .2s; pointer-events: none;
   }
   .toast.show { opacity: 1; }
@@ -125,50 +214,54 @@
     background: var(--panel-2); color: var(--text);
     border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
   }
-  input:focus, select:focus { outline: 1px solid var(--accent); }
-  .usage-grid { display: grid; grid-template-columns: minmax(320px, 2fr) minmax(240px, 1fr); gap: 16px; }
-  .usage-bars { display: flex; align-items: flex-end; gap: 4px; height: 128px; padding-top: 6px; }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .usage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+  .usage-bars { display: flex; align-items: flex-end; gap: 4px; height: 128px; padding-top: 8px; }
   .bar-col { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; gap: 4px; height: 100%; }
   .bar-stack { display: flex; flex-direction: column; justify-content: flex-end; height: 100px; gap: 1px; }
   .bar-seg { background: var(--accent); border-radius: 2px; min-height: 0; }
   .bar-seg.err { background: var(--bad); }
-  .bar-label { color: var(--muted); font-size: 10px; text-align: center; white-space: nowrap; overflow: hidden; }
+  .bar-label { color: var(--muted); font-size: var(--fs-xs); text-align: center; white-space: nowrap; overflow: hidden; }
+  .usage-legend { display: flex; gap: 12px; margin-top: 8px; font-size: var(--fs-xs); color: var(--muted); }
+  .legend-key { display: inline-flex; align-items: center; gap: 4px; }
+  .legend-seg { width: 10px; height: 10px; border-radius: 2px; background: var(--accent); }
+  .legend-seg.err { background: var(--bad); }
   .usage-totals { margin-top: 8px; justify-content: space-between; }
-  .budget-panel { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
-  .budget-head { margin-bottom: 6px; }
-  .budget-head h3 { margin: 0; font-size: 12px; color: var(--muted); font-weight: 600; }
-  .budget-chat { font-size: 12px; color: var(--muted); margin: 6px 0 2px; }
+  .budget-panel { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .budget-head { margin-bottom: 8px; }
+  .budget-chat { font-size: var(--fs-sm); color: var(--muted); margin: 8px 0 4px; }
   .budget-chat b { color: var(--text); font-weight: 600; }
   .budget-metric { margin-top: 8px; }
-  .budget-name { font-size: 12px; color: var(--text); }
+  .budget-name { font-size: var(--fs-sm); color: var(--text); }
   .budget-sub { margin-top: 4px; }
-  .budget-label { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--muted); }
+  .budget-label { display: flex; justify-content: space-between; gap: 8px; font-size: var(--fs-xs); color: var(--muted); }
   .budget-track {
-    margin-top: 3px; height: 6px; border-radius: 999px;
+    margin-top: 4px; height: 6px; border-radius: 999px;
     background: var(--panel-2); border: 1px solid var(--line); overflow: hidden;
   }
   .budget-fill { height: 100%; border-radius: 999px; background: var(--accent); transition: width .2s; }
   .budget-fill.warn { background: var(--warn); }
-  .budget-fill.hot { background: #fb923c; }
+  .budget-fill.hot { background: var(--hot); }
   .budget-fill.bad { background: var(--bad); }
-  .budget-muted { font-size: 11px; color: var(--muted); }
-  .budget-warnings { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .budget-muted { font-size: var(--fs-xs); color: var(--muted); }
+  .budget-warnings { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
   .budget-tag {
-    font-size: 11px; padding: 2px 8px; border-radius: 999px;
-    background: rgba(251, 191, 36, .12); border: 1px solid var(--warn); color: var(--warn);
+    font-size: var(--fs-xs); padding: 2px 8px; border-radius: 999px;
+    background: var(--tag-warn-bg); border: 1px solid var(--warn); color: var(--warn);
   }
-  .budget-tag.bad { background: rgba(248, 113, 113, .12); border-color: var(--bad); color: var(--bad); }
-  .session-list { display: grid; gap: 8px; max-height: 360px; overflow: auto; }
+  .budget-tag.bad { background: var(--tag-bad-bg); border-color: var(--bad); color: var(--bad); }
+  .session-list { display: grid; gap: 8px; max-height: var(--list-h-sessions); overflow: auto; }
   .session-row {
-    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--panel-2);
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; background: var(--panel-2);
   }
   .session-row .who { font-weight: 600; min-width: 110px; }
-  .session-row .meta { color: var(--muted); font-size: 12px; flex: 1; min-width: 180px; }
+  .session-row .meta { color: var(--muted); font-size: var(--fs-sm); flex: 1; min-width: 180px; }
   .session-row .acts { display: flex; gap: 6px; flex-wrap: wrap; }
-  .session-row .btn { padding: 4px 9px; font-size: 12px; }
+  .session-row .btn { padding: 4px 8px; font-size: var(--fs-sm); }
   .debug-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
-  .debug-form label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+  .debug-form label { display: grid; gap: 4px; color: var(--muted); font-size: var(--fs-sm); }
   .debug-form input, .debug-form select, .debug-form textarea { width: 100%; }
   .debug-form textarea {
     resize: vertical; min-height: 54px;
@@ -177,22 +270,22 @@
     font: inherit;
   }
   .debug-wide { grid-column: 1 / -1; }
-  .debug-switches { margin-top: 10px; gap: 16px; color: var(--muted); font-size: 12px; }
+  .debug-switches { margin-top: 12px; gap: 16px; color: var(--muted); font-size: var(--fs-sm); }
   .debug-switches label { display: inline-flex; align-items: center; gap: 5px; }
-  .debug-note { margin-top: 8px; font-size: 12px; }
+  .debug-note { margin-top: 8px; font-size: var(--fs-sm); }
   .debug-verdict {
-    margin-top: 12px; padding: 9px 12px; border-radius: 8px;
+    margin-top: 12px; padding: 8px 12px; border-radius: 8px;
     border: 1px solid var(--line); background: var(--panel-2); font-weight: 600;
   }
   .debug-verdict.model { border-color: var(--ok); }
   .debug-verdict.batch { border-color: var(--warn); }
   .debug-verdict.skip { border-color: var(--bad); }
   .debug-verdict.command { border-color: var(--accent); }
-  .debug-checks { display: grid; gap: 6px; margin-top: 10px; }
+  .debug-checks { display: grid; gap: 8px; margin-top: 12px; }
   .debug-check {
-    display: flex; gap: 8px; align-items: flex-start; padding: 6px 8px;
+    display: flex; gap: 8px; align-items: flex-start; padding: 8px;
     border-left: 2px solid var(--line); border-radius: 4px;
-    background: var(--panel-2); font-size: 12px;
+    background: var(--panel-2); font-size: var(--fs-sm);
   }
   .debug-check.pass { border-left-color: var(--ok); }
   .debug-check.blocked { border-left-color: var(--bad); }
@@ -200,78 +293,94 @@
   .debug-check.skipped { color: var(--muted); border-left-style: dashed; }
   .debug-check .st { flex: 0 0 48px; color: var(--muted); }
   .debug-check .detail { color: var(--muted); margin-left: auto; text-align: right; }
-  .debug-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; margin-top: 10px; }
-  .debug-metric { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; background: var(--panel-2); font-size: 12px; }
+  .debug-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-top: 12px; }
+  .debug-metric { border: 1px solid var(--line); border-radius: 6px; padding: 8px; background: var(--panel-2); font-size: var(--fs-sm); }
   .debug-metric .label { color: var(--muted); }
-  .debug-metric .value { font-weight: 600; margin-top: 2px; }
+  .debug-metric .value { font-weight: 600; margin-top: 4px; }
   body.timeline-open { overflow: hidden; }
   .drawer-backdrop {
     position: fixed; inset: 0; z-index: 15;
-    background: rgba(0, 0, 0, .55);
+    background: var(--overlay);
   }
   .timeline-drawer {
     position: fixed; top: 0; right: 0; bottom: 0; z-index: 20;
     width: min(960px, 96vw); display: flex; flex-direction: column;
     background: var(--bg); border-left: 1px solid var(--line);
-    box-shadow: -16px 0 40px rgba(0, 0, 0, .45);
+    box-shadow: -16px 0 40px var(--drawer-shadow);
   }
   .timeline-drawer[hidden], .drawer-backdrop[hidden] { display: none; }
   .timeline-head {
     display: flex; align-items: flex-start; gap: 12px;
-    padding: 14px 18px; border-bottom: 1px solid var(--line);
+    padding: 16px 20px; border-bottom: 1px solid var(--line);
   }
-  .timeline-head h2 { margin: 0; font-size: 15px; }
+  .timeline-head h2 { margin: 0; font-size: var(--fs-lg); }
   .timeline-head .spacer { flex: 1; }
   .timeline-metrics {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
-    gap: 8px; padding: 12px 18px; border-bottom: 1px solid var(--line);
+    gap: 8px; padding: 12px 20px; border-bottom: 1px solid var(--line);
   }
   .timeline-metric {
-    border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px;
     background: var(--panel);
   }
-  .timeline-metric .label { color: var(--muted); font-size: 11px; }
-  .timeline-metric .value { font-weight: 600; margin-top: 2px; }
+  .timeline-metric .label { color: var(--muted); font-size: var(--fs-xs); }
+  .timeline-metric .value { font-weight: 600; margin-top: 4px; }
   .timeline-toolbar {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-    padding: 9px 18px; border-bottom: 1px solid var(--line);
+    padding: 8px 20px; border-bottom: 1px solid var(--line);
     background: var(--panel);
   }
   .timeline-body {
-    flex: 1; overflow: auto; padding: 14px 18px;
+    flex: 1; overflow: auto; padding: 16px 20px;
     display: grid; align-content: start; gap: 8px;
   }
   .timeline-date {
-    color: var(--muted); font-size: 12px; text-align: center;
-    padding: 6px 0 2px; border-bottom: 1px dashed var(--line);
+    color: var(--muted); font-size: var(--fs-sm); text-align: center;
+    padding: 8px 0 4px; border-bottom: 1px dashed var(--line);
   }
   .timeline-msg {
     border: 1px solid var(--line); border-left: 3px solid var(--accent);
-    border-radius: 8px; padding: 8px 10px; background: var(--panel-2);
+    border-radius: 8px; padding: 8px 12px; background: var(--panel-2);
     max-width: 88%;
   }
   .timeline-msg.bot {
-    margin-left: auto; border-left-color: var(--ok); background: #16221c;
+    margin-left: auto; border-left-color: var(--ok); background: var(--bubble-ok);
   }
   .timeline-msg.hit {
-    outline: 2px solid var(--warn); background: #2a2413;
+    outline: 2px solid var(--warn); background: var(--bubble-warn);
     transition: background .3s;
   }
   .timeline-msg-head {
     display: flex; align-items: baseline; gap: 8px;
-    color: var(--muted); font-size: 12px; margin-bottom: 4px;
+    color: var(--muted); font-size: var(--fs-sm); margin-bottom: 4px;
   }
   .timeline-msg-head b { color: var(--text); font-weight: 600; }
   .timeline-msg-text { white-space: pre-wrap; word-break: break-word; }
-  .timeline-flags { color: var(--warn); font-size: 11px; margin-top: 5px; }
+  .timeline-flags { color: var(--warn); font-size: var(--fs-xs); margin-top: 4px; }
   .timeline-context {
-    border-top: 1px solid var(--line); padding: 10px 18px 16px;
+    border-top: 1px solid var(--line); padding: 12px 20px 16px;
     max-height: 34vh; overflow: auto; background: var(--panel);
   }
-  .timeline-context summary { cursor: pointer; color: var(--muted); font-size: 12px; }
-  .timeline-context h3 { font-size: 12px; color: var(--muted); margin: 10px 0 6px; }
+  .timeline-context summary { cursor: pointer; color: var(--muted); font-size: var(--fs-sm); }
+  .timeline-context h3 { font-size: var(--fs-sm); color: var(--muted); margin: 12px 0 8px; }
   .timeline-context .mem-list { max-height: none; }
-  .cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 6px 18px; }
+  .modal-backdrop { position: fixed; inset: 0; z-index: 30; background: var(--overlay); }
+  .modal {
+    position: fixed; z-index: 31; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: min(520px, 92vw); display: grid; gap: 12px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px; box-shadow: 0 16px 48px var(--drawer-shadow);
+  }
+  .modal h3 { margin: 0; font-size: var(--fs-md); color: var(--text); }
+  .modal textarea {
+    resize: vertical; min-height: 96px; width: 100%;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+    font: inherit;
+  }
+  .modal-actions { justify-content: flex-end; }
+  .delete-user-form { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px 20px; }
   .cfg-grid b { color: var(--text); font-weight: 600; }
 </style>
 </head>
@@ -286,16 +395,33 @@
   <button class="btn" id="btn-logout" hidden>退出登录</button>
   <button class="btn danger" id="btn-shutdown">退出控制台</button>
 </header>
+<div class="global-banner" id="global-banner" role="status" hidden></div>
 
 <main>
-  <section class="grid-3" id="processes"></section>
+  <section class="grid-3 span-full" id="processes"></section>
+
+  <section class="card">
+    <h2>登录二维码</h2>
+    <div class="row card-head">
+      <span class="pill st-stopped" id="login-state"><span class="dot"></span>登录状态未知</span>
+      <span class="kv" id="login-hint"></span>
+    </div>
+    <div id="qr-wrap">
+      <img id="qr" alt="登录二维码" class="empty" />
+      <div id="qr-placeholder">暂无二维码<br />NapCat 需要登录时会自动出现</div>
+      <div>
+        <div class="kv" id="qr-meta">—</div>
+        <div class="kv mt-2">扫码后会自动刷新，过期二维码会标黄。</div>
+      </div>
+    </div>
+  </section>
 
   <section class="card" id="health-card">
-    <div class="row" style="margin-bottom:10px">
-      <h2 style="margin:0">健康总览</h2>
+    <div class="row card-head">
+      <h2>健康总览</h2>
       <span class="pill st-stopped" id="health-state"><span class="dot"></span>加载中</span>
       <span class="kv" id="health-hint"></span>
-      <span class="spacer" style="flex:1"></span>
+      <span class="spacer"></span>
       <button class="btn" id="btn-refresh-health">刷新</button>
     </div>
     <div class="grid-3" id="health-processes"></div>
@@ -303,71 +429,73 @@
   </section>
 
   <section class="card" id="alerts-card">
-    <div class="row" style="margin-bottom:10px">
-      <h2 style="margin:0">告警事件</h2>
+    <div class="row card-head">
+      <h2>告警事件</h2>
       <span class="kv" id="alerts-hint">暂无活动事件</span>
-      <span class="spacer" style="flex:1"></span>
+      <span class="spacer"></span>
       <button class="btn" id="btn-test-alert">测试告警</button>
       <button class="btn" id="btn-refresh-alerts">刷新</button>
     </div>
-    <div class="mem-list" id="alerts-list" style="max-height:260px"></div>
+    <div class="mem-list list-h-lg" id="alerts-list"></div>
   </section>
 
   <section class="card" id="backups-card">
-    <div class="row" style="margin-bottom:10px">
-      <h2 style="margin:0">备份与恢复</h2>
+    <div class="row card-head">
+      <h2>备份与恢复</h2>
       <span class="kv" id="backups-hint"></span>
-      <span class="spacer" style="flex:1"></span>
+      <span class="spacer"></span>
       <button class="btn primary" id="btn-backup-now">立即备份</button>
       <button class="btn" id="btn-refresh-backups">刷新</button>
     </div>
-    <div class="row" style="margin-bottom:10px">
-      <input id="backup-restore-file" type="file" accept=".db,application/octet-stream" />
-      <input id="backup-restore-confirm" placeholder="输入 RESTORE 确认" style="width:180px" />
+    <div class="row card-toolbar">
+      <input id="backup-restore-file" type="file" accept=".db,application/octet-stream" aria-label="选择要恢复的备份文件" />
+      <input id="backup-restore-confirm" class="w-token" placeholder="输入 RESTORE 确认" aria-label="输入 RESTORE 确认以启用恢复" />
       <button class="btn" id="btn-backup-restore">上传并恢复</button>
     </div>
-    <div class="mem-list" id="backup-list" style="max-height:220px"></div>
-    <h3 style="font-size:12px;color:var(--muted);margin:12px 0 6px">审计日志</h3>
-    <div class="mem-list" id="audit-list" style="max-height:220px"></div>
+    <div class="mem-list list-h-md" id="backup-list"></div>
+    <h3 class="gap-top">审计日志</h3>
+    <div class="mem-list list-h-md" id="audit-list"></div>
   </section>
 
   <section class="card" id="security-card">
-    <div class="row" style="margin-bottom:10px">
-      <h2 style="margin:0">安全</h2>
+    <div class="row card-head">
+      <h2>安全</h2>
       <span class="kv" id="rotate-token-status">轮换控制口令会立即重启 Bot，旧口令立即失效</span>
     </div>
     <div class="row">
-      <input id="rotate-token-confirm" placeholder="输入 ROTATE 确认" style="width:180px" />
+      <input id="rotate-token-confirm" class="w-token" placeholder="输入 ROTATE 确认" aria-label="输入 ROTATE 确认以启用轮换" />
       <button class="btn danger" id="btn-rotate-token">轮换控制口令</button>
     </div>
-    <div class="kv" style="margin-top:8px">轮换后 Bot 会用新口令重启；任一步失败会保留旧口令。</div>
+    <div class="kv mt-2">轮换后 Bot 会用新口令重启；任一步失败会保留旧口令。</div>
   </section>
 
   <section class="card">
     <h2>大脑模式</h2>
-    <div class="mode-list" id="modes"></div>
-    <div class="row" style="margin-top:12px" id="model-row" hidden>
-      <select id="model-select"></select>
+    <div class="mode-list" id="modes" role="radiogroup" aria-label="大脑模式"></div>
+    <div class="row mt-3" id="model-row" hidden>
+      <select id="model-select" aria-label="本地模型列表"></select>
       <button class="btn" id="btn-refresh-models">刷新模型列表</button>
       <span class="kv" id="model-hint"></span>
     </div>
-    <div class="row" style="margin-top:12px">
+    <div class="row mt-3">
       <button class="btn primary" id="btn-apply-brain">应用切换</button>
       <span class="kv" id="brain-hint"></span>
     </div>
   </section>
 
-  <section class="card">
-    <div class="row" style="margin-bottom:10px">
-      <h2 style="margin:0">记忆</h2>
+  <section class="card span-full">
+    <div class="row card-head">
+      <h2>记忆</h2>
       <span class="kv" id="memory-hint"></span>
-      <span class="spacer" style="flex:1"></span>
-      <select id="memory-chat-filter" title="按会话类型筛选">
+      <span class="spacer"></span>
+      <select id="memory-chat-filter" title="按会话类型筛选" aria-label="按会话类型筛选">
         <option value="">全部会话</option>
         <option value="group">只看群聊</option>
         <option value="private">只看私聊</option>
       </select>
-      <input id="memory-chat-id" type="number" min="1" placeholder="会话 ID" style="width:110px" title="手动触发用的会话 ID" />
+      <input id="memory-chat-id" type="number" min="1" placeholder="会话 ID" class="w-id" title="手动触发用的会话 ID" aria-label="手动触发用的会话 ID" />
+    </div>
+    <div class="row card-toolbar">
       <button class="btn" id="btn-summarize">生成摘要</button>
       <button class="btn" id="btn-extract">抽取印象</button>
       <button class="btn" id="btn-merge-impressions" disabled>合并所选</button>
@@ -384,27 +512,27 @@
         <div class="mem-list" id="memory-impressions"></div>
       </div>
     </div>
-    <form class="row" id="delete-user-form" style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">
-      <span class="kv" style="min-width:84px">按用户删除</span>
-      <select id="delete-user-chat-type" title="会话类型">
+    <form class="row delete-user-form" id="delete-user-form">
+      <span class="kv w-label">按用户删除</span>
+      <select id="delete-user-chat-type" title="会话类型" aria-label="要删除的会话类型">
         <option value="group">群聊</option>
         <option value="private">私聊</option>
       </select>
-      <input id="delete-user-chat-id" type="number" min="1" placeholder="会话 ID" style="width:110px" />
-      <input id="delete-user-id" type="number" min="1" placeholder="用户 QQ 号" style="width:140px" />
-      <input id="delete-user-confirm" placeholder="输入 DELETE_USER 确认" style="width:190px" />
+      <input id="delete-user-chat-id" type="number" min="1" placeholder="会话 ID" class="w-id" aria-label="要删除的会话 ID" />
+      <input id="delete-user-id" type="number" min="1" placeholder="用户 QQ 号" class="w-user" aria-label="要删除的用户 QQ 号" />
+      <input id="delete-user-confirm" class="w-confirm" placeholder="输入 DELETE_USER 确认" aria-label="输入 DELETE_USER 确认以启用删除" />
       <button class="btn danger" type="submit" id="btn-delete-user">删除该用户消息</button>
       <span class="kv" id="delete-user-status"></span>
     </form>
-    <div class="kv" style="margin-top:6px">只删除该用户在本会话的原始消息；摘要与印象等聚合数据可能仍保留痕迹，操作不可撤销。如需彻底重建，请联系管理员执行 /forget。</div>
+    <div class="kv mt-2">只删除该用户在本会话的原始消息；摘要与印象等聚合数据可能仍保留痕迹，操作不可撤销。如需彻底重建，请联系管理员执行 /forget。</div>
   </section>
 
-  <section class="card">
-    <div class="row" style="margin-bottom:10px">
-      <h2 style="margin:0">用量趋势</h2>
+  <section class="card span-full">
+    <div class="row card-head">
+      <h2>用量趋势</h2>
       <span class="kv" id="usage-hint"></span>
-      <span class="spacer" style="flex:1"></span>
-      <select id="usage-days" title="统计区间">
+      <span class="spacer"></span>
+      <select id="usage-days" title="统计区间" aria-label="统计区间">
         <option value="7">近 7 天</option>
         <option value="14">近 14 天</option>
         <option value="30">近 30 天</option>
@@ -414,17 +542,21 @@
     <div class="usage-grid">
       <div>
         <div class="usage-bars" id="usage-bars"></div>
+        <div class="usage-legend">
+          <span class="legend-key"><span class="legend-seg"></span>回复</span>
+          <span class="legend-key"><span class="legend-seg err"></span>错误</span>
+        </div>
         <div class="row kv usage-totals" id="usage-totals"></div>
         <div class="budget-panel" id="budget-panel">
           <div class="row budget-head">
             <h3>预算</h3>
             <span class="kv">估算 · 上海时区</span>
-            <span style="flex:1"></span>
-            <select id="budget-chat-type" title="会话类型" style="min-width:100px">
+            <span class="spacer"></span>
+            <select id="budget-chat-type" title="会话类型" class="select-compact" aria-label="预算统计的会话类型">
               <option value="group">群聊</option>
               <option value="private">私聊</option>
             </select>
-            <input id="budget-chat-id" type="number" min="1" value="1" style="width:110px" title="会话 ID" />
+            <input id="budget-chat-id" type="number" min="1" value="1" class="w-id" title="会话 ID" aria-label="预算统计的会话 ID" />
             <button class="btn" id="btn-budget-refresh">刷新</button>
           </div>
           <div class="budget-chat" id="budget-chat">填写会话 ID 后加载预算</div>
@@ -435,49 +567,49 @@
         </div>
       </div>
       <div>
-        <h3 style="font-size:12px;color:var(--muted);margin:0 0 6px">回复最多的会话</h3>
-        <div class="mem-list" id="usage-top" style="max-height:110px"></div>
-        <h3 style="font-size:12px;color:var(--muted);margin:10px 0 6px">最近错误</h3>
-        <div class="mem-list" id="usage-errors" style="max-height:110px"></div>
+        <h3>回复最多的会话</h3>
+        <div class="mem-list list-h-sm" id="usage-top"></div>
+        <h3 class="gap-top">最近错误</h3>
+        <div class="mem-list list-h-sm" id="usage-errors"></div>
       </div>
     </div>
   </section>
 
-  <section class="card">
-    <div class="row" style="margin-bottom:10px">
-      <h2 style="margin:0">记忆搜索</h2>
+  <section class="card span-full">
+    <div class="row card-head">
+      <h2>记忆搜索</h2>
       <span class="kv" id="search-hint"></span>
     </div>
-    <div class="row" style="margin-bottom:10px">
-      <input id="search-q" placeholder="搜聊天记录里的关键词…" style="flex:1;min-width:200px" />
-      <select id="search-chat-filter">
+    <div class="row card-toolbar">
+      <input id="search-q" class="grow" placeholder="搜聊天记录里的关键词…" aria-label="搜索聊天记录的关键词" />
+      <select id="search-chat-filter" aria-label="按会话类型筛选搜索结果">
         <option value="">全部会话</option>
         <option value="group">只看群聊</option>
         <option value="private">只看私聊</option>
       </select>
-      <input id="search-chat-id" type="number" min="1" placeholder="会话 ID（可选）" style="width:130px" />
+      <input id="search-chat-id" type="number" min="1" placeholder="会话 ID（可选）" class="w-sid" aria-label="限定搜索的会话 ID（可选）" />
       <button class="btn primary" id="btn-search">搜索</button>
       <button class="btn" id="btn-search-more" disabled>更多</button>
     </div>
-    <div class="mem-list" id="search-results" style="max-height:340px"></div>
+    <div class="mem-list list-h-xl" id="search-results"></div>
   </section>
 
-  <section class="card">
-    <div class="row" style="margin-bottom:10px">
-      <h2 style="margin:0">会话管理</h2>
+  <section class="card span-full">
+    <div class="row card-head">
+      <h2>会话管理</h2>
       <span class="kv" id="sessions-hint"></span>
-      <span class="spacer" style="flex:1"></span>
+      <span class="spacer"></span>
       <button class="btn" id="btn-sessions-more" disabled>加载更多</button>
       <button class="btn" id="btn-refresh-sessions">刷新</button>
     </div>
     <div class="session-list" id="sessions"></div>
   </section>
 
-  <section class="card" id="trigger-debug">
-    <div class="row" style="margin-bottom:10px">
-      <h2 style="margin:0">触发规则调试器</h2>
+  <section class="card span-full" id="trigger-debug">
+    <div class="row card-head">
+      <h2>触发规则调试器</h2>
       <span class="kv" id="debug-hint">只读模拟 · 不会发送到会话</span>
-      <span class="spacer" style="flex:1"></span>
+      <span class="spacer"></span>
       <button class="btn primary" id="btn-debug-trigger">模拟判定</button>
     </div>
     <div class="debug-form">
@@ -505,54 +637,37 @@
       <label><input type="checkbox" id="debug-reply-bot" /> 引用回复机器人</label>
     </div>
     <div class="kv debug-note">不写消息、不调模型、不消耗预算/冷却、不动调度器</div>
-    <div id="debug-result" hidden>
+    <div id="debug-result" hidden aria-live="polite">
       <div class="debug-verdict" id="debug-verdict"></div>
-      <div class="kv" id="debug-reason" style="margin-top:6px"></div>
+      <div class="kv mt-2" id="debug-reason"></div>
       <div class="debug-checks" id="debug-checks"></div>
       <div class="debug-metrics" id="debug-metrics"></div>
     </div>
   </section>
 
   <section class="card">
-    <div class="row" style="margin-bottom:10px">
-      <h2 style="margin:0">运行配置</h2>
+    <div class="row card-head">
+      <h2>运行配置</h2>
       <span class="kv" id="config-hint">只读</span>
-      <span class="spacer" style="flex:1"></span>
+      <span class="spacer"></span>
       <button class="btn" id="btn-backup">下载备份</button>
-      <button class="btn" id="btn-restart-bot">重启 Bot</button>
       <button class="btn" id="btn-refresh-config">刷新</button>
     </div>
     <div class="kv cfg-grid" id="config-body"></div>
   </section>
 
-  <section class="card">
-    <h2>登录二维码</h2>
-    <div class="row" style="margin-bottom:10px">
-      <span class="pill st-stopped" id="login-state"><span class="dot"></span>登录状态未知</span>
-      <span class="kv" id="login-hint"></span>
-    </div>
-    <div id="qr-wrap">
-      <img id="qr" alt="登录二维码" class="empty" />
-      <div id="qr-placeholder">暂无二维码<br />NapCat 需要登录时会自动出现</div>
-      <div>
-        <div class="kv" id="qr-meta">—</div>
-        <div class="kv" style="margin-top:6px">扫码后会自动刷新，过期二维码会标黄。</div>
-      </div>
-    </div>
-  </section>
-
-  <section class="card">
+  <section class="card span-full">
     <h2>日志</h2>
-    <div class="log-head" id="log-tabs"></div>
+    <div class="log-head" id="log-tabs" role="tablist" aria-label="日志来源"></div>
     <div class="log-toolbar">
-      <select id="log-level" title="按文本中的级别关键字筛选">
+      <select id="log-level" title="按文本中的级别关键字筛选" aria-label="按级别筛选日志">
         <option value="">全部级别</option>
         <option value="error">ERROR</option>
         <option value="warn">WARNING</option>
         <option value="info">INFO</option>
       </select>
-      <input id="log-filter" placeholder="关键字筛选…" />
-      <select id="log-lines" title="重新连接时加载最近多少行">
+      <input id="log-filter" placeholder="关键字筛选…" aria-label="按关键字筛选日志" />
+      <select id="log-lines" title="重新连接时加载最近多少行" aria-label="重连时加载的行数">
         <option value="200">200 行</option>
         <option value="1000">1000 行</option>
         <option value="2000">2000 行</option>
@@ -567,7 +682,7 @@
 </main>
 
 <div class="drawer-backdrop" id="timeline-backdrop" hidden></div>
-<aside class="timeline-drawer" id="timeline-drawer" hidden aria-label="会话时间线">
+<aside class="timeline-drawer" id="timeline-drawer" hidden role="dialog" aria-modal="true" aria-label="会话时间线">
   <div class="timeline-head">
     <div>
       <h2 id="timeline-title">会话时间线</h2>
@@ -589,9 +704,22 @@
   </details>
 </aside>
 
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<div class="modal-backdrop" id="modal-backdrop" hidden></div>
+<div class="modal" id="impression-modal" role="dialog" aria-modal="true" aria-labelledby="impression-modal-title" hidden>
+  <h3 id="impression-modal-title">编辑印象</h3>
+  <textarea id="impression-modal-input" aria-label="印象内容"></textarea>
+  <div class="kv" id="impression-modal-note"></div>
+  <div class="row modal-actions">
+    <span class="spacer"></span>
+    <button class="btn" id="impression-modal-cancel">取消</button>
+    <button class="btn primary" id="impression-modal-ok">确定</button>
+  </div>
+</div>
 
 <script>
+(() => {
 const STATUS_TEXT = {
   running: "运行中", starting: "启动中", stopping: "停止中", stopped: "已停止",
   restarting: "重启中", failed: "连续失败", external: "外部运行",
@@ -611,6 +739,7 @@ let timelineTarget = null;
 let timelineNextBefore = null;
 let timelineHasMore = false;
 let timelineReq = 0;
+let timelineReturnFocus = null;
 
 const LOG_MAX_LINES = 5000;
 let logLines = [];
@@ -619,6 +748,25 @@ let logPending = 0;
 let logFollow = true;
 let logRenderTimer = null;
 let logFilterTimer = null;
+let logRenderedText = null;
+
+const MEMORY_PAGE = 30;
+// 只在 /api/memory 没有 limit_max 的旧服务端上生效；正常路径读服务端字段。
+const MEMORY_PAGE_MAX_FALLBACK = 200;
+let memoryPageMax = MEMORY_PAGE_MAX_FALLBACK;
+let memoryLimit = MEMORY_PAGE;
+
+const SEARCH_PAGE = 20;
+let searchOffset = 0;
+let searchTotal = 0;
+const SESSIONS_PAGE = 50;
+let sessionsOffset = 0;
+let sessionsTotal = 0;
+
+let usageDays = 7;
+let healthQuotaPaused = false;
+let healthReadFailed = false;
+let lastQrKey = "";
 
 const $ = (id) => document.getElementById(id);
 
@@ -631,6 +779,101 @@ function toast(message, isError = false) {
   toast._timer = setTimeout(() => el.classList.remove("show"), 3200);
 }
 
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[char]));
+}
+
+// 防连点：挂上 busy 标记到动作结束，返回 false 表示上一趟还没跑完。
+// 只用标记 + CSS 置灰（pointer-events:none），不碰 disabled，
+// 这样“加载更多”这类按数据状态自己改 disabled 的按钮不会被误改。
+async function withBusy(button, fn) {
+  if (!button || button.dataset.busy === "1") return false;
+  button.dataset.busy = "1";
+  try {
+    await fn();
+  } finally {
+    delete button.dataset.busy;
+  }
+  return true;
+}
+
+// 三处 blob 下载共用的一段：建临时链接、触发点击、稍后回收。
+function downloadBlob(name, blob) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+// 把二进制响应取回来，401 直接跳登录、非 2xx 抛出可读原因。
+async function fetchBlob(path) {
+  const resp = await fetch(path);
+  if (resp.status === 401) { redirectToLogin(); throw new Error("登录已过期"); }
+  if (!resp.ok) {
+    let reason = `HTTP ${resp.status}`;
+    try {
+      const data = await resp.json();
+      reason = (data && data.error) || reason;
+    } catch (_) { /* 非 JSON 错误体 */ }
+    throw new Error(reason);
+  }
+  return resp.blob();
+}
+
+// 页面内确认输入框，替换掉生硬的原生 prompt()。resolve 的值为 null 表示取消。
+function askModal({ title, value = "", note = "" }) {
+  return new Promise((resolve) => {
+    const modal = $("impression-modal");
+    const backdrop = $("modal-backdrop");
+    const input = $("impression-modal-input");
+    const previousFocus = document.activeElement;
+    $("impression-modal-title").textContent = title;
+    $("impression-modal-note").textContent = note;
+    input.value = value;
+    modal.hidden = false;
+    backdrop.hidden = false;
+    input.focus();
+    const onKey = (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        close(null);
+      } else if (ev.key === "Enter" && !ev.shiftKey) {
+        ev.preventDefault();
+        close(input.value);
+      }
+    };
+    modal.addEventListener("keydown", onKey);
+    const close = (result) => {
+      modal.hidden = true;
+      backdrop.hidden = true;
+      modal.removeEventListener("keydown", onKey);
+      okButton.removeEventListener("click", onOk);
+      cancelButton.removeEventListener("click", onCancel);
+      backdrop.removeEventListener("click", onCancel);
+      if (previousFocus && typeof previousFocus.focus === "function") previousFocus.focus();
+      resolve(result);
+    };
+    const onOk = () => close(input.value);
+    const onCancel = () => close(null);
+    const okButton = $("impression-modal-ok");
+    const cancelButton = $("impression-modal-cancel");
+    okButton.addEventListener("click", onOk);
+    cancelButton.addEventListener("click", onCancel);
+    backdrop.addEventListener("click", onCancel);
+  });
+}
+
 function redirectToLogin() {
   if (location.pathname === "/login") return;
   const next = location.pathname + location.search;
@@ -638,8 +881,10 @@ function redirectToLogin() {
 }
 
 async function api(path, options = {}) {
+  const headers = {};
+  if (!(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
   const resp = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
+    headers,
     ...options,
   });
   if (resp.status === 401) {
@@ -649,7 +894,7 @@ async function api(path, options = {}) {
   let data = null;
   try { data = await resp.json(); } catch (_) { data = null; }
   if (!resp.ok) {
-    const reason = (data && (data.error || data.reason)) || `HTTP ${resp.status}`;
+    const reason = (data && (data.error || data.reason || data.stage)) || `HTTP ${resp.status}`;
     throw new Error(reason);
   }
   return data;
@@ -781,22 +1026,34 @@ function renderProcesses() {
   if (!list.length) { box.innerHTML = '<div class="card kv">尚未获取到进程状态</div>'; return; }
   box.innerHTML = list.map((p) => {
     const st = p.status || "stopped";
+    const exitNote = p.last_exit_code !== null && p.last_exit_code !== undefined
+      ? ` · 上次退出码 ${p.last_exit_code}` : "";
+    const botRestart = p.name === "bot"
+      ? `<button class="btn danger" id="btn-restart-bot" data-act="restart" data-target="bot" ${st === "external" ? "disabled" : ""}>重启 Bot</button>`
+      : "";
     return `
       <div class="card">
-        <div class="proc-name">${PROC_TITLE[p.name] || p.name}</div>
-        <span class="pill st-${st}"><span class="dot"></span>${STATUS_TEXT[st] || st}</span>
-        <div class="kv" style="margin-top:8px">
+        <div class="proc-name">${escapeHtml(PROC_TITLE[p.name] || p.name)}</div>
+        <span class="pill st-${escapeHtml(st)}"><span class="dot"></span>${escapeHtml(STATUS_TEXT[st] || st)}</span>
+        <div class="kv proc-meta">
           PID ${p.pid || "—"} · 端口 ${p.port || "—"}<br />
-          运行 ${fmtUptime(p.uptime_seconds)} · 重启 ${p.restart_count} 次
-          ${p.last_exit_code !== null && p.last_exit_code !== undefined ? ` · 上次退出码 ${p.last_exit_code}` : ""}
+          <span class="proc-uptime" data-uptime-for="${escapeHtml(p.name)}">运行 ${fmtUptime(p.uptime_seconds)}</span> · 重启 ${p.restart_count} 次${exitNote}
         </div>
         <div class="proc-actions">
-          <button class="btn" data-act="start" data-target="${p.name}" ${st === "external" ? "disabled" : ""}>启动</button>
-          <button class="btn" data-act="stop" data-target="${p.name}" ${st === "external" ? "disabled" : ""}>停止</button>
-          <button class="btn" data-act="restart" data-target="${p.name}" ${st === "external" ? "disabled" : ""}>重启</button>
+          <button class="btn" data-act="start" data-target="${escapeHtml(p.name)}" ${st === "external" ? "disabled" : ""}>启动</button>
+          <button class="btn" data-act="stop" data-target="${escapeHtml(p.name)}" ${st === "external" ? "disabled" : ""}>停止</button>
+          ${p.name === "bot" ? botRestart : `<button class="btn" data-act="restart" data-target="${escapeHtml(p.name)}" ${st === "external" ? "disabled" : ""}>重启</button>`}
         </div>
       </div>`;
   }).join("");
+}
+
+// 只刷新运行时长文字，避免每 2 秒整卡重建销毁焦点。
+function updateUptimes(list) {
+  list.forEach((p) => {
+    const el = document.querySelector(`[data-uptime-for="${CSS.escape(p.name)}"]`);
+    if (el) el.textContent = `运行 ${fmtUptime(p.uptime_seconds)}`;
+  });
 }
 
 function renderBrain() {
@@ -813,10 +1070,11 @@ function renderBrain() {
     .map((m) => {
       const active = m.id === selectedProvider ? " active" : "";
       const disabled = m.ready ? "" : " disabled";
-      return `<div class="mode${active}${disabled}" data-mode="${m.id}">
-        <span class="label">${m.label}</span>
-        ${m.ready ? "" : `<span class="reason">${m.reason || "不可用"}</span>`}
-      </div>`;
+      const checked = m.id === selectedProvider ? "true" : "false";
+      return `<button type="button" class="mode${active}${disabled}" data-mode="${escapeHtml(m.id)}" role="radio" aria-checked="${checked}" ${m.ready ? "" : "disabled"}>
+        <span class="label">${escapeHtml(m.label)}</span>
+        ${m.ready ? "" : `<span class="reason">${escapeHtml(m.reason || "不可用")}</span>`}
+      </button>`;
     }).join("");
 
   const showModel = selectedProvider === "local_model";
@@ -826,7 +1084,7 @@ function renderBrain() {
     const activeModel = selectedModel || brain.model || "";
     const options = Array.from(select.options).map((o) => o.value);
     if (activeModel && !options.includes(activeModel)) {
-      select.insertAdjacentHTML("beforeend", `<option value="${activeModel}">${activeModel}</option>`);
+      select.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(activeModel)}">${escapeHtml(activeModel)}</option>`);
     }
     if (activeModel) select.value = activeModel;
   }
@@ -841,14 +1099,40 @@ function renderBrain() {
 }
 
 function applyStatus(data) {
+  const prev = state;
   state = data;
   const alive = data.brain && data.brain.available;
   $("hub-state").className = `pill st-${alive ? "running" : "failed"}`;
   $("hub-state").innerHTML = `<span class="dot"></span>${alive ? "bot 在线" : "bot 离线"}`;
-  renderProcesses();
-  renderBrain();
+
+  // 数据没变就跳过整卡重建，避免每 2 秒销毁键盘焦点、打断双击。
+  const procSig = JSON.stringify((data.processes || []).map((p) => [p.name, p.status, p.pid, p.port, p.restart_count, p.last_exit_code]));
+  if (!prev || JSON.stringify((prev.processes || []).map((p) => [p.name, p.status, p.pid, p.port, p.restart_count, p.last_exit_code])) !== procSig) {
+    renderProcesses();
+  } else {
+    updateUptimes(data.processes || []);
+  }
+
+  const brainSig = JSON.stringify(data.brain || {});
+  if (!prev || JSON.stringify(prev.brain || {}) !== brainSig) renderBrain();
+
   renderLogin(data.napcat);
   renderQr(data.qr, data.napcat);
+  renderGlobalBanner(data);
+}
+
+// 顶部全局降级横幅：命中任一条件就亮红条，文案区分是哪一种。
+function renderGlobalBanner(data) {
+  const reasons = [];
+  const alive = data.brain && data.brain.available;
+  if (!alive) reasons.push("Bot 进程离线，回复与记忆功能已停止");
+  const napcat = data.napcat || {};
+  if (napcat.offline) reasons.push("QQ 账号半离线：消息只进历史，不推送给群成员");
+  if (healthQuotaPaused) reasons.push("配额暂停中，摘要与印象抽取已暂停");
+  if (healthReadFailed) reasons.push("健康数据读取失败，上方状态可能不是最新的");
+  const banner = $("global-banner");
+  banner.textContent = reasons.length ? `注意：${reasons.join("；")}` : "";
+  banner.hidden = reasons.length === 0;
 }
 
 function renderLogin(napcat) {
@@ -864,7 +1148,7 @@ function renderLogin(napcat) {
       note = napcat.error || "";
     } else if (napcat.logged_in && napcat.offline) {
       // 半离线：isLogin 仍为 true，但账号实际 offline，消息只进历史不推送。
-      cls = "st-failed";
+      cls = "st-offline";
       text = "已登录 · 账号离线";
       note = "消息会进历史但不推送给群成员；检查是否在手机或其它客户端登录了同一账号。";
     } else if (napcat.logged_in) {
@@ -893,6 +1177,7 @@ function renderQr(qr, napcat) {
   const meta = $("qr-meta");
   if (napcat && napcat.logged_in && napcat.offline) {
     img.classList.add("empty");
+    lastQrKey = "";
     placeholder.style.display = "grid";
     meta.textContent = "账号离线，建议重新扫码登录";
     meta.style.color = "var(--bad)";
@@ -900,6 +1185,7 @@ function renderQr(qr, napcat) {
   }
   if (napcat && napcat.logged_in) {
     img.classList.add("empty");
+    lastQrKey = "";
     placeholder.style.display = "grid";
     meta.textContent = "已登录，无需二维码";
     meta.style.color = "var(--ok)";
@@ -907,14 +1193,19 @@ function renderQr(qr, napcat) {
   }
   if (!qr || !qr.exists) {
     img.classList.add("empty");
+    lastQrKey = "";
     placeholder.style.display = "grid";
     meta.textContent = "暂无二维码";
     return;
   }
   placeholder.style.display = "none";
   img.classList.remove("empty");
-  const bust = Math.floor(Date.now() / 5000);
-  img.src = `/api/qr/image?t=${bust}`;
+  // 二维码内容（过期标记变化或重新生成）才重设 src，避免可扫描期间反复重载闪烁。
+  const key = `${qr.stale ? "stale" : "fresh"}`;
+  if (key !== lastQrKey) {
+    img.src = `/api/qr/image?t=${Date.now()}`;
+    lastQrKey = key;
+  }
   meta.textContent = `生成于 ${qr.age_seconds}s 前${qr.stale ? " · 可能已过期" : ""}`;
   meta.style.color = qr.stale ? "var(--warn)" : "var(--muted)";
 }
@@ -979,6 +1270,7 @@ function renderHealth(data) {
   const traffic = data.traffic || {};
   const scheduler = data.scheduler || {};
   const quota = data.quota || {};
+  healthQuotaPaused = Boolean(quota.paused);
   const memory = data.memory || {};
   const disk = data.disk || {};
   const backups = data.backups || {};
@@ -1012,16 +1304,33 @@ function renderHealth(data) {
 async function refreshHealth() {
   try {
     renderHealth(await api("/api/health/detail"));
+    healthReadFailed = false;
   } catch (err) {
+    healthReadFailed = true;
     $("health-state").className = "pill st-failed";
-    $("health-state").innerHTML = '<span class="dot"></span>异常';
+    $("health-state").innerHTML = '<span class="dot"></span>读取失败';
     $("health-hint").textContent = `读取失败：${err.message}`;
   }
+  if (state) renderGlobalBanner(state);
+}
+
+// alerts 未启用：新后端回 200 + enabled:false（老后端 503）。
+// 一旦探测到未启用就隐藏告警卡并停止轮询，不展示也绝不往 console 刷网络错误。
+let alertsDisabled = false;
+
+function disableAlertsCard() {
+  alertsDisabled = true;
+  const card = $("alerts-card");
+  if (card) card.hidden = true;
 }
 
 async function refreshAlerts() {
   try {
     const data = await api("/api/alerts");
+    if (data && data.enabled === false) {
+      disableAlertsCard();
+      return;
+    }
     const events = data.events || [];
     const summary = data.summary || {};
     $("alerts-hint").textContent = events.length
@@ -1030,17 +1339,41 @@ async function refreshAlerts() {
     const box = $("alerts-list");
     box.replaceChildren();
     if (!events.length) {
-      box.appendChild(memItem("—", "暂无活动事件"));
+      box.appendChild(emptyState("暂无活动事件"));
       return;
     }
     events.forEach((ev) => {
-      const status = ev.status === "resolved" ? "已恢复" : "告警";
-      const meta = `${status} · ${ev.severity || "info"} · ${ev.last_seen_at || ev.first_seen_at || ""}`;
-      box.appendChild(memItem(meta, `${ev.title || ev.rule}\n${ev.detail || ""}`));
+      const resolved = ev.status === "resolved";
+      const severity = (ev.severity || "info").toLowerCase();
+      const sevClass = { critical: "sev-critical", warning: "sev-warning", info: "sev-info" }[severity] || "sev-info";
+      const item = memItem(
+        `${ev.severity || "info"} · ${ev.last_seen_at || ev.first_seen_at || ""}`,
+        `${ev.title || ev.rule}\n${ev.detail || ""}`
+      );
+      item.classList.add("alert-item", sevClass);
+      if (resolved) item.classList.add("is-resolved");
+      // 命中状态与已恢复要一眼分得开，不能只靠文字。
+      const badge = document.createElement("span");
+      badge.className = `alert-badge ${resolved ? "resolved" : "firing"}`;
+      badge.textContent = resolved ? "已恢复" : "告警中";
+      item.querySelector(".mem-meta").prepend(badge);
+      box.appendChild(item);
     });
   } catch (err) {
+    if (/未启用|HTTP 503/.test(String(err.message))) {
+      disableAlertsCard();
+      return;
+    }
     $("alerts-hint").textContent = `读取失败：${err.message}`;
   }
+}
+
+// 统一空状态：跟记忆/会话一致的 .mem-empty，而不是塞一条 "—" 的假数据。
+function emptyState(text) {
+  const el = document.createElement("div");
+  el.className = "mem-empty";
+  el.textContent = text;
+  return el;
 }
 
 function auditItem(row) {
@@ -1066,14 +1399,14 @@ async function refreshAudit() {
     box.replaceChildren();
     const items = data.items || [];
     if (!items.length) {
-      box.appendChild(memItem("—", "暂无审计记录"));
+      box.appendChild(emptyState("暂无审计记录"));
       return;
     }
     items.forEach((row) => {
       box.appendChild(auditItem(row));
     });
   } catch (err) {
-    $("audit-list").replaceChildren(memItem("—", `读取失败：${err.message}`));
+    $("audit-list").replaceChildren(emptyState(`读取失败：${err.message}`));
   }
 }
 
@@ -1089,7 +1422,7 @@ async function refreshBackups() {
     const box = $("backup-list");
     box.replaceChildren();
     if (!items.length) {
-      box.appendChild(memItem("—", "暂无备份"));
+      box.appendChild(emptyState("暂无备份"));
     }
     items.forEach((backup) => {
       const meta = `${backup.created_at} · ${backup.reason} · ${fmtBytes(backup.size_bytes)} · schema v${backup.schema_version}`;
@@ -1170,21 +1503,6 @@ async function deleteBackup(id, filename) {
   }
 }
 
-async function apiUpload(path, form) {
-  const resp = await fetch(path, { method: "POST", body: form });
-  if (resp.status === 401) {
-    redirectToLogin();
-    throw new Error("登录已过期");
-  }
-  let data = null;
-  try { data = await resp.json(); } catch (_) { data = null; }
-  if (!resp.ok) {
-    const reason = (data && (data.error || data.stage)) || `HTTP ${resp.status}`;
-    throw new Error(reason);
-  }
-  return data;
-}
-
 async function restoreBackup() {
   const fileInput = $("backup-restore-file");
   const confirmInput = $("backup-restore-confirm");
@@ -1205,7 +1523,7 @@ async function restoreBackup() {
   const button = $("btn-backup-restore");
   button.disabled = true;
   try {
-    const data = await apiUpload("/api/backups/restore", form);
+    const data = await api("/api/backups/restore", { method: "POST", body: form });
     toast(data.result && data.result.ok === false ? "恢复完成但启动失败，见日志" : "恢复完成");
     fileInput.value = "";
     confirmInput.value = "";
@@ -1232,9 +1550,16 @@ async function sendTestAlert() {
   }
 }
 
-function chatLabel(item) {
-  const kind = item.chat_type === "group" ? "群" : "私聊";
-  return `${kind} ${item.chat_id}`;
+// 统一的会话名：既能传 {chat_type, chat_id} 对象，也能传 (type, id) 两个参数。
+function chatLabel(typeOrItem, id) {
+  let type;
+  if (typeof typeOrItem === "object" && typeOrItem !== null) {
+    type = typeOrItem.chat_type;
+    id = typeOrItem.chat_id;
+  } else {
+    type = typeOrItem;
+  }
+  return `${type === "group" ? "群" : "私聊"} ${id}`;
 }
 
 function memItem(meta, text) {
@@ -1255,6 +1580,11 @@ function renderMemory(data) {
   const impressions = (data && data.impressions) || [];
   const summaryBox = $("memory-summaries");
   const impressionBox = $("memory-impressions");
+
+  // 重建 DOM 前记住勾选与滚动位置，重建后恢复，避免刷新打断正在进行的选择。
+  const previouslyChecked = new Set(selectedImpressionIds());
+  const summaryScroll = summaryBox.scrollTop;
+  const impressionScroll = impressionBox.scrollTop;
 
   summaryBox.replaceChildren();
   impressionBox.replaceChildren();
@@ -1277,14 +1607,18 @@ function renderMemory(data) {
       pick.type = "checkbox";
       pick.value = String(i.id);
       pick.title = "选择后合并";
+      pick.setAttribute("aria-label", `选择印象 #${i.id} 用于合并`);
+      pick.checked = previouslyChecked.has(i.id);
       pick.addEventListener("change", updateMergeButton);
       const edit = document.createElement("button");
       edit.className = "btn";
       edit.textContent = "编辑";
+      edit.setAttribute("aria-label", `编辑印象 #${i.id}`);
       edit.addEventListener("click", () => editImpression(i));
       const remove = document.createElement("button");
       remove.className = "btn";
       remove.textContent = "删除";
+      remove.setAttribute("aria-label", `删除印象 #${i.id}`);
       remove.addEventListener("click", () => deleteImpression(i.id));
       actions.append(pick, edit, remove);
       item.appendChild(actions);
@@ -1293,6 +1627,10 @@ function renderMemory(data) {
   });
   if (!summaries.length) summaryBox.innerHTML = '<div class="mem-empty">库里还没有摘要</div>';
   if (!impressions.length) impressionBox.innerHTML = '<div class="mem-empty">库里还没有印象</div>';
+
+  summaryBox.scrollTop = summaryScroll;
+  impressionBox.scrollTop = impressionScroll;
+
   const summaryTotal = Number(data && data.summary_total);
   const impressionTotal = Number(data && data.impression_total);
   const totalShown = Number.isFinite(summaryTotal) && Number.isFinite(impressionTotal);
@@ -1324,12 +1662,6 @@ function renderMemory(data) {
   updateMergeButton();
 }
 
-const MEMORY_PAGE = 30;
-// 只在 /api/memory 没有 limit_max 的旧服务端上生效；正常路径读服务端字段。
-const MEMORY_PAGE_MAX_FALLBACK = 200;
-let memoryPageMax = MEMORY_PAGE_MAX_FALLBACK;
-let memoryLimit = MEMORY_PAGE;
-
 function memoryUrl() {
   const params = new URLSearchParams({ limit: String(memoryLimit) });
   const chatType = $("memory-chat-filter").value;
@@ -1338,12 +1670,14 @@ function memoryUrl() {
 }
 
 async function loadMemory() {
+  if (document.hidden) return; // 后台标签不刷新，回到前台由 visibilitychange 触发
   try {
     renderMemory(await api(memoryUrl()));
   } catch (err) {
     $("memory-summaries").replaceChildren();
     $("memory-impressions").replaceChildren();
     $("memory-hint").textContent = `读取失败：${err.message}`;
+    $("btn-more-memory").disabled = memoryLimit >= memoryPageMax;
   }
 }
 
@@ -1443,7 +1777,11 @@ function updateMergeButton() {
 }
 
 async function editImpression(impression) {
-  const next = prompt(`修改印象 #${impression.id} 的内容`, impression.content);
+  const next = await askModal({
+    title: `修改印象 #${impression.id} 的内容`,
+    value: impression.content,
+    note: "留空保存会被拒绝。",
+  });
   if (next === null) return;
   const content = next.trim();
   if (!content) { toast("印象内容不能为空", true); return; }
@@ -1466,12 +1804,18 @@ async function mergeSelectedImpressions() {
     `#memory-impressions input[type=checkbox][value="${ids[0]}"]`
   );
   const suggested = first ? first.closest(".mem-item").querySelector(".mem-text").textContent : "";
-  const next = prompt("合并后的内容（留空沿用第一条）", suggested);
+  const next = await askModal({
+    title: "合并后的内容（留空沿用第一条）",
+    value: suggested,
+    note: `将合并 ${ids.length} 条印象，其余 ${ids.length - 1} 条会被删除。`,
+  });
   if (next === null) return;
   const payload = { ids };
   const content = next.trim();
   if (content) payload.content = content;
   if (!confirm(`合并 ${ids.length} 条印象？其余 ${ids.length - 1} 条将被删除，且不可撤销。`)) return;
+  const button = $("btn-merge-impressions");
+  button.disabled = true;
   try {
     await api("/api/memory/impressions/merge", {
       method: "POST",
@@ -1481,11 +1825,9 @@ async function mergeSelectedImpressions() {
     loadMemory();
   } catch (err) {
     toast(`合并失败：${err.message}`, true);
+  } finally {
+    updateMergeButton();
   }
-}
-
-function chatName(type, id) {
-  return `${type === "group" ? "群" : "私聊"} ${id}`;
 }
 
 function fmtTokens(n) {
@@ -1494,8 +1836,6 @@ function fmtTokens(n) {
   if (value >= 10000) return `${(value / 10000).toFixed(1)}万`;
   return String(value);
 }
-
-let usageDays = 7;
 
 async function loadUsage() {
   try {
@@ -1528,7 +1868,7 @@ async function loadUsage() {
     const top = data.top || [];
     $("usage-top").innerHTML = top.length
       ? top.map((r) => `<div class="mem-item">
-          <div class="mem-meta">${chatName(r.chat_type, r.chat_id)}</div>
+          <div class="mem-meta">${chatLabel(r.chat_type, r.chat_id)}</div>
           <div class="mem-text">回复 ${r.calls} 次 · ${fmtTokens(r.tokens)} token${r.errors ? ` · 错误 ${r.errors}` : ""}</div>
         </div>`).join("")
       : '<div class="mem-empty">区间内还没有回复</div>';
@@ -1537,15 +1877,13 @@ async function loadUsage() {
     $("usage-errors").innerHTML = errors.length
       ? errors.map((r) => `<div class="mem-item">
           <div class="mem-meta">${r.at || "—"}</div>
-          <div class="mem-text">${chatName(r.chat_type, r.chat_id)}</div>
+          <div class="mem-text">${chatLabel(r.chat_type, r.chat_id)}</div>
         </div>`).join("")
       : '<div class="mem-empty">没有错误记录</div>';
   } catch (err) {
     $("usage-hint").textContent = `读取失败：${err.message}`;
   }
 }
-
-const SEARCH_PAGE = 20;
 
 function budgetRatio(used, limit) {
   const denominator = Number(limit) || 0;
@@ -1555,16 +1893,6 @@ function budgetRatio(used, limit) {
 
 function budgetCount(value) {
   return String(Math.trunc(Number(value) || 0));
-}
-
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, (char) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-  }[char]));
 }
 
 function budgetFillClass(ratio) {
@@ -1608,7 +1936,7 @@ function renderBudget(data) {
   const callsNote = dailyCalls > 0 ? `（上限 ${budgetCount(dailyCalls)}）` : "（未启用）";
   const tokensNote = dailyTokens > 0 ? `（上限 ${fmtTokens(dailyTokens)}）` : "（未启用）";
   $("budget-chat").innerHTML =
-    `${chatName(data.chat_type, data.chat_id)} · 本会话今日 ` +
+    `${chatLabel(data.chat_type, data.chat_id)} · 本会话今日 ` +
     `调用 <b>${chatCalls}</b> 次${callsNote} · Token <b>${fmtTokens(chatTokens)}</b>${tokensNote}`;
 
   const global = data.global_daily || {};
@@ -1644,7 +1972,12 @@ function renderBudget(data) {
     : '<span class="budget-muted">暂无预算预警</span>';
 }
 
-async function loadBudget() {
+// 入口统一挂防连点：刷新按钮和两个筛选下拉都走这里。
+function loadBudget() {
+  return withBusy($("btn-budget-refresh"), loadBudgetData);
+}
+
+async function loadBudgetData() {
   const chatType = $("budget-chat-type").value;
   const rawId = $("budget-chat-id").value.trim();
   const chatId = Number(rawId);
@@ -1661,11 +1994,6 @@ async function loadBudget() {
     resetBudget(`预算读取失败：${err.message}`);
   }
 }
-let searchOffset = 0;
-let searchTotal = 0;
-const SESSIONS_PAGE = 50;
-let sessionsOffset = 0;
-let sessionsTotal = 0;
 
 async function searchMessages(append) {
   const q = $("search-q").value.trim();
@@ -1684,7 +2012,7 @@ async function searchMessages(append) {
     if (!append) box.replaceChildren();
     items.forEach((m) => {
       const item = memItem(
-        `${chatName(m.chat_type, m.chat_id)} · ${m.at || "—"} · ${m.is_bot ? "大肥鱼" : m.nickname}`,
+        `${chatLabel(m.chat_type, m.chat_id)} · ${m.at || "—"} · ${m.is_bot ? "大肥鱼" : m.nickname}`,
         m.snippet || m.content
       );
       const actions = document.createElement("div");
@@ -1693,10 +2021,10 @@ async function searchMessages(append) {
       locate.className = "btn";
       locate.textContent = "定位";
       locate.title = "在时间线中查看这条消息";
-      locate.addEventListener("click", () => openTimeline(
+      locate.addEventListener("click", () => withBusy(locate, () => openTimeline(
         { chat_type: m.chat_type, chat_id: m.chat_id },
         m.message_id
-      ));
+      )));
       actions.appendChild(locate);
       item.appendChild(actions);
       box.appendChild(item);
@@ -1712,19 +2040,21 @@ async function searchMessages(append) {
 }
 
 async function loadSessions(append = false) {
+  if (document.hidden) return; // 后台标签不刷新，回到前台由 visibilitychange 触发
   try {
     if (!append) sessionsOffset = 0;
     const data = await api(`/api/sessions?limit=${SESSIONS_PAGE}&offset=${sessionsOffset}`);
     const items = data.items || [];
     sessionsTotal = Number(data.total || 0);
     const box = $("sessions");
+    const scrollTop = box.scrollTop;
     if (!append) box.replaceChildren();
     items.forEach((s) => {
       const row = document.createElement("div");
       row.className = "session-row";
       const who = document.createElement("div");
       who.className = "who";
-      who.textContent = chatName(s.chat_type, s.chat_id);
+      who.textContent = chatLabel(s.chat_type, s.chat_id);
       const meta = document.createElement("div");
       meta.className = "meta";
       const parts = [
@@ -1745,7 +2075,7 @@ async function loadSessions(append = false) {
         const btn = document.createElement("button");
         btn.className = `btn ${cls}`.trim();
         btn.textContent = label;
-        btn.addEventListener("click", onClick);
+        btn.addEventListener("click", () => withBusy(btn, onClick));
         acts.appendChild(btn);
       };
       add("查看时间线", "", () => openTimeline(s));
@@ -1758,12 +2088,14 @@ async function loadSessions(append = false) {
       box.appendChild(row);
     });
     sessionsOffset += items.length;
+    box.scrollTop = scrollTop;
     const loaded = box.querySelectorAll(".session-row").length;
     $("sessions-hint").textContent = `${loaded} / ${sessionsTotal} 个会话`;
     if (!loaded) box.innerHTML = '<div class="mem-empty">还没有会话记录</div>';
     $("btn-sessions-more").disabled = sessionsOffset >= sessionsTotal;
   } catch (err) {
     $("sessions-hint").textContent = `读取失败：${err.message}`;
+    $("btn-sessions-more").disabled = sessionsOffset >= sessionsTotal;
   }
 }
 
@@ -1784,7 +2116,7 @@ async function sessionAction(session, action, ask) {
 }
 
 async function hardDeleteSession(session) {
-  if (!confirm(`彻底删除 ${chatName(session.chat_type, session.chat_id)}？\n会删除远端 session 和本地全部消息、摘要、印象、用量，且不可恢复。`)) return;
+  if (!confirm(`彻底删除 ${chatLabel(session.chat_type, session.chat_id)}？\n会删除远端 session 和本地全部消息、摘要、印象、用量，且不可恢复。`)) return;
   try {
     await api(`/api/sessions/${session.chat_type}/${session.chat_id}`, { method: "DELETE" });
     toast("已彻底删除");
@@ -1803,25 +2135,8 @@ async function exportChat(session, format) {
     format,
   });
   try {
-    const resp = await fetch(`/api/memory/export?${params.toString()}`);
-    if (resp.status === 401) { redirectToLogin(); return; }
-    if (!resp.ok) {
-      let reason = `HTTP ${resp.status}`;
-      try {
-        const data = await resp.json();
-        reason = (data && data.error) || reason;
-      } catch (_) { /* 非 JSON 错误体 */ }
-      throw new Error(reason);
-    }
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `dafeiyu-${session.chat_type}-${session.chat_id}.${format === "json" ? "json" : "md"}`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    const blob = await fetchBlob(`/api/memory/export?${params.toString()}`);
+    downloadBlob(`dafeiyu-${session.chat_type}-${session.chat_id}.${format === "json" ? "json" : "md"}`, blob);
     toast("已开始下载");
   } catch (err) {
     toast(`导出失败：${err.message}`, true);
@@ -1830,26 +2145,9 @@ async function exportChat(session, format) {
 
 async function downloadBackup() {
   try {
-    const resp = await fetch("/api/backup");
-    if (resp.status === 401) { redirectToLogin(); return; }
-    if (!resp.ok) {
-      let reason = `HTTP ${resp.status}`;
-      try {
-        const data = await resp.json();
-        reason = (data && data.error) || reason;
-      } catch (_) { /* 非 JSON 错误体 */ }
-      throw new Error(reason);
-    }
-    const blob = await resp.blob();
+    const blob = await fetchBlob("/api/backup");
     const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `dafeiyu-backup-${stamp}.db`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    downloadBlob(`dafeiyu-backup-${stamp}.db`, blob);
     toast("已开始下载整库备份");
   } catch (err) {
     toast(`备份失败：${err.message}`, true);
@@ -1871,7 +2169,7 @@ async function loadConfig() {
       ["网关", c.gateway.provider],
     ];
     $("config-body").innerHTML = rows
-      .map(([label, value]) => `<div><b>${label}</b>：${value}</div>`)
+      .map(([label, value]) => `<div><b>${escapeHtml(label)}</b>：${escapeHtml(value)}</div>`)
       .join("");
     $("config-hint").textContent = "只读 · 改配置需编辑 config.yaml";
   } catch (err) {
@@ -1883,6 +2181,13 @@ async function loadConfig() {
 async function doControl(act, target) {
   const label = { start: "启动", stop: "停止", restart: "重启" }[act] || act;
   const name = target === "all" ? "全部进程" : (PROC_TITLE[target] || target);
+  // 停止 / 重启都会打断正在进行的对话，动手前先确认一次。
+  if (act === "stop" || act === "restart") {
+    const consequence = target === "all"
+      ? "全部进程会中断所有正在进行的对话"
+      : `${name} 会中断正在进行的对话`;
+    if (!confirm(`确认${label} ${name}？${consequence}，确定继续吗？`)) return;
+  }
   try {
     const res = await api(`/api/control/${act}`, {
       method: "POST",
@@ -2103,10 +2408,12 @@ async function openTimeline(session, anchorMessageId = null) {
   timelineNextBefore = null;
   timelineHasMore = false;
   const drawer = $("timeline-drawer");
+  timelineReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   drawer.hidden = false;
   $("timeline-backdrop").hidden = false;
   document.body.classList.add("timeline-open");
-  $("timeline-title").textContent = `会话时间线 · ${chatName(session.chat_type, session.chat_id)}`;
+  $("btn-timeline-close").focus();
+  $("timeline-title").textContent = `会话时间线 · ${chatLabel(session.chat_type, session.chat_id)}`;
   $("timeline-subtitle").textContent = "只读 · 消息与记忆上下文";
   $("timeline-messages").replaceChildren();
   $("timeline-metrics").replaceChildren();
@@ -2119,9 +2426,14 @@ async function openTimeline(session, anchorMessageId = null) {
 function closeTimeline() {
   timelineReq += 1;
   timelineTarget = null;
+  const wasOpen = !$("timeline-drawer").hidden;
   $("timeline-drawer").hidden = true;
   $("timeline-backdrop").hidden = true;
   document.body.classList.remove("timeline-open");
+  if (wasOpen && timelineReturnFocus && document.contains(timelineReturnFocus)) {
+    timelineReturnFocus.focus();
+  }
+  timelineReturnFocus = null;
 }
 
 function logLevelOf(line) {
@@ -2141,7 +2453,12 @@ function renderLogLines() {
     if (keyword && !line.toLowerCase().includes(keyword)) return false;
     return true;
   });
-  pre.textContent = lines.join("\n");
+  const joined = lines.join("\n");
+  // 内容没变就不重写 textContent，避免无谓重排打断滚动。
+  if (joined !== logRenderedText) {
+    pre.textContent = joined;
+    logRenderedText = joined;
+  }
   if (logFollow) pre.scrollTop = pre.scrollHeight;
   if (logPaused) {
     $("log-hint").textContent = `已暂停 · ${logPending} 行待显示`;
@@ -2205,7 +2522,9 @@ function downloadLog() {
 function setLogSource(source) {
   currentSource = source;
   document.querySelectorAll("#log-tabs .tab").forEach((el) => {
-    el.classList.toggle("active", el.dataset.source === source);
+    const active = el.dataset.source === source;
+    el.classList.toggle("active", active);
+    el.setAttribute("aria-selected", active ? "true" : "false");
   });
   if (eventSource) eventSource.close();
   if (logRenderTimer !== null) {
@@ -2216,6 +2535,7 @@ function setLogSource(source) {
   logPending = 0;
   logPaused = false;
   logFollow = true;
+  logRenderedText = null;
   $("btn-log-pause").textContent = "暂停";
   $("logs").textContent = "";
   $("log-hint").textContent = "连接中…";
@@ -2232,7 +2552,7 @@ function setLogSource(source) {
 
 function initTabs() {
   $("log-tabs").innerHTML = LOG_SOURCES.map(
-    (s) => `<span class="tab" data-source="${s}">${s}</span>`
+    (s) => `<button type="button" class="tab" role="tab" data-source="${s}" aria-selected="false">${escapeHtml(s)}</button>`
   ).join("");
   document.querySelectorAll("#log-tabs .tab").forEach((el) => {
     el.addEventListener("click", () => setLogSource(el.dataset.source));
@@ -2251,8 +2571,8 @@ document.addEventListener("click", (ev) => {
   }
 });
 
-$("btn-refresh-models").addEventListener("click", loadModels);
-$("btn-apply-brain").addEventListener("click", applyBrain);
+$("btn-refresh-models").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadModels));
+$("btn-apply-brain").addEventListener("click", (ev) => withBusy(ev.currentTarget, applyBrain));
 $("btn-refresh-health").addEventListener("click", refreshHealth);
 $("btn-refresh-alerts").addEventListener("click", refreshAlerts);
 $("btn-test-alert").addEventListener("click", sendTestAlert);
@@ -2262,8 +2582,8 @@ $("btn-backup-restore").addEventListener("click", restoreBackup);
 $("btn-rotate-token").addEventListener("click", rotateControlToken);
 $("btn-refresh-memory").addEventListener("click", loadMemory);
 $("delete-user-form").addEventListener("submit", deleteUserMessages);
-$("btn-summarize").addEventListener("click", triggerSummary);
-$("btn-extract").addEventListener("click", triggerExtract);
+$("btn-summarize").addEventListener("click", (ev) => withBusy(ev.currentTarget, triggerSummary));
+$("btn-extract").addEventListener("click", (ev) => withBusy(ev.currentTarget, triggerExtract));
 $("btn-merge-impressions").addEventListener("click", mergeSelectedImpressions);
 $("btn-more-memory").addEventListener("click", () => {
   if (memoryLimit >= memoryPageMax) return;
@@ -2283,13 +2603,13 @@ $("usage-days").addEventListener("change", (ev) => {
 $("btn-budget-refresh").addEventListener("click", loadBudget);
 $("budget-chat-type").addEventListener("change", loadBudget);
 $("budget-chat-id").addEventListener("change", loadBudget);
-$("btn-search").addEventListener("click", () => searchMessages(false));
+$("btn-search").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => searchMessages(false)));
 $("search-q").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter") searchMessages(false);
 });
-$("btn-search-more").addEventListener("click", () => searchMessages(true));
-$("btn-sessions-more").addEventListener("click", () => loadSessions(true));
-$("btn-refresh-sessions").addEventListener("click", () => loadSessions());
+$("btn-search-more").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => searchMessages(true)));
+$("btn-sessions-more").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadSessions(true)));
+$("btn-refresh-sessions").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadSessions()));
 $("btn-debug-trigger").addEventListener("click", runTriggerDebug);
 $("debug-content").addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
@@ -2299,9 +2619,6 @@ $("debug-content").addEventListener("keydown", (event) => {
 });
 $("btn-backup").addEventListener("click", downloadBackup);
 $("btn-refresh-config").addEventListener("click", loadConfig);
-$("btn-restart-bot").addEventListener("click", () => {
-  if (confirm("重启 Bot 进程？正在处理的对话会中断。")) doControl("restart", "bot");
-});
 $("btn-shutdown").addEventListener("click", async () => {
   if (!confirm("将停止 OpenCode / Bot / NapCat 三个进程并退出控制台，确定吗？")) return;
   try {
@@ -2342,7 +2659,12 @@ $("logs").addEventListener("scroll", () => {
   logFollow = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 40;
 });
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape" && !$("timeline-drawer").hidden) closeTimeline();
+  if (ev.key !== "Escape") return;
+  if (!$("impression-modal").hidden) {
+    $("impression-modal-cancel").click();
+    return;
+  }
+  if (!$("timeline-drawer").hidden) closeTimeline();
 });
 
 initTabs();
@@ -2358,7 +2680,7 @@ loadSessions();
 loadConfig();
 setInterval(refresh, 2000);
 setInterval(() => { if (!document.hidden) refreshHealth(); }, 10000);
-setInterval(() => { if (!document.hidden) refreshAlerts(); }, 10000);
+setInterval(() => { if (!document.hidden && !alertsDisabled) refreshAlerts(); }, 10000);
 setInterval(() => { if (!document.hidden) refreshBackups(); }, 30000);
 setInterval(loadMemory, 10000);
 setInterval(loadUsage, 30000);
@@ -2367,9 +2689,12 @@ setInterval(loadSessions, 15000);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   refreshHealth();
-  refreshAlerts();
+  if (!alertsDisabled) refreshAlerts();
   refreshBackups();
+  loadMemory();
+  loadSessions();
 });
+})();
 </script>
 </body>
 </html>

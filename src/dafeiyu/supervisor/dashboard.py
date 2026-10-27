@@ -340,11 +340,16 @@ def create_app(
         return web.json_response({**snapshot, "alerts": alerts})
 
     async def alerts(request: web.Request) -> web.Response:
+        # alerts.enabled=false（或运维服务未整体启用）时不再回 503：
+        # 面板轮询拿到 503 会在浏览器 console 刷网络错误，改为 200 + enabled:false 让前端优雅隐藏卡片。
         if ops is None or ops.alerts is None:
-            return ops_unavailable()
+            return web.json_response(
+                {"enabled": False, "events": [], "summary": {"firing": 0, "resolved_24h": 0}}
+            )
         try:
             return web.json_response(
                 {
+                    "enabled": True,
                     "events": ops.alerts.events(),
                     "summary": ops.alerts.summary(),
                 }
