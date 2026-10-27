@@ -27,6 +27,13 @@ _PLACEHOLDERS = {
     "file": "[文件]",
 }
 
+_CARD_FALLBACK = "[小程序卡片]"
+_XML_FALLBACK = "[卡片]"
+_FORWARD_FALLBACK = "[合并转发]"
+_FORWARD_MAX_DEPTH = 2
+_FORWARD_MAX_NODES = 10
+_FORWARD_NODE_CLIP = 60
+
 
 def _as_int(value: Any) -> int:
     try:
@@ -35,8 +42,93 @@ def _as_int(value: Any) -> int:
         return 0
 
 
+def _clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _render_json_card(data: dict[str, Any]) -> str:
+    """json 段（小程序/分享卡）：浅层两轮查找可读标题，失败回退占位。"""
+    try:
+        raw = data.get("data")
+        if isinstance(raw, str):
+            parsed = json.loads(raw)
+        elif isinstance(raw, dict):
+            parsed = raw
+        else:
+            return _CARD_FALLBACK
+        if not isinstance(parsed, dict):
+            return _CARD_FALLBACK
+        title = _find_card_title(parsed, depth=2)
+        if not title:
+            return _CARD_FALLBACK
+        return f"[卡片] {_clip(title, 80)}"
+    except Exception:
+        return _CARD_FALLBACK
+
+
+def _find_card_title(node: Any, depth: int) -> str | None:
+    """在 JSON 里限深查找 title/desc 文本（meta.newsApp.title 之类）。"""
+    if depth < 0 or not isinstance(node, dict):
+        return None
+    for key in ("title", "desc"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for value in node.values():
+        found = _find_card_title(value, depth - 1)
+        if found:
+            return found
+    return None
+
+
+def _render_xml_card(data: dict[str, Any]) -> str:
+    """xml 段：用 QQ 客户端生成的 summary，缺失回退占位。"""
+    try:
+        summary = str(data.get("summary", "")).strip()
+        if not summary:
+            return _XML_FALLBACK
+        return f"{_XML_FALLBACK} {_clip(summary, 80)}"
+    except Exception:
+        return _XML_FALLBACK
+
+
+def _render_forward(data: dict[str, Any], depth: int) -> str:
+    """合并转发：内联节点递归渲染成「昵称: 内容」，超限回退占位。"""
+    if depth >= _FORWARD_MAX_DEPTH:
+        return _FORWARD_FALLBACK
+    try:
+        content = data.get("content")
+        if not isinstance(content, list) or not content:
+            return _FORWARD_FALLBACK
+        lines: list[str] = []
+        for node in content[:_FORWARD_MAX_NODES]:
+            if not isinstance(node, dict):
+                continue
+            sender = node.get("sender")
+            name = ""
+            if isinstance(sender, dict):
+                name = str(sender.get("nickname") or sender.get("user_id") or "").strip()
+            name = name or "群友"
+            message = node.get("message", "")
+            if isinstance(message, str):
+                body = message.strip()
+            elif isinstance(message, list):
+                body, _segs, _rid, _rqq = _render_segments(message, depth + 1)
+            else:
+                body = ""
+            lines.append(f"{name}: {_clip(body, _FORWARD_NODE_CLIP)}")
+        if not lines:
+            return _FORWARD_FALLBACK
+        return "[聊天记录]\n" + "\n".join(lines)
+    except Exception:
+        return _FORWARD_FALLBACK
+
+
 def _render_segments(
     raw_segments: list[Any],
+    depth: int = 0,
 ) -> tuple[str, list[Segment], str | None, int | None]:
     parts: list[str] = []
     segments: list[Segment] = []
@@ -59,7 +151,13 @@ def _render_segments(
         elif seg_type == "reply":
             reply_id = str(data.get("id", ""))
             reply_qq = _as_int(data.get("qq")) or None
-        # 其余段类型（json/xml/未知）一律忽略，不抛异常
+        elif seg_type == "json":
+            parts.append(_render_json_card(data))
+        elif seg_type == "xml":
+            parts.append(_render_xml_card(data))
+        elif seg_type == "forward":
+            parts.append(_render_forward(data, depth))
+        # 其余未知段类型一律忽略，不抛异常
 
     return "".join(parts).strip(), segments, reply_id, reply_qq
 

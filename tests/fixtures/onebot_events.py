@@ -21,6 +21,34 @@ def reply(message_id: str | int) -> dict:
     return {"type": "reply", "data": {"id": str(message_id)}}
 
 
+def json_card(embedded: str) -> dict:
+    """json 段：data.data 为内嵌 JSON 字符串。"""
+    return {"type": "json", "data": {"data": embedded}}
+
+
+def xml_card(summary: str, xml: str = "<msg>payload</msg>") -> dict:
+    """xml 段：data.summary 为 QQ 客户端生成的摘要。"""
+    return {"type": "xml", "data": {"data": xml, "summary": summary}}
+
+
+def forward(*nodes: dict, forward_id: str = "") -> dict:
+    """合并转发段：有内联 content 节点，或只有 id。"""
+    data: dict = {}
+    if forward_id:
+        data["id"] = forward_id
+    if nodes:
+        data["content"] = list(nodes)
+    return {"type": "forward", "data": data}
+
+
+def forward_node(nickname: str, message: list[dict] | str, user_id: int = 0) -> dict:
+    return {
+        "sender": {"nickname": nickname, "user_id": user_id},
+        "time": 1730000000,
+        "message": message,
+    }
+
+
 def group_event(
     *,
     segments: list[dict],

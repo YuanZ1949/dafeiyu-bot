@@ -1,4 +1,18 @@
-from fixtures.onebot_events import at, face, group_event, image, private_event, reply, text
+import json
+
+from fixtures.onebot_events import (
+    at,
+    face,
+    forward,
+    forward_node,
+    group_event,
+    image,
+    json_card,
+    private_event,
+    reply,
+    text,
+    xml_card,
+)
 
 from dafeiyu.gateway.qq import parse_event
 from dafeiyu.models import ChatType
@@ -95,3 +109,124 @@ def test_to_prompt_line() -> None:
     m = parse_event(group_event(segments=[text("你好")]), bot_qq=BOT_QQ)
     assert m is not None
     assert m.to_prompt_line() == "鱼片: 你好"
+
+
+# --- json 卡片（小程序/分享卡） ---
+
+def test_json_segment_renders_title() -> None:
+    embedded = json.dumps({
+        "app": "com.tencent.miniapp",
+        "meta": {"newsApp": {"title": "今日份的猫猫视频"}},
+    }, ensure_ascii=False)
+    m = parse_event(group_event(segments=[text("看这个"), json_card(embedded)]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "看这个[卡片] 今日份的猫猫视频"
+
+
+def test_json_segment_deep_title_found() -> None:
+    embedded = json.dumps({"meta": {"detail": {"title": "深夜食堂"}}}, ensure_ascii=False)
+    m = parse_event(group_event(segments=[json_card(embedded)]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "[卡片] 深夜食堂"
+
+
+def test_json_segment_broken_falls_back() -> None:
+    m = parse_event(group_event(segments=[json_card("{这不是json")]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "[小程序卡片]"
+
+
+def test_json_segment_no_title_falls_back() -> None:
+    embedded = json.dumps({"app": "com.tencent.foo", "prompt": "[应用] 某应用"}, ensure_ascii=False)
+    m = parse_event(group_event(segments=[json_card(embedded)]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "[小程序卡片]"
+
+
+def test_json_segment_non_dict_data_falls_back() -> None:
+    m = parse_event(group_event(segments=[{"type": "json", "data": "oops"}]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "[小程序卡片]"
+
+
+# --- xml 卡片 ---
+
+def test_xml_segment_uses_summary() -> None:
+    m = parse_event(group_event(segments=[xml_card("[分享] 某网页标题")]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "[卡片] [分享] 某网页标题"
+
+
+def test_xml_segment_without_summary_falls_back() -> None:
+    m = parse_event(group_event(segments=[{"type": "xml", "data": {"data": "<msg/>"}}]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "[卡片]"
+
+
+# --- 合并转发 ---
+
+def test_forward_inline_nodes_rendered() -> None:
+    node = forward_node("张三", [text("明天下雨吗")])
+    node2 = forward_node("李四", [text("应该不会"), image()])
+    m = parse_event(group_event(segments=[forward(node, node2)]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "[聊天记录]\n张三: 明天下雨吗\n李四: 应该不会[图片]"
+
+
+def test_forward_node_string_message() -> None:
+    node = forward_node("王五", "直接文本")
+    m = parse_event(group_event(segments=[forward(node)]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "[聊天记录]\n王五: 直接文本"
+
+
+def test_forward_id_only_falls_back() -> None:
+    m = parse_event(group_event(segments=[forward(forward_id="abc123")]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "[合并转发]"
+
+
+def test_forward_empty_content_falls_back() -> None:
+    m = parse_event(group_event(segments=[{"type": "forward", "data": {"content": []}}]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "[合并转发]"
+
+
+def test_forward_nested_depth_capped() -> None:
+    # 深度上限 = 展开 2 层：表层(0)展开 → 外层(1)展开 → 中层(2)达上限回退占位
+    level2 = {"type": "forward", "data": forward(forward_node("中层", [text("中层发言")]))["data"]}
+    level1 = {"type": "forward", "data": forward(forward_node("外层", [text("外层发言"), level2]))["data"]}
+    outer = forward(forward_node("表层", [text("转来的"), level1]))
+    m = parse_event(group_event(segments=[outer]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert "表层: 转来的" in m.content
+    assert "外层: 外层发言" in m.content
+    # 中层的 forward 达到深度上限：不再展开，回退占位
+    assert "中层发言" not in m.content
+    assert "[合并转发]" in m.content
+
+
+def test_forward_node_count_capped() -> None:
+    nodes = [forward_node(f"群友{i}", [text(f"消息{i}")]) for i in range(15)]
+    m = parse_event(group_event(segments=[forward(*nodes)]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert "群友9: 消息9" in m.content
+    assert "群友10" not in m.content
+    assert m.content.count("\n") <= 10
+
+
+def test_forward_node_text_clipped() -> None:
+    long_text = "很长的发言" * 100
+    m = parse_event(group_event(segments=[forward(forward_node("话痨", [text(long_text)]))]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert "很长的发言" in m.content
+    assert len(m.content) < 400
+
+
+def test_card_segments_mixed_with_text_do_not_raise() -> None:
+    m = parse_event(
+        group_event(segments=[text("标题党"), xml_card("摘要"), {"type": "mystery", "data": {}}]),
+        bot_qq=BOT_QQ,
+    )
+    assert m is not None
+    assert m.content.startswith("标题党[卡片] 摘要")
