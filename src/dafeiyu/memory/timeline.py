@@ -14,7 +14,11 @@ from dafeiyu.models import Message
 from dafeiyu.timeutil import SHANGHAI
 
 TIMELINE_LIMIT = 20
-TIMELINE_HINT = "以上是自你上次开口以来的新消息，按时间顺序排列；现在回应最后一条。"
+TIMELINE_HINT = (
+    "以上是自你上次开口以来的新消息，按时间顺序排列。"
+    "通读整段再决定要不要开口：被 @ 或引用必须回；"
+    "其余情况只在你对整段讨论有自己的看法时才开口，回就回你的观点，不是逐条应答。"
+)
 BATCH_HEADER = "—— 以下是自你上次开口以来的新消息 ——"
 CONTINUATION_HEADER = "【接续】"
 EMPTY_CONTENT = "（无文字内容）"

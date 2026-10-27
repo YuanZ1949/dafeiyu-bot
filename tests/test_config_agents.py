@@ -189,6 +189,25 @@ def test_agents_permissions_and_persona_sync() -> None:
         assert marker in persona, marker
 
 
+def test_personas_share_discussion_principle() -> None:
+    """两份人设都必须带「综合评论」原则，防止只改一处再次漂移。"""
+    persona = PERSONA_FILE.read_text(encoding="utf-8")
+    agent = AGENT_FILE.read_text(encoding="utf-8")
+    for marker in ("这段讨论缺什么", "不是逐条应答", "反套路"):
+        assert marker in persona, f"persona.md 缺少 {marker}"
+        assert marker in agent, f"deepseek-qq.md 缺少 {marker}"
+
+
+def test_personas_share_example_and_protocol_judgement() -> None:
+    """综合回复示例要两份都有；speak 判断标准只在带协议的 agent 文件里，但必须存在。"""
+    persona = PERSONA_FILE.read_text(encoding="utf-8")
+    agent = AGENT_FILE.read_text(encoding="utf-8")
+    assert "多人讨论" in persona
+    assert "多人讨论" in agent
+    assert "判断标准" in agent
+    assert "不是对最后一条的应答" in agent
+
+
 def test_memory_agent_file_denies_all_tools() -> None:
     text = MEMORY_AGENT_FILE.read_text(encoding="utf-8")
     fm = text.split("---")[1]

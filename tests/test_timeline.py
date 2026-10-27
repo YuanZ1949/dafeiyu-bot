@@ -87,6 +87,13 @@ def test_skipped_messages_are_backfilled_with_timestamps(tmp_path) -> None:
     assert prompt.index("21:04") < prompt.index("21:05") < prompt.index("21:09")
 
 
+def test_hint_asks_for_synthesis_not_last_message_reply() -> None:
+    """情商改造：hint 不再催「回应最后一条」，改为通读整段、综合判断。"""
+    assert "回应最后一条" not in TIMELINE_HINT
+    assert "整段" in TIMELINE_HINT
+    assert "不是逐条应答" in TIMELINE_HINT
+
+
 def test_cursor_advances_after_delivery(tmp_path) -> None:
     store = make_store(tmp_path)
     store.add_message(make_msg("旧甲", "m1", timestamp=at(21, 0)))
