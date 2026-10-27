@@ -61,11 +61,13 @@ def init_config(
     return InitResult(target_path, True, source_path)
 
 
-def _port_free(port: int) -> bool:
+def _port_free(port: int, host: str = "127.0.0.1") -> bool:
     # 故意不设 SO_REUSEADDR：Windows 下设了会让 bind 在端口被占用时也成功。
+    # 面板可能绑在 0.0.0.0，必须按它实际的地址试，否则会误报「空闲」。
+    bind_host = "" if host in {"", "0.0.0.0", "::", "*"} else host
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         try:
-            sock.bind(("127.0.0.1", port))
+            sock.bind((bind_host, port))
         except OSError:
             return False
     return True
@@ -179,12 +181,16 @@ def preflight(
 
     if check_ports:
         ports = {
-            "NapCat 反向 WS": settings.ws_port,
-            "bot 控制口": settings.supervisor.control.port,
-            "运维面板": settings.supervisor.dashboard.port,
-            "opencode": settings.opencode.port,
+            "NapCat 反向 WS": (settings.ws_host, settings.ws_port),
+            "bot 控制口": ("127.0.0.1", settings.supervisor.control_port),
+            "运维面板": (settings.supervisor.dashboard.host, settings.supervisor.dashboard.port),
+            "opencode": (settings.opencode.host, settings.opencode.port),
         }
-        busy = [f"{name} {port}" for name, port in ports.items() if not _port_free(port)]
+        busy = [
+            f"{name} {port}"
+            for name, (host, port) in ports.items()
+            if not _port_free(port, host)
+        ]
         if busy:
             issues.append(
                 Issue(

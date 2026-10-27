@@ -108,3 +108,19 @@ def test_preflight_passes_when_everything_present(tmp_path, monkeypatch):
 
     assert issues == []
     assert "体检通过" in format_issues(issues)
+
+
+def test_preflight_port_check_reads_configured_ports(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("BOT_QQ", raising=False)
+    config = _config(tmp_path)
+    env = _write_env(tmp_path, BOT_QQ="10001", DEEPSEEK_API_KEY="sk-test")
+    napcat = tmp_path / "vendor" / "napcat"
+    napcat.mkdir(parents=True)
+    (napcat / "node.exe").write_bytes(b"")
+
+    issues = preflight(config, env, root=tmp_path, check_ports=True)
+
+    assert [issue.title for issue in issues if issue.title != "端口已被占用"] == []
+    for issue in issues:
+        assert issue.level in {"error", "warn"}
