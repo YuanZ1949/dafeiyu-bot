@@ -14,6 +14,9 @@ from ..memory.store import Store
 from ..models import ChatType
 from .client import BrainError, BrainReply, parse_brain_reply
 
+# 仓库根；发布包里 opencode.exe 放在 vendor/opencode/ 下随包分发。
+INSTALL_ROOT = Path(__file__).resolve().parents[3]
+
 
 @dataclass(frozen=True)
 class _RunResult:
@@ -30,7 +33,8 @@ def resolve_opencode_bin(configured: str = "") -> str:
     """找到真正的 opencode.exe。
 
     Windows 下 npm 会生成 opencode.cmd / opencode.ps1，直接传中文参数容易
-    被 shim 弄坏；这里优先返回 exe 本体。
+    被 shim 弄坏；这里优先返回 exe 本体。没装 Node/npm 的用户用随包下载的
+    ``vendor/opencode/opencode.exe``。
     """
     value = configured.strip()
     if value:
@@ -42,7 +46,7 @@ def resolve_opencode_bin(configured: str = "") -> str:
             return found
         raise BrainError(f"opencode.bin 不存在：{value}")
 
-    candidates: list[Path] = []
+    candidates: list[Path] = [INSTALL_ROOT / "vendor" / "opencode" / "opencode.exe"]
     found = shutil.which("opencode.exe")
     if found:
         candidates.append(Path(found))
