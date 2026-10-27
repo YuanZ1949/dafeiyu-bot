@@ -138,10 +138,61 @@ async def test_send_timeout_raises_gateway_error() -> None:
         await adapter.stop()
 
 
-async def test_send_without_connection_raises() -> None:
+async def test_send_without_connection_raises(caplog) -> None:
     adapter = make_adapter()
-    with pytest.raises(GatewayError):
+    with caplog.at_level("WARNING"), pytest.raises(GatewayError):
         await adapter.send(ChatType.GROUP, 1, "hi")
+    assert "QQ 网关未连接" in caplog.text
+    assert "send_group_msg" in caplog.text
+
+
+async def test_send_logs_delivery_receipt_with_real_message_id(caplog) -> None:
+    """送达留痕：成功时必须留 INFO，带 NapCat 返回的真实 message_id。"""
+    adapter = make_adapter()
+    await adapter.start()
+    try:
+        uri = f"ws://127.0.0.1:{adapter.port}"
+        async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
+            with caplog.at_level("INFO", logger="dafeiyu.gateway.qq"):
+                task = asyncio.create_task(adapter.send(ChatType.GROUP, 20001, "hi"))
+                raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
+                await ws.send(
+                    json.dumps(
+                        {
+                            "status": "ok",
+                            "retcode": 0,
+                            "data": {"message_id": 2098681382},
+                            "echo": raw["echo"],
+                        }
+                    )
+                )
+                await asyncio.wait_for(task, 2)
+            assert "msg_id=2098681382" in caplog.text
+            assert "send_group_msg" in caplog.text
+            assert "group/20001" in caplog.text
+    finally:
+        await adapter.stop()
+
+
+async def test_send_failure_logs_retcode(caplog) -> None:
+    adapter = make_adapter()
+    await adapter.start()
+    try:
+        uri = f"ws://127.0.0.1:{adapter.port}"
+        async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
+            with caplog.at_level("WARNING", logger="dafeiyu.gateway.qq"):
+                task = asyncio.create_task(adapter.send(ChatType.GROUP, 1, "hi"))
+                raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
+                await ws.send(
+                    json.dumps(
+                        {"status": "failed", "retcode": 1200, "data": None, "echo": raw["echo"]}
+                    )
+                )
+                with pytest.raises(GatewayError):
+                    await asyncio.wait_for(task, 2)
+            assert "retcode=1200" in caplog.text
+    finally:
+        await adapter.stop()
 
 
 async def test_reply_to_bot_message_sets_flag() -> None:

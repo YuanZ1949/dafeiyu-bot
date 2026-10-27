@@ -292,13 +292,18 @@ class QQAdapter:
         self._fail_pending(GatewayError("QQ 网关已关闭"))
 
     async def send(self, chat_type: ChatType, chat_id: int, text: str) -> None:
-        ws = self._ws
-        if ws is None:
-            raise GatewayError("QQ 网关未连接")
         if chat_type is ChatType.GROUP:
             action, params = "send_group_msg", {"group_id": chat_id, "message": text}
         else:
             action, params = "send_private_msg", {"user_id": chat_id, "message": text}
+
+        target = f"{chat_type.value}/{chat_id}"
+        ws = self._ws
+        if ws is None:
+            logger.warning(
+                "消息发送失败 %s %s chars=%d：QQ 网关未连接", action, target, len(text)
+            )
+            raise GatewayError("QQ 网关未连接")
 
         echo = str(next(self._echo))
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -307,12 +312,23 @@ class QQAdapter:
             await ws.send(json.dumps({"action": action, "params": params, "echo": echo}, ensure_ascii=False))
             data = await asyncio.wait_for(future, self._send_timeout)
         except asyncio.TimeoutError as exc:
+            logger.warning(
+                "消息发送失败 %s %s chars=%d：等待响应超时", action, target, len(text)
+            )
             raise GatewayError(f"{action} 等待响应超时") from exc
+        except GatewayError as exc:
+            # 留痕：retcode/status 只在这里可见，调用方只知道"失败"。
+            logger.warning("消息发送失败 %s %s chars=%d：%s", action, target, len(text), exc)
+            raise
         finally:
             self._pending.pop(echo, None)
 
         self.last_send_at = time.time()
         message_id = data.get("message_id")
+        # 送达留痕：真实 message_id 是唯一能和 QQ 服务端对账的凭据，必须落日志。
+        logger.info(
+            "消息已发送 %s %s msg_id=%s chars=%d", action, target, message_id, len(text)
+        )
         if message_id is not None:
             try:
                 self.bot_message_ids.append(int(message_id))
