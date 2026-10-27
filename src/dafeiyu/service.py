@@ -15,10 +15,10 @@ from .commands import CommandRegistry, CommandSpec
 from .config import InjectionConfig, Settings
 from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
-from .memory.context import build_context, build_injection
+from .memory.context import build_injection
 from .memory.rotation import apply_rotation, needs_rotation
 from .memory.store import Store
-from .memory.timeline import build_batch_prompt, build_delivery
+from .memory.timeline import TIMELINE_LIMIT, build_batch_prompt
 from .memory.workspace import Workspace
 from .models import ChatType, Message
 from .router import Router, now_shanghai
@@ -790,39 +790,25 @@ class Service:
 
         await self._maybe_rotate(chat_type, chat_id)
 
-        injection_cfg = self.injection or InjectionConfig()
-        recall_queries = [
-            message.content
-            for message in batch
-            if not message.is_bot and message.content.strip()
-        ][-3:]
-        exclude_ids = {message.message_id for message in batch}
-        if injection_cfg.recall_enabled:
-            exclude_ids.update(
-                message.message_id
-                for message in self.store.recent_messages(
-                    chat_type, chat_id, self.settings.memory.window_size
-                )
-            )
-        injection = build_injection(
-            self.store,
-            self.workspace,
+        prompt = self._build_prompt(
             chat_type,
             chat_id,
-            injection_cfg,
-            today=now_shanghai().date().isoformat(),
-            recall_queries=recall_queries,
-            exclude_ids=exclude_ids,
-        )
-        prompt = build_batch_prompt(
             batch,
-            injection,
             continuation=self._continuations.get(key),
         )
 
+        log.info(
+            "批次送审 %s/%s ids=%d addressed=%s",
+            chat_type.value,
+            chat_id,
+            len(batch),
+            addressed,
+        )
         hint = self._tool_hint(chat_type, chat_id)
         try:
-            reply = await self.brain.reply(chat_type, chat_id, prompt, on_tool=hint)
+            reply = await self._call_brain(
+                chat_type, chat_id, batch, prompt, on_tool=hint
+            )
         except BrainError as exc:
             # 失败也占一次调用额度；游标随 mark_skipped 推进，不重投（补话已经告诉用户了）。
             self.store.record_usage(chat_type, chat_id, "error", 0, 0)
@@ -868,6 +854,13 @@ class Service:
     ) -> list[str]:
         """把批次回复分片发出并入库；返回真正发出去的分片。"""
         if not reply.speak:
+            log.info(
+                "模型选择不说 %s/%s ids=%d reason=%s",
+                chat_type.value,
+                chat_id,
+                len(batch),
+                (reply.reason or "-").strip()[:120],
+            )
             return []
         chunks = shape_reply(
             reply.reply,
@@ -973,42 +966,149 @@ class Service:
         )
 
     async def _ask_brain(self, msg: Message) -> BrainReply:
-        """OpenCode 模式走会话接口；本地模式仍走原来的上下文拼装。"""
-        responder = getattr(self.brain, "reply", None)
-        if callable(responder):
-            # 一个群共用一个 OpenCode session，必须让模型看到是谁在说话；
-            # 被规则跳过的消息也要补上，否则模型会把「你没回我」当成网络问题。
-            prompt, delivered = build_delivery(self.store, msg)
-            hint = os_probability_hint(self.settings.persona.os_probability)
-            if hint:
-                # 人设文件写死了默认概率，配置偏离时只能逐轮纠偏。
-                prompt = f"{prompt}\n\n{hint}"
-            reply = await responder(msg.chat_type, msg.chat_id, prompt)
-            # 只有真正送到模型那里才记账；失败时整批留到下一次重投。
-            self.store.mark_delivered(msg.chat_type, msg.chat_id, *delivered)
-            return reply
+        """单条消息与批次共用同一 prompt 构建；provider 差异只在 _call_brain 里。"""
+        omitted, pending = self.store.pending_messages(
+            msg.chat_type, msg.chat_id, msg.message_id, TIMELINE_LIMIT
+        )
+        current = pending or [msg]
+        prompt = self._build_prompt(
+            msg.chat_type, msg.chat_id, current, omitted=omitted
+        )
+        hint = os_probability_hint(self.settings.persona.os_probability)
+        if hint:
+            # 人设文件写死了默认概率，配置偏离时只能逐轮纠偏。
+            prompt = f"{prompt}\n\n{hint}"
+        log.info(
+            "消息送审 %s/%s id=%s ids=%d",
+            msg.chat_type.value,
+            msg.chat_id,
+            msg.message_id,
+            len(current),
+        )
+        reply = await self._call_brain(msg.chat_type, msg.chat_id, current, prompt)
+        # 只有真正送到模型那里才记账；失败时留到下一次重投。
+        self.store.mark_delivered(
+            msg.chat_type, msg.chat_id, *[m.message_id for m in current]
+        )
+        return reply
 
-        today = now_shanghai().date().isoformat()
-        chat_title = "本群" if msg.chat_type is ChatType.GROUP else msg.nickname
-        system = build_system_prompt(
+    def _build_prompt(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        messages: list[Message],
+        *,
+        continuation: str | None = None,
+        omitted: int = 0,
+    ) -> str:
+        """三种模式共用的 prompt：长期记忆注入 + 时间线（单条也走这里）。"""
+        injection_cfg = self.injection or InjectionConfig()
+        recall_queries = [
+            message.content
+            for message in messages
+            if not message.is_bot and message.content.strip()
+        ][-3:]
+        exclude_ids = {message.message_id for message in messages}
+        if injection_cfg.recall_enabled:
+            exclude_ids.update(
+                message.message_id
+                for message in self.store.recent_messages(
+                    chat_type, chat_id, self.settings.memory.window_size
+                )
+            )
+        injection = build_injection(
+            self.store,
+            self.workspace,
+            chat_type,
+            chat_id,
+            injection_cfg,
+            today=now_shanghai().date().isoformat(),
+            recall_queries=recall_queries,
+            exclude_ids=exclude_ids,
+        )
+        return build_batch_prompt(
+            messages, injection, continuation=continuation, omitted=omitted
+        )
+
+    async def _call_brain(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        messages: list[Message],
+        prompt: str,
+        *,
+        on_tool: Any = None,
+    ) -> BrainReply:
+        """唯一的大脑调用入口；会话型与无状态型的差异都收在这里。"""
+        responder = getattr(self.brain, "reply", None)
+        if not callable(responder):
+            # 旧 brain 只有 decide：保留兜底，切换期也不至于直接崩。
+            return await self.brain.decide(
+                self._system_prompt(chat_type, messages),
+                [{"role": "user", "content": prompt}],
+            )
+        if getattr(self.brain, "accepts_history", False):
+            return await responder(
+                chat_type,
+                chat_id,
+                prompt,
+                system=self._system_prompt(chat_type, messages),
+                history=self._history_before(chat_type, chat_id, messages),
+                on_tool=on_tool,
+            )
+        if on_tool is None:
+            # 单条路径历来不传 on_tool，旧的 brain/fake 只认三个位置参数。
+            return await responder(chat_type, chat_id, prompt)
+        return await responder(chat_type, chat_id, prompt, on_tool=on_tool)
+
+    def _system_prompt(self, chat_type: ChatType, messages: list[Message]) -> str:
+        chat_title = (
+            "本群"
+            if chat_type is ChatType.GROUP
+            else (messages[-1].nickname if messages else "私聊")
+        )
+        return build_system_prompt(
             self.persona_text,
             chat_title,
-            today,
+            now_shanghai().date().isoformat(),
             self.settings.persona.max_reply_chars,
             self.settings.persona.max_reply_chars_technical,
             self.settings.persona.os_probability,
+            tools_enabled=self._tools_enabled(),
         )
-        ctx = build_context(
-            self.store,
-            msg.chat_type,
-            msg.chat_id,
-            self.settings.memory.window_size,
-            self.settings.memory.impression_topk,
-            system,
-            today,
-            upto_message_id=msg.message_id,
+
+    def _tools_enabled(self) -> bool:
+        """只有 opencode 且工作区开着时，模型才真的有 read/edit/webfetch。"""
+        return (
+            bool(getattr(self.brain, "supports_tools", False))
+            and self.workspace is not None
         )
-        return await self.brain.decide(ctx.system, ctx.messages)
+
+    def _history_before(
+        self, chat_type: ChatType, chat_id: int, messages: list[Message]
+    ) -> list[dict[str, str]]:
+        """无状态大脑的历史：本批之前的最近 window_size 条，role 按是否 bot 区分。"""
+        window = max(0, int(self.settings.memory.window_size))
+        if not window or not messages:
+            return []
+        batch_ids = {message.message_id for message in messages}
+        rows = self.store.recent_messages(
+            chat_type,
+            chat_id,
+            window + len(messages),
+            upto_message_id=messages[0].message_id,
+        )
+        history: list[dict[str, str]] = []
+        for message in rows:
+            if message.message_id in batch_ids or not message.content.strip():
+                continue
+            history.append(
+                {
+                    "role": "assistant" if message.is_bot else "user",
+                    "content": message.to_prompt_line(),
+                }
+            )
+        return history[-window:]
 
     async def _reply(self, msg: Message) -> None:
         try:
@@ -1037,6 +1137,13 @@ class Service:
         )
 
         if not reply.speak:
+            log.info(
+                "模型选择不说 %s/%s id=%s reason=%s",
+                msg.chat_type.value,
+                msg.chat_id,
+                msg.message_id,
+                (reply.reason or "-").strip()[:120],
+            )
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
 

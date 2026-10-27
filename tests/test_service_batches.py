@@ -100,6 +100,32 @@ class FakeTokenBrain:
         pass
 
 
+class FakeStatelessBrain:
+    """有 reply、但要靠 service 显式给历史 —— 对应真实 BrainClient。"""
+
+    accepts_history = True
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def reply(
+        self, chat_type, chat_id, text, *, system, history, on_tool=None
+    ) -> BrainReply:
+        self.calls.append(
+            {
+                "chat_type": chat_type,
+                "chat_id": chat_id,
+                "prompt": text,
+                "system": system,
+                "history": list(history),
+            }
+        )
+        return BrainReply(True, "在呢", "test", 10, 5)
+
+    async def aclose(self) -> None:
+        pass
+
+
 def make_msg(
     content: str = "hi",
     *,
@@ -179,6 +205,73 @@ async def test_no_reply_method_falls_back_to_rules(tmp_path):
 
     assert service.scheduler is None
     assert brain.calls == 1
+
+
+async def test_stateless_brain_runs_through_same_batch_pipeline(tmp_path):
+    brain = FakeStatelessBrain()
+    service, _, _, _ = build(tmp_path, brain=brain, batch_seconds=0.0)
+
+    await service.handle(make_msg("第一句", message_id="m1"))
+    await service.drain()
+
+    assert service.scheduler is not None
+    assert len(brain.calls) == 1
+    call = brain.calls[0]
+    # 和 opencode 同一份 prompt 构建：注入段 + 时间线。
+    assert "—— 以下是自你上次开口以来的新消息 ——" in call["prompt"]
+    assert "第一句" in call["prompt"]
+    assert call["system"]
+
+
+def test_tools_enabled_requires_tool_brain_and_workspace(tmp_path) -> None:
+    """只有「大脑支持工具 + 工作区开着」才把查网页/记笔记写进 system。"""
+    brain = FakeStatelessBrain()
+    service, _, _, _ = build(tmp_path, brain=brain)
+
+    assert service._tools_enabled() is False
+
+    brain.supports_tools = True  # type: ignore[attr-defined]
+    assert service._tools_enabled() is False  # workspace 关着
+
+    service.workspace = object()  # type: ignore[assignment]
+    assert service._tools_enabled() is True
+
+
+async def test_stateless_history_contains_prior_turns(tmp_path):
+    brain = FakeStatelessBrain()
+    service, store, _, _ = build(tmp_path, brain=brain)
+    store.add_message(make_msg("第一句", message_id="m0"))
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id=1001,
+            user_id=999,
+            nickname="溟月",
+            content="旧回复",
+            message_id="m0:bot:0",
+            is_bot=True,
+        )
+    )
+    current = make_msg("第二句", message_id="m1")
+
+    history = service._history_before(ChatType.GROUP, 1001, [current])
+
+    assert [item["role"] for item in history] == ["user", "assistant"]
+    assert "第一句" in history[0]["content"]
+    assert history[1]["content"] == "溟月: 旧回复"
+    assert all("第二句" not in item["content"] for item in history)
+
+
+async def test_speak_false_is_logged_as_a_decision(tmp_path, caplog):
+    brain = FakeOpenCodeBrain(speak=False)
+    service, _, _, _ = build(tmp_path, brain=brain, batch_seconds=0.0)
+
+    await service.handle(make_msg("hi"))
+    with caplog.at_level("INFO"):
+        await service.drain()
+
+    assert "模型选择不说" in caplog.text
+    assert "reason=test" in caplog.text
 
 
 async def test_drain_flushes_due_batch(tmp_path):

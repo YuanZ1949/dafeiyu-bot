@@ -22,6 +22,7 @@ from .brain.factory import (
     mode_status,
     normalize_provider,
 )
+from .brain.lmstudio import ensure_server
 from . import __version__
 from .budget import BudgetGuard
 from .config import ConfigError, Settings
@@ -510,6 +511,13 @@ class BrainControl:
             )
             if target == before and (target != "local_model" or (model or before_model) == before_model):
                 return self.snapshot()
+
+            if target == "local_model":
+                # 端点没起就先把 LM Studio 拉起来；失败也继续切换，只记日志。
+                await ensure_server(
+                    self.settings.local_model,
+                    model or local_model_name(self.settings, self.runtime),
+                )
 
             try:
                 brain = build_brain(self.settings, self.store, target, model)

@@ -72,12 +72,14 @@ def build_batch_prompt(
     injection: str,
     *,
     continuation: str | None = None,
+    omitted: int = 0,
 ) -> str:
     """批次 prompt：注入段 →（接续）→ 新消息时间线。
 
     三段注入必须留在最前、时间线留在最后（模型对末尾更敏感）。
     at_bot / reply_to_bot 随消息一起落库，每条按自己的标志渲染标记，
     模型才知道哪几句是对它说的、是 @ 还是引用回复。
+    单条路径复用同一构建器，omitted 是更早未展开的消息数（由 pending 查询给出）。
     """
     parts: list[str] = []
     if injection.strip():
@@ -86,7 +88,10 @@ def build_batch_prompt(
         parts.append(f"{CONTINUATION_HEADER}\n{continuation}")
 
     if messages:
-        lines = [BATCH_HEADER]
+        lines: list[str] = []
+        if omitted:
+            lines.append(f"（更早还有 {omitted} 条消息未展开）")
+        lines.append(BATCH_HEADER)
         for msg in messages:
             current = msg if (msg.at_bot or msg.reply_to_bot) else None
             lines.append(format_message_line(msg, current=current))

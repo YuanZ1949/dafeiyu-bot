@@ -134,6 +134,18 @@ async def test_speak_false_records_usage_without_sending(tmp_path):
     assert calls == 1
 
 
+async def test_private_speak_false_is_logged_as_a_decision(tmp_path, caplog):
+    service, _, _, adapter, _ = build(tmp_path, brain=FakeOpenCodeBrain(speak=False))
+
+    with caplog.at_level("INFO"):
+        await service.handle(
+            make_msg(chat_type=ChatType.PRIVATE, content="你好", message_id="p1")
+        )
+
+    assert adapter.sent == []
+    assert "模型选择不说" in caplog.text
+
+
 async def test_private_bypasses_cooldown(tmp_path):
     service, _, brain, adapter, _ = build(tmp_path)
     await service.handle(make_msg(chat_type=ChatType.PRIVATE, content="你好", message_id="p1"))
@@ -253,7 +265,10 @@ async def test_opencode_brain_receives_speaker_and_chat(tmp_path):
     brain = FakeOpenCodeBrain()
     service, _, _, adapter, _ = build(tmp_path, brain=brain)
     await service.handle(make_msg())
-    assert brain.calls == [(ChatType.GROUP, 1001, "阿鱼：@溟月 在吗（@了你）")]
+    # 单条消息也走批次构建器：带时间线表头，行内仍标出说话人与 @。
+    assert brain.calls == [
+        (ChatType.GROUP, 1001, "—— 以下是自你上次开口以来的新消息 ——\n阿鱼：@溟月 在吗（@了你）")
+    ]
     assert adapter.sent == [(ChatType.GROUP, 1001, "在呢")]
     assert "[人设覆盖]" not in brain.calls[0][2]
 

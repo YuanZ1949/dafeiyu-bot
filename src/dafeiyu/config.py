@@ -165,6 +165,11 @@ class LocalModelConfig:
     # 旁路调用（印象/摘要）600 token 内 content 恒空。置 "none" 关掉思考；
     # 留空 = 不发该字段，保持对旧后端的兼容。
     reasoning_effort: str = ""
+    # 切到本地模型时若端点没起，自动用 lms CLI 拉起 LM Studio server。
+    autostart: bool = True
+    # 留空自动找 ~/.lmstudio/bin/lms.exe 或 PATH 里的 lms。
+    lms_path: str = ""
+    autostart_timeout_seconds: float = 20.0
 
 
 @dataclass(frozen=True)
@@ -714,6 +719,12 @@ def load_settings(
             local_model_raw.get("timeout_seconds", 60.0), "local_model.timeout_seconds"
         ),
         reasoning_effort=str(local_model_raw.get("reasoning_effort") or "").strip(),
+        autostart=bool(local_model_raw.get("autostart", True)),
+        lms_path=str(local_model_raw.get("lms_path") or "").strip(),
+        autostart_timeout_seconds=_float(
+            local_model_raw.get("autostart_timeout_seconds", 20.0),
+            "local_model.autostart_timeout_seconds",
+        ),
     )
     if not local_model.base_url:
         raise ConfigError("local_model.base_url 不能为空")
@@ -721,6 +732,8 @@ def load_settings(
         raise ConfigError("local_model.max_tokens 必须大于等于 256")
     if local_model.timeout_seconds <= 0:
         raise ConfigError("local_model.timeout_seconds 必须大于 0")
+    if local_model.autostart_timeout_seconds <= 0:
+        raise ConfigError("local_model.autostart_timeout_seconds 必须大于 0")
 
     opencode_raw = raw.get("opencode") or {}
     if not isinstance(opencode_raw, dict):

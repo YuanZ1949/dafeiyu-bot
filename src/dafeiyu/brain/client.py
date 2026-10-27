@@ -264,6 +264,29 @@ class BrainClient:
         )
         return replace(reply, estimated=True) if estimated else reply
 
+    async def reply(
+        self,
+        chat_type: object,
+        chat_id: int,
+        prompt: str,
+        *,
+        system: str = "",
+        history: list[dict] | None = None,
+        on_tool: object = None,
+    ) -> BrainReply:
+        """与 OpenCode 对齐的入口：无状态端点靠显式历史获得连续性。
+
+        chat_type / chat_id / on_tool 是为接口一致性保留的；本地端点没有
+        session，也接不了工具回调，历史由 service 按 window_size 拼好传进来。
+        """
+        messages = [*(history or []), {"role": "user", "content": prompt}]
+        return await self.decide(system, messages)
+
+    # service 只在为 True 时才传 system/history，避免改坏只认旧签名的 brain。
+    accepts_history = True
+    # 纯聊天端点没有任何工具（read/edit/webfetch 都没有）。
+    supports_tools = False
+
     async def complete(
         self,
         system: str,

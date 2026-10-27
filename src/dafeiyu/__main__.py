@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from .brain.client import BrainError
 from .brain.factory import build_brain, current_provider, local_model_name
+from .brain.lmstudio import ensure_server
 from .brain.opencode import resolve_opencode_bin
 from .brain.opencode_server import OpenCodeServer
 from .brain.runtime_config import server_env
@@ -149,6 +150,12 @@ async def main() -> None:
 
     try:
         runtime = load_runtime()
+        if provider == "local_model":
+            # 上次是本地模型：启动时就把端点准备好，别等第一条消息超时。
+            await ensure_server(
+                settings.local_model,
+                local_model_name(settings, runtime),
+            )
         effective_server_url = settings.opencode.server_url
         if provider == "opencode" and settings.opencode.manage_server:
             try:

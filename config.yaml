@@ -59,6 +59,11 @@ local_model:
   # qwen3.5 这类强思考模型会把 600 token 预算全烧在 reasoning 上，
   # 旁路（印象/摘要）content 恒空。none = 关掉思考；留空 = 不发该字段。
   reasoning_effort: none
+  # 切到本地模型时若 1234 没起，自动用 lms CLI 拉起 LM Studio。
+  autostart: true
+  # 留空自动找 ~/.lmstudio/bin/lms.exe 或 PATH 里的 lms。
+  lms_path: ""
+  autostart_timeout_seconds: 20
 
 supervisor:
   dashboard:
