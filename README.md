@@ -112,19 +112,20 @@ powershell -ExecutionPolicy Bypass -File scripts/setup-napcat.ps1 -Proxy http://
 - 消息格式：`array`（必须是 array，否则 @ 识别不到）
 - Token：与 `.env` 的 `NAPCAT_WS_TOKEN` 一致
 
-一键启动（先开 NapCat 窗口，再启动 bot）：
+一键启动：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1
 ```
 
-NapCat 窗口里用 `BOT_QQ` 对应的小号扫码登录。二维码也会保存到
-`vendor/napcat/napcat/cache/qrcode.png`。登录成功后，bot 日志会出现 `NapCat 已连接`。
+supervisor 会托管三个进程：OpenCode（大脑）、bot、NapCat。NapCat 用
+`-q <BOT_QQ>` 带上本地票据自动登录，**只有首次登录或票据失效时**才需要扫码：
+二维码保存到 `vendor/napcat/napcat/cache/qrcode.png`，面板的「登录二维码」卡片
+也会显示。登录成功后，bot 日志会出现 `NapCat 已连接`。
 
 ### 扫码页与二维码刷新
 
-终端里的二维码太小，`start-all.ps1` 会自动在后台启动一个二维码助手，等二维码生成后
-用默认浏览器打开放大版登录页：
+终端的二维码太小，用二维码助手打开放大版登录页：
 
 ```text
 vendor/napcat/napcat/cache/qrcode.html
@@ -137,15 +138,14 @@ QQ 服务端的单张二维码有效期约 2 分钟，无法从 NapCat 侧改长
 重新拉取，页面持续跟着更新，所以不用抢时间。
 
 ```powershell
-# 只生成/打开二维码页，不启动 bot
+# 生成并打开二维码页（不启动其他进程）
 powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1
 
 # 用系统图片查看器打开 qrcode-big.png（不会自动跟随刷新）
 powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
-
-# 启动时不要自动打开二维码页
-powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoQr
 ```
+
+> 面板的「登录二维码」卡片与 `GET /api/qr/image` 也能看到最新二维码。
 
 > 如果改了 `.env` 里的 `BOT_QQ`、`NAPCAT_WS_PORT` 或 `NAPCAT_WS_TOKEN`，重跑一次
 > `setup-napcat.ps1` 刷新 OneBot 配置；`-Force` 只用于重新下载 NapCat 本体。
@@ -195,15 +195,33 @@ powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1 -NoQr
 当前会话的 per-chat 额度在 `/budget` 和面板预算卡显示；单群预警不进入 supervisor
 告警通道。`alerts.rules.budget_warning` 可单独关闭预算预警。
 
-## 3. 启动
+## 3. 启动与停止
+
+日常用 `scripts/start-all.ps1`（或直接双击 `scripts/start.bat`，效果相同）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/start.ps1
+powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1
 ```
 
-脚本会：创建/复用 `.venv` → 安装依赖 → 检查 `.env` 与 `config.yaml` → 启动服务。
+它会在后台（隐藏窗口）拉起 supervisor，轮询 `/api/health` 直到面板就绪，并按
+`config.yaml` 的 `dashboard.open_browser` 决定是否打开浏览器。
 
-看到下面两行就说明链路通了：
+| 想做的事 | 命令 |
+| --- | --- |
+| 双击启动 | 双击 `scripts/start.bat` |
+| 命令行启动 | `powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1` |
+| 启动但不弹浏览器 | 加 `-NoBrowser` |
+| 停止（含 bot / OpenCode / NapCat） | `powershell -ExecutionPolicy Bypass -File scripts/stop.ps1` |
+| 首次安装依赖 / 只跑 bot 调试 | `powershell -ExecutionPolicy Bypass -File scripts/start.ps1` |
+
+`scripts/start.ps1` 与 supervisor 互斥：它会直接在前台运行 `python -m dafeiyu`，
+**占用 8080 / 8788**。supervisor 在运行时执行它会端口冲突，先 `scripts/stop.ps1`
+再跑。它只用于排查（能看前台日志、自动建 `.venv` 并装依赖）。
+
+停止走面板 `/api/shutdown`，失效时自动 `taskkill /T /F` 结束进程树。
+停止后 `data/supervisor.pid` 会被清掉，`start-all.ps1` 靠它判断“是不是已经在跑”。
+
+只跑 bot 时，看到下面两行就说明链路通了：
 
 ```
 QQ 网关已监听 127.0.0.1:8080
@@ -257,16 +275,19 @@ detail 只含会话类型/ID 与用户 ID，不含正文）。冷却按「群 + 
 
 ## 5. 控制台面板
 
-`scripts/start.ps1` 启动后打开 <http://127.0.0.1:8787>（端口在 `config.yaml` 的
-`supervisor.dashboard.port`）。面板和 Bot 控制口默认都只监听本机，不对外网开放。
+`scripts/start-all.ps1` 启动后，supervisor 会打印并打开面板地址（端口在 `config.yaml` 的
+`supervisor.dashboard.port`，默认 8787）。**面板默认监听 `0.0.0.0`，局域网内可直接访问；
+Bot 控制口（8788）与 OneBot 反向 WS（8080）仍只监听本机。**
 
 ### 局域网 / VPN 访问与登录
 
-默认 `supervisor.dashboard.host: 127.0.0.1`，本机访问免登录。要让手机或其他设备访问：
+`supervisor.dashboard.host` 默认 `0.0.0.0`，配合 `auth: auto` 会强制登录：
 
-1. 把 `supervisor.dashboard.host` 改成 `0.0.0.0` 或本机局域网地址；
-2. 在 `.env` 里设置至少 12 位的 `DAFEIYU_DASHBOARD_PASSWORD`（用户名默认 `admin`）；
-3. 重启 supervisor。
+1. 用户名默认 `admin`；
+2. 密码优先取 `.env` 的 `DAFEIYU_DASHBOARD_PASSWORD`（至少 12 位）；
+3. 没配密码时 supervisor 启动会**自动生成**一个 32 位口令写入 `data/dashboard.password`
+   （Windows 下用 `icacls` 收紧 ACL），启动日志会打出该路径；
+4. 只在本机用：把 `host` 改回 `127.0.0.1`，`auto` 就不再要求登录。
 
 `supervisor.dashboard.auth` 三档：
 
@@ -392,7 +413,8 @@ bot 与 supervisor 会写同一文件，写入和轮转通过 `.audit.jsonl.lock
 | HTTP 429 | 触发限流：降低 `sample_rate`、调小 `budget.daily_calls`，或给账户充值 |
 | 记忆面板不更新、提示「配额暂停中」 | 账号级熔断：10 分钟内累计 3 次 429 或 provider 报 quota 后，摘要/印象暂停 1 小时，面板显示恢复时间；日志搜「429」可见触发原因 |
 | 回复被截断 | 这是设计行为：闲聊 120 字、技术问题 300 字，改 `config.yaml` 即可 |
-| 中文日志乱码 | 用 `scripts/start.ps1` 启动（已设 UTF-8），不要直接双击 python |
+| 中文日志乱码 | 用 `scripts/start.bat` 或 `scripts/start-all.ps1` 启动（已设 UTF-8），不要直接双击 python |
+| 启动后没反应/端口占用 | 先 `scripts/stop.ps1` 停掉旧实例；`start.ps1` 不能和 supervisor 同时跑 |
 
 ## 8. 隐私与风险
 
