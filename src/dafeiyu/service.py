@@ -15,6 +15,7 @@ from .commands import CommandRegistry, CommandSpec
 from .config import InjectionConfig, Settings
 from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
+from .images import materialize
 from .keepalive import Keepalive
 from .memory.context import build_injection
 from .memory.rotation import apply_rotation, needs_rotation
@@ -222,6 +223,9 @@ class Service:
         return self._locks.setdefault((chat_type, chat_id), asyncio.Lock())
 
     async def handle(self, msg: Message) -> None:
+        # 图片物化必须在入库前：content 字符串是图片路径到达大脑的唯一载体。
+        # materialize 内部永不抛异常，失败保持 [图片] 占位。
+        await materialize(msg, self.settings)
         # 机器人自己的消息也要先落库（作为 assistant 轮次），但不触发任何回复。
         if not self.store.add_message(msg):
             return

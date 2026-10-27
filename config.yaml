@@ -138,6 +138,17 @@ workspace:
   # 单文件事后检查上限，超了保留尾部并插截断注释。
   max_file_bytes: 65536
 
+# QQ 图片消息物化：落盘 workspace.dir/images/ 并把路径写进 content，
+# 大脑用 read 工具看图（模型需支持视觉；不支持时至少知道"有图、在哪"）。
+images:
+  enabled: true
+  # 单张上限，超过保持 [图片] 占位。
+  max_bytes: 10485760
+  # 单张下载超时（秒）。
+  timeout_seconds: 8
+  # 落盘图片保留天数，0 = 永久保留。
+  retention_days: 7
+
 memory:
   window_size: 20
   impression_topk: 3

@@ -114,6 +114,19 @@ class WorkspaceConfig:
 
 
 @dataclass(frozen=True)
+class ImagesConfig:
+    """QQ 图片消息物化：落盘到 workspace.dir/images 并把路径写进 content。
+
+    ``retention_days`` 为 0 表示不清理（与 memory.retention_days 语义一致）。
+    """
+
+    enabled: bool = True
+    max_bytes: int = 10 * 1024 * 1024
+    timeout_seconds: float = 8.0
+    retention_days: int = 7
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     level: str
     dir: str
@@ -296,6 +309,7 @@ class Settings:
     reasoning_effort: str = ""
     injection: InjectionConfig = field(default_factory=InjectionConfig)
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
+    images: ImagesConfig = field(default_factory=ImagesConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
@@ -552,6 +566,24 @@ def _build_workspace(raw: dict[str, Any]) -> WorkspaceConfig:
         dir=str(raw.get("dir", "data/bot-workspace") or "").strip(),
         max_file_bytes=_positive_int(
             raw.get("max_file_bytes"), "workspace.max_file_bytes", 65536
+        ),
+    )
+
+
+def _build_images(raw: dict[str, Any]) -> ImagesConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("config.yaml 的 images 必须是映射")
+    timeout = _float(raw.get("timeout_seconds", 8.0), "images.timeout_seconds")
+    if timeout <= 0:
+        raise ConfigError("images.timeout_seconds 必须大于 0")
+    return ImagesConfig(
+        enabled=bool(raw.get("enabled", True)),
+        max_bytes=_positive_int(
+            raw.get("max_bytes"), "images.max_bytes", 10 * 1024 * 1024
+        ),
+        timeout_seconds=timeout,
+        retention_days=_non_negative_int(
+            raw.get("retention_days"), "images.retention_days", 7
         ),
     )
 
@@ -940,6 +972,7 @@ def load_settings(
         ),
         injection=_build_injection(workspace_raw, memory_raw),
         workspace=_build_workspace(workspace_raw),
+        images=_build_images(raw.get("images") or {}),
         logging=LoggingConfig(
             level=str(logging_raw.get("level", "INFO")),
             dir=str(logging_raw.get("dir", "logs")),
