@@ -195,6 +195,45 @@ async def test_send_failure_logs_retcode(caplog) -> None:
         await adapter.stop()
 
 
+async def test_send_returns_real_message_id() -> None:
+    """返回值必须是 NapCat 的真实 message_id —— 上层靠它入库对账。"""
+    adapter = make_adapter()
+    await adapter.start()
+    try:
+        uri = f"ws://127.0.0.1:{adapter.port}"
+        async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
+            task = asyncio.create_task(adapter.send(ChatType.GROUP, 20001, "hi"))
+            raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
+            await ws.send(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "retcode": 0,
+                        "data": {"message_id": 1388905241},
+                        "echo": raw["echo"],
+                    }
+                )
+            )
+            assert await asyncio.wait_for(task, 2) == "1388905241"
+    finally:
+        await adapter.stop()
+
+
+async def test_send_returns_none_without_message_id() -> None:
+    """网关没给 message_id 时返回 None，由调用方决定回退策略。"""
+    adapter = make_adapter()
+    await adapter.start()
+    try:
+        uri = f"ws://127.0.0.1:{adapter.port}"
+        async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
+            task = asyncio.create_task(adapter.send(ChatType.PRIVATE, 2, "yo"))
+            raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
+            await ws.send(json.dumps({"status": "ok", "retcode": 0, "data": {}, "echo": raw["echo"]}))
+            assert await asyncio.wait_for(task, 2) is None
+    finally:
+        await adapter.stop()
+
+
 async def test_reply_to_bot_message_sets_flag() -> None:
     adapter = make_adapter()
     adapter.bot_message_ids.append(9)

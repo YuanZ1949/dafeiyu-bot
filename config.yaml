@@ -172,8 +172,9 @@ logging:
 
 # 运维（分册 A）：健康巡检、告警、备份、审计。
 # alerts 默认关闭：不开就不建 AlertManager，也不发任何外呼。
+# 本仓库开启：只写状态文件 + 面板 /api/alerts；未配 webhook/qq_admin，不外呼。
 alerts:
-  enabled: false
+  enabled: true
   # 巡检间隔（秒），5-3600。
   check_seconds: 30
   # 同一告警重复通知间隔（秒），>=300；disk_low 另有 12h 下限。

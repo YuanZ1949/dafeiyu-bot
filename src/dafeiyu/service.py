@@ -881,8 +881,8 @@ class Service:
 
     async def _send_batch_reply(
         self, batch: list[Message], reply: BrainReply, chat_type: ChatType, chat_id: int
-    ) -> list[str]:
-        """把批次回复分片发出并入库；返回真正发出去的分片。"""
+    ) -> list[tuple[str, str | None]]:
+        """把批次回复分片发出并入库；返回 (分片文本, 网关真实 id) 列表。"""
         if not reply.speak:
             log.info(
                 "模型选择不说 %s/%s ids=%d reason=%s",
@@ -900,11 +900,11 @@ class Service:
         )
         if not chunks:
             return []
-        sent: list[str] = []
+        sent: list[tuple[str, str | None]] = []
         try:
             for chunk in chunks:
-                await self.adapter.send(chat_type, chat_id, chunk)
-                sent.append(chunk)
+                message_id = await self.adapter.send(chat_type, chat_id, chunk)
+                sent.append((chunk, message_id))
         except Exception as exc:  # 网络抖动不应拖垮整条链路
             log.warning("发送失败 %s/%s: %s", chat_id, batch[-1].message_id, exc)
         else:
@@ -1187,11 +1187,11 @@ class Service:
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
 
-        sent: list[str] = []
+        sent: list[tuple[str, str | None]] = []
         try:
             for chunk in chunks:
-                await self.adapter.send(msg.chat_type, msg.chat_id, chunk)
-                sent.append(chunk)
+                message_id = await self.adapter.send(msg.chat_type, msg.chat_id, chunk)
+                sent.append((chunk, message_id))
         except Exception as exc:  # 网络抖动不应拖垮整条链路
             log.warning("发送失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
         else:
@@ -1200,9 +1200,10 @@ class Service:
             # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
             self._store_bot_chunks(msg, sent)
 
-    def _store_bot_chunks(self, msg: Message, chunks: list[str]) -> None:
+    def _store_bot_chunks(self, msg: Message, chunks: list[tuple[str, str | None]]) -> None:
+        """入库 bot 回复：优先用网关返回的真实 message_id，没有才回退合成值。"""
         now_ts = int(now_shanghai().timestamp())
-        for index, chunk in enumerate(chunks):
+        for index, (chunk, message_id) in enumerate(chunks):
             self.store.add_message(
                 Message(
                     chat_type=msg.chat_type,
@@ -1210,7 +1211,7 @@ class Service:
                     user_id=self.settings.bot_qq,
                     nickname=self.settings.persona.name,
                     content=chunk,
-                    message_id=f"{msg.message_id}:bot:{index}",
+                    message_id=message_id or f"{msg.message_id}:bot:{index}",
                     is_bot=True,
                     timestamp=now_ts,
                 )

@@ -291,7 +291,7 @@ class QQAdapter:
             await ws.close()
         self._fail_pending(GatewayError("QQ 网关已关闭"))
 
-    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> None:
+    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> str | None:
         if chat_type is ChatType.GROUP:
             action, params = "send_group_msg", {"group_id": chat_id, "message": text}
         else:
@@ -329,11 +329,15 @@ class QQAdapter:
         logger.info(
             "消息已发送 %s %s msg_id=%s chars=%d", action, target, message_id, len(text)
         )
-        if message_id is not None:
-            try:
-                self.bot_message_ids.append(int(message_id))
-            except (TypeError, ValueError):
-                pass
+        if message_id is None:
+            return None
+        # 对账凭据：真实 id 返回给上层入库，同时记入回声过滤表。
+        value = str(message_id)
+        try:
+            self.bot_message_ids.append(int(value))
+        except (TypeError, ValueError):
+            pass
+        return value
 
     def _authorized(self, request: Any) -> bool:
         if not self._token:

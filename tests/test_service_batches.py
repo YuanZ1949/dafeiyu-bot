@@ -63,6 +63,13 @@ class FakeAdapter:
         pass
 
 
+class FakeAdapterWithoutIds(FakeAdapter):
+    """模拟网关拿不到 message_id 的退化情况。"""
+
+    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> None:
+        self.sent.append((chat_type, chat_id, text))
+
+
 class FakeOpenCodeBrain:
     def __init__(self, *, delay: float = 0.0, speak: bool = True, text: str = "在呢") -> None:
         self.delay = delay
@@ -178,6 +185,36 @@ async def test_private_still_replies_immediately(tmp_path):
 
     assert brain.reply_calls == 1
     assert adapter.sent
+
+
+async def test_reply_stored_with_gateway_message_id(tmp_path):
+    """bot 回复入库要用网关返回的真实 id，而不是合成值。"""
+    service, store, _, adapter = build(tmp_path)
+
+    await service.handle(
+        make_msg("hi", chat_type=ChatType.PRIVATE, chat_id=2002, message_id="p1")
+    )
+
+    bot = [m for m in store.recent_messages(ChatType.PRIVATE, 2002, 5) if m.is_bot]
+    assert [m.message_id for m in bot] == ["bot-1"]
+    assert adapter.sent
+
+
+async def test_reply_falls_back_to_synthetic_id_without_gateway_id(tmp_path):
+    """网关拿不到 id 时回退合成值，保证历史顺序不断。"""
+    adapter = FakeAdapterWithoutIds()
+    store = Store(str(tmp_path / "t.db"))
+    store.init_schema()
+    settings = make_settings()
+    router = Router(settings, store, clock=lambda: NOON)
+    service = Service(settings, store, FakeOpenCodeBrain(), adapter, router, "你是溟月")
+
+    await service.handle(
+        make_msg("hi", chat_type=ChatType.PRIVATE, chat_id=2002, message_id="p1")
+    )
+
+    bot = [m for m in store.recent_messages(ChatType.PRIVATE, 2002, 5) if m.is_bot]
+    assert [m.message_id for m in bot] == ["p1:bot:0"]
 
 
 async def test_quiet_hours_skips_with_reason(tmp_path):
