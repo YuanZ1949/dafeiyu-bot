@@ -126,7 +126,7 @@ def test_triggers_model_mode_parsed(tmp_path: Path) -> None:
 def test_triggers_defaults_to_rules(tmp_path: Path) -> None:
     s = load(tmp_path)
     assert s.triggers.mode == "rules"
-    assert s.triggers.batch_seconds == 45
+    assert s.triggers.batch_seconds == 12
 
 
 def test_triggers_rejects_unknown_mode(tmp_path: Path) -> None:

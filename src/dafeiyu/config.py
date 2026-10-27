@@ -34,12 +34,12 @@ class TriggerConfig:
     mode: str = "rules"
     # 点名消息的硬上限：防抖一直被打断时，最多等这么久也必须回。
     addressed_max_wait_seconds: float = 30.0
-    # 非点名消息攒多久再回（批次窗口）。
-    batch_seconds: float = 45.0
+    # 非点名消息攒多久再回（批次窗口）。12s：再长就像她没在听。
+    batch_seconds: float = 12.0
     # 点名后等群里说完再回；每来一条点名消息重新计时，但不突破上面的硬上限。
     addressed_debounce_seconds: float = 8.0
     # 两次非点名发言之间的最小间隔。
-    ambient_min_interval_seconds: float = 90.0
+    ambient_min_interval_seconds: float = 15.0
 
 
 @dataclass(frozen=True)
@@ -629,7 +629,7 @@ def _build_triggers(raw: dict[str, Any]) -> TriggerConfig:
     mode = str(raw.get("mode") or "rules").strip().casefold()
     if mode not in ("rules", "model"):
         raise ConfigError("triggers.mode 只能是 rules 或 model")
-    batch_seconds = _float(raw.get("batch_seconds", 45), "triggers.batch_seconds")
+    batch_seconds = _float(raw.get("batch_seconds", 12), "triggers.batch_seconds")
     addressed_debounce = _float(
         raw.get("addressed_debounce_seconds", 8),
         "triggers.addressed_debounce_seconds",
@@ -639,7 +639,7 @@ def _build_triggers(raw: dict[str, Any]) -> TriggerConfig:
         "triggers.addressed_max_wait_seconds",
     )
     ambient_min_interval = _float(
-        raw.get("ambient_min_interval_seconds", 90),
+        raw.get("ambient_min_interval_seconds", 15),
         "triggers.ambient_min_interval_seconds",
     )
     for name, value in (
