@@ -73,6 +73,7 @@ def _shape(raw: Any) -> dict[str, Any]:
         return {
             "reachable": True,
             "logged_in": False,
+            "offline": False,
             "phase": "",
             "phase_label": "",
             "qq": "",
@@ -85,6 +86,9 @@ def _shape(raw: Any) -> dict[str, Any]:
     return {
         "reachable": True,
         "logged_in": bool(raw.get("isLogin")),
+        # 半离线：进程活着、网关连着、isLogin 仍为 true，但账号实际 offline，
+        # 消息只进历史不推送。只看 isLogin 会把这种情况报成「已登录」。
+        "offline": bool(raw.get("isOffline")),
         "phase": phase,
         "phase_label": PHASE_LABELS.get(phase, phase),
         "qq": qq,
@@ -97,6 +101,7 @@ def _unreachable(error: str) -> dict[str, Any]:
     return {
         "reachable": False,
         "logged_in": False,
+        "offline": False,
         "phase": "",
         "phase_label": "",
         "qq": "",

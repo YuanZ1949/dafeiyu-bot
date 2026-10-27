@@ -122,21 +122,30 @@ class HealthMonitor:
 
     async def _napcat_state(self) -> dict[str, Any]:
         if self.napcat_login is None:
-            return {"logged_in": None, "qr_age_seconds": None}
+            return {"logged_in": None, "offline": False, "qr_age_seconds": None}
         try:
-            value = self.napcat_login()
+            # 构造时传的是 NapCatLogin 对象，不是函数；旧代码直接调用对象，
+            # 每次都 TypeError，导致 /api/health/detail 的 napcat 永远是假 false。
+            target = self.napcat_login
+            value = target() if callable(target) else target.state()
             if inspect.isawaitable(value):
                 value = await value
             if not isinstance(value, dict):
-                return {"logged_in": False, "qr_age_seconds": None}
+                return {"logged_in": False, "offline": False, "qr_age_seconds": None}
             return {
                 "logged_in": bool(value.get("logged_in")),
+                # isLogin 为 true 但 isOffline 为 true 时消息会静默丢，必须透传。
+                "offline": bool(value.get("offline")),
+                "reachable": value.get("reachable"),
+                "phase_label": value.get("phase_label") or "",
+                "error": value.get("error") or "",
                 "qr_age_seconds": value.get("qr_age_seconds"),
             }
         except Exception as exc:  # noqa: BLE001
             log.warning("读取 NapCat 登录状态失败：%s", exc)
             return {
                 "logged_in": False,
+                "offline": False,
                 "qr_age_seconds": None,
                 "error": exc.__class__.__name__,
             }

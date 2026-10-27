@@ -45,6 +45,8 @@ opencode:
 napcat:
   quick_password: ""
   quick_password_md5: ""
+  # 每 N 秒给机器人自己发一条私聊（保活探针），0 = 关闭。
+  keepalive_seconds: 300
 
 local_model:
   # 本机 LM Studio 默认端口

@@ -161,7 +161,7 @@ async def test_channel_failure_does_not_raise(tmp_path: Path) -> None:
     assert (tmp_path / "alert-state.json").exists()
 
 
-async def test_all_eight_rules_activate(tmp_path: Path) -> None:
+async def test_all_rules_activate(tmp_path: Path) -> None:
     clock = Clock()
     channel = FakeChannel()
     mgr = manager(tmp_path, clock, channel)
@@ -173,6 +173,7 @@ async def test_all_eight_rules_activate(tmp_path: Path) -> None:
     snapshot["bot"]["quota"]["paused_until"] = clock.now + 60
     snapshot["bot"]["errors"]["recent_count"] = 3
     snapshot["disk"]["free_percent"] = 5.0
+    snapshot["napcat"]["offline"] = True
     snapshot["backups"] = {
         "last_success_at": "2026-10-26T03:00:00+08:00",
         "last_error_at": "2026-10-26T04:00:00+08:00",
@@ -188,11 +189,29 @@ async def test_all_eight_rules_activate(tmp_path: Path) -> None:
         "bot_down",
         "opencode_down",
         "napcat_down",
+        "napcat_offline",
         "quota_pause",
         "reply_errors",
         "disk_low",
         "backup_failed",
     }
+
+
+async def test_half_offline_alerts_after_pending(tmp_path: Path) -> None:
+    """进程在、网关连、isLogin=true，只有 isOffline=true：也要告警。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["napcat"]["offline"] = True
+
+    await mgr.evaluate(snapshot)
+    assert channel.sent == []
+
+    clock.advance(181)
+    await mgr.evaluate(snapshot)
+    assert channel.sent[0][0].rule == "napcat_offline"
+    assert channel.sent[0][0].severity == "critical"
 
 
 async def test_restart_burst_triggers_process_failed(tmp_path: Path) -> None:

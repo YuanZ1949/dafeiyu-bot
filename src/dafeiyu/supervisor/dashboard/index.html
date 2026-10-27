@@ -862,6 +862,11 @@ function renderLogin(napcat) {
       cls = "st-failed";
       text = "NapCat 未响应";
       note = napcat.error || "";
+    } else if (napcat.logged_in && napcat.offline) {
+      // 半离线：isLogin 仍为 true，但账号实际 offline，消息只进历史不推送。
+      cls = "st-failed";
+      text = "已登录 · 账号离线";
+      note = "消息会进历史但不推送给群成员；检查是否在手机或其它客户端登录了同一账号。";
     } else if (napcat.logged_in) {
       const who = [napcat.qq, napcat.nickname].filter(Boolean).join(" ");
       cls = "st-running";
@@ -886,6 +891,13 @@ function renderQr(qr, napcat) {
   const img = $("qr");
   const placeholder = $("qr-placeholder");
   const meta = $("qr-meta");
+  if (napcat && napcat.logged_in && napcat.offline) {
+    img.classList.add("empty");
+    placeholder.style.display = "grid";
+    meta.textContent = "账号离线，建议重新扫码登录";
+    meta.style.color = "var(--bad)";
+    return;
+  }
   if (napcat && napcat.logged_in) {
     img.classList.add("empty");
     placeholder.style.display = "grid";

@@ -15,6 +15,7 @@ from .commands import CommandRegistry, CommandSpec
 from .config import InjectionConfig, Settings
 from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
+from .keepalive import Keepalive
 from .memory.context import build_injection
 from .memory.rotation import apply_rotation, needs_rotation
 from .memory.store import Store
@@ -129,6 +130,8 @@ class Service:
         self._command_last: dict[tuple[str, str, int], float] = {}
         self.scheduler: BatchScheduler | None = None
         self._scheduler_task: asyncio.Task | None = None
+        self.keepalive: Keepalive | None = None
+        self._keepalive_task: asyncio.Task | None = None
         self._locks: dict[tuple[ChatType, int], asyncio.Lock] = {}
         self._batch_locks: dict[tuple[ChatType, int], asyncio.Lock] = {}
         self._started_at = time.monotonic()
@@ -141,8 +144,15 @@ class Service:
         self._start_scheduler()
         self.adapter.on_message(self.handle)
         await self.adapter.start()
+        self._start_keepalive()
 
     async def stop(self) -> None:
+        task = self._keepalive_task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            self._keepalive_task = None
         task = self._scheduler_task
         if task is not None:
             task.cancel()
@@ -179,6 +189,22 @@ class Service:
         scheduler.resume(self.store.chats_with_pending(since_ts=now - 300))
         if self._scheduler_task is None:
             self._scheduler_task = asyncio.create_task(scheduler.run())
+
+    def _start_keepalive(self) -> None:
+        """启动保活：只在配置了间隔、且适配器知道自己的 QQ 号时启用。"""
+        seconds = float(self.settings.napcat.keepalive_seconds)
+        bot_qq = int(getattr(self.adapter, "bot_qq", 0) or 0)
+        if seconds <= 0 or bot_qq <= 0:
+            return
+        if self._keepalive_task is not None:
+            return
+        self.keepalive = Keepalive(self.adapter, bot_qq, seconds)
+        self._keepalive_task = asyncio.create_task(self.keepalive.run())
+
+    def keepalive_status(self) -> dict[str, Any]:
+        if self.keepalive is None:
+            return {"enabled": False}
+        return self.keepalive.status()
 
     def set_brain(self, brain: Any) -> Any:
         """原子换脑；返回旧实例，由调用方决定何时关闭。

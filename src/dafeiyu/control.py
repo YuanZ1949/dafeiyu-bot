@@ -460,6 +460,11 @@ class BrainControl:
                     getattr(self.adapter, "last_disconnect_at", None)
                 ),
             },
+            "keepalive": (
+                self.service.keepalive_status()
+                if callable(getattr(self.service, "keepalive_status", None))
+                else None
+            ),
             "traffic": {
                 "last_message_at": last_event_at,
                 "last_reply_at": _iso_ts(getattr(self.adapter, "last_send_at", None)),

@@ -30,6 +30,7 @@ class StubNapCat:
         phase: str = "waiting_qrcode",
         reject_first_status: bool = False,
         info_available: bool = True,
+        offline: bool = False,
     ):
         self.uin = uin
         self.nickname = nickname
@@ -37,6 +38,7 @@ class StubNapCat:
         self.logged_in = bool(uin)
         self.reject_first_status = reject_first_status
         self.info_available = info_available
+        self.offline = offline
         self.login_calls = 0
         self.status_calls = 0
         self.info_calls = 0
@@ -79,7 +81,7 @@ class StubNapCat:
                 "code": 0,
                 "data": {
                     "isLogin": self.logged_in,
-                    "isOffline": False,
+                    "isOffline": self.offline,
                     # 实机登录成功后报的是 ready，不是 online。
                     "loginPhase": "ready" if self.logged_in else self.phase,
                     "qrLoginAccepted": False,
@@ -146,11 +148,24 @@ async def test_state_reports_logged_in_qq() -> None:
         finally:
             await probe.close()
     assert state["logged_in"] is True
+    assert state["offline"] is False
     assert state["qq"] == "10001"
     assert state["nickname"] == "飞鱼小号"
     assert state["phase"] == "ready"
     assert state["phase_label"] == "已登录"
     assert stub.info_calls == 1
+
+
+async def test_state_exposes_half_offline() -> None:
+    """isLogin=true 但 isOffline=true：进程和网关都正常，账号却没在推消息。"""
+    async with StubNapCat(uin="10001", nickname="：）", offline=True) as stub:
+        probe = NapCatLogin(stub.auth)
+        try:
+            state = await probe.state()
+        finally:
+            await probe.close()
+    assert state["logged_in"] is True
+    assert state["offline"] is True
 
 
 async def test_state_maps_scanned_phase() -> None:

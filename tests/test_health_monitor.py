@@ -88,6 +88,64 @@ async def test_snapshot_aggregates_and_marks_bot_timeout(tmp_path: Path) -> None
     assert snap["napcat"]["logged_in"] is True
 
 
+async def test_napcat_login_object_state_is_awaited(tmp_path: Path) -> None:
+    """生产传的是 NapCatLogin 对象（有 state()），不是函数。"""
+
+    class FakeLogin:
+        async def state(self):
+            return {"logged_in": True, "qr_age_seconds": 3}
+
+    settings = make_settings(tmp_path)
+    monitor = HealthMonitor(
+        supervisor=FakeSupervisor(),
+        settings=settings,
+        bot_url="http://127.0.0.1:1",
+        token="t",
+        backups=FakeBackups(),
+        napcat_login=FakeLogin(),
+    )
+    try:
+        snap = await monitor.snapshot()
+    finally:
+        await monitor.close()
+
+    assert snap["napcat"]["logged_in"] is True
+    assert snap["napcat"]["qr_age_seconds"] == 3
+
+
+async def test_napcat_offline_is_passed_through(tmp_path: Path) -> None:
+    """半离线字段必须透传到 snapshot，否则告警和 dashboard 都看不见。"""
+
+    class FakeLogin:
+        async def state(self):
+            return {
+                "logged_in": True,
+                "offline": True,
+                "reachable": True,
+                "phase_label": "已登录",
+                "error": "",
+                "qr_age_seconds": None,
+            }
+
+    settings = make_settings(tmp_path)
+    monitor = HealthMonitor(
+        supervisor=FakeSupervisor(),
+        settings=settings,
+        bot_url="http://127.0.0.1:1",
+        token="t",
+        backups=FakeBackups(),
+        napcat_login=FakeLogin(),
+    )
+    try:
+        snap = await monitor.snapshot()
+    finally:
+        await monitor.close()
+
+    assert snap["napcat"]["logged_in"] is True
+    assert snap["napcat"]["offline"] is True
+    assert snap["napcat"]["reachable"] is True
+
+
 async def test_snapshot_reads_bot_health_over_http(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     client = TestClient(TestServer(bot_app()))

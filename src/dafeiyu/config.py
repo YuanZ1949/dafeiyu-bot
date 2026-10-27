@@ -183,6 +183,8 @@ class NapCatConfig:
 
     quick_password: str = ""
     quick_password_md5: str = ""
+    # 每 N 秒给机器人自己发一条私聊做保活；0 = 关闭。
+    keepalive_seconds: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -798,6 +800,11 @@ def load_settings(
         or any(c not in "0123456789abcdefABCDEF" for c in quick_password_md5)
     ):
         raise ConfigError("napcat.quick_password_md5 必须是 32 位十六进制")
+    keepalive_seconds = _float(
+        napcat_raw.get("keepalive_seconds", 300), "napcat.keepalive_seconds"
+    )
+    if keepalive_seconds < 0:
+        raise ConfigError("napcat.keepalive_seconds 不能小于 0")
 
     api_key = env.get("DEEPSEEK_API_KEY", "").strip()
     if provider == "token" and not api_key:
@@ -958,6 +965,7 @@ def load_settings(
         napcat=NapCatConfig(
             quick_password=quick_password,
             quick_password_md5=quick_password_md5,
+            keepalive_seconds=keepalive_seconds,
         ),
         supervisor=SupervisorConfig(
             dashboard=DashboardConfig(

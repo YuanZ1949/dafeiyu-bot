@@ -265,6 +265,24 @@ class AlertManager:
                 True, "critical", "NapCat 不在线", detail
             )
 
+        napcat = snapshot.get("napcat") or {}
+        if not isinstance(napcat, dict):
+            napcat = {}
+        # isLogin 仍为 true、进程也在，只是账号被挤成 offline：消息进历史但不推送，
+        # 从 dashboard 和普通探活完全看不出来。这是 01:30-02:00 那次的盲区。
+        if (
+            napcat.get("reachable") is not False
+            and napcat.get("logged_in") is True
+            and napcat.get("offline") is True
+        ):
+            conditions["napcat_offline"] = Condition(
+                True,
+                "critical",
+                "QQ 账号半离线",
+                "NapCat 显示已登录，但账号 isOffline=true：消息会进历史、不推送给群成员。"
+                "请检查是否在手机或其它客户端登录了同一账号。",
+            )
+
         quota = bot.get("quota") or {}
         if not isinstance(quota, dict):
             quota = {}
@@ -361,6 +379,7 @@ class AlertManager:
             "bot_down": rules.bot_down_seconds,
             "opencode_down": rules.opencode_down_seconds,
             "napcat_down": rules.napcat_down_seconds,
+            "napcat_offline": rules.napcat_down_seconds,
         }.get(rule, 0)
 
     def _repeat_seconds(self, rule: str) -> int:

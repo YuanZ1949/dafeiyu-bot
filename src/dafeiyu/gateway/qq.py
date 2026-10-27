@@ -159,6 +159,10 @@ class QQAdapter:
         return self._bound_port
 
     @property
+    def bot_qq(self) -> int:
+        return self._bot_qq
+
+    @property
     def connected(self) -> bool:
         return self._ws is not None
 
