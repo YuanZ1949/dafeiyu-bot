@@ -703,7 +703,9 @@ def load_settings(
     config_file: Path = Path("config.yaml"),
 ) -> Settings:
     if not config_file.exists():
-        raise ConfigError(f"找不到配置文件：{config_file}（可复制 config.yaml 示例后修改）")
+        raise ConfigError(
+            f"找不到配置文件：{config_file}。运行 dafeiyu init 生成（模板见 config.example.yaml）"
+        )
 
     try:
         raw = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
@@ -938,12 +940,18 @@ def load_settings(
     if not isinstance(workspace_raw, dict):
         raise ConfigError("config.yaml 的 workspace 必须是映射")
 
+    raw_bot_qq = str(env.get("BOT_QQ", "")).strip()
+    if not raw_bot_qq:
+        raise ConfigError(
+            "缺少 BOT_QQ：请在 .env 里填写机器人 QQ 号（BOT_QQ=123456789）"
+        )
+
     return Settings(
         api_key=api_key,
         base_url=env.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
         model=env.get("DEEPSEEK_MODEL", "deepseek-chat").strip(),
         reasoning_effort=env.get("DEEPSEEK_REASONING_EFFORT", "").strip(),
-        bot_qq=_int(env["BOT_QQ"], "BOT_QQ"),
+        bot_qq=_int(raw_bot_qq, "BOT_QQ"),
         ws_host=env.get("NAPCAT_WS_HOST", "127.0.0.1"),
         ws_port=ws_port,
         ws_token=env.get("NAPCAT_WS_TOKEN", ""),

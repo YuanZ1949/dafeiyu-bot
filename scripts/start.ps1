@@ -29,7 +29,7 @@ if ($needInstall) {
 }
 
 if (-not (Test-Path "config.yaml")) {
-    Write-Host "config.yaml is missing. Restore it from the repository root." -ForegroundColor Red
+    Write-Host "config.yaml is missing. Run scripts/setup.ps1 to generate it." -ForegroundColor Red
     exit 1
 }
 

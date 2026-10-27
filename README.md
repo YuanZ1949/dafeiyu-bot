@@ -8,6 +8,48 @@
 - **记忆**：每群最近 20 条对话 + 群友印象 + 昨日摘要，SQLite 落盘，重启不失忆；
   消息用 trigram FTS5 建索引，可按关键词检索并在回复前召回同会话旧消息
 
+## 五分钟上手
+
+> **平台**：目前只支持 **Windows 10/11**（启动脚本是 PowerShell，NapCat 用 Windows 版，权限加固用 `icacls`）。
+> **许可**：MIT，见 `LICENSE`。
+
+1. **装 NapCat**（约 345MB，不进 git）：
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts/setup-napcat.ps1
+   ```
+
+2. **初始化**（建 `.venv`、装依赖、从模板生成 `config.yaml`、体检）：
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts/setup.ps1
+   ```
+
+   首次运行如果 `.env` 不存在，脚本会复制一份模板然后停下，等你填完再跑一次。
+
+3. **填 `.env`**（只改这两行就能跑）：
+
+   ```ini
+   BOT_QQ=机器人QQ号
+   DEEPSEEK_API_KEY=sk-...
+   ```
+
+4. **启动**：双击 `scripts\start.bat`，或
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts/start-all.ps1
+   ```
+
+   面板默认监听 `0.0.0.0:8787`（局域网可访问）；没配口令时会自动生成到 `data\dashboard.password`。
+
+随时自检（配置、依赖、端口一次列全）：
+
+```powershell
+.venv\Scripts\python -m dafeiyu.cli doctor
+```
+
+`config.yaml` 是**本机配置，不进版本库**；模板是 `config.example.yaml`，要调行为就改前者。
+
 ## 架构
 
 ```
@@ -58,6 +100,8 @@ QQAdapter ── parse_event ──▶ Router（三层闸门）
 ## 2. 配置本项目
 
 ```powershell
+# 生成 config.yaml（已存在则不覆盖；要重置加 --force）
+.venv\Scripts\python -m dafeiyu.cli init
 Copy-Item .env.example .env
 ```
 

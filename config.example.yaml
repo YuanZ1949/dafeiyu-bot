@@ -1,3 +1,11 @@
+# 大肥鱼 / Deepseek娘 —— 配置模板
+#
+# 用法：运行 `dafeiyu init` 生成 config.yaml（本文件不会被读取）。
+# 完整的键说明见 README；这里只标出「拿到项目后必须改」的几处。
+#
+# 凭据（QQ 号、API Key、NapCat 口令）一律放 .env，不要写进这个文件。
+# 端口若被占用，改下面 supervisor / opencode 段的 port 即可。
+
 persona:
   name: Deepseek娘
   aliases: [Deepseek娘, 大肥鱼, 小鲸鱼, 鱼鱼, 肥鱼]
@@ -7,12 +15,12 @@ persona:
   # 留空使用内置人设 brain/persona.md；也可填自己的 md 路径（绝对或相对仓库根目录）
   prompt_file: ""
 
-# opencode：走专用 OpenCode 服务（supervisor 启动，独立 DB）
-# token：直连 DeepSeek API（原 local，向后兼容）
+# token：直连 DeepSeek API（只需 DEEPSEEK_API_KEY，上手最快）
+# opencode：走专用 OpenCode 服务（supervisor 启动，需要 npm i -g opencode-ai）
 # local_model：任意 OpenAI 兼容端点（默认本机 LM Studio）
-# 运行时可在 dashboard 切换，选择存 data/runtime.json
+# 运行时可在面板切换，选择存 data/runtime.json
 brain:
-  provider: opencode
+  provider: token
 
 gateway:
   # 只支持 qq；wechat 会在启动期直接报 ConfigError（协议未实现，不假装能跑）。
@@ -22,11 +30,10 @@ opencode:
   # 留空自动找 npm 全局安装的 opencode.exe
   bin: ""
   agent: deepseek-qq
-  # 留空使用当前工作目录（start.ps1 会切到 dafeiyu-bot）
   project_dir: ""
   # 联网 + 工具调用（webfetch / 读写工作区）会拉长单轮时间。
   timeout_seconds: 240
-  # Phase 2 起由 supervisor 拉起 serve，bot 只当客户端
+  # 由 supervisor 拉起 serve，bot 只当客户端
   manage_server: false
   server_url: http://127.0.0.1:24310
   db_path: data/opencode-bot.db
@@ -35,11 +42,10 @@ opencode:
   startup_timeout_seconds: 30
   # bot 专用 opencode 配置目录：隔离全局插件 / MCP / 外来 agent。
   # 留空 = 沿用启动环境的配置（软回滚）；相对路径按启动目录解析。
-  # 凭据（auth.json）在 data 目录，不受影响，不需要复制。
   config_home: data/opencode-runtime/config
 
-# NapCat 快登失败时的密码回退（可选）。凭据不要写在这里：config.yaml 进版本库。
-# 把值放 .env（已 gitignore）或进程环境，键名 NAPCAT_QUICK_PASSWORD /
+# NapCat 快登失败时的密码回退（可选）。凭据不要写在这里。
+# 把值放 .env 或进程环境，键名 NAPCAT_QUICK_PASSWORD /
 # NAPCAT_QUICK_PASSWORD_MD5（32 位十六进制，优先于明文）。
 # 留空则只用 `-q <uin>` 快登，失败后回落二维码。
 napcat:
@@ -49,17 +55,13 @@ napcat:
   keepalive_seconds: 1800
 
 local_model:
-  # 本机 LM Studio 默认端口
   base_url: http://127.0.0.1:1234/v1
-  # 留空：在 dashboard 里从 /v1/models 侦测并选择
+  # 留空：在面板里从 /v1/models 侦测并选择
   model: ""
   api_key: local
   # 思考型模型（Qwen3.x 等）先写 reasoning，预算太小会只出兜底话术
   max_tokens: 2048
-  # 本地推理比云端慢
   timeout_seconds: 60
-  # qwen3.5 这类强思考模型会把 600 token 预算全烧在 reasoning 上，
-  # 旁路（印象/摘要）content 恒空。none = 关掉思考；留空 = 不发该字段。
   reasoning_effort: none
   # 切到本地模型时若 1234 没起，自动用 lms CLI 拉起 LM Studio。
   autostart: true
@@ -69,6 +71,9 @@ local_model:
 
 supervisor:
   dashboard:
+    # 默认对局域网开放：手机/平板同网段可直接打开。
+    # 绑定非回环地址时会强制登录，口令留空则由 supervisor 生成并写入
+    # data/dashboard.password（也可用 DAFEIYU_DASHBOARD_PASSWORD 指定）。
     host: 0.0.0.0
     port: 8787
     open_browser: true
@@ -96,13 +101,14 @@ triggers:
   addressed_debounce_seconds: 8
   # 防抖一直被打断时，最多等这么久也必须回。
   addressed_max_wait_seconds: 30
-  # 两次非点名发言之间的最小间隔。15s：再长就像她听不见。
+  # 两次非点名发言之间的最小间隔。
   ambient_min_interval_seconds: 15
 
 groups:
+  # 留空 = 所有群都参与；填了就只在这些群里说话。号之间用逗号分隔。
   whitelist: []
   blacklist: []
-  # 群指令（/闭嘴、/醒来）只允许这些 QQ 号执行
+  # 群指令（/闭嘴、/醒来）只允许这些 QQ 号执行；留空 = 谁都不能用。
   admins: []
 
 budget:
@@ -128,23 +134,19 @@ budget:
   on_exceed: degrade
 
 # 长期记忆工作区：模型自己的笔记，只有 data/bot-workspace/ 可读写。
-# dir 留空 = 关闭工作区与注入（软回滚），同时给 session 下全量 deny。
+# dir 留空 = 关闭工作区与注入（软回滚）。
 workspace:
   dir: data/bot-workspace
-  # 三段注入的字符预算（不是 token）。
   memory_chars: 500
   summary_chars: 250
   impression_chars: 150
-  # 单文件事后检查上限，超了保留尾部并插截断注释。
   max_file_bytes: 65536
 
 # QQ 图片消息物化：落盘 workspace.dir/images/ 并把路径写进 content，
-# 大脑用 read 工具看图（模型需支持视觉；不支持时至少知道"有图、在哪"）。
+# 大脑用 read 工具看图（模型需支持视觉）。
 images:
   enabled: true
-  # 单张上限，超过保持 [图片] 占位。
   max_bytes: 10485760
-  # 单张下载超时（秒）。
   timeout_seconds: 8
   # 落盘图片保留天数，0 = 永久保留。
   retention_days: 7
@@ -153,15 +155,13 @@ memory:
   window_size: 20
   impression_topk: 3
   extract_every: 20
-  # 消息保留天数；0 = 永久保留。>0 时每天清理更早的消息（摘要与印象不受影响）。
+  # 消息保留天数；0 = 永久保留。
   retention_days: 0
-  # 会话轮换阈值，任一满足即换 session。
   rotation_messages: 60
   rotation_days: 7
   rotation_tokens: 40000
   inject_summaries: true
   inject_impressions: true
-  # 回复前按当前批次检索同会话旧消息，作为「相关旧记忆」注入；代码默认关，这里显式开启。
   recall_enabled: true
   recall_topk: 3
   recall_chars: 300
@@ -170,17 +170,16 @@ logging:
   level: INFO
   dir: logs
 
-# 运维（分册 A）：健康巡检、告警、备份、审计。
-# alerts 默认关闭：不开就不建 AlertManager，也不发任何外呼。
-# 本仓库开启：只写状态文件 + 面板 /api/alerts；未配 webhook/qq_admin，不外呼。
+# 运维健康巡检 / 告警 / 备份 / 审计。
+# 模板默认关闭：不开就不建 AlertManager，也不发任何外呼。
+# 开启后不配 webhook / qq_admin 时，事件只写 data/alert-state.json 与面板 /api/alerts。
 alerts:
-  enabled: true
-  # 巡检间隔（秒），5-3600。
+  enabled: false
   check_seconds: 30
   # 同一告警重复通知间隔（秒），>=300；disk_low 另有 12h 下限。
   repeat_seconds: 21600
   webhook:
-    # 留空 = 不启用 webhook 通道。
+    # 留空 = 不启用 webhook 通道。想收手机推送就填一个 ntfy topic。
     url: ""
     format: generic  # generic | ntfy | wecom | dingtalk
   # QQ 管理员号：非 0 时通过 bot 的 /api/notify/admin 发私聊告警。
@@ -195,18 +194,14 @@ alerts:
     reply_error_count: 3
     budget_warning: true
 
-# 备份默认开启，只写本地目录；手动/恢复前备份不受保留策略清理。
 backup:
   enabled: true
   dir: data/backups
   # scheduled 备份按天保留 N 份，另按周（周日 04:00 那批）保留 N 份。
   daily_keep: 7
   weekly_keep: 4
-  # 每天这个整点后第一次巡检触发 scheduled 备份。
   schedule_hour: 4
-  # 备份目录总大小上限；超限从最旧的 scheduled 开始删，至少保留 3 份。
   max_total_gb: 20
-  # 恢复上传上限（MB），超限返回 413。
   max_upload_mb: 512
 
 # append-only JSONL 审计；超过 max_bytes 轮转，保留 backups 份历史。

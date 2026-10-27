@@ -23,6 +23,7 @@ dev = [
 ]
 
 [project.scripts]
+dafeiyu = "dafeiyu.cli:main"
 dafeiyu-cli = "dafeiyu.cli:main"
 
 [tool.setuptools]
