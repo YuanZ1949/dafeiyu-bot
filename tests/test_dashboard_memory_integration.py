@@ -14,7 +14,7 @@ from pathlib import Path
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from conftest import TEST_CONFIG_YAML
+from conftest import TEST_CONFIG_YAML, TEST_DASHBOARD_LOOPBACK_YAML
 
 from dafeiyu.config import load_settings
 from dafeiyu.control import BrainControl, create_app as create_bot_app
@@ -23,7 +23,7 @@ from dafeiyu.models import ChatType, Message
 from dafeiyu.supervisor.dashboard import create_app as create_dashboard_app
 from dafeiyu.supervisor.logs import LogHub
 
-YAML = TEST_CONFIG_YAML
+YAML = TEST_CONFIG_YAML + TEST_DASHBOARD_LOOPBACK_YAML
 
 GROUP_ID = 20001
 PRIVATE_ID = 10001

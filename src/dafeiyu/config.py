@@ -218,7 +218,8 @@ def is_loopback_host(host: str) -> bool:
 
 @dataclass(frozen=True)
 class DashboardConfig:
-    host: str = "127.0.0.1"
+    # 默认对局域网开放；非 loopback 绑定会强制登录（见 auth_required）。
+    host: str = "0.0.0.0"
     port: int = 8787
     open_browser: bool = True
     # auto：loopback 免登录，非 loopback 强制登录；on：始终登录；off：只允许 loopback。
@@ -858,7 +859,7 @@ def load_settings(
     dash_raw = supervisor_raw.get("dashboard") or {}
     if not isinstance(dash_raw, dict):
         raise ConfigError("supervisor.dashboard 必须是映射")
-    dash_host = str(dash_raw.get("host") or "127.0.0.1").strip()
+    dash_host = str(dash_raw.get("host") or "0.0.0.0").strip()
     dash_port = _int(dash_raw.get("port", 8787), "supervisor.dashboard.port")
     open_browser = dash_raw.get("open_browser", True)
     if not isinstance(open_browser, bool):
@@ -886,9 +887,11 @@ def load_settings(
     dash_auth_required = dash_auth == "on" or (
         dash_auth == "auto" and not is_loopback_host(dash_host)
     )
-    if dash_auth_required and len(dash_password) < 12:
+    # 留空表示「交给 supervisor 首次启动生成并落盘」；写了就必须够长。
+    if dash_auth_required and dash_password and len(dash_password) < 12:
         raise ConfigError(
-            "开启 dashboard 登录时 DAFEIYU_DASHBOARD_PASSWORD 至少 12 位"
+            "DAFEIYU_DASHBOARD_PASSWORD 至少 12 位；留空则由 supervisor "
+            "自动生成并写入 data/dashboard.password"
         )
     ctrl_raw = supervisor_raw.get("control") or {}
     if not isinstance(ctrl_raw, dict):

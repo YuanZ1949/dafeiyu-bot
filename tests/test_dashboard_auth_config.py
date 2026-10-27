@@ -47,10 +47,15 @@ def test_loopback_auto_needs_no_password(tmp_path: Path) -> None:
     assert settings.supervisor.dashboard.password == ""
 
 
-def test_non_loopback_auto_requires_a_long_password(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="DAFEIYU_DASHBOARD_PASSWORD"):
-        load(tmp_path, host="0.0.0.0")
+def test_non_loopback_auto_allows_missing_password_for_bootstrap(tmp_path: Path) -> None:
+    """非回环 + 空密码不再报错：启动期用 data/dashboard.password 生成。"""
+    settings = load(tmp_path, host="0.0.0.0")
 
+    assert settings.supervisor.dashboard.password == ""
+    assert settings.supervisor.dashboard.auth_required is True
+
+
+def test_non_loopback_auto_requires_a_long_password(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="12"):
         load(tmp_path, host="0.0.0.0", password="short")
 
@@ -83,9 +88,10 @@ def test_auth_off_is_allowed_on_loopback(tmp_path: Path) -> None:
     assert settings.supervisor.dashboard.auth_required is False
 
 
-def test_auth_on_requires_password_even_on_loopback(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="DAFEIYU_DASHBOARD_PASSWORD"):
-        load(tmp_path, auth="on")
+def test_auth_on_requires_auth_even_on_loopback(tmp_path: Path) -> None:
+    # 空密码不再报错（启动期生成），但鉴权必须仍然开启。
+    settings = load(tmp_path, auth="on")
+    assert settings.supervisor.dashboard.auth_required is True
 
     settings = load(tmp_path, auth="on", password="correct-horse-battery")
     assert settings.supervisor.dashboard.auth_required is True

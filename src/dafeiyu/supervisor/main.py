@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import webbrowser
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -25,6 +26,8 @@ from .backup import BackupManager
 from .control_token import TOKEN_PATH, ControlToken
 from .dashboard import serve
 from .health import HealthMonitor
+from .lan_access import PASSWORD_PATH as DASHBOARD_PASSWORD_PATH
+from .lan_access import dashboard_urls, ensure_dashboard_password
 from .logs import LogHub
 from .manager import ProcSpec, Supervisor, pid_alive, port_owner
 from .napcat_login import NapCatLogin, load_webui_auth
@@ -403,6 +406,34 @@ async def run() -> int:
 
     holder = ControlToken(TOKEN_PATH)
     holder.load_or_create()
+
+    # 面板默认对局域网开放：没有显式密码时生成并落盘，不能因此起不来。
+    password_file_existed = DASHBOARD_PASSWORD_PATH.exists()
+    dashboard_password = ensure_dashboard_password(settings.supervisor.dashboard)
+    if dashboard_password and dashboard_password != settings.supervisor.dashboard.password:
+        settings = replace(
+            settings,
+            supervisor=replace(
+                settings.supervisor,
+                dashboard=replace(
+                    settings.supervisor.dashboard, password=dashboard_password
+                ),
+            ),
+        )
+        if password_file_existed:
+            logs.write("supervisor", f"面板口令读取自 {DASHBOARD_PASSWORD_PATH}")
+        elif DASHBOARD_PASSWORD_PATH.exists():
+            logs.write(
+                "supervisor",
+                f"面板口令已生成：{dashboard_password}"
+                f"（存于 {DASHBOARD_PASSWORD_PATH}，可用 .env 覆盖）",
+            )
+        else:
+            logs.write(
+                "supervisor",
+                f"面板口令已生成：{dashboard_password}（写盘失败，仅本次生效）",
+            )
+
     try:
         specs = build_specs(settings, holder.value)
     except ConfigError as exc:
@@ -479,14 +510,14 @@ async def run() -> int:
         control_token=holder,
     )
 
-    url = (
-        f"http://{settings.supervisor.dashboard.host}:"
-        f"{settings.supervisor.dashboard.port}/"
+    urls = dashboard_urls(
+        settings.supervisor.dashboard.host, settings.supervisor.dashboard.port
     )
-    logs.write("supervisor", f"dashboard: {url}")
+    for url in urls:
+        logs.write("supervisor", f"dashboard: {url}")
     if settings.supervisor.dashboard.open_browser:
         with contextlib.suppress(Exception):
-            loop.run_in_executor(None, webbrowser.open, url)
+            loop.run_in_executor(None, webbrowser.open, urls[0])
 
     tasks: list[asyncio.Task[None]] = []
     if settings.alerts.enabled:
