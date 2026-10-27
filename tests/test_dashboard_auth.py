@@ -32,12 +32,31 @@ def test_session_cookie_rejects_tampering_and_other_secret() -> None:
     token = auth.issue_cookie(now=1_000)
 
     body, signature = token.split(".", 1)
-    tampered = f"{body}.{signature[:-1]}x"
+    tampered = f"{body}.{signature[:-1]}{'A' if signature[-1] != 'A' else 'B'}"
     assert auth.verify_cookie(tampered, now=1_001) is False
 
     other = make_auth(secret=b"another-secret-32-bytes-long-0000")
     assert other.verify_cookie(token, now=1_001) is False
     assert auth.verify_cookie("not-a-cookie", now=1_001) is False
+
+
+BASE64URL_ALPHABET = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+
+
+def test_session_cookie_rejects_every_last_character_mutation() -> None:
+    """签名末位的未使用比特不参与解码，任何末位改动都必须被拒绝。"""
+    auth = make_auth()
+    token = auth.issue_cookie(now=1_000)
+    body, signature = token.split(".", 1)
+
+    for char in BASE64URL_ALPHABET:
+        if char == signature[-1]:
+            continue
+        mutated = f"{body}.{signature[:-1]}{char}"
+        assert auth.verify_cookie(mutated, now=1_001) is False, char
+
 
 
 def test_credentials_require_both_username_and_password() -> None:

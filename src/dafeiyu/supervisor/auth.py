@@ -21,7 +21,13 @@ def _b64encode(raw: bytes) -> str:
 
 def _b64decode(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode(value + padding)
+    raw = base64.urlsafe_b64decode(value + padding)
+    # 末位字符的低位比特不参与解码（32 字节签名编码成 43 字符，最后一个字符
+    # 只有 4 位有效），非严格解码会让「只改末位」的篡改照样验签通过。
+    # 用重编码比对拒绝非规范写法，同时挡住非法字符被静默丢弃。
+    if _b64encode(raw) != value:
+        raise ValueError("non-canonical base64")
+    return raw
 
 
 def safe_next_path(value: str) -> str:

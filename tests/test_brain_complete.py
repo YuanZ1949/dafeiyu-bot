@@ -99,9 +99,15 @@ async def test_audit_flags_synthetic_and_ignores_normal_round(fake: Fake) -> Non
     fake.server.inject_normal_round("ses_clean")
     assert await fake.brain._audit_round("ses_clean", 0, 10**12) == []
 
-    # type 合法但时间戳在本轮窗口外 → 仍要命中
-    fake.server.inject_user("ses_foreign", "外部注入", created=5)
-    assert await fake.brain._audit_round("ses_foreign", 1000, 2000) == ["msg_out"]
+    # 上一轮的 user 消息落在本轮窗口之前：是历史，不是外来注入。
+    # 曾经把它当注入，导致每两轮就把 session 清一次，上下文全丢。
+    fake.server.inject_user("ses_history", "上一轮说的话", created=5)
+    assert await fake.brain._audit_round("ses_history", 1000, 2000) == []
+
+    # 本轮窗口里多出来的 user 才是外部写入
+    fake.server.inject_normal_round("ses_extra")
+    fake.server.inject_user("ses_extra", "外部注入", created=fake.server.last_created)
+    assert await fake.brain._audit_round("ses_extra", 0, 10**12) == ["msg_out"]
 
 
 async def test_reply_rotates_on_foreign_message(
@@ -118,3 +124,11 @@ async def test_reply_rotates_on_foreign_message(
     assert reply.reply == "在群聊卖萌"
     assert fake.store.get_opencode_session(ChatType.GROUP, 1) is None
     assert any("外来消息" in rec.getMessage() for rec in caplog.records)
+
+
+async def test_two_rounds_keep_session(fake: Fake) -> None:
+    """连续两轮不该把会话判成污染：第三轮还得接得上第一轮。"""
+    await fake.brain.reply(ChatType.GROUP, 1, "第一句")
+    await fake.brain.reply(ChatType.GROUP, 1, "第二句")
+
+    assert fake.store.get_opencode_session(ChatType.GROUP, 1) == "ses_new"

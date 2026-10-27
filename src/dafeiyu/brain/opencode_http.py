@@ -226,17 +226,27 @@ class OpenCodeHttpBrain:
     ) -> list[str]:
         """找出本轮窗口里不该出现的消息（外部注入 / 别的进程写的）。
 
-        正常一轮只有 user/assistant/idle，且 user 一定落在本轮窗口内。
-        命中说明这个 session 被别的东西动过，继续用它会把上下文串味。
+        正常一轮只有 user/assistant/idle，且本轮只有 bot 发的那一条 user。
+        只看窗口内：窗口之前的消息属于之前的轮次，是历史，不是注入——
+        把它们当外来消息会让每两轮就重置一次 session，上下文全丢。
         """
         messages = await self._messages(session_id, limit=50)
+        # 服务端默认倒序；按时间排好，第一条 user 才是本轮 bot 发的那条。
+        messages.sort(key=_created)
         hits: list[str] = []
+        users: list[dict[str, Any]] = []
         for message in messages:
+            created = _created(message)
+            if created < since or created > until:
+                continue
             kind = message.get("type")
             if kind not in ALLOWED_MESSAGE_TYPES:
                 hits.append(str(message.get("id") or ""))
-            elif kind == "user" and not (since <= _created(message) <= until):
-                hits.append(str(message.get("id") or ""))
+            elif kind == "user":
+                users.append(message)
+        # 一轮只应有 bot 自己发的那一条 user；窗口里多出来的才是外部写入。
+        if len(users) > 1:
+            hits.extend(str(m.get("id") or "") for m in users[1:])
         return hits
 
     async def reply(
