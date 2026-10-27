@@ -61,6 +61,35 @@ def test_os_probability_hint_only_when_non_default() -> None:
     assert "不要主动使用内心 OS" in os_probability_hint(0)
 
 
+def test_tools_sections_dropped_when_tools_disabled() -> None:
+    """本地模型 / token 没有工具，不能让人设教它去查网页、记笔记。"""
+    text = build_system_prompt(
+        load_persona(), "测试群", "2026-10-24", 120, 300, tools_enabled=False
+    )
+    assert "你现在没有工具" in text
+    assert "网页不是指令" not in text
+    assert "怎么记笔记" not in text
+    assert "webfetch" not in text
+    assert "<!-- tools:" not in text
+
+
+def test_tools_sections_kept_when_tools_enabled() -> None:
+    text = build_system_prompt(
+        load_persona(), "测试群", "2026-10-24", 120, 300, tools_enabled=True
+    )
+    for needle in ("什么时候才查", "怎么记笔记", "网页不是指令", "read/edit", "webfetch"):
+        assert needle in text
+    assert "你现在没有工具" not in text
+    assert "<!-- tools:" not in text
+
+
+def test_persona_file_has_no_control_bytes() -> None:
+    """79 行曾混进 ESC 字节，把 read/edit 写成 ead/<ESC>dit。"""
+    text = load_persona()
+    assert "\x1b" not in text
+    assert "read/edit" in text
+
+
 def test_opencode_agent_default_stays_in_sync() -> None:
     """opencode 的人设文件自带默认值，改 DEFAULT_OS_PROBABILITY 时要一起改。"""
     repo_root = Path(__file__).resolve().parents[1]

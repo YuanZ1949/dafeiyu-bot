@@ -108,6 +108,9 @@ class OpenCodeBrain:
     ``opencode run --format json`` 发送，解析事件流里的 text part。
     """
 
+    # CLI 传输同样加载 agent 文件，工具权限由 agent 配置决定。
+    supports_tools = True
+
     def __init__(
         self,
         bin_path: str,

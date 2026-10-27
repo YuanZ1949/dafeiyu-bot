@@ -121,6 +121,9 @@ class OpenCodeHttpBrain:
     直到拿到本轮完成的 assistant 文本。
     """
 
+    # agent 文件里有 read/edit/webfetch；工作区关掉时 factory 会下推全量 deny。
+    supports_tools = True
+
     def __init__(
         self,
         *,

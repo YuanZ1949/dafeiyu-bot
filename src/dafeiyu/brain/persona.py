@@ -8,6 +8,16 @@ DEFAULT_PERSONA_PATH = Path(__file__).with_name("persona.md")
 # persona.md 与 .opencode/agents/deepseek-qq.md 里写死的默认值，改这里要同步那两处。
 DEFAULT_OS_PROBABILITY = 0.05
 
+# persona.md 里只对 opencode 成立的章节（查网页、记笔记、网页注入）。
+TOOLS_START = "<!-- tools:start -->"
+TOOLS_END = "<!-- tools:end -->"
+
+NO_TOOLS_SECTION = """## 六、你现在没有工具
+
+- 这一轮你只能聊天：不能读写工作区、不能上网查网页、不能执行命令。
+- 被问到实时信息、链接内容或本地文件时，直说「这个本鱼现在查不了」，再凭已有知识回答，并说明可能过时。
+- 不要假装看过网页、记过笔记或查过文件。"""
+
 SYSTEM_TEMPLATE = """$persona
 
 ## 当前场景
@@ -21,6 +31,28 @@ SYSTEM_TEMPLATE = """$persona
 def load_persona(path: Path | None = None) -> str:
     target = path or DEFAULT_PERSONA_PATH
     return target.read_text(encoding="utf-8").strip()
+
+
+def strip_tools_section(persona_text: str) -> str:
+    """把「查网页 / 记笔记」章节换成「你现在没有工具」。
+
+    这些章节是写给 opencode 的；本地模型和 token 模式没有任何工具，
+    照原样注入会让她声称自己能上网、能翻文件。
+    """
+    start = persona_text.find(TOOLS_START)
+    end = persona_text.find(TOOLS_END)
+    if start < 0 or end < start:
+        return persona_text
+    head = persona_text[:start].rstrip()
+    tail = persona_text[end + len(TOOLS_END) :].strip()
+    parts = [head, NO_TOOLS_SECTION]
+    if tail:
+        parts.append(tail)
+    return "\n\n".join(parts)
+
+
+def remove_tools_markers(persona_text: str) -> str:
+    return persona_text.replace(TOOLS_START, "").replace(TOOLS_END, "")
 
 
 def os_rule(probability: float) -> str:
@@ -51,6 +83,8 @@ def build_system_prompt(
     max_chars: int,
     max_chars_technical: int,
     os_probability: float = DEFAULT_OS_PROBABILITY,
+    *,
+    tools_enabled: bool = True,
 ) -> str:
     values = {
         "chat_title": chat_title,
@@ -62,5 +96,10 @@ def build_system_prompt(
     # 人设本身也带占位符（$max_chars / $os_rule），必须先渲染再嵌入外层模板；
     # Template 不递归替换，直接 substitute 会把字面量漏进最终 prompt。
     # safe_substitute 容忍人设里的未知 $name，避免自定义人设把整轮打挂。
-    rendered = Template(persona_text.strip()).safe_substitute(values)
+    source = (
+        remove_tools_markers(persona_text)
+        if tools_enabled
+        else strip_tools_section(persona_text)
+    )
+    rendered = Template(source.strip()).safe_substitute(values)
     return Template(SYSTEM_TEMPLATE).substitute(persona=rendered, **values)
