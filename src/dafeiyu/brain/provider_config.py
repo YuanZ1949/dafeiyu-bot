@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +10,13 @@ from ..config import BrainConfig, LocalModelConfig
 
 # 生成物首行的标记：配置写盘前据此判断是不是我们自己的文件。
 GENERATED_MARK = "// generated-by: dafeiyu"
+# agent 文件是 markdown，首行用 HTML 注释；同一套「是不是生成物」的判定思路。
+AGENT_MARK = "<!-- generated-by: dafeiyu -->"
+AGENT_DESCRIPTION = "Deepseek娘 QQ 群聊人格（可联网查证、可在自己的工作区记笔记）"
+# lean 档收尾：模型这一轮没有工具，得让人设自己知道，别去试。
+AGENT_LEAN_NOTE = (
+    "（本轮没有工具：不要读文件、不要查网页、不要调用任何工具，直接回话。）"
+)
 FREE_MODEL = "opencode/deepseek-v4.1-flash-free"
 
 # 自备 Key / 本地模型两档都走 OpenAI 兼容 provider 插件，只是端点与驱动方式不同。
@@ -152,3 +161,155 @@ def render_config(data: dict) -> str:
 def config_path(config_home: str) -> Path:
     """bot 专用 opencode 配置路径；只拼路径，不建目录。"""
     return Path(config_home) / "opencode" / "opencode.jsonc"
+
+
+def _agent_model(mode: str, cfg: BrainConfig, local: LocalModelConfig) -> str:
+    """agent 前置区里钉住的模型 id；三档与 build_config 保持一致。"""
+    if mode == "free":
+        return FREE_MODEL
+    if mode == "key":
+        return f"{KEY_PROVIDER_ID}/{cfg.key_model}"
+    if mode == "local_model":
+        return f"{LOCAL_PROVIDER_ID}/{local.model}"
+    supported = " / ".join(SUPPORTED_MODES)
+    raise ValueError(f"不支持的大脑模式：{mode}（仅支持 {supported}）")
+
+
+def _agent_permissions(lean: bool) -> list[str]:
+    """agent 的 permissions 段：通配 deny 打底，白名单逐项开例外。
+
+    顺序不能动：规则是「最后匹配者胜」，所以 deny 通配必须在最前，
+    密钥文件的显式 deny 必须排在白名单之后。
+    """
+    lines = [
+        "permissions:",
+        "  # 通配 deny 必须放最前：规则是「最后匹配者胜」，后面才能用 allow 开例外。",
+        "  # 逐项写 read/shell 会漏掉 MCP 工具（ast_* 之类），将来接上就漏。",
+        '  - action: "*"',
+        '    resource: "*"',
+        "    effect: deny",
+        "  # 读模型目录只是为了知道有哪些模型可选，不碰别处。",
+        "  - action: read",
+        '    resource: "~/.cache/opencode/models.json"',
+        "    effect: allow",
+    ]
+    if not lean:
+        lines += [
+            "  # 长期记忆工作区：只能读写这一个目录。故意不开枚举类工具，",
+            "  # 否则等于允许翻出 chats/ 下所有群与私聊的笔记。",
+            "  - action: read",
+            '    resource: "data/bot-workspace/**"',
+            "    effect: allow",
+            "  - action: edit",
+            '    resource: "data/bot-workspace/**"',
+            "    effect: allow",
+            "  - action: webfetch",
+            '    resource: "*"',
+            "    effect: allow",
+        ]
+    for action in (
+        "shell",
+        "websearch",
+        "skill",
+        "subagent",
+        "question",
+        "external_directory",
+        "execute",
+    ):
+        lines += [
+            f"  - action: {action}",
+            '    resource: "*"',
+            "    effect: deny",
+        ]
+    lines += [
+        "  # 密钥文件显式再堵一遍：将来白名单放宽时它们也不该被读到。",
+    ]
+    for resource in (
+        ".env",
+        "data/secrets/*",
+        "data/*.password",
+        "data/*.token",
+        "data/dashboard.password",
+        "data/supervisor.token",
+    ):
+        lines += [
+            "  - action: read",
+            f'    resource: "{resource}"',
+            "    effect: deny",
+        ]
+    return lines
+
+
+def build_agent(
+    mode: str,
+    *,
+    lean: bool,
+    template: str,
+    cfg: BrainConfig | None = None,
+    local: LocalModelConfig | None = None,
+) -> str:
+    """把 persona 模板渲染成 opencode agent 文件。
+
+    `.opencode/agents/<name>.md` 是唯一真正生效的一层（model 与 permissions
+    都以它为准），所以这里把它当生成物写：前置区按档位钉模型，权限固定为
+    「通配 deny + 白名单」，正文原样取自 `agent_template.md`。
+
+    lean=True 时去掉 read/edit 与 webfetch 白名单（工作区与联网都不开），
+    并在正文末尾补一句「本轮没有工具」；deny 通配与密钥 deny 保留。
+    """
+    cfg = cfg if cfg is not None else BrainConfig(mode=mode)
+    local = local if local is not None else LocalModelConfig()
+    model = _agent_model(mode, cfg, local)
+    head = [
+        AGENT_MARK,
+        "---",
+        f"description: {AGENT_DESCRIPTION}",
+        "mode: primary",
+        "# 4 步给「查网页 → 读结果 → 写笔记 → 出 JSON」留余量；最后一步仍会移除工具。",
+        "steps: 4",
+        "# 钉住模型：全局默认变了也不该静默改变 bot 行为。",
+        f"model: {model}",
+        *_agent_permissions(lean),
+        "---",
+        "",
+    ]
+    body = template if template.endswith("\n") else f"{template}\n"
+    if lean:
+        trimmed = body.rstrip("\n")
+        body = f"{trimmed}\n\n{AGENT_LEAN_NOTE}\n"
+    return "\n".join(head) + body
+
+
+def write_generated(path: Path, content: str) -> bool:
+    """写生成物，返回是否备份过用户手改的旧文件。
+
+    - 文件不存在：直接写，False；
+    - 内容一致：不写，False（纯幂等）；
+    - 旧文件首行是我们的标记：直接覆盖，False；
+    - 其余情况（用户手改过）：先复制成 `<name>.bak.<YYYYmmdd-HHMMSS>` 再写，True。
+    """
+    target = Path(path)
+    existed = target.exists()
+    old: str | None = None
+    if existed:
+        try:
+            old = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            # 读不出来的旧文件一律当手改过：备份比覆盖安全。
+            old = None
+        if old == content:
+            return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    backed_up = False
+    if existed and not (old or "").startswith(AGENT_MARK):
+        # 备份名用本地时间：用户在看目录时对得上自己刚改的时间。
+        stamp = datetime.now(UTC).astimezone().strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(target, target.with_name(f"{target.name}.bak.{stamp}"))
+        backed_up = True
+    target.write_text(content, encoding="utf-8", newline="\n")
+    return backed_up
+
+
+def agent_path(root: Path) -> Path:
+    """bot 工程里的 agent 文件路径；只拼路径，不建目录。"""
+    return Path(root) / ".opencode" / "agents" / "deepseek-qq.md"
