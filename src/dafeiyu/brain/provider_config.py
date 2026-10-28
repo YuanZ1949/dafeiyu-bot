@@ -10,8 +10,11 @@ from ..config import BrainConfig, LocalModelConfig
 
 # 生成物首行的标记：配置写盘前据此判断是不是我们自己的文件。
 GENERATED_MARK = "// generated-by: dafeiyu"
-# agent 文件是 markdown，首行用 HTML 注释；同一套「是不是生成物」的判定思路。
+# agent 文件是 markdown：标记不能放首行（opencode 只在文件以 `---` 开头时
+# 解析前置区），所以它落在闭合 `---` 之后的正文首行。
 AGENT_MARK = "<!-- generated-by: dafeiyu -->"
+# 判定「是不是生成物」时扫描的行数上限：只覆盖前置区，不扫正文。
+AGENT_MARK_SCAN_LINES = 120
 AGENT_DESCRIPTION = "Deepseek娘 QQ 群聊人格（可联网查证、可在自己的工作区记笔记）"
 # lean 档收尾：模型这一轮没有工具，得让人设自己知道，别去试。
 AGENT_LEAN_NOTE = (
@@ -254,6 +257,10 @@ def build_agent(
     都以它为准），所以这里把它当生成物写：前置区按档位钉模型，权限固定为
     「通配 deny + 白名单」，正文原样取自 `agent_template.md`。
 
+    布局契约：文件第一行必须是 `---`（opencode 只在这种情况下解析前置区，
+    否则 model/permissions 整段失效、回落到默认值），因此 `AGENT_MARK` 落在
+    闭合 `---` 之后的正文首行，再空一行接人设正文。
+
     lean=True 时去掉 read/edit 与 webfetch 白名单（工作区与联网都不开），
     并在正文末尾补一句「本轮没有工具」；deny 通配与密钥 deny 保留。
     """
@@ -261,7 +268,6 @@ def build_agent(
     local = local if local is not None else LocalModelConfig()
     model = _agent_model(mode, cfg, local)
     head = [
-        AGENT_MARK,
         "---",
         f"description: {AGENT_DESCRIPTION}",
         "mode: primary",
@@ -271,13 +277,28 @@ def build_agent(
         f"model: {model}",
         *_agent_permissions(lean),
         "---",
-        "",
+        # 标记放在前置区之后：文件必须以 `---` 开头，opencode 才解析 model/permissions。
+        AGENT_MARK,
     ]
     body = template if template.endswith("\n") else f"{template}\n"
     if lean:
         trimmed = body.rstrip("\n")
         body = f"{trimmed}\n\n{AGENT_LEAN_NOTE}\n"
-    return "\n".join(head) + body
+    return "\n".join(head) + "\n\n" + body
+
+
+def _looks_generated(text: str) -> bool:
+    """前置区范围内出现标记就算生成物。
+
+    标记在正文首行（前置区之后），不再位于文件开头，所以不能只用 startswith。
+    窗口取 120 行而不是 60：permissions 有 14 条 deny/allow（每条 3 行），
+    整个前置区就有 69 行，标记落在第 70 行；窗口太窄会把自家文件当成手改件、
+    每次运行都白备份一遍。窗口仍只覆盖前置区，不会把正文里的偶发同名字串
+    误判成生成物。
+    """
+    return any(
+        line.strip() == AGENT_MARK for line in text.splitlines()[:AGENT_MARK_SCAN_LINES]
+    )
 
 
 def write_generated(path: Path, content: str) -> bool:
@@ -285,7 +306,7 @@ def write_generated(path: Path, content: str) -> bool:
 
     - 文件不存在：直接写，False；
     - 内容一致：不写，False（纯幂等）；
-    - 旧文件首行是我们的标记：直接覆盖，False；
+    - 旧文件前 60 行里有我们的标记：直接覆盖，False；
     - 其余情况（用户手改过）：先复制成 `<name>.bak.<YYYYmmdd-HHMMSS>` 再写，True。
     """
     target = Path(path)
@@ -301,7 +322,7 @@ def write_generated(path: Path, content: str) -> bool:
             return False
     target.parent.mkdir(parents=True, exist_ok=True)
     backed_up = False
-    if existed and not (old or "").startswith(AGENT_MARK):
+    if existed and not _looks_generated(old or ""):
         # 备份名用本地时间：用户在看目录时对得上自己刚改的时间。
         stamp = datetime.now(UTC).astimezone().strftime("%Y%m%d-%H%M%S")
         shutil.copy2(target, target.with_name(f"{target.name}.bak.{stamp}"))
