@@ -1,9 +1,14 @@
 """用户自备 provider API key 的唯一落盘位置（data/secrets/provider.key）。
 
-档位切换、仪表盘表单、doctor 都从这里读写，所以这两点必须在同一处定死：
-权限从文件出现的第一刻起就只属于当前用户，替换是原子的——中途失败既不能
-留下半截密钥，也不能让最终路径短暂地人人可读。密钥值本身不进日志、不进异常
-消息。
+档位切换、仪表盘表单、doctor 都从这里读写，所以这几点必须在同一处定死：
+权限从文件出现的第一刻起就只属于当前用户（临时文件在**空**状态下先加固，
+之后才写入密钥值），替换是原子的——中途失败既不能留下半截密钥，也不能让
+最终路径短暂地人人可读。进程被硬杀可能留下加固过但无主的临时文件，下次
+写入前会统一清扫。密钥值本身不进日志、不进异常消息。
+
+前置条件：加固只授予当前用户 ``(R,W)``（与 control token 共享同一实现），
+所以替换/删除能否成功取决于**父目录**是否授予删除子项（DELETE_CHILD）；
+在只有 Modify 的目录下写入会以 :class:`SecretWriteError` 失败。
 """
 
 from __future__ import annotations
@@ -26,17 +31,43 @@ class SecretWriteError(OSError):
     """密钥写盘失败。消息只带路径和错误类名，绝不回显密钥值。"""
 
 
+def _sweep_stale_temps(target: Path) -> None:
+    """删掉上次进程被硬杀留下的 ``.<name>.*.tmp`` 临时文件。
+
+    残留文件是加固过的，但仍然是无主的明文副本，所以每次写入前都扫一遍。
+    删不掉（被别的进程占着、权限不足）就记一条告警继续走：清理失败不能连带
+    让本次写入失败，下次写入还会再扫。
+    """
+    pattern = f".{target.name}.*.tmp"
+    try:
+        leftovers = list(target.parent.glob(pattern))
+    except OSError as exc:
+        log.warning(
+            "provider key 临时文件清扫失败（%s）：%s", pattern, type(exc).__name__
+        )
+        return
+    for leftover in leftovers:
+        try:
+            leftover.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning(
+                "provider key 临时文件删除失败（%s）：%s", leftover, type(exc).__name__
+            )
+
+
 def write_secret(value: str, path: Path = KEY_PATH) -> Path:
     """把 provider key 写入 ``path`` 并返回该路径。
 
     ``value`` 会先 ``strip()``。strip 后为空表示“没有配置密钥”：删掉已有文件
     （文件本来就不存在也算成功），不会留下空文件。写入顺序固定为
-    临时文件 → 加固临时文件 → ``os.replace``：先收回权限再换名，最终路径从
-    出现那一刻起就不是人人可读，不存在可被抢读的窗口。任何失败都会清掉临时
-    文件并抛 :class:`SecretWriteError`（仅含路径与 OS 错误类名）。
+    临时文件（此时为空）→ 加固临时文件 → 写入密钥值 → ``os.replace``：
+    密钥值只出现在已经收好权限的文件里，最终路径从出现那一刻起就不是人人
+    可读，不存在可被抢读的窗口。建立新临时文件前会先清扫历史残留。任何失败
+    都会清掉临时文件并抛 :class:`SecretWriteError`（仅含路径与 OS 错误类名）。
     """
     target = Path(path)
     cleaned = value.strip()
+    _sweep_stale_temps(target)
     if not cleaned:
         target.unlink(missing_ok=True)
         return target
@@ -50,8 +81,9 @@ def write_secret(value: str, path: Path = KEY_PATH) -> Path:
     os.close(fd)  # mkstemp 本身按 0600 建文件，POSIX 上不会先以宽权限落盘
     tmp_path = Path(raw_tmp)
     try:
-        tmp_path.write_text(cleaned, encoding="utf-8")
+        # 先加固空文件再写值：密钥不会被写进还带着继承 ACL 的文件里。
         harden_token_file(tmp_path)
+        tmp_path.write_text(cleaned, encoding="utf-8")
         os.replace(tmp_path, target)
     except BaseException as exc:
         try:
