@@ -66,8 +66,9 @@ def ensure_isolated_config(config_home: str | Path) -> Path:
     - 文件不存在：写带生成标记的兜底配置；
     - 首行是 ``// generated-by: dafeiyu``：生成物，一个字都不动；
     - 等于升级前的兜底配置原文：同样不动（无标记但确实是自家文件）；
-    - 其余（用户手改过）：先复制成 ``<name>.bak.<YYYYmmdd-HHMMSS>`` 再写兜底
-      配置，备份路径记在 ``LAST_BACKUP`` 并打一条 warning。
+    - 其余（用户手改过，或非 UTF-8 等读不出来）：先复制成
+      ``<name>.bak.<YYYYmmdd-HHMMSS>`` 再写兜底配置，备份路径记在
+      ``LAST_BACKUP`` 并打一条 warning。
 
     返回值始终是配置根目录（``server_env`` 用它拼 ``XDG_CONFIG_HOME``）。
     相对路径按当前工作目录解析，与 ``workspace.dir`` 一致。
@@ -84,8 +85,14 @@ def ensure_isolated_config(config_home: str | Path) -> Path:
         config_file.write_text(content, encoding="utf-8", newline="\n")
         return root
 
-    old = config_file.read_text(encoding="utf-8")
-    if _is_generated(old) or _is_legacy_minimal(old):
+    try:
+        old: str | None = config_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        # 读不出来的旧文件一律当手改过：备份比覆盖安全。GBK 等非 UTF-8 编辑器
+        # 写出的配置会抛 UnicodeDecodeError，不能让它冒到 server_env 外面把
+        # 启动打挂（那里只兜 OSError）。策略同 provider_config.write_generated。
+        old = None
+    if old is not None and (_is_generated(old) or _is_legacy_minimal(old)):
         return root
 
     # 备份名用本地时间：用户在看目录时对得上自己刚改的时间。

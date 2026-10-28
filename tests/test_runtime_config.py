@@ -60,19 +60,31 @@ def test_ensure_is_idempotent_for_generated_file(tmp_path: Path) -> None:
 def test_generated_file_is_left_alone(tmp_path: Path) -> None:
     p = provider_config.config_path(str(tmp_path))
     p.parent.mkdir(parents=True)
-    p.write_text("// generated-by: dafeiyu\n{}", encoding="utf-8")
+    generated = "// generated-by: dafeiyu\n{}\n"
+    p.write_text(generated, encoding="utf-8")
 
     ensure_isolated_config(str(tmp_path))
 
-    assert p.read_text(encoding="utf-8").startswith("// generated-by: dafeiyu")
+    # 整份字节不变：只断言首行标记的话，「用兜底配置覆盖生成物」也会绿。
+    assert p.read_text(encoding="utf-8") == generated
     assert runtime_config.LAST_BACKUP is None
 
 
 def test_old_minimal_config_is_left_alone(tmp_path: Path) -> None:
-    """升级前的兜底配置（无标记、raw json.dumps）不该被当成手改件备份。"""
+    """升级前的兜底配置（无标记、raw json.dumps）不该被当成手改件备份。
+
+    原文写死成升级前的字面量（不是用当前 MINIMAL_CONFIG 拼）：将来改默认值却
+    忘了兼容旧文件时，这里会红，而不是每台机器静默多出一份备份。
+    """
     p = provider_config.config_path(str(tmp_path))
     p.parent.mkdir(parents=True)
-    legacy = json.dumps(MINIMAL_CONFIG, ensure_ascii=False, indent=2) + "\n\n"
+    legacy = (
+        "{\n"
+        '  "$schema": "https://opencode.ai/config.json",\n'
+        '  "model": "opencode/deepseek-v4.1-flash-free",\n'
+        '  "plugins": []\n'
+        "}\n\n"
+    )
     p.write_text(legacy, encoding="utf-8")
 
     ensure_isolated_config(str(tmp_path))
@@ -80,6 +92,30 @@ def test_old_minimal_config_is_left_alone(tmp_path: Path) -> None:
     assert p.read_text(encoding="utf-8") == legacy
     assert not list(p.parent.glob("opencode.jsonc.bak.*"))
     assert runtime_config.LAST_BACKUP is None
+
+
+def test_undecodable_file_is_backed_up(tmp_path: Path) -> None:
+    """GBK 等非 UTF-8 编辑器写出的配置：不抛异常，按手改过备份再写兜底。"""
+    p = provider_config.config_path(str(tmp_path))
+    p.parent.mkdir(parents=True)
+    raw = '{"model": "自定义模型"}'.encode("gbk")
+    p.write_bytes(raw)
+
+    root = ensure_isolated_config(str(tmp_path))
+
+    assert root == tmp_path.resolve()
+    backups = list(p.parent.glob("opencode.jsonc.bak.*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == raw
+    assert runtime_config.LAST_BACKUP == backups[0]
+    assert p.read_text(encoding="utf-8") == provider_config.render_config(
+        MINIMAL_CONFIG
+    )
+
+
+def test_default_model_is_single_sourced() -> None:
+    assert DEFAULT_OPENCODE_MODEL is provider_config.FREE_MODEL
+    assert MINIMAL_CONFIG["model"] == provider_config.FREE_MODEL
 
 
 def test_manual_file_is_backed_up(tmp_path: Path) -> None:
