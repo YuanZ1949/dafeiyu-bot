@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
+from . import __version__
 from .brain.factory import (
     build_brain,
     current_provider,
@@ -34,14 +35,20 @@ from .brain.provider_config import (
     write_generated,
 )
 from .brain.runtime_config import ensure_isolated_config
-from . import __version__
 from .budget import BudgetGuard
-from .config import ConfigError, OVERRIDES_PATH, Settings
+from .config import OVERRIDES_PATH, ConfigError, Settings
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
 from .model_probe import ProbeError, normalize_base_url, probe_models
 from .models import ChatType, Message
 from .runtime import RuntimeState, load_runtime, save_runtime
-from .secrets_store import INSTALL_ROOT, KEY_PATH, read_secret, write_secret
+from .secrets_store import (
+    INSTALL_ROOT,
+    KEY_PATH,
+    LOCAL_KEY_PATH,
+    read_secret,
+    secret_exists,
+    write_secret,
+)
 from .service import BRAIN_ERROR_COOLDOWN_SECONDS, TOOL_HINT_INTERVAL_SECONDS
 from .settings_local import OverrideError, read_overrides, write_overrides
 from .timeutil import SHANGHAI, now_shanghai
@@ -316,23 +323,33 @@ def _restore_overrides(existing: dict[str, Any], had_file: bool) -> None:
         log.warning("覆盖层回滚失败：%s", type(exc).__name__)
 
 
-def _restore_secret(previous: str) -> None:
+def _restore_secret(previous: str, path: Path = KEY_PATH) -> None:
     """把密钥文件恢复到切换前；空值等价于删除（`write_secret` 的契约）。"""
     try:
-        write_secret(previous, KEY_PATH)
+        write_secret(previous, path)
     except OSError as exc:
         log.warning("provider key 回滚失败：%s", type(exc).__name__)
 
 
-def _key_reference(config_dir: Path) -> str:
+def _mode_for_provider(provider: str) -> str:
+    """老 provider 口径 → 用户可见三档（只在没有覆盖层时兜底）。"""
+    if provider == "local_model":
+        return "local_model"
+    if provider == "token":
+        return "key"
+    return "free"
+
+
+def _key_reference(config_dir: Path, path: Path = KEY_PATH) -> str:
     """密钥文件相对 opencode 配置目录的引用。
 
     `{file:}` 只保证相对路径可用（绝对路径在 JSONC 里还要转义，且跨平台
-    不稳定），所以按实际 `KEY_PATH` 与配置目录现算，而不是写死
-    `DEFAULT_KEY_REL`——自定义/留空的 `config_home` 下那个常量会指向不存在的
-    位置。Windows 跨盘符无法表达相对路径时才退化为绝对 POSIX 路径。
+    不稳定），所以按实际密钥文件（`provider.key` / `provider-local.key`）与
+    配置目录现算，而不是写死 `DEFAULT_KEY_REL`——自定义/留空的 `config_home`
+    下那个常量会指向不存在的位置。Windows 跨盘符无法表达相对路径时才退化为
+    绝对 POSIX 路径。
     """
-    target = Path(KEY_PATH).resolve()
+    target = Path(path).resolve()
     try:
         relative = os.path.relpath(target, Path(config_dir).resolve())
     except ValueError:
@@ -520,7 +537,48 @@ class BrainControl:
         # snapshot 必须与切换响应一致，不能继续报启动时的 token/local_model。
         self._mode_provider = ""
         self._mode_model = ""
+        # switch_mode 成功后的「生效视图」：self.settings 要到重启才重新加载，
+        # 这里先钉住刚写进覆盖层的 key/local 配置，GET /api/brain 才不会回退。
+        self._mode_view: dict[str, Any] | None = None
         self.budget_guard = BudgetGuard(store, settings.budget)
+
+    def _local_token(self) -> str:
+        """本地档当前真正可用的令牌（不含 "local" 占位哨兵）。"""
+        stored = read_secret(LOCAL_KEY_PATH)
+        if stored:
+            return stored
+        configured = str(self.settings.local_model.api_key or "").strip()
+        return "" if configured == "local" else configured
+
+    def _brain_view(self, provider: str) -> dict[str, Any]:
+        """GET /api/brain 的档位视图：只含 has_key，绝不含密钥本身。"""
+        if self._mode_view is not None:
+            view = self._mode_view
+            return {
+                "mode": view["mode"],
+                "key": dict(view["key"]),
+                "local": dict(view["local"]),
+            }
+        mode = (
+            self.settings.brain.mode
+            if self.settings.brain.mode_from_overrides
+            else _mode_for_provider(provider)
+        )
+        return {
+            "mode": mode,
+            "key": {
+                "base_url": self.settings.brain.key_base_url,
+                "model": self.settings.brain.key_model,
+                "has_key": secret_exists(KEY_PATH),
+            },
+            "local": {
+                "base_url": self.settings.local_model.base_url,
+                "model": local_model_name(self.settings, self.runtime),
+                "context": self.settings.local_model.context,
+                "lean": bool(self.settings.local_model.lean),
+                "has_key": bool(self._local_token()),
+            },
+        }
 
     def snapshot(self) -> dict[str, Any]:
         provider = self._mode_provider or current_provider(self.settings, self.runtime)
@@ -531,9 +589,13 @@ class BrainControl:
         else:
             # opencode：展示 switch_mode 钉住的档位模型；老 switch() 进来时为空。
             model = self._mode_model
+        view = self._brain_view(provider)
         return {
             "provider": provider,
+            "mode": view["mode"],
             "model": model,
+            "key": view["key"],
+            "local": view["local"],
             "modes": mode_status(self.settings, self.runtime),
             "gateway_connected": bool(getattr(self.adapter, "connected", False)),
         }
@@ -730,6 +792,7 @@ class BrainControl:
             # 老协议接管后，snapshot 回到 runtime/config 的口径。
             self._mode_provider = ""
             self._mode_model = ""
+            self._mode_view = None
             try:
                 save_runtime(self.runtime, self.runtime_path)
             except OSError as exc:
@@ -768,11 +831,14 @@ class BrainControl:
                 raise SwitchError(500, f"覆盖层读取失败：{exc}") from exc
 
             # 探活与生成都用「本次真的会生效的本地令牌」：payload 没给就沿用
-            # config.yaml 里已配置的那个。哨兵值 "local" 只是占位，不是真密钥。
-            local_key = (
-                local["api_key"] or str(self.settings.local_model.api_key or "").strip()
-            )
-            local_has_key = bool(local_key) and local_key != "local"
+            # 本地专用密钥文件，再回落到 config.yaml，最后才排掉 "local" 哨兵。
+            # 自备 Key 文件（provider.key）不参与本地档，避免两档互相污染。
+            local_stored = read_secret(LOCAL_KEY_PATH)
+            local_configured = str(self.settings.local_model.api_key or "").strip()
+            if local_configured == "local":
+                local_configured = ""
+            local_key = local["api_key"] or local_stored or local_configured
+            local_has_key = bool(local_key)
 
             if not force:
                 if mode == "key":
@@ -825,7 +891,8 @@ class BrainControl:
             # 配置目录与 ensure_isolated_config 的解析方式一致（空 config_home
             # = 当前工作目录），密钥引用据此现算。
             config_dir = config_path(Path(config_home or ".")).resolve().parent
-            key_rel = _key_reference(config_dir)
+            secret_path = LOCAL_KEY_PATH if mode == "local_model" else KEY_PATH
+            key_rel = _key_reference(config_dir, secret_path)
             use_key_ref = mode == "key" or (mode == "local_model" and local_has_key)
             data = build_config(
                 mode,
@@ -845,19 +912,19 @@ class BrainControl:
                 local=local_cfg,
             )
 
-            # 密钥只落 data/secrets/provider.key：key 档写面板给的，local 档写
-            # 实际生效的本地令牌（可能来自 config.yaml）。为空都保持原文件不动。
+            # 两档各写各的密钥文件：key → provider.key，local → provider-local.key。
+            # 为空都保持原文件不动；local 档永远不碰 provider.key。
             secret_value = key["api_key"] if mode == "key" else ""
             if mode == "local_model" and local_has_key:
                 secret_value = local_key
             previous_secret = ""
             if secret_value:
-                previous_secret = read_secret(KEY_PATH)
+                previous_secret = read_secret(secret_path)
                 try:
-                    write_secret(secret_value, KEY_PATH)
+                    write_secret(secret_value, secret_path)
                 except OSError as exc:
                     raise SwitchError(
-                        500, f"provider key 写入失败（{type(exc).__name__}）"
+                        500, f"凭据写入失败（{type(exc).__name__}）"
                     ) from exc
 
             had_overrides = Path(OVERRIDES_PATH).exists()
@@ -866,7 +933,7 @@ class BrainControl:
             except OSError as exc:
                 # 密钥已经落盘但模式没写进去：同样只留一种状态。
                 if secret_value:
-                    _restore_secret(previous_secret)
+                    _restore_secret(previous_secret, secret_path)
                 raise SwitchError(
                     500, f"覆盖层写入失败（{type(exc).__name__}）"
                 ) from exc
@@ -883,7 +950,7 @@ class BrainControl:
                 # 覆盖层已落盘但生成物没写成：恢复上一版覆盖层与密钥，别把
                 # 「一半生效」的状态留给面板。
                 if secret_value:
-                    _restore_secret(previous_secret)
+                    _restore_secret(previous_secret, secret_path)
                 _restore_overrides(existing, had_overrides)
                 raise SwitchError(
                     500,
@@ -914,6 +981,21 @@ class BrainControl:
                 previous = self.service.set_brain(brain)
                 self._mode_provider = provider
                 self._mode_model = str(data.get("model") or "")
+                self._mode_view = {
+                    "mode": mode,
+                    "key": {
+                        "base_url": cfg.key_base_url,
+                        "model": cfg.key_model,
+                        "has_key": secret_exists(KEY_PATH),
+                    },
+                    "local": {
+                        "base_url": local_cfg.base_url,
+                        "model": local_cfg.model,
+                        "context": local_cfg.context,
+                        "lean": bool(local_cfg.lean),
+                        "has_key": local_has_key,
+                    },
+                }
                 self.runtime = self.runtime.with_provider(provider, "")
                 try:
                     save_runtime(self.runtime, self.runtime_path)

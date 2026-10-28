@@ -568,8 +568,8 @@
       </label>
       <label class="field field-wide">
         <span>API Key</span>
-        <input id="key-api-key" type="password" placeholder="留空则沿用已保存的 Key" autocomplete="new-password" />
-        <span class="field-note">Key 只写入本机密钥文件，不会回显。</span>
+        <input id="key-api-key" type="password" placeholder="输入 API Key" autocomplete="new-password" />
+        <span class="field-note">Key 单独保存在本机，不会回显，也不会用于本地模型档。</span>
       </label>
     </div>
     <div class="brain-fields" data-mode-fields="local_model" hidden>
@@ -589,13 +589,13 @@
       </label>
       <label class="field">
         <span>上下文窗口</span>
-        <input id="local-context" type="number" min="0" step="1024" inputmode="numeric" placeholder="例如 32768" />
-        <span class="field-note" id="context-hint">按模型实际上下文填写，颜色只作提示。</span>
+        <input id="local-context" type="number" min="0" step="1024" inputmode="numeric" placeholder="留空使用默认" />
+        <span class="field-note" id="context-hint">留空使用默认；0 也表示默认。</span>
       </label>
       <label class="field">
         <span>访问令牌（可选）</span>
-        <input id="local-api-key" type="password" placeholder="留空则沿用已保存的令牌" autocomplete="new-password" />
-        <span class="field-note">只有需要鉴权的本地网关才填。</span>
+        <input id="local-api-key" type="password" placeholder="访问令牌（可选）" autocomplete="new-password" />
+        <span class="field-note">令牌单独保存，不会复用自备 Key；只有需要鉴权的本地网关才填。</span>
       </label>
       <label class="field-check">
         <input id="local-lean" type="checkbox" />
@@ -854,7 +854,6 @@ const PROC_TITLE = { opencode: "OpenCode", bot: "Bot", napcat: "NapCat" };
 const LOG_SOURCES = ["supervisor", "opencode", "bot", "napcat"];
 const MODE_ORDER = ["free", "key", "local_model"];
 const MODE_LABEL = { free: "免费额度", key: "自备 Key", local_model: "本地模型" };
-const PROVIDER_LABEL = { opencode: "OpenCode", token: "DeepSeek", local_model: "本地模型", free: "免费额度", key: "自备 Key" };
 // 与 model_probe.CONTEXT_P90 保持一致：静态页不能 import Python 常量，测试钉住两边相同。
 const CONTEXT_P90 = 21062;
 
@@ -1210,30 +1209,62 @@ function selectMode(mode, { focus = false } = {}) {
   }
 }
 
-// 当前生效的档位从一个只读快照里反推：switch_mode 之后 provider 统一是
-// opencode，真正的档位藏在生成模型的 provider 前缀里。
+// 服务端已经给出生效档位时直接用它；只有老服务端没有 mode 字段时才从
+// 模型前缀 / provider 反推。切换后 provider 统一是 opencode，不能再靠它。
 function inferBrainMode(brain) {
+  if (MODE_ORDER.includes(brain.mode)) return brain.mode;
   const model = String(brain.model || "");
-  if (model.includes("dafeiyu-local/")) return "local_model";
-  if (model.includes("dafeiyu-key/")) return "key";
+  if (model.startsWith("dafeiyu-local/")) return "local_model";
+  if (model.startsWith("dafeiyu-key/")) return "key";
   if (brain.provider === "local_model") return "local_model";
   if (brain.provider === "token") return "key";
   return "free";
 }
 
-// 把当前生效的本地模型补进下拉，避免切回来时下拉为空、保存后把模型清掉。
-function syncLocalModelOption() {
-  const select = $("local-model-select");
-  const live = String((state && state.brain && state.brain.model) || "");
-  const marker = live.indexOf("dafeiyu-local/");
-  if (marker < 0) return;
-  const model = live.slice(marker + "dafeiyu-local/".length);
-  if (!model) return;
-  const known = Array.from(select.options).some((o) => o.value === model);
-  if (!known) {
-    select.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`);
+// 预填只覆盖「用户没动过」的字段：记住上次写入的值，当前值被改过就跳过，
+// 这样 2 秒轮询带来的无关变化不会吞掉正在输入的内容。
+function setPrefillValue(el, value) {
+  const next = value === null || value === undefined ? "" : String(value);
+  if (el.dataset.prefill !== undefined && el.value !== el.dataset.prefill) return;
+  if (el.value !== next) el.value = next;
+  el.dataset.prefill = next;
+}
+
+function setPrefillSelect(select, value) {
+  const next = value === null || value === undefined ? "" : String(value);
+  if (select.dataset.prefill !== undefined && select.value !== select.dataset.prefill) return;
+  if (next && !Array.from(select.options).some((option) => option.value === next)) {
+    select.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(next)}">${escapeHtml(next)}</option>`);
   }
-  if (!select.value) select.value = model;
+  select.value = next;
+  select.dataset.prefill = next;
+}
+
+function setPrefillChecked(el, checked) {
+  const current = el.checked ? "1" : "0";
+  if (el.dataset.prefill !== undefined && current !== el.dataset.prefill) return;
+  el.checked = checked;
+  el.dataset.prefill = checked ? "1" : "0";
+}
+
+function prefillBrain(brain) {
+  const key = brain.key || {};
+  const local = brain.local || {};
+  setPrefillValue($("key-base-url"), key.base_url);
+  setPrefillValue($("key-model"), key.model);
+  setPrefillValue($("local-base-url"), local.base_url);
+  setPrefillSelect($("local-model-select"), local.model);
+  const context = Number(local.context);
+  // 0 = 未覆盖，面板按「留空使用默认」显示，避免把哨兵值当成用户填的窗口。
+  setPrefillValue($("local-context"), Number.isFinite(context) && context > 0 ? String(context) : "");
+  setPrefillChecked($("local-lean"), !!local.lean);
+  // 只根据 has_key 改提示；密钥本身永远不会从服务端回到 DOM。
+  $("key-api-key").placeholder = key.has_key ? "已保存 Key，留空沿用" : "输入 API Key";
+  $("local-api-key").placeholder = local.has_key ? "已保存令牌，留空沿用" : "访问令牌（可选）";
+}
+
+function clearPrefillGuards() {
+  document.querySelectorAll("[data-prefill]").forEach((el) => delete el.dataset.prefill);
 }
 
 function renderBrain() {
@@ -1246,13 +1277,12 @@ function renderBrain() {
     selectedMode = inferBrainMode(brain);
     renderModeSelection();
   }
-  syncLocalModelOption();
-  const provider = PROVIDER_LABEL[brain.provider] || brain.provider || "—";
-  const gw = brain.gateway_connected;
+  prefillBrain(brain);
+  const mode = inferBrainMode(brain);
   $("brain-hint").textContent =
-    `当前：${provider}` +
+    `当前：${MODE_LABEL[mode] || mode}` +
     (brain.model ? ` · ${brain.model}` : "") +
-    ` · OneBot ${gw ? "已连接" : "未连接"}`;
+    ` · OneBot ${brain.gateway_connected ? "已连接" : "未连接"}`;
 }
 
 function applyStatus(data) {
@@ -2377,7 +2407,6 @@ async function probeLocalModels() {
   let url = `/api/brain/models?base_url=${encodeURIComponent(baseUrl)}`;
   if (apiKey) url += `&api_key=${encodeURIComponent(apiKey)}`;
   setProbeStatus("正在探测…");
-  select.innerHTML = '<option value="">探测中…</option>';
   try {
     const resp = await fetch(url, { headers: { Accept: "application/json" } });
     if (resp.status === 401) { redirectToLogin(); return; }
@@ -2387,13 +2416,15 @@ async function probeLocalModels() {
       const reason = (data && (data.error || data.reason)) || `HTTP ${resp.status}`;
       const prefix = resp.status === 504 ? "探测超时" : resp.status === 502 ? "地址不可达" : "探测失败";
       setProbeStatus(`${prefix}：${reason}`, "err");
-      select.innerHTML = '<option value="">探测失败</option>';
       return;
     }
-    const models = (data && data.models) || [];
+    const models = data && data.models;
+    if (!Array.isArray(models)) {
+      setProbeStatus("返回格式异常", "err");
+      return;
+    }
     if (!models.length) {
       setProbeStatus("没有可用模型", "warn");
-      select.innerHTML = '<option value="">没有可用模型</option>';
       return;
     }
     select.innerHTML = models
@@ -2403,7 +2434,6 @@ async function probeLocalModels() {
     setProbeStatus(`已找到 ${models.length} 个模型`, "ok");
   } catch (err) {
     setProbeStatus(`无法连接控制台：${err.message}`, "err");
-    select.innerHTML = '<option value="">探测失败</option>';
   }
 }
 
@@ -2417,16 +2447,28 @@ function gradeContext(value) {
 
 function updateContextGrade() {
   const input = $("local-context");
-  const grade = gradeContext(Number(input.value));
+  const raw = input.value.trim();
   input.classList.remove("grade-red", "grade-yellow", "grade-green");
+  if (raw === "0") {
+    $("context-hint").textContent = "0 表示默认，可留空";
+    return;
+  }
+  if (raw === "") {
+    $("context-hint").textContent = "留空使用默认；0 也表示默认。";
+    return;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+    $("context-hint").textContent = "上下文窗口必须是正整数";
+    return;
+  }
+  const grade = gradeContext(value);
   if (grade) input.classList.add(`grade-${grade}`);
   $("context-hint").textContent = grade === "red"
     ? "偏小：不到常见窗口的 0.75 倍"
     : grade === "yellow"
       ? "够用：常见窗口的常规范围"
-      : grade === "green"
-        ? "充裕：超过常见窗口的 1.5 倍"
-        : "按模型实际上下文填写，颜色只作提示。";
+      : "充裕：超过常见窗口的 1.5 倍";
 }
 
 function brainPayload() {
@@ -2447,15 +2489,30 @@ function brainPayload() {
       lean: $("local-lean").checked,
       api_key: $("local-api-key").value,
     };
+    if (!local.base_url) throw new Error("先填写接口地址");
+    if (!local.model) throw new Error("先探测并选择本地模型");
     const raw = $("local-context").value.trim();
     if (raw !== "") {
       const context = Number(raw);
-      if (!Number.isInteger(context) || context < 0) {
-        throw new Error("上下文窗口必须是非负整数");
+      if (!Number.isInteger(context) || context <= 0) {
+        throw new Error(context === 0 ? "0 表示默认，可留空" : "上下文窗口必须是正整数");
       }
       local.context = context;
     }
-    return { mode: "local_model", local };
+    return {
+      mode: "local_model",
+      local,
+    };
+  }
+  if (selectedMode === "key") {
+    return {
+      mode: "key",
+      key: {
+        base_url: $("key-base-url").value.trim(),
+        model: $("key-model").value.trim(),
+        api_key: $("key-api-key").value,
+      },
+    };
   }
   return { mode: "free" };
 }
@@ -2481,7 +2538,12 @@ async function applyBrain() {
       method: "POST",
       body: JSON.stringify(payload),
     });
-    selectedMode = data.mode || selectedMode;
+    if (!data || typeof data !== "object") {
+      showBrainStatus("服务返回无法解析，可能已生效，请刷新确认", "warn");
+      refresh();
+      return;
+    }
+    selectedMode = MODE_ORDER.includes(data.mode) ? data.mode : selectedMode;
     modeTouched = true;
     renderModeSelection();
     // 用户刚输入的密钥只在本次请求里用一次，成功后立刻从 DOM 清掉。
@@ -2491,10 +2553,16 @@ async function applyBrain() {
       `已切换到${MODE_LABEL[selectedMode] || selectedMode}` +
         (data.model ? ` · ${data.model}` : ""),
     ];
-    if (data.reload !== "ok") lines.push("需重启 opencode 后生效");
-    (data.warnings || []).forEach((w) => lines.push(w));
+    const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+    // 后端警告已经带「需重启」时不再重复一行；只补它没说的那一刻。
+    if (data.reload !== "ok" && !warnings.some((w) => String(w).includes("重启"))) {
+      lines.push("需重启 opencode 后生效");
+    }
+    warnings.forEach((w) => lines.push(w));
     showBrainStatus(lines.join("\n"), data.reload === "ok" ? "ok" : "warn");
     toast("已切换大脑模式");
+    // 应用成功后重新允许服务端预填：下一轮 /api/brain 才是新的基线。
+    clearPrefillGuards();
     refresh();
   } catch (err) {
     showBrainStatus(`切换失败：${err.message}`, "err");

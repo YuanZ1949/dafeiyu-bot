@@ -81,12 +81,52 @@ def test_html_key_field_is_password_and_reuse_is_explained() -> None:
     assert match is not None
     assert 'type="password"' in match.group(0)
     assert 'autocomplete="new-password"' in match.group(0)
-    assert "留空则沿用已保存的 Key" in match.group(0)
+    # 初始状态是「没有已保存 Key」；有 Key 时由 brain.key.has_key 换成复用提示。
+    assert 'placeholder="输入 API Key"' in match.group(0)
+    assert "已保存 Key，留空沿用" in html
+    assert "已保存令牌，留空沿用" in html
 
 
 def test_html_probe_url_carries_base_url() -> None:
     html = read_html()
     assert "/api/brain/models?base_url=" in html
+
+
+def test_html_brain_payload_shape_and_mode_selection() -> None:
+    html = read_html()
+    # 提交体必须仍带三档各自字段；pin 住这些键，避免重构时静默改协议。
+    for token in (
+        'mode: "key"',
+        "key: {",
+        'mode: "local_model"',
+        "local,",
+        "base_url:",
+        "model:",
+        "api_key:",
+        "context",
+        "lean",
+    ):
+        assert token in html, token
+    # 选中态优先读服务端 mode；旧的前缀推断只作为 fallback，且必须是 startsWith。
+    assert "brain.mode" in html
+    assert 'model.startsWith("dafeiyu-local/")' in html
+    assert 'model.startsWith("dafeiyu-key/")' in html
+    assert 'model.includes("dafeiyu-local/")' not in html
+    assert 'model.includes("dafeiyu-key/")' not in html
+
+
+def test_html_probe_and_context_edge_cases_are_explained() -> None:
+    html = read_html()
+    # 探测失败不清空已选模型；返回不是数组时单独报格式错误。
+    assert "返回格式异常" in html
+    assert "select.innerHTML = '<option value=\"\">探测失败</option>'" not in html
+    # 0 不是合法窗口值，但空值表示使用默认。
+    assert "0 表示默认，可留空" in html
+    assert 'raw === "0"' in html
+    # 200 但 JSON 不可解析时不能报成「切换失败」。
+    assert "服务返回无法解析，可能已生效，请刷新确认" in html
+    # 重启提示只由一处补足，后端 warnings 已经带了就不再重复。
+    assert html.count("需重启 opencode 后生效") == 1
 
 
 def test_html_context_p90_matches_model_probe() -> None:
@@ -110,10 +150,16 @@ def test_html_never_renders_a_stored_secret() -> None:
 
 
 async def test_dashboard_models_proxy_forwards_query_string(tmp_path: Path) -> None:
-    seen: list[tuple[str, str]] = []
+    seen: list[tuple[str, str, str]] = []
 
     async def models(request: web.Request) -> web.Response:
-        seen.append((request.path_qs, request.query.get("base_url", "")))
+        seen.append(
+            (
+                request.path,
+                request.query.get("base_url", ""),
+                request.query.get("api_key", ""),
+            )
+        )
         return web.json_response({"models": ["qwen3"]})
 
     bot_app = web.Application()
@@ -140,21 +186,23 @@ async def test_dashboard_models_proxy_forwards_query_string(tmp_path: Path) -> N
         await dash_client.start_server()
 
         resp = await dash_client.get(
-            "/api/brain/models",
-            params={"base_url": "http://127.0.0.1:1234/v1"},
+            "/api/brain/models"
+            "?base_url=http%3A%2F%2F127.0.0.1%3A1234%2Fv1"
+            "&api_key=sk%2Fa%23b"
         )
         assert resp.status == 200
         assert await resp.json() == {"models": ["qwen3"]}
-        assert seen == [
-            (
-                "/api/brain/models?base_url=http://127.0.0.1:1234/v1",
-                "http://127.0.0.1:1234/v1",
-            )
-        ]
+        # 代理必须原样转发编码串：如果先解码再转发，`#` 会变成片段，bot 只能
+        # 收到 `sk/a`；这里断言 bot 拿到的是完整解码值。
+        assert seen[0][1] == "http://127.0.0.1:1234/v1"
+        assert seen[0][2] == "sk/a#b"
+        assert seen[0][0] == "/api/brain/models"
 
         # 不带查询串时保持原来的请求路径，一个字节都不变。
         await dash_client.get("/api/brain/models")
-        assert seen[-1] == ("/api/brain/models", "")
+        assert seen[-1][0] == "/api/brain/models"
+        assert seen[-1][1] == ""
+        assert seen[-1][2] == ""
     finally:
         if dash_client is not None:
             await dash_client.close()

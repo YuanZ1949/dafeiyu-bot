@@ -644,9 +644,11 @@ def create_app(
 
     async def models(request: web.Request) -> web.Response:
         path = "/api/brain/models"
-        if request.query_string:
-            # 探测按钮把 base_url / api_key 放在查询串里；不转发就只能探默认端点。
-            path = f"{path}?{request.query_string}"
+        # 不能转发 request.query_string：它已经解码过，值里的 `/`、`#` 会二次
+        # 解释（`#` 甚至变成片段），必须原样转发 rel_url 里的编码串。
+        raw_query = request.rel_url.raw_query_string
+        if raw_query:
+            path = f"{path}?{raw_query}"
         code, data = await bot_call("GET", path, None, BOT_SWITCH_TIMEOUT)
         return web.json_response(data, status=code)
 

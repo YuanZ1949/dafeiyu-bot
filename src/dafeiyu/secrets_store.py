@@ -1,4 +1,8 @@
-"""用户自备 provider API key 的唯一落盘位置（data/secrets/provider.key）。
+"""用户自备凭据的唯一落盘位置（data/secrets/）。
+
+自备 Key 与本地模型令牌分开存放：`provider.key` 只给「自备 Key」档，
+`provider-local.key` 只给「本地模型」档。两档的令牌互不覆盖，也避免把本地
+网关的占位令牌当成云端 Key 复用。
 
 档位切换、仪表盘表单、doctor 都从这里读写，所以这几点必须在同一处定死：
 权限从文件出现的第一刻起就只属于当前用户（临时文件在**空**状态下先加固，
@@ -25,6 +29,7 @@ log = logging.getLogger(__name__)
 INSTALL_ROOT = Path(__file__).resolve().parents[2]
 SECRETS_DIR = INSTALL_ROOT / "data" / "secrets"
 KEY_PATH = SECRETS_DIR / "provider.key"
+LOCAL_KEY_PATH = SECRETS_DIR / "provider-local.key"
 
 
 class SecretWriteError(OSError):
@@ -130,6 +135,7 @@ def mask(value: str) -> str:
 __all__ = [
     "INSTALL_ROOT",
     "KEY_PATH",
+    "LOCAL_KEY_PATH",
     "SECRETS_DIR",
     "SecretWriteError",
     "mask",

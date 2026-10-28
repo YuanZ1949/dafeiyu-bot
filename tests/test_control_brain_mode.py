@@ -15,6 +15,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from conftest import TEST_CONFIG_YAML
 
+from dafeiyu import config as config_mod
 from dafeiyu import control as control_mod
 from dafeiyu import secrets_store
 from dafeiyu.brain.provider_config import agent_path, config_path
@@ -100,6 +101,7 @@ def control(tmp_path: Path, monkeypatch, store_spy: StoreSpy) -> BrainControl:
     )
     monkeypatch.setattr(control_mod, "OVERRIDES_PATH", tmp_path / "settings.local.yaml")
     monkeypatch.setattr(control_mod, "KEY_PATH", tmp_path / "provider.key")
+    monkeypatch.setattr(control_mod, "LOCAL_KEY_PATH", tmp_path / "provider-local.key")
     # 测试机不跑真实 icacls：密钥文件内容与清理逻辑才是本文件的关注点。
     monkeypatch.setattr(secrets_store, "harden_token_file", lambda path: None)
 
@@ -272,6 +274,90 @@ async def test_empty_api_key_keeps_stored_secret(control: BrainControl) -> None:
     )
 
     assert read_secret(control_mod.KEY_PATH) == "sk-keep-me-1234"
+    assert read_secret(control_mod.LOCAL_KEY_PATH) == ""
+    generated = config_path(Path(control.settings.opencode.config_home))
+    assert key_file_target(generated) == Path(control_mod.KEY_PATH).resolve()
+
+
+async def test_snapshot_has_key_flags_without_exposing_values(
+    control: BrainControl,
+) -> None:
+    snap = control.snapshot()
+    assert snap["key"]["has_key"] is False
+    assert snap["local"]["has_key"] is False
+    assert "api_key" not in json.dumps(snap)
+
+    write_secret("sk-key-snapshot", control_mod.KEY_PATH)
+    write_secret("sk-local-snapshot", control_mod.LOCAL_KEY_PATH)
+    snap = control.snapshot()
+
+    assert snap["key"]["has_key"] is True
+    assert snap["local"]["has_key"] is True
+    assert "sk-key-snapshot" not in json.dumps(snap)
+    assert "sk-local-snapshot" not in json.dumps(snap)
+
+
+async def test_snapshot_mode_survives_restart(
+    tmp_path: Path, monkeypatch, control: BrainControl, store_spy: StoreSpy
+) -> None:
+    overrides_path = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_mod, "OVERRIDES_PATH", overrides_path)
+    monkeypatch.setattr(config_mod, "OVERRIDES_PATH", overrides_path)
+    await control.switch_mode(
+        {
+            "mode": "key",
+            "force": True,
+            "key": {
+                "base_url": "https://api.x/v1",
+                "model": "m",
+                "api_key": "sk-restart",
+            },
+        }
+    )
+
+    settings = load_settings(
+        env_file=tmp_path / "test.env", config_file=tmp_path / "config.yaml"
+    )
+    restarted = BrainControl(
+        settings,
+        store_spy,
+        FakeService(),
+        FakeAdapter(),
+        runtime_path=str(tmp_path / "runtime.json"),
+    )
+    snap = restarted.snapshot()
+
+    assert snap["mode"] == "key"
+    assert snap["key"]["base_url"] == "https://api.x/v1"
+    assert snap["key"]["model"] == "m"
+    assert snap["key"]["has_key"] is True
+    assert snap["local"]["has_key"] is False
+
+
+async def test_successful_post_never_echoes_local_secret(control: BrainControl) -> None:
+    app = create_app(control)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/api/brain",
+            json={
+                "mode": "local_model",
+                "force": True,
+                "local": {
+                    "base_url": "http://h:1/v1",
+                    "model": "lm",
+                    "api_key": "sk-local-response-secret",
+                },
+            },
+        )
+        text = await resp.text()
+    finally:
+        await client.close()
+
+    assert resp.status == 200
+    assert "sk-local-response-secret" not in text
+    assert read_secret(control_mod.LOCAL_KEY_PATH) == "sk-local-response-secret"
 
 
 async def test_repeated_switch_does_not_back_up_generated_config(
@@ -511,6 +597,7 @@ async def test_local_key_feeds_probe_and_generated_reference(
         return ["lm"]
 
     monkeypatch.setattr(control_mod, "probe_models", fake_probe)
+    write_secret("sk-key-must-stay", control_mod.KEY_PATH)
     out = await control.switch_mode(
         {
             "mode": "local_model",
@@ -523,15 +610,45 @@ async def test_local_key_feeds_probe_and_generated_reference(
     )
 
     assert seen == ["sk-local-777"]
-    assert read_secret(control_mod.KEY_PATH) == "sk-local-777"
+    # 本地令牌只进 provider-local.key，自备 Key 文件一个字节都不能动。
+    assert read_secret(control_mod.LOCAL_KEY_PATH) == "sk-local-777"
+    assert read_secret(control_mod.KEY_PATH) == "sk-key-must-stay"
     generated = config_path(Path(control.settings.opencode.config_home))
     generated_text = generated.read_text(encoding="utf-8")
     assert "sk-local-777" not in generated_text
-    assert key_file_target(generated) == Path(control_mod.KEY_PATH).resolve()
+    assert key_file_target(generated) == Path(control_mod.LOCAL_KEY_PATH).resolve()
     assert "sk-local-777" not in json.dumps(out)
+    assert control.snapshot()["local"]["has_key"] is True
+    assert control.snapshot()["key"]["has_key"] is True
 
 
-async def test_local_probe_falls_back_to_stored_key(
+async def test_local_empty_token_reuses_local_secret_not_provider_key(
+    control: BrainControl, monkeypatch
+) -> None:
+    write_secret("sk-key-only", control_mod.KEY_PATH)
+    write_secret("sk-local-keep", control_mod.LOCAL_KEY_PATH)
+    seen: list[str] = []
+
+    async def fake_probe(base_url, *, api_key="", timeout=8.0):
+        seen.append(api_key)
+        return ["lm"]
+
+    monkeypatch.setattr(control_mod, "probe_models", fake_probe)
+    await control.switch_mode(
+        {
+            "mode": "local_model",
+            "local": {"base_url": "http://h:1/v1", "model": "lm"},
+        }
+    )
+
+    assert seen == ["sk-local-keep"]
+    assert read_secret(control_mod.LOCAL_KEY_PATH) == "sk-local-keep"
+    assert read_secret(control_mod.KEY_PATH) == "sk-key-only"
+    generated = config_path(Path(control.settings.opencode.config_home))
+    assert key_file_target(generated) == Path(control_mod.LOCAL_KEY_PATH).resolve()
+
+
+async def test_local_probe_falls_back_to_configured_token(
     control: BrainControl, monkeypatch
 ) -> None:
     control.settings = dc_replace(
@@ -553,6 +670,6 @@ async def test_local_probe_falls_back_to_stored_key(
     )
 
     assert seen == ["sk-stored-1"]
-    assert read_secret(control_mod.KEY_PATH) == "sk-stored-1"
+    assert read_secret(control_mod.LOCAL_KEY_PATH) == "sk-stored-1"
     generated = config_path(Path(control.settings.opencode.config_home))
-    assert key_file_target(generated) == Path(control_mod.KEY_PATH).resolve()
+    assert key_file_target(generated) == Path(control_mod.LOCAL_KEY_PATH).resolve()
