@@ -142,7 +142,7 @@ def preflight(
                     "error",
                     "找不到 opencode",
                     str(exc),
-                    "安装 Node.js 后执行 npm i -g opencode-ai",
+                    "运行 scripts\\setup-opencode.ps1 下载 opencode.exe（无需 Node.js）",
                 )
             )
     elif provider == "token" and not settings.api_key:
