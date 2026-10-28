@@ -10,6 +10,7 @@ logs/
 *.egg-info/
 vendor/napcat/
 vendor/napcat.zip
+vendor/opencode/
 
 # 发布后 config.yaml 属于本机配置，从模板生成
 config.yaml
