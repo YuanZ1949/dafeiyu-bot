@@ -22,6 +22,7 @@ from .logs import SOURCES, LogHub
 from .manager import Supervisor
 from .napcat_login import NapCatLogin
 from .ops import OpsServices
+from .redact import redact
 from .restore import RestoreError
 
 log = logging.getLogger(__name__)
@@ -871,6 +872,53 @@ def create_app(
             )
         return web.json_response(result, status=207 if errors else 200)
 
+    async def reload_opencode(request: web.Request) -> web.Response:
+        # restart 内部已 stop + start，并在 start 里等待 ready_url；
+        # 这里只负责把结果翻译成接口返回，不再重复轮询。
+        try:
+            await supervisor.restart("opencode")
+        except asyncio.CancelledError:
+            write_audit(
+                request,
+                "opencode.reload",
+                target="opencode",
+                result="error",
+                detail={"error": "cancelled"},
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - 失败要回 503，不能把面板带崩
+            message = redact(f"opencode 重载失败：{exc}")
+            log.warning("%s", message)
+            write_audit(
+                request,
+                "opencode.reload",
+                target="opencode",
+                result="error",
+                detail={"error": message},
+            )
+            return web.json_response({"ok": False, "error": message}, status=503)
+
+        state = supervisor.states.get("opencode")
+        pid = state.as_dict().get("pid") if state is not None else None
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            message = "opencode 已重启但未取得 pid"
+            write_audit(
+                request,
+                "opencode.reload",
+                target="opencode",
+                result="error",
+                detail={"error": message},
+            )
+            return web.json_response({"ok": False, "error": message}, status=503)
+
+        write_audit(
+            request,
+            "opencode.reload",
+            target="opencode",
+            detail={"pid": pid},
+        )
+        return web.json_response({"ok": True, "pid": pid})
+
     async def rotate_control_token(request: web.Request) -> web.Response:
         if control_token is None:
             return ops_unavailable()
@@ -1010,6 +1058,7 @@ def create_app(
         memory_user_delete,
     )
     app.router.add_post("/api/control/{action}", control)
+    app.router.add_post("/api/opencode/reload", reload_opencode)
     app.router.add_post("/api/control-token/rotate", rotate_control_token)
     app.router.add_post("/api/shutdown", shutdown)
     return app
