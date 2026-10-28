@@ -274,3 +274,9 @@ def test_gateway_wechat_fails_at_startup_with_three_paths(tmp_path: Path) -> Non
 def test_gateway_rejects_unknown_provider(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="只能是 qq 或 wechat"):
         load(tmp_path, "gateway:\n  provider: telegram\n")
+
+
+def test_example_config_defaults_to_free_opencode():
+    text = Path("config.example.yaml").read_text(encoding="utf-8")
+    assert "provider: opencode" in text
+    assert "mode: free" in text

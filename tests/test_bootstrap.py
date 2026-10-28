@@ -14,6 +14,15 @@ from dafeiyu.bootstrap import (
 EXAMPLE = Path(__file__).resolve().parents[1] / "config.example.yaml"
 
 
+@pytest.fixture(autouse=True)
+def _stub_opencode_bin(monkeypatch):
+    """模板默认 provider=opencode；体检能否找到 opencode.exe 与本文件的断言无关。"""
+
+    monkeypatch.setattr(
+        "dafeiyu.bootstrap.resolve_opencode_bin", lambda _bin: Path("opencode.exe")
+    )
+
+
 def _write_env(tmp_path: Path, **values: str) -> Path:
     env = tmp_path / ".env"
     env.write_text("\n".join(f"{k}={v}" for k, v in values.items()), encoding="utf-8")

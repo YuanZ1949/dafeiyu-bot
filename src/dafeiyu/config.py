@@ -135,6 +135,7 @@ class LoggingConfig:
 @dataclass(frozen=True)
 class BrainConfig:
     provider: str = "local"
+    mode: str = "free"
 
 
 @dataclass(frozen=True)

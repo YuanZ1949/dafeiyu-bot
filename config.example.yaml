@@ -15,12 +15,14 @@ persona:
   # 留空使用内置人设 brain/persona.md；也可填自己的 md 路径（绝对或相对仓库根目录）
   prompt_file: ""
 
-# token：直连 DeepSeek API（只需 DEEPSEEK_API_KEY，上手最快）
-# opencode：走专用 OpenCode 服务（supervisor 启动，需要 npm i -g opencode-ai）
+# token：直连 DeepSeek API（需 DEEPSEEK_API_KEY，有 key 时最省事）
+# opencode：走专用 OpenCode 服务（supervisor 启动；opencode.exe 由安装脚本下载，无需 Node.js / npm）
 # local_model：任意 OpenAI 兼容端点（默认本机 LM Studio）
 # 运行时可在面板切换，选择存 data/runtime.json
 brain:
-  provider: token
+  provider: opencode
+  # free=opencode 免费模型，无需任何 key
+  mode: free
 
 gateway:
   # 只支持 qq；wechat 会在启动期直接报 ConfigError（协议未实现，不假装能跑）。
