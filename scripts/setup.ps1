@@ -8,8 +8,8 @@
 # 阶段：0 Python 预检 → 1 venv → 2 依赖 → 3 config.yaml → 4 .env 向导
 #       → 5 NapCat 下载 → 6 NapCat OneBot 配置 → 7 opencode 下载 → 8 doctor
 #
-# 无人值守：先设环境变量 BOT_QQ，第 4 段会直接写进 .env 而不提问；
-# 不设也没关系，第 6 段会跳过并提示填好后重跑本脚本。
+# 第 4 段的取值顺序：.env 里已有可用 BOT_QQ 就保留原值（重跑不改写）→ 否则用环境变量
+# BOT_QQ（可无人值守）→ 否则提问。仍是空值/占位值时第 6 段会跳过，填好后重跑本脚本即可。
 param(
     [string]$Proxy = "",
     [switch]$Force
@@ -30,13 +30,14 @@ $napcatScript = Join-Path $PSScriptRoot "setup-napcat.ps1"
 $opencodeScript = Join-Path $PSScriptRoot "setup-opencode.ps1"
 
 # 只取值、不打印：第 4、6 段用它判断 BOT_QQ 是否已填。
+# 必须显式 -Encoding UTF8：模板是无 BOM 的 UTF-8，PS 5.1 默认按 ANSI 代码页读会把中文注释读坏。
 function Get-EnvValue {
     param([string]$Path, [string]$Key)
     if (-not (Test-Path $Path)) {
         return ""
     }
     $pattern = '^\s*' + [regex]::Escape($Key) + '\s*=\s*(.*?)\s*$'
-    foreach ($line in Get-Content -LiteralPath $Path) {
+    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
         if ($line -match $pattern) {
             return $matches[1].Trim('"').Trim("'")
         }
@@ -45,9 +46,10 @@ function Get-EnvValue {
 }
 
 # 只改目标键这一行，其它键与注释原样保留；不回显写入的值。
+# Get-Content 同样要 -Encoding UTF8，否则读写一轮就会把中文注释毁掉。
 function Set-EnvValue {
     param([string]$Path, [string]$Key, [string]$Value)
-    $lines = @(Get-Content -LiteralPath $Path)
+    $lines = @(Get-Content -LiteralPath $Path -Encoding UTF8)
     $pattern = '^\s*' + [regex]::Escape($Key) + '\s*='
     $hit = $false
     for ($i = 0; $i -lt $lines.Count; $i++) {
@@ -61,6 +63,12 @@ function Set-EnvValue {
     }
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllLines($Path, $lines, $utf8NoBom)
+}
+
+# QQ 号的形状：5–12 位纯数字。模板自带的占位值也满足这个形状，所以另按模板值单独排除。
+function Test-BotQQ {
+    param([string]$Value)
+    return ($Value -match '^\d{5,12}$')
 }
 
 # 失败就停在这一段，并给出可照抄的下一步。
@@ -138,7 +146,11 @@ if (-not (Test-Path "config.yaml")) {
 }
 
 # ---- 4. .env 向导 -------------------------------------------------------
-# 只报告「已创建 / 已存在 / BOT_QQ 是否已填」，永不回显文件内容或具体值。
+# 只报告「已创建 / 已存在 / BOT_QQ 是否可用」，永不回显文件内容或具体值。
+# 模板里的 BOT_QQ 是占位值（形状合法但属于模板自己），必须当成「没填」：
+# 新建的文件会先清空该行，已存在的旧文件里等于模板值的也按无效处理。
+$templateQQ = Get-EnvValue $envTemplate "BOT_QQ"
+
 Write-Host "[4/8] 准备 .env（QQ 号等凭据）..." -ForegroundColor Cyan
 if (Test-Path $envPath) {
     Write-Host "      .env 已存在" -ForegroundColor Green
@@ -148,23 +160,41 @@ if (Test-Path $envPath) {
     }
     Copy-Item -LiteralPath $envTemplate -Destination $envPath
     Write-Host "      已创建 .env（来自 .env.example）" -ForegroundColor Green
+    if ($templateQQ) {
+        # 占位值不能留在新文件里，否则下面会把它当作用户填的号。
+        Set-EnvValue $envPath "BOT_QQ" ""
+        Write-Host "      模板里的 BOT_QQ 是占位值，已清空待填" -ForegroundColor DarkGray
+    }
 }
 
-$botQQ = ""
+$envVarQQ = ""
 if ($env:BOT_QQ) {
-    $botQQ = $env:BOT_QQ.Trim()
+    $envVarQQ = $env:BOT_QQ.Trim()
 }
-if ($botQQ) {
-    Set-EnvValue $envPath "BOT_QQ" $botQQ
+$currentQQ = Get-EnvValue $envPath "BOT_QQ"
+$currentValid = (Test-BotQQ $currentQQ) -and ($currentQQ -ne $templateQQ)
+
+if ($currentValid) {
+    Write-Host "      .env 里已有可用 BOT_QQ，保留原值（不询问、不覆盖）" -ForegroundColor Green
+} elseif ($envVarQQ -and (Test-BotQQ $envVarQQ) -and ($envVarQQ -ne $templateQQ)) {
+    Set-EnvValue $envPath "BOT_QQ" $envVarQQ
     Write-Host "      BOT_QQ 已按环境变量写入 .env（不回显具体值）" -ForegroundColor Green
-} elseif (Get-EnvValue $envPath "BOT_QQ") {
-    Write-Host "      .env 里已有 BOT_QQ，保留原值" -ForegroundColor Green
 } else {
-    Write-Host "      请输入机器人 QQ 号（直接回车可跳过）" -ForegroundColor Yellow
+    if ($currentQQ) {
+        Write-Host "      现有 BOT_QQ 无效（模板占位值或不是 5–12 位数字），需要重新填写。" -ForegroundColor Yellow
+    }
+    if ($envVarQQ) {
+        Write-Host "      环境变量 BOT_QQ 也无效（需要 5–12 位数字），改为手工输入。" -ForegroundColor Yellow
+    }
+    Write-Host "      请输入机器人 QQ 号（5–12 位数字，直接回车可跳过）" -ForegroundColor Yellow
     $answer = Read-Host "      BOT_QQ"
     if ($answer -and $answer.Trim()) {
-        Set-EnvValue $envPath "BOT_QQ" $answer.Trim()
-        Write-Host "      BOT_QQ 已写入 .env" -ForegroundColor Green
+        if (Test-BotQQ $answer.Trim()) {
+            Set-EnvValue $envPath "BOT_QQ" $answer.Trim()
+            Write-Host "      BOT_QQ 已写入 .env" -ForegroundColor Green
+        } else {
+            Write-Host "      输入的不是 5–12 位数字，未写入 .env。" -ForegroundColor Yellow
+        }
     } else {
         Write-Host "      未填 BOT_QQ：第 6 段会跳过，填好后重跑本脚本即可补上 OneBot 配置。" -ForegroundColor Yellow
     }
@@ -190,11 +220,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # ---- 6. NapCat OneBot 配置 ----------------------------------------------
-# 不带 -DownloadOnly 的调用要读 .env 里的 BOT_QQ，缺了就跳过而不是报错。
+# 不带 -DownloadOnly 的调用要读 .env 里的 BOT_QQ，缺了/是占位值就跳过而不是报错。
 Write-Host "[6/8] 写入 NapCat OneBot 配置 ..." -ForegroundColor Cyan
 $botQQ = Get-EnvValue $envPath "BOT_QQ"
-if (-not $botQQ) {
-    Write-Host "      跳过：.env 里还没有 BOT_QQ，填好后重跑本脚本即可写入。" -ForegroundColor Yellow
+if (-not (Test-BotQQ $botQQ) -or $botQQ -eq $templateQQ) {
+    Write-Host "      跳过：.env 里还没有可用的 BOT_QQ（5–12 位数字），填好后重跑本脚本即可写入。" -ForegroundColor Yellow
 } else {
     $napcatConfig = @{}
     if ($Proxy) {
