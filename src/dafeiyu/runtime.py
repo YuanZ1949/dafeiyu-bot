@@ -18,6 +18,9 @@ class RuntimeState:
 
     provider: str = ""
     local_model_model: str = ""
+    # 免费档自检结果：None = 还没探过。只在内存里，绝不落盘——重启后一个
+    # 陈旧的 True 就是谎话，宁可重新探一次。
+    free_available: bool | None = None
 
     def with_provider(self, provider: str, model: str = "") -> "RuntimeState":
         if provider == "local_model":

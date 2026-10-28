@@ -38,7 +38,13 @@ from .brain.runtime_config import ensure_isolated_config
 from .budget import BudgetGuard
 from .config import OVERRIDES_PATH, ConfigError, Settings
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
-from .model_probe import ProbeError, normalize_base_url, probe_models
+from .model_probe import (
+    FREE_PROBE_TTL,
+    ProbeError,
+    normalize_base_url,
+    probe_free_model,
+    probe_models,
+)
 from .models import ChatType, Message
 from .runtime import RuntimeState, load_runtime, save_runtime
 from .secrets_store import (
@@ -541,6 +547,10 @@ class BrainControl:
         # 这里先钉住刚写进覆盖层的 key/local 配置，GET /api/brain 才不会回退。
         self._mode_view: dict[str, Any] | None = None
         self.budget_guard = BudgetGuard(store, settings.budget)
+        # 免费档自检：结果只留在内存（RuntimeState），启动时探一次，之后按
+        # FREE_PROBE_TTL 懒刷新。_free_probe_at 用单调时钟，不落盘。
+        self._free_probe_at = 0.0
+        self._free_probe_task: asyncio.Task | None = None
 
     def _local_token(self) -> str:
         """本地档当前真正可用的令牌（不含 "local" 占位哨兵）。"""
@@ -549,6 +559,57 @@ class BrainControl:
             return stored
         configured = str(self.settings.local_model.api_key or "").strip()
         return "" if configured == "local" else configured
+
+    def _free_probe_client(self) -> Any:
+        """免费档自检用的 HTTP 传输：opencode brain 自己的 httpx client。
+
+        没有 HTTP 传输（测试替身、还没换脑）时返回 None，自检直接跳过——
+        这种情况下的 free_available 保持 None（未探测），不谎报 False。
+        """
+        brain = getattr(self.service, "brain", None)
+        return getattr(brain, "_client", None)
+
+    def _free_probe_due(self) -> bool:
+        """自检是否该跑：没探过（含刚切回免费档）或结果已过期。"""
+        if self.runtime.free_available is None:
+            return True
+        return time.monotonic() - self._free_probe_at >= FREE_PROBE_TTL
+
+    def schedule_free_probe(self, *, force: bool = False) -> None:
+        """安排一次后台自检：只在免费档、且结果过期时才真的去跑。
+
+        启动流程与 GET /api/brain 都调这里。探测最慢要 8 秒，谁都不等它：
+        任务异常只记日志，绝不冒进请求 handler，也不阻塞响应。
+        """
+        try:
+            if self.snapshot().get("mode") != "free":
+                return
+            if self._free_probe_client() is None:
+                return
+            if not force and not self._free_probe_due():
+                return
+            task = self._free_probe_task
+            if task is not None and not task.done():
+                return
+            # 先盖时间戳再去探：同一 TTL 窗口内最多一次，面板轮询不会堆任务。
+            self._free_probe_at = time.monotonic()
+            self._free_probe_task = asyncio.get_running_loop().create_task(
+                self._run_free_probe()
+            )
+        except Exception as exc:  # noqa: BLE001 - 自检调度失败只降级
+            log.debug("免费模型自检调度失败：%s", exc)
+
+    async def _run_free_probe(self) -> None:
+        client = self._free_probe_client()
+        if client is None:
+            return
+        try:
+            available = await probe_free_model(client)
+        except Exception:  # noqa: BLE001 - 自检永远不允许打断启动
+            log.warning("免费模型自检异常", exc_info=True)
+            available = False
+        self.runtime = replace(self.runtime, free_available=available)
+        log.info("免费模型自检结果：%s", "可用" if available else "不可用")
 
     def _brain_view(self, provider: str) -> dict[str, Any]:
         """GET /api/brain 的档位视图：只含 has_key，绝不含密钥本身。"""
@@ -598,6 +659,8 @@ class BrainControl:
             "local": view["local"],
             "modes": mode_status(self.settings, self.runtime),
             "gateway_connected": bool(getattr(self.adapter, "connected", False)),
+            # 免费档自检结果：None = 未探测，面板只在 False 时亮黄条。
+            "free_available": self.runtime.free_available,
         }
 
     def health_snapshot(self) -> dict[str, Any]:
@@ -734,6 +797,8 @@ class BrainControl:
                 "reason": "额度熔断" if quota_paused else "",
             },
             "brain": {"provider": state["provider"], "model": state["model"]},
+            # 免费档降级提示的唯一数据源：supervisor 的 /api/state 会把它透传给面板。
+            "free_available": state["free_available"],
             "memory": memory,
             "errors": errors,
         }
@@ -1452,6 +1517,8 @@ def create_app(
         return web.json_response(control.snapshot())
 
     async def get_brain(_: web.Request) -> web.Response:
+        # 面板每 2 秒轮询一次：顺手把过期的免费档自检排进后台，绝不等待它。
+        control.schedule_free_probe()
         return web.json_response(control.snapshot())
 
     async def post_brain(request: web.Request) -> web.Response:
@@ -2084,6 +2151,9 @@ async def start_control_server(
     token = os.environ.get("DAFEIYU_CONTROL_TOKEN", "").strip()
 
     control = BrainControl(settings, store, service, adapter, runtime_path)
+    # 免费档启动自检：supervisor 要等 opencode /api/info 就绪才拉起本进程，
+    # 所以走到这里 opencode 已经 ready。只探测不阻塞，失败仅置标志。
+    control.schedule_free_probe(force=True)
     app = create_app(control, token, memory_actions)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()

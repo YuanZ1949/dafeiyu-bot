@@ -79,6 +79,16 @@
     border-bottom: 1px solid var(--line);
     font-size: var(--fs-sm);
   }
+  /* 免费档降级提示（顶栏黄条）：不阻塞，只提示可以切到另外两档。 */
+  .warn {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+    padding: 10px 20px;
+    background: var(--bubble-warn); color: var(--warn);
+    border-bottom: 1px solid var(--warn);
+    font-size: var(--fs-sm);
+  }
+  /* 自定义 display 会盖掉 [hidden] 的 UA 样式，必须显式关掉。 */
+  .warn[hidden] { display: none; }
   .btn {
     background: var(--panel-2);
     color: var(--text);
@@ -454,6 +464,10 @@
   <button class="btn" id="btn-logout" hidden>退出登录</button>
   <button class="btn danger" id="btn-shutdown">退出控制台</button>
 </header>
+<div id="free-banner" class="warn" role="status" hidden>
+  <span>免费模型当前不可用，请切换到「自备 Key」或「本地模型」</span>
+  <button class="btn" type="button" id="free-banner-go">去切换</button>
+</div>
 <div class="global-banner" id="global-banner" role="status" hidden></div>
 
 <main>
@@ -1307,6 +1321,15 @@ function applyStatus(data) {
   renderLogin(data.napcat);
   renderQr(data.qr, data.napcat);
   renderGlobalBanner(data);
+  renderFreeBanner(data);
+}
+
+// 免费档降级提示：只有自检明确给出 false 时才亮黄条。
+// null / undefined 都表示「还没探测」，不能当成不可用误报。
+function renderFreeBanner(data) {
+  const brain = data.brain || {};
+  const flag = data.free_available !== undefined ? data.free_available : brain.free_available;
+  $("free-banner").hidden = !(brain.mode === "free" && flag === false);
 }
 
 // 顶部全局降级横幅：命中任一条件就亮红条，文案区分是哪一种。
@@ -2908,6 +2931,12 @@ $("probe-btn").addEventListener("click", (ev) => withBusy(ev.currentTarget, prob
 $("local-context").addEventListener("blur", updateContextGrade);
 $("btn-apply-brain").addEventListener("click", (ev) => withBusy(ev.currentTarget, applyBrain));
 $("btn-refresh-health").addEventListener("click", refreshHealth);
+$("free-banner-go").addEventListener("click", () => {
+  // 只跳到大卡片并把焦点放到「自备 Key」，不替用户做切换。
+  $("brain-card").scrollIntoView({ behavior: "smooth", block: "start" });
+  const keyMode = document.querySelector('.mode-card[data-mode="key"]');
+  if (keyMode) keyMode.focus();
+});
 $("btn-refresh-alerts").addEventListener("click", refreshAlerts);
 $("btn-test-alert").addEventListener("click", sendTestAlert);
 $("btn-refresh-backups").addEventListener("click", refreshBackups);
