@@ -17,7 +17,10 @@ from .brain import provider_config
 normalize_base_url = provider_config.normalize_base_url
 
 # 面板按 p90 上下文窗口给模型分档：低于 0.75 倍偏红，高于 1.5 倍算绿。
-DEFAULT_P90_CONTEXT = 21062
+# 静态页里另有一份同名常量（index.html 不能 import Python），测试会钉住两边一致。
+CONTEXT_P90 = 21062
+# 兼容旧名字：外部还在按这个常量取值，规则本身只允许有一个数字来源。
+DEFAULT_P90_CONTEXT = CONTEXT_P90
 PROBE_ERROR_MESSAGE = "地址不可达或不是 OpenAI 兼容接口"
 
 
@@ -94,7 +97,7 @@ async def probe_models(
     return ids
 
 
-def context_grade(context: int, *, p90: int = DEFAULT_P90_CONTEXT) -> str:
+def context_grade(context: int, *, p90: int = CONTEXT_P90) -> str:
     """按 p90 上下文窗口把模型分成红/黄/绿三档，给面板上色用。"""
     if context < 0.75 * p90:
         return "red"

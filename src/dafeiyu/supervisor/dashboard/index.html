@@ -23,11 +23,13 @@
     --surface-deep: #0b0d12;
     --toast-deep: #1f2937;
     --mode-active: #1b2436;
+    --mode-glow: rgba(96, 165, 250, .18);
     --bubble-ok: #16221c;
     --bubble-warn: #2a2413;
     --hot: #fb923c;
     --tag-warn-bg: rgba(251, 191, 36, .12);
     --tag-bad-bg: rgba(248, 113, 113, .12);
+    --tag-ok-bg: rgba(74, 222, 128, .12);
     --overlay: rgba(0, 0, 0, .55);
     --drawer-shadow: rgba(0, 0, 0, .45);
     /* 字号阶梯：16 / 14 / 12 / 11 四级 */
@@ -168,17 +170,74 @@
   .proc-meta { margin-top: 8px; }
   .proc-actions { margin-top: 12px; display: flex; gap: 8px; }
   .proc-actions .btn { padding: 4px 12px; font-size: var(--fs-sm); }
-  .mode-list { display: grid; gap: 8px; }
-  .mode {
-    display: flex; align-items: center; gap: 12px; width: 100%;
-    border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
-    cursor: pointer; background: var(--panel-2);
-    font: inherit; color: inherit; text-align: left;
+  .brain-modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+  .mode-card {
+    position: relative; display: grid; gap: 4px; padding: 14px 40px 13px 16px;
+    text-align: left; font: inherit; color: inherit; cursor: pointer;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
+    transition: border-color .16s ease, background .16s ease, box-shadow .16s ease, transform .16s ease;
   }
-  .mode.active { border-color: var(--accent); background: var(--mode-active); }
-  .mode.disabled { opacity: .7; cursor: not-allowed; }
-  .mode .label { font-weight: 600; }
-  .mode .reason { color: var(--muted); font-size: var(--fs-sm); margin-left: auto; }
+  .mode-card::before {
+    content: ""; position: absolute; left: 0; top: 12px; bottom: 12px; width: 2px;
+    border-radius: 2px; background: transparent; transition: background .16s ease;
+  }
+  .mode-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .mode-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .mode-card[aria-checked=true] {
+    border-color: var(--accent); background: var(--mode-active); box-shadow: 0 0 0 1px var(--mode-glow) inset;
+  }
+  .mode-card[aria-checked=true]::before { background: var(--accent); }
+  .mode-num {
+    font: var(--fs-xs)/1 Consolas, "Cascadia Mono", monospace;
+    color: var(--muted); letter-spacing: .12em;
+  }
+  .mode-name { font-weight: 600; }
+  .mode-need { color: var(--muted); font-size: var(--fs-sm); }
+  .mode-check {
+    position: absolute; top: 12px; right: 12px; width: 16px; height: 16px;
+    display: grid; place-items: center; border: 1px solid var(--line); border-radius: 50%;
+    color: transparent; font-size: 10px; line-height: 1;
+  }
+  .mode-card[aria-checked=true] .mode-check { border-color: var(--accent); background: var(--accent); color: var(--surface-deep); }
+  .brain-fields {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px;
+    margin-top: 14px; padding: 14px; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 10px;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .brain-fields:not([hidden]) { animation: brain-in .18s ease; }
+    @keyframes brain-in { from { opacity: 0; transform: translateY(-3px); } }
+  }
+  .field { display: grid; gap: 6px; min-width: 0; }
+  .field > span { color: var(--muted); font-size: var(--fs-sm); }
+  .field input, .field select { width: 100%; }
+  .field input[type="number"] { font-variant-numeric: tabular-nums; }
+  .field-row { display: flex; align-items: center; gap: 8px; }
+  .field-row input { flex: 1; min-width: 0; }
+  .field-wide { grid-column: 1 / -1; }
+  .field-note { color: var(--muted); font-size: var(--fs-xs); min-height: 1em; }
+  .field-check { display: flex; align-items: center; gap: 8px; align-self: end; padding-bottom: 7px; }
+  .field-check input { width: 16px; height: 16px; accent-color: var(--accent); }
+  .brain-free-note {
+    grid-column: 1 / -1; color: var(--muted); font-size: var(--fs-sm);
+    border: 1px dashed var(--line); border-radius: 8px; padding: 12px 14px;
+  }
+  .probe-status { font-size: var(--fs-sm); color: var(--muted); min-height: 1em; }
+  .probe-status.ok { color: var(--ok); }
+  .probe-status.warn { color: var(--warn); }
+  .probe-status.err { color: var(--bad); }
+  input.grade-red { border-color: var(--bad); background: var(--tag-bad-bg); }
+  input.grade-yellow { border-color: var(--warn); background: var(--tag-warn-bg); }
+  input.grade-green { border-color: var(--ok); background: var(--tag-ok-bg); }
+  .brain-actions { margin-top: 14px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .brain-status {
+    margin-top: 12px; padding: 10px 12px; background: var(--panel-2);
+    border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 8px; font-size: var(--fs-sm); white-space: pre-line;
+  }
+  .brain-status.ok { border-left-color: var(--ok); }
+  .brain-status.warn { border-left-color: var(--warn); }
+  .brain-status.err { border-left-color: var(--bad); }
   select {
     background: var(--panel-2); color: var(--text);
     border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-width: 180px;
@@ -469,18 +528,85 @@
     <div class="kv mt-2">轮换后 Bot 会用新口令重启；任一步失败会保留旧口令。</div>
   </section>
 
-  <section class="card">
-    <h2>大脑模式</h2>
-    <div class="mode-list" id="modes" role="radiogroup" aria-label="大脑模式"></div>
-    <div class="row mt-3" id="model-row" hidden>
-      <select id="model-select" aria-label="本地模型列表"></select>
-      <button class="btn" id="btn-refresh-models">刷新模型列表</button>
-      <span class="kv" id="model-hint"></span>
-    </div>
-    <div class="row mt-3">
-      <button class="btn primary" id="btn-apply-brain">应用切换</button>
+  <section class="card" id="brain-card">
+    <div class="row card-head">
+      <h2>大脑模式</h2>
+      <span class="spacer"></span>
       <span class="kv" id="brain-hint"></span>
     </div>
+    <div class="brain-modes" id="modes" role="radiogroup" aria-label="大脑模式">
+      <button type="button" class="mode-card" data-mode="free" role="radio" aria-checked="true" tabindex="0">
+        <span class="mode-num">01</span>
+        <span class="mode-name">免费额度</span>
+        <span class="mode-need">无需配置</span>
+        <span class="mode-check" aria-hidden="true">✓</span>
+      </button>
+      <button type="button" class="mode-card" data-mode="key" role="radio" aria-checked="false" tabindex="-1">
+        <span class="mode-num">02</span>
+        <span class="mode-name">自备 Key</span>
+        <span class="mode-need">自备 API Key</span>
+        <span class="mode-check" aria-hidden="true">✓</span>
+      </button>
+      <button type="button" class="mode-card" data-mode="local_model" role="radio" aria-checked="false" tabindex="-1">
+        <span class="mode-num">03</span>
+        <span class="mode-name">本地模型</span>
+        <span class="mode-need">本地 LM Studio</span>
+        <span class="mode-check" aria-hidden="true">✓</span>
+      </button>
+    </div>
+    <div class="brain-fields" data-mode-fields="free">
+      <div class="brain-free-note">使用内置免费模型，不需要填写任何配置。想用自己的端点，切到另外两档。</div>
+    </div>
+    <div class="brain-fields" data-mode-fields="key" hidden>
+      <label class="field">
+        <span>接口地址</span>
+        <input id="key-base-url" type="text" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false" />
+      </label>
+      <label class="field">
+        <span>模型</span>
+        <input id="key-model" type="text" placeholder="deepseek-chat" autocomplete="off" spellcheck="false" />
+      </label>
+      <label class="field field-wide">
+        <span>API Key</span>
+        <input id="key-api-key" type="password" placeholder="留空则沿用已保存的 Key" autocomplete="new-password" />
+        <span class="field-note">Key 只写入本机密钥文件，不会回显。</span>
+      </label>
+    </div>
+    <div class="brain-fields" data-mode-fields="local_model" hidden>
+      <div class="field field-wide">
+        <span>接口地址</span>
+        <div class="field-row">
+          <input id="local-base-url" type="text" placeholder="http://127.0.0.1:1234/v1" autocomplete="off" spellcheck="false" />
+          <button class="btn" id="probe-btn" type="button">探测模型</button>
+        </div>
+        <span class="probe-status" id="probe-status" role="status" aria-live="polite"></span>
+      </div>
+      <label class="field">
+        <span>模型</span>
+        <select id="local-model-select" aria-label="本地模型列表">
+          <option value="">先探测模型</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>上下文窗口</span>
+        <input id="local-context" type="number" min="0" step="1024" inputmode="numeric" placeholder="例如 32768" />
+        <span class="field-note" id="context-hint">按模型实际上下文填写，颜色只作提示。</span>
+      </label>
+      <label class="field">
+        <span>访问令牌（可选）</span>
+        <input id="local-api-key" type="password" placeholder="留空则沿用已保存的令牌" autocomplete="new-password" />
+        <span class="field-note">只有需要鉴权的本地网关才填。</span>
+      </label>
+      <label class="field-check">
+        <input id="local-lean" type="checkbox" />
+        精简模式（只回话，不调用工具）
+      </label>
+    </div>
+    <div class="brain-actions">
+      <button class="btn primary" id="btn-apply-brain">应用切换</button>
+      <span class="kv">切换会重新生成 opencode 配置</span>
+    </div>
+    <div class="brain-status" id="brain-status" role="status" aria-live="polite" hidden></div>
   </section>
 
   <section class="card span-full">
@@ -726,11 +852,15 @@ const STATUS_TEXT = {
 };
 const PROC_TITLE = { opencode: "OpenCode", bot: "Bot", napcat: "NapCat" };
 const LOG_SOURCES = ["supervisor", "opencode", "bot", "napcat"];
-const MODE_ORDER = ["local_model", "token", "opencode"];
+const MODE_ORDER = ["free", "key", "local_model"];
+const MODE_LABEL = { free: "免费额度", key: "自备 Key", local_model: "本地模型" };
+const PROVIDER_LABEL = { opencode: "OpenCode", token: "DeepSeek", local_model: "本地模型", free: "免费额度", key: "自备 Key" };
+// 与 model_probe.CONTEXT_P90 保持一致：静态页不能 import Python 常量，测试钉住两边相同。
+const CONTEXT_P90 = 21062;
 
 let state = null;
-let selectedProvider = null;
-let selectedModel = "";
+let selectedMode = "free";
+let modeTouched = false;
 let currentSource = "bot";
 let eventSource = null;
 
@@ -1056,46 +1186,73 @@ function updateUptimes(list) {
   });
 }
 
+// 三档模式卡是静态节点：这里只同步选中态与对应字段区，不重建 DOM，
+// 否则每 2 秒的状态轮询会吞掉用户正在输入的内容。
+function renderModeSelection() {
+  document.querySelectorAll(".mode-card").forEach((card) => {
+    const on = card.dataset.mode === selectedMode;
+    card.setAttribute("aria-checked", on ? "true" : "false");
+    card.tabIndex = on ? 0 : -1;
+  });
+  document.querySelectorAll("[data-mode-fields]").forEach((el) => {
+    el.hidden = el.dataset.modeFields !== selectedMode;
+  });
+}
+
+function selectMode(mode, { focus = false } = {}) {
+  if (!MODE_ORDER.includes(mode)) return;
+  selectedMode = mode;
+  modeTouched = true;
+  renderModeSelection();
+  if (focus) {
+    const card = document.querySelector(`.mode-card[data-mode="${mode}"]`);
+    if (card) card.focus();
+  }
+}
+
+// 当前生效的档位从一个只读快照里反推：switch_mode 之后 provider 统一是
+// opencode，真正的档位藏在生成模型的 provider 前缀里。
+function inferBrainMode(brain) {
+  const model = String(brain.model || "");
+  if (model.includes("dafeiyu-local/")) return "local_model";
+  if (model.includes("dafeiyu-key/")) return "key";
+  if (brain.provider === "local_model") return "local_model";
+  if (brain.provider === "token") return "key";
+  return "free";
+}
+
+// 把当前生效的本地模型补进下拉，避免切回来时下拉为空、保存后把模型清掉。
+function syncLocalModelOption() {
+  const select = $("local-model-select");
+  const live = String((state && state.brain && state.brain.model) || "");
+  const marker = live.indexOf("dafeiyu-local/");
+  if (marker < 0) return;
+  const model = live.slice(marker + "dafeiyu-local/".length);
+  if (!model) return;
+  const known = Array.from(select.options).some((o) => o.value === model);
+  if (!known) {
+    select.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`);
+  }
+  if (!select.value) select.value = model;
+}
+
 function renderBrain() {
   const brain = (state && state.brain) || {};
-  const modes = brain.modes && brain.modes.length
-    ? brain.modes
-    : MODE_ORDER.map((id) => ({ id, label: id, ready: false, reason: "bot 未运行" }));
-  if (selectedProvider === null) selectedProvider = brain.provider || modes[0].id;
-  if (brain.provider) selectedProvider = selectedProvider || brain.provider;
-
-  $("modes").innerHTML = modes
-    .slice()
-    .sort((a, b) => MODE_ORDER.indexOf(a.id) - MODE_ORDER.indexOf(b.id))
-    .map((m) => {
-      const active = m.id === selectedProvider ? " active" : "";
-      const disabled = m.ready ? "" : " disabled";
-      const checked = m.id === selectedProvider ? "true" : "false";
-      return `<button type="button" class="mode${active}${disabled}" data-mode="${escapeHtml(m.id)}" role="radio" aria-checked="${checked}" ${m.ready ? "" : "disabled"}>
-        <span class="label">${escapeHtml(m.label)}</span>
-        ${m.ready ? "" : `<span class="reason">${escapeHtml(m.reason || "不可用")}</span>`}
-      </button>`;
-    }).join("");
-
-  const showModel = selectedProvider === "local_model";
-  $("model-row").hidden = !showModel;
-  if (showModel) {
-    const select = $("model-select");
-    const activeModel = selectedModel || brain.model || "";
-    const options = Array.from(select.options).map((o) => o.value);
-    if (activeModel && !options.includes(activeModel)) {
-      select.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(activeModel)}">${escapeHtml(activeModel)}</option>`);
-    }
-    if (activeModel) select.value = activeModel;
+  if (brain.available === false) {
+    $("brain-hint").textContent = "bot 未运行，无法读取模式";
+    return;
   }
-
+  if (!modeTouched) {
+    selectedMode = inferBrainMode(brain);
+    renderModeSelection();
+  }
+  syncLocalModelOption();
+  const provider = PROVIDER_LABEL[brain.provider] || brain.provider || "—";
   const gw = brain.gateway_connected;
-  const tip = brain.available === false
-    ? "bot 未运行，无法读取模式"
-    : `当前：${(modes.find((m) => m.id === brain.provider) || {}).label || brain.provider || "—"}` +
-      (brain.model ? ` · ${brain.model}` : "") +
-      ` · OneBot ${gw ? "已连接" : "未连接"}`;
-  $("brain-hint").textContent = tip;
+  $("brain-hint").textContent =
+    `当前：${provider}` +
+    (brain.model ? ` · ${brain.model}` : "") +
+    ` · OneBot ${gw ? "已连接" : "未连接"}`;
 }
 
 function applyStatus(data) {
@@ -2201,37 +2358,146 @@ async function doControl(act, target) {
   refresh();
 }
 
-async function loadModels() {
-  const select = $("model-select");
-  select.innerHTML = '<option value="">加载中…</option>';
+function setProbeStatus(text, tone = "") {
+  const el = $("probe-status");
+  el.textContent = text;
+  el.className = `probe-status${tone ? ` ${tone}` : ""}`;
+}
+
+// 探测只读接口地址，不带任何已保存的凭据；只有用户这次真的输入了才随查询串发出去。
+async function probeLocalModels() {
+  const baseUrl = $("local-base-url").value.trim();
+  const apiKey = $("local-api-key").value;
+  const select = $("local-model-select");
+  if (!baseUrl) {
+    setProbeStatus("先填写接口地址", "err");
+    return;
+  }
+  const previous = select.value;
+  let url = `/api/brain/models?base_url=${encodeURIComponent(baseUrl)}`;
+  if (apiKey) url += `&api_key=${encodeURIComponent(apiKey)}`;
+  setProbeStatus("正在探测…");
+  select.innerHTML = '<option value="">探测中…</option>';
   try {
-    const data = await api("/api/brain/models");
-    const models = data.models || [];
-    if (!models.length) {
-      select.innerHTML = '<option value="">LM Studio 没有可用模型</option>';
+    const resp = await fetch(url, { headers: { Accept: "application/json" } });
+    if (resp.status === 401) { redirectToLogin(); return; }
+    let data = null;
+    try { data = await resp.json(); } catch (_) { data = null; }
+    if (!resp.ok) {
+      const reason = (data && (data.error || data.reason)) || `HTTP ${resp.status}`;
+      const prefix = resp.status === 504 ? "探测超时" : resp.status === 502 ? "地址不可达" : "探测失败";
+      setProbeStatus(`${prefix}：${reason}`, "err");
+      select.innerHTML = '<option value="">探测失败</option>';
       return;
     }
-    select.innerHTML = models.map((m) => `<option value="${m}">${m}</option>`).join("");
-    if (selectedModel && models.includes(selectedModel)) select.value = selectedModel;
+    const models = (data && data.models) || [];
+    if (!models.length) {
+      setProbeStatus("没有可用模型", "warn");
+      select.innerHTML = '<option value="">没有可用模型</option>';
+      return;
+    }
+    select.innerHTML = models
+      .map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`)
+      .join("");
+    if (previous && models.includes(previous)) select.value = previous;
+    setProbeStatus(`已找到 ${models.length} 个模型`, "ok");
   } catch (err) {
-    select.innerHTML = '<option value="">加载失败</option>';
-    toast(`拉取模型列表失败：${err.message}`, true);
+    setProbeStatus(`无法连接控制台：${err.message}`, "err");
+    select.innerHTML = '<option value="">探测失败</option>';
   }
 }
 
+// 阈值与 model_probe.context_grade 一致：红 < 0.75·p90，黄 < 1.5·p90，其余绿。
+function gradeContext(value) {
+  if (!Number.isFinite(value) || value <= 0) return "";
+  if (value < 0.75 * CONTEXT_P90) return "red";
+  if (value < 1.5 * CONTEXT_P90) return "yellow";
+  return "green";
+}
+
+function updateContextGrade() {
+  const input = $("local-context");
+  const grade = gradeContext(Number(input.value));
+  input.classList.remove("grade-red", "grade-yellow", "grade-green");
+  if (grade) input.classList.add(`grade-${grade}`);
+  $("context-hint").textContent = grade === "red"
+    ? "偏小：不到常见窗口的 0.75 倍"
+    : grade === "yellow"
+      ? "够用：常见窗口的常规范围"
+      : grade === "green"
+        ? "充裕：超过常见窗口的 1.5 倍"
+        : "按模型实际上下文填写，颜色只作提示。";
+}
+
+function brainPayload() {
+  if (selectedMode === "key") {
+    return {
+      mode: "key",
+      key: {
+        base_url: $("key-base-url").value.trim(),
+        model: $("key-model").value.trim(),
+        api_key: $("key-api-key").value,
+      },
+    };
+  }
+  if (selectedMode === "local_model") {
+    const local = {
+      base_url: $("local-base-url").value.trim(),
+      model: $("local-model-select").value,
+      lean: $("local-lean").checked,
+      api_key: $("local-api-key").value,
+    };
+    const raw = $("local-context").value.trim();
+    if (raw !== "") {
+      const context = Number(raw);
+      if (!Number.isInteger(context) || context < 0) {
+        throw new Error("上下文窗口必须是非负整数");
+      }
+      local.context = context;
+    }
+    return { mode: "local_model", local };
+  }
+  return { mode: "free" };
+}
+
+function showBrainStatus(text, tone = "") {
+  const el = $("brain-status");
+  el.hidden = !text;
+  el.className = `brain-status${tone ? ` ${tone}` : ""}`;
+  el.textContent = text;
+}
+
 async function applyBrain() {
-  if (!selectedProvider) return;
-  const model = selectedProvider === "local_model" ? $("model-select").value : "";
+  let payload;
+  try {
+    payload = brainPayload();
+  } catch (err) {
+    showBrainStatus(err.message, "err");
+    return;
+  }
+  showBrainStatus("正在应用…");
   try {
     const data = await api("/api/brain", {
       method: "POST",
-      body: JSON.stringify({ provider: selectedProvider, model }),
+      body: JSON.stringify(payload),
     });
-    selectedModel = data.model || model;
+    selectedMode = data.mode || selectedMode;
+    modeTouched = true;
+    renderModeSelection();
+    // 用户刚输入的密钥只在本次请求里用一次，成功后立刻从 DOM 清掉。
+    $("key-api-key").value = "";
+    $("local-api-key").value = "";
+    const lines = [
+      `已切换到${MODE_LABEL[selectedMode] || selectedMode}` +
+        (data.model ? ` · ${data.model}` : ""),
+    ];
+    if (data.reload !== "ok") lines.push("需重启 opencode 后生效");
+    (data.warnings || []).forEach((w) => lines.push(w));
+    showBrainStatus(lines.join("\n"), data.reload === "ok" ? "ok" : "warn");
     toast("已切换大脑模式");
     refresh();
   } catch (err) {
-    toast(`切换失败：${err.message}`, true);
+    showBrainStatus(`切换失败：${err.message}`, "err");
   }
 }
 
@@ -2563,15 +2829,24 @@ function initTabs() {
 document.addEventListener("click", (ev) => {
   const btn = ev.target.closest("[data-act]");
   if (btn) { doControl(btn.dataset.act, btn.dataset.target); return; }
-  const mode = ev.target.closest(".mode");
-  if (mode && !mode.classList.contains("disabled")) {
-    selectedProvider = mode.dataset.mode;
-    renderBrain();
-    if (selectedProvider === "local_model") loadModels();
-  }
+  const card = ev.target.closest(".mode-card");
+  if (card) selectMode(card.dataset.mode);
 });
 
-$("btn-refresh-models").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadModels));
+$("modes").addEventListener("keydown", (ev) => {
+  const index = MODE_ORDER.indexOf(selectedMode);
+  let next = null;
+  if (ev.key === "ArrowRight" || ev.key === "ArrowDown") next = (index + 1) % MODE_ORDER.length;
+  else if (ev.key === "ArrowLeft" || ev.key === "ArrowUp") next = (index - 1 + MODE_ORDER.length) % MODE_ORDER.length;
+  else if (ev.key === "Home") next = 0;
+  else if (ev.key === "End") next = MODE_ORDER.length - 1;
+  if (next === null) return;
+  ev.preventDefault();
+  selectMode(MODE_ORDER[next], { focus: true });
+});
+
+$("probe-btn").addEventListener("click", (ev) => withBusy(ev.currentTarget, probeLocalModels));
+$("local-context").addEventListener("blur", updateContextGrade);
 $("btn-apply-brain").addEventListener("click", (ev) => withBusy(ev.currentTarget, applyBrain));
 $("btn-refresh-health").addEventListener("click", refreshHealth);
 $("btn-refresh-alerts").addEventListener("click", refreshAlerts);
@@ -2594,7 +2869,6 @@ $("memory-chat-filter").addEventListener("change", () => {
   memoryLimit = MEMORY_PAGE;
   loadMemory();
 });
-$("model-select").addEventListener("change", (ev) => { selectedModel = ev.target.value; });
 $("btn-refresh-usage").addEventListener("click", loadUsage);
 $("usage-days").addEventListener("change", (ev) => {
   usageDays = Number(ev.target.value) || 7;

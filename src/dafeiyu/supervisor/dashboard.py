@@ -642,8 +642,12 @@ def create_app(
         code, data = await bot_call("POST", "/api/brain", payload, BOT_SWITCH_TIMEOUT)
         return web.json_response(data, status=code)
 
-    async def models(_: web.Request) -> web.Response:
-        code, data = await bot_call("GET", "/api/brain/models", None, BOT_SWITCH_TIMEOUT)
+    async def models(request: web.Request) -> web.Response:
+        path = "/api/brain/models"
+        if request.query_string:
+            # 探测按钮把 base_url / api_key 放在查询串里；不转发就只能探默认端点。
+            path = f"{path}?{request.query_string}"
+        code, data = await bot_call("GET", path, None, BOT_SWITCH_TIMEOUT)
         return web.json_response(data, status=code)
 
     async def memory(request: web.Request) -> web.Response:
