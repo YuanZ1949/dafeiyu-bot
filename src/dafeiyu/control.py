@@ -12,7 +12,6 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
-import aiohttp
 from aiohttp import web
 
 from .brain.factory import (
@@ -27,6 +26,7 @@ from . import __version__
 from .budget import BudgetGuard
 from .config import ConfigError, Settings
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
+from .model_probe import ProbeError, normalize_base_url, probe_models
 from .models import ChatType, Message
 from .runtime import RuntimeState, load_runtime, save_runtime
 from .service import BRAIN_ERROR_COOLDOWN_SECONDS, TOOL_HINT_INTERVAL_SECONDS
@@ -610,33 +610,18 @@ class BrainControl:
         }
 
     async def list_models(self) -> list[str]:
-        base = self.settings.local_model.base_url.rstrip("/")
+        """探测本机 LM Studio 的模型列表；默认行为保持不变（409/504/502）。"""
+        base = normalize_base_url(self.settings.local_model.base_url)
         if not base:
             raise SwitchError(409, "未配置 local_model.base_url")
-        url = f"{base}/models"
-        timeout = aiohttp.ClientTimeout(total=MODEL_PROBE_TIMEOUT)
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as client:
-                async with client.get(url) as resp:
-                    status = resp.status
-                    payload = await resp.json(content_type=None) if status < 400 else None
-        except asyncio.TimeoutError as exc:
-            raise SwitchError(
-                504, f"LM Studio 在 {MODEL_PROBE_TIMEOUT:.0f}s 内没有响应"
-            ) from exc
-        except aiohttp.ClientError as exc:
-            raise SwitchError(
-                502, f"连不上 LM Studio（{base}）：{exc.__class__.__name__}"
-            ) from exc
-        except ValueError as exc:
-            raise SwitchError(502, "LM Studio 返回格式异常") from exc
-        if status >= 400:
-            raise SwitchError(502, f"LM Studio 返回 HTTP {status}")
-        try:
-            items = (payload or {}).get("data") or []
-            return [str(item["id"]) for item in items if item.get("id")]
-        except (KeyError, TypeError, AttributeError) as exc:
-            raise SwitchError(502, "LM Studio 返回格式异常") from exc
+            return await probe_models(base, timeout=MODEL_PROBE_TIMEOUT)
+        except ProbeError as exc:
+            if exc.timed_out:
+                raise SwitchError(
+                    504, f"LM Studio 在 {MODEL_PROBE_TIMEOUT:.0f}s 内没有响应"
+                ) from exc
+            raise SwitchError(502, f"连不上 LM Studio（{base}）") from exc
 
     # ---- dashboard 扩展：用量 / 搜索 / 导出 / 会话 / 配置 ----
     def usage_snapshot(self, days: int = 7) -> dict[str, Any]:
@@ -1071,11 +1056,33 @@ def create_app(
                 {"error": f"触发调试失败：{exc.__class__.__name__}"}, status=500
             )
 
-    async def models(_: web.Request) -> web.Response:
+    async def models(request: web.Request) -> web.Response:
+        """模型列表：不带 base_url 时探本机 LM Studio，带了就探任意兼容端点。
+
+        `api_key` 只进请求头，任何响应都不回显。
+        """
+        base_url = (request.query.get("base_url") or "").strip()
+        api_key = (request.query.get("api_key") or "").strip()
+        if request.can_read_body:
+            payload, error = await _read_json_object(request)
+            if error is not None:
+                return error
+            base_url = str(payload.get("base_url") or base_url).strip()
+            api_key = str(payload.get("api_key") or api_key).strip()
         try:
-            return web.json_response({"models": await control.list_models()})
+            base = normalize_base_url(base_url)
+            if not base:
+                return web.json_response({"models": await control.list_models()})
+            found = await probe_models(
+                base, api_key=api_key, timeout=MODEL_PROBE_TIMEOUT
+            )
+            return web.json_response({"models": found})
         except SwitchError as exc:
             return web.json_response({"error": exc.reason}, status=exc.status)
+        except ProbeError as exc:
+            return web.json_response(
+                {"error": str(exc)}, status=504 if exc.timed_out else 502
+            )
 
     async def memory(request: web.Request) -> web.Response:
         try:
