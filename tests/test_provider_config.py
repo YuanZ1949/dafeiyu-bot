@@ -37,6 +37,16 @@ def test_key_mode_uses_file_reference():
     assert "sk-" not in json.dumps(out)
 
 
+def test_key_mode_defaults_to_documented_key_reference():
+    cfg = BrainConfig(
+        mode="key", key_base_url="https://api.x/v1", key_model="deepseek-chat"
+    )
+    out = build_config("key", cfg)
+    settings = out["providers"]["dafeiyu-key"]["settings"]
+    assert settings["apiKey"] == "{file:../../../secrets/provider.key}"
+    assert "sk-" not in json.dumps(out)
+
+
 def test_local_mode_writes_limit_and_capabilities():
     local = LocalModelConfig(
         base_url="http://127.0.0.1:1234/v1", model="qwen3", context=32768

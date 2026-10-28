@@ -19,6 +19,8 @@ DEFAULT_CONTEXT_LIMIT = 32768
 DEFAULT_OUTPUT_LIMIT = 8192
 MODEL_CAPABILITIES = {"tools": True, "vision": False}
 SUPPORTED_MODES = ("free", "key", "local_model")
+# 相对配置目录的密钥文件引用；自备 Key 档的默认值（也是该档唯一的意义所在）。
+DEFAULT_KEY_REL = "../../../secrets/provider.key"
 
 
 def normalize_base_url(url: str) -> str:
@@ -93,11 +95,25 @@ def _local_config(
     }
 
 
+class _UnsetKeyRel:
+    """哨兵：区分「未传 key_rel」与「显式传 None」。
+
+    自备 Key 档不传 key_rel 时用 `DEFAULT_KEY_REL`（文档化的默认引用）；
+    本地档不传时保持不写 apiKey。显式传 None 两档都不写 apiKey。
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - 仅用于调试输出
+        return "DEFAULT_KEY_REL"
+
+
+_UNSET_KEY_REL = _UnsetKeyRel()
+
+
 def build_config(
     mode: str,
     cfg: BrainConfig,
     *,
-    key_rel: str | None = None,
+    key_rel: str | None | _UnsetKeyRel = _UNSET_KEY_REL,
     local: LocalModelConfig | None = None,
 ) -> dict[str, Any]:
     """按用户可见档位生成 opencode 配置的 JSON 数据。
@@ -106,9 +122,11 @@ def build_config(
 
     - free：固定免费模型 + 空插件列表，不写 providers；
     - key：`providers.dafeiyu-key`，顶层 model 为 `dafeiyu-key/<cfg.key_model>`，
-      密钥只以 `{file:<key_rel>}` 形式引用；
+      密钥只以 `{file:<key_rel>}` 形式引用；省略 key_rel 时用文档化的
+      `DEFAULT_KEY_REL`（`../../../secrets/provider.key`）；
     - local_model：`providers.dafeiyu-local`，顶层 model 为
-      `dafeiyu-local/<local.model>`，可选 apiKey（本地服务需要令牌时）与 lean。
+      `dafeiyu-local/<local.model>`，可选 apiKey（本地服务需要令牌时）与 lean；
+      本地档不继承 key 档的默认引用。
 
     两档 provider 的模型条目都带 `limit.context` / `limit.output` / `capabilities`。
     未知档位直接报错，避免悄悄落回免费形状。
@@ -117,9 +135,11 @@ def build_config(
         # 免费档不碰用户密钥与本地端点，key_rel / local 一律忽略。
         return {"model": FREE_MODEL, "plugins": []}
     if mode == "key":
-        return _key_config(cfg, key_rel)
+        resolved = DEFAULT_KEY_REL if key_rel is _UNSET_KEY_REL else key_rel
+        return _key_config(cfg, resolved)
     if mode == "local_model":
-        return _local_config(local, key_rel)
+        resolved = None if key_rel is _UNSET_KEY_REL else key_rel
+        return _local_config(local, resolved)
     supported = " / ".join(SUPPORTED_MODES)
     raise ValueError(f"不支持的大脑模式：{mode}（仅支持 {supported}）")
 
