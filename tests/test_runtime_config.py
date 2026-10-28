@@ -6,15 +6,24 @@ import json
 from pathlib import Path
 
 import pytest
+from test_config_agents import BASE, load, patch
 
+from dafeiyu.brain import provider_config, runtime_config
 from dafeiyu.brain.opencode_server import OpenCodeServer
 from dafeiyu.brain.runtime_config import (
     DEFAULT_OPENCODE_MODEL,
+    MINIMAL_CONFIG,
     ensure_isolated_config,
     server_env,
 )
 from dafeiyu.config import ConfigError
-from test_config_agents import BASE, load, patch
+
+
+def _load_config(text: str) -> dict:
+    """生成物首行是标记（JSONC 注释），解析前先摘掉。"""
+    lines = text.splitlines()
+    assert lines[0] == provider_config.GENERATED_MARK
+    return json.loads("\n".join(lines[1:]))
 
 
 # ---- 配置目录本体 ---------------------------------------------------------
@@ -28,22 +37,76 @@ def test_ensure_creates_minimal_config(tmp_path: Path) -> None:
     assert root == home.resolve()
     cfg = home / "opencode" / "opencode.jsonc"
     assert cfg.is_file()
-    data = json.loads(cfg.read_text(encoding="utf-8"))
+    data = _load_config(cfg.read_text(encoding="utf-8"))
     assert data["$schema"] == "https://opencode.ai/config.json"
     assert data["model"] == DEFAULT_OPENCODE_MODEL
     # 显式空列表：隔离目录里不该再加载任何插件
     assert data["plugins"] == []
 
 
-def test_ensure_is_idempotent_and_keeps_hand_edits(tmp_path: Path) -> None:
+def test_ensure_is_idempotent_for_generated_file(tmp_path: Path) -> None:
     home = tmp_path / "config"
     ensure_isolated_config(home)
     cfg = home / "opencode" / "opencode.jsonc"
-    cfg.write_text('{"model": "custom/model"}', encoding="utf-8")
+    before = cfg.read_text(encoding="utf-8")
 
     ensure_isolated_config(home)
 
-    assert cfg.read_text(encoding="utf-8") == '{"model": "custom/model"}'
+    assert cfg.read_text(encoding="utf-8") == before
+    assert not list(cfg.parent.glob("opencode.jsonc.bak.*"))
+    assert runtime_config.LAST_BACKUP is None
+
+
+def test_generated_file_is_left_alone(tmp_path: Path) -> None:
+    p = provider_config.config_path(str(tmp_path))
+    p.parent.mkdir(parents=True)
+    p.write_text("// generated-by: dafeiyu\n{}", encoding="utf-8")
+
+    ensure_isolated_config(str(tmp_path))
+
+    assert p.read_text(encoding="utf-8").startswith("// generated-by: dafeiyu")
+    assert runtime_config.LAST_BACKUP is None
+
+
+def test_old_minimal_config_is_left_alone(tmp_path: Path) -> None:
+    """升级前的兜底配置（无标记、raw json.dumps）不该被当成手改件备份。"""
+    p = provider_config.config_path(str(tmp_path))
+    p.parent.mkdir(parents=True)
+    legacy = json.dumps(MINIMAL_CONFIG, ensure_ascii=False, indent=2) + "\n\n"
+    p.write_text(legacy, encoding="utf-8")
+
+    ensure_isolated_config(str(tmp_path))
+
+    assert p.read_text(encoding="utf-8") == legacy
+    assert not list(p.parent.glob("opencode.jsonc.bak.*"))
+    assert runtime_config.LAST_BACKUP is None
+
+
+def test_manual_file_is_backed_up(tmp_path: Path) -> None:
+    p = provider_config.config_path(str(tmp_path))
+    p.parent.mkdir(parents=True)
+    p.write_text('{"model":"x"}', encoding="utf-8")
+
+    ensure_isolated_config(str(tmp_path))
+
+    assert list(p.parent.glob("opencode.jsonc.bak.*"))
+
+
+def test_manual_file_backup_is_exposed(tmp_path: Path) -> None:
+    p = provider_config.config_path(str(tmp_path))
+    p.parent.mkdir(parents=True)
+    p.write_text('{"model":"x"}', encoding="utf-8")
+
+    root = ensure_isolated_config(str(tmp_path))
+
+    # 返回值仍是配置根目录（server_env 依赖它拼 XDG_CONFIG_HOME）。
+    assert root == tmp_path.resolve()
+    backup = runtime_config.LAST_BACKUP
+    assert backup is not None
+    assert backup.parent == p.parent
+    assert backup.name.startswith("opencode.jsonc.bak.")
+    assert backup.read_text(encoding="utf-8") == '{"model":"x"}'
+    assert p.read_text(encoding="utf-8").startswith(provider_config.GENERATED_MARK)
 
 
 def test_ensure_resolves_relative_to_cwd(
