@@ -334,6 +334,36 @@ async def test_snapshot_mode_survives_restart(
     assert snap["local"]["has_key"] is False
 
 
+async def test_restart_mode_comes_from_override_layer(
+    tmp_path: Path, monkeypatch, control: BrainControl, store_spy: StoreSpy
+) -> None:
+    """重启后档位只能读覆盖层：按 provider 反推会给出另一个档位。"""
+    overrides_path = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_mod, "OVERRIDES_PATH", overrides_path)
+    monkeypatch.setattr(config_mod, "OVERRIDES_PATH", overrides_path)
+    await control.switch_mode({"mode": "free"})
+
+    settings = load_settings(
+        env_file=tmp_path / "test.env", config_file=tmp_path / "config.yaml"
+    )
+    # 启动配置的 brain.provider 是 token（按 provider 映射会得到 key），
+    # 覆盖层写的是 free：两个来源不一致，只有覆盖层优先才是对的。
+    assert settings.brain.provider == "token"
+    assert settings.brain.mode_from_overrides is True
+
+    restarted = BrainControl(
+        settings,
+        store_spy,
+        FakeService(),
+        FakeAdapter(),
+        runtime_path=str(tmp_path / "runtime.json"),
+    )
+    snap = restarted.snapshot()
+
+    assert snap["provider"] == "token"
+    assert snap["mode"] == "free"
+
+
 async def test_successful_post_never_echoes_local_secret(control: BrainControl) -> None:
     app = create_app(control)
     client = TestClient(TestServer(app))
@@ -434,6 +464,9 @@ async def test_each_mode_rebuilds_opencode_and_snapshot_agrees(
     assert control.brain_builds == [("opencode", "")]
     assert control.snapshot()["provider"] == "opencode"
     assert control.snapshot()["model"] == out["model"]
+    # 档位不能靠 provider 反推：三档的 provider 都是 opencode，反推只会得到 free。
+    # 这里钉住 switch_mode 成功后的生效视图（key/local 没有它就会显示成 free）。
+    assert control.snapshot()["mode"] == payload["mode"]
     assert load_runtime(control.runtime_path).provider == "opencode"
 
 

@@ -1256,15 +1256,16 @@ function prefillBrain(brain) {
   setPrefillSelect($("local-model-select"), local.model);
   const context = Number(local.context);
   // 0 = 未覆盖，面板按「留空使用默认」显示，避免把哨兵值当成用户填的窗口。
-  setPrefillValue($("local-context"), Number.isFinite(context) && context > 0 ? String(context) : "");
+  const contextInput = $("local-context");
+  setPrefillValue(contextInput, Number.isFinite(context) && context > 0 ? String(context) : "");
+  // 预填进来的窗口也要马上上色：等级原本只在 blur 时才补，首屏会是一格素色输入框。
+  contextInput.classList.remove("grade-red", "grade-yellow", "grade-green");
+  const contextGrade = gradeContext(Number(contextInput.value.trim()));
+  if (contextGrade) contextInput.classList.add(`grade-${contextGrade}`);
   setPrefillChecked($("local-lean"), !!local.lean);
   // 只根据 has_key 改提示；密钥本身永远不会从服务端回到 DOM。
   $("key-api-key").placeholder = key.has_key ? "已保存 Key，留空沿用" : "输入 API Key";
   $("local-api-key").placeholder = local.has_key ? "已保存令牌，留空沿用" : "访问令牌（可选）";
-}
-
-function clearPrefillGuards() {
-  document.querySelectorAll("[data-prefill]").forEach((el) => delete el.dataset.prefill);
 }
 
 function renderBrain() {
@@ -2504,16 +2505,6 @@ function brainPayload() {
       local,
     };
   }
-  if (selectedMode === "key") {
-    return {
-      mode: "key",
-      key: {
-        base_url: $("key-base-url").value.trim(),
-        model: $("key-model").value.trim(),
-        api_key: $("key-api-key").value,
-      },
-    };
-  }
   return { mode: "free" };
 }
 
@@ -2561,8 +2552,8 @@ async function applyBrain() {
     warnings.forEach((w) => lines.push(w));
     showBrainStatus(lines.join("\n"), data.reload === "ok" ? "ok" : "warn");
     toast("已切换大脑模式");
-    // 应用成功后重新允许服务端预填：下一轮 /api/brain 才是新的基线。
-    clearPrefillGuards();
+    // 不清 data-prefill 基线：刷新回来的是刚写进去的值，但用户可能已经在改下一个
+    // 字段；保留基线，无关的 brain 变化就不会把输入中的内容盖掉（重启后重新预填）。
     refresh();
   } catch (err) {
     showBrainStatus(`切换失败：${err.message}`, "err");
