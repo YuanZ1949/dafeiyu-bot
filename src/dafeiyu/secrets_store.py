@@ -6,9 +6,9 @@
 最终路径短暂地人人可读。进程被硬杀可能留下加固过但无主的临时文件，下次
 写入前会统一清扫。密钥值本身不进日志、不进异常消息。
 
-前置条件：加固只授予当前用户 ``(R,W)``（与 control token 共享同一实现），
-所以替换/删除能否成功取决于**父目录**是否授予删除子项（DELETE_CHILD）；
-在只有 Modify 的目录下写入会以 :class:`SecretWriteError` 失败。
+前置条件：临时文件在写入密钥值之前就被加固为当前用户**读写删** ``(R,W,D)``
+（与 control token 共享同一实现），因此 ``os.replace`` 与 ``unlink`` 不依赖
+父目录是否授予删除子项（DELETE_CHILD）。
 """
 
 from __future__ import annotations
