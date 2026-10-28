@@ -9,6 +9,17 @@ from typing import Any
 import yaml
 from dotenv import dotenv_values
 
+from .settings_local import (
+    DEFAULT_PATH,
+    VALID_MODES,
+    OverrideError,
+    normalize_mode,
+    read_overrides,
+)
+
+# 仪表盘写下的覆盖层；测试与嵌入方可以改写这个模块级路径。
+OVERRIDES_PATH = DEFAULT_PATH
+
 
 class ConfigError(Exception):
     """配置缺失或非法。消息只提字段名，不回显字段值。"""
@@ -135,7 +146,13 @@ class LoggingConfig:
 @dataclass(frozen=True)
 class BrainConfig:
     provider: str = "local"
+    # 用户可见的三档：free / key / local_model；provider 是底层实现。
     mode: str = "free"
+    # key 档的端点与模型；空 = 未配置，由后续 provider 生成逻辑兜底。
+    key_base_url: str = ""
+    key_model: str = ""
+    # 覆盖层显式给了 brain.mode 时为 True：runtime.json 里的旧 provider 不再生效。
+    mode_from_overrides: bool = False
 
 
 @dataclass(frozen=True)
@@ -173,6 +190,10 @@ class LocalModelConfig:
     # 本地 Qwen3.x 这类思考型模型会先写一大段 reasoning，预算太低会导致
     # finish_reason=length 且 content 为空，群里只能看到兜底话术。
     max_tokens: int = 2048
+    # 面板写入的上下文窗口；0 = 未覆盖，由调用点用自己的默认值。
+    context: int = 0
+    # 精简模式（少注入、少旁路调用）；False = 未覆盖。
+    lean: bool = False
     # 本地推理比云端慢，15s 默认超时对思考型模型不够。
     timeout_seconds: float = 60.0
     # 思考型本地模型（如 qwen3.5）会把 token 预算全烧在 reasoning 上，
@@ -699,6 +720,120 @@ def _build_triggers(raw: dict[str, Any]) -> TriggerConfig:
     )
 
 
+def _validated_mode(value: Any) -> str:
+    """把 brain.mode 归一成三档；覆盖层的 OverrideError 统一包成 ConfigError。"""
+    try:
+        return normalize_mode(value)
+    except OverrideError as exc:
+        raise ConfigError(
+            f"brain.mode 只支持：{' / '.join(VALID_MODES)}"
+            "（local 只是 provider 的别名，不能当 mode 用）"
+        ) from exc
+
+
+def _overlay_target(raw: dict[str, Any], name: str) -> dict[str, Any]:
+    """取得（必要时创建）raw 里可被覆盖层写入的配置段。"""
+    value = raw.get(name)
+    if value is None:
+        value = {}
+        raw[name] = value
+    if not isinstance(value, dict):
+        raise ConfigError(f"config.yaml 的 {name} 必须是映射")
+    return value
+
+
+def _overlay_subtarget(
+    raw: dict[str, Any], section: str, name: str
+) -> dict[str, Any]:
+    parent = _overlay_target(raw, section)
+    value = parent.get(name)
+    if value is None:
+        value = {}
+        parent[name] = value
+    if not isinstance(value, dict):
+        raise ConfigError(f"config.yaml 的 {section}.{name} 必须是映射")
+    return value
+
+
+def _overlay_text(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(f"覆盖层 {field} 必须是字符串")
+    return value.strip()
+
+
+def _overlay_non_negative_int(value: Any, field: str) -> int:
+    # bool 是 int 的子类，true/false 混进数值字段要单独拒绝。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"覆盖层 {field} 必须是整数")
+    if value < 0:
+        raise ConfigError(f"覆盖层 {field} 必须大于等于 0")
+    return value
+
+
+def _overlay_bool(value: Any, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"覆盖层 {field} 必须是布尔值")
+    return value
+
+
+def _apply_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> bool:
+    """把覆盖层白名单键盖到 raw 上，返回覆盖层是否显式给了 brain.mode。
+
+    白名单之外的键（包括 brain.provider、brain.local_model.api_key）一律忽略：
+    覆盖层由面板生成，出现别的键说明版本不一致，静默跳过比报错更稳。
+    """
+    brain_override = overrides.get("brain")
+    if brain_override is None:
+        return False
+    if not isinstance(brain_override, dict):
+        raise ConfigError("覆盖层的 brain 必须是映射")
+
+    has_mode = "mode" in brain_override
+    if has_mode:
+        _overlay_target(raw, "brain")["mode"] = _validated_mode(
+            brain_override["mode"]
+        )
+
+    key_override = brain_override.get("key")
+    if key_override is not None:
+        if not isinstance(key_override, dict):
+            raise ConfigError("覆盖层的 brain.key 必须是映射")
+        key_target = _overlay_subtarget(raw, "brain", "key")
+        for name in ("base_url", "model"):
+            if name in key_override:
+                key_target[name] = _overlay_text(
+                    key_override[name], f"brain.key.{name}"
+                )
+
+    local_override = brain_override.get("local_model")
+    if local_override is not None:
+        if not isinstance(local_override, dict):
+            raise ConfigError("覆盖层的 brain.local_model 必须是映射")
+        # 覆盖层把本地模型放在 brain 下，config.yaml 里是顶层 local_model。
+        local_target = _overlay_target(raw, "local_model")
+        for name in ("base_url", "model"):
+            if name in local_override:
+                local_target[name] = _overlay_text(
+                    local_override[name], f"brain.local_model.{name}"
+                )
+        if "context" in local_override:
+            local_target["context"] = _overlay_non_negative_int(
+                local_override["context"], "brain.local_model.context"
+            )
+        if "output" in local_override:
+            # output 目前不是 LocalModelConfig 的字段（Task 11 有自己的默认值），
+            # 但仍要校验类型，免得面板写坏值后被静默吞掉。
+            _overlay_non_negative_int(
+                local_override["output"], "brain.local_model.output"
+            )
+        if "lean" in local_override:
+            local_target["lean"] = _overlay_bool(
+                local_override["lean"], "brain.local_model.lean"
+            )
+
+    return has_mode
+
+
 def load_settings(
     env_file: Path = Path(".env"),
     config_file: Path = Path("config.yaml"),
@@ -715,6 +850,12 @@ def load_settings(
     if not isinstance(raw, dict):
         raise ConfigError("config.yaml 顶层必须是映射")
 
+    try:
+        overrides = read_overrides(OVERRIDES_PATH)
+    except OverrideError as exc:
+        raise ConfigError(f"覆盖层读取失败：{exc}") from exc
+    mode_from_overrides = _apply_overrides(raw, overrides)
+
     env: dict[str, str] = {}
     env.update({k: v for k, v in dotenv_values(env_file).items() if v is not None})
     env.update(os.environ)
@@ -728,6 +869,12 @@ def load_settings(
         raise ConfigError(
             "brain.provider 只能是 opencode、token 或 local_model（local 为 token 的别名）"
         )
+    mode = _validated_mode(brain_raw.get("mode", "free"))
+    key_raw = brain_raw.get("key") or {}
+    if not isinstance(key_raw, dict):
+        raise ConfigError("config.yaml 的 brain.key 必须是映射")
+    key_base_url = str(key_raw.get("base_url") or "").strip()
+    key_model = str(key_raw.get("model") or "").strip()
 
     gateway_raw = raw.get("gateway") or {}
     if not isinstance(gateway_raw, dict):
@@ -753,6 +900,10 @@ def load_settings(
         model=str(local_model_raw.get("model") or "").strip(),
         api_key=str(local_model_raw.get("api_key") or "local").strip(),
         max_tokens=_int(local_model_raw.get("max_tokens", 2048), "local_model.max_tokens"),
+        context=_non_negative_int(
+            local_model_raw.get("context"), "local_model.context", 0
+        ),
+        lean=_bool(local_model_raw.get("lean", False), "local_model.lean"),
         timeout_seconds=_float(
             local_model_raw.get("timeout_seconds", 60.0), "local_model.timeout_seconds"
         ),
@@ -989,7 +1140,13 @@ def load_settings(
             level=str(logging_raw.get("level", "INFO")),
             dir=str(logging_raw.get("dir", "logs")),
         ),
-        brain=BrainConfig(provider=provider),
+        brain=BrainConfig(
+            provider=provider,
+            mode=mode,
+            key_base_url=key_base_url,
+            key_model=key_model,
+            mode_from_overrides=mode_from_overrides,
+        ),
         gateway=GatewayConfig(provider=gateway_provider),
         opencode=OpenCodeConfig(
             bin=str(opencode_raw.get("bin") or "").strip(),

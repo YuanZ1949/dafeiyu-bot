@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from .client import BrainClient
-from .opencode import OpenCodeBrain, resolve_opencode_bin
-from .opencode_http import DENY_ALL_PERMISSIONS, DEFAULT_MEMORY_AGENT, OpenCodeHttpBrain
 from ..config import ConfigError, Settings
 from ..memory.store import Store
 from ..runtime import RuntimeState
+from .client import BrainClient
+from .opencode import OpenCodeBrain, resolve_opencode_bin
+from .opencode_http import DEFAULT_MEMORY_AGENT, DENY_ALL_PERMISSIONS, OpenCodeHttpBrain
 
 MODES: tuple[tuple[str, str], ...] = (
     ("local_model", "本地模型"),
@@ -23,6 +23,10 @@ def normalize_provider(value: str) -> str:
 
 
 def current_provider(settings: Settings, runtime: RuntimeState) -> str:
+    # 覆盖层显式给了 brain.mode 时，runtime.json 里的旧 provider 是切换前的
+    # 残留，读路径直接忽略它，免得面板档位与运行时不一致。
+    if settings.brain.mode_from_overrides:
+        return normalize_provider(settings.brain.provider)
     return runtime.provider or normalize_provider(settings.brain.provider)
 
 
