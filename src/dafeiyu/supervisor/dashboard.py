@@ -19,7 +19,7 @@ from .auth import COOKIE_NAME, DashboardAuth, safe_next_path
 from .backup import REASONS, BackupError
 from .control_token import ControlToken
 from .logs import SOURCES, LogHub
-from .manager import Supervisor
+from .manager import EXTERNAL, Supervisor
 from .napcat_login import NapCatLogin
 from .ops import OpsServices
 from .redact import redact
@@ -112,6 +112,9 @@ def create_app(
     closing = asyncio.Event()
     # 每个 app 独立一把锁，避免跨事件循环复用；只保护 token 轮换关键区。
     rotate_lock = asyncio.Lock()
+    # reload 会 stop+start 同一个进程，并发执行会互相终止刚拉起的子进程；
+    # 用 app 级锁串行化，后到的请求排队并再重启一次（返回新的 pid）。
+    reload_lock = asyncio.Lock()
 
     async def _mark_closing(_: web.Application) -> None:
         closing.set()
@@ -872,52 +875,48 @@ def create_app(
             )
         return web.json_response(result, status=207 if errors else 200)
 
-    async def reload_opencode(request: web.Request) -> web.Response:
-        # restart 内部已 stop + start，并在 start 里等待 ready_url；
-        # 这里只负责把结果翻译成接口返回，不再重复轮询。
-        try:
-            await supervisor.restart("opencode")
-        except asyncio.CancelledError:
-            write_audit(
-                request,
-                "opencode.reload",
-                target="opencode",
-                result="error",
-                detail={"error": "cancelled"},
-            )
-            raise
-        except Exception as exc:  # noqa: BLE001 - 失败要回 503，不能把面板带崩
-            message = redact(f"opencode 重载失败：{exc}")
-            log.warning("%s", message)
-            write_audit(
-                request,
-                "opencode.reload",
-                target="opencode",
-                result="error",
-                detail={"error": message},
-            )
-            return web.json_response({"ok": False, "error": message}, status=503)
-
-        state = supervisor.states.get("opencode")
-        pid = state.as_dict().get("pid") if state is not None else None
-        if not isinstance(pid, int) or isinstance(pid, bool):
-            message = "opencode 已重启但未取得 pid"
-            write_audit(
-                request,
-                "opencode.reload",
-                target="opencode",
-                result="error",
-                detail={"error": message},
-            )
-            return web.json_response({"ok": False, "error": message}, status=503)
-
+    def reload_error(request: web.Request, message: str) -> web.Response:
         write_audit(
             request,
             "opencode.reload",
             target="opencode",
-            detail={"pid": pid},
+            result="error",
+            detail={"error": message},
         )
-        return web.json_response({"ok": True, "pid": pid})
+        return web.json_response({"ok": False, "error": message}, status=503)
+
+    async def reload_opencode(request: web.Request) -> web.Response:
+        # restart 内部已 stop + start，并在 start 里等待 ready_url；
+        # 这里只负责把结果翻译成接口返回，不再重复轮询。
+        async with reload_lock:
+            state = supervisor.states.get("opencode")
+            if state is None:
+                return reload_error(request, "未知进程：opencode")
+            # 外部实例不归 supervisor 管，restart 会直接返回空操作；
+            # 不能在这种情况下返回 ok，否则调用方会误以为新配置已生效。
+            if state.status == EXTERNAL:
+                return reload_error(request, "opencode 由外部实例接管，无法重载")
+            try:
+                await supervisor.restart("opencode")
+            except asyncio.CancelledError:
+                reload_error(request, "cancelled")
+                raise
+            except Exception as exc:  # noqa: BLE001 - 失败要回 503，不能把面板带崩
+                message = redact(f"opencode 重载失败：{exc}")
+                log.warning("%s", message)
+                return reload_error(request, message)
+
+            pid = state.as_dict().get("pid")
+            if not isinstance(pid, int) or isinstance(pid, bool):
+                return reload_error(request, "opencode 已重启但未取得 pid")
+
+            write_audit(
+                request,
+                "opencode.reload",
+                target="opencode",
+                detail={"pid": pid},
+            )
+            return web.json_response({"ok": True, "pid": pid})
 
     async def rotate_control_token(request: web.Request) -> web.Response:
         if control_token is None:

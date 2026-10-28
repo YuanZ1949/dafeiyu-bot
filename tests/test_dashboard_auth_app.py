@@ -117,7 +117,12 @@ async def test_unauthenticated_page_redirects_and_api_returns_401(
             assert resp.status == 401, path
             assert await resp.json() == {"error": "unauthorized"}, path
 
-        for path in ("/api/control/stop", "/api/auth/logout", "/api/debug/trigger"):
+        for path in (
+            "/api/control/stop",
+            "/api/opencode/reload",
+            "/api/auth/logout",
+            "/api/debug/trigger",
+        ):
             resp = await client.post(path, json={"target": "all"})
             assert resp.status == 401, path
         assert supervisor.calls == []
