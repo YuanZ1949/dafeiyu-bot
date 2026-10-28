@@ -2,8 +2,13 @@ import json
 
 import pytest
 
-from dafeiyu.brain.provider_config import GENERATED_MARK, build_config, render_config
-from dafeiyu.config import BrainConfig
+from dafeiyu.brain.provider_config import (
+    GENERATED_MARK,
+    build_config,
+    normalize_base_url,
+    render_config,
+)
+from dafeiyu.config import BrainConfig, LocalModelConfig
 
 
 def test_free_mode_config_shape():
@@ -20,7 +25,45 @@ def test_render_starts_with_generated_mark():
     assert json.loads("\n".join(text.splitlines()[1:]))["plugins"] == []
 
 
-@pytest.mark.parametrize("mode", ["key", "local_model", "bogus"])
-def test_unimplemented_modes_raise(mode):
-    with pytest.raises(ValueError, match=mode):
-        build_config(mode, BrainConfig())
+def test_key_mode_uses_file_reference():
+    cfg = BrainConfig(
+        mode="key", key_base_url="https://api.x/v1/", key_model="deepseek-chat"
+    )
+    out = build_config("key", cfg, key_rel="../../../secrets/provider.key")
+    prov = out["providers"]["dafeiyu-key"]
+    assert prov["package"] == "@opencode/ai/providers/openai-compatible"
+    assert prov["settings"]["baseURL"] == "https://api.x/v1"
+    assert prov["settings"]["apiKey"] == "{file:../../../secrets/provider.key}"
+    assert "sk-" not in json.dumps(out)
+
+
+def test_local_mode_writes_limit_and_capabilities():
+    local = LocalModelConfig(
+        base_url="http://127.0.0.1:1234/v1", model="qwen3", context=32768
+    )
+    out = build_config("local_model", BrainConfig(mode="local_model"), local=local)
+    model = out["providers"]["dafeiyu-local"]["models"]["qwen3"]
+    assert model["limit"]["context"] == 32768
+    assert model["limit"]["output"] == 8192
+    assert model["capabilities"]["tools"] is True
+    assert "apiKey" not in out["providers"]["dafeiyu-local"]["settings"]
+
+
+def test_unknown_mode_raises_with_mode_name():
+    with pytest.raises(ValueError, match="bogus"):
+        build_config("bogus", BrainConfig())
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", ""),
+        ("https://api.x/v1/", "https://api.x/v1"),
+        ("https://api.x/v1/  ", "https://api.x/v1"),
+        (" https://api.x/v1/v1", "https://api.x/v1"),
+        ("https://api.x/v1/v1/", "https://api.x/v1"),
+        ("https://api.x/v1///", "https://api.x/v1"),
+    ],
+)
+def test_normalize_base_url(raw, expected):
+    assert normalize_base_url(raw) == expected
