@@ -50,6 +50,19 @@ def test_read_malformed_yaml_raises_override_error(tmp_path):
     assert "YAML" in str(excinfo.value)
 
 
+def test_malformed_yaml_error_hides_source_line(tmp_path):
+    p = tmp_path / "settings.local.yaml"
+    # Tab 缩进是常见手误；出错行本身带着密钥，PyYAML 的 str(exc) 会把它引用出来。
+    p.write_text("brain:\n\tapi_key: sk-abc\n  mode: free\n", encoding="utf-8")
+
+    with pytest.raises(OverrideError) as excinfo:
+        read_overrides(p)
+
+    message = str(excinfo.value)
+    assert "sk-abc" not in message
+    assert "第 2 行" in message
+
+
 def test_read_blank_file_ok_but_non_mapping_rejected(tmp_path):
     p = tmp_path / "settings.local.yaml"
 

@@ -53,7 +53,8 @@ def read_overrides(path: Path | None = None) -> dict[str, Any]:
     try:
         loaded = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise OverrideError(f"覆盖层 YAML 解析失败：{exc}") from exc
+        # 只取结构化位置信息：YAMLError 的 str() 会带出错行源码，密钥可能被回显。
+        raise OverrideError(_parse_error_message(target, exc)) from exc
     if loaded is None:
         return {}
     if not isinstance(loaded, dict):
@@ -89,3 +90,19 @@ def write_overrides(mapping: dict[str, Any], path: Path | None = None) -> Path:
 
 def _resolve(path: Path | None) -> Path:
     return DEFAULT_PATH if path is None else Path(path)
+
+
+def _parse_error_message(target: Path, exc: yaml.YAMLError) -> str:
+    """拼一条能定位到行列、但不含源码的解析错误。
+
+    PyYAML 的 ``str(exc)`` 会带上出错行及其上下文，覆盖层里可能是密钥；
+    这里只用 problem（描述）与 problem_mark（行列）。
+    """
+    detail = getattr(exc, "problem", None) or "无法解析"
+    mark = getattr(exc, "problem_mark", None)
+    if mark is None:
+        return f"覆盖层 YAML 解析失败：{target.resolve()}（{detail}）。"
+    return (
+        f"覆盖层 YAML 解析失败：{target.resolve()} "
+        f"第 {mark.line + 1} 行第 {mark.column + 1} 列：{detail}。"
+    )
