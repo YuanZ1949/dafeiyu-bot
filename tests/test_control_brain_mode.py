@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace as dc_replace
 from pathlib import Path
 
 import pytest
@@ -22,8 +23,9 @@ from dafeiyu.control import BrainControl, SwitchError, create_app
 from dafeiyu.memory.store import Store
 from dafeiyu.model_probe import ProbeError
 from dafeiyu.models import ChatType
+from dafeiyu.runtime import load_runtime
 from dafeiyu.secrets_store import read_secret, write_secret
-from dafeiyu.settings_local import read_overrides
+from dafeiyu.settings_local import read_overrides, write_overrides
 
 
 class FakeBrain:
@@ -110,12 +112,24 @@ def control(tmp_path: Path, monkeypatch, store_spy: StoreSpy) -> BrainControl:
     monkeypatch.setattr(control_mod, "probe_models", fake_probe)
     # 只替换「构造 brain」这一步：本机 cacert 加载病态慢（单次 40s+），而
     # switch_mode 的契约是文件与顺序，重建本身由 tests/test_control_api.py 覆盖。
-    monkeypatch.setattr(
-        control_mod,
-        "build_brain",
-        lambda settings, store, provider, model="": FakeBrain(),
-    )
+    # 桩必须记录参数：Important 1 要求重建用的是「刚切换到的模式」。
+    built: list[tuple[str, str]] = []
+
+    def fake_build_brain(settings, store, provider, model=""):
+        built.append((provider, model))
+        return FakeBrain()
+
+    monkeypatch.setattr(control_mod, "build_brain", fake_build_brain)
+    ctrl.brain_builds = built  # type: ignore[attr-defined]
     return ctrl
+
+
+def key_file_target(config_file: Path) -> Path:
+    """从 `{file:...}` 引用反解出绝对路径（断言它真的指向 KEY_PATH）。"""
+    text = config_file.read_text(encoding="utf-8")
+    start = text.index("{file:") + len("{file:")
+    end = text.index("}", start)
+    return (config_file.parent / text[start:end]).resolve()
 
 
 async def test_switch_to_key_writes_everything(
@@ -144,10 +158,21 @@ async def test_switch_to_key_writes_everything(
 
     generated = config_path(Path(control.settings.opencode.config_home))
     assert generated.is_file()
-    assert "dafeiyu-key/m" in generated.read_text(encoding="utf-8")
+    generated_text = generated.read_text(encoding="utf-8")
+    assert "dafeiyu-key/m" in generated_text
+    # 密钥只能以文件引用出现，生成物与响应里都不能有明文。
+    assert "sk-test-123456" not in generated_text
+    assert key_file_target(generated) == Path(control_mod.KEY_PATH).resolve()
     agent_file = agent_path(Path(control.settings.opencode.project_dir))
-    assert agent_file.is_file()
-    assert "model: dafeiyu-key/m" in agent_file.read_text(encoding="utf-8")
+    agent_text = agent_file.read_text(encoding="utf-8")
+    assert "model: dafeiyu-key/m" in agent_text
+    assert "sk-test-123456" not in agent_text
+
+    # 重建必须按新模式走 opencode，snapshot 也要和响应一致。
+    assert control.brain_builds == [("opencode", "")]
+    assert control.snapshot()["provider"] == "opencode"
+    assert control.snapshot()["model"] == out["model"]
+    assert load_runtime(control.runtime_path).provider == "opencode"
 
 
 async def test_invalid_mode_returns_400(control: BrainControl) -> None:
@@ -296,3 +321,238 @@ async def test_post_api_brain_dispatches_mode_payload(control: BrainControl) -> 
 
     assert resp.status == 200
     assert data["mode"] == "free"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"mode": "free"},
+        {
+            "mode": "key",
+            "force": True,
+            "key": {"base_url": "https://api.x/v1", "model": "m"},
+        },
+        {
+            "mode": "local_model",
+            "force": True,
+            "local": {"base_url": "http://h:1/v1", "model": "lm"},
+        },
+    ],
+)
+async def test_each_mode_rebuilds_opencode_and_snapshot_agrees(
+    control: BrainControl, payload: dict
+) -> None:
+    out = await control.switch_mode(payload)
+
+    # 三档都由 opencode 承载：重建参数不能沿用启动时的 token/local_model。
+    assert control.brain_builds == [("opencode", "")]
+    assert control.snapshot()["provider"] == "opencode"
+    assert control.snapshot()["model"] == out["model"]
+    assert load_runtime(control.runtime_path).provider == "opencode"
+
+
+async def test_omitted_local_fields_use_persisted_overrides(
+    control: BrainControl,
+) -> None:
+    await control.switch_mode(
+        {
+            "mode": "local_model",
+            "force": True,
+            "local": {
+                "base_url": "http://h:1/v1",
+                "model": "lm",
+                "context": 65536,
+                "lean": True,
+            },
+        }
+    )
+    await control.switch_mode({"mode": "free"})
+    # 第二轮故意不再带 context/lean：生成物必须以覆盖层里保留的值为准，
+    # 不能回落到启动快照的 32768 / false。
+    await control.switch_mode(
+        {
+            "mode": "local_model",
+            "force": True,
+            "local": {"base_url": "http://h:1/v1", "model": "lm"},
+        }
+    )
+
+    overrides = read_overrides(control_mod.OVERRIDES_PATH)
+    assert overrides["brain"]["local_model"]["context"] == 65536
+    assert overrides["brain"]["local_model"]["lean"] is True
+
+    generated = config_path(Path(control.settings.opencode.config_home))
+    generated_text = generated.read_text(encoding="utf-8")
+    assert '"context": 65536' in generated_text
+    assert '"lean": true' in generated_text
+    agent_text = agent_path(Path(control.settings.opencode.project_dir)).read_text(
+        encoding="utf-8"
+    )
+    assert "- action: webfetch" not in agent_text  # lean 档不开联网
+
+
+async def test_generation_failure_rolls_back_overrides(
+    control: BrainControl, monkeypatch
+) -> None:
+    previous = {"brain": {"mode": "free", "local_model": {"context": 111}}, "keep": 1}
+    write_overrides(previous, control_mod.OVERRIDES_PATH)
+
+    def boom(path, content):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(control_mod, "write_generated", boom)
+    with pytest.raises(SwitchError) as exc:
+        await control.switch_mode(
+            {
+                "mode": "local_model",
+                "force": True,
+                "local": {
+                    "base_url": "http://h:1/v1",
+                    "model": "lm",
+                    "context": 4096,
+                },
+            }
+        )
+
+    assert exc.value.status == 500
+    assert "OSError" in exc.value.reason
+    assert "回滚" in exc.value.reason
+    assert read_overrides(control_mod.OVERRIDES_PATH) == previous
+    agent_file = agent_path(Path(control.settings.opencode.project_dir))
+    assert not agent_file.exists()
+
+
+async def test_generation_failure_restores_previous_secret(
+    control: BrainControl, monkeypatch
+) -> None:
+    write_secret("sk-old-secret", control_mod.KEY_PATH)
+
+    def boom(path, content):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(control_mod, "write_generated", boom)
+    with pytest.raises(SwitchError) as exc:
+        await control.switch_mode(
+            {
+                "mode": "key",
+                "force": True,
+                "key": {
+                    "base_url": "https://api.x/v1",
+                    "model": "m",
+                    "api_key": "sk-new-secret",
+                },
+            }
+        )
+
+    assert exc.value.status == 500
+    assert "回滚" in exc.value.reason
+    assert read_secret(control_mod.KEY_PATH) == "sk-old-secret"
+    assert not Path(control_mod.OVERRIDES_PATH).exists()
+
+
+async def test_session_clear_failure_keeps_writes(
+    control: BrainControl, store_spy: StoreSpy, monkeypatch
+) -> None:
+    def boom() -> int:
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(store_spy, "clear_opencode_sessions", boom)
+    out = await control.switch_mode({"mode": "free"})
+
+    assert out["mode"] == "free"
+    assert any("会话缓存" in warning for warning in out["warnings"])
+    assert read_overrides(control_mod.OVERRIDES_PATH)["brain"]["mode"] == "free"
+    assert config_path(Path(control.settings.opencode.config_home)).is_file()
+
+
+async def test_brain_rebuild_failure_keeps_writes_and_warns(
+    control: BrainControl, monkeypatch
+) -> None:
+    def boom(settings, store, provider, model=""):
+        raise RuntimeError("no brain")
+
+    monkeypatch.setattr(control_mod, "build_brain", boom)
+    out = await control.switch_mode({"mode": "free"})
+
+    assert out["mode"] == "free"
+    assert any(
+        "大脑重建失败" in warning and "RuntimeError" in warning
+        for warning in out["warnings"]
+    )
+    assert read_overrides(control_mod.OVERRIDES_PATH)["brain"]["mode"] == "free"
+    assert config_path(Path(control.settings.opencode.config_home)).is_file()
+
+
+async def test_reload_requires_explicit_ack(control: BrainControl) -> None:
+    async def reload():
+        return None
+
+    control.opencode_reload = reload
+    out = await control.switch_mode({"mode": "free"})
+
+    assert out["reload"] == "pending"
+    assert any("重载" in warning for warning in out["warnings"])
+
+
+@pytest.mark.parametrize("bad", [[], "", 0])
+async def test_key_must_be_object(control: BrainControl, bad) -> None:
+    with pytest.raises(SwitchError) as exc:
+        await control.switch_mode({"mode": "key", "key": bad})
+    assert exc.value.status == 400
+
+
+async def test_local_key_feeds_probe_and_generated_reference(
+    control: BrainControl, monkeypatch
+) -> None:
+    seen: list[str] = []
+
+    async def fake_probe(base_url, *, api_key="", timeout=8.0):
+        seen.append(api_key)
+        return ["lm"]
+
+    monkeypatch.setattr(control_mod, "probe_models", fake_probe)
+    out = await control.switch_mode(
+        {
+            "mode": "local_model",
+            "local": {
+                "base_url": "http://h:1/v1",
+                "model": "lm",
+                "api_key": "sk-local-777",
+            },
+        }
+    )
+
+    assert seen == ["sk-local-777"]
+    assert read_secret(control_mod.KEY_PATH) == "sk-local-777"
+    generated = config_path(Path(control.settings.opencode.config_home))
+    generated_text = generated.read_text(encoding="utf-8")
+    assert "sk-local-777" not in generated_text
+    assert key_file_target(generated) == Path(control_mod.KEY_PATH).resolve()
+    assert "sk-local-777" not in json.dumps(out)
+
+
+async def test_local_probe_falls_back_to_stored_key(
+    control: BrainControl, monkeypatch
+) -> None:
+    control.settings = dc_replace(
+        control.settings,
+        local_model=dc_replace(control.settings.local_model, api_key="sk-stored-1"),
+    )
+    seen: list[str] = []
+
+    async def fake_probe(base_url, *, api_key="", timeout=8.0):
+        seen.append(api_key)
+        return ["lm"]
+
+    monkeypatch.setattr(control_mod, "probe_models", fake_probe)
+    await control.switch_mode(
+        {
+            "mode": "local_model",
+            "local": {"base_url": "http://h:1/v1", "model": "lm"},
+        }
+    )
+
+    assert seen == ["sk-stored-1"]
+    assert read_secret(control_mod.KEY_PATH) == "sk-stored-1"
+    generated = config_path(Path(control.settings.opencode.config_home))
+    assert key_file_target(generated) == Path(control_mod.KEY_PATH).resolve()

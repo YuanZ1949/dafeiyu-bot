@@ -33,7 +33,7 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-dafeiyu = ["brain/persona.md", "supervisor/dashboard/*.html"]
+dafeiyu = ["brain/persona.md", "brain/agent_template.md", "supervisor/dashboard/*.html"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

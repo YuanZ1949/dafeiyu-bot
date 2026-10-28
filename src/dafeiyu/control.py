@@ -213,10 +213,15 @@ def _brain_mode_payload(
             f"不支持的大脑模式：{raw_mode.strip()[:32]}（仅支持 {BRAIN_MODE_LABEL}）",
         )
 
-    key_raw = payload.get("key") or {}
+    key_raw = payload.get("key")
+    if key_raw is None:
+        key_raw = {}
+    # 显式判类型：`or {}` 会把 []/""/0 这类非法值悄悄当成空对象放过。
     if not isinstance(key_raw, dict):
         raise SwitchError(400, "key 必须是对象")
-    local_raw = payload.get("local") or {}
+    local_raw = payload.get("local")
+    if local_raw is None:
+        local_raw = {}
     if not isinstance(local_raw, dict):
         raise SwitchError(400, "local 必须是对象")
 
@@ -233,7 +238,7 @@ def _brain_mode_payload(
     local: dict[str, Any] = {
         "base_url": normalize_base_url(_mode_text(local_raw.get("base_url"))),
         "model": _mode_text(local_raw.get("model")),
-        # 本地服务的令牌只喂探活，不落盘。
+        # 本地服务的令牌只用于探活和密钥文件，不进覆盖层。
         "api_key": _mode_text(local_raw.get("api_key")),
     }
     if "context" in local_raw:
@@ -286,6 +291,53 @@ def _merged_overrides(
         brain["local_model"] = section
     overrides["brain"] = brain
     return overrides
+
+
+def _merged_section(overrides: dict[str, Any], name: str) -> dict[str, Any]:
+    """取覆盖层里 `brain.<name>` 子段；形状不对就当没给。"""
+    brain = overrides.get("brain")
+    if not isinstance(brain, dict):
+        return {}
+    section = brain.get(name)
+    return section if isinstance(section, dict) else {}
+
+
+def _restore_overrides(existing: dict[str, Any], had_file: bool) -> None:
+    """把覆盖层恢复到切换前的样子。
+
+    恢复失败只记一条 warning：不能拿回滚错误盖住原始的生成失败原因。
+    """
+    try:
+        if had_file:
+            write_overrides(existing, OVERRIDES_PATH)
+        else:
+            Path(OVERRIDES_PATH).unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("覆盖层回滚失败：%s", type(exc).__name__)
+
+
+def _restore_secret(previous: str) -> None:
+    """把密钥文件恢复到切换前；空值等价于删除（`write_secret` 的契约）。"""
+    try:
+        write_secret(previous, KEY_PATH)
+    except OSError as exc:
+        log.warning("provider key 回滚失败：%s", type(exc).__name__)
+
+
+def _key_reference(config_dir: Path) -> str:
+    """密钥文件相对 opencode 配置目录的引用。
+
+    `{file:}` 只保证相对路径可用（绝对路径在 JSONC 里还要转义，且跨平台
+    不稳定），所以按实际 `KEY_PATH` 与配置目录现算，而不是写死
+    `DEFAULT_KEY_REL`——自定义/留空的 `config_home` 下那个常量会指向不存在的
+    位置。Windows 跨盘符无法表达相对路径时才退化为绝对 POSIX 路径。
+    """
+    target = Path(KEY_PATH).resolve()
+    try:
+        relative = os.path.relpath(target, Path(config_dir).resolve())
+    except ValueError:
+        return target.as_posix()
+    return Path(relative).as_posix()
 
 
 async def _probe_endpoint(label: str, base_url: str, api_key: str) -> None:
@@ -464,16 +516,21 @@ class BrainControl:
         # 由启动方注入（Task 16 的 POST /api/opencode/reload）。本模块不猜
         # supervisor 的地址与 token；没注入时切换照样落盘，只把 reload 标成 pending。
         self.opencode_reload: Callable[[], Awaitable[dict[str, Any]]] | None = None
+        # switch_mode 成功后钉住「当前活着的 brain」：三档都由 opencode 提供，
+        # snapshot 必须与切换响应一致，不能继续报启动时的 token/local_model。
+        self._mode_provider = ""
+        self._mode_model = ""
         self.budget_guard = BudgetGuard(store, settings.budget)
 
     def snapshot(self) -> dict[str, Any]:
-        provider = current_provider(self.settings, self.runtime)
+        provider = self._mode_provider or current_provider(self.settings, self.runtime)
         if provider == "local_model":
             model = local_model_name(self.settings, self.runtime)
         elif provider == "token":
             model = self.settings.model
         else:
-            model = ""
+            # opencode：展示 switch_mode 钉住的档位模型；老 switch() 进来时为空。
+            model = self._mode_model
         return {
             "provider": provider,
             "model": model,
@@ -670,6 +727,9 @@ class BrainControl:
 
             previous = self.service.set_brain(brain)
             self.runtime = self.runtime.with_provider(target, model)
+            # 老协议接管后，snapshot 回到 runtime/config 的口径。
+            self._mode_provider = ""
+            self._mode_model = ""
             try:
                 save_runtime(self.runtime, self.runtime_path)
             except OSError as exc:
@@ -684,14 +744,20 @@ class BrainControl:
         顺序固定：校验 →（非 force 时）探活 → 写 provider key → 写覆盖层 →
         重生 opencode.jsonc 与 agent 文件 → reload → 清会话缓存 → 重建 brain。
         校验与探活都发生在第一次写盘之前，所以填错端点不会留下半套配置。
+        生成物以「刚持久化的覆盖层」为基线（省略 context/lean 时沿用上一轮），
+        三档都由 opencode 承载，重建后 `snapshot()` 也切到 opencode。
 
         生成物路径：jsonc 在 `ensure_isolated_config(opencode.config_home)` 的
         配置根下（config_home 留空时沿用当前工作目录的 `opencode/`，与软回滚
         语义一致）；agent 在 `opencode.project_dir` 下，project_dir 为空才回退
         到安装根（仓库里的 `.opencode/agents/`）。
 
-        reload 走注入的 `self.opencode_reload`：没注入或抛异常都只降级为
-        `reload: "pending"` 并记一条 warning，绝不回滚已经写入的配置。
+        reload 走注入的 `self.opencode_reload`：没注入、抛异常或没有显式
+        `{"ok": true}` 回执都只降级为 `reload: "pending"` 并记一条 warning，
+        绝不回滚已经写入的配置。生成物写失败则回滚覆盖层。
+
+        清会话缓存 / 重建 brain 发生在全部落盘之后，失败只记 warning 并保持
+        成功返回形状；下半段失败不该让面板以为配置没生效。
         """
         mode, key, local, force = _brain_mode_payload(payload)
 
@@ -700,6 +766,13 @@ class BrainControl:
                 existing = read_overrides(OVERRIDES_PATH)
             except OverrideError as exc:
                 raise SwitchError(500, f"覆盖层读取失败：{exc}") from exc
+
+            # 探活与生成都用「本次真的会生效的本地令牌」：payload 没给就沿用
+            # config.yaml 里已配置的那个。哨兵值 "local" 只是占位，不是真密钥。
+            local_key = (
+                local["api_key"] or str(self.settings.local_model.api_key or "").strip()
+            )
+            local_has_key = bool(local_key) and local_key != "local"
 
             if not force:
                 if mode == "key":
@@ -711,24 +784,55 @@ class BrainControl:
                         key["api_key"] or read_secret(KEY_PATH),
                     )
                 elif mode == "local_model":
-                    await _probe_endpoint(
-                        "本地模型端点", local["base_url"], local["api_key"]
-                    )
+                    await _probe_endpoint("本地模型端点", local["base_url"], local_key)
 
+            # 生成基线是「刚持久化的覆盖层」，不是启动快照：面板省略
+            # context/lean 时，覆盖层里上一轮的值仍然有效，生成物必须跟它一致。
+            merged = _merged_overrides(existing, mode, key, local)
+            key_section = _merged_section(merged, "key")
+            local_section = _merged_section(merged, "local_model")
             cfg = replace(
                 self.settings.brain,
                 mode=mode,
-                key_base_url=key["base_url"] or self.settings.brain.key_base_url,
-                key_model=key["model"] or self.settings.brain.key_model,
+                key_base_url=str(
+                    key_section.get("base_url") or self.settings.brain.key_base_url
+                ),
+                key_model=str(
+                    key_section.get("model") or self.settings.brain.key_model
+                ),
             )
+            context = local_section.get("context", self.settings.local_model.context)
+            lean = local_section.get("lean", self.settings.local_model.lean)
             local_cfg = replace(
                 self.settings.local_model,
-                base_url=local["base_url"] or self.settings.local_model.base_url,
-                model=local["model"] or self.settings.local_model.model,
-                context=local.get("context", self.settings.local_model.context),
-                lean=local.get("lean", self.settings.local_model.lean),
+                base_url=str(
+                    local_section.get("base_url") or self.settings.local_model.base_url
+                ),
+                model=str(
+                    local_section.get("model") or self.settings.local_model.model
+                ),
+                context=(
+                    context
+                    if isinstance(context, int) and not isinstance(context, bool)
+                    else self.settings.local_model.context
+                ),
+                lean=lean if isinstance(lean, bool) else self.settings.local_model.lean,
             )
-            data = build_config(mode, cfg, local=local_cfg)
+
+            config_home = str(self.settings.opencode.config_home or "").strip()
+            project_dir = str(self.settings.opencode.project_dir or "").strip()
+            agent_root = Path(project_dir) if project_dir else Path(INSTALL_ROOT)
+            # 配置目录与 ensure_isolated_config 的解析方式一致（空 config_home
+            # = 当前工作目录），密钥引用据此现算。
+            config_dir = config_path(Path(config_home or ".")).resolve().parent
+            key_rel = _key_reference(config_dir)
+            use_key_ref = mode == "key" or (mode == "local_model" and local_has_key)
+            data = build_config(
+                mode,
+                cfg,
+                key_rel=key_rel if use_key_ref else None,
+                local=local_cfg,
+            )
             try:
                 template = AGENT_TEMPLATE_PATH.read_text(encoding="utf-8")
             except OSError as exc:
@@ -741,26 +845,32 @@ class BrainControl:
                 local=local_cfg,
             )
 
-            if mode == "key" and key["api_key"]:
+            # 密钥只落 data/secrets/provider.key：key 档写面板给的，local 档写
+            # 实际生效的本地令牌（可能来自 config.yaml）。为空都保持原文件不动。
+            secret_value = key["api_key"] if mode == "key" else ""
+            if mode == "local_model" and local_has_key:
+                secret_value = local_key
+            previous_secret = ""
+            if secret_value:
+                previous_secret = read_secret(KEY_PATH)
                 try:
-                    write_secret(key["api_key"], KEY_PATH)
+                    write_secret(secret_value, KEY_PATH)
                 except OSError as exc:
                     raise SwitchError(
                         500, f"provider key 写入失败（{type(exc).__name__}）"
                     ) from exc
 
+            had_overrides = Path(OVERRIDES_PATH).exists()
             try:
-                write_overrides(
-                    _merged_overrides(existing, mode, key, local), OVERRIDES_PATH
-                )
+                write_overrides(merged, OVERRIDES_PATH)
             except OSError as exc:
+                # 密钥已经落盘但模式没写进去：同样只留一种状态。
+                if secret_value:
+                    _restore_secret(previous_secret)
                 raise SwitchError(
                     500, f"覆盖层写入失败（{type(exc).__name__}）"
                 ) from exc
 
-            config_home = str(self.settings.opencode.config_home or "").strip()
-            project_dir = str(self.settings.opencode.project_dir or "").strip()
-            agent_root = Path(project_dir) if project_dir else Path(INSTALL_ROOT)
             try:
                 backed_up = write_generated(
                     config_path(ensure_isolated_config(config_home)),
@@ -770,8 +880,14 @@ class BrainControl:
                     write_generated(agent_path(agent_root), agent_text) or backed_up
                 )
             except OSError as exc:
+                # 覆盖层已落盘但生成物没写成：恢复上一版覆盖层与密钥，别把
+                # 「一半生效」的状态留给面板。
+                if secret_value:
+                    _restore_secret(previous_secret)
+                _restore_overrides(existing, had_overrides)
                 raise SwitchError(
-                    500, f"生成 opencode 配置失败（{type(exc).__name__}）"
+                    500,
+                    f"生成 opencode 配置失败（{type(exc).__name__}），覆盖层已回滚",
                 ) from exc
 
             warnings: list[str] = []
@@ -786,17 +902,25 @@ class BrainControl:
                 log.warning("清空 opencode 会话缓存失败：%s", type(exc).__name__)
                 warnings.append("旧会话缓存清理失败，部分会话可能仍沿用切换前的模型")
 
-            provider = current_provider(self.settings, self.runtime)
-            model_arg = local_cfg.model if provider == "local_model" else ""
+            # 三档都由 opencode 提供，只是喂给它的 provider 配置不同，所以
+            # 重建的是 opencode brain，snapshot 也跟着切到 opencode。
+            provider = "opencode"
             try:
-                brain = build_brain(self.settings, self.store, provider, model_arg)
-            except ConfigError as exc:
-                raise SwitchError(409, str(exc)) from exc
-            except Exception as exc:  # 构造失败不该用半个新大脑顶上去
-                log.exception("重建 %s brain 失败", provider)
-                raise SwitchError(500, f"重建 {provider} 失败：{exc}") from exc
-            previous = self.service.set_brain(brain)
-            asyncio.create_task(self._close_later(previous))
+                brain = build_brain(self.settings, self.store, provider, "")
+            except Exception as exc:  # noqa: BLE001 - 已落盘，失败只降级为 warning
+                log.warning("重建 %s brain 失败：%s", provider, type(exc).__name__)
+                warnings.append(f"大脑重建失败，重启后生效：{type(exc).__name__}")
+            else:
+                previous = self.service.set_brain(brain)
+                self._mode_provider = provider
+                self._mode_model = str(data.get("model") or "")
+                self.runtime = self.runtime.with_provider(provider, "")
+                try:
+                    save_runtime(self.runtime, self.runtime_path)
+                except OSError as exc:
+                    log.warning("runtime.json 写入失败：%s", exc)
+                    warnings.append("runtime.json 写入失败，重启后可能回到旧 provider")
+                asyncio.create_task(self._close_later(previous))
             log.info("大脑模式已切换：%s（provider=%s）", mode, provider)
             return {
                 "mode": mode,
@@ -821,9 +945,10 @@ class BrainControl:
             return "pending", [
                 f"opencode 重载失败（{type(exc).__name__}），需重启 opencode 才会生效"
             ]
-        if isinstance(result, dict) and result.get("ok") is False:
-            return "pending", ["opencode 重载未确认成功，需重启 opencode 才会生效"]
-        return "ok", []
+        if isinstance(result, dict) and result.get("ok") is True:
+            return "ok", []
+        # 只认显式 ack：None / 缺字段 / 其它真值都不能当成重载成功。
+        return "pending", ["opencode 重载未确认成功，需重启 opencode 才会生效"]
 
     async def _close_later(self, brain: Any) -> None:
         await asyncio.sleep(CLOSE_DELAY_SECONDS)
