@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import subprocess
 
 import httpx
@@ -34,9 +36,10 @@ class FakeGet:
 
 
 class FakeResponse:
-    def __init__(self, payload, status: int = 200) -> None:
+    def __init__(self, payload, status: int = 200, *, json_error=None) -> None:
         self.payload = payload
         self.status_code = status
+        self.json_error = json_error
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -50,14 +53,19 @@ class FakeResponse:
             )
 
     def json(self):
+        if self.json_error is not None:
+            raise self.json_error
         return self.payload
 
 
 class FakeClient:
-    def __init__(self, *, payload=None, error=None, status: int = 200) -> None:
+    def __init__(
+        self, *, payload=None, error=None, status: int = 200, json_error=None
+    ) -> None:
         self.payload = payload
         self.error = error
         self.status = status
+        self.json_error = json_error
         self.last: tuple | None = None
 
     async def __aenter__(self):
@@ -70,15 +78,19 @@ class FakeClient:
         self.last = (url, headers)
         if self.error is not None:
             raise self.error
-        return FakeResponse(self.payload, self.status)
+        return FakeResponse(self.payload, self.status, json_error=self.json_error)
 
 
-def fake_httpx(monkeypatch, *, payload=None, error=None, status: int = 200):
+def fake_httpx(
+    monkeypatch, *, payload=None, error=None, status: int = 200, json_error=None
+):
     """把 httpx.AsyncClient 换成假的，并返回被创建的客户端列表。"""
     created: list[FakeClient] = []
 
     def factory(*_args, **_kwargs):
-        client = FakeClient(payload=payload, error=error, status=status)
+        client = FakeClient(
+            payload=payload, error=error, status=status, json_error=json_error
+        )
         created.append(client)
         return client
 
@@ -96,9 +108,13 @@ def test_normalize_base_url_is_the_shared_implementation():
 def test_probe_never_shells_out(monkeypatch):
     # 探测只能走 HTTP：调 opencode CLI 会连到用户已运行的共享服务。
     def boom(*args, **kwargs):
-        raise AssertionError("不允许调用 subprocess")
+        raise AssertionError("不允许调用子进程")
 
+    # 模块里根本不该有 subprocess 属性；标准库的三个入口也全部钉死。
+    assert not hasattr(model_probe, "subprocess")
     monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(subprocess, "Popen", boom)
+    monkeypatch.setattr(os, "system", boom)
     monkeypatch.setattr(model_probe, "_get", FakeGet([{"id": "m"}]))
 
     assert asyncio.run(probe_models("http://h:1234/v1")) == ["m"]
@@ -123,6 +139,13 @@ async def test_probe_models_reads_data_envelope(monkeypatch):
     monkeypatch.setattr(model_probe, "_get", FakeGet({"data": [{"id": "qwen3"}]}))
 
     assert await probe_models("http://h:1234/v1") == ["qwen3"]
+
+
+async def test_probe_models_accepts_bare_string_ids(monkeypatch):
+    # 有的本地服务直接回 ["qwen3", "llama"]，不能被静默吞成空列表。
+    monkeypatch.setattr(model_probe, "_get", FakeGet(["qwen3", "llama"]))
+
+    assert await probe_models("http://h:1234/v1") == ["qwen3", "llama"]
 
 
 async def test_probe_models_rejects_payload_without_data(monkeypatch):
@@ -150,6 +173,34 @@ async def test_get_maps_http_error_to_probe_error(monkeypatch):
     with pytest.raises(ProbeError) as info:
         await probe_models("http://h:1234/v1")
 
+    assert info.value.timed_out is False
+    # 上游状态码要留住，控制口才能说「返回 HTTP 401」而不是笼统的「连不上」。
+    assert info.value.status == 401
+
+
+async def test_get_maps_invalid_url_to_probe_error(monkeypatch):
+    # InvalidURL 既不是 HTTPError 也不是 ValueError，漏接会变成 500。
+    # 这里只钉映射；真实 httpx 解析的端到端用例在 test_control_api.py。
+    fake_httpx(monkeypatch, error=httpx.InvalidURL("Invalid port: 'abc'"))
+
+    with pytest.raises(ProbeError) as info:
+        await probe_models("http://h:abc/v1")
+
+    assert str(info.value) == "地址不可达或不是 OpenAI 兼容接口"
+    assert info.value.timed_out is False
+    assert info.value.status is None
+
+
+async def test_get_maps_non_json_body_to_probe_error(monkeypatch):
+    fake_httpx(
+        monkeypatch,
+        json_error=json.JSONDecodeError("Expecting value", "<html>", 0),
+    )
+
+    with pytest.raises(ProbeError) as info:
+        await probe_models("http://h:1234/v1")
+
+    assert str(info.value) == "地址不可达或不是 OpenAI 兼容接口"
     assert info.value.timed_out is False
 
 

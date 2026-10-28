@@ -206,6 +206,126 @@ async def test_models_endpoint_reports_unreachable(tmp_path: Path) -> None:
     assert "LM Studio" in payload["error"]
 
 
+async def test_models_endpoint_rejects_malformed_base_url(tmp_path: Path) -> None:
+    # 回归：http://h:abc/v1 曾让 httpx.InvalidURL 漏出 _get → 500 + traceback。
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.get("/api/brain/models?base_url=http://h:abc/v1")
+        payload = await resp.json()
+
+    assert resp.status == 502
+    assert payload["error"] == "地址不可达或不是 OpenAI 兼容接口"
+
+
+async def test_models_endpoint_probes_given_base_url(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls: list[tuple] = []
+
+    async def fake_probe(base_url, *, api_key="", timeout=8.0):
+        calls.append((base_url, api_key, timeout))
+        return ["m1", "m2"]
+
+    monkeypatch.setattr(control_module, "probe_models", fake_probe)
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.get(
+            "/api/brain/models",
+            params={"base_url": "http://h:1234/v1/v1/", "api_key": "k-secret"},
+        )
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload == {"models": ["m1", "m2"]}
+    # 粘贴多出来的 /v1/ 被规整掉；key 只进探测层，超时仍共用 3s。
+    assert calls == [("http://h:1234/v1", "k-secret", 3.0)]
+
+
+async def test_models_endpoint_maps_timeout_to_504(tmp_path: Path, monkeypatch) -> None:
+    async def fake_probe(base_url, *, api_key="", timeout=8.0):
+        raise control_module.ProbeError(timed_out=True)
+
+    monkeypatch.setattr(control_module, "probe_models", fake_probe)
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.get(
+            "/api/brain/models", params={"base_url": "http://h:1234/v1"}
+        )
+        payload = await resp.json()
+
+    assert resp.status == 504
+    assert payload["error"] == "地址不可达或不是 OpenAI 兼容接口"
+
+
+async def test_models_endpoint_never_echoes_api_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    async def fake_probe(base_url, *, api_key="", timeout=8.0):
+        return ["m1"]
+
+    monkeypatch.setattr(control_module, "probe_models", fake_probe)
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        ok = await client.get(
+            "/api/brain/models",
+            params={"base_url": "http://h:1234/v1", "api_key": "k-secret"},
+        )
+        ok_text = await ok.text()
+
+        async def boom(base_url, *, api_key="", timeout=8.0):
+            raise control_module.ProbeError()
+
+        monkeypatch.setattr(control_module, "probe_models", boom)
+        failed = await client.get(
+            "/api/brain/models",
+            params={"base_url": "http://h:1234/v1", "api_key": "k-secret"},
+        )
+        failed_text = await failed.text()
+
+    assert ok.status == 200
+    assert failed.status == 502
+    assert "k-secret" not in ok_text
+    assert "k-secret" not in failed_text
+
+
+async def test_models_endpoint_default_path_uses_local_settings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls: list[tuple] = []
+
+    async def fake_probe(base_url, *, api_key="", timeout=8.0):
+        calls.append((base_url, api_key, timeout))
+        return ["local-model"]
+
+    monkeypatch.setattr(control_module, "probe_models", fake_probe)
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.get("/api/brain/models")
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload == {"models": ["local-model"]}
+    # 不带参数时仍走本机 local_model.base_url，且不带 api_key。
+    assert calls == [("http://127.0.0.1:1/v1", "", 3.0)]
+
+
+async def test_models_endpoint_keeps_upstream_http_status(
+    tmp_path: Path, monkeypatch
+) -> None:
+    async def fake_probe(base_url, *, api_key="", timeout=8.0):
+        raise control_module.ProbeError(status=503)
+
+    monkeypatch.setattr(control_module, "probe_models", fake_probe)
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.get("/api/brain/models")
+        payload = await resp.json()
+
+    # 状态码不变（502），但文案保留上游状态，便于诊断。
+    assert resp.status == 502
+    assert payload["error"] == "LM Studio 返回 HTTP 503"
+
+
 async def test_runtime_file_overrides_config_provider(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime.json"
     runtime.write_text(

@@ -24,22 +24,28 @@ PROBE_ERROR_MESSAGE = "地址不可达或不是 OpenAI 兼容接口"
 class ProbeError(Exception):
     """探测失败。
 
-    `timed_out` 用于让控制口把超时映射成 504、其余失败映射成 502；
-    对外的文案仍保持同一句，免得把 httpx 的异常细节漏给面板。
+    `timed_out` 让控制口把超时映射成 504、其余失败映射成 502；`status` 是上游
+    真的回了状态码时的那个码（没回就是 None），控制口据此保留「返回 HTTP xxx」
+    这种可诊断的文案。对外的默认文案仍保持同一句，不把 httpx 异常细节漏给面板。
     """
 
     def __init__(
-        self, message: str = PROBE_ERROR_MESSAGE, *, timed_out: bool = False
+        self,
+        message: str = PROBE_ERROR_MESSAGE,
+        *,
+        timed_out: bool = False,
+        status: int | None = None,
     ) -> None:
         super().__init__(message)
         self.timed_out = timed_out
+        self.status = status
 
 
 async def _get(url: str, api_key: str, timeout: float) -> Any:
     """GET 一个 URL，返回解码后的 JSON。
 
     这是模块里唯一的 HTTP 出口，测试替换它就不用起服务。非 2xx、超时、
-    非 JSON 响应统统收敛成 ProbeError；key 为空时连 Authorization 头都不发。
+    非 JSON、非法 URL 统统收敛成 ProbeError；key 为空时连 Authorization 头都不发。
     """
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
@@ -49,7 +55,12 @@ async def _get(url: str, api_key: str, timeout: float) -> Any:
             return response.json()
     except httpx.TimeoutException as exc:
         raise ProbeError(timed_out=True) from exc
-    except (httpx.HTTPError, ValueError) as exc:
+    except httpx.HTTPStatusError as exc:
+        # 上游确实回了状态码：控制口据此保留「返回 HTTP xxx」的可诊断文案。
+        raise ProbeError(status=exc.response.status_code) from exc
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+        # InvalidURL 既不继承 HTTPError 也不继承 ValueError，必须单列，
+        # 否则用户填错端口（http://h:abc/v1）会漏成 500。
         raise ProbeError() from exc
 
 
@@ -58,8 +69,9 @@ async def probe_models(
 ) -> list[str]:
     """探测 `{base}/models`，返回模型 id 列表（顺序保持服务端给的样子）。
 
-    兼容两种响应形状：标准 OpenAI 的 `{"data": [{"id": ...}]}`，以及直接给
-    一个 id 对象数组的本地服务。其它形状一律按「不是 OpenAI 兼容接口」处理。
+    兼容三种响应形状：标准 OpenAI 的 `{"data": [{"id": ...}]}`、直接给 id 对象
+    数组的本地服务，以及直接给字符串 id 数组（`["qwen3", "llama"]`）的本地服务。
+    其它形状一律按「不是 OpenAI 兼容接口」处理。
     """
     base = normalize_base_url(base_url)
     if not base:
@@ -71,7 +83,12 @@ async def probe_models(
         raise ProbeError()
     ids: list[str] = []
     for item in payload:
-        model_id = item.get("id") if isinstance(item, dict) else None
+        if isinstance(item, str):
+            model_id = item
+        elif isinstance(item, dict):
+            model_id = item.get("id")
+        else:
+            model_id = None
         if model_id:
             ids.append(str(model_id))
     return ids

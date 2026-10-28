@@ -621,6 +621,8 @@ class BrainControl:
                 raise SwitchError(
                     504, f"LM Studio 在 {MODEL_PROBE_TIMEOUT:.0f}s 内没有响应"
                 ) from exc
+            if exc.status is not None:
+                raise SwitchError(502, f"LM Studio 返回 HTTP {exc.status}") from exc
             raise SwitchError(502, f"连不上 LM Studio（{base}）") from exc
 
     # ---- dashboard 扩展：用量 / 搜索 / 导出 / 会话 / 配置 ----
