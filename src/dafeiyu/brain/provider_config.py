@@ -288,7 +288,11 @@ def build_agent(
 
 
 def _looks_generated(text: str) -> bool:
-    """前置区范围内出现标记就算生成物。
+    """前置区范围内出现我们的标记就算生成物。
+
+    两种标记都必须认：agent 用 HTML 注释（不能放首行，否则 opencode 不解析
+    前置区），jsonc 配置用 `//` 首行（`render_config` 的输出）。只认一种会让
+    另一类生成物每次都被当成手改件、白备份一遍。
 
     标记在正文首行（前置区之后），不再位于文件开头，所以不能只用 startswith。
     窗口取 120 行而不是 60：permissions 有 14 条 deny/allow（每条 3 行），
@@ -296,8 +300,9 @@ def _looks_generated(text: str) -> bool:
     每次运行都白备份一遍。窗口仍只覆盖前置区，不会把正文里的偶发同名字串
     误判成生成物。
     """
+    markers = (GENERATED_MARK, AGENT_MARK)
     return any(
-        line.strip() == AGENT_MARK for line in text.splitlines()[:AGENT_MARK_SCAN_LINES]
+        line.strip() in markers for line in text.splitlines()[:AGENT_MARK_SCAN_LINES]
     )
 
 

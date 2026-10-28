@@ -9,8 +9,10 @@ import os
 import sqlite3
 import tempfile
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
@@ -22,14 +24,26 @@ from .brain.factory import (
     normalize_provider,
 )
 from .brain.lmstudio import ensure_server
+from .brain.provider_config import (
+    SUPPORTED_MODES,
+    agent_path,
+    build_agent,
+    build_config,
+    config_path,
+    render_config,
+    write_generated,
+)
+from .brain.runtime_config import ensure_isolated_config
 from . import __version__
 from .budget import BudgetGuard
-from .config import ConfigError, Settings
+from .config import ConfigError, OVERRIDES_PATH, Settings
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
 from .model_probe import ProbeError, normalize_base_url, probe_models
 from .models import ChatType, Message
 from .runtime import RuntimeState, load_runtime, save_runtime
+from .secrets_store import INSTALL_ROOT, KEY_PATH, read_secret, write_secret
 from .service import BRAIN_ERROR_COOLDOWN_SECONDS, TOOL_HINT_INTERVAL_SECONDS
+from .settings_local import OverrideError, read_overrides, write_overrides
 from .timeutil import SHANGHAI, now_shanghai
 from .workers.failure import (
     QUOTA_KEY,
@@ -56,6 +70,12 @@ ERROR_STATS_WINDOW_SECONDS = 3600
 MAX_NOTIFY_CHARS = 1000
 MAX_DEDUPE_KEY_CHARS = 64
 NOTIFY_MIN_INTERVAL_SECONDS = 10.0
+# 三档切换的探活上限：云端端点比本机 LM Studio 慢，list_models 的 3s 不够用。
+BRAIN_PROBE_TIMEOUT = 8.0
+# 人设正文的唯一来源：provider_config 只替换前置区，正文原样搬运。
+AGENT_TEMPLATE_PATH = Path(__file__).resolve().parent / "brain" / "agent_template.md"
+# 用户可见的三档，错误文案与 provider_config 共用同一份定义。
+BRAIN_MODE_LABEL = " / ".join(SUPPORTED_MODES)
 
 
 def _iso_ts(timestamp: Any) -> str | None:
@@ -167,6 +187,119 @@ class SwitchError(Exception):
         super().__init__(reason)
         self.status = status
         self.reason = reason
+
+
+def _mode_text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _brain_mode_payload(
+    payload: dict[str, Any],
+) -> tuple[str, dict[str, Any], dict[str, Any], bool]:
+    """校验并归一面板提交的三档切换请求。
+
+    只认 `free / key / local_model`；`local` 是历史拼法，必须拒绝，否则会被
+    provider 层静默解析成 token 档。key/local 只保留本次请求真的给了的字段：
+    没给的字段不在覆盖层里写，保留用户上一次的选择。
+    """
+    raw_mode = payload.get("mode")
+    if not isinstance(raw_mode, str):
+        raise SwitchError(400, f"mode 必须是字符串（仅支持 {BRAIN_MODE_LABEL}）")
+    mode = raw_mode.strip().casefold()
+    if mode not in SUPPORTED_MODES:
+        # 只回显有限长度：mode 不是密钥字段，但不该把任意 payload 原样吐回。
+        raise SwitchError(
+            400,
+            f"不支持的大脑模式：{raw_mode.strip()[:32]}（仅支持 {BRAIN_MODE_LABEL}）",
+        )
+
+    key_raw = payload.get("key") or {}
+    if not isinstance(key_raw, dict):
+        raise SwitchError(400, "key 必须是对象")
+    local_raw = payload.get("local") or {}
+    if not isinstance(local_raw, dict):
+        raise SwitchError(400, "local 必须是对象")
+
+    raw_force = payload.get("force", False)
+    if not isinstance(raw_force, bool):
+        raise SwitchError(400, "force 必须是布尔值")
+
+    key: dict[str, Any] = {
+        "base_url": normalize_base_url(_mode_text(key_raw.get("base_url"))),
+        "model": _mode_text(key_raw.get("model")),
+        # 只用于写密钥文件/探活，绝不进覆盖层。
+        "api_key": _mode_text(key_raw.get("api_key")),
+    }
+    local: dict[str, Any] = {
+        "base_url": normalize_base_url(_mode_text(local_raw.get("base_url"))),
+        "model": _mode_text(local_raw.get("model")),
+        # 本地服务的令牌只喂探活，不落盘。
+        "api_key": _mode_text(local_raw.get("api_key")),
+    }
+    if "context" in local_raw:
+        context = local_raw["context"]
+        if isinstance(context, bool) or not isinstance(context, int) or context < 0:
+            raise SwitchError(400, "local.context 必须是非负整数")
+        local["context"] = context
+    if "lean" in local_raw:
+        if not isinstance(local_raw["lean"], bool):
+            raise SwitchError(400, "local.lean 必须是布尔值")
+        local["lean"] = local_raw["lean"]
+
+    if mode == "key":
+        if not key["base_url"]:
+            raise SwitchError(400, "自备 Key 模式需要填写 base_url")
+        if not key["model"]:
+            raise SwitchError(400, "自备 Key 模式需要填写 model")
+    elif mode == "local_model":
+        if not local["base_url"]:
+            raise SwitchError(400, "本地模型模式需要填写 base_url")
+        if not local["model"]:
+            raise SwitchError(400, "本地模型模式需要选择 model")
+
+    return mode, key, local, raw_force
+
+
+def _merged_overrides(
+    existing: dict[str, Any], mode: str, key: dict[str, Any], local: dict[str, Any]
+) -> dict[str, Any]:
+    """把本次选择并进已有覆盖层；不在白名单里的键原样保留。"""
+    overrides = dict(existing)
+    brain_raw = overrides.get("brain")
+    brain = dict(brain_raw) if isinstance(brain_raw, dict) else {}
+    brain["mode"] = mode
+    if mode == "key":
+        section_raw = brain.get("key")
+        section = dict(section_raw) if isinstance(section_raw, dict) else {}
+        section["base_url"] = key["base_url"]
+        section["model"] = key["model"]
+        brain["key"] = section
+    elif mode == "local_model":
+        section_raw = brain.get("local_model")
+        section = dict(section_raw) if isinstance(section_raw, dict) else {}
+        section["base_url"] = local["base_url"]
+        section["model"] = local["model"]
+        if "context" in local:
+            section["context"] = local["context"]
+        if "lean" in local:
+            section["lean"] = local["lean"]
+        brain["local_model"] = section
+    overrides["brain"] = brain
+    return overrides
+
+
+async def _probe_endpoint(label: str, base_url: str, api_key: str) -> None:
+    """探活一个 OpenAI 兼容端点；超时 504，其余失败 502。"""
+    try:
+        await probe_models(base_url, api_key=api_key, timeout=BRAIN_PROBE_TIMEOUT)
+    except ProbeError as exc:
+        if exc.timed_out:
+            raise SwitchError(
+                504, f"{label} 在 {BRAIN_PROBE_TIMEOUT:.0f}s 内没有响应"
+            ) from exc
+        if exc.status is not None:
+            raise SwitchError(502, f"{label} 返回 HTTP {exc.status}") from exc
+        raise SwitchError(502, f"连不上{label}（{base_url}）") from exc
 
 
 def _query_int(request: web.Request, name: str, default: int) -> int:
@@ -328,6 +461,9 @@ class BrainControl:
         self.runtime: RuntimeState = load_runtime(runtime_path)
         self._lock = asyncio.Lock()
         self._last_notify_at: float | None = None
+        # 由启动方注入（Task 16 的 POST /api/opencode/reload）。本模块不猜
+        # supervisor 的地址与 token；没注入时切换照样落盘，只把 reload 标成 pending。
+        self.opencode_reload: Callable[[], Awaitable[dict[str, Any]]] | None = None
         self.budget_guard = BudgetGuard(store, settings.budget)
 
     def snapshot(self) -> dict[str, Any]:
@@ -541,6 +677,153 @@ class BrainControl:
             asyncio.create_task(self._close_later(previous))
             log.info("大脑已切换：%s -> %s", before, target)
             return self.snapshot()
+
+    async def switch_mode(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """按用户可见的三档（free / key / local_model）切换大脑。
+
+        顺序固定：校验 →（非 force 时）探活 → 写 provider key → 写覆盖层 →
+        重生 opencode.jsonc 与 agent 文件 → reload → 清会话缓存 → 重建 brain。
+        校验与探活都发生在第一次写盘之前，所以填错端点不会留下半套配置。
+
+        生成物路径：jsonc 在 `ensure_isolated_config(opencode.config_home)` 的
+        配置根下（config_home 留空时沿用当前工作目录的 `opencode/`，与软回滚
+        语义一致）；agent 在 `opencode.project_dir` 下，project_dir 为空才回退
+        到安装根（仓库里的 `.opencode/agents/`）。
+
+        reload 走注入的 `self.opencode_reload`：没注入或抛异常都只降级为
+        `reload: "pending"` 并记一条 warning，绝不回滚已经写入的配置。
+        """
+        mode, key, local, force = _brain_mode_payload(payload)
+
+        async with self._lock:
+            try:
+                existing = read_overrides(OVERRIDES_PATH)
+            except OverrideError as exc:
+                raise SwitchError(500, f"覆盖层读取失败：{exc}") from exc
+
+            if not force:
+                if mode == "key":
+                    # 空 api_key = 沿用已保存的密钥；探活也得用它，否则需要鉴权
+                    # 的端点会被误判成不可达。
+                    await _probe_endpoint(
+                        "自备 Key 端点",
+                        key["base_url"],
+                        key["api_key"] or read_secret(KEY_PATH),
+                    )
+                elif mode == "local_model":
+                    await _probe_endpoint(
+                        "本地模型端点", local["base_url"], local["api_key"]
+                    )
+
+            cfg = replace(
+                self.settings.brain,
+                mode=mode,
+                key_base_url=key["base_url"] or self.settings.brain.key_base_url,
+                key_model=key["model"] or self.settings.brain.key_model,
+            )
+            local_cfg = replace(
+                self.settings.local_model,
+                base_url=local["base_url"] or self.settings.local_model.base_url,
+                model=local["model"] or self.settings.local_model.model,
+                context=local.get("context", self.settings.local_model.context),
+                lean=local.get("lean", self.settings.local_model.lean),
+            )
+            data = build_config(mode, cfg, local=local_cfg)
+            try:
+                template = AGENT_TEMPLATE_PATH.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise SwitchError(500, "agent 模板读取失败，未做任何写入") from exc
+            agent_text = build_agent(
+                mode,
+                lean=local_cfg.lean if mode == "local_model" else False,
+                template=template,
+                cfg=cfg,
+                local=local_cfg,
+            )
+
+            if mode == "key" and key["api_key"]:
+                try:
+                    write_secret(key["api_key"], KEY_PATH)
+                except OSError as exc:
+                    raise SwitchError(
+                        500, f"provider key 写入失败（{type(exc).__name__}）"
+                    ) from exc
+
+            try:
+                write_overrides(
+                    _merged_overrides(existing, mode, key, local), OVERRIDES_PATH
+                )
+            except OSError as exc:
+                raise SwitchError(
+                    500, f"覆盖层写入失败（{type(exc).__name__}）"
+                ) from exc
+
+            config_home = str(self.settings.opencode.config_home or "").strip()
+            project_dir = str(self.settings.opencode.project_dir or "").strip()
+            agent_root = Path(project_dir) if project_dir else Path(INSTALL_ROOT)
+            try:
+                backed_up = write_generated(
+                    config_path(ensure_isolated_config(config_home)),
+                    render_config(data),
+                )
+                backed_up = (
+                    write_generated(agent_path(agent_root), agent_text) or backed_up
+                )
+            except OSError as exc:
+                raise SwitchError(
+                    500, f"生成 opencode 配置失败（{type(exc).__name__}）"
+                ) from exc
+
+            warnings: list[str] = []
+            if backed_up:
+                warnings.append("旧的 opencode 文件不是生成物，已备份为 .bak 后覆盖")
+            reload_state, reload_warnings = await self._reload_opencode()
+            warnings.extend(reload_warnings)
+
+            try:
+                self.store.clear_opencode_sessions()
+            except Exception as exc:  # noqa: BLE001 - 清缓存失败不该让切换失败
+                log.warning("清空 opencode 会话缓存失败：%s", type(exc).__name__)
+                warnings.append("旧会话缓存清理失败，部分会话可能仍沿用切换前的模型")
+
+            provider = current_provider(self.settings, self.runtime)
+            model_arg = local_cfg.model if provider == "local_model" else ""
+            try:
+                brain = build_brain(self.settings, self.store, provider, model_arg)
+            except ConfigError as exc:
+                raise SwitchError(409, str(exc)) from exc
+            except Exception as exc:  # 构造失败不该用半个新大脑顶上去
+                log.exception("重建 %s brain 失败", provider)
+                raise SwitchError(500, f"重建 {provider} 失败：{exc}") from exc
+            previous = self.service.set_brain(brain)
+            asyncio.create_task(self._close_later(previous))
+            log.info("大脑模式已切换：%s（provider=%s）", mode, provider)
+            return {
+                "mode": mode,
+                "model": str(data.get("model") or ""),
+                "reload": reload_state,
+                "warnings": warnings,
+            }
+
+    async def _reload_opencode(self) -> tuple[str, list[str]]:
+        """让注入的重载通道重启 opencode；任何失败都只降级为 pending。
+
+        警告里只带异常类名：reload 的异常消息可能来自 supervisor 的响应体，
+        不该因为一次重载失败把任何凭据/内部细节带进面板。
+        """
+        reloader = self.opencode_reload
+        if reloader is None:
+            return "pending", ["未接入 opencode 重载通道，需重启 opencode 才会生效"]
+        try:
+            result = await reloader()
+        except Exception as exc:  # noqa: BLE001 - 重载失败不回滚已写入的配置
+            log.warning("opencode 重载失败：%s", type(exc).__name__)
+            return "pending", [
+                f"opencode 重载失败（{type(exc).__name__}），需重启 opencode 才会生效"
+            ]
+        if isinstance(result, dict) and result.get("ok") is False:
+            return "pending", ["opencode 重载未确认成功，需重启 opencode 才会生效"]
+        return "ok", []
 
     async def _close_later(self, brain: Any) -> None:
         await asyncio.sleep(CLOSE_DELAY_SECONDS)
@@ -971,6 +1254,13 @@ def create_app(
             return web.json_response({"error": "请求体必须是 JSON"}, status=400)
         if not isinstance(payload, dict):
             return web.json_response({"error": "请求体必须是对象"}, status=400)
+        if "mode" in payload:
+            # 新协议：{mode, key, local, force}，落盘 + 重生生成物 + 重载。
+            # 老协议仍带 provider，保留原分支，面板以外的调用方不用改。
+            try:
+                return web.json_response(await control.switch_mode(payload))
+            except SwitchError as exc:
+                return web.json_response({"error": exc.reason}, status=exc.status)
         provider = str(payload.get("provider") or "")
         model = str(payload.get("model") or "")
         if normalize_provider(provider) not in ("opencode", "token", "local_model"):

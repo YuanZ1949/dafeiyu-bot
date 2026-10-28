@@ -1113,6 +1113,19 @@ class Store:
     def clear_opencode_session(self, chat_type: ChatType, chat_id: int) -> None:
         self.clear_brain_session("opencode", chat_type, chat_id)
 
+    def clear_opencode_sessions(self) -> int:
+        """清空全部 opencode 会话映射，返回删掉的行数。
+
+        换 provider 档位后旧 session 的模型已经过时（opencode 以会话里选的
+        模型优先于配置默认值），必须整表清掉；只清单个会话会漏掉其余仍在
+        用旧档位的群与私聊。
+        """
+        cur = self._conn.execute(
+            "DELETE FROM brain_sessions WHERE provider = ?", (_SESSION_PROVIDER,)
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     # ---- impressions ----------------------------------------------
     def upsert_impression(
         self,
