@@ -23,10 +23,15 @@ def _current_user() -> str:
 
 
 def harden_token_file(path: Path) -> None:
-    """把 token 文件收紧到当前用户可读写；失败只告警，不能阻断启动。
+    """把 token 文件收紧到当前用户可读写删；失败只告警，不能阻断启动。
 
     Windows 用 icacls 去掉继承；POSIX 用 0o600。测试会 mock 掉真正的系统调用，
     不会修改测试机的 ACL。
+
+    授予里必须带 DELETE（``(R,W,D)``）：加固后的文件还要被 ``os.replace`` 覆盖、
+    被 ``unlink`` 清除，二者都需要文件自身的删除权限；父目录未必授予
+    DELETE_CHILD（例如只继承 ``(M)`` 的目录）。D 只给属主本人，不会让其他用户
+    多读一个字节。
     """
     try:
         if os.name == "nt":
@@ -40,7 +45,7 @@ def harden_token_file(path: Path) -> None:
                 str(path),
                 "/inheritance:r",
                 "/grant:r",
-                f"{user}:(R,W)",
+                f"{user}:(R,W,D)",
             ]
             result = subprocess.run(
                 args,

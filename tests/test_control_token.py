@@ -36,7 +36,10 @@ def test_harden_windows_uses_icacls(monkeypatch, tmp_path) -> None:
     assert str(path) in args
     assert "/inheritance:r" in args
     assert "/grant:r" in args
-    assert "alice:(R,W)" in args
+    assert "alice:(R,W,D)" in args
+    # DELETE 不能省：加固后的文件要靠它完成替换/删除，父目录未必有 DELETE_CHILD。
+    grant = args[args.index("/grant:r") + 1]
+    assert "D" in grant
 
 
 def test_harden_posix_chmods_600(monkeypatch, tmp_path) -> None:

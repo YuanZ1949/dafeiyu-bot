@@ -129,11 +129,9 @@ def test_stale_temp_sweep_swallows_oserror(tmp_path, monkeypatch):
 def test_real_acl_write_replace_delete_without_stub(tmp_path, monkeypatch):
     """不打桩 harden_token_file：真实 icacls 下二次写入与空值删除都必须成功。
 
-    ``harden_token_file`` 只授予 ``(R,W)``，不含 DELETE，所以 ``os.replace``
-    的源端删除与 ``unlink`` 只能靠父目录的 DELETE_CHILD 权限。这条用例就是
-    用来在真机上暴露那个前提是否成立的（``tmp_path`` 在用户目录下，该目录
-    默认授予当前用户完全控制，因此这里覆盖的是“父目录可删子项”的情形）。
-    全部操作限制在 ``tmp_path`` 内。
+    加固授予 ``(R,W,D)``，``os.replace`` 的源端删除与 ``unlink`` 不再依赖父目录
+    的 DELETE_CHILD，所以这条用例与默认 ``data\\secrets`` 路径走的是同一条成功
+    路径，不需要“父目录可删子项”这一前提才能通过。全部操作限制在 ``tmp_path`` 内。
     """
     monkeypatch.setattr(secrets_store, "harden_token_file", real_harden_token_file)
     target = tmp_path / "secrets" / "provider.key"
