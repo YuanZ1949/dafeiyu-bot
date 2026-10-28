@@ -1,12 +1,16 @@
 ﻿# Download and prepare a portable NapCat inside this project.
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts/setup-napcat.ps1
+#   powershell -ExecutionPolicy Bypass -File scripts/setup-napcat.ps1 -DownloadOnly
 #   powershell -ExecutionPolicy Bypass -File scripts/setup-napcat.ps1 -Proxy http://127.0.0.1:10808
 #   powershell -ExecutionPolicy Bypass -File scripts/setup-napcat.ps1 -Force
+# -DownloadOnly only downloads/verifies NapCat and skips the OneBot config, so it
+# works before BOT_QQ is known; run again without it once BOT_QQ is filled in.
 param(
     [string]$Version = "v4.18.41",
     [string]$Proxy = "",
-    [switch]$Force
+    [switch]$Force,
+    [switch]$DownloadOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,8 +22,28 @@ $vendorDir = Join-Path $root "vendor"
 $napcatDir = Join-Path $vendorDir "napcat"
 $zipPath = Join-Path $vendorDir "napcat.zip"
 $napcatBat = Join-Path $napcatDir "napcat.bat"
+$nodeExe = Join-Path $napcatDir "node.exe"
 
-if ((Test-Path $napcatBat) -and -not $Force) {
+# The download stage counts as done only when the launcher and its bundled node
+# both exist and node actually runs: an interrupted extraction must not be
+# mistaken for a complete install, or it would be skipped forever.
+function Test-NapCatRuntime {
+    param([string]$BatPath, [string]$NodePath)
+    if (-not (Test-Path $BatPath)) {
+        return $false
+    }
+    if (-not (Test-Path $NodePath)) {
+        return $false
+    }
+    try {
+        & $NodePath --version 2>$null | Out-Null
+    } catch {
+        return $false
+    }
+    return ($LASTEXITCODE -eq 0)
+}
+
+if ((Test-NapCatRuntime -BatPath $napcatBat -NodePath $nodeExe) -and -not $Force) {
     Write-Host "NapCat already exists: $napcatDir" -ForegroundColor Green
     Write-Host "Use -Force to download it again." -ForegroundColor DarkGray
 } else {
@@ -53,6 +77,12 @@ if ((Test-Path $napcatBat) -and -not $Force) {
     New-Item -ItemType Directory -Force -Path $napcatDir | Out-Null
     Write-Host "Extracting ..." -ForegroundColor Cyan
     Expand-Archive -LiteralPath $zipPath -DestinationPath $napcatDir -Force
+
+    # Probe once after extracting, so a broken download fails loudly instead of
+    # being treated as installed on the next run.
+    if (-not (Test-NapCatRuntime -BatPath $napcatBat -NodePath $nodeExe)) {
+        throw "NapCat was extracted but node.exe cannot run: $nodeExe. Rerun: powershell -ExecutionPolicy Bypass -File scripts\setup-napcat.ps1 -Force"
+    }
 }
 
 # Read only the values needed for the OneBot config; never print tokens.
@@ -67,8 +97,22 @@ if (Test-Path $envPath) {
 }
 
 $botQQ = $envMap["BOT_QQ"]
+
+# Stage 1 only: the download is done, the OneBot config is left for later, when
+# BOT_QQ is known. Missing BOT_QQ is not an error here.
+if ($DownloadOnly) {
+    Write-Host "NapCat is ready: $napcatDir" -ForegroundColor Green
+    if ($botQQ) {
+        Write-Host "OneBot config skipped (-DownloadOnly). Run again without -DownloadOnly to write it." -ForegroundColor DarkGray
+    } else {
+        Write-Host "BOT_QQ is missing in .env: OneBot config skipped." -ForegroundColor Yellow
+        Write-Host "After filling BOT_QQ, run this script again without -DownloadOnly to write the OneBot config." -ForegroundColor Yellow
+    }
+    return
+}
+
 if (-not $botQQ) {
-    throw "BOT_QQ is missing in .env. Fill it before running this script."
+    throw "BOT_QQ is missing in .env. Fill it before running this script (or add -DownloadOnly to install NapCat only)."
 }
 $port = $envMap["NAPCAT_WS_PORT"]
 if (-not $port) {
@@ -82,6 +126,9 @@ if ($null -eq $token) {
 $configDir = Join-Path $napcatDir "napcat\config"
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
+# Stage 2 runs every time, independently of the download idempotency: the file is
+# pure local state, and a config left over from an earlier run (or written before
+# BOT_QQ was filled in) must not win over the current .env values.
 $config = [ordered]@{
     network = [ordered]@{
         httpServers      = @()
