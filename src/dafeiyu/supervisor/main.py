@@ -266,6 +266,10 @@ def build_ops(
         weekly_keep=settings.backup.weekly_keep,
         max_total_gb=settings.backup.max_total_gb,
         audit=audit,
+        # 长期记忆（MEMORY.md、chats/*.md）随备份一起打包；未启用工作区时为 None。
+        workspace_dir=(
+            _repo_path(settings.workspace.dir) if settings.workspace.enabled else None
+        ),
     )
 
     async def ready_check() -> bool:

@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sqlite3
+import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +58,9 @@ class BackupManifest:
     schema_version: int
     integrity_ok: bool
     app_version: str
+    # 旧 manifest 没有这两个键，带默认值保证反序列化兼容。
+    workspace_filename: str = ""
+    workspace_sha256: str = ""
 
 
 def validate_database(path: Path, max_schema_version: int = 1) -> tuple[bool, str]:
@@ -115,9 +119,12 @@ class BackupManager:
         max_total_gb: int = 20,
         audit: AuditLog | None = None,
         clock: Callable[[], datetime] | None = None,
+        workspace_dir: Path | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.backup_dir = Path(backup_dir)
+        # 长期记忆工作区：None 时不产 zip，行为与旧版本完全一致。
+        self.workspace_dir = Path(workspace_dir) if workspace_dir else None
         self.daily_keep = max(0, int(daily_keep))
         self.weekly_keep = max(0, int(weekly_keep))
         self.max_total_bytes = max(1, int(max_total_gb)) * 1024**3
@@ -163,6 +170,11 @@ class BackupManager:
                 target.unlink(missing_ok=True)
                 raise BackupError(f"备份校验失败：{reason_text}")
             schema_version = _schema_version(target)
+            try:
+                workspace_filename, workspace_sha256 = self._backup_workspace(target)
+            except OSError as exc:
+                log.warning("工作区打包失败，本次只备份数据库：%s", exc)
+                workspace_filename, workspace_sha256 = "", ""
             manifest = BackupManifest(
                 id=Path(filename).stem,
                 filename=filename,
@@ -173,6 +185,8 @@ class BackupManager:
                 schema_version=schema_version,
                 integrity_ok=True,
                 app_version=__version__,
+                workspace_filename=workspace_filename,
+                workspace_sha256=workspace_sha256,
             )
             _write_manifest(target.with_suffix(".json"), manifest)
             self._last_success_at = manifest.created_at
@@ -203,6 +217,30 @@ class BackupManager:
         self._last_error = message
         self._last_error_at = self._clock().isoformat(timespec="seconds")
         log.warning("备份失败：%s", message)
+
+    def _backup_workspace(self, db_backup: Path) -> tuple[str, str]:
+        """把工作区打平成 `<db stem>-workspace.zip`；目录缺失或为空则不产文件。"""
+        workspace = self.workspace_dir
+        if workspace is None or not workspace.is_dir():
+            return "", ""
+        files = sorted(
+            path
+            for path in workspace.rglob("*")
+            if path.is_file() and not path.is_relative_to(self.backup_dir)
+        )
+        if not files:
+            return "", ""
+        name = f"{db_backup.stem}-workspace.zip"
+        target = self.backup_dir / name
+        tmp = target.with_name(f".{os.getpid()}-workspace.tmp")
+        try:
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+                for path in files:
+                    zf.write(path, path.relative_to(workspace).as_posix())
+            os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return name, _sha256(target)
 
     def _unique_name(self, name: str) -> str:
         candidate = name
@@ -268,6 +306,8 @@ class BackupManager:
     def _remove(self, manifest: BackupManifest) -> None:
         (self.backup_dir / manifest.filename).unlink(missing_ok=True)
         (self.backup_dir / f"{manifest.id}.json").unlink(missing_ok=True)
+        if manifest.workspace_filename:
+            (self.backup_dir / manifest.workspace_filename).unlink(missing_ok=True)
 
     def status(self) -> dict[str, Any]:
         return {
@@ -328,6 +368,9 @@ def _read_manifest(path: Path) -> BackupManifest | None:
             schema_version=int(raw["schema_version"]),
             integrity_ok=bool(raw["integrity_ok"]),
             app_version=str(raw["app_version"]),
+            # 旧 manifest 无此键，缺省为空串即可。
+            workspace_filename=str(raw.get("workspace_filename") or ""),
+            workspace_sha256=str(raw.get("workspace_sha256") or ""),
         )
     except (KeyError, TypeError, ValueError):
         return None

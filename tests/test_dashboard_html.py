@@ -186,6 +186,31 @@ def test_html_never_renders_a_stored_secret() -> None:
             assert "value=" not in match.group(0)
 
 
+def test_html_polling_intervals_are_throttled() -> None:
+    """面板轮询降频：状态 5s、记忆体检 30s。
+
+    `/api/memory/health` 每次落一次 DB 查询，是最重的一个；2s 状态轮询
+    也把 supervisor 压得太紧。这里钉住这两条间隔，并确保 2s 不再回来。
+    """
+    html = read_html()
+    # 定时器段：从第一个 setInterval 到最后一条，单独截出来断言，避免误匹配
+    # 配置下拉里的数字（如重载间隔选项）。
+    start = html.index("setInterval(refresh,")
+    end = html.index("document.addEventListener(\"visibilitychange\"")
+    timers = html[start:end]
+
+    match = re.search(r"setInterval\(refresh, (\d+)\);", timers)
+    assert match is not None, "状态刷新必须仍是 setInterval(refresh, N)"
+    assert match.group(1) == "5000"
+
+    match = re.search(r"setInterval\(loadMemory, (\d+)\);", timers)
+    assert match is not None, "记忆体检必须仍是 setInterval(loadMemory, N)"
+    assert match.group(1) == "30000"
+
+    # 旧的 2s 状态轮询不能再出现（全文件范围，含可能的注释/旧写法）。
+    assert "setInterval(refresh, 2000)" not in html
+
+
 async def test_dashboard_models_proxy_forwards_query_string(tmp_path: Path) -> None:
     seen: list[tuple[str, str, str]] = []
 

@@ -4,17 +4,18 @@ import asyncio
 import contextlib
 import logging
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .brain.client import BrainError
 from .brain.factory import build_brain, current_provider, local_model_name
 from .brain.lmstudio import ensure_server
 from .brain.opencode import resolve_opencode_bin
 from .brain.opencode_server import OpenCodeServer
-from .brain.runtime_config import server_env
 from .brain.persona import load_persona
+from .brain.runtime_config import server_env
 from .config import ConfigError, Settings, load_settings
 from .control import MemoryActions, start_control_server
 from .gateway.qq import QQAdapter
@@ -31,6 +32,9 @@ from .workers.retention import retention_loop
 from .workers.summary import SummaryScheduler, summary_loop
 
 log = logging.getLogger(__name__)
+
+# WAL 定期落盘周期：与 memory.retention_days 无关，防止 -wal 一直涨。
+CHECKPOINT_INTERVAL_SECONDS = 6 * 3600
 
 
 @dataclass(frozen=True)
@@ -121,6 +125,34 @@ def setup_logging(settings: Settings) -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+async def checkpoint_loop(
+    store: Store,
+    interval: float = CHECKPOINT_INTERVAL_SECONDS,
+    stop: asyncio.Event | None = None,
+) -> None:
+    """每 interval 秒把 WAL 截断一次；启动时不立即执行，stop 置位即退出。"""
+    stop = stop or asyncio.Event()
+    while not stop.is_set():
+        try:
+            # wait_for 正常返回说明 stop 被置位：这一轮不再 checkpoint。
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except TimeoutError:
+            pass
+        try:
+            busy, log_pages, checkpointed = store.checkpoint()
+            if busy:
+                log.warning("WAL checkpoint 被占用（busy=%s），下一轮再试", busy)
+            else:
+                log.debug(
+                    "WAL checkpoint 完成（log=%s, checkpointed=%s）",
+                    log_pages,
+                    checkpointed,
+                )
+        except Exception:
+            log.exception("WAL checkpoint 失败")
+
+
 async def main() -> None:
     settings = load_settings()
     setup_logging(settings)
@@ -147,6 +179,7 @@ async def main() -> None:
     service_started = False
     summary_task: asyncio.Task | None = None
     retention_task: asyncio.Task | None = None
+    checkpoint_task: asyncio.Task | None = None
 
     try:
         runtime = load_runtime()
@@ -235,6 +268,8 @@ async def main() -> None:
             if settings.memory.retention_days > 0
             else None
         )
+        # WAL 落盘与 retention 无关：即使永久保留消息，-wal 也要定期截断。
+        checkpoint_task = asyncio.create_task(checkpoint_loop(store))
 
         await service.start()
         service_started = True
@@ -266,6 +301,10 @@ async def main() -> None:
             retention_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await retention_task
+        if checkpoint_task is not None:
+            checkpoint_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await checkpoint_task
         if control_runner is not None:
             await control_runner.cleanup()
         if service_started and service is not None:

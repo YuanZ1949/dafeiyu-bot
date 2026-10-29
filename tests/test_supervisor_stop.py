@@ -94,7 +94,9 @@ async def test_stop_reports_not_running_and_cleans_stale_pid(tmp_path):
     path = tmp_path / "supervisor.pid"
     path.write_text("999999", encoding="utf-8")
 
-    result = await stop_mod.stop_supervisor(port=8787, pid_path=path)
+    result = await stop_mod.stop_supervisor(
+        port=8787, pid_path=path, port_finder=lambda port: None
+    )
 
     assert result.status == "not_running"
     assert result.stale is True
@@ -114,6 +116,114 @@ def _wait_dead(proc: subprocess.Popen, timeout: float = 10.0) -> None:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=timeout)
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    """测试收尾：只清理本用例自己起的进程。"""
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=10)
+
+
+async def test_stop_falls_back_to_port_owner_when_pid_file_missing(tmp_path):
+    """pid 文件丢了但 supervisor 还占着端口：按端口找回来并正常停掉。"""
+    proc = _spawn_sleeper()
+    path = tmp_path / "supervisor.pid"
+    calls = {"shutdown": 0}
+
+    async def fake_shutdown(host, port, *, username, password):
+        calls["shutdown"] += 1
+        proc.terminate()
+        return True
+
+    try:
+        result = await stop_mod.stop_supervisor(
+            port=8787,
+            pid_path=path,
+            shutdown_fn=fake_shutdown,
+            port_finder=lambda port: proc.pid,
+            cmdline_fn=lambda pid: f"{sys.executable} -m dafeiyu.supervisor",
+        )
+    finally:
+        _wait_dead(proc)
+
+    assert result.status == "stopped"
+    assert result.method == "shutdown"
+    assert result.pid == proc.pid
+    assert result.stale is True
+    assert calls["shutdown"] == 1
+    assert not path.exists()
+
+
+async def test_stop_fallback_ignores_non_supervisor_port_owner(tmp_path):
+    """端口被无关进程占着时不能误杀。"""
+    proc = _spawn_sleeper()
+    path = tmp_path / "supervisor.pid"
+    calls = {"shutdown": 0}
+
+    async def fake_shutdown(host, port, *, username, password):
+        calls["shutdown"] += 1
+        return True
+
+    try:
+        result = await stop_mod.stop_supervisor(
+            port=8787,
+            pid_path=path,
+            shutdown_fn=fake_shutdown,
+            port_finder=lambda port: proc.pid,
+            cmdline_fn=lambda pid: r"C:\Windows\system32\notepad.exe",
+        )
+        assert proc.poll() is None
+    finally:
+        _reap(proc)
+
+    assert result.status == "not_running"
+    assert result.stale is False
+    assert calls["shutdown"] == 0
+    assert not path.exists()
+
+
+async def test_stop_fallback_never_targets_self(tmp_path):
+    path = tmp_path / "supervisor.pid"
+
+    result = await stop_mod.stop_supervisor(
+        port=8787,
+        pid_path=path,
+        port_finder=lambda port: os.getpid(),
+        cmdline_fn=lambda pid: "python -m dafeiyu.supervisor",
+    )
+
+    assert result.status == "not_running"
+    assert result.pid is None
+
+
+async def test_stop_dead_pid_does_not_kill_unrelated_port_owner(tmp_path):
+    """pid 文件存在但进程已死：旧行为保留，端口上的无关进程不受影响。"""
+    proc = _spawn_sleeper()
+    path = tmp_path / "supervisor.pid"
+    path.write_text("999999", encoding="utf-8")
+    calls = {"shutdown": 0}
+
+    async def fake_shutdown(host, port, *, username, password):
+        calls["shutdown"] += 1
+        return True
+
+    try:
+        result = await stop_mod.stop_supervisor(
+            port=8787,
+            pid_path=path,
+            shutdown_fn=fake_shutdown,
+            port_finder=lambda port: proc.pid,
+            cmdline_fn=lambda pid: r"C:\Windows\system32\notepad.exe",
+        )
+        assert proc.poll() is None
+    finally:
+        _reap(proc)
+
+    assert result.status == "not_running"
+    assert result.stale is True
+    assert calls["shutdown"] == 0
+    assert not path.exists()
 
 
 async def test_stop_prefers_graceful_shutdown(tmp_path):

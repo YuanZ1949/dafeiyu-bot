@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -199,6 +200,146 @@ def test_validate_rejects_newer_schema(tmp_path: Path) -> None:
     ok, reason = validate_database(db)
     assert ok is False
     assert "版本" in reason
+
+
+# ---- workspace（长期记忆） --------------------------------------------------
+
+
+def make_workspace(root: Path) -> Path:
+    workspace = root / "bot-workspace"
+    (workspace / "chats").mkdir(parents=True)
+    (workspace / "MEMORY.md").write_text("- 记住：群规\n", encoding="utf-8", newline="\n")
+    (workspace / "chats" / "a.md").write_text("群事\n", encoding="utf-8", newline="\n")
+    return workspace
+
+
+async def test_backup_includes_workspace_zip(tmp_path: Path) -> None:
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    workspace = make_workspace(tmp_path)
+    manager = BackupManager(
+        db, tmp_path / "backups", workspace_dir=workspace, clock=FakeClock()
+    )
+
+    manifest = await manager.create()
+
+    assert manifest.workspace_filename == f"{Path(manifest.filename).stem}-workspace.zip"
+    zip_path = tmp_path / "backups" / manifest.workspace_filename
+    assert zip_path.exists()
+    assert manifest.workspace_sha256 == hashlib.sha256(zip_path.read_bytes()).hexdigest()
+    with zipfile.ZipFile(zip_path) as zf:
+        names = set(zf.namelist())
+        assert "MEMORY.md" in names
+        assert "chats/a.md" in names
+        assert zf.read("chats/a.md").decode("utf-8") == "群事\n"
+
+
+async def test_backup_without_workspace_dir_skips_zip(tmp_path: Path) -> None:
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    manager = BackupManager(
+        db, tmp_path / "backups", workspace_dir=tmp_path / "missing", clock=FakeClock()
+    )
+
+    manifest = await manager.create()
+
+    assert manifest.workspace_filename == ""
+    assert manifest.workspace_sha256 == ""
+    assert not list((tmp_path / "backups").glob("*workspace*.zip"))
+    assert manifest.sha256 == hashlib.sha256(
+        (tmp_path / "backups" / manifest.filename).read_bytes()
+    ).hexdigest()
+
+
+async def test_backup_succeeds_when_workspace_packaging_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    workspace = make_workspace(tmp_path)
+    manager = BackupManager(
+        db, tmp_path / "backups", workspace_dir=workspace, clock=FakeClock()
+    )
+
+    def fail_workspace(db_backup: Path) -> tuple[str, str]:
+        raise OSError("boom")
+
+    monkeypatch.setattr(manager, "_backup_workspace", fail_workspace)
+
+    manifest = await manager.create()
+
+    assert manifest.workspace_filename == ""
+    assert manifest.workspace_sha256 == ""
+    db_path = tmp_path / "backups" / manifest.filename
+    manifest_path = db_path.with_suffix(".json")
+    assert db_path.exists()
+    assert manifest_path.exists()
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["id"] == manifest.id
+    assert [item.id for item in manager.list()] == [manifest.id]
+
+
+async def test_delete_removes_workspace_zip(tmp_path: Path) -> None:
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    workspace = make_workspace(tmp_path)
+    manager = BackupManager(
+        db, tmp_path / "backups", workspace_dir=workspace, clock=FakeClock()
+    )
+    manifest = await manager.create()
+    zip_path = tmp_path / "backups" / manifest.workspace_filename
+    assert zip_path.exists()
+
+    manager.delete(manifest.id)
+
+    assert not zip_path.exists()
+    assert manager.list() == []
+
+
+async def test_prune_removes_workspace_zip(tmp_path: Path) -> None:
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    workspace = make_workspace(tmp_path)
+    clock = FakeClock()
+    manager = BackupManager(
+        db,
+        tmp_path / "backups",
+        daily_keep=1,
+        weekly_keep=0,
+        workspace_dir=workspace,
+        clock=clock,
+    )
+
+    for _ in range(3):
+        await manager.create("scheduled")
+        clock.advance(1)
+
+    zips = list((tmp_path / "backups").glob("*workspace.zip"))
+    assert len(zips) == 1
+    assert len(manager.list()) == 1
+
+
+def test_read_manifest_tolerates_missing_workspace_fields(tmp_path: Path) -> None:
+    from dafeiyu.supervisor.backup import _read_manifest
+
+    raw = {
+        "id": "dafeiyu-20261026-040000-manual",
+        "filename": "dafeiyu-20261026-040000-manual.db",
+        "created_at": "2026-10-26T04:00:00+08:00",
+        "reason": "manual",
+        "size_bytes": 1,
+        "sha256": "0" * 64,
+        "schema_version": 1,
+        "integrity_ok": True,
+        "app_version": "0.0.0",
+    }
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    manifest = _read_manifest(path)
+
+    assert manifest is not None
+    assert manifest.workspace_filename == ""
+    assert manifest.workspace_sha256 == ""
 
 
 # ---- restore ---------------------------------------------------------------

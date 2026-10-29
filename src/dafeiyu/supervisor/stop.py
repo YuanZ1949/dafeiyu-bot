@@ -21,6 +21,7 @@ import aiohttp
 from ..config import load_settings
 from .auth import COOKIE_NAME
 from .lan_access import ensure_dashboard_password
+from .manager import port_owner
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PID_PATH = REPO_ROOT / "data" / "supervisor.pid"
@@ -116,6 +117,62 @@ async def request_shutdown(
 
 
 ShutdownFn = Callable[..., Awaitable[bool]]
+PortFinder = Callable[[int], int | None]
+CmdlineFn = Callable[[int], str | None]
+
+
+def _process_command_line(pid: int) -> str | None:
+    """查询进程命令行；非 Windows 或查询失败时返回 None（按不匹配处理）。"""
+    if os.name != "nt":
+        return None
+    command = (
+        f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}").CommandLine'
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    text = (proc.stdout or "").strip()
+    return text or None
+
+
+def _looks_like_supervisor(command_line: str) -> bool:
+    lowered = command_line.lower()
+    return "dafeiyu" in lowered and "supervisor" in lowered
+
+
+def _supervisor_pid_on_port(
+    port: int,
+    port_finder: PortFinder,
+    cmdline_fn: CmdlineFn,
+) -> int | None:
+    """端口占用者确认是 supervisor 时返回其 pid；否则 None（绝不误杀）。"""
+    try:
+        owner = port_finder(port)
+    except Exception:  # noqa: BLE001 - 查不到就当没有
+        return None
+    if owner is None or owner <= 0:
+        return None
+    if owner == os.getpid():
+        return None
+    if not pid_alive(owner):
+        return None
+    try:
+        command_line = cmdline_fn(owner)
+    except Exception:  # noqa: BLE001 - 查不到就当没有
+        return None
+    if not command_line or not _looks_like_supervisor(command_line):
+        return None
+    return owner
 
 
 async def stop_supervisor(
@@ -129,13 +186,23 @@ async def stop_supervisor(
     force: bool = True,
     shutdown_fn: ShutdownFn = request_shutdown,
     poll_seconds: float = 0.25,
+    port_finder: PortFinder = port_owner,
+    cmdline_fn: CmdlineFn = _process_command_line,
 ) -> StopResult:
     pid = read_pid(pid_path)
-    if pid is None:
-        return StopResult(status="not_running")
-    if not pid_alive(pid):
-        _unlink(pid_path)
-        return StopResult(status="not_running", pid=pid, stale=True)
+    stale = False
+    if pid is None or not pid_alive(pid):
+        recorded_pid = pid
+        if pid is not None:
+            # pid 文件里的进程已经死了：保持原来的清理行为。
+            _unlink(pid_path)
+            stale = True
+        # pid 文件丢了/损坏/过期时，按端口兜底找回仍活着的 supervisor。
+        fallback = _supervisor_pid_on_port(port, port_finder, cmdline_fn)
+        if fallback is None:
+            return StopResult(status="not_running", pid=recorded_pid, stale=stale)
+        pid = fallback
+        stale = True
 
     method: str | None = None
     graceful = await shutdown_fn(
@@ -149,9 +216,9 @@ async def stop_supervisor(
             method = "forced"
 
     if method is None:
-        return StopResult(status="failed", pid=pid)
+        return StopResult(status="failed", pid=pid, stale=stale)
     _unlink(pid_path)
-    return StopResult(status="stopped", pid=pid, method=method)
+    return StopResult(status="stopped", pid=pid, method=method, stale=stale)
 
 
 async def _wait_dead(pid: int, timeout: float, poll_seconds: float) -> bool:

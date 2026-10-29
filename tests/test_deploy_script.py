@@ -20,16 +20,47 @@ POWERSHELL = ("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="部署脚本只在 Windows + PowerShell 下可用")
 
 
-def _run(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
+def _run(
+    args: list[str],
+    timeout: int = 120,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [*POWERSHELL, *args],
         cwd=ROOT,
+        check=False,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        env=env,
     )
+
+
+def _isolated_env(tmp_path: Path) -> dict[str, str]:
+    """把 TEMP/TMP 指向 pytest 的 tmp_path。
+
+    deploy.ps1 用 ``$env:TEMP\\opencode\\deploy-<时间戳>`` 做回滚备份；不隔离的话
+    每跑一次测试就往真实的 %TEMP%\\opencode 里堆一个目录，永远不会被清理。
+    """
+    temp_root = tmp_path / "temp"
+    temp_root.mkdir(exist_ok=True)
+    env = dict(os.environ)
+    env["TEMP"] = str(temp_root)
+    env["TMP"] = str(temp_root)
+    return env
+
+
+def _make_release_target(tmp_path: Path) -> Path:
+    """造一个最小可部署的 release 目录（不是真的能拉起服务的 venv）。"""
+    target = tmp_path / "release"
+    (target / "src" / "dafeiyu").mkdir(parents=True)
+    (target / "scripts").mkdir()
+    (target / "scripts" / "start-all.ps1").write_text("# stub\n", encoding="utf-8-sig")
+    (target / ".venv" / "Scripts").mkdir(parents=True)
+    (target / ".venv" / "Scripts" / "python.exe").write_bytes(b"")
+    return target
 
 
 def test_deploy_script_parses() -> None:
@@ -46,7 +77,10 @@ def test_deploy_plan_lists_payload_without_touching_target(tmp_path: Path) -> No
     target = tmp_path / "release"
     target.mkdir()
 
-    result = _run(["-File", str(SCRIPT), "-Target", str(target), "-Plan"])
+    result = _run(
+        ["-File", str(SCRIPT), "-Target", str(target), "-Plan"],
+        env=_isolated_env(tmp_path),
+    )
 
     assert result.returncode == 0, result.stdout + result.stderr
     payload = [
@@ -65,17 +99,15 @@ def test_deploy_plan_lists_payload_without_touching_target(tmp_path: Path) -> No
 
 
 def test_deploy_no_restart_copies_payload_and_keeps_secrets(tmp_path: Path) -> None:
-    target = tmp_path / "release"
-    (target / "src" / "dafeiyu").mkdir(parents=True)
-    (target / "scripts").mkdir()
-    (target / "scripts" / "start-all.ps1").write_text("# stub\n", encoding="utf-8-sig")
-    (target / ".venv" / "Scripts").mkdir(parents=True)
-    (target / ".venv" / "Scripts" / "python.exe").write_bytes(b"")
+    target = _make_release_target(tmp_path)
     (target / "config.yaml").write_text("sentinel-config", encoding="utf-8")
     (target / "data").mkdir()
     (target / "data" / "keep.txt").write_text("keep", encoding="utf-8")
 
-    result = _run(["-File", str(SCRIPT), "-Target", str(target), "-NoRestart"])
+    result = _run(
+        ["-File", str(SCRIPT), "-Target", str(target), "-NoRestart"],
+        env=_isolated_env(tmp_path),
+    )
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert (target / "src" / "dafeiyu" / "control.py").exists()
@@ -104,3 +136,48 @@ def test_deploy_restart_path_clears_pythonpath_and_requires_new_pid() -> None:
     assert "仍在运行" in text
     assert "Wait-ForNewSupervisorPid $oldPid" in text
     assert "supervisor 没有被重启" in text
+
+
+def _deploy_dirs(root: Path) -> set[str]:
+    """列出某个目录下 deploy-* 子目录的名字；目录不存在时视为空。"""
+    if not root.is_dir():
+        return set()
+    return {item.name for item in root.glob("deploy-*") if item.is_dir()}
+
+
+def test_deploy_no_restart_backup_stays_under_fake_temp(tmp_path: Path) -> None:
+    """跑一次真实部署（-NoRestart），备份目录只能落在伪造的 TEMP 下。
+
+    真实 %TEMP%\\opencode 里已经堆了历史目录，不能断言它不存在，只能做前后
+    快照对比：本次运行不得新增任何 deploy-*。
+    """
+    target = _make_release_target(tmp_path)
+    env = _isolated_env(tmp_path)
+
+    real_temp = Path(os.environ.get("TEMP") or os.environ.get("TMP") or "")
+    assert str(real_temp) and real_temp.is_dir(), "拿不到真实 TEMP，无法做前后快照"
+    real_opencode = real_temp / "opencode"
+    before = _deploy_dirs(real_opencode)
+
+    result = _run(["-File", str(SCRIPT), "-Target", str(target), "-NoRestart"], env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    fake_dirs = _deploy_dirs(tmp_path / "temp" / "opencode")
+    assert len(fake_dirs) == 1, f"伪造 TEMP 下应有 1 个 deploy-*，实际：{fake_dirs}"
+    after = _deploy_dirs(real_opencode)
+    assert after - before == set(), f"真实 TEMP\\opencode 新增了备份目录：{after - before}"
+
+
+def test_deploy_health_probe_uses_token_and_checks_gateway() -> None:
+    """健康检查必须探 /api/health/detail：只看 HTTP 200 会把「没连上 QQ」判成成功。"""
+    text = SCRIPT.read_text(encoding="utf-8-sig")
+
+    assert "/api/health/detail" in text
+    assert "supervisor.token" in text
+    assert "X-Control-Token" in text
+    assert "gateway.connected" in text
+    # token 文件带尾随空白，读出来必须 Trim 再放进请求头。
+    assert ".Trim()" in text
+    # 失败原因要能说清是连不上、401，还是网关没连上。
+    assert "401" in text
+    assert "连接失败" in text

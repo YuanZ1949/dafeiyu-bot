@@ -235,7 +235,9 @@ try {
         }
         Write-Host "supervisor 已重启：pid $oldPid -> $newPid" -ForegroundColor Green
 
-        # ---- 5. 健康检查：bot 控制口的 /api/health 免鉴权，直接探 ----
+        # ---- 5. 健康检查：探 /api/health/detail，必须确认 QQ 网关真的连上了 ----
+        # /api/health 只回 {"ok": true}，bot 没连上 QQ 也照样 200，不能拿它当部署成功。
+        # /api/health/detail 需要控制口令，口令从目标目录的 data\supervisor.token 读。
         $env:PYTHONPATH = Join-Path $Target "src"
         $controlPort = 8788
         $printed = ""
@@ -251,26 +253,59 @@ try {
         if ($printed) {
             $controlPort = [int](($printed | Select-Object -Last 1).Trim())
         }
-        $healthUrl = "http://127.0.0.1:$controlPort/api/health"
+        $healthUrl = "http://127.0.0.1:$controlPort/api/health/detail"
+        # 口令文件由 supervisor 生成；文件可能带尾随换行/空白，必须 Trim 后再放进头里。
+        $tokenPath = Join-Path $Target "data\supervisor.token"
+        if (-not (Test-Path -LiteralPath $tokenPath)) {
+            throw "缺少 data/supervisor.token，无法探 health/detail（$tokenPath）"
+        }
+        try {
+            $controlToken = (Get-Content -LiteralPath $tokenPath -Raw).Trim()
+        } catch {
+            throw "读取 data/supervisor.token 失败：$($_.Exception.Message)"
+        }
+        if (-not $controlToken) {
+            throw "data/supervisor.token 为空，无法探 health/detail（$tokenPath）"
+        }
         $deadline = (Get-Date).AddSeconds($HealthTimeoutSeconds)
         $healthy = $false
-        $lastError = ""
+        $lastError = "尚未开始探测"
         while ((Get-Date) -lt $deadline) {
             try {
-                $resp = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 2
-                if ($resp.StatusCode -eq 200) {
-                    $healthy = $true
-                    break
+                $resp = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 2 `
+                    -Headers @{ "X-Control-Token" = $controlToken }
+                if ($resp.StatusCode -ne 200) {
+                    $lastError = "HTTP $($resp.StatusCode)"
+                } else {
+                    # 只看 gateway.connected 是否真的是 true；字段缺失或解析失败都算未通过。
+                    $connected = $false
+                    try {
+                        $detail = $resp.Content | ConvertFrom-Json
+                        $connected = [bool]$detail.gateway.connected
+                    } catch {
+                        $connected = $false
+                    }
+                    if ($connected) {
+                        $healthy = $true
+                        break
+                    }
+                    $lastError = "gateway 未连接（health/detail 的 gateway.connected 不是 true）"
                 }
             } catch {
-                $lastError = $_.Exception.Message
-                Start-Sleep -Milliseconds 500
+                $statusCode = 0
+                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = 0 }
+                if ($statusCode -eq 401) {
+                    $lastError = "401 未授权（data/supervisor.token 与控制口口令不一致）"
+                } else {
+                    $lastError = "连接失败：$($_.Exception.Message)"
+                }
             }
+            Start-Sleep -Seconds 1
         }
         if (-not $healthy) {
-            throw "健康检查未通过：$healthUrl（$lastError）"
+            throw "健康检查未通过：$healthUrl（最后一次原因：$lastError）"
         }
-        Write-Host "健康检查通过：$healthUrl" -ForegroundColor Green
+        Write-Host "健康检查通过：$healthUrl（QQ 网关已连接）" -ForegroundColor Green
     } else {
         Write-Host "（已传 -NoRestart，未重启服务）" -ForegroundColor DarkGray
     }

@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE (chat_type, chat_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages (chat_type, chat_id, id);
+-- 摘要/体检/清理按时间窗扫全表：(会话, 时间) 走覆盖范围，单列时间给跨会话统计。
+CREATE INDEX IF NOT EXISTS idx_messages_chat_ts
+    ON messages (chat_type, chat_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages (timestamp);
 
 CREATE TABLE IF NOT EXISTS impressions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -425,6 +429,24 @@ class Store:
 
     def close(self) -> None:
         self._conn.close()
+
+    def checkpoint(self) -> tuple[int, int, int]:
+        """执行一次 WAL TRUNCATE 检查点，返回 (busy, log, checkpointed)。
+
+        非 WAL 库（含 ``:memory:``）上 SQLite 返回 (0, -1, -1)：统一归一成
+        (0, 0, 0)，调用方不必区分。任何 sqlite3.Error 也不外抛 —— 定时任务
+        不能因为一次锁冲突就退出。
+        """
+        try:
+            row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.Error:
+            return (0, 0, 0)
+        if row is None:
+            return (0, 0, 0)
+        busy, log_pages, checkpointed = int(row[0]), int(row[1]), int(row[2])
+        if busy < 0 or log_pages < 0 or checkpointed < 0:
+            return (0, 0, 0)
+        return (busy, log_pages, checkpointed)
 
     def backup_to(self, path: str | Path) -> None:
         """用 SQLite backup API 写一致性快照（WAL 中已提交的内容也会带上）。"""
