@@ -23,6 +23,11 @@ brain:
   provider: opencode
   # free=opencode 免费模型，无需任何 key
   mode: free
+  # 自备 Key 档（model 留空 = 切档时按端点清单自动选 flash；
+  # 填了但已不在清单里，比如官方换掉 deepseek-chat，也会自动换）：
+  # key:
+  #   base_url: https://api.deepseek.com
+  #   model: ""
 
 gateway:
   # 只支持 qq；wechat 会在启动期直接报 ConfigError（协议未实现，不假装能跑）。

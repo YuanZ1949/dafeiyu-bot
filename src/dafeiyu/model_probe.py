@@ -10,13 +10,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import httpx
 
 from .brain import provider_config
-from .netssl import default_ssl_context
 from .brain.opencode_http import DENY_ALL_PERMISSIONS, _error_status
+from .netssl import default_ssl_context
 
 # 与两条配置生成路径共用同一个函数对象：端点规整规则只允许有一处定义。
 normalize_base_url = provider_config.normalize_base_url
@@ -24,6 +25,10 @@ normalize_base_url = provider_config.normalize_base_url
 FREE_MODEL = provider_config.FREE_MODEL
 
 log = logging.getLogger(__name__)
+
+# 自备 Key 档的默认模型。官方会换版本号（deepseek-chat 已不在清单里），
+# 所以只把这个名字当「首选」，真正落盘前还会按端点清单核对一次。
+FLASH_MODEL = "deepseek-flash"
 
 # 面板按 p90 上下文窗口给模型分档：低于 0.75 倍偏红，高于 1.5 倍算绿。
 # 静态页里另有一份同名常量（index.html 不能 import Python），测试会钉住两边一致。
@@ -267,6 +272,22 @@ async def probe_models(
         if model_id:
             ids.append(str(model_id))
     return ids
+
+
+def pick_flash_model(ids: Sequence[str]) -> str | None:
+    """从端点返回的模型 id 里挑 flash：先认精确 id，再认任意含 flash 的。
+
+    纯函数、不看网络：清单拉取与失败兜底都由调用方负责，这样切档流程可以
+    「拉不到清单就保持原值」而不用把异常语义混进来。
+    """
+    cleaned = [str(item).strip() for item in ids if str(item).strip()]
+    for model_id in cleaned:
+        if model_id.casefold() == FLASH_MODEL:
+            return model_id
+    for model_id in cleaned:
+        if "flash" in model_id.casefold():
+            return model_id
+    return None
 
 
 def context_grade(context: int, *, p90: int = CONTEXT_P90) -> str:

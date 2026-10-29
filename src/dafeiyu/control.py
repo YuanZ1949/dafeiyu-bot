@@ -42,6 +42,7 @@ from .model_probe import (
     FREE_PROBE_TTL,
     ProbeError,
     normalize_base_url,
+    pick_flash_model,
     probe_free_model,
     probe_models,
 )
@@ -269,8 +270,8 @@ def _brain_mode_payload(
     if mode == "key":
         if not key["base_url"]:
             raise SwitchError(400, "自备 Key 模式需要填写 base_url")
-        if not key["model"]:
-            raise SwitchError(400, "自备 Key 模式需要填写 model")
+        # model 允许留空：留空意为「按端点清单自动选 flash」，由 switch_mode
+        # 在落盘前解析。本地模型档没有等价约定，仍然必填。
     elif mode == "local_model":
         if not local["base_url"]:
             raise SwitchError(400, "本地模型模式需要填写 base_url")
@@ -306,6 +307,36 @@ def _merged_overrides(
         brain["local_model"] = section
     overrides["brain"] = brain
     return overrides
+
+
+def _with_key_model(overrides: dict[str, Any], model: str) -> dict[str, Any]:
+    """返回把 `brain.key.model` 换成给定值的覆盖层副本（不就地改入参）。"""
+    out = dict(overrides)
+    brain_raw = out.get("brain")
+    brain = dict(brain_raw) if isinstance(brain_raw, dict) else {}
+    section_raw = brain.get("key")
+    section = dict(section_raw) if isinstance(section_raw, dict) else {}
+    section["model"] = model
+    brain["key"] = section
+    out["brain"] = brain
+    return out
+
+
+async def _probe_model_ids(base_url: str, api_key: str) -> list[str]:
+    """拉一次端点模型清单；任何失败都返回空列表。
+
+    自动对齐是「尽力而为」：端点临时不可达、返回体不合规都不该让切档失败，
+    所以这里吞掉异常（只留 debug 日志），调用方按空列表处理。
+    """
+    if not base_url:
+        return []
+    try:
+        return await probe_models(
+            base_url, api_key=api_key, timeout=MODEL_PROBE_TIMEOUT
+        )
+    except Exception:  # 对齐失败不得挡住保存
+        log.debug("模型清单拉取失败，跳过 key 模型自动对齐", exc_info=True)
+        return []
 
 
 def _merged_section(overrides: dict[str, Any], name: str) -> dict[str, Any]:
@@ -959,6 +990,41 @@ class BrainControl:
             # 生成基线是「刚持久化的覆盖层」，不是启动快照：面板省略
             # context/lean 时，覆盖层里上一轮的值仍然有效，生成物必须跟它一致。
             merged = _merged_overrides(existing, mode, key, local)
+
+            # key 档的模型名会过期（官方换版本号，旧名从清单里消失），落盘前
+            # 按端点清单对齐一次：清单里有就原样保留，没有就退到 flash。
+            # 清单拉不到只跳过对齐——判定失败绝不能让保存跟着失败。
+            model_warning = ""
+            if mode == "key":
+                section = _merged_section(merged, "key")
+                probe_base = str(
+                    section.get("base_url") or self.settings.brain.key_base_url
+                )
+                current_model = str(
+                    section.get("model") or self.settings.brain.key_model
+                )
+                ids = await _probe_model_ids(
+                    probe_base, key["api_key"] or read_secret(KEY_PATH)
+                )
+                if not current_model:
+                    # 留空 = 让端点清单决定用哪个 flash。选不出来就明确报错，
+                    # 绝不落盘 `dafeiyu-key/` 这种跑不起来的配置。
+                    chosen = pick_flash_model(ids)
+                    if not chosen:
+                        raise SwitchError(
+                            502, "端点清单里找不到 flash 模型，请手动填写 model"
+                        )
+                    merged = _with_key_model(merged, chosen)
+                    model_warning = f"未指定模型，已按端点清单选择 {chosen}"
+                elif ids and current_model not in ids:
+                    chosen = pick_flash_model(ids)
+                    if chosen:
+                        merged = _with_key_model(merged, chosen)
+                        model_warning = (
+                            f"模型 {current_model} 不在端点清单内，"
+                            f"已自动切换为 {chosen}"
+                        )
+
             key_section = _merged_section(merged, "key")
             local_section = _merged_section(merged, "local_model")
             cfg = replace(
@@ -1062,6 +1128,8 @@ class BrainControl:
                 ) from exc
 
             warnings: list[str] = []
+            if model_warning:
+                warnings.append(model_warning)
             if backed_up:
                 warnings.append("旧的 opencode 文件不是生成物，已备份为 .bak 后覆盖")
             reload_state, reload_warnings = await self._reload_opencode()
