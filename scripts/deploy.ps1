@@ -120,13 +120,51 @@ function Get-Sha256([string]$Path) {
     }
 }
 
+function Clear-DeployPythonPath {
+    # 本脚本为了读发布清单把 PYTHONPATH 指向了源目录；子进程会继承它，
+    # 导致 release 的 stop/start 实际加载源目录的 dafeiyu（pid 文件也会找错地方）。
+    Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+}
+
 function Invoke-TargetStop {
+    Clear-DeployPythonPath
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $targetScripts "stop.ps1") | Out-Host
+    return ($LASTEXITCODE -eq 0)
 }
 
 function Invoke-TargetStart {
+    Clear-DeployPythonPath
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $targetScripts "start-all.ps1") -NoBrowser -WaitSeconds 120 | Out-Host
     return ($LASTEXITCODE -eq 0)
+}
+
+function Get-SupervisorPid {
+    $pidFile = Join-Path $Target "data\supervisor.pid"
+    if (-not (Test-Path -LiteralPath $pidFile)) { return 0 }
+    $raw = ""
+    try { $raw = (Get-Content -LiteralPath $pidFile -Raw).Trim() } catch { return 0 }
+    $value = 0
+    if ([int]::TryParse($raw, [ref]$value)) { return $value }
+    return 0
+}
+
+function Test-PidAlive([int]$ProcessId) {
+    if ($ProcessId -le 0) { return $false }
+    return [bool](Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+}
+
+function Wait-ForNewSupervisorPid([int]$OldPid, [int]$TimeoutSeconds = 30) {
+    # 只认「pid 变了且活着」：start-all 遇到旧进程还在会直接跳过启动，
+    # 那样健康检查照样通过，但跑的还是旧代码——部署等于没做。
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $current = Get-SupervisorPid
+        if ($current -gt 0 -and $current -ne $OldPid -and (Test-PidAlive $current)) {
+            return $current
+        }
+        Start-Sleep -Milliseconds 300
+    }
+    return 0
 }
 
 function Restore-Backup {
@@ -150,10 +188,16 @@ function Restore-Backup {
 
 $stopped = $false
 $copied = $false
+$oldPid = Get-SupervisorPid
 try {
     if (-not $NoRestart) {
         Write-Host "停止 release 当前进程..." -ForegroundColor Cyan
-        Invoke-TargetStop
+        if (-not (Invoke-TargetStop)) {
+            throw "stop.ps1 返回失败"
+        }
+        if ($oldPid -gt 0 -and (Test-PidAlive $oldPid)) {
+            throw "停止失败：supervisor（pid $oldPid）仍在运行，继续部署只会覆盖文件而不会生效"
+        }
         $stopped = $true
     }
 
@@ -185,6 +229,11 @@ try {
         if (-not (Invoke-TargetStart)) {
             throw "start-all.ps1 未在 120 秒内拉起面板"
         }
+        $newPid = Wait-ForNewSupervisorPid $oldPid 30
+        if ($newPid -le 0) {
+            throw "supervisor 没有被重启（旧 pid $oldPid 仍在用），本次部署不会生效"
+        }
+        Write-Host "supervisor 已重启：pid $oldPid -> $newPid" -ForegroundColor Green
 
         # ---- 5. 健康检查：bot 控制口的 /api/health 免鉴权，直接探 ----
         $env:PYTHONPATH = Join-Path $Target "src"
@@ -197,6 +246,7 @@ try {
             $printed = ""
         } finally {
             Pop-Location
+            Clear-DeployPythonPath
         }
         if ($printed) {
             $controlPort = [int](($printed | Select-Object -Last 1).Trim())

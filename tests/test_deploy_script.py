@@ -84,3 +84,23 @@ def test_deploy_no_restart_copies_payload_and_keeps_secrets(tmp_path: Path) -> N
     assert (target / "config.yaml").read_text(encoding="utf-8") == "sentinel-config"
     assert (target / "data" / "keep.txt").read_text(encoding="utf-8") == "keep"
     assert "SHA256 校验通过" in result.stdout
+
+
+def test_deploy_restart_path_clears_pythonpath_and_requires_new_pid() -> None:
+    """读发布清单时 PYTHONPATH 指向源目录，子进程继承后会加载错的 dafeiyu。
+
+    症状：stop.ps1 找的是源目录的 pid 文件，报「未在运行」；start-all 发现
+    旧进程还在就跳过启动，健康检查照样通过，但跑的还是旧代码。
+    """
+    text = SCRIPT.read_text(encoding="utf-8-sig")
+
+    stop_fn = text.split("function Invoke-TargetStop")[1].split("function Invoke-TargetStart")[0]
+    assert "Clear-DeployPythonPath" in stop_fn
+
+    start_fn = text.split("function Invoke-TargetStart")[1].split("function Get-SupervisorPid")[0]
+    assert "Clear-DeployPythonPath" in start_fn
+
+    # 停不干净就别继续拷文件；启动后必须换 pid，否则这次部署根本没生效。
+    assert "仍在运行" in text
+    assert "Wait-ForNewSupervisorPid $oldPid" in text
+    assert "supervisor 没有被重启" in text
