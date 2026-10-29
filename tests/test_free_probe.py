@@ -159,6 +159,24 @@ async def test_probe_warns_that_model_only_labels_the_session(monkeypatch, caplo
     assert any("仅用于会话标签" in r.message for r in caplog.records)
 
 
+async def test_probe_detail_reports_provider_status_as_reason(monkeypatch):
+    monkeypatch.setattr(model_probe, "_post", OkayPost())
+
+    result = await model_probe.probe_free_model_detail(ErrorClient(429))
+
+    assert result.available is False
+    assert result.reason == "上游报错（HTTP 429）"
+
+
+async def test_probe_detail_reports_transport_failure_as_reason(monkeypatch):
+    monkeypatch.setattr(model_probe, "_post", TimeoutPost())
+
+    result = await model_probe.probe_free_model_detail(object())
+
+    assert result.available is False
+    assert "ReadTimeout" in result.reason
+
+
 async def test_probe_cleanup_requests_use_the_remaining_budget(monkeypatch):
     """清理 DELETE 不能再按整份 timeout 拖住：用剩余预算，且最多 1s。"""
     real_monotonic = model_probe.time.monotonic
@@ -262,9 +280,9 @@ async def test_control_keeps_last_result_when_opencode_is_not_ready(
 
     async def fake_probe(client):
         calls.append(client)
-        return False
+        return model_probe.FreeProbeResult(False, "上游报错（HTTP 429）")
 
-    monkeypatch.setattr(control_module, "probe_free_model", fake_probe)
+    monkeypatch.setattr(control_module, "probe_free_model_detail", fake_probe)
     control = _free_mode_control(tmp_path, DownClient())
     control.runtime = replace(control.runtime, free_available=True)
     control._free_probe_at = 1.0
@@ -282,9 +300,9 @@ async def test_control_probes_once_per_ttl_and_exposes_flag(tmp_path, monkeypatc
 
     async def fake_probe(client):
         calls.append(client)
-        return False
+        return model_probe.FreeProbeResult(False, "上游报错（HTTP 429）")
 
-    monkeypatch.setattr(control_module, "probe_free_model", fake_probe)
+    monkeypatch.setattr(control_module, "probe_free_model_detail", fake_probe)
     client = object()
     control = _free_mode_control(tmp_path, client)
 
@@ -295,7 +313,9 @@ async def test_control_probes_once_per_ttl_and_exposes_flag(tmp_path, monkeypatc
     assert calls == [client]
     # 结果进了内存里的 runtime，并同时出现在 /api/brain 与健康快照里。
     assert control.snapshot()["free_available"] is False
+    assert control.snapshot()["free_reason"] == "上游报错（HTTP 429）"
     assert control.health_snapshot()["free_available"] is False
+    assert control.health_snapshot()["free_reason"] == "上游报错（HTTP 429）"
 
     control.schedule_free_probe()  # TTL 内不重复探测
     assert control._free_probe_task is first

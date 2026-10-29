@@ -196,6 +196,22 @@ async def test_switch_to_local_model_persists_and_closes_old(
     assert saved["local_model_model"] == "qwen2.5-7b"
 
 
+async def test_get_brain_probe_query_forces_free_probe(tmp_path: Path) -> None:
+    """面板首次打开带 ?probe=1：必须强制重探，轮询时则走 TTL。"""
+    control, _, app = make_control(tmp_path)
+    calls: list[bool] = []
+
+    def fake_probe(*, force: bool = False) -> None:
+        calls.append(force)
+
+    control.schedule_free_probe = fake_probe  # type: ignore[method-assign]
+    async with running(app) as client:
+        assert (await client.get("/api/brain?probe=1")).status == 200
+        assert (await client.get("/api/brain")).status == 200
+
+    assert calls == [True, False]
+
+
 async def test_switch_is_idempotent(tmp_path: Path) -> None:
     _, service, app = make_control(tmp_path)
     async with running(app) as client:

@@ -465,7 +465,7 @@
   <button class="btn danger" id="btn-shutdown">退出控制台</button>
 </header>
 <div id="free-banner" class="warn" role="status" hidden>
-  <span>免费模型当前不可用，请切换到「自备 Key」或「本地模型」</span>
+  <span id="free-banner-text">免费模型当前不可用，请切换到「自备 Key」或「本地模型」</span>
   <button class="btn" type="button" id="free-banner-go">去切换</button>
 </div>
 <div class="global-banner" id="global-banner" role="status" hidden></div>
@@ -1331,7 +1331,13 @@ function applyStatus(data) {
 // null / undefined 都表示「还没探测」，不能当成不可用误报。
 function renderFreeBanner(data) {
   const brain = data.brain || {};
-  $("free-banner").hidden = !(brain.mode === "free" && brain.free_available === false);
+  const show = brain.mode === "free" && brain.free_available === false;
+  $("free-banner").hidden = !show;
+  if (!show) return;
+  // 自检带回的原因（如「上游报错（HTTP 429）」）写进黄条，省得用户只能猜。
+  const reason = brain.free_reason ? `（${brain.free_reason}）` : "";
+  $("free-banner-text").textContent =
+    `免费模型当前不可用${reason}，请切换到「自备 Key」或「本地模型」`;
 }
 
 // 顶部全局降级横幅：命中任一条件就亮红条，文案区分是哪一种。
@@ -3071,6 +3077,8 @@ document.addEventListener("keydown", (ev) => {
 
 initTabs();
 loadAuthSession();
+// 面板刚打开：强制重探一次免费档，别让上一次会话留下的旧黄条继续挂着。
+api("/api/brain?probe=1").catch(() => {});
 refresh();
 refreshHealth();
 refreshAlerts();

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 
+from ..netssl import default_ssl_context
 from .control_token import TOKEN_PATH
 
 log = logging.getLogger(__name__)
@@ -40,7 +41,9 @@ async def reload_opencode(
         return {"ok": False, "error": "缺少 supervisor 控制口令"}
     url = f"http://127.0.0.1:{port}/api/opencode/reload"
     try:
-        async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout, verify=default_ssl_context(), transport=transport
+        ) as client:
             response = await client.post(url, headers={"X-Control-Token": token})
     except httpx.HTTPError as exc:
         return {"ok": False, "error": f"supervisor 不可达：{exc.__class__.__name__}"}

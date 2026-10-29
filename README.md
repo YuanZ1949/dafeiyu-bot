@@ -111,7 +111,7 @@ Copy-Item .env.example .env
 | --- | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | ✅ | — | DeepSeek 密钥 |
 | `DEEPSEEK_BASE_URL` | | `https://api.deepseek.com` | 兼容其他 OpenAI 风格网关时可改 |
-| `DEEPSEEK_MODEL` | | `deepseek-chat` | 可换 `deepseek-reasoner` |
+| `DEEPSEEK_MODEL` | | `deepseek-flash` | 可换 `deepseek-reasoner`（会自动核对端点清单） |
 | `DEEPSEEK_REASONING_EFFORT` | | 空 | 设为 `none` 可关闭 Qwen3.5 等本地模型的思考过程 |
 | `BOT_QQ` | ✅ | — | 机器人 QQ 号（NapCat 登录的那个） |
 | `NAPCAT_WS_HOST` | | `127.0.0.1` | 监听地址 |
@@ -453,7 +453,7 @@ bot 与 supervisor 会写同一文件，写入和轮转通过 `.audit.jsonl.lock
 | 启动报「缺少环境变量 DEEPSEEK_API_KEY」 | `.env` 没建或变量名拼错；确认在仓库根目录启动 |
 | 日志没有「NapCat 已连接」 | NapCat 的 WebSocket 客户端没启用；URL/端口/Token 不一致；端口被占用 |
 | 群消息完全没反应 | 机器人小号没进群；群在 blacklist；`groups.whitelist` 非空但没包含该群；看 `logs/dafeiyu.log` 里的 `reason` |
-| 回得很慢 | `DEEPSEEK_MODEL=deepseek-chat` 比 `deepseek-reasoner` 快很多；检查系统代理，httpx 已设 `trust_env=False` |
+| 回得很慢 | `DEEPSEEK_MODEL=deepseek-flash` 比 `deepseek-reasoner` 快很多；检查系统代理，httpx 已设 `trust_env=False` |
 | HTTP 429 | 触发限流：降低 `sample_rate`、调小 `budget.daily_calls`，或给账户充值 |
 | 记忆面板不更新、提示「配额暂停中」 | 账号级熔断：10 分钟内累计 3 次 429 或 provider 报 quota 后，摘要/印象暂停 1 小时，面板显示恢复时间；日志搜「429」可见触发原因 |
 | 回复被截断 | 这是设计行为：闲聊 120 字、技术问题 300 字，改 `config.yaml` 即可 |

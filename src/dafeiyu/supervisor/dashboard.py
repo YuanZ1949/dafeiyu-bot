@@ -647,8 +647,12 @@ def create_app(
             },
         )
 
-    async def get_brain(_: web.Request) -> web.Response:
-        code, data = await bot_call("GET", "/api/brain")
+    async def get_brain(request: web.Request) -> web.Response:
+        # 面板首次打开会带 ?probe=1：原样透传，让控制口强制重探免费档。
+        path = "/api/brain"
+        if request.query_string:
+            path = f"{path}?{request.query_string}"
+        code, data = await bot_call("GET", path)
         return web.json_response(data, status=code)
 
     async def post_brain(request: web.Request) -> web.Response:

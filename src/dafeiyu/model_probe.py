@@ -11,6 +11,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -164,10 +165,26 @@ def _round_settled(messages: list[dict[str, Any]]) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class FreeProbeResult:
+    """免费档自检结论：available 决定亮不亮黄条，reason 告诉用户为什么。"""
+
+    available: bool
+    reason: str = ""
+
+
 async def probe_free_model(
     client: Any, *, model: str = FREE_MODEL, timeout: float = 8.0
 ) -> bool:
-    """探测免费模型当前是否可用：能建 session 且 prompt 被受理即算可用。
+    """探测免费模型当前是否可用（只要布尔结论，兼容旧调用方）。"""
+    result = await probe_free_model_detail(client, model=model, timeout=timeout)
+    return result.available
+
+
+async def probe_free_model_detail(
+    client: Any, *, model: str = FREE_MODEL, timeout: float = 8.0
+) -> FreeProbeResult:
+    """探测免费模型当前是否可用，并带回不可用的原因。
 
     只走 HTTP：建一个临时 session、发一句最小 prompt，再读一眼消息里有没有
     provider 写的 4xx/5xx。
@@ -176,8 +193,9 @@ async def probe_free_model(
     由 opencode 生成配置决定。传了非默认值时发一条 warning，免得调用方误以为
     这个参数能换模型。
 
-    任何异常（401/403/404/429/超时/连不上/模型不存在）都返回 False：
-    这个结果只决定面板亮不亮黄条，绝不能抛给调用方或拖住启动。
+    任何异常（401/403/404/429/超时/连不上/模型不存在）都收敛成
+    ``available=False`` 加一句原因：这个结果只决定面板亮不亮黄条，绝不能抛给
+    调用方或拖住启动。
     """
     if model != FREE_MODEL:
         log.warning(
@@ -204,7 +222,7 @@ async def probe_free_model(
         session_id = _session_id(created)
         if not session_id:
             log.warning("免费模型探测：opencode 没有返回 session id")
-            return False
+            return FreeProbeResult(False, "opencode 没有返回 session id")
         await _post(
             client,
             f"/api/session/{session_id}/prompt",
@@ -215,23 +233,22 @@ async def probe_free_model(
             messages = await _messages_once(client, session_id, _budget())
             if messages is None:
                 # 读不到消息不代表模型不可用：prompt 已被受理，按可用处理。
-                return True
+                return FreeProbeResult(True)
             failure = _round_failure(messages)
             if failure is not None:
-                log.warning(
-                    "免费模型探测：provider 报错（HTTP %s）",
-                    _error_status(failure) or "?",
-                )
-                return False
+                status = _error_status(failure)
+                log.warning("免费模型探测：provider 报错（HTTP %s）", status or "?")
+                reason = f"上游报错（HTTP {status}）" if status else "上游报错"
+                return FreeProbeResult(False, reason)
             if _round_settled(messages):
-                return True
+                return FreeProbeResult(True)
             if time.monotonic() >= deadline:
                 # 观测窗口用完还没看到错误：prompt 受理即视为可用。
-                return True
+                return FreeProbeResult(True)
             await asyncio.sleep(FREE_PROBE_POLL_SECONDS)
     except Exception as exc:  # noqa: BLE001 - 自检失败只置标志，绝不打断启动
         log.warning("免费模型探测失败：%s", exc.__class__.__name__)
-        return False
+        return FreeProbeResult(False, f"探测异常（{exc.__class__.__name__}）")
     finally:
         if session_id:
             try:

@@ -43,10 +43,11 @@ from .config import OVERRIDES_PATH, ConfigError, Settings
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
 from .model_probe import (
     FREE_PROBE_TTL,
+    FreeProbeResult,
     ProbeError,
     normalize_base_url,
     pick_flash_model,
-    probe_free_model,
+    probe_free_model_detail,
     probe_models,
 )
 from .models import ChatType, Message
@@ -92,6 +93,12 @@ NOTIFY_MIN_INTERVAL_SECONDS = 10.0
 BRAIN_PROBE_TIMEOUT = 8.0
 # 免费档懒刷新前先看一眼 opencode 就绪：重启窗口内的失败不能缓存 600s。
 FREE_PROBE_READY_TIMEOUT = 1.0
+# 布尔型的查询参数：只有明确写了真值的才算，空串/0/false 一律当否。
+_TRUE_QUERY_VALUES = {"1", "true", "yes", "on"}
+
+
+def _truthy(raw: str | None) -> bool:
+    return str(raw or "").strip().casefold() in _TRUE_QUERY_VALUES
 # 人设正文的唯一来源：provider_config 只替换前置区，正文原样搬运。
 AGENT_TEMPLATE_PATH = Path(__file__).resolve().parent / "brain" / "agent_template.md"
 # 记忆旁路 agent 的正文；与聊天 agent 分开，模型随档位一起生成。
@@ -693,18 +700,21 @@ class BrainControl:
             log.debug("免费模型自检跳过：opencode 未就绪")
             return
         try:
-            available = await probe_free_model(client)
+            result = await probe_free_model_detail(client)
         except Exception:  # noqa: BLE001 - 自检永远不允许打断启动
             log.warning("免费模型自检异常", exc_info=True)
-            available = False
+            result = FreeProbeResult(False, "探测异常")
+        available, reason = result.available, result.reason
         if not available and ready is None and self.runtime.free_available is not None:
             # 拿不到就绪信号时区分不了「模型坏了」和「opencode 正好在重启」：
             # 保留旧结论，宁可晚一轮报警，也不谎报 600 秒。
             self._free_probe_at = 0.0
             log.debug("免费模型自检未通过，但无法确认 opencode 就绪，保留上一次结果")
             return
-        self.runtime = replace(self.runtime, free_available=available)
-        log.info("免费模型自检结果：%s", "可用" if available else "不可用")
+        self.runtime = replace(
+            self.runtime, free_available=available, free_reason=reason
+        )
+        log.info("免费模型自检结果：%s", "可用" if available else f"不可用（{reason}）")
 
     def _brain_view(self, provider: str) -> dict[str, Any]:
         """GET /api/brain 的档位视图：只含 has_key，绝不含密钥本身。"""
@@ -756,6 +766,7 @@ class BrainControl:
             "gateway_connected": bool(getattr(self.adapter, "connected", False)),
             # 免费档自检结果：None = 未探测，面板只在 False 时亮黄条。
             "free_available": self.runtime.free_available,
+            "free_reason": self.runtime.free_reason,
         }
 
     def health_snapshot(self) -> dict[str, Any]:
@@ -894,6 +905,7 @@ class BrainControl:
             "brain": {"provider": state["provider"], "model": state["model"]},
             # 免费档降级提示的唯一数据源：supervisor 的 /api/state 会把它透传给面板。
             "free_available": state["free_available"],
+            "free_reason": state["free_reason"],
             "memory": memory,
             "errors": errors,
         }
@@ -1707,9 +1719,11 @@ def create_app(
     async def status(_: web.Request) -> web.Response:
         return web.json_response(control.snapshot())
 
-    async def get_brain(_: web.Request) -> web.Response:
+    async def get_brain(request: web.Request) -> web.Response:
         # 面板每 2 秒轮询一次：顺手把过期的免费档自检排进后台，绝不等待它。
-        control.schedule_free_probe()
+        # 面板刚打开时带 ?probe=1 强制重探，避免上次会话留下的旧黄条误导人。
+        force = _truthy(request.query.get("probe"))
+        control.schedule_free_probe(force=force)
         return web.json_response(control.snapshot())
 
     async def post_brain(request: web.Request) -> web.Response:

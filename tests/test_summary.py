@@ -183,6 +183,114 @@ async def test_summarize_chat_unexpected_failure_keeps_traceback(caplog):
     assert records[0].exc_info is not None
 
 
+class TimeoutThenAnswer:
+    """第一次超时，之后按顺序返回预设答案。"""
+
+    def __init__(self, *answers: str) -> None:
+        self.answers = list(answers)
+        self.calls: list[dict] = []
+
+    async def complete(self, system, messages, max_tokens=400, temperature=0.2) -> str:
+        self.calls.append({"system": system, "messages": messages})
+        if len(self.calls) == 1:
+            raise BrainError("OpenCode 超时（120 秒），本条放弃")
+        return self.answers[min(len(self.calls) - 2, len(self.answers) - 1)]
+
+
+def seed_day(store: Store, count: int = 4, chat_id: int = 9001) -> None:
+    for i in range(count):
+        seed(
+            store,
+            datetime(2026, 10, 23, 10 + i, 0, tzinfo=TZ),
+            content=f"第{i + 1}条消息",
+            chat_id=chat_id,
+        )
+
+
+def _prompt_text(call: dict) -> str:
+    return call["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_timeout_splits_messages_in_half_then_merges():
+    store = make_store()
+    seed_day(store, 4)
+    brain = TimeoutThenAnswer("前半摘要", "后半摘要", "合并后的摘要")
+
+    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    assert text == "合并后的摘要"
+    assert len(brain.calls) == 4  # 整段超时 + 两个半段 + 合并
+    first_half = _prompt_text(brain.calls[1])
+    second_half = _prompt_text(brain.calls[2])
+    assert "第1条消息" in first_half and "第2条消息" in first_half
+    assert "第3条消息" not in first_half
+    assert "第3条消息" in second_half and "第4条消息" in second_half
+    merge_prompt = _prompt_text(brain.calls[3])
+    assert "前半摘要" in merge_prompt and "后半摘要" in merge_prompt
+    assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) == text
+
+
+@pytest.mark.asyncio
+async def test_timeout_with_single_message_gives_up_without_split():
+    store = make_store()
+    seed_day(store, 1)
+    brain = TimeoutThenAnswer("不该出现")
+
+    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    assert text is None
+    assert len(brain.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_timeout_in_a_half_gives_up_after_one_split():
+    """只切一层：半段再超时直接放弃，不无限递归。"""
+    store = make_store()
+    seed_day(store, 4)
+
+    class HalfTimeout:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, system, messages, max_tokens=400, temperature=0.2):
+            self.calls += 1
+            if self.calls == 1:
+                raise BrainError("OpenCode 超时（120 秒），本条放弃")
+            if self.calls == 3:
+                raise BrainError("OpenCode 超时（120 秒），本条放弃")
+            return "只剩一半"
+
+    brain = HalfTimeout()
+    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    assert text is None
+    assert brain.calls == 3
+    assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) is None
+
+
+@pytest.mark.asyncio
+async def test_merge_timeout_falls_back_to_joined_halves():
+    store = make_store()
+    seed_day(store, 4)
+
+    class MergeTimeout:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, system, messages, max_tokens=400, temperature=0.2):
+            self.calls += 1
+            if self.calls in (1, 4):
+                raise BrainError("OpenCode 超时（120 秒），本条放弃")
+            return "前半" if self.calls == 2 else "后半"
+
+    brain = MergeTimeout()
+    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    assert text == "前半\n后半"
+    assert brain.calls == 4
+
+
 @pytest.mark.asyncio
 async def test_scheduler_backs_off_failed_chat_until_window_expires():
     store = make_store()

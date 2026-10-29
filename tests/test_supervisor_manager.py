@@ -357,6 +357,10 @@ async def test_external_instance_turns_stopped_when_pid_dies(tmp_path: Path) -> 
 
 
 RECOVER_CODE = (
+    # 子进程 stdout 走管道时按区域设置编码（本机是 GBK），而 manager 统一按
+    # UTF-8 读：显式 reconfigure 成 UTF-8，避免断言随机器区域设置漂移。
+    "import sys\n"
+    "sys.stdout.reconfigure(encoding='utf-8')\n"
     "import time\n"
     "print('当前账号(10001)已登录，无法重复登录', flush=True)\n"
     "print('当前账号(10001)已登录，无法重复登录', flush=True)\n"

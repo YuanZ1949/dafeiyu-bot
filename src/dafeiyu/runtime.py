@@ -21,6 +21,9 @@ class RuntimeState:
     # 免费档自检结果：None = 还没探过。只在内存里，绝不落盘——重启后一个
     # 陈旧的 True 就是谎话，宁可重新探一次。
     free_available: bool | None = None
+    # 不可用时的原因（如「上游报错（HTTP 429）」），给面板黄条补一句话；
+    # 可用或未探测时为空串。同样只在内存里。
+    free_reason: str = ""
 
     def with_provider(self, provider: str, model: str = "") -> "RuntimeState":
         if provider == "local_model":

@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from dafeiyu.brain.client import BrainError
 from dafeiyu.brain.tokens import resolve_usage
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
@@ -35,10 +36,87 @@ ROTATION_SYSTEM = """你是群聊记录整理助手。请把下面这段对话�
 - 只输出摘要正文，不要标题、前缀或解释
 """
 
+MERGE_SYSTEM = """你是群聊记录整理助手。下面是同一段聊天记录拆成两半后各自生成的摘要，请合并成不超过 200 字的最终摘要：
+- 保留主要话题、结论、梗和外号，去掉重复
+- 用第三人称陈述，不评论、不发挥
+- 只输出摘要正文，不要标题、前缀或解释
+"""
+
+# 只有本地等 opencode 回包超时才值得切半重试；provider 自己报的 timeout
+# （如 provider.timeout）说明上游已明确失败，重试只会重复撞墙，交给退避。
+TIMEOUT_HINT = "OpenCode 超时"
+
 
 def _day_bounds(date: str) -> tuple[int, int]:
     start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=SHANGHAI)
     return int(start.timestamp()), int((start + timedelta(days=1)).timestamp())
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    return isinstance(exc, BrainError) and TIMEOUT_HINT in str(exc)
+
+
+async def _complete_once(
+    brain, system: str, prompt: str, max_tokens: int = 600
+) -> tuple[str, int, int, bool]:
+    """一次模型调用，顺带把 token 用量折算好。"""
+    detailed = getattr(brain, "complete_detailed", None)
+    if detailed is not None:
+        raw, prompt_tokens, completion_tokens = await detailed(
+            system, [{"role": "user", "content": prompt}], max_tokens=max_tokens
+        )
+    else:
+        raw = await brain.complete(
+            system, [{"role": "user", "content": prompt}], max_tokens=max_tokens
+        )
+        prompt_tokens = completion_tokens = 0
+    prompt_tokens, completion_tokens, estimated = resolve_usage(
+        f"{system}\n{prompt}", raw or "", prompt_tokens, completion_tokens
+    )
+    return (raw or ""), prompt_tokens, completion_tokens, estimated
+
+
+async def _summarize_lines(
+    brain,
+    system: str,
+    merge_system: str,
+    header: str,
+    lines: list[str],
+) -> tuple[str, int, int, bool]:
+    """整段摘要；本地超时且有多行时切成两半各摘一次再合并。只切一层。"""
+    prompt = f"{header}\n" + "\n".join(lines)
+    try:
+        return await _complete_once(brain, system, prompt)
+    except Exception as exc:  # 只有超时才走分段，其余原样抛出
+        if not _is_timeout_error(exc) or len(lines) < 2:
+            raise
+
+    mid = len(lines) // 2
+    text_parts: list[str] = []
+    prompt_tokens = completion_tokens = 0
+    estimated = False
+    for chunk in (lines[:mid], lines[mid:]):
+        raw, used_in, used_out, est = await _complete_once(
+            brain, system, f"{header}\n" + "\n".join(chunk)
+        )
+        text_parts.append(raw.strip())
+        prompt_tokens += used_in
+        completion_tokens += used_out
+        estimated = estimated or est
+
+    merge_prompt = f"第一段摘要：\n{text_parts[0]}\n\n第二段摘要：\n{text_parts[1]}"
+    try:
+        raw, used_in, used_out, est = await _complete_once(
+            brain, merge_system, merge_prompt
+        )
+    except Exception as exc:  # noqa: BLE001 - 合并失败就退化成拼接，保住已摘的部分
+        logger.warning("摘要合并失败，退回拼接两段：%s", exc)
+        raw = "\n".join(part for part in text_parts if part)
+    else:
+        prompt_tokens += used_in
+        completion_tokens += used_out
+        estimated = estimated or est
+    return raw, prompt_tokens, completion_tokens, estimated
 
 
 async def summarize_chat(
@@ -56,27 +134,17 @@ async def summarize_chat(
         return ""
 
     lines = [m.to_prompt_line() for m in messages][-MAX_SOURCE_LINES:]
-    prompt = f"日期：{date}\n以下是当天的群聊记录：\n" + "\n".join(lines)
-    detailed = getattr(brain, "complete_detailed", None)
+    header = f"日期：{date}\n以下是当天的群聊记录："
     try:
-        if detailed is not None:
-            raw, prompt_tokens, completion_tokens = await detailed(
-                SUMMARY_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=600
-            )
-        else:
-            raw = await brain.complete(
-                SUMMARY_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=600
-            )
-            prompt_tokens = completion_tokens = 0
+        raw, prompt_tokens, completion_tokens, estimated = await _summarize_lines(
+            brain, SUMMARY_SYSTEM, MERGE_SYSTEM, header, lines
+        )
     except Exception as exc:  # noqa: BLE001 - 摘要失败不影响主链路
         log_memory_failure(logger, f"生成摘要 {date}", exc, chat_type, chat_id)
         if on_error is not None:
             on_error(exc)
         return None
 
-    prompt_tokens, completion_tokens, estimated = resolve_usage(
-        f"{SUMMARY_SYSTEM}\n{prompt}", raw or "", prompt_tokens, completion_tokens
-    )
     store.record_usage(
         chat_type, chat_id, "summary", prompt_tokens, completion_tokens, estimated
     )
@@ -98,25 +166,15 @@ async def summarize_for_rotation(
     if not messages:
         return ""
     lines = [m.to_prompt_line() for m in messages][-MAX_SOURCE_LINES:]
-    prompt = "以下是需要交接的对话：\n" + "\n".join(lines)
-    detailed = getattr(brain, "complete_detailed", None)
+    header = "以下是需要交接的对话："
     try:
-        if detailed is not None:
-            raw, prompt_tokens, completion_tokens = await detailed(
-                ROTATION_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=600
-            )
-        else:
-            raw = await brain.complete(
-                ROTATION_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=600
-            )
-            prompt_tokens = completion_tokens = 0
+        raw, prompt_tokens, completion_tokens, estimated = await _summarize_lines(
+            brain, ROTATION_SYSTEM, MERGE_SYSTEM, header, lines
+        )
     except Exception as exc:  # noqa: BLE001 - 摘要失败不影响主链路
         log_memory_failure(logger, "生成轮换摘要", exc, chat_type, chat_id)
         return ""
 
-    prompt_tokens, completion_tokens, estimated = resolve_usage(
-        f"{ROTATION_SYSTEM}\n{prompt}", raw or "", prompt_tokens, completion_tokens
-    )
     store.record_usage(
         chat_type, chat_id, "summary", prompt_tokens, completion_tokens, estimated
     )
