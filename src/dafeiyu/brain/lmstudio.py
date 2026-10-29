@@ -19,6 +19,7 @@ from pathlib import Path
 import httpx
 
 from ..config import LocalModelConfig
+from ..netssl import default_ssl_context
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ async def probe(base_url: str, *, timeout: float = 1.5) -> bool:
     """端点能回 /models 就算就绪（不关心模型是否已加载）。"""
     url = base_url.rstrip("/") + "/models"
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, verify=default_ssl_context()) as client:
             resp = await client.get(url)
             return resp.status_code < 400
     except Exception:  # noqa: BLE001 - 连不上就是没就绪

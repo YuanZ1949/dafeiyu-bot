@@ -8,6 +8,8 @@ from dataclasses import dataclass, replace
 
 import httpx
 
+from ..netssl import default_ssl_context
+
 from .tokens import resolve_usage
 
 log = logging.getLogger(__name__)
@@ -231,7 +233,10 @@ class BrainClient:
         self._sleep = sleep or asyncio.sleep
         self._transport = transport
         self._client = httpx.AsyncClient(
-            timeout=timeout, transport=transport, trust_env=trust_env
+            timeout=timeout,
+            transport=transport,
+            trust_env=trust_env,
+            verify=default_ssl_context(),
         )
 
     async def aclose(self) -> None:

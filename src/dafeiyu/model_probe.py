@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 from .brain import provider_config
+from .netssl import default_ssl_context
 from .brain.opencode_http import DENY_ALL_PERMISSIONS, _error_status
 
 # 与两条配置生成路径共用同一个函数对象：端点规整规则只允许有一处定义。
@@ -68,7 +69,7 @@ async def _get(url: str, api_key: str, timeout: float) -> Any:
     """
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, verify=default_ssl_context()) as client:
             response = await client.get(url, headers=headers)
             response.raise_for_status()
             return response.json()

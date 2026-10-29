@@ -12,6 +12,7 @@ from pathlib import Path
 import httpx
 
 from .client import BrainError
+from ..netssl import default_ssl_context
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ class OpenCodeServer:
 
     async def _probe(self) -> bool:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=1.0, trust_env=False)
+            self._client = httpx.AsyncClient(timeout=1.0, trust_env=False, verify=default_ssl_context())
         response = await self._client.get(f"{self.url}/api/info")
         # opencode v2 起 serve 强制 Basic 认证，401 同样说明服务已经就绪。
         return response.status_code < 500

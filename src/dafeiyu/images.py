@@ -26,6 +26,7 @@ from typing import Awaitable, Callable
 import httpx
 
 from .config import Settings
+from .netssl import default_ssl_context
 from .models import Message
 
 log = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ FetchFn = Callable[[str, float, int], Awaitable[bytes]]
 async def _default_fetch(url: str, timeout: float, max_bytes: int) -> bytes:
     """流式下载，边收边判上限，超限即断。"""
     async with httpx.AsyncClient(
-        timeout=timeout, follow_redirects=True
+        timeout=timeout, follow_redirects=True, verify=default_ssl_context()
     ) as client:
         async with client.stream("GET", url) as resp:
             resp.raise_for_status()

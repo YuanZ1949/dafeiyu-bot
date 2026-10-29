@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 
 from ..memory.store import Store
+from ..netssl import default_ssl_context
 from ..models import ChatType
 from .client import BrainError, BrainReply, parse_brain_reply
 from .tokens import resolve_usage
@@ -161,6 +162,7 @@ class OpenCodeHttpBrain:
             headers=headers,
             timeout=REQUEST_TIMEOUT_SECONDS,
             transport=transport,
+            verify=default_ssl_context(),
         )
 
     async def aclose(self) -> None:
