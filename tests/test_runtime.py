@@ -46,3 +46,16 @@ def test_non_object_payload_falls_back(tmp_path: Path) -> None:
     path = tmp_path / "runtime.json"
     path.write_text('["provider"]', encoding="utf-8")
     assert load_runtime(path) == RuntimeState()
+
+
+def test_free_available_is_never_persisted(tmp_path: Path) -> None:
+    """自检结果只在内存里：落盘一个陈旧的 True 就是重启后的谎话。"""
+    path = tmp_path / "runtime.json"
+    save_runtime(
+        RuntimeState(provider="opencode", local_model_model="qwen", free_available=False),
+        path,
+    )
+
+    text = path.read_text(encoding="utf-8")
+
+    assert "free_available" not in text

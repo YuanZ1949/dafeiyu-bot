@@ -1328,8 +1328,7 @@ function applyStatus(data) {
 // null / undefined 都表示「还没探测」，不能当成不可用误报。
 function renderFreeBanner(data) {
   const brain = data.brain || {};
-  const flag = data.free_available !== undefined ? data.free_available : brain.free_available;
-  $("free-banner").hidden = !(brain.mode === "free" && flag === false);
+  $("free-banner").hidden = !(brain.mode === "free" && brain.free_available === false);
 }
 
 // 顶部全局降级横幅：命中任一条件就亮红条，文案区分是哪一种。

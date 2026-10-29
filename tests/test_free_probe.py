@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import subprocess
 from dataclasses import replace
 from types import SimpleNamespace
@@ -132,7 +133,67 @@ def test_probe_uses_http_not_subprocess(monkeypatch):
     # 这里再把标准库入口钉死：任何 shell-out 都会炸。
     assert not hasattr(model_probe, "subprocess")
     monkeypatch.setattr(subprocess, "run", _boom, raising=False)
-    asyncio.run(probe_free_model(object()))
+    # 钉住返回值：只断言「没起子进程」的话，函数整个返回 None 也能过。
+    assert asyncio.run(probe_free_model(object())) is False
+
+
+async def test_messages_once_logs_read_failure(caplog):
+    """读消息失败可以吞，但不能静默：至少留一条 debug。"""
+
+    class BrokenGet:
+        async def get(self, url, params=None, timeout=None):
+            raise httpx.ConnectError("boom")
+
+    caplog.set_level(logging.DEBUG, logger="dafeiyu.model_probe")
+    assert await model_probe._messages_once(BrokenGet(), "ses_x", 1.0) is None
+    assert any("探测消息读取失败" in r.message for r in caplog.records)
+
+
+async def test_probe_warns_that_model_only_labels_the_session(monkeypatch, caplog):
+    """``model`` 不参与选模型：传非默认值时必须显式提醒调用方。"""
+    monkeypatch.setattr(model_probe, "_post", OkayPost())
+    caplog.set_level(logging.WARNING, logger="dafeiyu.model_probe")
+
+    assert await probe_free_model(object(), model="qwen-other") is True
+
+    assert any("仅用于会话标签" in r.message for r in caplog.records)
+
+
+async def test_probe_cleanup_requests_use_the_remaining_budget(monkeypatch):
+    """清理 DELETE 不能再按整份 timeout 拖住：用剩余预算，且最多 1s。"""
+    real_monotonic = model_probe.time.monotonic
+    offset = {"value": 0.0}
+    monkeypatch.setattr(
+        model_probe.time, "monotonic", lambda: real_monotonic() + offset["value"]
+    )
+
+    class BudgetClient:
+        def __init__(self, spend: float) -> None:
+            self.spend = spend
+            self.deletes: list[float] = []
+
+        async def get(self, url, params=None, timeout=None):
+            offset["value"] += self.spend
+            return FakeResponse(
+                {"data": [{"type": "assistant", "finish": "stop"}]}
+            )
+
+        async def delete(self, url, timeout=None):
+            self.deletes.append(timeout)
+            return FakeResponse({})
+
+    monkeypatch.setattr(model_probe, "_post", OkayPost())
+
+    # 预算还剩 8s：清理最多用 1s，不能再用整份 timeout。
+    fast = BudgetClient(0.0)
+    assert await probe_free_model(fast, timeout=8.0) is True
+    assert fast.deletes == [1.0]
+
+    # 探测把预算耗到只剩 ~0.3s：清理必须跟着剩余预算走。
+    offset["value"] = 0.0
+    slow = BudgetClient(7.7)
+    assert await probe_free_model(slow, timeout=8.0) is True
+    assert 0.1 <= slow.deletes[0] <= 0.5
 
 
 async def test_probe_sends_one_prompt_and_treats_provider_error_as_unavailable(
@@ -174,6 +235,46 @@ def _free_mode_control(tmp_path, client):
         SimpleNamespace(connected=True),
         runtime_path=str(tmp_path / "runtime.json"),
     )
+
+
+def test_free_probe_client_logs_missing_transport(tmp_path, caplog):
+    """没有 HTTP 传输时跳过自检，但必须留一条 debug：否则看不出「没探」。"""
+    control = _free_mode_control(tmp_path, None)
+    caplog.set_level(logging.DEBUG, logger="dafeiyu.control")
+
+    assert control._free_probe_client() is None
+
+    assert any("未找到 HTTP 传输" in r.message for r in caplog.records)
+
+
+class DownClient:
+    """opencode 正在重启：任何请求都连不上。"""
+
+    async def get(self, url, params=None, timeout=None):
+        raise httpx.ConnectError("opencode 未就绪")
+
+
+async def test_control_keeps_last_result_when_opencode_is_not_ready(
+    tmp_path, monkeypatch
+):
+    """未就绪时本轮跳过刷新：旧值不被 False 覆盖，也不缓存这一轮。"""
+    calls: list[object] = []
+
+    async def fake_probe(client):
+        calls.append(client)
+        return False
+
+    monkeypatch.setattr(control_module, "probe_free_model", fake_probe)
+    control = _free_mode_control(tmp_path, DownClient())
+    control.runtime = replace(control.runtime, free_available=True)
+    control._free_probe_at = 1.0
+
+    await control._run_free_probe()
+
+    assert calls == []  # 未就绪：连探测都不发
+    assert control.runtime.free_available is True
+    assert control.snapshot()["free_available"] is True
+    assert control._free_probe_at == 0.0  # 这一轮不算「已探测」，下轮立刻重试
 
 
 async def test_control_probes_once_per_ttl_and_exposes_flag(tmp_path, monkeypatch):

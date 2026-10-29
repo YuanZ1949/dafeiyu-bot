@@ -85,6 +85,8 @@ MAX_DEDUPE_KEY_CHARS = 64
 NOTIFY_MIN_INTERVAL_SECONDS = 10.0
 # 三档切换的探活上限：云端端点比本机 LM Studio 慢，list_models 的 3s 不够用。
 BRAIN_PROBE_TIMEOUT = 8.0
+# 免费档懒刷新前先看一眼 opencode 就绪：重启窗口内的失败不能缓存 600s。
+FREE_PROBE_READY_TIMEOUT = 1.0
 # 人设正文的唯一来源：provider_config 只替换前置区，正文原样搬运。
 AGENT_TEMPLATE_PATH = Path(__file__).resolve().parent / "brain" / "agent_template.md"
 # 用户可见的三档，错误文案与 provider_config 共用同一份定义。
@@ -567,7 +569,31 @@ class BrainControl:
         这种情况下的 free_available 保持 None（未探测），不谎报 False。
         """
         brain = getattr(self.service, "brain", None)
-        return getattr(brain, "_client", None)
+        client = getattr(brain, "_client", None)
+        if client is None:
+            # 跳过要留痕：否则「面板一直不亮黄条」看不出是没探还是探不了。
+            log.debug("免费模型自检跳过：未找到 HTTP 传输，本次不探测")
+        return client
+
+    async def _opencode_ready(self, client: Any) -> bool | None:
+        """opencode 是否已就绪；拿不到就绪信号时返回 None。
+
+        判据与 supervisor / OpenCodeServer 的就绪探测一致：GET /api/info，
+        状态码 < 500 就算活着（opencode v2 起 serve 强制 Basic 认证，401
+        同样说明服务在）。传输对象没有 ``get``（测试替身）时拿不到信号。
+        """
+        probe = getattr(client, "get", None)
+        if not callable(probe):
+            return None
+        try:
+            response = await probe("/api/info", timeout=FREE_PROBE_READY_TIMEOUT)
+        except Exception:  # noqa: BLE001 - 连不上就是没就绪
+            return False
+        status = getattr(response, "status_code", None)
+        if status is None:
+            # 测试替身常常只有 raise_for_status()：拿不到状态码就当它活着。
+            return True
+        return int(status) < 500
 
     def _free_probe_due(self) -> bool:
         """自检是否该跑：没探过（含刚切回免费档）或结果已过期。"""
@@ -603,11 +629,24 @@ class BrainControl:
         client = self._free_probe_client()
         if client is None:
             return
+        ready = await self._opencode_ready(client)
+        if ready is False:
+            # opencode 正在重启/没起来：这一轮直接跳过，保持上一次结论，
+            # 也不把这个「不算数」的失败缓存进 TTL——下次轮询立刻重试。
+            self._free_probe_at = 0.0
+            log.debug("免费模型自检跳过：opencode 未就绪")
+            return
         try:
             available = await probe_free_model(client)
         except Exception:  # noqa: BLE001 - 自检永远不允许打断启动
             log.warning("免费模型自检异常", exc_info=True)
             available = False
+        if not available and ready is None and self.runtime.free_available is not None:
+            # 拿不到就绪信号时区分不了「模型坏了」和「opencode 正好在重启」：
+            # 保留旧结论，宁可晚一轮报警，也不谎报 600 秒。
+            self._free_probe_at = 0.0
+            log.debug("免费模型自检未通过，但无法确认 opencode 就绪，保留上一次结果")
+            return
         self.runtime = replace(self.runtime, free_available=available)
         log.info("免费模型自检结果：%s", "可用" if available else "不可用")
 

@@ -129,6 +129,22 @@ def test_html_probe_and_context_edge_cases_are_explained() -> None:
     assert html.count("需重启 opencode 后生效") == 1
 
 
+def test_html_free_banner_needs_explicit_unavailable_flag() -> None:
+    """免费档黄条的判定条件：只有「免费档 + 自检明确 false」才亮。"""
+    html = read_html()
+    assert 'id="free-banner"' in html
+    match = re.search(
+        r"function renderFreeBanner\(data\) \{\n(.*?)\n\}", html, re.S
+    )
+    assert match is not None, "renderFreeBanner 必须仍是一段可直接断言的函数体"
+    body = match.group(1)
+
+    assert 'brain.mode === "free"' in body
+    assert "brain.free_available === false" in body
+    # /api/status 顶层从来没有 free_available（它在 brain 里），旧分支是死代码。
+    assert "data.free_available" not in body
+
+
 def test_html_context_p90_matches_model_probe() -> None:
     html = read_html()
     assert CONTEXT_P90 == 21062

@@ -113,6 +113,8 @@ async def _messages_once(
         response.raise_for_status()
         payload = response.json()
     except Exception:  # noqa: BLE001 - 读失败只算「没看到」
+        # 吞掉是对的，但要留痕：否则探测结果突然变 True 时无从追。
+        log.debug("探测消息读取失败", exc_info=True)
         return None
     data = payload.get("data") if isinstance(payload, dict) else payload
     if not isinstance(data, list):
@@ -163,12 +165,20 @@ async def probe_free_model(
     """探测免费模型当前是否可用：能建 session 且 prompt 被受理即算可用。
 
     只走 HTTP：建一个临时 session、发一句最小 prompt，再读一眼消息里有没有
-    provider 写的 4xx/5xx。``model`` 只进临时 session 标题——opencode 的模型
-    选择来自生成的配置，不是每次请求带的参数。
+    provider 写的 4xx/5xx。
+
+    ``model`` 仅用于会话标签（`probe:<model>` 标题），不参与选模型：实际模型
+    由 opencode 生成配置决定。传了非默认值时发一条 warning，免得调用方误以为
+    这个参数能换模型。
 
     任何异常（401/403/404/429/超时/连不上/模型不存在）都返回 False：
     这个结果只决定面板亮不亮黄条，绝不能抛给调用方或拖住启动。
     """
+    if model != FREE_MODEL:
+        log.warning(
+            "免费模型探测：model 参数（%s）仅用于会话标签，实际模型由 opencode 生成配置决定",
+            model,
+        )
     deadline = time.monotonic() + max(float(timeout), 0.0)
 
     def _budget() -> float:
@@ -220,7 +230,11 @@ async def probe_free_model(
     finally:
         if session_id:
             try:
-                await client.delete(f"/api/session/{session_id}", timeout=timeout)
+                # 清理也吃总预算：探测已经把时间用完时，删除不能再用一整份
+                # timeout 把请求拖住（面板/启动都在等这个后台任务）。
+                await client.delete(
+                    f"/api/session/{session_id}", timeout=min(1.0, _budget())
+                )
             except Exception:  # noqa: BLE001 - 清理失败不影响判定
                 log.debug("探测 session 删除失败：%s", session_id, exc_info=True)
 
