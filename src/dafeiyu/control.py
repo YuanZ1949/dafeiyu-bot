@@ -11,6 +11,7 @@ import tempfile
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -60,6 +61,7 @@ from .secrets_store import (
 )
 from .service import BRAIN_ERROR_COOLDOWN_SECONDS, TOOL_HINT_INTERVAL_SECONDS
 from .settings_local import OverrideError, read_overrides, write_overrides
+from .supervisor.reload_client import reload_opencode
 from .timeutil import SHANGHAI, now_shanghai
 from .workers.failure import (
     QUOTA_KEY,
@@ -1245,6 +1247,14 @@ class BrainControl:
         if isinstance(result, dict) and result.get("ok") is True:
             return "ok", []
         # 只认显式 ack：None / 缺字段 / 其它真值都不能当成重载成功。
+        # supervisor 的 error 已经过 redact()，带上它比「未确认成功」好排查。
+        reason = ""
+        if isinstance(result, dict):
+            reason = str(result.get("error") or "").strip()[:120]
+        if reason:
+            return "pending", [
+                f"opencode 重载失败：{reason}（需重启 opencode 才会生效）"
+            ]
         return "pending", ["opencode 重载未确认成功，需重启 opencode 才会生效"]
 
     async def _close_later(self, brain: Any) -> None:
@@ -2301,6 +2311,10 @@ async def start_control_server(
     token = os.environ.get("DAFEIYU_CONTROL_TOKEN", "").strip()
 
     control = BrainControl(settings, store, service, adapter, runtime_path)
+    # 切档后必须重启 opencode 才真的换模型：配置由本进程写，进程归 supervisor 管。
+    control.opencode_reload = partial(
+        reload_opencode, settings.supervisor.dashboard.port
+    )
     # 免费档启动自检：supervisor 要等 opencode /api/info 就绪才拉起本进程，
     # 所以走到这里 opencode 已经 ready。只探测不阻塞，失败仅置标志。
     control.schedule_free_probe(force=True)

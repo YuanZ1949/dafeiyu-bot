@@ -358,6 +358,17 @@ async def test_reload_ok_is_reported(control: BrainControl) -> None:
     assert out["warnings"] == []
 
 
+async def test_failed_reload_surfaces_supervisor_reason(control: BrainControl) -> None:
+    async def reload():
+        return {"ok": False, "error": "未知进程：opencode"}
+
+    control.opencode_reload = reload
+    out = await control.switch_mode({"mode": "free"})
+
+    assert out["reload"] == "pending"
+    assert any("未知进程：opencode" in warning for warning in out["warnings"])
+
+
 async def test_empty_api_key_keeps_stored_secret(control: BrainControl) -> None:
     write_secret("sk-keep-me-1234", control_mod.KEY_PATH)
 

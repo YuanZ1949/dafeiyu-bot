@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import html as html_lib
 import json
 import logging
@@ -49,6 +50,10 @@ async def _same_origin(request: web.Request, handler):
 
 
 AUTH_KEY: web.AppKey[DashboardAuth] = web.AppKey("dashboard_auth", DashboardAuth)
+# bot 进程没有浏览器 cookie，切档后要调 supervisor 重启 opencode，只能靠共享口令。
+# 只放行这些路径：口令能做的事必须显式列举，别让它变成万能后台钥匙。
+CONTROL_KEY: web.AppKey[ControlToken] = web.AppKey("control_token", ControlToken)
+OPS_TOKEN_PATHS = frozenset({"/api/opencode/reload"})
 
 
 def _wants_html(request: web.Request) -> bool:
@@ -64,6 +69,15 @@ async def _auth_middleware(request: web.Request, handler):
     auth = request.app.get(AUTH_KEY)
     if auth is None or not auth.enabled or auth.is_public(request.path):
         return await handler(request)
+    if request.path in OPS_TOKEN_PATHS:
+        control = request.app.get(CONTROL_KEY)
+        supplied = request.headers.get("X-Control-Token", "")
+        if (
+            control is not None
+            and supplied
+            and hmac.compare_digest(supplied, control.value)
+        ):
+            return await handler(request)
     if auth.verify_cookie(request.cookies.get(COOKIE_NAME, "")):
         return await handler(request)
     if _wants_html(request):
@@ -109,6 +123,8 @@ def create_app(
     app = web.Application(middlewares=[_same_origin, _auth_middleware])
     auth_config = auth or _auth_from_settings(settings)
     app[AUTH_KEY] = auth_config
+    if control_token is not None:
+        app[CONTROL_KEY] = control_token
     closing = asyncio.Event()
     # 每个 app 独立一把锁，避免跨事件循环复用；只保护 token 轮换关键区。
     rotate_lock = asyncio.Lock()
