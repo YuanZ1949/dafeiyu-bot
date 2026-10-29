@@ -138,6 +138,9 @@ class Service:
         self._started_at = time.monotonic()
         # 轮换后的接续文本：成功投递才弹出，失败留到下一批重试。
         self._continuations: dict[tuple[ChatType, int], str] = {}
+        # 已从库里补投过接续语的会话：同一进程内不再重复注入（重启后内存为空，
+        # 会再从 session_summaries 捞一次，然后同样只注入一次）。
+        self._continuation_used: set[tuple[ChatType, int]] = set()
         self._hint_at: dict[tuple[ChatType, int], float] = {}
         self._error_reply_at: dict[tuple[ChatType, int], float] = {}
 
@@ -820,11 +823,12 @@ class Service:
 
         await self._maybe_rotate(chat_type, chat_id)
 
+        continuation = self._continuation_for(chat_type, chat_id)
         prompt = self._build_prompt(
             chat_type,
             chat_id,
             batch,
-            continuation=self._continuations.get(key),
+            continuation=continuation,
         )
 
         log.info(
@@ -877,6 +881,9 @@ class Service:
             tokens=reply.prompt_tokens + reply.completion_tokens,
         )
         self._continuations.pop(key, None)
+        if continuation:
+            # 已消费：同一进程内不再从库里重复注入（内存里的到这一步也已弹出）。
+            self._continuation_used.add(key)
         self._check_workspace(chat_type, chat_id)
 
     async def _send_batch_reply(
@@ -905,7 +912,7 @@ class Service:
             for chunk in chunks:
                 message_id = await self.adapter.send(chat_type, chat_id, chunk)
                 sent.append((chunk, message_id))
-        except Exception as exc:  # 网络抖动不应拖垮整条链路
+        except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
             log.warning("发送失败 %s/%s: %s", chat_id, batch[-1].message_id, exc)
         else:
             self.router.note_bot_spoke(chat_type, chat_id)
@@ -964,6 +971,19 @@ class Service:
         hint.sent = False
         return hint
 
+    def _continuation_for(self, chat_type: ChatType, chat_id: int) -> str | None:
+        """本轮要注入的接续语：内存优先，重启后回落到库里的 24h 摘要。
+
+        只为拼 prompt 取值，不在这里删除：失败的那一轮必须能原样重投。
+        """
+        key = (chat_type, chat_id)
+        text = self._continuations.get(key)
+        if text:
+            return text
+        if key in self._continuation_used:
+            return None
+        return self.store.recent_session_summary(chat_type, chat_id)
+
     async def _maybe_rotate(self, chat_type: ChatType, chat_id: int) -> None:
         """到阈值就换 session；摘要写不出来就继续用旧的，下一批再试。"""
         if not callable(getattr(self.brain, "reset_session", None)):
@@ -984,6 +1004,8 @@ class Service:
         )
         if continuation:
             self._continuations[(chat_type, chat_id)] = continuation
+            # 轮换产出了新接续语，旧的「已消费」标记必须失效，否则这条新语不会注入。
+            self._continuation_used.discard((chat_type, chat_id))
 
     def _check_workspace(self, chat_type: ChatType, chat_id: int) -> None:
         """每轮结束后 stat 一次；超上限保留尾部并留截断注释。"""
@@ -1233,7 +1255,7 @@ class Service:
             for chunk in chunks:
                 message_id = await self.adapter.send(msg.chat_type, msg.chat_id, chunk)
                 sent.append((chunk, message_id))
-        except Exception as exc:  # 网络抖动不应拖垮整条链路
+        except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
             log.warning("发送失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
         else:
             self.router.note_bot_spoke(msg.chat_type, msg.chat_id)

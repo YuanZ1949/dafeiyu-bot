@@ -54,6 +54,19 @@ def test_html_shows_memory_health_line() -> None:
     assert "记忆摘要落后" in html
 
 
+def test_html_memory_health_lists_pending_slots() -> None:
+    """缺口要落到「哪个会话、哪天、多少条」，不能只报天数。"""
+    html = read_html()
+    match = re.search(
+        r"async function loadMemoryHealth\(\) \{\n(.*?)\n\}", html, re.DOTALL
+    )
+    assert match is not None, "loadMemoryHealth 必须仍是一段可直接断言的函数体"
+    body = match.group(1)
+    assert "pending_slots" in body
+    assert "条" in body  # 明细必须带消息条数这个单位
+    assert "pending_days" in body  # 旧后端没有 pending_slots 时的兜底
+
+
 def test_html_has_three_mode_cards() -> None:
     html = read_html()
     for mode in ("free", "key", "local_model"):

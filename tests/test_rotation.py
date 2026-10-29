@@ -7,6 +7,7 @@ import pytest
 from dafeiyu.memory.rotation import apply_rotation, needs_rotation
 from dafeiyu.memory.store import SessionStats, Store
 from dafeiyu.models import ChatType, Message
+from dafeiyu.timeutil import SHANGHAI
 from dafeiyu.workers.summary import summarize_for_rotation
 
 GROUP = ChatType.GROUP
@@ -43,8 +44,13 @@ def make_msg(idx: int, content: str) -> Message:
 
 
 def test_needs_rotation_by_each_threshold():
-    now = datetime(2026, 10, 24)
-    kw = dict(now=now, rotation_messages=60, rotation_days=7, rotation_tokens=40000)
+    now = datetime(2026, 10, 24, tzinfo=SHANGHAI)
+    kw = {
+        "now": now,
+        "rotation_messages": 60,
+        "rotation_days": 7,
+        "rotation_tokens": 40000,
+    }
     assert needs_rotation(SessionStats(0, 40000, "2026-10-24"), **kw) is True
     assert needs_rotation(SessionStats(60, 0, "2026-10-24"), **kw) is True
     assert needs_rotation(SessionStats(0, 0, "2026-10-16"), **kw) is True
@@ -52,10 +58,37 @@ def test_needs_rotation_by_each_threshold():
 
 
 def test_needs_rotation_without_created_at_ignores_days():
-    now = datetime(2026, 10, 24)
-    kw = dict(now=now, rotation_messages=60, rotation_days=7, rotation_tokens=40000)
+    now = datetime(2026, 10, 24, tzinfo=SHANGHAI)
+    kw = {
+        "now": now,
+        "rotation_messages": 60,
+        "rotation_days": 7,
+        "rotation_tokens": 40000,
+    }
     assert needs_rotation(SessionStats(0, 0, None), **kw) is False
     assert needs_rotation(SessionStats(60, 0, None), **kw) is True
+
+
+def test_rotation_days_reads_created_at_from_store(store):
+    """链路：set_brain_session 落库的 created_at → session_stats → 天数判据。"""
+    now = datetime(2026, 10, 24, tzinfo=SHANGHAI)
+    kw = {
+        "now": now,
+        "rotation_messages": 60,
+        "rotation_days": 7,
+        "rotation_tokens": 40000,
+    }
+
+    store.set_brain_session("opencode", GROUP, 1, "s-1")
+    assert store.session_stats(GROUP, 1).created_at
+    assert needs_rotation(store.session_stats(GROUP, 1), **kw) is False
+
+    store._conn.execute(
+        "UPDATE brain_sessions SET created_at = '2026-10-16' WHERE chat_id = 1"
+    )
+    store._conn.commit()
+
+    assert needs_rotation(store.session_stats(GROUP, 1), **kw) is True
 
 
 async def test_apply_rotation_resets_and_returns_continuation(store):

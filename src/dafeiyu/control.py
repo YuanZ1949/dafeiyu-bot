@@ -1336,13 +1336,20 @@ class BrainControl:
             },
         }
 
-    def memory_health(self) -> dict[str, Any]:
+    def memory_health(self, *, now: datetime | None = None) -> dict[str, Any]:
         """记忆链路体检：最近几天有缺口、最近一条摘要、是否熔断。
 
         摘要 worker 只补「昨天」，缺口平时只出现在日志里。这里把缺口做成
         只读数据给面板，看板一眼就能判断「记忆是不是落后了」。
+
+        「今天」永远不算缺口：摘要次日 4 点才生成。4 点前连「昨天」也还没到期，
+        窗口再往前收一天，避免每天凌晨面板都在误报。
         """
-        pending = self.store.pending_summary_days()
+        now = now or now_shanghai()
+        lag = 1 if now.hour >= 4 else 2
+        until = (now.date() - timedelta(days=lag)).isoformat()
+        slots = self.store.pending_summary_slots(until=until)
+        pending = sorted({slot.date for slot in slots})
         latest = self.store.recent_summaries(1, 0)
         quota_until = self.store.load_backoff().get(QUOTA_KEY)
         quota_paused = bool(quota_until and float(quota_until) > time.time())
@@ -1351,6 +1358,15 @@ class BrainControl:
             "ok": not pending and not quota_paused,
             "pending_days": pending,
             "pending_count": len(pending),
+            "pending_slots": [
+                {
+                    "chat_type": slot.chat_type.value,
+                    "chat_id": slot.chat_id,
+                    "date": slot.date,
+                    "messages": slot.messages,
+                }
+                for slot in slots
+            ],
             "summary_total": self.store.count_summaries(),
             "impression_total": self.store.count_impressions(),
             "last_summary": None

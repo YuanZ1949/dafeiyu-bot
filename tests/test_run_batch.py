@@ -163,7 +163,7 @@ def build(
         workspace = Workspace(tmp_path / "ws")
         workspace.ensure()
         workspace.global_path().write_bytes(
-            "# 大肥鱼的长期记忆\n喜欢水草和沉木\n".encode("utf-8")
+            "# 大肥鱼的长期记忆\n喜欢水草和沉木\n".encode()
         )
 
     service = Service(
@@ -196,7 +196,7 @@ def batch_ids(service) -> list[str]:
 
 
 async def test_batch_marks_delivered_and_records_ambient(tmp_path):
-    service, store, brain, adapter = build(tmp_path)
+    service, store, _brain, adapter = build(tmp_path)
 
     await service._run_batch(ChatType.GROUP, 1001)
 
@@ -237,7 +237,7 @@ async def test_batch_does_not_inject_recalled_old_messages_by_default(tmp_path):
 
 
 async def test_budget_exhausted_skips_without_calling_brain(tmp_path):
-    service, store, brain, adapter = build(
+    service, store, brain, _adapter = build(
         tmp_path, budget=BudgetConfig(daily_calls=1, daily_tokens=300000)
     )
     store.record_usage(ChatType.GROUP, 1001, "ambient", 1, 1)
@@ -268,7 +268,7 @@ async def test_addressed_batch_uses_reply_purpose(tmp_path):
 
 
 async def test_at_bot_batch_marks_at(tmp_path):
-    service, store, brain, _ = build(tmp_path)
+    service, _store, brain, _ = build(tmp_path)
 
     await service.handle(make_msg("在吗", message_id="m2", at_bot=True))
     await service._run_batch(ChatType.GROUP, 1001)
@@ -333,6 +333,57 @@ async def test_rotation_runs_before_model_call(tmp_path):
     assert brain.reset_calls == 1
     assert "上次聊到" in brain.last_prompt
     assert "【接续】" in brain.last_prompt
+
+
+async def test_continuation_from_db_survives_restart(tmp_path):
+    """重启后内存字典空：接续语要从 session_summaries 捞回来，且只注入一次。"""
+    service, store, brain, _ = build(tmp_path)
+    store.add_session_summary(ChatType.GROUP, 1001, "上次聊到鱼缸和水草")
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert "【接续】" in brain.last_prompt
+    assert "上次聊到鱼缸和水草" in brain.last_prompt
+
+    # 第二轮同一进程：已消费，不再重复注入（哪怕库里那条还在）。
+    store.add_message(make_msg("再说一句", message_id="m2"))
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert "【接续】" not in brain.last_prompt
+    assert "上次聊到鱼缸和水草" not in brain.last_prompt
+
+
+async def test_db_continuation_is_not_consumed_on_brain_error(tmp_path):
+    brain = FakeBrain(error=True)
+    service, store, brain, _ = build(tmp_path, brain=brain)
+    store.add_session_summary(ChatType.GROUP, 1001, "上次聊到鱼缸和水草")
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    # 失败不消费：下一批仍要带上接续语。
+    brain.error = False
+    store.add_message(make_msg("再来一次", message_id="m2"))
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert "上次聊到鱼缸和水草" in brain.last_prompt
+
+
+async def test_new_rotation_continuation_reinjects_after_consumed(tmp_path):
+    service, store, brain, _ = build(tmp_path)
+    store.add_session_summary(ChatType.GROUP, 1001, "第一次接续")
+
+    await service._run_batch(ChatType.GROUP, 1001)
+    assert "第一次接续" in brain.last_prompt
+
+    # 下一轮触发轮换：新接续语要重新注入，不能被「已消费」挡住。
+    store.bump_session_stats(ChatType.GROUP, 1001, messages=60, tokens=0)
+    store.add_message(make_msg("继续聊", message_id="m2"))
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert brain.reset_calls == 1
+    assert "【接续】" in brain.last_prompt
+    assert "第一次接续" not in brain.last_prompt
+    assert "大家在聊鱼缸和水草" in brain.last_prompt
 
 
 async def test_prompt_contains_all_segments_and_timeline(tmp_path):

@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from dafeiyu.models import ChatType, Impression, Message, Summary
 from dafeiyu.timeutil import SHANGHAI, today_shanghai
@@ -256,6 +257,21 @@ class SessionStats:
     created_at: str | None = None
 
 
+@dataclass(frozen=True)
+class PendingSummary:
+    """一个「有消息却没摘要」的槽位：会话 + 日期 + 当天消息数。"""
+
+    chat_type: ChatType
+    chat_id: int
+    date: str
+    messages: int
+
+
+def _parse_day(value: str) -> datetime:
+    """把 YYYY-MM-DD 解析成上海时区的当天零点。"""
+    return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=SHANGHAI)
+
+
 def _memory_scope(
     chat_type: ChatType | None, chat_id: int | None
 ) -> tuple[str, list[object]]:
@@ -297,6 +313,7 @@ class Store:
             )
         self._conn.executescript(_SCHEMA)
         self._ensure_columns()
+        self._backfill_session_created_at()
         try:
             self._conn.executescript(_IMPRESSION_FTS_SCHEMA)
             self._fts = True
@@ -359,6 +376,17 @@ class Store:
                     self._conn.execute(
                         f"ALTER TABLE {table} ADD COLUMN {name} {decl}"
                     )
+
+    def _backfill_session_created_at(self) -> None:
+        """老库的数据迁移：created_at 补列后历史行是 NULL，天数判据会一直跳过。
+
+        回填成「今天」（启动日）是保守选择：无法还原真实建立时间时，最长也只能
+        晚一次轮换周期，不会把老会话立刻当成过期。WHERE 只挑 NULL，重复执行幂等。
+        """
+        self._conn.execute(
+            "UPDATE brain_sessions SET created_at = ? WHERE created_at IS NULL",
+            (today_shanghai(),),
+        )
 
     def close(self) -> None:
         self._conn.close()
@@ -1026,14 +1054,22 @@ class Store:
     def set_brain_session(
         self, provider: str, chat_type: ChatType, chat_id: int, session_id: str
     ) -> None:
+        """写入/更新会话 id；created_at 是这一轮 session 的起点，只落一次。
+
+        老库升级前建的行 created_at 为 NULL，ON CONFLICT 时用 COALESCE 补上，
+        已有值绝不覆盖——否则每次握手都会把轮换天数判据重置掉。
+        """
         self._conn.execute(
             """
-            INSERT INTO brain_sessions (provider, chat_type, chat_id, session_id)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT (provider, chat_type, chat_id)
-            DO UPDATE SET session_id = excluded.session_id, updated_at = datetime('now')
+            INSERT INTO brain_sessions
+                (provider, chat_type, chat_id, session_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (provider, chat_type, chat_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                updated_at = datetime('now'),
+                created_at = COALESCE(brain_sessions.created_at, excluded.created_at)
             """,
-            (provider, chat_type.value, chat_id, session_id),
+            (provider, chat_type.value, chat_id, session_id, today_shanghai()),
         )
         self._conn.commit()
 
@@ -1078,7 +1114,8 @@ class Store:
             VALUES (?, ?, ?, '', ?, ?, ?)
             ON CONFLICT (provider, chat_type, chat_id) DO UPDATE SET
                 delivered_count = brain_sessions.delivered_count + excluded.delivered_count,
-                token_estimate = brain_sessions.token_estimate + excluded.token_estimate
+                token_estimate = brain_sessions.token_estimate + excluded.token_estimate,
+                created_at = COALESCE(brain_sessions.created_at, excluded.created_at)
             """,
             (
                 _SESSION_PROVIDER,
@@ -1395,32 +1432,54 @@ class Store:
         ).fetchone()
         return int(row["total"] or 0)
 
-    def pending_summary_days(self, days: int = 7) -> list[str]:
-        """最近 `days` 天里有消息、却没有对应摘要的日期（升序）。
+    def pending_summary_slots(
+        self, days: int = 7, *, until: str | None = None
+    ) -> list[PendingSummary]:
+        """最近 `days` 天里 (会话, 日期) 有消息却缺摘要的槽位，日期倒序。
 
-        「有缺口」按 (会话, 日期) 判定：同一天两个群，只有一个群生成了
-        摘要，这天仍算没补完。只读、无副作用，供面板体检用。
+        `until` 是窗口最后一天（含），默认昨天：worker 次日凌晨才跑，今天本来
+        就不该有摘要，算进缺口只会天天误报。调度器传自己时钟算出的日期，
+        测试与线上才对齐。
         """
         window = max(1, min(int(days), 90))
-        start = datetime.strptime(self.today(), "%Y-%m-%d").replace(tzinfo=SHANGHAI)
-        start -= timedelta(days=window - 1)
+        end = _parse_day(until) if until else _parse_day(self.today()) - timedelta(days=1)
+        start = end - timedelta(days=window - 1)
         start_ts = int(start.timestamp())
-        end_ts = int((start + timedelta(days=window)).timestamp())
+        end_ts = int((end + timedelta(days=1)).timestamp())
         rows = self._conn.execute(
             """
-            SELECT DISTINCT
-                   strftime('%Y-%m-%d', m.timestamp, 'unixepoch', '+8 hours') AS day
+            SELECT m.chat_type,
+                   m.chat_id,
+                   strftime('%Y-%m-%d', m.timestamp, 'unixepoch', '+8 hours') AS day,
+                   COUNT(*) AS n
             FROM messages AS m
             LEFT JOIN summaries AS s
               ON s.chat_type = m.chat_type
              AND s.chat_id = m.chat_id
              AND s.date = strftime('%Y-%m-%d', m.timestamp, 'unixepoch', '+8 hours')
             WHERE m.timestamp >= ? AND m.timestamp < ? AND s.date IS NULL
-            ORDER BY day
+            GROUP BY m.chat_type, m.chat_id, day
+            ORDER BY day DESC, m.chat_id ASC
             """,
             (start_ts, end_ts),
         ).fetchall()
-        return [str(row["day"]) for row in rows]
+        return [
+            PendingSummary(
+                chat_type=ChatType(row["chat_type"]),
+                chat_id=int(row["chat_id"]),
+                date=str(row["day"]),
+                messages=int(row["n"]),
+            )
+            for row in rows
+        ]
+
+    def pending_summary_days(self, days: int = 7, *, until: str | None = None) -> list[str]:
+        """缺摘要的日期（去重升序），面板横幅只关心「哪几天」。
+
+        「有缺口」按 (会话, 日期) 判定：同一天两个群，只有一个群生成了
+        摘要，这天仍算没补完。只读、无副作用。
+        """
+        return sorted({slot.date for slot in self.pending_summary_slots(days, until=until)})
 
     def recent_summaries(
         self,
@@ -1471,6 +1530,26 @@ class Store:
             ORDER BY id DESC LIMIT 1
             """,
             (chat_type.value, chat_id),
+        ).fetchone()
+        return None if row is None else str(row["content"])
+
+    def recent_session_summary(
+        self, chat_type: ChatType, chat_id: int, within_hours: float = 24
+    ) -> str | None:
+        """`within_hours` 内的最新接续摘要；重启后靠它把轮换接续语捞回来。
+
+        created_at 是 UTC（datetime('now')），窗口比较也交给 SQLite，避免 Python
+        侧混时区。过期的旧摘要不返回：几天前的交接语接到当前对话上只会串台。
+        """
+        seconds = int(max(0.0, float(within_hours)) * 3600)
+        row = self._conn.execute(
+            """
+            SELECT content FROM session_summaries
+            WHERE chat_type = ? AND chat_id = ?
+              AND created_at >= datetime('now', ?)
+            ORDER BY id DESC LIMIT 1
+            """,
+            (chat_type.value, chat_id, f"-{seconds} seconds"),
         ).fetchone()
         return None if row is None else str(row["content"])
 
@@ -1817,7 +1896,7 @@ class Store:
             if current is None:
                 sessions[key] = row
                 continue
-            if current["provider"] != _SESSION_PROVIDER and row["provider"] == _SESSION_PROVIDER:
+            if current["provider"] != _SESSION_PROVIDER and row["provider"] == _SESSION_PROVIDER:  # noqa: SIM114
                 sessions[key] = row
             elif (
                 current["provider"] != _SESSION_PROVIDER

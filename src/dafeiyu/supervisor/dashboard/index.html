@@ -1902,6 +1902,17 @@ async function loadMemory() {
   loadMemoryHealth();
 }
 
+// 缺口明细：后端给 { chat_type, chat_id, date, messages }，date 已是
+// YYYY-MM-DD，直接切字符串，不用 new Date（时区会把日期算错一天）。
+const PENDING_SLOT_CHAT_TYPE = { group: "群", private: "私聊", channel: "频道" };
+
+function pendingSlotText(slot) {
+  const label = PENDING_SLOT_CHAT_TYPE[slot.chat_type] || slot.chat_type;
+  const date = String(slot.date || "").slice(5) || "未知日期";
+  const count = Number(slot.messages);
+  return `${label} ${slot.chat_id} · ${date} · ${Number.isFinite(count) ? count : 0} 条`;
+}
+
 // 记忆体检：摘要缺口与熔断原因。列表读取失败时也要能单独看到这一行，
 // 所以不复用 loadMemory 的 try，自己兜住错误。
 async function loadMemoryHealth() {
@@ -1918,7 +1929,15 @@ async function loadMemoryHealth() {
       );
     }
     if (h.pending_count > 0) {
-      parts.push(`最近 ${h.pending_count} 天缺摘要：${(h.pending_days || []).join("、")}`);
+      const slots = Array.isArray(h.pending_slots) ? h.pending_slots : [];
+      if (slots.length > 0) {
+        // 最多列 5 条，其余用总数收口，避免这一行把面板撑开。
+        const shown = slots.slice(0, 5).map(pendingSlotText).join("，");
+        parts.push(`缺摘要：${shown}${slots.length > 5 ? ` 等 ${slots.length} 处` : ""}`);
+      } else {
+        // 旧后端没有 pending_slots，退回只报天数。
+        parts.push(`最近 ${h.pending_count} 天缺摘要：${(h.pending_days || []).join("、")}`);
+      }
     } else {
       parts.push("最近 7 天摘要齐全");
     }

@@ -29,6 +29,10 @@ SUMMARY_SYSTEM = """你是群聊记录整理助手。请把给定日期的一段
 
 MAX_SUMMARY_CHARS = 200
 MAX_SOURCE_LINES = 400
+# 回补窗口：worker 每轮除了昨天，还会捡最近 7 天里漏掉的 (会话, 日期)。
+BACKFILL_DAYS = 7
+# 每轮最多补几个槽位：一次补太多会顶满当轮预算，剩下的留给下一轮。
+MAX_BACKFILL_PER_RUN = 3
 
 ROTATION_SYSTEM = """你是群聊记录整理助手。请把下面这段对话压缩成不超过 200 字的交接摘要，供换 session 后继续聊天：
 - 记下正在聊的话题、已达成的结论、称呼与梗
@@ -242,14 +246,16 @@ class SummaryScheduler:
         if self._backoff.is_paused():
             return 0
 
-        target = (now.date() - timedelta(days=1)).isoformat()
-        start_ts, end_ts = _day_bounds(target)
+        # 只补「昨天」的话，某天失败后目标日期就永久前移，那一整天再也没人补。
+        # 这里把最近 7 天的缺口一起捞出来（截止昨天，今天本来就不该有摘要）。
+        until = (now.date() - timedelta(days=1)).isoformat()
+        slots = self._store.pending_summary_slots(BACKFILL_DAYS, until=until)
         created = 0
-        for chat_type, chat_id in self._store.active_chats_between(start_ts, end_ts):
-            if self._backoff.is_paused():
+        for slot in slots:
+            if created >= MAX_BACKFILL_PER_RUN or self._backoff.is_paused():
                 break
-            key = (chat_type, chat_id, target)
-            if self._store.get_summary(chat_type, chat_id, target):
+            key = (slot.chat_type, slot.chat_id, slot.date)
+            if self._store.get_summary(slot.chat_type, slot.chat_id, slot.date):
                 self._backoff.mark_ok(key)
                 continue
             if self._backoff.should_skip(key):
@@ -257,10 +263,10 @@ class SummaryScheduler:
             text = await summarize_chat(
                 self._store,
                 self._current_brain(),
-                chat_type,
-                chat_id,
-                target,
-                on_error=lambda exc: self._backoff.mark_failed(key, exc),
+                slot.chat_type,
+                slot.chat_id,
+                slot.date,
+                on_error=lambda exc, key=key: self._backoff.mark_failed(key, exc),
             )
             if text is None:
                 continue
