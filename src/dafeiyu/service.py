@@ -235,7 +235,8 @@ class Service:
         if msg.is_bot:
             return
 
-        # 印象抽取按消息条数触发，与是否回复无关，必须在早退分支之前调度。
+        # 印象抽取按消息条数触发，与是否回复无关，必须在早退分支之前调度；
+        # 只对群聊抽印象（私聊内容不进 impressions，也不花抽取配额）。
         self._schedule_impressions(msg)
 
         async with self._lock(msg.chat_type, msg.chat_id):
@@ -1281,6 +1282,9 @@ class Service:
             )
 
     def _schedule_impressions(self, msg: Message) -> None:
+        # 印象是「群友印象」：私聊既不落库也不消耗抽取配额。
+        if msg.chat_type != ChatType.GROUP:
+            return
         if self.impressions is None:
             return
 

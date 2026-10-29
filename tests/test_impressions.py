@@ -203,3 +203,93 @@ async def test_failure_cooldown_blocks_retry_until_expired(store: Store) -> None
     assert brain.calls == 2  # 冷却过期后允许重试
 
 
+# ---- 去重与降权 ---------------------------------------------------
+
+
+def test_nickname_keeps_only_latest_per_user(store: Store) -> None:
+    store.upsert_impression(CHAT, CHAT_ID, 456, "nickname", "外号叫鱼干", 0.7)
+    store.upsert_impression(CHAT, CHAT_ID, 123, "nickname", "外号叫鱼片", 0.8)
+    store.upsert_impression(CHAT, CHAT_ID, 123, "nickname", "外号叫小鱼", 0.6)
+
+    impressions = store.list_impressions(CHAT, CHAT_ID, topk=10)
+    mine = [im for im in impressions if im.subject_user_id == 123]
+    assert [im.content for im in mine] == ["外号叫小鱼"]
+    others = [im for im in impressions if im.subject_user_id == 456]
+    assert [im.content for im in others] == ["外号叫鱼干"]
+
+
+def test_preference_dedupes_normalized_copy(store: Store) -> None:
+    store.upsert_impression(
+        CHAT, CHAT_ID, 123, "preference", "喜欢 Coffee 。", 0.6, source_message_id="m1"
+    )
+    first = store.list_impressions(CHAT, CHAT_ID, topk=10)[0]
+
+    store.upsert_impression(
+        CHAT, CHAT_ID, 123, "preference", "喜欢coffee！", 0.9, source_message_id="m2"
+    )
+    impressions = store.list_impressions(CHAT, CHAT_ID, topk=10)
+
+    assert len(impressions) == 1
+    assert impressions[0].id == first.id  # 保留原 id，不新增行
+    assert impressions[0].confidence == 0.9  # 取较大值
+    assert impressions[0].content == "喜欢coffee！"  # 内容更新为新写法
+    assert impressions[0].source_message_id == "m2"
+
+
+def test_distinct_preferences_are_kept(store: Store) -> None:
+    store.upsert_impression(CHAT, CHAT_ID, 123, "preference", "喜欢咖啡", 0.6)
+    store.upsert_impression(CHAT, CHAT_ID, 123, "preference", "喜欢茶", 0.6)
+
+    contents = {im.content for im in store.list_impressions(CHAT, CHAT_ID, topk=10)}
+    assert contents == {"喜欢咖啡", "喜欢茶"}
+
+
+def test_stale_impression_ranks_after_fresh(store: Store) -> None:
+    store.upsert_impression(CHAT, CHAT_ID, 123, "preference", "喜欢咖啡", 0.9)
+    store.upsert_impression(CHAT, CHAT_ID, 123, "preference", "喜欢茶", 0.2)
+    stale = next(
+        im
+        for im in store.list_impressions(CHAT, CHAT_ID, topk=10)
+        if im.content == "喜欢咖啡"
+    )
+    store._conn.execute(
+        "UPDATE impressions SET last_seen_at = datetime('now', '-40 days') WHERE id = ?",
+        (stale.id,),
+    )
+    store._conn.commit()
+
+    impressions = store.list_impressions(CHAT, CHAT_ID, topk=10)
+    assert [im.content for im in impressions] == ["喜欢茶", "喜欢咖啡"]  # 降权但不删
+
+
+def test_stale_impression_still_searchable_but_ranked_last(store: Store) -> None:
+    store.upsert_impression(CHAT, CHAT_ID, 123, "preference", "喜欢咖啡", 0.9)
+    store.upsert_impression(CHAT, CHAT_ID, 123, "preference", "喜欢茶", 0.2)
+    stale = next(
+        im
+        for im in store.list_impressions(CHAT, CHAT_ID, topk=10)
+        if im.content == "喜欢咖啡"
+    )
+    store._conn.execute(
+        "UPDATE impressions SET last_seen_at = datetime('now', '-40 days') WHERE id = ?",
+        (stale.id,),
+    )
+    store._conn.commit()
+
+    results = store.search_impressions(CHAT, CHAT_ID, "喜欢", topk=10)
+    assert [im.content for im in results] == ["喜欢茶", "喜欢咖啡"]
+
+
+def test_repeat_write_refreshes_last_seen_at(store: Store) -> None:
+    store.upsert_impression(CHAT, CHAT_ID, 123, "nickname", "外号叫鱼片", 0.8)
+    store._conn.execute("UPDATE impressions SET last_seen_at = datetime('now', '-40 days')")
+    store._conn.commit()
+
+    store.upsert_impression(CHAT, CHAT_ID, 123, "nickname", "外号叫鱼片", 0.8)
+
+    row = store._conn.execute(
+        "SELECT last_seen_at >= datetime('now', '-30 days') AS fresh FROM impressions"
+    ).fetchone()
+    assert row["fresh"] == 1
+
+

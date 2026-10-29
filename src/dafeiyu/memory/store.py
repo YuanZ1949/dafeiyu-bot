@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS impressions (
     -- 来源只记最近一条同用户消息，删消息后仍能看出这条印象从哪来。
     source_message_id TEXT NOT NULL DEFAULT '',
     source_excerpt TEXT NOT NULL DEFAULT '',
+    -- 最近一次被重新观察到的时刻：排序降权用，老内容不删只靠后。
+    last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (chat_type, chat_id, subject_user_id, kind, content)
 );
@@ -171,6 +173,7 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
     "impressions": {
         "source_message_id": "TEXT NOT NULL DEFAULT ''",
         "source_excerpt": "TEXT NOT NULL DEFAULT ''",
+        "last_seen_at": "TEXT NOT NULL DEFAULT (datetime('now'))",
     },
     "usage": {
         "estimated": "INTEGER NOT NULL DEFAULT 0",
@@ -232,6 +235,20 @@ END;
 def _like_pattern(query: str) -> str:
     escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
+
+
+# 印象归一化去重时忽略的常见中英文标点（引号含全角/半角两种写法）。
+_IMPRESSION_PUNCT = frozenset("，。！？、；：“”‘’\"'（）()[]【】,.!?;:`")
+
+# 昵称有自己的唯一规则（同用户只留最新一条），不参与归一化合并。
+_NORMALIZED_KINDS = frozenset({"preference", "fact"})
+
+
+def _normalize_impression(text: str) -> str:
+    """印象去重键：去掉所有空白与常见中英文标点后转小写。"""
+    return "".join(
+        ch for ch in text if not ch.isspace() and ch not in _IMPRESSION_PUNCT
+    ).lower()
 
 
 @dataclass(frozen=True)
@@ -372,10 +389,28 @@ class Store:
                 continue
             existing = {row["name"] for row in info}
             for name, decl in columns.items():
-                if name not in existing:
+                if name in existing:
+                    continue
+                try:
                     self._conn.execute(
                         f"ALTER TABLE {table} ADD COLUMN {name} {decl}"
                     )
+                except sqlite3.OperationalError:
+                    # SQLite 的 ADD COLUMN 不接受非常量默认值（如 datetime('now')）：
+                    # 用当前时间的常量字面量重试，老行同样补成迁移时刻。
+                    constant = self._materialize_default(decl)
+                    if constant == decl:
+                        raise
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {constant}"
+                    )
+
+    def _materialize_default(self, decl: str) -> str:
+        """把 ``DEFAULT (datetime('now'))`` 换成等价的常量默认值。"""
+        if "(datetime('now'))" not in decl:
+            return decl
+        now = self._conn.execute("SELECT datetime('now')").fetchone()[0]
+        return decl.replace("(datetime('now'))", f"'{now}'")
 
     def _backfill_session_created_at(self) -> None:
         """老库的数据迁移：created_at 补列后历史行是 NULL，天数判据会一直跳过。
@@ -1176,16 +1211,50 @@ class Store:
         source_message_id: str = "",
         source_excerpt: str = "",
     ) -> None:
+        subject = subject_user_id or 0
+        if kind == "nickname":
+            # 昵称是「唯一称呼」：同一用户只留最新一条，旧行交给 DELETE 让 FTS 触发器同步。
+            self._conn.execute(
+                """
+                DELETE FROM impressions
+                WHERE chat_type = ? AND chat_id = ? AND subject_user_id = ?
+                  AND kind = 'nickname' AND content <> ?
+                """,
+                (chat_type.value, chat_id, subject, content),
+            )
+        elif kind in _NORMALIZED_KINDS:
+            # 同义写法（空白/标点/大小写差异）归一到已有行，不新增重复项。
+            rows = self._conn.execute(
+                """
+                SELECT * FROM impressions
+                WHERE chat_type = ? AND chat_id = ? AND subject_user_id = ? AND kind = ?
+                """,
+                (chat_type.value, chat_id, subject, kind),
+            ).fetchall()
+            key = _normalize_impression(content)
+            if key:
+                for row in rows:
+                    if _normalize_impression(row["content"]) == key:
+                        self._merge_impression_row(
+                            row,
+                            content,
+                            confidence,
+                            source_message_id,
+                            source_excerpt,
+                        )
+                        self._conn.commit()
+                        return
         self._conn.execute(
             """
             INSERT INTO impressions
                 (chat_type, chat_id, subject_user_id, kind, content, confidence,
-                 source_message_id, source_excerpt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 source_message_id, source_excerpt, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT (chat_type, chat_id, subject_user_id, kind, content)
             DO UPDATE SET
                 confidence = excluded.confidence,
                 updated_at = datetime('now'),
+                last_seen_at = datetime('now'),
                 source_message_id = CASE
                     WHEN excluded.source_message_id <> ''
                     THEN excluded.source_message_id
@@ -1200,7 +1269,7 @@ class Store:
             (
                 chat_type.value,
                 chat_id,
-                subject_user_id or 0,
+                subject,
                 kind,
                 content,
                 confidence,
@@ -1209,6 +1278,42 @@ class Store:
             ),
         )
         self._conn.commit()
+
+    def _merge_impression_row(
+        self,
+        row: sqlite3.Row,
+        content: str,
+        confidence: float,
+        source_message_id: str,
+        source_excerpt: str,
+    ) -> None:
+        """归一化去重命中：沿用 merge_impressions 的语义就地更新，保留原 id。"""
+        merged_content = content.strip() or row["content"]
+        self._conn.execute(
+            """
+            UPDATE impressions
+            SET content = ?,
+                confidence = ?,
+                updated_at = datetime('now'),
+                last_seen_at = datetime('now'),
+                source_message_id = CASE
+                    WHEN ? <> '' THEN ? ELSE source_message_id
+                END,
+                source_excerpt = CASE
+                    WHEN ? <> '' THEN ? ELSE source_excerpt
+                END
+            WHERE id = ?
+            """,
+            (
+                merged_content,
+                max(float(row["confidence"]), float(confidence)),
+                source_message_id,
+                source_message_id,
+                source_excerpt,
+                source_excerpt,
+                int(row["id"]),
+            ),
+        )
 
     def get_impression(self, impression_id: int) -> Impression | None:
         row = self._conn.execute(
@@ -1306,7 +1411,9 @@ class Store:
                     JOIN impressions i ON i.id = f.rowid
                     WHERE impressions_fts MATCH ?
                       AND i.chat_type = ? AND i.chat_id = ?
-                    ORDER BY bm25(impressions_fts)
+                    ORDER BY (i.last_seen_at >= datetime('now', '-30 days')) DESC,
+                             i.confidence DESC, i.updated_at DESC,
+                             bm25(impressions_fts)
                     LIMIT ?
                     """,
                     (phrase, chat_type.value, chat_id, topk),
@@ -1318,7 +1425,8 @@ class Store:
                 """
                 SELECT * FROM impressions
                 WHERE chat_type = ? AND chat_id = ? AND content LIKE ? ESCAPE '\\'
-                ORDER BY confidence DESC, updated_at DESC
+                ORDER BY (last_seen_at >= datetime('now', '-30 days')) DESC,
+                         confidence DESC, updated_at DESC
                 LIMIT ?
                 """,
                 (chat_type.value, chat_id, _like_pattern(query), topk),
@@ -1330,7 +1438,8 @@ class Store:
             """
             SELECT * FROM impressions
             WHERE chat_type = ? AND chat_id = ?
-            ORDER BY confidence DESC, updated_at DESC
+            ORDER BY (last_seen_at >= datetime('now', '-30 days')) DESC,
+                     confidence DESC, updated_at DESC
             LIMIT ?
             """,
             (chat_type.value, chat_id, topk),

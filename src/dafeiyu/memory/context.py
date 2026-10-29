@@ -18,6 +18,10 @@ SYSTEM_MAX_TOKENS = 1400
 
 IMPRESSION_HEADER = "【群友印象】"
 SUMMARY_HEADER = "【昨日摘要】"
+# 摘要注入窗口：含今天往前 3 天，最多取最新 2 条，总长共用 500 字预算。
+SUMMARY_WINDOW_DAYS = 3
+SUMMARY_MAX_ITEMS = 2
+SUMMARY_TOTAL_CHARS = 500
 
 # ---- opencode 分支的三段注入（与本地模型的 build_context 无关）----
 INJECTION_MEMORY_HEADER = "【长期记忆】"
@@ -67,10 +71,6 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     return text[:lo]
 
 
-def _yesterday(today: str) -> str:
-    return (date.fromisoformat(today) - timedelta(days=1)).isoformat()
-
-
 def _compose_system(base: str, impressions: list[str], summary: str | None) -> str:
     parts = [base]
     if impressions:
@@ -104,7 +104,9 @@ def build_context(
     impression_lines = [
         f"{imp.content}" for imp in store.list_impressions(chat_type, chat_id, impression_topk)
     ]
-    summary = store.get_summary(chat_type, chat_id, _yesterday(today))
+    summary = _recent_summary(
+        store, chat_type, chat_id, today, SUMMARY_TOTAL_CHARS
+    ) or None
 
     def total(system_text: str, msgs: list[dict[str, str]]) -> int:
         return estimate_tokens(system_text) + sum(estimate_tokens(m["content"]) for m in msgs)
@@ -143,6 +145,30 @@ def _clip(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+def _recent_summary(
+    store: Store,
+    chat_type: ChatType,
+    chat_id: int,
+    today: str,
+    max_chars: int,
+) -> str:
+    """取最近几天（含今天共 3 天）内最新的 2 条摘要，按时间正序带日期前缀渲染。"""
+    start = (
+        date.fromisoformat(today) - timedelta(days=SUMMARY_WINDOW_DAYS - 1)
+    ).isoformat()
+    rows = [
+        summary
+        for summary in store.all_summaries(chat_type, chat_id)
+        if start <= summary.date <= today
+    ]
+    if not rows:
+        return ""
+    rendered = "\n".join(
+        f"{summary.date[5:]}：{summary.content}" for summary in rows[-SUMMARY_MAX_ITEMS:]
+    )
+    return _clip(rendered, max_chars)
 
 
 def _recall_terms(text: str) -> list[str]:
@@ -218,7 +244,7 @@ def build_injection(
     recall_queries: Sequence[str] = (),
     exclude_ids: set[str] | None = None,
 ) -> str:
-    """opencode 分支的四段前缀：长期记忆 → 相关旧记忆 → 昨日摘要 → 群友印象。
+    """opencode 分支的四段前缀：长期记忆 → 相关旧记忆 → 最近几天摘要 → 群友印象。
 
     每段独立截断、空段整段省略；时间线由 timeline.build_delivery 追加在最后。
     记忆段带数据边界行：笔记是模型自己写的，下一轮又进 prompt，必须当作不可信输入。
@@ -257,9 +283,12 @@ def build_injection(
             parts.append(f"{INJECTION_RECALL_HEADER}\n{INJECTION_BOUNDARY}\n{recalled}")
 
     if cfg.inject_summaries:
-        summary = _clip(
-            store.get_summary(chat_type, chat_id, _yesterday(today)) or "",
-            cfg.summary_chars,
+        summary = _recent_summary(
+            store,
+            chat_type,
+            chat_id,
+            today,
+            min(SUMMARY_TOTAL_CHARS, max(0, cfg.summary_chars) * 2),
         )
         if summary:
             parts.append(f"{INJECTION_SUMMARY_HEADER}\n{summary}")

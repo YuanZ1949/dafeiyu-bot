@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Any
 
 from dafeiyu.brain.client import BrainError
-from dafeiyu.brain.tokens import resolve_usage
+from dafeiyu.brain.tokens import estimate_tokens, resolve_usage
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.timeutil import SHANGHAI, now_shanghai
@@ -29,6 +30,10 @@ SUMMARY_SYSTEM = """你是群聊记录整理助手。请把给定日期的一段
 
 MAX_SUMMARY_CHARS = 200
 MAX_SOURCE_LINES = 400
+# 单次请求的经验预算：整段超时就按它切成若干块分别再摘，块内还可以继续细分。
+MAX_CHUNK_TOKENS = 1200
+# 递归深度上限：切两层还超时就放弃，避免在小模型上无限重试烧配额。
+MAX_SPLIT_DEPTH = 2
 # 回补窗口：worker 每轮除了昨天，还会捡最近 7 天里漏掉的 (会话, 日期)。
 BACKFILL_DAYS = 7
 # 每轮最多补几个槽位：一次补太多会顶满当轮预算，剩下的留给下一轮。
@@ -60,6 +65,42 @@ def _is_timeout_error(exc: BaseException) -> bool:
     return isinstance(exc, BrainError) and TIMEOUT_HINT in str(exc)
 
 
+def _summary_line(message: Message) -> str:
+    """摘要专用的记录行：带上海时刻，方便模型判断先后与间隔。"""
+    stamp = datetime.fromtimestamp(message.timestamp, SHANGHAI).strftime("%H:%M")
+    return f"[{stamp}] {message.nickname}: {message.content}"
+
+
+def _source_lines(messages: list[Message]) -> list[str]:
+    """取最近 MAX_SOURCE_LINES 条；被截掉的部分用一行说明，别静默丢失。"""
+    shown = messages[-MAX_SOURCE_LINES:]
+    lines = [_summary_line(m) for m in shown]
+    hidden = len(messages) - len(shown)
+    if hidden > 0:
+        lines.insert(0, f"（更早还有 {hidden} 条未展开）")
+    return lines
+
+
+def _split_by_tokens(
+    lines: list[str], limit: int = MAX_CHUNK_TOKENS
+) -> list[list[str]]:
+    """按 token 预算贪心切块；单行超预算时也独占一块，至少保证能往下走。"""
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    used = 0
+    for line in lines:
+        cost = estimate_tokens(line)
+        if current and used + cost > limit:
+            chunks.append(current)
+            current = []
+            used = 0
+        current.append(line)
+        used += cost
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def _complete_once(
     brain, system: str, prompt: str, max_tokens: int = 600
 ) -> tuple[str, int, int, bool]:
@@ -86,35 +127,48 @@ async def _summarize_lines(
     merge_system: str,
     header: str,
     lines: list[str],
+    depth: int = 0,
 ) -> tuple[str, int, int, bool]:
-    """整段摘要；本地超时且有多行时切成两半各摘一次再合并。只切一层。"""
+    """整段摘要；本地超时就按 token 分块递归再摘，最后合并。
+
+    只在超时且还有细分空间时递归（深度上限 ``MAX_SPLIT_DEPTH``）；
+    其他异常、只剩一行、深度用尽都原样抛给调用方记失败。
+    """
     prompt = f"{header}\n" + "\n".join(lines)
     try:
         return await _complete_once(brain, system, prompt)
     except Exception as exc:  # 只有超时才走分段，其余原样抛出
-        if not _is_timeout_error(exc) or len(lines) < 2:
+        if not _is_timeout_error(exc) or len(lines) < 2 or depth >= MAX_SPLIT_DEPTH:
             raise
 
-    mid = len(lines) // 2
+    chunks = _split_by_tokens(lines)
+    if len(chunks) < 2:
+        # 行数少到装不满一个 token 预算，仍按旧逻辑对半切，给超时留一次机会。
+        mid = len(lines) // 2
+        chunks = [lines[:mid], lines[mid:]]
+
     text_parts: list[str] = []
     prompt_tokens = completion_tokens = 0
     estimated = False
-    for chunk in (lines[:mid], lines[mid:]):
-        raw, used_in, used_out, est = await _complete_once(
-            brain, system, f"{header}\n" + "\n".join(chunk)
+    for chunk in chunks:
+        raw, used_in, used_out, est = await _summarize_lines(
+            brain, system, merge_system, header, chunk, depth + 1
         )
         text_parts.append(raw.strip())
         prompt_tokens += used_in
         completion_tokens += used_out
         estimated = estimated or est
 
-    merge_prompt = f"第一段摘要：\n{text_parts[0]}\n\n第二段摘要：\n{text_parts[1]}"
+    merge_prompt = "\n\n".join(
+        f"第{index}段摘要：\n{part}"
+        for index, part in enumerate(text_parts, start=1)
+    )
     try:
         raw, used_in, used_out, est = await _complete_once(
             brain, merge_system, merge_prompt
         )
     except Exception as exc:  # noqa: BLE001 - 合并失败就退化成拼接，保住已摘的部分
-        logger.warning("摘要合并失败，退回拼接两段：%s", exc)
+        logger.warning("摘要合并失败，退回拼接各段：%s", exc)
         raw = "\n".join(part for part in text_parts if part)
     else:
         prompt_tokens += used_in
@@ -137,7 +191,7 @@ async def summarize_chat(
     if not messages:
         return ""
 
-    lines = [m.to_prompt_line() for m in messages][-MAX_SOURCE_LINES:]
+    lines = _source_lines(messages)
     header = f"日期：{date}\n以下是当天的群聊记录："
     try:
         raw, prompt_tokens, completion_tokens, estimated = await _summarize_lines(
@@ -169,7 +223,7 @@ async def summarize_for_rotation(
     """换 session 前的一次性交接摘要；失败返回空串，调用方据此放弃轮换。"""
     if not messages:
         return ""
-    lines = [m.to_prompt_line() for m in messages][-MAX_SOURCE_LINES:]
+    lines = _source_lines(messages)
     header = "以下是需要交接的对话："
     try:
         raw, prompt_tokens, completion_tokens, estimated = await _summarize_lines(
@@ -286,9 +340,9 @@ async def summary_loop(
     while not stop.is_set():
         try:
             await scheduler.run_pending()
-        except Exception:  # noqa: BLE001 - 摘要失败不能拖垮主循环
+        except Exception:
             logger.exception("摘要调度执行失败")
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass

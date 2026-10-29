@@ -78,6 +78,8 @@ def test_current_message_survives_budget(store: Store) -> None:
 def test_impressions_dropped_after_window_shrinks(store: Store) -> None:
     for i in range(3):
         add(store, i, f"消息{i}")
+    # 摘要现在最多注入 500 字，改用一条超长消息把预算撑爆，保持本用例原意。
+    add(store, 3, "长" * 3000)
     for j in range(30):
         store.upsert_impression(GROUP, CHAT, j + 100, "nickname", "肥" * 200, 0.9)
     store.upsert_summary(GROUP, CHAT, "2026-10-23", "摘" * 4000)
