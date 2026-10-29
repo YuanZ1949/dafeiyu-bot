@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ..config import BrainConfig, LocalModelConfig
+from ..config import BrainConfig, LocalModelConfig, Settings
 
 # 生成物首行的标记：配置写盘前据此判断是不是我们自己的文件。
 GENERATED_MARK = "// generated-by: dafeiyu"
@@ -386,3 +386,66 @@ def build_memory_agent(
     ]
     body = template if template.endswith("\n") else f"{template}\n"
     return "\n".join(head) + "\n\n" + body
+
+
+# 模板与源码同目录（src/dafeiyu/brain/）；仓库根是再往上三层。
+TEMPLATES_DIR = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _differs(path: Path, content: str) -> bool:
+    """写之前判断内容是否真的变了；读不出来一律当作变了。"""
+    try:
+        return path.read_text(encoding="utf-8") != content
+    except (OSError, UnicodeDecodeError):
+        return True
+
+
+def ensure_agent_files(settings: Settings, *, root: Path | None = None) -> list[str]:
+    """按当前档位重渲两个 agent 文件，返回本次被改写的文件路径。
+
+    切档时面板会写一遍 agent 文件，但下面两种情况都会让磁盘上的文件和
+    实际档位脱节：切档后进程没真正重启、或者用户直接改了
+    `config.yaml` / `settings.local.yaml` 冷启动。opencode 只认 agent 文件
+    前置区里钉住的 model，错一次就错一整个会话，所以 supervisor 启动子进程
+    之前无条件对齐一次。
+
+    - 幂等：内容一致不写盘，连续两次调用第二次返回空列表；
+    - 手改过（无生成标记）的文件由 ``write_generated`` 先备份再覆盖；
+    - agent 根目录：``root`` > ``settings.opencode.project_dir`` > 仓库根。
+    """
+    mode = settings.brain.mode
+    if mode not in SUPPORTED_MODES:
+        supported = " / ".join(SUPPORTED_MODES)
+        raise ValueError(f"不支持的大脑模式：{mode}（仅支持 {supported}）")
+
+    project_dir = str(settings.opencode.project_dir or "").strip()
+    agent_root = Path(root) if root is not None else (
+        Path(project_dir) if project_dir else REPO_ROOT
+    )
+    local = settings.local_model
+    chat_template = (TEMPLATES_DIR / "agent_template.md").read_text(encoding="utf-8")
+    memory_template = (TEMPLATES_DIR / "memory_agent_template.md").read_text(
+        encoding="utf-8"
+    )
+    chat_text = build_agent(
+        mode,
+        lean=local.lean if mode == "local_model" else False,
+        template=chat_template,
+        cfg=settings.brain,
+        local=local,
+    )
+    memory_text = build_memory_agent(
+        mode, template=memory_template, cfg=settings.brain, local=local
+    )
+
+    rewritten: list[str] = []
+    for path, content in (
+        (agent_path(agent_root), chat_text),
+        (memory_agent_path(agent_root), memory_text),
+    ):
+        changed = _differs(path, content)
+        write_generated(path, content)
+        if changed:
+            rewritten.append(str(path))
+    return rewritten

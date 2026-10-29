@@ -17,6 +17,7 @@ import aiohttp
 
 from ..brain.client import BrainError
 from ..brain.opencode import resolve_opencode_bin
+from ..brain.provider_config import ensure_agent_files
 from ..brain.runtime_config import server_env
 from ..config import ConfigError, Settings, load_settings
 from ..timeutil import now_shanghai
@@ -417,6 +418,22 @@ def _clear_pid() -> None:
         PID_PATH.unlink()
 
 
+def selfheal_agent_files(settings: Settings, logs: LogHub) -> list[str]:
+    """启动子进程前按当前档位对齐 agent 文件，返回本次改写的路径。
+
+    自愈失败只写日志、返回空列表：配置文件坏了不该让机器人起不来，
+    但要留下可查的痕迹（下次看日志能直接看到是哪个异常）。
+    """
+    try:
+        rewritten = ensure_agent_files(settings)
+    except Exception as exc:  # noqa: BLE001 - 自愈失败不该阻断启动
+        logs.write("supervisor", f"agent 文件自愈失败（{type(exc).__name__}）：{exc}")
+        return []
+    if rewritten:
+        logs.write("supervisor", "agent 文件已按当前档位刷新：" + "、".join(rewritten))
+    return rewritten
+
+
 async def run() -> int:
     settings = load_settings()
     logs = LogHub(Path(settings.logging.dir) / "supervisor")
@@ -544,6 +561,10 @@ async def run() -> int:
         tasks.append(asyncio.create_task(backup_loop(ops, settings, stop), name="backup-loop"))
 
     try:
+        # opencode 先起、bot 后起：agent 文件若还钉着上一个档位的模型，整个
+        # 会话都会用错模型（聊天错档、记忆旁路撞免费额度）。启动前按当前
+        # 档位重渲一次；失败只记日志，绝不能把机器人挡在门外。
+        selfheal_agent_files(settings, logs)
         await supervisor.start_all()
         await stop.wait()
     finally:
