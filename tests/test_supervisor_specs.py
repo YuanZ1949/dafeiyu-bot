@@ -116,3 +116,17 @@ def test_opencode_spec_without_config_home_keeps_inherited_env(tmp_path: Path) -
     env = specs["opencode"].env or {}
     assert "XDG_CONFIG_HOME" not in env
     assert "OPENCODE_CONFIG" not in env
+
+
+def test_find_napcat_pids_returns_every_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    """主进程崩溃后 worker 会留在同一目录：必须全部列出，不能只取一个。"""
+    import dafeiyu.supervisor.main as main_mod
+
+    class Result:
+        stdout = "4321\r\n8765\r\n\r\n"
+        returncode = 0
+
+    monkeypatch.setattr(main_mod.subprocess, "run", lambda *a, **k: Result())
+
+    assert main_mod.find_napcat_pids(Path("C:/napcat")) == [4321, 8765]
+    assert main_mod.find_napcat_pid(Path("C:/napcat")) == 4321

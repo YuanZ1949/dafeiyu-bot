@@ -95,12 +95,21 @@ def _eprint(message: str) -> None:
 
 def find_napcat_pid(directory: Path = NAPCAT_DIR) -> int | None:
     """NapCat 是 node.exe，用命令行是否包含安装目录来认，端口认不出来。"""
+    pids = find_napcat_pids(directory)
+    return pids[0] if pids else None
+
+
+def find_napcat_pids(directory: Path = NAPCAT_DIR) -> list[int]:
+    """列出安装目录下的所有 node 进程（主进程 + worker）。
+
+    主进程崩溃后 worker 会留下来继续占着 QQ 登录态，只认「第一个」不够用。
+    """
     if os.name != "nt":
-        return None
+        return []
     script = (
         "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
         f"Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('{directory}') }} | "
-        "Select-Object -First 1 -ExpandProperty ProcessId"
+        "Select-Object -ExpandProperty ProcessId"
     )
     try:
         result = subprocess.run(
@@ -108,16 +117,20 @@ def find_napcat_pid(directory: Path = NAPCAT_DIR) -> int | None:
             capture_output=True,
             text=True,
             timeout=20,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
-    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
-    if not lines:
-        return None
-    try:
-        return int(lines[-1])
-    except ValueError:
-        return None
+        return []
+    pids: list[int] = []
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pids.append(int(line))
+        except ValueError:
+            continue
+    return pids
 
 
 def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
@@ -191,6 +204,9 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
         cwd=str(NAPCAT_DIR),
         env=napcat_env or None,
         creationflags=CREATE_NO_WINDOW,
+        # 主进程被 NapCat 自己的 kill EPERM 打崩后，worker 会继续占着 QQ 登录态；
+        # 不先清掉，新实例只会报「当前账号已登录，无法重复登录」然后卡住。
+        sweep_pids=lambda: find_napcat_pids(NAPCAT_DIR),
     )
     return specs
 

@@ -141,6 +141,49 @@ async def test_unknown_process_raises(tmp_path: Path) -> None:
         await supervisor.start("nope")
 
 
+async def test_start_sweeps_leftover_processes(tmp_path: Path, monkeypatch) -> None:
+    """NapCat 主进程崩溃后 worker 会占着登录态：启动前必须清掉。"""
+    import dafeiyu.supervisor.manager as manager_mod
+
+    killed: list[int] = []
+
+    async def fake_kill_tree(pid: int) -> bool:
+        killed.append(pid)
+        return True
+
+    monkeypatch.setattr(manager_mod, "_kill_tree", fake_kill_tree)
+    specs = {
+        "napcat": ProcSpec(
+            "napcat",
+            [sys.executable, "-u", "-c", SLEEPER],
+            sweep_pids=lambda: [4321, 8765],
+        )
+    }
+    supervisor, hub = make_supervisor(tmp_path, specs)
+    await supervisor.start("napcat")
+
+    assert killed == [4321, 8765]
+    logs = hub.tail("napcat")
+    assert any("清理残留进程 pid=4321" in line for line in logs)
+    await supervisor.stop("napcat")
+
+
+async def test_sweep_failure_does_not_block_start(tmp_path: Path, monkeypatch) -> None:
+    import dafeiyu.supervisor.manager as manager_mod
+
+    def boom() -> list[int]:
+        raise OSError("powershell 挂了")
+
+    specs = {
+        "x": ProcSpec("x", [sys.executable, "-u", "-c", SLEEPER], sweep_pids=boom)
+    }
+    supervisor, hub = make_supervisor(tmp_path, specs)
+    await supervisor.start("x")
+
+    assert any("扫描残留进程失败" in line for line in hub.tail("x"))
+    await supervisor.stop("x")
+
+
 async def test_stop_all_marks_everything_stopped(tmp_path: Path) -> None:
     specs = {
         "a": ProcSpec("a", [sys.executable, "-c", SLEEPER]),

@@ -37,6 +37,9 @@ class ProcSpec:
     env: dict[str, str] | None = None
     ready_url: str = ""
     creationflags: int = 0
+    # 启动前先清掉同目录的残留进程（NapCat 的 worker 会在主进程崩溃后
+    # 继续占着 QQ 登录态，新实例只会报「当前账号已登录，无法重复登录」）。
+    sweep_pids: Callable[[], list[int]] | None = None
 
 
 @dataclass
@@ -121,6 +124,8 @@ class Supervisor:
         state.manual_stop = False
         state.status = STARTING
         spec = state.spec
+        if spec.sweep_pids is not None:
+            await self._sweep(name, spec.sweep_pids)
         env = dict(os.environ)
         if spec.env:
             env.update(spec.env)
@@ -154,6 +159,19 @@ class Supervisor:
                 raise RuntimeError(f"{name} 未在 {self.ready_timeout:.0f}s 内就绪")
         state.status = READY
         state.watcher = asyncio.create_task(self._watch(state))
+
+    async def _sweep(self, name: str, finder: Callable[[], list[int]]) -> None:
+        """启动前清理同目录残留进程；finder 是同步调用（可能跑 powershell）。"""
+        try:
+            pids = await asyncio.to_thread(finder)
+        except Exception as exc:  # noqa: BLE001 - 扫不到就当没有残留
+            self.logs.write(name, f"扫描残留进程失败：{exc.__class__.__name__}")
+            return
+        for pid in pids or []:
+            if pid == os.getpid():
+                continue
+            await _kill_tree(pid)
+            self.logs.write(name, f"清理残留进程 pid={pid}（启动前）")
 
     async def _wait_ready(self, state: ProcState) -> bool:
         deadline = time.monotonic() + self.ready_timeout
