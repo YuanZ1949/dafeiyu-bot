@@ -1324,6 +1324,37 @@ class BrainControl:
             },
         }
 
+    def memory_health(self) -> dict[str, Any]:
+        """记忆链路体检：最近几天有缺口、最近一条摘要、是否熔断。
+
+        摘要 worker 只补「昨天」，缺口平时只出现在日志里。这里把缺口做成
+        只读数据给面板，看板一眼就能判断「记忆是不是落后了」。
+        """
+        pending = self.store.pending_summary_days()
+        latest = self.store.recent_summaries(1, 0)
+        quota_until = self.store.load_backoff().get(QUOTA_KEY)
+        quota_paused = bool(quota_until and float(quota_until) > time.time())
+        last = latest[0] if latest else None
+        return {
+            "ok": not pending and not quota_paused,
+            "pending_days": pending,
+            "pending_count": len(pending),
+            "summary_total": self.store.count_summaries(),
+            "impression_total": self.store.count_impressions(),
+            "last_summary": None
+            if last is None
+            else {
+                "chat_type": last.chat_type.value,
+                "chat_id": last.chat_id,
+                "date": last.date,
+                "updated_at": last.updated_at,
+            },
+            "quota": {
+                "paused": quota_paused,
+                "until": float(quota_until) if quota_paused else None,
+            },
+        }
+
     async def list_models(self) -> list[str]:
         """探测本机 LM Studio 的模型列表；默认行为保持不变（409/504/502）。"""
         base = normalize_base_url(self.settings.local_model.base_url)
@@ -1853,6 +1884,15 @@ def create_app(
                 {"error": f"读取记忆失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def memory_health(request: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.memory_health())
+        except Exception as exc:  # 体检读库失败同样不能把控制口打挂
+            log.warning("读取记忆健康失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取记忆健康失败：{exc.__class__.__name__}"}, status=500
+            )
+
     async def post_summary(request: web.Request) -> web.Response:
         if memory_actions is None:
             return web.json_response({"error": "记忆操作未启用"}, status=503)
@@ -2261,6 +2301,7 @@ def create_app(
     app.router.add_get("/api/brain/models", models)
     app.router.add_post("/api/debug/trigger", debug_trigger)
     app.router.add_get("/api/memory", memory)
+    app.router.add_get("/api/memory/health", memory_health)
     app.router.add_post("/api/memory/summaries", post_summary)
     app.router.add_post("/api/memory/impressions", post_impressions)
     app.router.add_patch(

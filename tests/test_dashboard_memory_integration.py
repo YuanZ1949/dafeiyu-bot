@@ -139,6 +139,14 @@ async def test_dashboard_memory_reads_seeded_store_end_to_end(tmp_path: Path) ->
         private = await resp.json()
         assert [s["content"] for s in private["summaries"]] == ["私聊聊了晚饭"]
         assert private["impressions"] == []
+
+        # 记忆体检也走同一条代理链路：只有摘要、没有消息，因此没有缺口。
+        resp = await dash_client.get("/api/memory/health")
+        health = await resp.json()
+        assert resp.status == 200
+        assert health["ok"] is True
+        assert health["pending_count"] == 0
+        assert health["last_summary"]["date"] == "2026-10-24"
     finally:
         if dash_client is not None:
             await dash_client.close()

@@ -642,6 +642,7 @@
       <button class="btn" id="btn-more-memory">显示更多</button>
       <button class="btn" id="btn-refresh-memory">刷新</button>
     </div>
+    <div class="kv" id="memory-health" role="status" aria-live="polite"></div>
     <div class="mem-grid">
       <div class="mem-col">
         <h3>按日摘要</h3>
@@ -909,6 +910,8 @@ let sessionsTotal = 0;
 let usageDays = 7;
 let healthQuotaPaused = false;
 let healthReadFailed = false;
+// 最近 7 天缺摘要的天数：由记忆体检接口写入，顶部横幅据此提醒。
+let memoryPendingDays = 0;
 let lastQrKey = "";
 
 const $ = (id) => document.getElementById(id);
@@ -1339,6 +1342,7 @@ function renderGlobalBanner(data) {
   const napcat = data.napcat || {};
   if (napcat.offline) reasons.push("QQ 账号半离线：消息只进历史，不推送给群成员");
   if (healthQuotaPaused) reasons.push("配额暂停中，摘要与印象抽取已暂停");
+  if (memoryPendingDays > 0) reasons.push(`记忆摘要落后 ${memoryPendingDays} 天`);
   if (healthReadFailed) reasons.push("健康数据读取失败，上方状态可能不是最新的");
   const banner = $("global-banner");
   banner.textContent = reasons.length ? `注意：${reasons.join("；")}` : "";
@@ -1889,6 +1893,43 @@ async function loadMemory() {
     $("memory-hint").textContent = `读取失败：${err.message}`;
     $("btn-more-memory").disabled = memoryLimit >= memoryPageMax;
   }
+  loadMemoryHealth();
+}
+
+// 记忆体检：摘要缺口与熔断原因。列表读取失败时也要能单独看到这一行，
+// 所以不复用 loadMemory 的 try，自己兜住错误。
+async function loadMemoryHealth() {
+  const box = $("memory-health");
+  try {
+    const h = await api("/api/memory/health");
+    const parts = [];
+    if (h.quota && h.quota.paused) {
+      const until = Number(h.quota.until);
+      parts.push(
+        Number.isFinite(until) && until > 0
+          ? `配额熔断中（至 ${new Date(until * 1000).toLocaleString()}）`
+          : "配额熔断中",
+      );
+    }
+    if (h.pending_count > 0) {
+      parts.push(`最近 ${h.pending_count} 天缺摘要：${(h.pending_days || []).join("、")}`);
+    } else {
+      parts.push("最近 7 天摘要齐全");
+    }
+    if (h.last_summary) {
+      const last = h.last_summary;
+      parts.push(`最近摘要 ${last.date}（${last.chat_type} ${last.chat_id}）`);
+    } else {
+      parts.push("还没有任何摘要");
+    }
+    box.textContent = parts.join(" · ");
+    box.style.color = h.ok ? "" : "var(--warn)";
+    memoryPendingDays = Number(h.pending_count) || 0;
+  } catch (err) {
+    box.textContent = `记忆健康读取失败：${err.message}`;
+    box.style.color = "var(--warn)";
+  }
+  if (state) renderGlobalBanner(state);
 }
 
 function memoryTarget() {

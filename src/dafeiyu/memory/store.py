@@ -5,10 +5,11 @@ import json
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from dafeiyu.models import ChatType, Impression, Message, Summary
-from dafeiyu.timeutil import today_shanghai
+from dafeiyu.timeutil import SHANGHAI, today_shanghai
 
 # dashboard 只读面板单页上限，接口层同样按这个值校验。
 MAX_MEMORY_PAGE = 200
@@ -1393,6 +1394,33 @@ class Store:
             f"SELECT COUNT(*) AS total FROM summaries {scope}", params
         ).fetchone()
         return int(row["total"] or 0)
+
+    def pending_summary_days(self, days: int = 7) -> list[str]:
+        """最近 `days` 天里有消息、却没有对应摘要的日期（升序）。
+
+        「有缺口」按 (会话, 日期) 判定：同一天两个群，只有一个群生成了
+        摘要，这天仍算没补完。只读、无副作用，供面板体检用。
+        """
+        window = max(1, min(int(days), 90))
+        start = datetime.strptime(self.today(), "%Y-%m-%d").replace(tzinfo=SHANGHAI)
+        start -= timedelta(days=window - 1)
+        start_ts = int(start.timestamp())
+        end_ts = int((start + timedelta(days=window)).timestamp())
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT
+                   strftime('%Y-%m-%d', m.timestamp, 'unixepoch', '+8 hours') AS day
+            FROM messages AS m
+            LEFT JOIN summaries AS s
+              ON s.chat_type = m.chat_type
+             AND s.chat_id = m.chat_id
+             AND s.date = strftime('%Y-%m-%d', m.timestamp, 'unixepoch', '+8 hours')
+            WHERE m.timestamp >= ? AND m.timestamp < ? AND s.date IS NULL
+            ORDER BY day
+            """,
+            (start_ts, end_ts),
+        ).fetchall()
+        return [str(row["day"]) for row in rows]
 
     def recent_summaries(
         self,

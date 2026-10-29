@@ -46,6 +46,14 @@ def read_html() -> str:
     return HTML_PATH.read_text(encoding="utf-8")
 
 
+def test_html_shows_memory_health_line() -> None:
+    """记忆卡要有一行体检：缺口天数、最近摘要、熔断原因。"""
+    html = read_html()
+    assert 'id="memory-health"' in html
+    assert "/api/memory/health" in html
+    assert "记忆摘要落后" in html
+
+
 def test_html_has_three_mode_cards() -> None:
     html = read_html()
     for mode in ("free", "key", "local_model"):

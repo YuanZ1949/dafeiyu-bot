@@ -690,6 +690,9 @@ def create_app(
     async def memory_search(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/memory/search")
 
+    async def memory_health(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/memory/health")
+
     async def sessions(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/sessions")
 
@@ -1055,6 +1058,7 @@ def create_app(
     app.router.add_get("/api/usage", usage)
     app.router.add_get("/api/budget", budget)
     app.router.add_get("/api/memory/search", memory_search)
+    app.router.add_get("/api/memory/health", memory_health)
     app.router.add_get("/api/memory/export", memory_export)
     app.router.add_get("/api/sessions", sessions)
     app.router.add_post("/api/debug/trigger", debug_trigger)
