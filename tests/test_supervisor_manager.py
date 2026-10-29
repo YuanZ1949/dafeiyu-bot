@@ -38,16 +38,41 @@ def make_supervisor(
     return supervisor, hub
 
 
+async def wait_for_log_line(
+    hub: LogHub,
+    source: str,
+    needle: str,
+    timeout: float = 5.0,
+    interval: float = 0.02,
+) -> list[str]:
+    """轮询等待某行进入日志环，返回最后一次 tail 的内容。
+
+    子进程冷启动（解释器加载）在 CI / 本机上可能远超 0.4s，固定 sleep 会
+    在行还没读到时取样。这里只去掉对固定时长的依赖，断言本身不变。
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        lines = hub.tail(source)
+        if any(needle in line for line in lines):
+            return lines
+        if loop.time() >= deadline:
+            return lines
+        await asyncio.sleep(interval)
+
+
 async def test_start_streams_output_and_stop(tmp_path: Path) -> None:
     specs = {"sleeper": ProcSpec("sleeper", [sys.executable, "-u", "-c", SLEEPER])}
     supervisor, hub = make_supervisor(tmp_path, specs)
     await supervisor.start("sleeper")
     try:
-        await asyncio.sleep(0.4)
+        lines = await wait_for_log_line(hub, "sleeper", "ready-line")
         state = supervisor.states["sleeper"]
-        assert state.status == READY
-        assert any("ready-line" in line for line in hub.tail("sleeper"))
-        assert supervisor.status()[0]["pid"] == state.proc.pid
+        context = f"status={state.status!r} tail={lines!r}"
+        assert state.status == READY, context
+        assert any("ready-line" in line for line in lines), context
+        assert state.proc is not None, context
+        assert supervisor.status()[0]["pid"] == state.proc.pid, context
     finally:
         await supervisor.stop("sleeper")
 
