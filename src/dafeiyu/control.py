@@ -1061,7 +1061,14 @@ class BrainControl:
                         "has_key": local_has_key,
                     },
                 }
-                self.runtime = self.runtime.with_provider(provider, "")
+                runtime = self.runtime
+                if mode == "local_model":
+                    # 面板刚选的本地模型必须写回运行时：就绪判定只读 runtime 与
+                    # 配置，不写回的话 modes[] 会继续报「未选择模型」，与同一份
+                    # 快照里的 model 字段自相矛盾，前端会把本地档置灰。
+                    runtime = runtime.with_provider("local_model", local_cfg.model)
+                # 三档的 provider 都是 opencode；上面的本地模型记忆必须保留。
+                self.runtime = runtime.with_provider(provider, "")
                 try:
                     save_runtime(self.runtime, self.runtime_path)
                 except OSError as exc:

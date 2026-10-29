@@ -6,6 +6,7 @@ import re
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -102,6 +103,47 @@ async def test_snapshot_lists_three_modes(tmp_path: Path) -> None:
     assert by_id["opencode"]["ready"] is False
     assert "server_url" in by_id["opencode"]["reason"]
     assert by_id["local_model"]["ready"] is False  # 还没选模型
+
+
+async def test_switch_to_local_model_marks_mode_ready(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """切到本地档后 modes[] 必须跟着就绪：同一份快照不能自相矛盾。"""
+    monkeypatch.setattr(
+        control_module, "OVERRIDES_PATH", tmp_path / "settings.local.yaml"
+    )
+    monkeypatch.setattr(control_module, "CLOSE_DELAY_SECONDS", 0.01)
+    control, _, app = make_control(tmp_path)
+    # 生成物落在 tmp_path，重建 brain 也不碰真实 SSL/网络：本用例只看快照口径。
+    control.settings = replace(
+        control.settings,
+        opencode=replace(
+            control.settings.opencode,
+            config_home=str(tmp_path / "config-home"),
+            project_dir=str(tmp_path / "project"),
+        ),
+    )
+    monkeypatch.setattr(
+        control_module, "build_brain", lambda *args, **kwargs: FakeBrain()
+    )
+
+    async with running(app) as client:
+        resp = await client.post(
+            "/api/brain",
+            json={
+                "mode": "local_model",
+                "force": True,
+                "local": {"base_url": "http://127.0.0.1:1/v1", "model": "m1"},
+            },
+        )
+        assert resp.status == 200
+        snap = await (await client.get("/api/brain")).json()
+
+    by_id = {m["id"]: m for m in snap["modes"]}
+    assert by_id["local_model"]["ready"] is True
+    assert by_id["local_model"]["reason"] == ""
+    # 既有的 model 前缀口径不能被写回动作破坏。
+    assert snap["model"] == "dafeiyu-local/m1"
 
 
 def test_local_model_mode_stays_ready_after_switching_away() -> None:
