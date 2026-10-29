@@ -6,11 +6,11 @@ model: opencode/deepseek-v4.1-flash-free
 # 只做一件事：把输入压成摘要或抽成画像。单步防止它自己发起工具调用。
 steps: 1
 permissions:
-  # 通配 deny 放最前，后面不开任何例外：这个 agent 不该碰文件、网络或子 agent。
   - action: "*"
     resource: "*"
     effect: deny
 ---
+<!-- generated-by: dafeiyu -->
 
 # 你是记忆整理器
 

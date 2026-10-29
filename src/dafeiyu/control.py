@@ -30,7 +30,9 @@ from .brain.provider_config import (
     agent_path,
     build_agent,
     build_config,
+    build_memory_agent,
     config_path,
+    memory_agent_path,
     render_config,
     write_generated,
 )
@@ -90,6 +92,10 @@ BRAIN_PROBE_TIMEOUT = 8.0
 FREE_PROBE_READY_TIMEOUT = 1.0
 # 人设正文的唯一来源：provider_config 只替换前置区，正文原样搬运。
 AGENT_TEMPLATE_PATH = Path(__file__).resolve().parent / "brain" / "agent_template.md"
+# 记忆旁路 agent 的正文；与聊天 agent 分开，模型随档位一起生成。
+MEMORY_AGENT_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent / "brain" / "memory_agent_template.md"
+)
 # 用户可见的三档，错误文案与 provider_config 共用同一份定义。
 BRAIN_MODE_LABEL = " / ".join(SUPPORTED_MODES)
 
@@ -1074,12 +1080,19 @@ class BrainControl:
                 template = AGENT_TEMPLATE_PATH.read_text(encoding="utf-8")
             except OSError as exc:
                 raise SwitchError(500, "agent 模板读取失败，未做任何写入") from exc
+            try:
+                memory_template = MEMORY_AGENT_TEMPLATE_PATH.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise SwitchError(500, "记忆 agent 模板读取失败，未做任何写入") from exc
             agent_text = build_agent(
                 mode,
                 lean=local_cfg.lean if mode == "local_model" else False,
                 template=template,
                 cfg=cfg,
                 local=local_cfg,
+            )
+            memory_agent_text = build_memory_agent(
+                mode, template=memory_template, cfg=cfg, local=local_cfg
             )
 
             # 两档各写各的密钥文件：key → provider.key，local → provider-local.key。
@@ -1115,6 +1128,12 @@ class BrainControl:
                 )
                 backed_up = (
                     write_generated(agent_path(agent_root), agent_text) or backed_up
+                )
+                backed_up = (
+                    write_generated(
+                        memory_agent_path(agent_root), memory_agent_text
+                    )
+                    or backed_up
                 )
             except OSError as exc:
                 # 覆盖层已落盘但生成物没写成：恢复上一版覆盖层与密钥，别把

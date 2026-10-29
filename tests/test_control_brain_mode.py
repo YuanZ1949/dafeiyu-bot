@@ -18,7 +18,7 @@ from conftest import TEST_CONFIG_YAML
 from dafeiyu import config as config_mod
 from dafeiyu import control as control_mod
 from dafeiyu import secrets_store
-from dafeiyu.brain.provider_config import agent_path, config_path
+from dafeiyu.brain.provider_config import agent_path, config_path, memory_agent_path
 from dafeiyu.config import load_settings
 from dafeiyu.control import BrainControl, SwitchError, create_app
 from dafeiyu.memory.store import Store
@@ -182,6 +182,31 @@ async def test_invalid_mode_returns_400(control: BrainControl) -> None:
         await control.switch_mode({"mode": "local"})
     assert exc.value.status == 400
     assert "local_model" in exc.value.reason
+
+async def test_switch_keeps_memory_agent_on_same_model(
+    tmp_path: Path, monkeypatch, control: BrainControl
+) -> None:
+    """摘要/印象走的是 memory agent，它的模型必须跟着档位走。"""
+    monkeypatch.setattr(control_mod, "OVERRIDES_PATH", tmp_path / "settings.local.yaml")
+    await control.switch_mode(
+        {
+            "mode": "key",
+            "key": {
+                "base_url": "https://api.x/v1",
+                "model": "m",
+                "api_key": "sk-test-123456",
+            },
+        }
+    )
+    memory_file = memory_agent_path(Path(control.settings.opencode.project_dir))
+    text = memory_file.read_text(encoding="utf-8")
+    assert "model: dafeiyu-key/m" in text
+    assert "steps: 1" in text
+    assert "flash-free" not in text
+
+    await control.switch_mode({"mode": "free"})
+    free_text = memory_file.read_text(encoding="utf-8")
+    assert "model: opencode/deepseek-v4.1-flash-free" in free_text
 
 
 async def test_failed_probe_leaves_no_partial_write(

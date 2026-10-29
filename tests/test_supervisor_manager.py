@@ -152,6 +152,86 @@ async def test_stop_all_marks_everything_stopped(tmp_path: Path) -> None:
     assert [p["status"] for p in supervisor.status()] == [STOPPED, STOPPED]
 
 
+class _StubbornProc:
+    """不肯优雅退出的子进程：terminate() 无效，wait() 一直挂着。"""
+
+    def __init__(self, pid: int = 4321) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+        self.terminated = False
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    async def wait(self) -> int:
+        while self.returncode is None:
+            await asyncio.sleep(0.01)
+        return self.returncode
+
+    def die(self) -> None:
+        self.returncode = -9
+
+
+def _stubborn_state(supervisor: Supervisor, proc: _StubbornProc):
+    from dafeiyu.supervisor.manager import ProcState
+
+    state = ProcState("napcat", ProcSpec("napcat", [sys.executable, "-c", SLEEPER]))
+    state.proc = proc
+    state.status = READY
+    supervisor.states["napcat"] = state
+    return state
+
+
+async def test_terminate_retries_kill_tree_after_eperm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NapCat 的 worker 收尾时会 EPERM：第一次 kill 失败要再试一次。"""
+    import dafeiyu.supervisor.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "STOP_TIMEOUT", 0.01)
+    monkeypatch.setattr(manager_mod, "KILL_WAIT_TIMEOUT", 0.05)
+    supervisor, hub = make_supervisor(tmp_path, {})
+    proc = _StubbornProc()
+    state = _stubborn_state(supervisor, proc)
+    attempts: list[int] = []
+
+    async def fake_kill_tree(pid: int) -> bool:
+        attempts.append(pid)
+        if len(attempts) == 1:
+            return False  # 第一次 EPERM
+        proc.die()
+        return True
+
+    monkeypatch.setattr(manager_mod, "_kill_tree", fake_kill_tree)
+    await supervisor._terminate(state)
+
+    assert attempts == [4321, 4321]
+    logs = hub.tail("napcat")
+    assert any("强制结束进程树" in line for line in logs)
+    assert not any("强制结束失败" in line for line in logs)
+
+
+async def test_terminate_logs_残留进程_when_kill_keeps_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dafeiyu.supervisor.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "STOP_TIMEOUT", 0.01)
+    monkeypatch.setattr(manager_mod, "KILL_WAIT_TIMEOUT", 0.01)
+    supervisor, hub = make_supervisor(tmp_path, {})
+    proc = _StubbornProc()
+    state = _stubborn_state(supervisor, proc)
+
+    async def fake_kill_tree(pid: int) -> bool:
+        return False
+
+    monkeypatch.setattr(manager_mod, "_kill_tree", fake_kill_tree)
+    await supervisor._terminate(state)
+
+    logs = hub.tail("napcat")
+    assert any("强制结束失败（pid=4321）" in line for line in logs)
+
+
 def test_port_owner_returns_none_for_free_port() -> None:
     # 端口 1 在本地不会有人监听
     assert port_owner(1) is None

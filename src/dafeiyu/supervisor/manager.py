@@ -16,6 +16,8 @@ from .logs import LogHub
 log = logging.getLogger(__name__)
 
 STOP_TIMEOUT = 5.0
+# taskkill 之后等进程真正退出的上限：Windows 上 /F 发出信号到进程消失有延迟。
+KILL_WAIT_TIMEOUT = 5.0
 HEALTHY_UPTIME = 30.0
 
 READY = "running"
@@ -232,14 +234,31 @@ class Supervisor:
         proc = state.proc
         if proc is None or proc.returncode is not None:
             return
+        pid = proc.pid
         with contextlib.suppress(OSError):
             proc.terminate()
         try:
             await asyncio.wait_for(proc.wait(), timeout=STOP_TIMEOUT)
+            return
         except asyncio.TimeoutError:
-            await _kill_tree(proc.pid)
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            self.logs.write(
+                state.name,
+                f"{STOP_TIMEOUT:.0f}s 内未退出（pid={pid}），强制结束进程树",
+            )
+        # 第一次 taskkill 失败常见于 NapCat：它的 worker 正在自己收尾，
+        # 这时 /F 会拿到 EPERM。隔一秒再试一次，别让残留进程占着 QQ 登录态。
+        for attempt in (1, 2):
+            if await _kill_tree(pid):
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=KILL_WAIT_TIMEOUT)
+            if proc.returncode is not None:
+                return
+            if attempt == 1:
+                await asyncio.sleep(1.0)
+        self.logs.write(
+            state.name,
+            f"强制结束失败（pid={pid}），残留进程可能占着端口或 QQ 登录态",
+        )
 
     async def restart(self, name: str) -> None:
         await self.stop(name)
@@ -415,11 +434,13 @@ def _find_listener_pid(port: int) -> int | None:
     return None
 
 
-async def _kill_tree(pid: int) -> None:
+async def _kill_tree(pid: int) -> bool:
+    """强制结束进程树；返回 taskkill 是否成功（失败由调用方决定要不要再试）。"""
     if os.name != "nt":
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, 9)
-        return
+            return True
+        return False
     try:
         proc = await asyncio.create_subprocess_exec(
             "taskkill", "/PID", str(pid), "/T", "/F",
@@ -428,4 +449,5 @@ async def _kill_tree(pid: int) -> None:
         )
         await proc.wait()
     except OSError:
-        pass
+        return False
+    return proc.returncode == 0

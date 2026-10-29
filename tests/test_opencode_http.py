@@ -338,6 +338,55 @@ async def test_forget_clears_stored_session(store: Store) -> None:
     assert not store.get_opencode_session(ChatType.PRIVATE, 42)
 
 
+async def test_forget_treats_empty_delete_body_as_success(store: Store) -> None:
+    """opencode 的 DELETE 回 204 空 body：不能当成「返回的不是 JSON」而失败。"""
+    store.set_opencode_session(ChatType.PRIVATE, 42, "ses_old")
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(204)
+
+    brain = OpenCodeHttpBrain(
+        base_url="http://opencode.test",
+        store=store,
+        password="pw",
+        agent="deepseek-qq",
+        timeout=2.0,
+        transport=httpx.MockTransport(handler),
+    )
+    await brain.forget(ChatType.PRIVATE, 42)
+    await brain.aclose()
+
+    assert [r.method for r in seen] == ["DELETE"]
+    assert not store.get_opencode_session(ChatType.PRIVATE, 42)
+
+
+async def test_forget_clears_mapping_even_if_remote_delete_fails(
+    store: Store, caplog: pytest.LogCaptureFixture
+) -> None:
+    """远端删不掉也必须清映射：否则下一轮又把该忘的 session 接回来。"""
+    store.set_opencode_session(ChatType.PRIVATE, 42, "ses_old")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"message": "boom"})
+
+    brain = OpenCodeHttpBrain(
+        base_url="http://opencode.test",
+        store=store,
+        password="pw",
+        agent="deepseek-qq",
+        timeout=2.0,
+        transport=httpx.MockTransport(handler),
+    )
+    with caplog.at_level("WARNING"):
+        await brain.forget(ChatType.PRIVATE, 42)
+    await brain.aclose()
+
+    assert not store.get_opencode_session(ChatType.PRIVATE, 42)
+    assert "仍清空映射" in caplog.text
+
+
 # ---- 解析层：三种真实损坏都要能救回来 --------------------------------
 
 

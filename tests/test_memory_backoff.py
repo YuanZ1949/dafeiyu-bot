@@ -188,6 +188,43 @@ def test_rate_limit_detection() -> None:
     assert not is_rate_limit_error(None)
 
 
+def test_free_limit_is_treated_as_quota() -> None:
+    """opencode 免费档的额度耗尽文案不含 "quota"，只按 429 处理会每 10 分钟撞一次。"""
+    from dafeiyu.workers.failure import is_quota_error
+
+    assert is_quota_error(
+        BrainError(
+            "OpenCode 调用失败（provider.free-limit）：Free usage limit reached. "
+            "Connect a provider or subscribe to OpenCode Go to keep going",
+            status=429,
+        )
+    )
+    assert is_quota_error(BrainError("insufficient credit"))
+    assert is_quota_error(BrainError("provider.quota: 额度已用完"))
+    assert not is_quota_error(BrainError("HTTP 429 rate limit"))
+    assert not is_quota_error(BrainError("network down"))
+    assert not is_quota_error(None)
+
+
+def test_free_limit_pauses_every_chat_for_an_hour() -> None:
+    """账号级额度耗尽：一次失败就该全局停，而不是单会话短歇 5 分钟。"""
+    clock = Clock()
+    backoff = FailureBackoff(monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall)
+
+    backoff.mark_failed(
+        (ChatType.GROUP, 1),
+        BrainError("provider.free-limit: Free usage limit reached", status=429),
+    )
+
+    assert backoff.is_paused()
+    assert backoff.should_skip((ChatType.PRIVATE, 9))
+    clock.advance(QUOTA_PAUSE_SECONDS - 1)
+    assert backoff.is_paused()
+    clock.advance(2)
+    assert not backoff.is_paused()
+
+
+
 def test_single_429_only_cools_that_chat() -> None:
     clock = Clock()
     backoff = FailureBackoff(monotonic=lambda: clock.mono, wall_clock=lambda: clock.wall)

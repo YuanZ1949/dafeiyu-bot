@@ -169,13 +169,19 @@ class OpenCodeHttpBrain:
         await self._client.aclose()
 
     async def forget(self, chat_type: ChatType, chat_id: int) -> None:
-        """删掉远端 session 再清映射：/forget 之后不该留下可被翻出来的历史。"""
+        """删掉远端 session 再清映射：/forget 之后不该留下可被翻出来的历史。
+
+        映射一定清：远端删失败（网络、服务端异常）时若留着映射，下一轮会把
+        本该被忘掉的 session 接回来，等于 /forget 失效。
+        """
         session_id = self.store.get_opencode_session(chat_type, chat_id)
         if session_id:
             try:
                 await self._request("DELETE", f"/api/session/{session_id}")
             except _UnknownSession:
                 pass  # 远端已经没有了，映射照样清
+            except BrainError as exc:
+                log.warning("删除 opencode 会话失败，仍清空映射：%s", exc)
         self.store.clear_opencode_session(chat_type, chat_id)
 
     def reset_session(self, chat_type: ChatType, chat_id: int) -> None:
@@ -531,6 +537,10 @@ class OpenCodeHttpBrain:
                 f"OpenCode 服务不可达：{exc.__class__.__name__}"
             ) from exc
         self._check_response(response)
+        # 204 / 空 body 是正常响应（DELETE /api/session 就是 204）：没有正文
+        # 不代表出错，按空对象处理，否则「彻底删除会话」永远失败。
+        if response.status_code == 204 or not response.content:
+            return {}
         try:
             payload = response.json()
         except ValueError as exc:

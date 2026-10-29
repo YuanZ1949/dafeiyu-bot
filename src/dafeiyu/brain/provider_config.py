@@ -16,6 +16,9 @@ AGENT_MARK = "<!-- generated-by: dafeiyu -->"
 # 判定「是不是生成物」时扫描的行数上限：只覆盖前置区，不扫正文。
 AGENT_MARK_SCAN_LINES = 120
 AGENT_DESCRIPTION = "Deepseek娘 QQ 群聊人格（可联网查证、可在自己的工作区记笔记）"
+# 记忆旁路（摘要/印象）用的 agent：与聊天 agent 分开，只做单步文本整理。
+MEMORY_AGENT_NAME = "dafeiyu-memory"
+MEMORY_AGENT_DESCRIPTION = "记忆旁路专用（摘要/印象），单步、无工具、只输出纯文本或 JSON"
 # lean 档收尾：模型这一轮没有工具，得让人设自己知道，别去试。
 AGENT_LEAN_NOTE = (
     "（本轮没有工具：不要读文件、不要查网页、不要调用任何工具，直接回话。）"
@@ -339,3 +342,47 @@ def write_generated(path: Path, content: str) -> bool:
 def agent_path(root: Path) -> Path:
     """bot 工程里的 agent 文件路径；只拼路径，不建目录。"""
     return Path(root) / ".opencode" / "agents" / "deepseek-qq.md"
+
+
+def memory_agent_path(root: Path) -> Path:
+    """记忆旁路 agent 的路径；与聊天 agent 同目录，只换个文件名。"""
+    return Path(root) / ".opencode" / "agents" / f"{MEMORY_AGENT_NAME}.md"
+
+
+def build_memory_agent(
+    mode: str,
+    *,
+    template: str,
+    cfg: BrainConfig | None = None,
+    local: LocalModelConfig | None = None,
+) -> str:
+    """渲染记忆旁路 agent：单步、无工具、模型与聊天档位保持一致。
+
+    记忆旁路走的是 ``_temp_session``（摘要/印象），它继承的是 agent 文件里
+    钉住的模型。以前这个文件是手写的、永远写死免费模型，于是自备 Key 档下
+    聊天走 DeepSeek、摘要/印象却一直撞免费额度——免费额度耗尽后记忆整条
+    旁路瘫痪。现在它和 ``deepseek-qq.md`` 一样是生成物，三档同源。
+
+    与聊天 agent 的差别只有三处：描述、步数（1 步，禁止自行发起工具调用）、
+    权限（整段通配 deny，不留任何白名单）。
+    """
+    cfg = cfg if cfg is not None else BrainConfig(mode=mode)
+    local = local if local is not None else LocalModelConfig()
+    model = _agent_model(mode, cfg, local)
+    head = [
+        "---",
+        f"description: {MEMORY_AGENT_DESCRIPTION}",
+        "mode: primary",
+        "# 专用配置目录没有全局 model 兜底，这里必须自己钉住（spec §6.2）。",
+        f"model: {model}",
+        "# 只做一件事：把输入压成摘要或抽成画像。单步防止它自己发起工具调用。",
+        "steps: 1",
+        "permissions:",
+        '  - action: "*"',
+        '    resource: "*"',
+        "    effect: deny",
+        "---",
+        AGENT_MARK,
+    ]
+    body = template if template.endswith("\n") else f"{template}\n"
+    return "\n".join(head) + "\n\n" + body

@@ -52,11 +52,18 @@ def log_memory_failure(
         )
 
 
+# 各 provider 的「额度用完」文案：opencode 免费档叫 free-limit / free usage
+# limit reached，别家叫 quota exceeded / insufficient_quota。只查 "quota" 会漏掉
+# 前者，于是账号级耗尽被当成单会话 429 短歇，每 10 分钟重试一次撞两小时。
+QUOTA_HINTS = ("quota", "free-limit", "free limit", "usage limit", "insufficient credit")
+
+
 def is_quota_error(exc: BaseException | None) -> bool:
     """配额耗尽的错误文本来自各 provider 的 BrainError，统一按关键词识别。"""
     if exc is None:
         return False
-    return "quota" in str(exc).casefold()
+    text = str(exc).casefold()
+    return any(hint in text for hint in QUOTA_HINTS)
 
 
 def is_rate_limit_error(exc: BaseException | None) -> bool:
