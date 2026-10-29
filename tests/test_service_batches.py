@@ -3,7 +3,9 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-from dafeiyu.brain.client import BrainReply
+import pytest
+
+from dafeiyu.brain.client import BrainError, BrainReply
 from dafeiyu.config import (
     BudgetConfig,
     GroupsConfig,
@@ -322,3 +324,50 @@ async def test_drain_flushes_due_batch(tmp_path):
     assert brain.reply_calls == 1
     assert store.last_delivered_id(ChatType.GROUP, 1001) is not None
     assert adapter.sent
+
+
+class FakeQuotaBrain:
+    """会话型大脑：第一次撞额度，靠 reply_fresh 兜住。"""
+
+    def __init__(self, error: BrainError | None = None) -> None:
+        self.error = error or BrainError(
+            "OpenCode 调用失败（provider.free-limit）：Free usage limit reached",
+            status=429,
+        )
+        self.calls: list[tuple] = []
+
+    async def reply(self, chat_type, chat_id, text, *, on_tool=None) -> BrainReply:
+        self.calls.append(("reply", text))
+        raise self.error
+
+    async def reply_fresh(
+        self, chat_type, chat_id, text, *, system, history, on_tool=None
+    ) -> BrainReply:
+        self.calls.append(("fresh", text, system, list(history)))
+        return BrainReply(True, "新会话里回的", "test", 20, 5)
+
+    async def aclose(self) -> None:
+        pass
+
+
+async def test_quota_failure_retries_in_a_fresh_session(tmp_path):
+    brain = FakeQuotaBrain()
+    service, _store, _, _ = build(tmp_path, brain=brain)
+
+    reply = await service._call_brain(ChatType.GROUP, 1001, [make_msg("hi")], "hi")
+
+    assert reply.reply == "新会话里回的"
+    assert [c[0] for c in brain.calls] == ["reply", "fresh"]
+    fresh = brain.calls[1]
+    assert fresh[2]
+    assert isinstance(fresh[3], list)
+
+
+async def test_other_errors_are_not_retried(tmp_path):
+    brain = FakeQuotaBrain(error=BrainError("OpenCode 服务不可达：ConnectError"))
+    service, _store, _, _ = build(tmp_path, brain=brain)
+
+    with pytest.raises(BrainError):
+        await service._call_brain(ChatType.GROUP, 1001, [make_msg("hi")], "hi")
+
+    assert [c[0] for c in brain.calls] == ["reply"]

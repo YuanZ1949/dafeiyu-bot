@@ -581,7 +581,10 @@ class BrainControl:
         # switch_mode 成功后钉住「当前活着的 brain」：三档都由 opencode 提供，
         # snapshot 必须与切换响应一致，不能继续报启动时的 token/local_model。
         self._mode_provider = ""
-        self._mode_model = ""
+        # 重启后也要能报出模型名：_mode_model 以前只在切档时赋值，于是进程一
+        # 重启 GET /api/brain 就回空串，面板与脚本都读不到。这里按当前 settings
+        # 直接重算一次，等价于「刚用这个档位切过档」。
+        self._mode_model = self._initial_mode_model()
         # switch_mode 成功后的「生效视图」：self.settings 要到重启才重新加载，
         # 这里先钉住刚写进覆盖层的 key/local 配置，GET /api/brain 才不会回退。
         self._mode_view: dict[str, Any] | None = None
@@ -590,6 +593,20 @@ class BrainControl:
         # FREE_PROBE_TTL 懒刷新。_free_probe_at 用单调时钟，不落盘。
         self._free_probe_at = 0.0
         self._free_probe_task: asyncio.Task | None = None
+
+    def _initial_mode_model(self) -> str:
+        """启动时按当前档位重算展示用模型名（free/key/local_model 三档同源）。
+
+        只用 ``build_config`` 的 ``model`` 字段，不碰密钥与端点：这里要的是
+        「面板该显示什么」，不是能用的客户端。配置本身非法时宁可为空，也不能
+        因为一个展示字段把整个进程打挂。
+        """
+        cfg = self.settings.brain
+        try:
+            data = build_config(cfg.mode, cfg, local=self.settings.local_model)
+            return str(data.get("model") or "")
+        except (ValueError, KeyError, TypeError):
+            return ""
 
     def _local_token(self) -> str:
         """本地档当前真正可用的令牌（不含 "local" 占位哨兵）。"""

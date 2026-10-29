@@ -25,7 +25,7 @@ from .memory.workspace import Workspace
 from .models import ChatType, Message
 from .router import Router, now_shanghai
 from .sender import is_technical_question, shape_reply
-from .workers.failure import QUOTA_KEY
+from .workers.failure import QUOTA_KEY, is_quota_error, is_rate_limit_error
 from .workers.summary import summarize_for_rotation
 
 if TYPE_CHECKING:
@@ -1088,8 +1088,49 @@ class Service:
             )
         if on_tool is None:
             # 单条路径历来不传 on_tool，旧的 brain/fake 只认三个位置参数。
-            return await responder(chat_type, chat_id, prompt)
-        return await responder(chat_type, chat_id, prompt, on_tool=on_tool)
+            try:
+                return await responder(chat_type, chat_id, prompt)
+            except BrainError as exc:
+                return await self._retry_fresh_session(
+                    chat_type, chat_id, messages, prompt, exc
+                )
+        try:
+            return await responder(chat_type, chat_id, prompt, on_tool=on_tool)
+        except BrainError as exc:
+            return await self._retry_fresh_session(
+                chat_type, chat_id, messages, prompt, exc, on_tool=on_tool
+            )
+
+    async def _retry_fresh_session(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        messages: list[Message],
+        prompt: str,
+        exc: BrainError,
+        *,
+        on_tool: Any = None,
+    ) -> BrainReply:
+        """额度/限流失败：换新会话重放本地历史再试一次，其余错误原样抛。
+
+        免费额度、账号配额这类失败不会因为重试同一会话就好转；换一个干净的
+        session 并补上本地窗口，至少还能把这一轮聊完。普通网络错误不重试，
+        避免一次超时变成两次计费。
+        """
+        if not (is_quota_error(exc) or is_rate_limit_error(exc)):
+            raise exc
+        fresh = getattr(self.brain, "reply_fresh", None)
+        if not callable(fresh):
+            raise exc
+        log.warning("大脑调用失败，换新会话重放历史再试一次：%s", exc)
+        return await fresh(
+            chat_type,
+            chat_id,
+            prompt,
+            system=self._system_prompt(chat_type, messages),
+            history=self._history_before(chat_type, chat_id, messages),
+            on_tool=on_tool,
+        )
 
     def _system_prompt(self, chat_type: ChatType, messages: list[Message]) -> str:
         chat_title = (

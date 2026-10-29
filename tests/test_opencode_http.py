@@ -338,6 +338,34 @@ async def test_forget_clears_stored_session(store: Store) -> None:
     assert not store.get_opencode_session(ChatType.PRIVATE, 42)
 
 
+async def test_reply_fresh_replays_history_in_a_new_session(store: Store) -> None:
+    """额度失败后的兜底：换新 session，把系统提示 + 本地窗口重放一遍。"""
+    store.set_opencode_session(ChatType.PRIVATE, 42, "ses_old")
+    server = FakeServer()
+    brain = make_brain(store, server)
+
+    reply = await brain.reply_fresh(
+        ChatType.PRIVATE,
+        42,
+        "刚才说到哪了",
+        system="你是溟月",
+        history=[
+            {"role": "user", "content": "早"},
+            {"role": "assistant", "content": "早啊"},
+        ],
+    )
+    await brain.aclose()
+
+    prompt = server.prompts[-1]
+    assert prompt.startswith("你是溟月")
+    assert "user: 早" in prompt
+    assert "assistant: 早啊" in prompt
+    assert prompt.endswith("刚才说到哪了")
+    # 旧会话被丢掉，新会话接管后续轮次。
+    assert store.get_opencode_session(ChatType.PRIVATE, 42) == "ses_new"
+    assert reply.reply == "在群聊卖萌"
+
+
 async def test_forget_treats_empty_delete_body_as_success(store: Store) -> None:
     """opencode 的 DELETE 回 204 空 body：不能当成「返回的不是 JSON」而失败。"""
     store.set_opencode_session(ChatType.PRIVATE, 42, "ses_old")

@@ -183,6 +183,77 @@ async def test_invalid_mode_returns_400(control: BrainControl) -> None:
     assert exc.value.status == 400
     assert "local_model" in exc.value.reason
 
+def test_snapshot_reports_model_before_any_switch(
+    tmp_path: Path, store_spy: StoreSpy
+) -> None:
+    """重启后 GET /api/brain 的 model 不能是空串：以前只在切档时赋值。"""
+    settings = make_settings(tmp_path)
+    settings = dc_replace(
+        settings,
+        brain=dc_replace(
+            settings.brain, mode="free", provider="opencode", mode_from_overrides=True
+        ),
+    )
+    ctrl = BrainControl(
+        settings,
+        store_spy,
+        FakeService(),
+        FakeAdapter(),
+        runtime_path=str(tmp_path / "runtime-free.json"),
+    )
+
+    snap = ctrl.snapshot()
+
+    assert snap["mode"] == "free"
+    assert snap["model"] == "opencode/deepseek-v4.1-flash-free"
+
+
+def test_snapshot_reports_key_model_without_switch(
+    tmp_path: Path, store_spy: StoreSpy
+) -> None:
+    """进程按 key 档启动、还没人点过「应用」时，也要报出当前模型名。"""
+    settings = make_settings(tmp_path)
+    settings = dc_replace(
+        settings,
+        brain=dc_replace(
+            settings.brain,
+            mode="key",
+            provider="opencode",
+            mode_from_overrides=True,
+            key_model="deepseek-flash",
+        ),
+    )
+    ctrl = BrainControl(
+        settings,
+        store_spy,
+        FakeService(),
+        FakeAdapter(),
+        runtime_path=str(tmp_path / "runtime2.json"),
+    )
+
+    snap = ctrl.snapshot()
+
+    assert snap["mode"] == "key"
+    assert snap["model"] == "dafeiyu-key/deepseek-flash"
+
+
+def test_invalid_mode_in_settings_keeps_model_empty(
+    tmp_path: Path, store_spy: StoreSpy
+) -> None:
+    """坏配置只该让展示字段为空，不能让构造直接抛。"""
+    settings = make_settings(tmp_path)
+    settings = dc_replace(settings, brain=dc_replace(settings.brain, mode="nope"))
+    ctrl = BrainControl(
+        settings,
+        store_spy,
+        FakeService(),
+        FakeAdapter(),
+        runtime_path=str(tmp_path / "runtime3.json"),
+    )
+
+    assert ctrl._mode_model == ""
+
+
 async def test_switch_keeps_memory_agent_on_same_model(
     tmp_path: Path, monkeypatch, control: BrainControl
 ) -> None:

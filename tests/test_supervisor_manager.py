@@ -168,9 +168,7 @@ async def test_start_sweeps_leftover_processes(tmp_path: Path, monkeypatch) -> N
     await supervisor.stop("napcat")
 
 
-async def test_sweep_failure_does_not_block_start(tmp_path: Path, monkeypatch) -> None:
-    import dafeiyu.supervisor.manager as manager_mod
-
+async def test_sweep_failure_does_not_block_start(tmp_path: Path) -> None:
     def boom() -> list[int]:
         raise OSError("powershell 挂了")
 
@@ -356,3 +354,53 @@ async def test_external_instance_turns_stopped_when_pid_dies(tmp_path: Path) -> 
     assert supervisor.states["napcat"].external_pid is None
     assert any("外部实例已退出" in line for line in hub.tail("napcat"))
     await supervisor.shutdown()
+
+
+RECOVER_CODE = (
+    "import time\n"
+    "print('当前账号(10001)已登录，无法重复登录', flush=True)\n"
+    "print('当前账号(10001)已登录，无法重复登录', flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
+async def test_recover_pattern_restarts_once_then_cools_down(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """命中「无法重复登录」→ 清残留 + 重启；同一条日志再刷也只在冷却期里记一笔。"""
+    import dafeiyu.supervisor.manager as manager_mod
+
+    async def fake_kill_tree(pid: int) -> bool:
+        return True
+
+    monkeypatch.setattr(manager_mod, "_kill_tree", fake_kill_tree)
+    monkeypatch.setattr(manager_mod, "KILL_WAIT_TIMEOUT", 0.5)
+    specs = {
+        "napcat": ProcSpec(
+            "napcat",
+            [sys.executable, "-u", "-c", RECOVER_CODE],
+            sweep_pids=list,
+            recover_patterns=("无法重复登录",),
+        )
+    }
+    supervisor, hub = make_supervisor(tmp_path, specs)
+    await supervisor.start("napcat")
+
+    lines = await wait_for_log_line(hub, "napcat", "命中自愈模式")
+    assert any("清理残留并重启" in line for line in lines)
+
+    lines = await wait_for_log_line(hub, "napcat", "冷却中", timeout=10.0)
+    assert any("冷却中" in line for line in lines)
+    await supervisor.stop("napcat")
+
+
+async def test_recover_is_ignored_without_patterns(tmp_path: Path) -> None:
+    specs = {
+        "x": ProcSpec("x", [sys.executable, "-u", "-c", RECOVER_CODE]),
+    }
+    supervisor, hub = make_supervisor(tmp_path, specs)
+    await supervisor.start("x")
+    await wait_for_log_line(hub, "x", "无法重复登录")
+
+    assert not any("命中自愈模式" in line for line in hub.tail("x"))
+    await supervisor.stop("x")

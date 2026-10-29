@@ -207,6 +207,8 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
         # 主进程被 NapCat 自己的 kill EPERM 打崩后，worker 会继续占着 QQ 登录态；
         # 不先清掉，新实例只会报「当前账号已登录，无法重复登录」然后卡住。
         sweep_pids=lambda: find_napcat_pids(NAPCAT_DIR),
+        # 真出现这句时说明已经有残留占着登录态：清干净再重启一次。
+        recover_patterns=("无法重复登录",),
     )
     return specs
 

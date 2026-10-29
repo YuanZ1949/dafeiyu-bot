@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import yaml
 
 from dafeiyu.brain.provider_config import (
@@ -98,3 +100,23 @@ def test_build_agent_lean_drops_tools_but_keeps_denies():
     assert text.splitlines()[-1].startswith("（本轮没有工具")
     assert 'action: "*"' in text and "effect: deny" in text
     assert ".env" in text and "data/secrets" in text
+
+
+CHAT_AGENT_TEMPLATE = (
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "dafeiyu"
+    / "brain"
+    / "agent_template.md"
+)
+REPO_CHAT_AGENT = (
+    Path(__file__).resolve().parents[1] / ".opencode" / "agents" / "deepseek-qq.md"
+)
+
+
+def test_repo_chat_agent_is_up_to_date() -> None:
+    """仓库里那份必须等于生成结果：手改会静默丢掉密钥 deny 段之类的更新。"""
+    generated = build_agent(
+        "free", lean=False, template=CHAT_AGENT_TEMPLATE.read_text(encoding="utf-8")
+    )
+    assert REPO_CHAT_AGENT.read_text(encoding="utf-8") == generated

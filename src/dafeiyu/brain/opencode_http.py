@@ -297,20 +297,63 @@ class OpenCodeHttpBrain:
                     foreign,
                 )
                 self.store.clear_opencode_session(chat_type, chat_id)
-            prompt_tokens, completion_tokens, estimated = resolve_usage(
-                prompt,
-                result.text,
-                result.prompt_tokens,
-                result.completion_tokens,
-            )
-            reply = parse_brain_reply(
-                result.text,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-            )
-            return replace(reply, estimated=True) if estimated else reply
+            return self._reply_from(prompt, result)
 
         raise BrainError("OpenCode 调用失败：session 重建失败")
+
+    async def reply_fresh(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        text: str,
+        *,
+        system: str = "",
+        history: list[dict[str, str]] | None = None,
+        on_tool: Callable[[str], Awaitable[None]] | None = None,
+    ) -> BrainReply:
+        """丢掉旧会话，用「系统提示 + 本地历史 + 本条」开新会话再试一次。
+
+        额度/限流类失败之后，旧 session 里往往已经留下半截上下文；服务端配额
+        不会因为重试同一会话就好转。这里按无状态大脑的拼法把本地窗口重放一遍，
+        等价于「换会话继续聊」，下一轮起又回到正常的会话型流程。
+        """
+        prompt = text.strip()
+        if not prompt:
+            raise BrainError("用户消息为空")
+        blocks: list[str] = []
+        if system.strip():
+            blocks.append(system.strip())
+        for item in history or []:
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            role = str(item.get("role") or "user")
+            blocks.append(f"{role}: {content}")
+        blocks.append(prompt)
+        body = "\n\n".join(blocks)
+
+        self.store.clear_opencode_session(chat_type, chat_id)
+        sid = await self._create_session()
+        result = await self._ask(sid, body, on_tool=on_tool)
+        self.store.set_opencode_session(chat_type, chat_id, sid)
+        if not result.text.strip():
+            raise BrainError("OpenCode 没有返回文本")
+        return self._reply_from(prompt, result)
+
+    @staticmethod
+    def _reply_from(prompt: str, result: RoundResult) -> BrainReply:
+        prompt_tokens, completion_tokens, estimated = resolve_usage(
+            prompt,
+            result.text,
+            result.prompt_tokens,
+            result.completion_tokens,
+        )
+        reply = parse_brain_reply(
+            result.text,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+        return replace(reply, estimated=True) if estimated else reply
 
     async def _create_session(
         self,

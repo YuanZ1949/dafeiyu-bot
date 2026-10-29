@@ -18,6 +18,8 @@ log = logging.getLogger(__name__)
 STOP_TIMEOUT = 5.0
 # taskkill 之后等进程真正退出的上限：Windows 上 /F 发出信号到进程消失有延迟。
 KILL_WAIT_TIMEOUT = 5.0
+# 自愈冷却：同一条恢复路径 10 分钟内只做一次，避免日志刷屏时反复重启。
+RECOVER_COOLDOWN = 600.0
 HEALTHY_UPTIME = 30.0
 
 READY = "running"
@@ -40,6 +42,8 @@ class ProcSpec:
     # 启动前先清掉同目录的残留进程（NapCat 的 worker 会在主进程崩溃后
     # 继续占着 QQ 登录态，新实例只会报「当前账号已登录，无法重复登录」）。
     sweep_pids: Callable[[], list[int]] | None = None
+    # 输出里命中这些片段时自愈：清残留 + 重启自己（有冷却，见 RECOVER_COOLDOWN）。
+    recover_patterns: tuple[str, ...] = ()
 
 
 @dataclass
@@ -57,6 +61,10 @@ class ProcState:
     external_pid: int | None = None
     drains: list[asyncio.Task] = field(default_factory=list)
     watcher: asyncio.Task | None = None
+    # 自愈：上次触发时间、正在跑、已排队；三者一起防重复重启。
+    last_recover_at: float = 0.0
+    recovering: bool = False
+    recover_pending: bool = False
 
     def uptime(self) -> float:
         return 0.0 if not self.started_at else max(0.0, time.monotonic() - self.started_at)
@@ -320,11 +328,59 @@ class Supervisor:
                 line = await stream.readline()
                 if not line:
                     return
-                self.logs.write(name, line.decode("utf-8", errors="replace").rstrip())
+                text = line.decode("utf-8", errors="replace").rstrip()
+                self.logs.write(name, text)
+                self._maybe_recover(name, text)
         except asyncio.CancelledError:
             raise
         except OSError:
             return
+
+    def _maybe_recover(self, name: str, text: str) -> None:
+        """输出里出现已知的「卡死」文案时，安排一次自愈（不阻塞读流）。"""
+        state = self.states.get(name)
+        if state is None:
+            return
+        patterns = state.spec.recover_patterns
+        if not patterns:
+            return
+        hit = next((p for p in patterns if p in text), None)
+        if hit is None or state.recovering or state.recover_pending:
+            return
+        state.recover_pending = True
+        asyncio.create_task(self._recover(state, hit))
+
+    async def _recover(self, state: ProcState, hit: str) -> None:
+        """清掉残留进程并重启自己；冷却期内只记一行日志。"""
+        name = state.name
+        try:
+            now = time.monotonic()
+            if state.last_recover_at and now - state.last_recover_at < RECOVER_COOLDOWN:
+                self.logs.write(
+                    name,
+                    f"命中自愈模式（{hit}），但 {RECOVER_COOLDOWN / 60:.0f} 分钟冷却中，跳过",
+                )
+                return
+            state.last_recover_at = now
+            state.recovering = True
+            self.logs.write(name, f"命中自愈模式（{hit}），清理残留并重启")
+            # 先钉住 manual_stop：杀进程会让 _watch 醒来，别让它再排一次重启。
+            state.manual_stop = True
+            proc = state.proc
+            if proc is not None and proc.returncode is None:
+                await _kill_tree(proc.pid)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=KILL_WAIT_TIMEOUT)
+            state.proc = None
+            await self._cancel_drains(state)
+            state.status = STOPPED
+            await self.start(name)
+        except Exception as exc:  # noqa: BLE001 - 自愈失败要写日志，不能吞掉
+            state.status = FAILED
+            self.logs.write(name, f"自愈失败：{exc.__class__.__name__}: {exc}")
+        finally:
+            state.recovering = False
+            state.recover_pending = False
 
     async def _cancel_drains(self, state: ProcState) -> None:
         tasks = state.drains
