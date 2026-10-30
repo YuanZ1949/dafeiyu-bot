@@ -480,3 +480,40 @@ async def test_private_reply_is_segmented(tmp_path):
 
     assert len(adapter.texts()) == 2
     assert delays == [0.8]
+
+
+async def test_closed_thread_skips_ambient_batch(tmp_path):
+    service, _store, brain, adapter = build(tmp_path)
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+
+    await service.handle(make_msg("随便聊聊", message_id="m2"))
+
+    assert brain.reply_calls == 0
+    assert adapter.texts() == []
+
+
+async def test_addressed_message_reopens_closed_batch(tmp_path):
+    service, _store, brain, adapter = build(tmp_path)
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+
+    await service.handle(make_msg("在吗", message_id="m2", at_bot=True))
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert brain.reply_calls == 1
+    assert adapter.texts()
+
+
+async def test_ambient_replies_count_toward_thread_limit(tmp_path):
+    service, _store, _brain, _adapter = build(tmp_path)
+
+    await service.handle(make_msg("随便聊聊", message_id="m2"))
+    await service._run_batch(ChatType.GROUP, 1001)
+    assert service.router.ambient_turns(ChatType.GROUP, 1001) == 1
+    assert service.router.is_thread_closed(ChatType.GROUP, 1001) is False
+
+    await service.handle(make_msg("继续说", message_id="m3"))
+    await service._run_batch(ChatType.GROUP, 1001)
+    assert service.router.ambient_turns(ChatType.GROUP, 1001) == 2
+    assert service.router.is_thread_closed(ChatType.GROUP, 1001) is True

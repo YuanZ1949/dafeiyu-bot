@@ -53,6 +53,12 @@ class TriggerConfig:
     addressed_debounce_seconds: float = 8.0
     # 两次非点名发言之间的最小间隔。
     ambient_min_interval_seconds: float = 15.0
+    # 同一话题里连续 ambient 发言达到这个次数就收尾，等被点名再回来。
+    ambient_max_turns: int = 2
+    # bot 说完后这么久没人接，视为话题结束。
+    thread_idle_seconds: int = 300
+    # 话题结束后，这么久内不再主动加入；被点名会立刻重开。
+    thread_closed_seconds: int = 600
 
 
 @dataclass(frozen=True)
@@ -707,11 +713,23 @@ def _build_triggers(raw: dict[str, Any]) -> TriggerConfig:
         raw.get("ambient_min_interval_seconds", 15),
         "triggers.ambient_min_interval_seconds",
     )
+    ambient_max_turns = _int(
+        raw.get("ambient_max_turns", 2), "triggers.ambient_max_turns"
+    )
+    thread_idle = _int(
+        raw.get("thread_idle_seconds", 300), "triggers.thread_idle_seconds"
+    )
+    thread_closed = _int(
+        raw.get("thread_closed_seconds", 600), "triggers.thread_closed_seconds"
+    )
     for name, value in (
         ("triggers.batch_seconds", batch_seconds),
         ("triggers.addressed_debounce_seconds", addressed_debounce),
         ("triggers.addressed_max_wait_seconds", addressed_max_wait),
         ("triggers.ambient_min_interval_seconds", ambient_min_interval),
+        ("triggers.ambient_max_turns", ambient_max_turns),
+        ("triggers.thread_idle_seconds", thread_idle),
+        ("triggers.thread_closed_seconds", thread_closed),
     ):
         if value <= 0:
             raise ConfigError(f"{name} 必须大于 0")
@@ -725,6 +743,9 @@ def _build_triggers(raw: dict[str, Any]) -> TriggerConfig:
         addressed_debounce_seconds=addressed_debounce,
         addressed_max_wait_seconds=addressed_max_wait,
         ambient_min_interval_seconds=ambient_min_interval,
+        ambient_max_turns=ambient_max_turns,
+        thread_idle_seconds=thread_idle,
+        thread_closed_seconds=thread_closed,
     )
 
 

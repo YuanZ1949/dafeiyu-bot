@@ -240,3 +240,16 @@ def test_explain_reports_global_and_monthly_metrics(env) -> None:
         "monthly",
         "cost",
     }
+
+
+def test_explain_reports_closed_thread(env) -> None:
+    build, _store = env
+    router = build()
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    router.clock = lambda: NOW + timedelta(seconds=301)
+
+    data = router.explain(msg())
+
+    assert data["decision"]["reason"] == "closed"
+    by_key = {check["key"]: check["status"] for check in data["checks"]}
+    assert by_key["closed"] == "blocked"

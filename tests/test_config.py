@@ -122,6 +122,36 @@ def test_segment_delay_rejects_negative(tmp_path: Path) -> None:
         load_settings(env_file=env, config_file=write_yaml(tmp_path, bad))
 
 
+def test_thread_state_defaults_and_parses(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    default = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+    assert default.triggers.ambient_max_turns == 2
+    assert default.triggers.thread_idle_seconds == 300
+    assert default.triggers.thread_closed_seconds == 600
+
+    custom = BASE_YAML.replace(
+        "sample_rate: 0.05",
+        "sample_rate: 0.05\n"
+        "  ambient_max_turns: 3\n"
+        "  thread_idle_seconds: 120\n"
+        "  thread_closed_seconds: 900",
+    )
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, custom))
+    assert s.triggers.ambient_max_turns == 3
+    assert s.triggers.thread_idle_seconds == 120
+    assert s.triggers.thread_closed_seconds == 900
+
+
+def test_thread_state_rejects_negative(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    bad = BASE_YAML.replace(
+        "sample_rate: 0.05",
+        "sample_rate: 0.05\n  thread_idle_seconds: -1",
+    )
+    with pytest.raises(ConfigError, match="thread_idle_seconds"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, bad))
+
+
 def test_persona_prompt_file_defaults_empty_and_reads_yaml(tmp_path: Path) -> None:
     env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
     default = load_settings(env_file=env, config_file=write_yaml(tmp_path))

@@ -46,11 +46,17 @@ def parse_command(text: str) -> Command | None:
 @dataclass
 class _ChatState:
     last_bot_spoke: datetime | None = None
+    last_user_message: datetime | None = None
     no_reply_streak: int = 0
     downshift_until: datetime | None = None
     muted_until: datetime | None = None
     last_prompt: str = ""
     last_prompt_at: datetime | None = None
+    # 连续 ambient 发言计数；被点名时清零。
+    ambient_streak: int = 0
+    # 话题收尾窗口：非空且未过期时，不再主动接话。
+    thread_closed_until: datetime | None = None
+    last_closed_at: datetime | None = None
 
 
 _CHECK_LABELS = {
@@ -67,6 +73,7 @@ _CHECK_LABELS = {
     "duplicate": "重复消息",
     "question": "提问",
     "cooldown": "冷却",
+    "closed": "话题收尾",
     "hot": "热聊",
     "sample": "随机抽样",
 }
@@ -153,6 +160,9 @@ def _check_detail(
     if key == "cooldown":
         left = metrics["cooldown_remaining_seconds"]
         return f"剩余 {int(left)} 秒" if left > 0 else "不在冷却"
+    if key == "closed":
+        left = metrics["closed_remaining_seconds"]
+        return f"话题已收尾，剩余 {int(left)} 秒" if status == "blocked" else "话题进行中"
     if key == "hot":
         return "60 秒内消息充足" if status == "pass" else "热度不足"
     if key == "sample":
@@ -183,8 +193,61 @@ class Router:
     def _state(self, chat_type: ChatType, chat_id: int) -> _ChatState:
         return self._states.setdefault((chat_type, chat_id), _ChatState())
 
-    def note_bot_spoke(self, chat_type: ChatType, chat_id: int) -> None:
-        self._state(chat_type, chat_id).last_bot_spoke = self.clock()
+    def note_bot_spoke(
+        self, chat_type: ChatType, chat_id: int, *, ambient: bool = False
+    ) -> None:
+        st = self._state(chat_type, chat_id)
+        st.last_bot_spoke = self.clock()
+        st.ambient_streak = st.ambient_streak + 1 if ambient else 0
+
+    def note_user_message(
+        self, chat_type: ChatType, chat_id: int, *, addressed: bool = False
+    ) -> None:
+        """记录用户消息；被点名等于话题重新开始，清掉收尾与降频状态。"""
+        st = self._state(chat_type, chat_id)
+        st.last_user_message = self.clock()
+        if addressed:
+            st.ambient_streak = 0
+            st.thread_closed_until = None
+            st.no_reply_streak = 0
+            st.downshift_until = None
+
+    def ambient_turns(self, chat_type: ChatType, chat_id: int) -> int:
+        return self._state(chat_type, chat_id).ambient_streak
+
+    def is_thread_closed(
+        self, chat_type: ChatType, chat_id: int, now: datetime | None = None
+    ) -> bool:
+        """话题是否已经收尾：连续 ambient 发言超限，或发言后无人回应。"""
+        now = now or self.clock()
+        st = self._state(chat_type, chat_id)
+        closed_seconds = getattr(self.settings.triggers, "thread_closed_seconds", 600)
+        if st.thread_closed_until is not None:
+            if now < st.thread_closed_until:
+                return True
+            st.thread_closed_until = None
+            st.ambient_streak = 0
+
+        max_turns = getattr(self.settings.triggers, "ambient_max_turns", 2)
+        if st.ambient_streak >= max_turns:
+            st.thread_closed_until = now + timedelta(seconds=closed_seconds)
+            st.last_closed_at = now
+            return True
+
+        if st.last_bot_spoke is None:
+            return False
+        # 上一次收尾之前的发言不再重复触发收尾，否则窗口一过期就立刻又关上。
+        if st.last_closed_at is not None and st.last_bot_spoke <= st.last_closed_at:
+            return False
+        idle_seconds = getattr(self.settings.triggers, "thread_idle_seconds", 300)
+        if (now - st.last_bot_spoke).total_seconds() <= idle_seconds:
+            return False
+        # 发言之后有人接过话，说明话题还在继续。
+        if st.last_user_message is not None and st.last_user_message > st.last_bot_spoke:
+            return False
+        st.thread_closed_until = now + timedelta(seconds=closed_seconds)
+        st.last_closed_at = now
+        return True
 
     def note_reply(self, chat_type: ChatType, chat_id: int) -> None:
         st = self._state(chat_type, chat_id)
@@ -277,6 +340,10 @@ class Router:
 
         if self._in_quiet_hours(now):
             return False, "quiet"
+
+        # 话题已经收尾：非点名消息一律不接，等被点名再重开。
+        if self.is_thread_closed(msg.chat_type, msg.chat_id, now):
+            return False, "closed"
 
         # 同一句话在冷却窗口内重复出现（含并发重复投递），不重复回。
         content = msg.content.strip()
@@ -377,6 +444,9 @@ class Router:
         downshift_left = 0.0
         if st.downshift_until is not None:
             downshift_left = max(0.0, (st.downshift_until - now).total_seconds())
+        closed_left = 0.0
+        if st.thread_closed_until is not None:
+            closed_left = max(0.0, (st.thread_closed_until - now).total_seconds())
         base_rate = self.settings.triggers.sample_rate
         effective_rate = base_rate / 2 if downshift_left > 0 else base_rate
         metrics: dict[str, Any] = {
@@ -387,6 +457,7 @@ class Router:
             "muted_remaining_seconds": round(muted_left, 3),
             "cooldown_remaining_seconds": round(cooldown_left, 3),
             "downshift_remaining_seconds": round(downshift_left, 3),
+            "closed_remaining_seconds": round(closed_left, 3),
             "last_prompt_age_seconds": (
                 round((now - st.last_prompt_at).total_seconds(), 3)
                 if st.last_prompt_at is not None
@@ -460,6 +531,7 @@ class Router:
             "duplicate",
             "question",
             "cooldown",
+            "closed",
             "hot",
             "sample",
         ]

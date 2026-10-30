@@ -308,6 +308,7 @@ def test_explain_hard_trigger_has_ordered_checks_and_alias_source() -> None:
         "duplicate",
         "question",
         "cooldown",
+        "closed",
         "hot",
         "sample",
     ]
@@ -404,3 +405,66 @@ def test_parse_command() -> None:
     assert parse_command("/吃鱼 小鱼干 蛋糕") == Command("吃鱼", ["小鱼干", "蛋糕"])
     assert parse_command("你好") is None
     assert parse_command("/") is None
+
+
+# ---- 话题状态机 -------------------------------------------------
+
+
+def test_bot_message_going_unanswered_closes_thread() -> None:
+    router, _, clock = make_router()
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    clock.advance(300)
+    assert router.is_thread_closed(ChatType.GROUP, 1) is False
+    clock.advance(1)
+    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+    decision = router.should_handle(msg("随便聊聊"))
+    assert decision.call_model is False
+    assert decision.reason == "closed"
+
+
+def test_addressed_message_reopens_closed_thread() -> None:
+    router, _, clock = make_router()
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    clock.advance(301)
+    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+    router.note_user_message(ChatType.GROUP, 1, addressed=True)
+    assert router.is_thread_closed(ChatType.GROUP, 1) is False
+    assert router.should_handle(msg("大肥鱼", at=True)).hard is True
+
+
+def test_two_ambient_replies_close_thread() -> None:
+    router, _, _ = make_router()
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    assert router.is_thread_closed(ChatType.GROUP, 1) is False
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+    assert router.should_handle(msg("在聊什么")).reason == "closed"
+
+
+def test_closed_window_expires_and_allows_ambient_again() -> None:
+    router, _, clock = make_router()
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+    clock.advance(600)
+    assert router.is_thread_closed(ChatType.GROUP, 1) is False
+    assert router.should_handle(msg("随便聊聊")).call_model is True
+
+
+def test_ambient_turns_reset_after_addressed_message() -> None:
+    router, _, _ = make_router()
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    router.note_user_message(ChatType.GROUP, 1, addressed=True)
+    assert router.ambient_turns(ChatType.GROUP, 1) == 0
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    assert router.ambient_turns(ChatType.GROUP, 1) == 1
+    assert router.is_thread_closed(ChatType.GROUP, 1) is False
+
+
+def test_user_message_after_bot_keeps_thread_open() -> None:
+    router, _, clock = make_router()
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    clock.advance(301)
+    # 话题可能已经结束，但这条消息说明还有人接话：先记账再判定，不能关。
+    router.note_user_message(ChatType.GROUP, 1)
+    assert router.is_thread_closed(ChatType.GROUP, 1) is False

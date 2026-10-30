@@ -246,6 +246,12 @@ class Service:
         self._schedule_impressions(msg)
 
         async with self._lock(msg.chat_type, msg.chat_id):
+            # 先记用户消息：被点名会重开已收尾的话题，普通消息只刷新时间。
+            self.router.note_user_message(
+                msg.chat_type,
+                msg.chat_id,
+                addressed=self.router.is_addressed(msg),
+            )
             if msg.reply_to_bot:
                 self.router.note_reply(msg.chat_type, msg.chat_id)
 
@@ -312,6 +318,9 @@ class Service:
             return "muted"
         if self.router.is_quiet(msg.chat_type, msg.chat_id):
             return "quiet"
+        # 话题已收尾：非点名消息不接，避免在别人聊完后硬插话。
+        if not addressed and self.router.is_thread_closed(msg.chat_type, msg.chat_id):
+            return "closed"
         # 连续三次选择不说后进入降频窗口：批次模式也必须认，否则降频是死状态。
         if not addressed and self.router.is_downshifted(msg.chat_type, msg.chat_id):
             return "downshift"
@@ -943,7 +952,8 @@ class Service:
         except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
             log.warning("发送失败 %s/%s: %s", chat_id, batch[-1].message_id, exc)
         else:
-            self.router.note_bot_spoke(chat_type, chat_id)
+            addressed = any(self.router.is_addressed(m) for m in batch)
+            self.router.note_bot_spoke(chat_type, chat_id, ambient=not addressed)
         finally:
             # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
             self._store_bot_chunks(batch[-1], sent)
@@ -1291,7 +1301,12 @@ class Service:
         except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
             log.warning("发送失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
         else:
-            self.router.note_bot_spoke(msg.chat_type, msg.chat_id)
+            self.router.note_bot_spoke(
+                msg.chat_type,
+                msg.chat_id,
+                ambient=msg.chat_type is ChatType.GROUP
+                and not self.router.is_addressed(msg),
+            )
         finally:
             # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
             self._store_bot_chunks(msg, sent)
