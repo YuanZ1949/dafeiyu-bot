@@ -9,11 +9,13 @@
 #   powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -Target D:\dafeiyu-release
 #   powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -Plan        # 只列出将拷贝哪些文件
 #   powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -NoRestart   # 只拷文件，不重启
+#   powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -AllowDisconnected  # 网关未连上也放行（扫码期用）
 param(
     [string]$Source = "",
     [string]$Target = "C:\MyFile\AICoding\dafeiyu-release",
     [switch]$Plan,
     [switch]$NoRestart,
+    [switch]$AllowDisconnected,
     [int]$HealthTimeoutSeconds = 120
 )
 
@@ -269,6 +271,7 @@ try {
         }
         $deadline = (Get-Date).AddSeconds($HealthTimeoutSeconds)
         $healthy = $false
+        $gatewayConnected = $false
         $lastError = "尚未开始探测"
         while ((Get-Date) -lt $deadline) {
             try {
@@ -286,6 +289,12 @@ try {
                         $connected = $false
                     }
                     if ($connected) {
+                        $gatewayConnected = $true
+                        $healthy = $true
+                        break
+                    }
+                    if ($AllowDisconnected) {
+                        Write-Host "警告：网关未连接，已按 -AllowDisconnected 放行（$healthUrl）" -ForegroundColor Yellow
                         $healthy = $true
                         break
                     }
@@ -305,7 +314,11 @@ try {
         if (-not $healthy) {
             throw "健康检查未通过：$healthUrl（最后一次原因：$lastError）"
         }
-        Write-Host "健康检查通过：$healthUrl（QQ 网关已连接）" -ForegroundColor Green
+        if ($gatewayConnected) {
+            Write-Host "健康检查通过：$healthUrl（QQ 网关已连接）" -ForegroundColor Green
+        } else {
+            Write-Host "健康检查通过：$healthUrl（网关未连接，已按 -AllowDisconnected 放行）" -ForegroundColor Yellow
+        }
     } else {
         Write-Host "（已传 -NoRestart，未重启服务）" -ForegroundColor DarkGray
     }

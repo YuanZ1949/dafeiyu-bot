@@ -1205,7 +1205,7 @@ async def test_config_endpoint_has_thresholds_and_no_secrets(tmp_path: Path) -> 
         "quota_pause_seconds": 3600.0,
     }
     assert payload["budget"]["daily_calls"] == 200
-    assert payload["memory"] == {"window_size": 20, "retention_days": 0}
+    assert payload["memory"] == {"window_size": 20, "retention_days": 180}
 
 
 def test_dashboard_exposes_new_panels() -> None:

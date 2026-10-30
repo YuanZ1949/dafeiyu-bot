@@ -163,7 +163,7 @@ memory:
   impression_topk: 3
   extract_every: 20
   # 消息保留天数；0 = 永久保留。
-  retention_days: 0
+  retention_days: 180  # 默认 180 天；0 = 永久保留
   rotation_messages: 60
   rotation_days: 7
   rotation_tokens: 40000

@@ -45,8 +45,8 @@ def add_message(store: Store, message_id: str, timestamp: int) -> None:
     )
 
 
-def test_retention_days_defaults_to_zero_and_parses(tmp_path: Path) -> None:
-    assert load(tmp_path).memory.retention_days == 0
+def test_retention_days_defaults_to_180_and_parses(tmp_path: Path) -> None:
+    assert load(tmp_path).memory.retention_days == 180
     assert load(tmp_path, 30).memory.retention_days == 30
 
 

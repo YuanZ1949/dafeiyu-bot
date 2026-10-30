@@ -225,7 +225,7 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `memory.window_size` | `20` | 上下文窗口消息数 |
 | `memory.impression_topk` | `5` | 每次注入的群友印象条数 |
 | `memory.extract_every` | `20` | 每 N 条消息抽一次印象 |
-| `memory.retention_days` | `0` | 消息保留天数；`0` = 永久，`>0` 时每天清理更早的消息（摘要/印象保留） |
+| `memory.retention_days` | `180` | 消息保留天数；`0` = 永久，`>0` 时每天清理更早的消息（摘要/印象保留） |
 | `memory.recall_enabled` | `false` | 回复前按当前批次检索同会话旧消息，注入「相关旧记忆」；代码默认关，`config.yaml` 示例已显式开启 |
 | `memory.recall_topk` | `3` | 相关旧记忆最多注入几条 |
 | `memory.recall_chars` | `300` | 相关旧记忆段落的字符预算 |

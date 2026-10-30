@@ -89,7 +89,7 @@ class MemoryConfig:
     impression_topk: int
     extract_every: int
     # 0 = 永久保留；>0 时由 retention_loop 每天清理更早的消息。
-    retention_days: int = 0
+    retention_days: int = 180
     # 会话轮换阈值（任一触发）；Task 13 才在 config.yaml 里显式暴露。
     rotation_messages: int = 60
     rotation_days: int = 7
@@ -1121,7 +1121,7 @@ def load_settings(
             impression_topk=_int(memory_raw.get("impression_topk", 5), "memory.impression_topk"),
             extract_every=extract_every,
             retention_days=_non_negative_int(
-                memory_raw.get("retention_days"), "memory.retention_days", 0
+                memory_raw.get("retention_days"), "memory.retention_days", 180
             ),
             rotation_messages=_positive_int(
                 memory_raw.get("rotation_messages"), "memory.rotation_messages", 60

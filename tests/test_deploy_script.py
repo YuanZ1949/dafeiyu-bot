@@ -181,3 +181,17 @@ def test_deploy_health_probe_uses_token_and_checks_gateway() -> None:
     # 失败原因要能说清是连不上、401，还是网关没连上。
     assert "401" in text
     assert "连接失败" in text
+
+
+def test_deploy_allow_disconnected_is_opt_in() -> None:
+    """-AllowDisconnected 是显式逃生开关：默认必须强判据，不能悄悄放宽。"""
+    text = SCRIPT.read_text(encoding="utf-8-sig")
+
+    assert "[switch]$AllowDisconnected" in text
+    # 默认关闭：param 里不能带 = $true
+    assert "[switch]$AllowDisconnected = $true" not in text
+    # 只有显式开关才放行，且要打警告
+    assert "if ($AllowDisconnected)" in text
+    assert "已按 -AllowDisconnected 放行" in text
+    # 强判据仍在：默认分支仍以 gateway.connected 为准
+    assert "$gatewayConnected = $true" in text
