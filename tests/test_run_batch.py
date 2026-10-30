@@ -150,6 +150,7 @@ def build(
     memory: MemoryConfig | None = None,
     with_workspace: bool = False,
     injection: InjectionConfig | None = None,
+    sleep=None,
 ):
     store = Store(str(tmp_path / "t.db"))
     store.init_schema()
@@ -175,6 +176,7 @@ def build(
         "你是溟月",
         workspace=workspace,
         injection=injection or InjectionConfig(),
+        sleep=sleep,
     )
 
     # 先钉一条「上线前」的消息当游标下限，这样 m0/m1 会一起进批次。
@@ -422,3 +424,59 @@ async def test_downshift_skips_batch(tmp_path):
 
     assert brain.reply_calls == 0
     assert adapter.texts() == []
+
+
+async def test_multi_sentence_reply_is_sent_in_segments(tmp_path):
+    delays: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    brain = FakeBrain(
+        text=(
+            "结论是这个方案能跑，配置和依赖都没问题，今天就可以直接上线。"
+            "原因有两个，一个是开关没打开，一个是网络不稳，这两点都确认过了。"
+        )
+    )
+    service, _store, _brain, adapter = build(tmp_path, brain=brain, sleep=fake_sleep)
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert len(adapter.texts()) == 2
+    assert delays == [0.8]
+
+
+async def test_short_reply_stays_single_message(tmp_path):
+    delays: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    service, _store, _brain, adapter = build(tmp_path, sleep=fake_sleep)
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert len(adapter.texts()) == 1
+    assert delays == []
+
+
+async def test_private_reply_is_segmented(tmp_path):
+    delays: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    brain = FakeBrain(
+        text=(
+            "结论是这个方案能跑，配置和依赖都没问题，今天就可以直接上线。"
+            "原因有两个，一个是开关没打开，一个是网络不稳，这两点都确认过了。"
+        )
+    )
+    service, _store, _brain, adapter = build(tmp_path, brain=brain, sleep=fake_sleep)
+
+    await service._handle_batched(
+        make_msg("在吗", message_id="p1", chat_type=ChatType.PRIVATE, chat_id=2002)
+    )
+
+    assert len(adapter.texts()) == 2
+    assert delays == [0.8]

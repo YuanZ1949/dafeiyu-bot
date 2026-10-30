@@ -33,6 +33,8 @@ class PersonaConfig:
     max_reply_chars_technical: int
     os_probability: float
     prompt_file: str = ""
+    # 拆成多条短消息时，每条之间的停顿（秒）。
+    segment_delay_seconds: float = 0.8
 
 
 @dataclass(frozen=True)
@@ -663,6 +665,11 @@ def _build_persona(raw: dict[str, Any]) -> PersonaConfig:
     max_tech = _int(raw.get("max_reply_chars_technical", 300), "persona.max_reply_chars_technical")
     if max_chars < 1 or max_tech < 1:
         raise ConfigError("persona 回复长度上限必须大于 0")
+    segment_delay = _float(
+        raw.get("segment_delay_seconds", 0.8), "persona.segment_delay_seconds"
+    )
+    if not 0 <= segment_delay <= 10:
+        raise ConfigError("persona.segment_delay_seconds 必须在 0 到 10 秒之间")
     return PersonaConfig(
         name=str(raw.get("name", "溟月")),
         aliases=tuple(str(a) for a in aliases),
@@ -670,6 +677,7 @@ def _build_persona(raw: dict[str, Any]) -> PersonaConfig:
         max_reply_chars_technical=max_tech,
         os_probability=_float(raw.get("os_probability", 0.05), "persona.os_probability"),
         prompt_file=str(raw.get("prompt_file") or "").strip(),
+        segment_delay_seconds=segment_delay,
     )
 
 

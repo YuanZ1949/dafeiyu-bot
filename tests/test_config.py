@@ -99,6 +99,29 @@ def test_recall_rejects_non_positive_numbers(tmp_path: Path) -> None:
         load_settings(env_file=env, config_file=write_yaml(tmp_path, bad))
 
 
+def test_segment_delay_defaults_and_parses(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    default = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+    assert default.persona.segment_delay_seconds == 0.8
+
+    custom = BASE_YAML.replace(
+        "  os_probability: 0.05",
+        "  os_probability: 0.05\n  segment_delay_seconds: 1.5",
+    )
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, custom))
+    assert s.persona.segment_delay_seconds == 1.5
+
+
+def test_segment_delay_rejects_negative(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    bad = BASE_YAML.replace(
+        "  os_probability: 0.05",
+        "  os_probability: 0.05\n  segment_delay_seconds: -1",
+    )
+    with pytest.raises(ConfigError, match="segment_delay_seconds"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, bad))
+
+
 def test_persona_prompt_file_defaults_empty_and_reads_yaml(tmp_path: Path) -> None:
     env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
     default = load_settings(env_file=env, config_file=write_yaml(tmp_path))

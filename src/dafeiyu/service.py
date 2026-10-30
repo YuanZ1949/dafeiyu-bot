@@ -24,7 +24,7 @@ from .memory.timeline import TIMELINE_LIMIT, build_batch_prompt
 from .memory.workspace import Workspace
 from .models import ChatType, Message, RecallEvent
 from .router import Router, now_shanghai
-from .sender import is_technical_question, shape_reply
+from .sender import is_technical_question, segment_reply, shape_reply
 from .workers.failure import QUOTA_KEY, is_quota_error, is_rate_limit_error
 from .workers.summary import summarize_for_rotation
 
@@ -114,6 +114,7 @@ class Service:
         workspace: Workspace | None = None,
         injection: InjectionConfig | None = None,
         audit: AuditLog | None = None,
+        sleep=None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -126,6 +127,7 @@ class Service:
         self.workspace = workspace
         self.injection = injection
         self.audit = audit
+        self._sleep = sleep or asyncio.sleep
         self.commands = CommandRegistry()
         self._command_clock: Callable[[], float] = time.monotonic
         self._command_last: dict[tuple[str, str, int], float] = {}
@@ -925,11 +927,17 @@ class Service:
             self.settings.persona.max_reply_chars_technical,
             is_technical=is_technical_question(batch[-1].content),
         )
+        # 单条回复够长且有多句时拆成 2-3 条短消息；>500 字的技术长文仍按原分片走。
+        if len(chunks) == 1:
+            chunks = segment_reply(chunks[0])
         if not chunks:
             return []
         sent: list[tuple[str, str | None]] = []
+        delay = float(getattr(self.settings.persona, "segment_delay_seconds", 0.0))
         try:
-            for chunk in chunks:
+            for index, chunk in enumerate(chunks):
+                if index and delay > 0:
+                    await self._sleep(delay)
                 message_id = await self.adapter.send(chat_type, chat_id, chunk)
                 sent.append((chunk, message_id))
         except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
@@ -1266,13 +1274,18 @@ class Service:
             self.settings.persona.max_reply_chars_technical,
             is_technical=is_technical_question(msg.content),
         )
+        if len(chunks) == 1:
+            chunks = segment_reply(chunks[0])
         if not chunks:
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
 
         sent: list[tuple[str, str | None]] = []
+        delay = float(getattr(self.settings.persona, "segment_delay_seconds", 0.0))
         try:
-            for chunk in chunks:
+            for index, chunk in enumerate(chunks):
+                if index and delay > 0:
+                    await self._sleep(delay)
                 message_id = await self.adapter.send(msg.chat_type, msg.chat_id, chunk)
                 sent.append((chunk, message_id))
         except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
