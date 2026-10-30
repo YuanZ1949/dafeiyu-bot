@@ -633,15 +633,26 @@
         <option value="group">只看群聊</option>
         <option value="private">只看私聊</option>
       </select>
-      <input id="memory-chat-id" type="number" min="1" placeholder="会话 ID" class="w-id" title="手动触发用的会话 ID" aria-label="手动触发用的会话 ID" />
     </div>
     <div class="row card-toolbar">
-      <button class="btn" id="btn-summarize">生成摘要</button>
-      <button class="btn" id="btn-extract">抽取印象</button>
+      <label class="kv" for="summary-date">摘要日期</label>
+      <input id="summary-date" type="date" class="w-id" title="默认昨天，可自选" aria-label="摘要日期" />
       <button class="btn" id="btn-merge-impressions" disabled>合并所选</button>
       <button class="btn" id="btn-more-memory">显示更多</button>
       <button class="btn" id="btn-refresh-memory">刷新</button>
     </div>
+    <details id="memory-advanced">
+      <summary class="kv">高级：手动指定会话 ID</summary>
+      <div class="row card-toolbar">
+        <select id="memory-target-type" title="手动触发目标的会话类型" aria-label="手动触发目标的会话类型">
+          <option value="group">群聊</option>
+          <option value="private">私聊</option>
+        </select>
+        <input id="memory-chat-id" type="number" min="1" placeholder="会话 ID" class="w-id" title="手动触发用的会话 ID" aria-label="手动触发用的会话 ID" />
+        <button class="btn" id="btn-summarize">按 ID 生成摘要</button>
+        <button class="btn" id="btn-extract">按 ID 抽取印象</button>
+      </div>
+    </details>
     <div class="kv" id="memory-health" role="status" aria-live="polite"></div>
     <div class="mem-grid">
       <div class="mem-col">
@@ -1957,11 +1968,36 @@ async function loadMemoryHealth() {
   if (state) renderGlobalBanner(state);
 }
 
+function isoDateLocal(d) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function yesterdayIso() {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  return isoDateLocal(d);
+}
+
+function summaryDate() {
+  const raw = ($("summary-date") && $("summary-date").value) || "";
+  return raw || yesterdayIso();
+}
+
 function memoryTarget() {
   const chatId = Number($("memory-chat-id").value);
-  if (!Number.isInteger(chatId) || chatId <= 0) throw new Error("请先填会话 ID");
-  const chatType = $("memory-chat-filter").value || "group";
+  if (!Number.isInteger(chatId) || chatId <= 0) {
+    throw new Error("请先在「高级」里填会话 ID，或直接点会话行的「摘要 / 印象」");
+  }
+  const chatType = $("memory-target-type").value || "group";
   return { chat_type: chatType, chat_id: chatId };
+}
+
+function resolveTarget(chatType, chatId) {
+  if (Number.isInteger(chatId) && chatId > 0 && (chatType === "group" || chatType === "private")) {
+    return { chat_type: chatType, chat_id: chatId };
+  }
+  return memoryTarget();
 }
 
 async function deleteUserMessages(event) {
@@ -2004,29 +2040,45 @@ async function deleteUserMessages(event) {
   }
 }
 
-async function triggerSummary() {
+async function triggerSummary(chatType, chatId) {
+  let target;
+  try {
+    target = { ...resolveTarget(chatType, chatId), date: summaryDate() };
+  } catch (err) {
+    toast(err.message, true);
+    return;
+  }
+  const label = chatLabel(target.chat_type, target.chat_id);
   try {
     const data = await api("/api/memory/summaries", {
       method: "POST",
-      body: JSON.stringify(memoryTarget()),
+      body: JSON.stringify(target),
     });
-    toast(data.summary ? `已生成 ${data.date} 摘要` : `${data.date} 没有可总结的消息`);
+    toast(data.summary ? `已生成 ${label} ${data.date} 摘要` : `${label} ${data.date} 没有可总结的消息`);
     loadMemory();
   } catch (err) {
-    toast(`生成摘要失败：${err.message}`, true);
+    toast(`生成摘要失败（${label} ${target.date}）：${err.message}`, true);
   }
 }
 
-async function triggerExtract() {
+async function triggerExtract(chatType, chatId) {
+  let target;
+  try {
+    target = resolveTarget(chatType, chatId);
+  } catch (err) {
+    toast(err.message, true);
+    return;
+  }
+  const label = chatLabel(target.chat_type, target.chat_id);
   try {
     const data = await api("/api/memory/impressions", {
       method: "POST",
-      body: JSON.stringify(memoryTarget()),
+      body: JSON.stringify(target),
     });
-    toast(`已抽取 ${data.added} 条印象`);
+    toast(`${label} 已抽取 ${data.added} 条印象`);
     loadMemory();
   } catch (err) {
-    toast(`抽取印象失败：${err.message}`, true);
+    toast(`抽取印象失败（${label}）：${err.message}`, true);
   }
 }
 
@@ -2354,6 +2406,8 @@ async function loadSessions(append = false) {
         btn.addEventListener("click", () => withBusy(btn, onClick));
         acts.appendChild(btn);
       };
+      add("摘要", "", () => triggerSummary(s.chat_type, s.chat_id));
+      add("印象", "", () => triggerExtract(s.chat_type, s.chat_id));
       add("查看时间线", "", () => openTimeline(s));
       add("新建会话", "", () => sessionAction(s, "new", "只清 session 映射，消息和摘要都会保留。继续？"));
       add("软忘记", "", () => sessionAction(s, "forget", "将清空该会话的消息和映射，保留摘要与印象。继续？"));
@@ -3095,6 +3149,8 @@ document.addEventListener("keydown", (ev) => {
 });
 
 initTabs();
+// 摘要日期默认昨天，用户可改；每次打开面板都重置回默认，避免沿用上次选择。
+$("summary-date").value = yesterdayIso();
 loadAuthSession();
 // 面板刚打开：强制重探一次免费档，别让上一次会话留下的旧黄条继续挂着。
 api("/api/brain?probe=1").catch(() => {});

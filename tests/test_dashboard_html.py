@@ -67,6 +67,45 @@ def test_html_memory_health_lists_pending_slots() -> None:
     assert "pending_days" in body  # 旧后端没有 pending_slots 时的兜底
 
 
+def test_memory_session_rows_trigger_summary_and_impressions() -> None:
+    """会话行直接带 chat_type/chat_id，用户不用把 ID 抄到上面的输入框。"""
+    html = read_html()
+    assert 'add("摘要", "", () => triggerSummary(s.chat_type, s.chat_id));' in html
+    assert 'add("印象", "", () => triggerExtract(s.chat_type, s.chat_id));' in html
+
+
+def test_memory_manual_target_lives_in_advanced_and_has_own_type() -> None:
+    """手输 ID 保留但收进高级；目标类型不能借用显示筛选器。"""
+    html = read_html()
+    advanced = html.index('<details id="memory-advanced">')
+    assert html.index('id="memory-chat-id"') > advanced
+    assert 'id="memory-target-type"' in html
+
+    match = re.search(r"function memoryTarget\(\) \{\n(.*?)\n\}", html, re.DOTALL)
+    assert match is not None, "memoryTarget 必须仍是一段可直接断言的函数体"
+    body = match.group(1)
+    assert 'memory-target-type' in body
+    assert 'memory-chat-filter' not in body
+
+
+def test_summary_date_defaults_to_yesterday_but_is_selectable() -> None:
+    """摘要日期默认昨天，可自选；生成时把日期一起发给后端。"""
+    html = read_html()
+    assert 'id="summary-date" type="date"' in html
+    assert "function yesterdayIso()" in html
+    assert '$("summary-date").value = yesterdayIso();' in html
+
+    match = re.search(
+        r"async function triggerSummary\(chatType, chatId\) \{\n(.*?)\n\}",
+        html,
+        re.DOTALL,
+    )
+    assert match is not None
+    body = match.group(1)
+    assert "summaryDate()" in body
+    assert "chatLabel(target.chat_type, target.chat_id)" in body
+
+
 def test_html_has_three_mode_cards() -> None:
     html = read_html()
     for mode in ("free", "key", "local_model"):
