@@ -55,6 +55,24 @@ MERGE_SYSTEM = """你是群聊记录整理助手。下面是同一段聊天记�
 # （如 provider.timeout）说明上游已明确失败，重试只会重复撞墙，交给退避。
 TIMEOUT_HINT = "OpenCode 超时"
 
+# 截断摘要时优先落在句末，避免把最后一句话切成半句。
+_CLIP_BOUNDARIES = "。！？；!?;\n"
+# 断点太靠前（不足一半）说明第一句本身很短，截到那里会丢掉大部分内容，此时宁可硬截断。
+_MIN_CLIP_CHARS = MAX_SUMMARY_CHARS // 2
+
+
+def _clip_summary(text: str) -> str:
+    """收敛模型输出：优先在句末标点处断开，找不到合适断点才硬截断并加省略号。"""
+    body = (text or "").strip()
+    if len(body) <= MAX_SUMMARY_CHARS:
+        return body
+    window = body[:MAX_SUMMARY_CHARS]
+    cut = max(window.rfind(ch) for ch in _CLIP_BOUNDARIES)
+    if cut + 1 >= _MIN_CLIP_CHARS:
+        return window[: cut + 1].rstrip()
+    return window[: MAX_SUMMARY_CHARS - 1].rstrip() + "…"
+
+
 
 def _day_bounds(date: str) -> tuple[int, int]:
     start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=SHANGHAI)
@@ -206,7 +224,7 @@ async def summarize_chat(
     store.record_usage(
         chat_type, chat_id, "summary", prompt_tokens, completion_tokens, estimated
     )
-    text = (raw or "").strip()[:MAX_SUMMARY_CHARS]
+    text = _clip_summary(raw)
     if not text:
         return ""
     store.upsert_summary(chat_type, chat_id, date, text)
@@ -236,7 +254,7 @@ async def summarize_for_rotation(
     store.record_usage(
         chat_type, chat_id, "summary", prompt_tokens, completion_tokens, estimated
     )
-    text = (raw or "").strip()[:MAX_SUMMARY_CHARS]
+    text = _clip_summary(raw)
     if not text:
         return ""
     store.add_session_summary(chat_type, chat_id, text)

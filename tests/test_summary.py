@@ -11,6 +11,7 @@ from dafeiyu.workers.summary import (
     MAX_CHUNK_TOKENS,
     MAX_SOURCE_LINES,
     MAX_SPLIT_DEPTH,
+    MAX_SUMMARY_CHARS,
     SummaryScheduler,
     summarize_chat,
     summarize_for_rotation,
@@ -63,6 +64,74 @@ async def test_summarize_truncates_to_200_and_stores():
     assert len(text) == 200
     assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) == text
     assert len(brain.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_summarize_cuts_at_last_sentence_boundary():
+    store = make_store()
+    seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ))
+    kept = "甲" * 90 + "。" + "乙" * 100 + "。"
+    brain = FakeBrain(kept + "丙" * 100)
+
+    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    assert text == kept
+
+
+@pytest.mark.asyncio
+async def test_summarize_cuts_at_newline_boundary():
+    store = make_store()
+    seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ))
+    kept = "甲" * 120
+    brain = FakeBrain(kept + "\n" + "乙" * 120)
+
+    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    assert text == kept
+
+
+@pytest.mark.asyncio
+async def test_summarize_hard_cut_marks_ellipsis_without_boundary():
+    store = make_store()
+    seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ))
+    brain = FakeBrain("鱼" * 250)
+
+    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    assert len(text) == MAX_SUMMARY_CHARS
+    assert text.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_summarize_ignores_boundary_in_first_half():
+    store = make_store()
+    seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ))
+    brain = FakeBrain("好。" + "鱼" * 250)
+
+    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    assert len(text) == MAX_SUMMARY_CHARS
+    assert text.startswith("好。")
+    assert text.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_rotation_summary_cuts_at_sentence_boundary():
+    store = make_store()
+    seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ))
+    start = datetime(2026, 10, 23, tzinfo=TZ)
+    messages = store.messages_between(
+        ChatType.GROUP,
+        9001,
+        int(start.timestamp()),
+        int((start + timedelta(days=1)).timestamp()),
+    )
+    kept = "甲" * 90 + "。" + "乙" * 100 + "。"
+    brain = FakeBrain(kept + "丙" * 100)
+
+    text = await summarize_for_rotation(brain, store, ChatType.GROUP, 9001, messages)
+
+    assert text == kept
 
 
 @pytest.mark.asyncio
