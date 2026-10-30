@@ -1072,6 +1072,35 @@ class Store:
         ).fetchall()
         return [self._row_to_message(r) for r in reversed(rows)]
 
+    def count_undelivered_before(
+        self, chat_type: ChatType, chat_id: int, message_id: str
+    ) -> int:
+        """投递窗口之前还有多少条未投递消息。
+
+        积压超过 pending_batch 的 limit 时，更早的消息既不进 prompt 也不会被标记投递；
+        这个计数用来在 prompt 里留一句「更早还有 N 条未展开」，让模型知道有断层。
+        """
+        row_id = self._row_id(chat_type, chat_id, message_id)
+        if row_id is None:
+            return 0
+        floor = self.last_delivered_id(chat_type, chat_id)
+        if floor is None:
+            return 0
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM messages m
+            WHERE m.chat_type = ? AND m.chat_id = ? AND m.is_bot = 0
+              AND m.id > ? AND m.id < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM delivered_messages d
+                  WHERE d.chat_type = m.chat_type AND d.chat_id = m.chat_id
+                    AND d.message_id = m.message_id
+              )
+            """,
+            (chat_type.value, chat_id, floor, row_id),
+        ).fetchone()
+        return int(row["n"]) if row is not None else 0
+
     def mark_recalled(self, chat_type: ChatType, chat_id: int, message_id: str) -> bool:
         """把一条已入库消息标记为撤回；原文保留，只是不再进入 prompt。"""
         cur = self._conn.execute(

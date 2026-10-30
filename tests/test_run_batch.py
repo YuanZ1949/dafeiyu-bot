@@ -517,3 +517,14 @@ async def test_ambient_replies_count_toward_thread_limit(tmp_path):
     await service._run_batch(ChatType.GROUP, 1001)
     assert service.router.ambient_turns(ChatType.GROUP, 1001) == 2
     assert service.router.is_thread_closed(ChatType.GROUP, 1001) is True
+
+
+async def test_batch_prompt_reports_backlog_before_window(tmp_path):
+    service, store, brain, _ = build(tmp_path)
+    for i in range(2, 26):
+        store.add_message(make_msg(f"第{i}条", message_id=f"m{i}"))
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    # 26 条待投递只取最新 20 条（m6..m25），m0..m5 共 6 条被省略。
+    assert "（更早还有 6 条消息未展开）" in brain.last_prompt

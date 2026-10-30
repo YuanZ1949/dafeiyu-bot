@@ -110,3 +110,46 @@ async def test_note_during_flush_keeps_new_window():
 
     now[0] = 60.0
     assert s.tick() == [(ChatType.GROUP, 1)]
+
+
+async def test_ambient_note_during_flush_restarts_batch_window():
+    now = [0.0]
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_flush(chat_type, chat_id):
+        started.set()
+        await release.wait()
+
+    fast = SimpleNamespace(
+        trigger=TriggerConfig(
+            cooldown_seconds=30,
+            sample_rate=0.1,
+            quiet_hours=("23:00", "08:00"),
+            keywords=("大肥鱼",),
+            batch_seconds=8,
+            addressed_debounce_seconds=3,
+            addressed_max_wait_seconds=20,
+            ambient_min_interval_seconds=2,
+        )
+    )
+    s = BatchScheduler(None, fast, on_flush=slow_flush, clock=lambda: now[0])
+    s.note(make_msg(0), addressed=False)
+    now[0] = 100.0
+
+    task = asyncio.create_task(s.run(interval=0.01))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        # 投递期间又来了一条普通消息：新一批要从现在重新等 batch_seconds，
+        # 不能沿用旧窗口的到期时间立刻再发一次。
+        now[0] = 101.0
+        s.note(make_msg(1), addressed=False)
+        release.set()
+        await asyncio.sleep(0.1)
+    finally:
+        task.cancel()
+
+    assert s.tick() == []
+
+    now[0] = 109.5
+    assert s.tick() == [(ChatType.GROUP, 1)]

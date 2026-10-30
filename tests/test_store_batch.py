@@ -45,6 +45,17 @@ def test_pending_batch_takes_newest_not_oldest(store: Store) -> None:
     assert [m.message_id for m in batch] == [f"m{i}" for i in range(5, 25)]
 
 
+def test_count_undelivered_before_counts_backlog(store: Store) -> None:
+    for i in range(25):
+        store.add_message(make_msg(i))
+    store.mark_delivered(ChatType.GROUP, 1, "m0")
+
+    # m1..m4 是投递窗口之外、更早的未投递消息。
+    assert store.count_undelivered_before(ChatType.GROUP, 1, "m5") == 4
+    assert store.count_undelivered_before(ChatType.GROUP, 1, "m24") == 23
+    assert store.count_undelivered_before(ChatType.GROUP, 1, "m0") == 0
+
+
 def test_first_delivery_does_not_backfill(store: Store) -> None:
     for i in range(5):
         store.add_message(make_msg(i))

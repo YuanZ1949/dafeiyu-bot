@@ -835,6 +835,16 @@ class Service:
             return
 
         ids = [m.message_id for m in batch]
+        # 积压超过窗口时更早的消息不进 prompt：给模型留一句断层提示，别当成连续对话。
+        backlog = self.store.count_undelivered_before(chat_type, chat_id, ids[0])
+        if backlog:
+            log.info(
+                "批次积压 %s/%s backlog=%d window=%d",
+                chat_id,
+                ids[0],
+                backlog,
+                len(ids),
+            )
         addressed_ids = [m.message_id for m in batch if m.at_bot or m.reply_to_bot]
         addressed = bool(addressed_ids)
         current_id = addressed_ids[-1] if addressed_ids else ids[-1]
@@ -860,6 +870,7 @@ class Service:
             chat_id,
             batch,
             continuation=continuation,
+            omitted=backlog,
         )
 
         log.info(

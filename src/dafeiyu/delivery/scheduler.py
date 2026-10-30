@@ -128,7 +128,11 @@ class BatchScheduler:
             now = self.clock()
             if self._revisions.get(key, 0) == revision:
                 on_flushed(window, now=now, addressed=addressed)
-            elif not addressed:
-                # 投递期间进了新消息：窗口留着，但这次发言仍占用了环境发言名额。
-                window.last_ambient_at = now
+            else:
+                # 投递期间进了新消息：新一批从 now 重新起算，否则旧窗口的到期时间
+                # 早已过期，下一拍会立刻再 flush 一次，变成对同一话题连发两条。
+                window.first_queued_at = now
+                if not addressed:
+                    # 这次发言仍占用了环境发言名额。
+                    window.last_ambient_at = now
             self.done(chat_type, chat_id)
