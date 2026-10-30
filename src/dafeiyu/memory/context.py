@@ -295,10 +295,16 @@ def build_injection(
 
     # 私聊没有群友概念，整段省略。
     if cfg.inject_impressions and chat_type == ChatType.GROUP:
-        lines = [
-            imp.content
-            for imp in store.list_impressions(chat_type, chat_id, INJECTION_IMPRESSION_TOPK)
-        ]
+        lines = []
+        for imp in store.list_impressions(
+            chat_type, chat_id, INJECTION_IMPRESSION_TOPK
+        ):
+            name = imp.subject_nickname.strip()
+            if name and not imp.content.startswith(name):
+                # 带上主语，模型才知道「喜欢猫」说的是谁。
+                lines.append(f"{name}：{imp.content}")
+            else:
+                lines.append(imp.content)
         block = _clip("\n".join(lines), cfg.impression_chars)
         if block:
             parts.append(f"{INJECTION_IMPRESSION_HEADER}\n{block}")

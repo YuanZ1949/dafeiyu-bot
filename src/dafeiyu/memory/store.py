@@ -60,6 +60,8 @@ CREATE TABLE IF NOT EXISTS impressions (
     kind TEXT NOT NULL,
     content TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 0.5,
+    -- 抽取时该用户的最新群昵称，注入时用来标明「这是谁」。
+    subject_nickname TEXT NOT NULL DEFAULT '',
     -- 来源只记最近一条同用户消息，删消息后仍能看出这条印象从哪来。
     source_message_id TEXT NOT NULL DEFAULT '',
     source_excerpt TEXT NOT NULL DEFAULT '',
@@ -69,6 +71,16 @@ CREATE TABLE IF NOT EXISTS impressions (
     UNIQUE (chat_type, chat_id, subject_user_id, kind, content)
 );
 CREATE INDEX IF NOT EXISTS idx_impressions_chat ON impressions (chat_type, chat_id);
+
+-- 印象抽取游标：记录该会话已抽到第几条消息。重启后据此续跑，
+-- 避免 _last_count 只存在内存导致每个活跃会话立刻白跑一次。
+CREATE TABLE IF NOT EXISTS impression_cursors (
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    last_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_type, chat_id)
+);
 
 CREATE TABLE IF NOT EXISTS summaries (
     chat_type TEXT NOT NULL,
@@ -178,6 +190,7 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         "source_message_id": "TEXT NOT NULL DEFAULT ''",
         "source_excerpt": "TEXT NOT NULL DEFAULT ''",
         "last_seen_at": "TEXT NOT NULL DEFAULT (datetime('now'))",
+        "subject_nickname": "TEXT NOT NULL DEFAULT ''",
     },
     "usage": {
         "estimated": "INTEGER NOT NULL DEFAULT 0",
@@ -1232,8 +1245,10 @@ class Store:
         confidence: float,
         source_message_id: str = "",
         source_excerpt: str = "",
+        subject_nickname: str = "",
     ) -> None:
         subject = subject_user_id or 0
+        nickname = subject_nickname.strip()[:40]
         if kind == "nickname":
             # 昵称是「唯一称呼」：同一用户只留最新一条，旧行交给 DELETE 让 FTS 触发器同步。
             self._conn.execute(
@@ -1263,6 +1278,7 @@ class Store:
                             confidence,
                             source_message_id,
                             source_excerpt,
+                            nickname,
                         )
                         self._conn.commit()
                         return
@@ -1270,13 +1286,18 @@ class Store:
             """
             INSERT INTO impressions
                 (chat_type, chat_id, subject_user_id, kind, content, confidence,
-                 source_message_id, source_excerpt, last_seen_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                 subject_nickname, source_message_id, source_excerpt, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT (chat_type, chat_id, subject_user_id, kind, content)
             DO UPDATE SET
                 confidence = excluded.confidence,
                 updated_at = datetime('now'),
                 last_seen_at = datetime('now'),
+                subject_nickname = CASE
+                    WHEN excluded.subject_nickname <> ''
+                    THEN excluded.subject_nickname
+                    ELSE impressions.subject_nickname
+                END,
                 source_message_id = CASE
                     WHEN excluded.source_message_id <> ''
                     THEN excluded.source_message_id
@@ -1295,6 +1316,7 @@ class Store:
                 kind,
                 content,
                 confidence,
+                nickname,
                 source_message_id,
                 source_excerpt,
             ),
@@ -1308,6 +1330,7 @@ class Store:
         confidence: float,
         source_message_id: str,
         source_excerpt: str,
+        subject_nickname: str = "",
     ) -> None:
         """归一化去重命中：沿用 merge_impressions 的语义就地更新，保留原 id。"""
         merged_content = content.strip() or row["content"]
@@ -1318,6 +1341,9 @@ class Store:
                 confidence = ?,
                 updated_at = datetime('now'),
                 last_seen_at = datetime('now'),
+                subject_nickname = CASE
+                    WHEN ? <> '' THEN ? ELSE subject_nickname
+                END,
                 source_message_id = CASE
                     WHEN ? <> '' THEN ? ELSE source_message_id
                 END,
@@ -1329,6 +1355,8 @@ class Store:
             (
                 merged_content,
                 max(float(row["confidence"]), float(confidence)),
+                subject_nickname,
+                subject_nickname,
                 source_message_id,
                 source_message_id,
                 source_excerpt,
@@ -1498,6 +1526,33 @@ class Store:
         ).fetchone()
         return int(row["total"] or 0)
 
+    # ---- 印象抽取游标 ----------------------------------------------
+    def get_impression_cursor(self, chat_type: ChatType, chat_id: int) -> int:
+        """已抽取到的消息条数；没有记录时返回 0。"""
+        row = self._conn.execute(
+            """
+            SELECT last_count FROM impression_cursors
+            WHERE chat_type = ? AND chat_id = ?
+            """,
+            (chat_type.value, chat_id),
+        ).fetchone()
+        return 0 if row is None else int(row["last_count"] or 0)
+
+    def set_impression_cursor(
+        self, chat_type: ChatType, chat_id: int, last_count: int
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO impression_cursors (chat_type, chat_id, last_count, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT (chat_type, chat_id)
+            DO UPDATE SET last_count = excluded.last_count,
+                          updated_at = datetime('now')
+            """,
+            (chat_type.value, chat_id, max(0, int(last_count))),
+        )
+        self._conn.commit()
+
     @staticmethod
     def _row_to_impression(r: sqlite3.Row) -> Impression:
         return Impression(
@@ -1507,6 +1562,7 @@ class Store:
             kind=r["kind"],
             content=r["content"],
             confidence=r["confidence"],
+            subject_nickname=r["subject_nickname"] or "",
             source_message_id=r["source_message_id"] or "",
             source_excerpt=r["source_excerpt"] or "",
             updated_at=r["updated_at"],

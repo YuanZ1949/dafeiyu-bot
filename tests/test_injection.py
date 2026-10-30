@@ -79,3 +79,25 @@ def test_build_context_includes_two_days_ago_summary(store, tmp_path):
     bundle = build_context(store, GROUP, 1, 20, 5, "系统", "2026-10-24")
     assert "周末聊了露营" in bundle.system
     assert "10-22：" in bundle.system
+
+
+def test_impressions_are_injected_with_subject_nickname(store, tmp_path):
+    """没有主语的印象（「喜欢猫」）必须带上是谁，否则模型无法使用。"""
+    store.upsert_impression(
+        GROUP, 1, 1001, "preference", "喜欢猫", 0.9, subject_nickname="阿猫"
+    )
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, InjectionConfig(), today="2026-10-24"
+    )
+    assert "阿猫：喜欢猫" in text
+
+
+def test_impression_already_starting_with_nickname_is_not_doubled(store, tmp_path):
+    store.upsert_impression(
+        GROUP, 1, 1001, "preference", "阿猫：爱猫人士", 0.9, subject_nickname="阿猫"
+    )
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, InjectionConfig(), today="2026-10-24"
+    )
+    assert "阿猫：阿猫：爱猫人士" not in text
+    assert "阿猫：爱猫人士" in text

@@ -105,14 +105,24 @@ class ImpressionWorker:
         if self._backoff.should_skip(key):
             return 0
         count = self.store.count_messages(chat_type, chat_id)
-        last = self._last_count.get(key, 0)
+        last = self._last_count_for(key)
         if count < last:  # 会话被 /forget 清空过，重新开始计数
             last = 0
         if count < last + self.every:
             return 0
-        self._last_count[key] = count
         added = await self.extract(chat_type, chat_id)
-        return 0 if added is None else added
+        if added is None:
+            # 失败不推进游标：退避结束后同一批消息还能再试。
+            return 0
+        self._last_count[key] = count
+        self.store.set_impression_cursor(chat_type, chat_id, count)
+        return added
+
+    def _last_count_for(self, key: tuple[ChatType, int]) -> int:
+        """游标落库：重启后从上次抽到的位置继续，而不是从 0 重跑一遍。"""
+        if key not in self._last_count:
+            self._last_count[key] = self.store.get_impression_cursor(*key)
+        return self._last_count[key]
 
     async def extract(self, chat_type: ChatType, chat_id: int) -> int | None:
         """抽取并写入印象；调用失败返回 None，供上层决定是否退避。"""
@@ -181,6 +191,7 @@ class ImpressionWorker:
                 confidence,
                 source_message_id=source.message_id if source else "",
                 source_excerpt=source.content[:80] if source else "",
+                subject_nickname=source.nickname if source else "",
             )
         self._backoff.mark_ok((chat_type, chat_id))
         return added

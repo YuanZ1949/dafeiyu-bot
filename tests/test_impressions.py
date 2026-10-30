@@ -293,3 +293,46 @@ def test_repeat_write_refreshes_last_seen_at(store: Store) -> None:
     assert row["fresh"] == 1
 
 
+async def test_restart_resumes_from_persisted_cursor(store: Store) -> None:
+    brain = FakeBrain(
+        json.dumps(
+            [{"user_id": 123, "kind": "fact", "content": "住在杭州", "confidence": 0.8}]
+        )
+    )
+    worker = ImpressionWorker(store, brain, every=20)
+    for i in range(20):
+        store.add_message(make_message(i))
+    assert await worker.maybe_extract(CHAT, CHAT_ID) == 1
+    assert brain.calls == 1
+
+    restarted = ImpressionWorker(store, brain, every=20)
+    assert await restarted.maybe_extract(CHAT, CHAT_ID) == 0
+    assert brain.calls == 1  # 重启后不重抽同一批消息
+
+    for i in range(20, 40):
+        store.add_message(make_message(i))
+    await restarted.maybe_extract(CHAT, CHAT_ID)
+    assert brain.calls == 2  # 新消息到了仍然会抽
+
+
+async def test_extraction_stores_subject_nickname(store: Store) -> None:
+    brain = FakeBrain(
+        json.dumps(
+            [{"user_id": 123, "kind": "preference", "content": "喜欢猫", "confidence": 0.9}]
+        )
+    )
+    worker = ImpressionWorker(store, brain, every=1)
+    store.add_message(make_message(1, content="我喜欢猫"))
+    await worker.maybe_extract(CHAT, CHAT_ID)
+    assert store.list_impressions(CHAT, CHAT_ID, topk=10)[0].subject_nickname == "鱼片"
+
+
+async def test_failure_does_not_advance_cursor(store: Store) -> None:
+    brain = FakeBrain(exc=BrainError("provider.timeout"))
+    worker = ImpressionWorker(store, brain, every=20, backoff_seconds=0)
+    for i in range(20):
+        store.add_message(make_message(i))
+    assert await worker.maybe_extract(CHAT, CHAT_ID) == 0
+    assert store.get_impression_cursor(CHAT, CHAT_ID) == 0
+
+

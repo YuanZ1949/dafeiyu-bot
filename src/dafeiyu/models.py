@@ -41,6 +41,8 @@ class Impression:
     kind: str
     content: str
     confidence: float
+    # 抽取时记下的最新群昵称：注入时用来回答「这是谁」，消息被清理后也不丢。
+    subject_nickname: str = ""
     source_message_id: str = ""
     source_excerpt: str = ""
     updated_at: str = ""
