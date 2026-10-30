@@ -152,6 +152,37 @@ def test_thread_state_rejects_negative(tmp_path: Path) -> None:
         load_settings(env_file=env, config_file=write_yaml(tmp_path, bad))
 
 
+def test_closed_sample_rate_defaults_and_parses(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    default = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+    assert default.triggers.closed_sample_rate == 0.05
+
+    custom = BASE_YAML.replace(
+        "sample_rate: 0.05",
+        "sample_rate: 0.05\n  closed_sample_rate: 0.2",
+    )
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, custom))
+    assert s.triggers.closed_sample_rate == 0.2
+
+    silent = BASE_YAML.replace(
+        "sample_rate: 0.05",
+        "sample_rate: 0.05\n  closed_sample_rate: 0",
+    )
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, silent))
+    assert s.triggers.closed_sample_rate == 0
+
+
+def test_closed_sample_rate_rejects_out_of_range(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    for value in ("1.5", "-0.1"):
+        bad = BASE_YAML.replace(
+            "sample_rate: 0.05",
+            f"sample_rate: 0.05\n  closed_sample_rate: {value}",
+        )
+        with pytest.raises(ConfigError, match="closed_sample_rate"):
+            load_settings(env_file=env, config_file=write_yaml(tmp_path, bad))
+
+
 def test_persona_prompt_file_defaults_empty_and_reads_yaml(tmp_path: Path) -> None:
     env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
     default = load_settings(env_file=env, config_file=write_yaml(tmp_path))

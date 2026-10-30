@@ -318,8 +318,12 @@ class Service:
             return "muted"
         if self.router.is_quiet(msg.chat_type, msg.chat_id):
             return "quiet"
-        # 话题已收尾：非点名消息不接，避免在别人聊完后硬插话。
-        if not addressed and self.router.is_thread_closed(msg.chat_type, msg.chat_id):
+        # 话题已收尾：不再硬拦，按低概率抽样放行，让模型自己判断要不要接。
+        if (
+            not addressed
+            and self.router.is_thread_closed(msg.chat_type, msg.chat_id)
+            and not self.router.closed_sample(msg.chat_type, msg.chat_id)
+        ):
             return "closed"
         # 连续三次选择不说后进入降频窗口：批次模式也必须认，否则降频是死状态。
         if not addressed and self.router.is_downshifted(msg.chat_type, msg.chat_id):
@@ -1145,7 +1149,7 @@ class Service:
         if not callable(responder):
             # 旧 brain 只有 decide：保留兜底，切换期也不至于直接崩。
             return await self.brain.decide(
-                self._system_prompt(chat_type, messages),
+                self._system_prompt(chat_type, messages, chat_id),
                 [{"role": "user", "content": prompt}],
             )
         if getattr(self.brain, "accepts_history", False):
@@ -1153,7 +1157,7 @@ class Service:
                 chat_type,
                 chat_id,
                 prompt,
-                system=self._system_prompt(chat_type, messages),
+                system=self._system_prompt(chat_type, messages, chat_id),
                 history=self._history_before(chat_type, chat_id, messages),
                 on_tool=on_tool,
             )
@@ -1198,18 +1202,23 @@ class Service:
             chat_type,
             chat_id,
             prompt,
-            system=self._system_prompt(chat_type, messages),
+            system=self._system_prompt(chat_type, messages, chat_id),
             history=self._history_before(chat_type, chat_id, messages),
             on_tool=on_tool,
         )
 
-    def _system_prompt(self, chat_type: ChatType, messages: list[Message]) -> str:
+    def _system_prompt(
+        self,
+        chat_type: ChatType,
+        messages: list[Message],
+        chat_id: int | None = None,
+    ) -> str:
         chat_title = (
             "本群"
             if chat_type is ChatType.GROUP
             else (messages[-1].nickname if messages else "私聊")
         )
-        return build_system_prompt(
+        prompt = build_system_prompt(
             self.persona_text,
             chat_title,
             now_shanghai().date().isoformat(),
@@ -1218,6 +1227,16 @@ class Service:
             self.settings.persona.os_probability,
             tools_enabled=self._tools_enabled(),
         )
+        if (
+            chat_id is not None
+            and chat_type is ChatType.GROUP
+            and self.router.is_thread_closed(chat_type, chat_id)
+        ):
+            prompt += (
+                "\n\n这个话题你刚收尾过。除非对方明显在问你、"
+                "或者话题被重新提起，否则不要接。"
+            )
+        return prompt
 
     def _tools_enabled(self) -> bool:
         """只有 opencode 且工作区开着时，模型才真的有 read/edit/webfetch。"""

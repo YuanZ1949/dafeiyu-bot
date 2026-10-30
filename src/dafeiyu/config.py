@@ -59,6 +59,8 @@ class TriggerConfig:
     thread_idle_seconds: int = 300
     # 话题结束后，这么久内不再主动加入；被点名会立刻重开。
     thread_closed_seconds: int = 600
+    # 关窗期间非点名消息的采样率；0 表示彻底静默，被点名仍不受影响。
+    closed_sample_rate: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -722,6 +724,11 @@ def _build_triggers(raw: dict[str, Any]) -> TriggerConfig:
     thread_closed = _int(
         raw.get("thread_closed_seconds", 600), "triggers.thread_closed_seconds"
     )
+    closed_sample_rate = _float(
+        raw.get("closed_sample_rate", 0.05), "triggers.closed_sample_rate"
+    )
+    if not 0 <= closed_sample_rate <= 1:
+        raise ConfigError("triggers.closed_sample_rate 必须在 [0, 1] 之间")
     for name, value in (
         ("triggers.batch_seconds", batch_seconds),
         ("triggers.addressed_debounce_seconds", addressed_debounce),
@@ -746,6 +753,7 @@ def _build_triggers(raw: dict[str, Any]) -> TriggerConfig:
         ambient_max_turns=ambient_max_turns,
         thread_idle_seconds=thread_idle,
         thread_closed_seconds=thread_closed,
+        closed_sample_rate=closed_sample_rate,
     )
 
 

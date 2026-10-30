@@ -151,13 +151,14 @@ def build(
     with_workspace: bool = False,
     injection: InjectionConfig | None = None,
     sleep=None,
+    rng=None,
 ):
     store = Store(str(tmp_path / "t.db"))
     store.init_schema()
     settings = make_settings(budget=budget, memory=memory)
     adapter = FakeAdapter()
     brain = brain or FakeBrain()
-    router = Router(settings, store, clock=lambda: NOON)
+    router = Router(settings, store, clock=lambda: NOON, rng=rng)
 
     workspace = None
     if with_workspace:
@@ -528,3 +529,98 @@ async def test_batch_prompt_reports_backlog_before_window(tmp_path):
 
     # 26 条待投递只取最新 20 条（m6..m25），m0..m5 共 6 条被省略。
     assert "（更早还有 6 条消息未展开）" in brain.last_prompt
+
+
+class _FixedRng:
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def random(self) -> float:
+        return self.value
+
+
+async def test_closed_thread_samples_ambient_message(tmp_path):
+    service, store, brain, _adapter = build(tmp_path, rng=_FixedRng(0.0))
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    assert service.router.is_thread_closed(ChatType.GROUP, 1001) is True
+
+    msg = make_msg("还在聊吗", message_id="m3")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert brain.reply_calls == 1
+    assert "收尾" in service._system_prompt(ChatType.GROUP, [msg], 1001)
+
+
+async def test_closed_thread_sample_miss_skips(tmp_path):
+    service, store, brain, _adapter = build(tmp_path, rng=_FixedRng(0.9))
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    assert service.router.is_thread_closed(ChatType.GROUP, 1001) is True
+
+    msg = make_msg("随便聊聊", message_id="m3")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+
+    assert brain.reply_calls == 0
+
+
+async def test_closed_thread_addressed_still_replies(tmp_path):
+    service, store, brain, _adapter = build(tmp_path, rng=_FixedRng(0.9))
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    assert service.router.is_thread_closed(ChatType.GROUP, 1001) is True
+
+    msg = make_msg("大肥鱼", message_id="m3", at_bot=True)
+    store.add_message(msg)
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert brain.reply_calls == 1
+
+
+class _HistoryBrain(FakeBrain):
+    """模拟 opencode 那种会话型大脑：system prompt 由 service 传入。"""
+
+    accepts_history = True
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.systems: list[str] = []
+
+    async def reply(
+        self, chat_type, chat_id, text: str, *, system=None, history=None, on_tool=None
+    ) -> BrainReply:
+        self.systems.append(system or "")
+        return await super().reply(chat_type, chat_id, text, on_tool=on_tool)
+
+
+async def test_closed_thread_hint_reaches_model_system_prompt(tmp_path):
+    brain = _HistoryBrain()
+    service, store, _brain, _adapter = build(tmp_path, brain=brain, rng=_FixedRng(0.0))
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    assert service.router.is_thread_closed(ChatType.GROUP, 1001) is True
+
+    msg = make_msg("还在聊吗", message_id="m3")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert brain.reply_calls == 1
+    assert "收尾" in brain.systems[-1]
+
+
+async def test_open_thread_has_no_closed_hint(tmp_path):
+    brain = _HistoryBrain()
+    service, store, _brain, _adapter = build(tmp_path, brain=brain, rng=_FixedRng(0.0))
+
+    msg = make_msg("今天下雨", message_id="m3")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert brain.reply_calls == 1
+    assert "收尾" not in brain.systems[-1]

@@ -205,6 +205,9 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `persona.prompt_file` | `""` | 自定义人设文件路径；留空使用内置 `brain/persona.md`。改完重启生效 |
 | `triggers.cooldown_seconds` | `60` | 同一群两次**非提问**发言的最小间隔（明确提问、@/引用/叫名字不受限） |
 | `triggers.sample_rate` | `0.05` | 普通消息被纳入模型判断的采样率 |
+| `triggers.thread_idle_seconds` | `300` | 机器人说完后这么久没人接，算话题结束 |
+| `triggers.thread_closed_seconds` | `600` | 话题结束后的收尾窗口；窗口内默认不主动接话，被点名立刻重开 |
+| `triggers.closed_sample_rate` | `0.05` | 收尾窗口内非点名消息的放行概率，命中了交给模型自己判断；`0` = 完全静默 |
 | `triggers.quiet_hours` | `["01:00","07:00"]` | 静默时段，不主动插话（@ 仍会回） |
 | `triggers.keywords` | 怎么/为什么/崩了… | 命中即进入模型判断（问号结尾也算；「没什么」这类否定口语不算） |
 | `groups.whitelist` | `[]` | 留空 = 所有群；非空 = 只服务这些群号（被 @/引用/叫名字时不受限） |

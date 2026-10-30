@@ -35,6 +35,15 @@ class FakeStore:
         self.calls = 0
         self.tokens = 0
         self.msgs: list[Message] = []
+        self.states: dict[tuple[ChatType, int], dict[str, object]] = {}
+
+    def load_chat_state(self, chat_type: ChatType, chat_id: int) -> dict[str, object] | None:
+        return self.states.get((chat_type, chat_id))
+
+    def save_chat_state(
+        self, chat_type: ChatType, chat_id: int, state: dict[str, object]
+    ) -> None:
+        self.states[(chat_type, chat_id)] = dict(state)
 
     def usage_today(self, chat_type: ChatType, chat_id: int, today: str) -> tuple[int, int]:
         return self.calls, self.tokens
@@ -63,6 +72,7 @@ class FakeStore:
 def make_settings(
     *,
     sample_rate: float = 0.05,
+    closed_sample_rate: float = 0.05,
     whitelist: tuple[int, ...] = (),
     blacklist: tuple[int, ...] = (),
     daily_calls: int = 200,
@@ -74,6 +84,7 @@ def make_settings(
         triggers=SimpleNamespace(
             cooldown_seconds=60,
             sample_rate=sample_rate,
+            closed_sample_rate=closed_sample_rate,
             quiet_hours=quiet_hours,
             keywords=keywords,
         ),
@@ -411,7 +422,7 @@ def test_parse_command() -> None:
 
 
 def test_bot_message_going_unanswered_closes_thread() -> None:
-    router, _, clock = make_router()
+    router, _, clock = make_router(closed_sample_rate=0.0)
     router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
     clock.advance(300)
     assert router.is_thread_closed(ChatType.GROUP, 1) is False
@@ -468,3 +479,99 @@ def test_user_message_after_bot_keeps_thread_open() -> None:
     # 话题可能已经结束，但这条消息说明还有人接话：先记账再判定，不能关。
     router.note_user_message(ChatType.GROUP, 1)
     assert router.is_thread_closed(ChatType.GROUP, 1) is False
+
+
+def close_thread(router) -> None:
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+
+
+def test_mute_survives_restart() -> None:
+    router, store, clock = make_router()
+    router.quiet(ChatType.GROUP, 1, 30)
+
+    restarted = Router(make_settings(), store, clock=clock, rng=FakeRng(0.0))
+    assert restarted.is_muted(ChatType.GROUP, 1) is True
+
+
+def test_closed_thread_survives_restart() -> None:
+    router, store, clock = make_router()
+    close_thread(router)
+    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+
+    restarted = Router(make_settings(), store, clock=clock, rng=FakeRng(0.0))
+    assert restarted.is_thread_closed(ChatType.GROUP, 1) is True
+
+
+def test_expired_closed_window_does_not_block_after_restart() -> None:
+    router, store, clock = make_router()
+    close_thread(router)
+    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+    clock.advance(601)
+
+    restarted = Router(make_settings(), store, clock=clock, rng=FakeRng(0.0))
+    assert restarted.is_thread_closed(ChatType.GROUP, 1) is False
+
+
+def test_downshift_survives_restart() -> None:
+    router, store, clock = make_router()
+    for _ in range(3):
+        router.note_no_reply(ChatType.GROUP, 1)
+    assert router.is_downshifted(ChatType.GROUP, 1) is True
+
+    restarted = Router(make_settings(), store, clock=clock, rng=FakeRng(0.0))
+    assert restarted.is_downshifted(ChatType.GROUP, 1) is True
+
+
+def test_expired_downshift_does_not_block_after_restart() -> None:
+    router, store, clock = make_router()
+    for _ in range(3):
+        router.note_no_reply(ChatType.GROUP, 1)
+    clock.advance(1801)
+
+    restarted = Router(make_settings(), store, clock=clock, rng=FakeRng(0.0))
+    assert restarted.is_downshifted(ChatType.GROUP, 1) is False
+
+
+def test_closed_sample_uses_closed_rate() -> None:
+    router, _, _ = make_router(rng=0.01, closed_sample_rate=0.05)
+    close_thread(router)
+    assert router.closed_sample(ChatType.GROUP, 1) is True
+
+    router, _, _ = make_router(rng=0.2, closed_sample_rate=0.05)
+    close_thread(router)
+    assert router.closed_sample(ChatType.GROUP, 1) is False
+
+
+def test_closed_sample_rate_zero_never_samples() -> None:
+    router, _, _ = make_router(rng=0.0, closed_sample_rate=0.0)
+    close_thread(router)
+    assert router.closed_sample(ChatType.GROUP, 1) is False
+
+
+def test_persist_failure_does_not_break_state_updates() -> None:
+    class BoomStore(FakeStore):
+        def save_chat_state(self, chat_type, chat_id, state):
+            raise RuntimeError("db down")
+
+    clock = FakeClock(datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI))
+    router = Router(make_settings(), BoomStore(), clock=clock, rng=FakeRng(0.0))
+    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    assert router.ambient_turns(ChatType.GROUP, 1) == 1
+
+
+def test_probe_does_not_persist() -> None:
+    router, store, _clock = make_router()
+    probe = router.clone(now=datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI))
+    probe.quiet(ChatType.GROUP, 1, 10)
+    assert (ChatType.GROUP, 1) not in store.states
+
+
+def test_closed_sampled_message_reaches_model_in_rules_mode() -> None:
+    router, _, _ = make_router(rng=0.0, closed_sample_rate=0.05)
+    close_thread(router)
+    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+
+    decision = router.should_handle(msg("随便聊聊"))
+    assert decision.call_model is True
+    assert decision.reason == "closed"

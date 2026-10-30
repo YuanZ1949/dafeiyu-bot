@@ -87,6 +87,23 @@ CREATE TABLE IF NOT EXISTS impression_cursors (
     PRIMARY KEY (chat_type, chat_id)
 );
 
+-- 会话级运行状态：静音、话题收尾、ambient 计数。时间存 epoch 秒，
+-- 避免重启后时区/夏令时转换把窗口算歪。
+CREATE TABLE IF NOT EXISTS chat_state (
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    last_bot_spoke REAL,
+    last_user_message REAL,
+    muted_until REAL,
+    ambient_streak INTEGER NOT NULL DEFAULT 0,
+    no_reply_streak INTEGER NOT NULL DEFAULT 0,
+    downshift_until REAL,
+    thread_closed_until REAL,
+    last_closed_at REAL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_type, chat_id)
+);
+
 CREATE TABLE IF NOT EXISTS summaries (
     chat_type TEXT NOT NULL,
     chat_id INTEGER NOT NULL,
@@ -217,6 +234,11 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
     # 早期的 429 计数表用 streak 列；现在改存事件时间数组，老库补列即可。
     "memory_rate_limit": {
         "events": "TEXT NOT NULL DEFAULT '[]'",
+    },
+    # chat_state 是本轮新表；补列项留给跑过中间版本库的本地环境。
+    "chat_state": {
+        "no_reply_streak": "INTEGER NOT NULL DEFAULT 0",
+        "downshift_until": "REAL",
     },
 }
 
@@ -1679,6 +1701,73 @@ class Store:
                           updated_at = datetime('now')
             """,
             (chat_type.value, chat_id, max(0, int(last_count))),
+        )
+        self._conn.commit()
+
+    # ---- 会话运行状态 ----------------------------------------------
+    def load_chat_state(
+        self, chat_type: ChatType, chat_id: int
+    ) -> dict[str, object] | None:
+        """静音/话题收尾等运行状态；没有记录返回 None。"""
+        row = self._conn.execute(
+            """
+            SELECT last_bot_spoke, last_user_message, muted_until,
+                   ambient_streak, no_reply_streak, downshift_until,
+                   thread_closed_until, last_closed_at
+            FROM chat_state
+            WHERE chat_type = ? AND chat_id = ?
+            """,
+            (chat_type.value, chat_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "last_bot_spoke": row["last_bot_spoke"],
+            "last_user_message": row["last_user_message"],
+            "muted_until": row["muted_until"],
+            "ambient_streak": int(row["ambient_streak"] or 0),
+            "no_reply_streak": int(row["no_reply_streak"] or 0),
+            "downshift_until": row["downshift_until"],
+            "thread_closed_until": row["thread_closed_until"],
+            "last_closed_at": row["last_closed_at"],
+        }
+
+    def save_chat_state(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        state: dict[str, object],
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO chat_state (
+                chat_type, chat_id, last_bot_spoke, last_user_message,
+                muted_until, ambient_streak, no_reply_streak, downshift_until,
+                thread_closed_until, last_closed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT (chat_type, chat_id) DO UPDATE SET
+                last_bot_spoke = excluded.last_bot_spoke,
+                last_user_message = excluded.last_user_message,
+                muted_until = excluded.muted_until,
+                ambient_streak = excluded.ambient_streak,
+                no_reply_streak = excluded.no_reply_streak,
+                downshift_until = excluded.downshift_until,
+                thread_closed_until = excluded.thread_closed_until,
+                last_closed_at = excluded.last_closed_at,
+                updated_at = datetime('now')
+            """,
+            (
+                chat_type.value,
+                chat_id,
+                state.get("last_bot_spoke"),
+                state.get("last_user_message"),
+                state.get("muted_until"),
+                max(0, int(state.get("ambient_streak") or 0)),
+                max(0, int(state.get("no_reply_streak") or 0)),
+                state.get("downshift_until"),
+                state.get("thread_closed_until"),
+                state.get("last_closed_at"),
+            ),
         )
         self._conn.commit()
 

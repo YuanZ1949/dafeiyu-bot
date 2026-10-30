@@ -248,7 +248,7 @@ def test_explain_reports_closed_thread(env) -> None:
     router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
     router.clock = lambda: NOW + timedelta(seconds=301)
 
-    data = router.explain(msg())
+    data = router.explain(msg(), seed=0)
 
     assert data["decision"]["reason"] == "closed"
     by_key = {check["key"]: check["status"] for check in data["checks"]}

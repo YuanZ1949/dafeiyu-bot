@@ -110,6 +110,12 @@ triggers:
   addressed_max_wait_seconds: 30
   # 两次非点名发言之间的最小间隔。
   ambient_min_interval_seconds: 15
+  # 机器人说完后这么久没人接，算话题结束。
+  thread_idle_seconds: 300
+  # 话题结束后这段时间不主动接话；被点名会立刻重开。
+  thread_closed_seconds: 600
+  # 收尾期内非点名消息的放行概率，命中了交给模型自己判断要不要接；0 = 完全静默。
+  closed_sample_rate: 0.05
 
 groups:
   # 留空 = 所有群都参与；填了就只在这些群里说话。号之间用逗号分隔。
