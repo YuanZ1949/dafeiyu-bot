@@ -534,8 +534,10 @@ async def test_batch_prompt_reports_backlog_before_window(tmp_path):
 class _FixedRng:
     def __init__(self, value: float) -> None:
         self.value = value
+        self.calls = 0
 
     def random(self) -> float:
+        self.calls += 1
         return self.value
 
 
@@ -624,3 +626,18 @@ async def test_open_thread_has_no_closed_hint(tmp_path):
 
     assert brain.reply_calls == 1
     assert "收尾" not in brain.systems[-1]
+
+async def test_closed_thread_samples_once_in_model_mode(tmp_path):
+    """收尾期一条消息只抽一次：入队抽过，跑批次时不能再抽一次。"""
+    rng = _FixedRng(0.0)
+    service, store, brain, _adapter = build(tmp_path, rng=rng)
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+
+    msg = make_msg("还在聊吗", message_id="m3")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert brain.reply_calls == 1
+    assert rng.calls == 1

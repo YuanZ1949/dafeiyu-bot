@@ -61,3 +61,41 @@ def test_old_impressions_table_gets_source_columns(tmp_path: Path) -> None:
         assert new.source_excerpt == "新印象的来源"
     finally:
         store.close()
+
+def test_old_chat_state_table_gets_new_columns(tmp_path: Path) -> None:
+    """跑过中间版本的库只有基础列；启动后应自动补齐降频与判重字段。"""
+    path = tmp_path / "old-chat.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE chat_state (
+            chat_type TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            last_bot_spoke REAL,
+            last_user_message REAL,
+            muted_until REAL,
+            ambient_streak INTEGER NOT NULL DEFAULT 0,
+            thread_closed_until REAL,
+            last_closed_at REAL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (chat_type, chat_id)
+        );
+        INSERT INTO chat_state (chat_type, chat_id, ambient_streak)
+        VALUES ('group', 100, 2);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    store.init_schema()
+    try:
+        row = store.load_chat_state(ChatType.GROUP, 100)
+        assert row is not None
+        assert row["ambient_streak"] == 2
+        assert row["no_reply_streak"] == 0
+        assert row["downshift_until"] is None
+        assert row["last_prompt"] == ""
+        assert row["last_prompt_at"] is None
+    finally:
+        store.close()

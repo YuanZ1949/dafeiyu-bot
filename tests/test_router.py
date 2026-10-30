@@ -30,6 +30,18 @@ class FakeRng:
         return self.value
 
 
+class CountingRng:
+    """固定返回值 + 记调用次数：用来锁死「同一条消息只抽一次」。"""
+
+    def __init__(self, value: float = 0.0) -> None:
+        self.value = value
+        self.calls = 0
+
+    def random(self) -> float:
+        self.calls += 1
+        return self.value
+
+
 class FakeStore:
     def __init__(self) -> None:
         self.calls = 0
@@ -531,6 +543,28 @@ def test_expired_downshift_does_not_block_after_restart() -> None:
 
     restarted = Router(make_settings(), store, clock=clock, rng=FakeRng(0.0))
     assert restarted.is_downshifted(ChatType.GROUP, 1) is False
+
+
+def test_duplicate_suppression_survives_restart() -> None:
+    router, store, clock = make_router()
+    assert router.should_handle(msg("这游戏怎么又崩了")).call_model is True
+
+    restarted = Router(make_settings(), store, clock=clock, rng=FakeRng(0.0))
+    decision = restarted.should_handle(msg("这游戏怎么又崩了"))
+    assert decision.call_model is False
+    assert decision.reason == "duplicate"
+
+
+def test_closed_thread_samples_once_in_rules_mode() -> None:
+    rng = CountingRng(0.0)
+    clock = FakeClock(datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI))
+    router = Router(make_settings(), FakeStore(), clock=clock, rng=rng)
+    close_thread(router)
+
+    decision = router.should_handle(msg("随便聊聊"))
+
+    assert decision.call_model is True
+    assert rng.calls == 1
 
 
 def test_closed_sample_uses_closed_rate() -> None:

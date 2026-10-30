@@ -22,6 +22,8 @@ def test_chat_state_roundtrip(tmp_path) -> None:
             "ambient_streak": 2,
             "no_reply_streak": 3,
             "downshift_until": 2500.0,
+            "last_prompt": "今天吃什么",
+            "last_prompt_at": 1003.5,
             "thread_closed_until": 3000.0,
             "last_closed_at": 1002.5,
         },
@@ -35,6 +37,8 @@ def test_chat_state_roundtrip(tmp_path) -> None:
     assert row["ambient_streak"] == 2
     assert row["no_reply_streak"] == 3
     assert row["downshift_until"] == 2500.0
+    assert row["last_prompt"] == "今天吃什么"
+    assert row["last_prompt_at"] == 1003.5
     assert row["thread_closed_until"] == 3000.0
     assert row["last_closed_at"] == 1002.5
 

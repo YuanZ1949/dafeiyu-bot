@@ -230,6 +230,8 @@ class Router:
         st.ambient_streak = int(row.get("ambient_streak") or 0)
         st.no_reply_streak = int(row.get("no_reply_streak") or 0)
         st.downshift_until = self._from_epoch(row.get("downshift_until"))
+        st.last_prompt = str(row.get("last_prompt") or "")
+        st.last_prompt_at = self._from_epoch(row.get("last_prompt_at"))
         st.thread_closed_until = self._from_epoch(row.get("thread_closed_until"))
         st.last_closed_at = self._from_epoch(row.get("last_closed_at"))
 
@@ -251,6 +253,8 @@ class Router:
                     "ambient_streak": st.ambient_streak,
                     "no_reply_streak": st.no_reply_streak,
                     "downshift_until": self._epoch(st.downshift_until),
+                    "last_prompt": st.last_prompt,
+                    "last_prompt_at": self._epoch(st.last_prompt_at),
                     "thread_closed_until": self._epoch(st.thread_closed_until),
                     "last_closed_at": self._epoch(st.last_closed_at),
                 },
@@ -454,7 +458,7 @@ class Router:
         if self.is_thread_closed(msg.chat_type, msg.chat_id, now):
             rate = self.closed_sample_rate()
             if rate > 0 and self._rng.random() < rate:
-                self._remember_prompt(st, content, now)
+                self._remember_prompt(msg.chat_type, msg.chat_id, st, content, now)
                 return True, "closed"
             return False, "closed"
 
@@ -470,7 +474,7 @@ class Router:
 
         # 明确提问不受冷却约束：追问被静默丢掉，比多回一句的代价高得多。
         if self._is_question(msg.content):
-            self._remember_prompt(st, content, now)
+            self._remember_prompt(msg.chat_type, msg.chat_id, st, content, now)
             return True, "question"
 
         # 冷却只压「热聊」和随机抽样这两类没被点名的发言。
@@ -480,21 +484,29 @@ class Router:
                 return False, "cooldown"
 
         if self._is_hot(msg, now):
-            self._remember_prompt(st, content, now)
+            self._remember_prompt(msg.chat_type, msg.chat_id, st, content, now)
             return True, "hot"
 
         rate = self.settings.triggers.sample_rate
         if st.downshift_until is not None and now < st.downshift_until:
             rate /= 2
         if self._rng.random() < rate:
-            self._remember_prompt(st, content, now)
+            self._remember_prompt(msg.chat_type, msg.chat_id, st, content, now)
             return True, "sample"
         return False, "sample_skip"
 
-    @staticmethod
-    def _remember_prompt(st: _ChatState, content: str, now: datetime) -> None:
+    def _remember_prompt(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        st: _ChatState,
+        content: str,
+        now: datetime,
+    ) -> None:
+        """记下「这次接的是哪句话」用于防重复；顺手落库，重启后仍能判重。"""
         st.last_prompt = content
         st.last_prompt_at = now
+        self._persist(chat_type, chat_id, st)
 
     def should_handle(self, msg: Message) -> TriggerDecision:
         if msg.is_bot:

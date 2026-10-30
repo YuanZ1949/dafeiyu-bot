@@ -98,6 +98,8 @@ CREATE TABLE IF NOT EXISTS chat_state (
     ambient_streak INTEGER NOT NULL DEFAULT 0,
     no_reply_streak INTEGER NOT NULL DEFAULT 0,
     downshift_until REAL,
+    last_prompt TEXT NOT NULL DEFAULT '',
+    last_prompt_at REAL,
     thread_closed_until REAL,
     last_closed_at REAL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -239,6 +241,8 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
     "chat_state": {
         "no_reply_streak": "INTEGER NOT NULL DEFAULT 0",
         "downshift_until": "REAL",
+        "last_prompt": "TEXT NOT NULL DEFAULT ''",
+        "last_prompt_at": "REAL",
     },
 }
 
@@ -1713,6 +1717,7 @@ class Store:
             """
             SELECT last_bot_spoke, last_user_message, muted_until,
                    ambient_streak, no_reply_streak, downshift_until,
+                   last_prompt, last_prompt_at,
                    thread_closed_until, last_closed_at
             FROM chat_state
             WHERE chat_type = ? AND chat_id = ?
@@ -1728,6 +1733,8 @@ class Store:
             "ambient_streak": int(row["ambient_streak"] or 0),
             "no_reply_streak": int(row["no_reply_streak"] or 0),
             "downshift_until": row["downshift_until"],
+            "last_prompt": row["last_prompt"] or "",
+            "last_prompt_at": row["last_prompt_at"],
             "thread_closed_until": row["thread_closed_until"],
             "last_closed_at": row["last_closed_at"],
         }
@@ -1743,8 +1750,9 @@ class Store:
             INSERT INTO chat_state (
                 chat_type, chat_id, last_bot_spoke, last_user_message,
                 muted_until, ambient_streak, no_reply_streak, downshift_until,
+                last_prompt, last_prompt_at,
                 thread_closed_until, last_closed_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT (chat_type, chat_id) DO UPDATE SET
                 last_bot_spoke = excluded.last_bot_spoke,
                 last_user_message = excluded.last_user_message,
@@ -1752,6 +1760,8 @@ class Store:
                 ambient_streak = excluded.ambient_streak,
                 no_reply_streak = excluded.no_reply_streak,
                 downshift_until = excluded.downshift_until,
+                last_prompt = excluded.last_prompt,
+                last_prompt_at = excluded.last_prompt_at,
                 thread_closed_until = excluded.thread_closed_until,
                 last_closed_at = excluded.last_closed_at,
                 updated_at = datetime('now')
@@ -1765,6 +1775,8 @@ class Store:
                 max(0, int(state.get("ambient_streak") or 0)),
                 max(0, int(state.get("no_reply_streak") or 0)),
                 state.get("downshift_until"),
+                str(state.get("last_prompt") or ""),
+                state.get("last_prompt_at"),
                 state.get("thread_closed_until"),
                 state.get("last_closed_at"),
             ),
