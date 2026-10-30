@@ -148,12 +148,13 @@ await self._run_weekly(now, budget=MAX_BACKFILL_PER_RUN - created)
 
 `context._recent_summary` 改为 `_summary_block`：
 
-1. 取最近 1 条周汇总，渲染为 `周汇总（MM-DD~MM-DD）：内容`，上限 300 字。
+1. 取最近 1 条周汇总，渲染为 `周汇总（MM-DD~MM-DD）：内容`，上限 300 字；`week_start` 距今超过 21 天则不注入（`WEEKLY_WINDOW_DAYS`）。
 2. 取最近 3 天内最多 2 条日摘要，渲染为 `MM-DD：内容`。
 3. 顺序：周汇总在前，日摘要按日期正序在后。
-4. 总预算 500 字（`SUMMARY_TOTAL_CHARS` 与 `cfg.summary_chars * 2` 取小，维持现状）。
-5. 超预算时：先丢较早的日摘要，仍超再截周汇总；周汇总单独存在时直接按剩余预算截断。
+4. 总预算 750 字（`SUMMARY_TOTAL_CHARS` 与 `cfg.summary_chars * 2` 取小；默认 `summary_chars=375`）。750 = 300 字周汇总 + 2×200 字日摘要 + 日期/标题前缀余量。
+5. 超预算时：先丢较早的日摘要；**最新一条日摘要永远保留**，仍超则把周汇总截到剩余额度（`room <= 0` 时只留最新日摘要）。
 6. 没有周汇总时退化为现有行为，不改变已有输出格式的顺序（日摘要仍按日期正序）。
+7. 日摘要回补窗口 `BACKFILL_DAYS` 由 7 天提到 14 天，让周汇总尽量基于完整的一周。
 
 ### 5.6 保留
 

@@ -18,10 +18,13 @@ SYSTEM_MAX_TOKENS = 1400
 
 IMPRESSION_HEADER = "【群友印象】"
 SUMMARY_HEADER = "【昨日摘要】"
-# 摘要注入窗口：含今天往前 3 天，最多取最新 2 条，总长共用 500 字预算。
+# 摘要注入窗口：含今天往前 3 天，最多取最新 2 条；
+# 750 = 300 字周汇总 + 2×200 字日摘要 + 日期/标题前缀余量。
 SUMMARY_WINDOW_DAYS = 3
 SUMMARY_MAX_ITEMS = 2
-SUMMARY_TOTAL_CHARS = 500
+SUMMARY_TOTAL_CHARS = 750
+# 周汇总只在最近 21 天内有效；停更的群不能把上个月当成「最近一周」。
+WEEKLY_WINDOW_DAYS = 21
 
 # ---- opencode 分支的三段注入（与本地模型的 build_context 无关）----
 INJECTION_MEMORY_HEADER = "【长期记忆】"
@@ -37,7 +40,7 @@ IMPRESSION_FOCUS_MESSAGES = 20
 @dataclass(frozen=True)
 class InjectionConfig:
     memory_chars: int = 500
-    summary_chars: int = 250
+    summary_chars: int = 375
     impression_chars: int = 150
     inject_summaries: bool = True
     inject_impressions: bool = True
@@ -164,6 +167,10 @@ def _summary_block(
     weekly_line = ""
     if weekly is not None:
         start = date.fromisoformat(weekly.week_start)
+        if (date.fromisoformat(today) - start).days > WEEKLY_WINDOW_DAYS:
+            weekly = None
+    if weekly is not None:
+        start = date.fromisoformat(weekly.week_start)
         end = start + timedelta(days=6)
         weekly_line = (
             f"周汇总（{start.isoformat()[5:]}~{end.isoformat()[5:]}）：{weekly.content}"
@@ -182,12 +189,24 @@ def _summary_block(
     if not weekly_line:
         return _clip("\n".join(daily_lines), max_chars)
 
-    while daily_lines:
-        text = "\n".join([weekly_line, *daily_lines])
-        if len(text) <= max_chars:
-            return text
+    # 最新一条日摘要永远保留：宁可把周汇总截短，也不让当天的细节消失。
+    while len(daily_lines) > 1 and len("\n".join([weekly_line, *daily_lines])) > max_chars:
         daily_lines.pop(0)
-    return _clip(weekly_line, max_chars)
+    if not daily_lines:
+        return _clip(weekly_line, max_chars)
+
+    text = "\n".join([weekly_line, *daily_lines])
+    if len(text) <= max_chars:
+        return text
+
+    newest = daily_lines[-1]
+    room = max_chars - len(newest) - 1
+    if room <= 0:
+        return _clip(newest, max_chars)
+    weekly_line = _clip(weekly_line, room)
+    if not weekly_line:
+        return _clip(newest, max_chars)
+    return f"{weekly_line}\n{newest}"
 
 
 def _recall_terms(text: str) -> list[str]:

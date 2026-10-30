@@ -86,6 +86,19 @@ async def test_scheduler_backfills_at_most_three_slots_per_run():
 
 
 @pytest.mark.asyncio
+async def test_scheduler_backfills_gap_older_than_a_week():
+    """N4：回补窗口 14 天，10 天前的缺口也要补上。"""
+    store = make_store()
+    seed(store, at(10, 14))
+    brain = FakeBrain()
+    scheduler = SummaryScheduler(store, brain, clock=lambda: NOW, hour=4)
+
+    await scheduler.run_pending()
+
+    assert store.get_summary(ChatType.GROUP, 9001, "2026-10-14") == "摘要"
+
+
+@pytest.mark.asyncio
 async def test_scheduler_never_summarizes_today():
     store = make_store()
     seed(store, at(10, 24, hour=1))

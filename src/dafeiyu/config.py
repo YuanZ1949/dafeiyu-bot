@@ -101,7 +101,7 @@ class InjectionConfig:
     """opencode 分支的注入预算，单位是字符数（不是 token）。"""
 
     memory_chars: int = 500
-    summary_chars: int = 250
+    summary_chars: int = 375
     impression_chars: int = 150
     inject_summaries: bool = True
     inject_impressions: bool = True
@@ -620,7 +620,7 @@ def _build_injection(
             workspace_raw.get("memory_chars"), "workspace.memory_chars", 500
         ),
         summary_chars=_positive_int(
-            workspace_raw.get("summary_chars"), "workspace.summary_chars", 250
+            workspace_raw.get("summary_chars"), "workspace.summary_chars", 375
         ),
         impression_chars=_positive_int(
             workspace_raw.get("impression_chars"), "workspace.impression_chars", 150

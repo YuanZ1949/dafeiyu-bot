@@ -62,7 +62,7 @@ def test_summary_outside_window_not_injected(store, tmp_path):
     assert "三天前的旧摘要" not in text
 
 
-def test_only_latest_two_summaries_and_total_within_500(store, tmp_path):
+def test_only_latest_two_summaries_and_total_within_750(store, tmp_path):
     store.upsert_summary(GROUP, 1, "2026-10-22", "甲" * 300)
     store.upsert_summary(GROUP, 1, "2026-10-23", "乙" * 300)
     store.upsert_summary(GROUP, 1, "2026-10-24", "丙" * 300)
@@ -71,7 +71,7 @@ def test_only_latest_two_summaries_and_total_within_500(store, tmp_path):
     assert "10-23：" in text
     assert "10-24：" in text
     body = text.split("【昨日摘要】\n", 1)[1]
-    assert len(body) <= 500
+    assert len(body) <= 750
 
 
 def test_build_context_includes_two_days_ago_summary(store, tmp_path):
@@ -201,3 +201,59 @@ def test_weekly_summary_alone_is_clipped_to_budget(store, tmp_path):
 
     body = text.split("【昨日摘要】\n", 1)[1]
     assert len(body) <= 500
+
+
+def test_newest_daily_survives_long_weekly(store, tmp_path):
+    """N1：周汇总再长也不能把当天唯一的日摘要挤掉。"""
+    store.upsert_weekly_summary(GROUP, 1, "2026-10-12", "周" * 300)
+    store.upsert_summary(GROUP, 1, "2026-10-23", "今" * 300)
+    cfg = InjectionConfig(summary_chars=250)  # 预算 500
+
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, cfg, today="2026-10-24"
+    )
+
+    assert "今" * 50 in text
+    assert "周汇总" in text
+    body = text.split("【昨日摘要】\n", 1)[1]
+    assert len(body) <= 500
+
+
+def test_default_budget_fits_weekly_and_two_days(store, tmp_path):
+    """N2-A：默认预算 700，能装下 1 条周汇总 + 2 条日摘要。"""
+    store.upsert_weekly_summary(GROUP, 1, "2026-10-12", "周" * 300)
+    store.upsert_summary(GROUP, 1, "2026-10-22", "前" * 200)
+    store.upsert_summary(GROUP, 1, "2026-10-23", "昨" * 200)
+
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, InjectionConfig(), today="2026-10-24"
+    )
+
+    assert "周" * 10 in text
+    assert "前" * 10 in text
+    assert "昨" * 10 in text
+    body = text.split("【昨日摘要】\n", 1)[1]
+    assert len(body) <= 750
+
+
+def test_stale_weekly_summary_is_not_injected(store, tmp_path):
+    """N3：超过 21 天的周汇总不再注入，避免把上个月当成最近一周。"""
+    store.upsert_weekly_summary(GROUP, 1, "2026-09-21", "上个月的周汇总")
+    store.upsert_summary(GROUP, 1, "2026-10-23", "昨天聊了猫")
+
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, InjectionConfig(), today="2026-10-24"
+    )
+
+    assert "上个月的周汇总" not in text
+    assert "昨天聊了猫" in text
+
+
+def test_weekly_summary_within_window_is_injected(store, tmp_path):
+    store.upsert_weekly_summary(GROUP, 1, "2026-10-05", "两周多前的周汇总")
+
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, InjectionConfig(), today="2026-10-24"
+    )
+
+    assert "两周多前的周汇总" in text
