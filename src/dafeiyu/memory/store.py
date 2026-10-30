@@ -1483,16 +1483,34 @@ class Store:
             ).fetchall()
         return [self._row_to_impression(r) for r in rows]
 
-    def list_impressions(self, chat_type: ChatType, chat_id: int, topk: int) -> list[Impression]:
+    def list_impressions(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        topk: int,
+        focus_user_ids: Sequence[int] = (),
+    ) -> list[Impression]:
+        """按新鲜度/置信度排序；focus_user_ids 里的人优先占名额。
+
+        focus 只影响谁先入选，名额内仍按 30 天内见过 > confidence > updated_at 排。
+        """
+        focus = list(dict.fromkeys(int(uid) for uid in focus_user_ids))[:32]
+        if focus:
+            marks = ",".join("?" for _ in focus)
+            order = f"(subject_user_id IN ({marks})) DESC,"
+            params: tuple[Any, ...] = (chat_type.value, chat_id, *focus, topk)
+        else:
+            order = ""
+            params = (chat_type.value, chat_id, topk)
         rows = self._conn.execute(
-            """
+            f"""
             SELECT * FROM impressions
             WHERE chat_type = ? AND chat_id = ?
-            ORDER BY (last_seen_at >= datetime('now', '-30 days')) DESC,
+            ORDER BY {order} (last_seen_at >= datetime('now', '-30 days')) DESC,
                      confidence DESC, updated_at DESC
             LIMIT ?
             """,
-            (chat_type.value, chat_id, topk),
+            params,
         ).fetchall()
         return [self._row_to_impression(r) for r in rows]
 

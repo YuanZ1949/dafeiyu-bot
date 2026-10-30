@@ -23,6 +23,9 @@ EXTRACT_SYSTEM = """\
 content 不超过 60 字。没有值得记的就输出 []。"""
 
 MAX_SOURCE_MESSAGES = 40
+# 抽取窗口在游标之后的新消息前面再带几条上文，帮助模型理解指代；
+# 上限固定，避免每次把上一批消息整段重喂。
+CONTEXT_MESSAGES = 10
 MAX_CONTENT_CHARS = 60
 VALID_KINDS = {"nickname", "preference", "fact"}
 
@@ -69,7 +72,11 @@ def _valid_item(item: dict) -> tuple[int, str, str, float] | None:
 
 
 class ImpressionWorker:
-    """每 N 条消息（按会话计数）异步抽取一次印象，避免拖慢回复主链路。"""
+    """每 N 条消息（按会话计数）异步抽取一次印象，避免拖慢回复主链路。
+
+    每轮只喂游标之后的新消息，外加最多 CONTEXT_MESSAGES 条上文；
+    手动触发（不带 messages）仍取最近 MAX_SOURCE_MESSAGES 条。
+    """
 
     def __init__(
         self,
@@ -110,7 +117,11 @@ class ImpressionWorker:
             last = 0
         if count < last + self.every:
             return 0
-        added = await self.extract(chat_type, chat_id)
+        # 新消息优先；上文只是辅助，积压超过上限时先丢更早的新消息。
+        new_count = count - last
+        fetch = min(MAX_SOURCE_MESSAGES, new_count + CONTEXT_MESSAGES)
+        messages = self.store.recent_messages(chat_type, chat_id, fetch)
+        added = await self.extract(chat_type, chat_id, messages=messages)
         if added is None:
             # 失败不推进游标：退避结束后同一批消息还能再试。
             return 0
@@ -124,9 +135,20 @@ class ImpressionWorker:
             self._last_count[key] = self.store.get_impression_cursor(*key)
         return self._last_count[key]
 
-    async def extract(self, chat_type: ChatType, chat_id: int) -> int | None:
-        """抽取并写入印象；调用失败返回 None，供上层决定是否退避。"""
-        messages = self.store.recent_messages(chat_type, chat_id, MAX_SOURCE_MESSAGES)
+    async def extract(
+        self,
+        chat_type: ChatType,
+        chat_id: int,
+        messages: list[Message] | None = None,
+    ) -> int | None:
+        """抽取并写入印象；调用失败返回 None，供上层决定是否退避。
+
+        messages 为空时取最近 MAX_SOURCE_MESSAGES 条（面板手动触发走这条路）。
+        """
+        if messages is None:
+            messages = self.store.recent_messages(
+                chat_type, chat_id, MAX_SOURCE_MESSAGES
+            )
         if not messages:
             return 0
 

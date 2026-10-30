@@ -30,6 +30,8 @@ INJECTION_SUMMARY_HEADER = "【昨日摘要】"
 INJECTION_IMPRESSION_HEADER = "【群友印象】"
 INJECTION_RECALL_HEADER = "【相关旧记忆】"
 INJECTION_IMPRESSION_TOPK = 3
+# 印象注入看最近多少条消息判断「谁在说话」；只在群聊生效。
+IMPRESSION_FOCUS_MESSAGES = 20
 
 
 @dataclass(frozen=True)
@@ -233,6 +235,20 @@ def _recall_lines(
     ]
 
 
+def _focus_user_ids(
+    store: Store, chat_type: ChatType, chat_id: int
+) -> list[int]:
+    """最近 20 条消息的发言人（不含 bot），用于印象注入优先占名额。"""
+    seen: list[int] = []
+    for message in store.recent_messages(
+        chat_type, chat_id, IMPRESSION_FOCUS_MESSAGES
+    ):
+        if message.is_bot or message.user_id in seen:
+            continue
+        seen.append(message.user_id)
+    return seen
+
+
 def build_injection(
     store: Store,
     workspace: Workspace | None,
@@ -297,7 +313,10 @@ def build_injection(
     if cfg.inject_impressions and chat_type == ChatType.GROUP:
         lines = []
         for imp in store.list_impressions(
-            chat_type, chat_id, INJECTION_IMPRESSION_TOPK
+            chat_type,
+            chat_id,
+            INJECTION_IMPRESSION_TOPK,
+            focus_user_ids=_focus_user_ids(store, chat_type, chat_id),
         ):
             name = imp.subject_nickname.strip()
             if name and not imp.content.startswith(name):

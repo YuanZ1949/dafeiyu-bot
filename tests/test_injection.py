@@ -5,7 +5,7 @@ import pytest
 from dafeiyu.memory.context import InjectionConfig, build_context, build_injection
 from dafeiyu.memory.store import Store
 from dafeiyu.memory.workspace import Workspace
-from dafeiyu.models import ChatType
+from dafeiyu.models import ChatType, Message
 
 GROUP = ChatType.GROUP
 PRIVATE = ChatType.PRIVATE
@@ -101,3 +101,48 @@ def test_impression_already_starting_with_nickname_is_not_doubled(store, tmp_pat
     )
     assert "阿猫：阿猫：爱猫人士" not in text
     assert "阿猫：爱猫人士" in text
+
+
+# ---- P5: 印象注入优先当前发言人 ---------------------------------------
+
+
+def _seed_impressions(store) -> None:
+    store.upsert_impression(GROUP, 1, 1, "preference", "喜欢咖啡", 0.95, subject_nickname="甲")
+    store.upsert_impression(GROUP, 1, 2, "preference", "喜欢茶", 0.9, subject_nickname="乙")
+    store.upsert_impression(GROUP, 1, 3, "preference", "喜欢酒", 0.85, subject_nickname="丙")
+    store.upsert_impression(GROUP, 1, 4, "preference", "喜欢水", 0.2, subject_nickname="丁")
+
+
+def test_impressions_prioritize_recent_speakers(store, tmp_path):
+    _seed_impressions(store)
+    store.add_message(
+        Message(GROUP, 1, 4, "丁", "我最近只喝水", "m1")
+    )
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, InjectionConfig(), today="2026-10-24"
+    )
+    assert "丁：喜欢水" in text  # 正在说话的人优先
+    assert "甲：喜欢咖啡" in text  # 剩余名额按原排序补
+    assert "丙：喜欢酒" not in text  # 被丁挤掉
+
+
+def test_impression_order_unchanged_without_recent_messages(store, tmp_path):
+    _seed_impressions(store)
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, InjectionConfig(), today="2026-10-24"
+    )
+    assert "甲：喜欢咖啡" in text
+    assert "乙：喜欢茶" in text
+    assert "丙：喜欢酒" in text
+    assert "丁：喜欢水" not in text
+
+
+def test_bot_messages_do_not_count_as_speakers(store, tmp_path):
+    _seed_impressions(store)
+    store.add_message(
+        Message(GROUP, 1, 4, "丁", "bot 复读", "m1", is_bot=True)
+    )
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, InjectionConfig(), today="2026-10-24"
+    )
+    assert "丁：喜欢水" not in text

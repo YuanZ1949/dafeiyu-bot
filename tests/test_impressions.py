@@ -7,7 +7,7 @@ import pytest
 from dafeiyu.brain.client import BrainError
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
-from dafeiyu.workers.impressions import ImpressionWorker
+from dafeiyu.workers.impressions import MAX_SOURCE_MESSAGES, ImpressionWorker
 
 CHAT = ChatType.GROUP
 CHAT_ID = 90001
@@ -334,5 +334,68 @@ async def test_failure_does_not_advance_cursor(store: Store) -> None:
         store.add_message(make_message(i))
     assert await worker.maybe_extract(CHAT, CHAT_ID) == 0
     assert store.get_impression_cursor(CHAT, CHAT_ID) == 0
+
+
+async def test_window_feeds_new_messages_plus_bounded_context(store: Store) -> None:
+    """每轮只喂游标之后的新消息 + 固定 10 条上文，避免把上一批整段重喂。"""
+    brain = FakeBrain()
+    worker = ImpressionWorker(store, brain, every=20)
+    for i in range(20):
+        store.add_message(make_message(i))
+    await worker.maybe_extract(CHAT, CHAT_ID)
+    assert brain.calls == 1
+    assert len(brain.last_messages[0]["content"].splitlines()) == 20
+
+    for i in range(20, 40):
+        store.add_message(make_message(i))
+    await worker.maybe_extract(CHAT, CHAT_ID)
+    assert brain.calls == 2
+    lines = brain.last_messages[0]["content"].splitlines()
+    assert len(lines) == 30  # 20 条新消息 + 10 条上文
+    assert lines[0].endswith(": 消息 10")  # 上文起点
+    assert lines[10].endswith(": 消息 20")  # 新消息起点
+    assert lines[-1].endswith(": 消息 39")
+    assert not any(line.endswith(": 消息 9") for line in lines)
+
+
+async def test_window_caps_at_max_source_messages(store: Store) -> None:
+    """积压很大时仍封顶 40 条，并且保留最新消息。"""
+    brain = FakeBrain()
+    worker = ImpressionWorker(store, brain, every=20)
+    for i in range(100):
+        store.add_message(make_message(i))
+    await worker.maybe_extract(CHAT, CHAT_ID)
+
+    lines = brain.last_messages[0]["content"].splitlines()
+    assert len(lines) == MAX_SOURCE_MESSAGES
+    assert lines[0].endswith(": 消息 60")
+    assert lines[-1].endswith(": 消息 99")
+
+
+async def test_manual_extract_uses_recent_window(store: Store) -> None:
+    """面板手动触发不带 messages，仍按最近 40 条抽取。"""
+    brain = FakeBrain()
+    worker = ImpressionWorker(store, brain, every=20)
+    for i in range(50):
+        store.add_message(make_message(i))
+    await worker.extract(CHAT, CHAT_ID)
+
+    lines = brain.last_messages[0]["content"].splitlines()
+    assert len(lines) == MAX_SOURCE_MESSAGES
+    assert lines[0].endswith(": 消息 10")
+    assert lines[-1].endswith(": 消息 49")
+
+
+def test_list_impressions_prioritizes_focus_users(store: Store) -> None:
+    store.upsert_impression(CHAT, CHAT_ID, 1, "preference", "甲喜欢咖啡", 0.9)
+    store.upsert_impression(CHAT, CHAT_ID, 2, "preference", "乙喜欢茶", 0.8)
+    store.upsert_impression(CHAT, CHAT_ID, 3, "preference", "丙喜欢酒", 0.7)
+
+    focused = store.list_impressions(CHAT, CHAT_ID, 2, focus_user_ids=[3])
+    assert [im.subject_user_id for im in focused] == [3, 1]
+    assert [
+        im.subject_user_id for im in store.list_impressions(CHAT, CHAT_ID, 2)
+    ] == [1, 2]
+
 
 
