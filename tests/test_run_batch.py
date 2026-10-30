@@ -400,3 +400,25 @@ async def test_prompt_contains_all_segments_and_timeline(tmp_path):
     assert "【昨日摘要】" in prompt and "昨天聊了鱼缸" in prompt
     assert "【群友印象】" in prompt and "阿鱼：爱养鱼" in prompt
     assert "第一批第二条" in prompt
+
+
+async def test_recalled_anchor_skips_batch(tmp_path):
+    service, store, brain, adapter = build(tmp_path)
+    # 触发本轮的最后一条被撤回了：整批不回复，免得对着空气说话。
+    store.mark_recalled(ChatType.GROUP, 1001, "m1")
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert brain.reply_calls == 0
+    assert adapter.texts() == []
+
+
+async def test_downshift_skips_batch(tmp_path):
+    service, _store, brain, adapter = build(tmp_path)
+    for _ in range(3):
+        service.router.note_no_reply(ChatType.GROUP, 1001)
+
+    await service._handle_batched(make_msg("随便聊聊", message_id="m2"))
+
+    assert brain.reply_calls == 0
+    assert adapter.texts() == []

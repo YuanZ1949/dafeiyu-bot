@@ -32,7 +32,10 @@ def time_label(timestamp: int) -> str:
 
 def format_message_line(msg: Message, *, current: Message | None = None) -> str:
     """一行一条消息；当前这条额外标出 @ 与引用，模型才知道话是对它说的。"""
-    content = msg.content.strip() or EMPTY_CONTENT
+    if msg.recalled_at:
+        content = "[已撤回]"
+    else:
+        content = msg.content.strip() or EMPTY_CONTENT
     label = time_label(msg.timestamp)
     prefix = f"[{label}] " if label else ""
     marks = ""

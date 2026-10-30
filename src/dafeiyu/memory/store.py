@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS messages (
     -- 回复目标：id 用于回查被回复消息的昵称，uid 是消息被清理后的退路。
     reply_to_message_id TEXT,
     reply_to_user_id INTEGER,
+    -- 非空 = 已被撤回；原文保留但不再进入 prompt。
+    recalled_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (chat_type, chat_id, message_id)
 );
@@ -193,6 +195,7 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         "reply_to_bot": "INTEGER NOT NULL DEFAULT 0",
         "reply_to_message_id": "TEXT",
         "reply_to_user_id": "INTEGER",
+        "recalled_at": "TEXT",
     },
     "brain_sessions": {
         "created_at": "TEXT",
@@ -1040,6 +1043,7 @@ class Store:
 
         首次投递（还没有投递下限）时只返回 anchor 这一条，不回填历史 —
         与 pending_messages 的语义保持一致，但这里是 id 正序且不带「被省略条数」。
+        积压超过 limit 时保留**最新**的一段：回来先接上最近的话题，陈旧消息不占窗口。
         """
         anchor = self._row_id(chat_type, chat_id, anchor_id)
         if anchor is None:
@@ -1062,11 +1066,35 @@ class Store:
                   WHERE d.chat_type = m.chat_type AND d.chat_id = m.chat_id
                     AND d.message_id = m.message_id
               )
-            ORDER BY m.id ASC LIMIT ?
+            ORDER BY m.id DESC LIMIT ?
             """,
             (chat_type.value, chat_id, floor, anchor, limit),
         ).fetchall()
-        return [self._row_to_message(r) for r in rows]
+        return [self._row_to_message(r) for r in reversed(rows)]
+
+    def mark_recalled(self, chat_type: ChatType, chat_id: int, message_id: str) -> bool:
+        """把一条已入库消息标记为撤回；原文保留，只是不再进入 prompt。"""
+        cur = self._conn.execute(
+            """
+            UPDATE messages SET recalled_at = datetime('now')
+            WHERE chat_type = ? AND chat_id = ? AND message_id = ?
+              AND recalled_at IS NULL
+            """,
+            (chat_type.value, chat_id, message_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def is_recalled(self, chat_type: ChatType, chat_id: int, message_id: str) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM messages
+            WHERE chat_type = ? AND chat_id = ? AND message_id = ?
+              AND recalled_at IS NOT NULL
+            """,
+            (chat_type.value, chat_id, message_id),
+        ).fetchone()
+        return row is not None
 
     def chats_with_pending(self, since_ts: int) -> list[tuple[ChatType, int]]:
         """哪些会话还有「游标之后、窗口内、未投递」的人类消息（无游标的会话不算）。"""
@@ -1148,6 +1176,7 @@ class Store:
             reply_to_message_id=r["reply_to_message_id"],
             reply_to_user_id=r["reply_to_user_id"],
             timestamp=r["timestamp"],
+            recalled_at=r["recalled_at"],
         )
 
     # ---- OpenCode session mapping ---------------------------------

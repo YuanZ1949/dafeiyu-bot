@@ -14,7 +14,7 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 from dafeiyu.gateway.base import GatewayError
-from dafeiyu.models import ChatType, Message, Segment
+from dafeiyu.models import ChatType, Message, RecallEvent, Segment
 
 logger = logging.getLogger(__name__)
 
@@ -162,12 +162,38 @@ def _render_segments(
     return "".join(parts).strip(), segments, reply_id, reply_qq
 
 
+def _parse_recall(event: dict[str, Any]) -> RecallEvent | None:
+    """notice 里的撤回事件；其他 notice 一律忽略。"""
+    notice_type = event.get("notice_type")
+    if notice_type == "group_recall":
+        chat_type = ChatType.GROUP
+        chat_id = _as_int(event.get("group_id"))
+    elif notice_type == "friend_recall":
+        chat_type = ChatType.PRIVATE
+        chat_id = _as_int(event.get("user_id"))
+    else:
+        return None
+    message_id = str(event.get("message_id") or "")
+    if not chat_id or not message_id:
+        return None
+    return RecallEvent(
+        chat_type=chat_type,
+        chat_id=chat_id,
+        message_id=message_id,
+        operator_id=_as_int(event.get("operator_id")),
+    )
+
+
 def parse_event(
     event: dict[str, Any],
     bot_qq: int,
     bot_message_ids: Collection[str] = (),
-) -> Message | None:
-    if not isinstance(event, dict) or event.get("post_type") != "message":
+) -> Message | RecallEvent | None:
+    if not isinstance(event, dict):
+        return None
+    if event.get("post_type") == "notice":
+        return _parse_recall(event)
+    if event.get("post_type") != "message":
         return None
 
     message_type = event.get("message_type")
@@ -243,6 +269,7 @@ class QQAdapter:
         self._send_timeout = send_timeout
         self.bot_message_ids: deque[int] = deque(maxlen=max_bot_message_ids)
         self._handler: Callable[[Message], Awaitable[None]] | None = None
+        self._recall_handler: Callable[[RecallEvent], Awaitable[None]] | None = None
         self._server: Server | None = None
         self._ws: ServerConnection | None = None
         self._pending: dict[str, tuple[asyncio.Future[dict[str, Any]], str]] = {}
@@ -268,6 +295,9 @@ class QQAdapter:
 
     def on_message(self, handler: Callable[[Message], Awaitable[None]]) -> None:
         self._handler = handler
+
+    def on_recall(self, handler: Callable[[RecallEvent], Awaitable[None]]) -> None:
+        self._recall_handler = handler
 
     async def start(self) -> None:
         if self._server is not None:
@@ -377,10 +407,17 @@ class QQAdapter:
 
         if "post_type" in data:
             event = parse_event(data, self._bot_qq, self.bot_message_ids)
-            if event is None or self._handler is None:
+            if event is None:
                 return
             self.last_event_at = time.time()
-            task = asyncio.create_task(self._run_handler(event))
+            if isinstance(event, RecallEvent):
+                if self._recall_handler is None:
+                    return
+                task = asyncio.create_task(self._run_recall(event))
+            else:
+                if self._handler is None:
+                    return
+                task = asyncio.create_task(self._run_handler(event))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             return
@@ -408,6 +445,13 @@ class QQAdapter:
             await self._handler(event)
         except Exception:
             logger.exception("消息处理器异常")
+
+    async def _run_recall(self, event: RecallEvent) -> None:
+        assert self._recall_handler is not None
+        try:
+            await self._recall_handler(event)
+        except Exception:
+            logger.exception("撤回处理器异常")
 
     def _fail_pending(self, exc: Exception) -> None:
         for future, _action in self._pending.values():

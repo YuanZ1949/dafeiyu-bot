@@ -22,7 +22,7 @@ from .memory.rotation import apply_rotation, needs_rotation
 from .memory.store import Store
 from .memory.timeline import TIMELINE_LIMIT, build_batch_prompt
 from .memory.workspace import Workspace
-from .models import ChatType, Message
+from .models import ChatType, Message, RecallEvent
 from .router import Router, now_shanghai
 from .sender import is_technical_question, shape_reply
 from .workers.failure import QUOTA_KEY, is_quota_error, is_rate_limit_error
@@ -147,6 +147,9 @@ class Service:
     async def start(self) -> None:
         self._start_scheduler()
         self.adapter.on_message(self.handle)
+        on_recall = getattr(self.adapter, "on_recall", None)
+        if callable(on_recall):
+            on_recall(self.handle_recall)
         await self.adapter.start()
         self._start_keepalive()
 
@@ -228,7 +231,8 @@ class Service:
     async def handle(self, msg: Message) -> None:
         # 图片物化必须在入库前：content 字符串是图片路径到达大脑的唯一载体。
         # materialize 内部永不抛异常，失败保持 [图片] 占位。
-        await materialize(msg, self.settings)
+        # 没有 read 工具的大脑看不到图，路径字符串只是噪音：直接跳过物化。
+        await materialize(msg, self.settings, annotate=self._tools_enabled())
         # 机器人自己的消息也要先落库（作为 assistant 轮次），但不触发任何回复。
         if not self.store.add_message(msg):
             return
@@ -255,6 +259,10 @@ class Service:
                 await self._handle_batched(msg)
             else:
                 await self._handle_sync(msg)
+
+    async def handle_recall(self, event: RecallEvent) -> None:
+        """撤回只做标记：原文留库，时间线渲染成占位，摘要/抽取跳过。"""
+        self.store.mark_recalled(event.chat_type, event.chat_id, event.message_id)
 
     async def _handle_sync(self, msg: Message) -> None:
         """rules 模式：规则判定通过就同步等模型（旧行为，回滚用）。"""
@@ -302,6 +310,9 @@ class Service:
             return "muted"
         if self.router.is_quiet(msg.chat_type, msg.chat_id):
             return "quiet"
+        # 连续三次选择不说后进入降频窗口：批次模式也必须认，否则降频是死状态。
+        if not addressed and self.router.is_downshifted(msg.chat_type, msg.chat_id):
+            return "downshift"
         if msg.chat_id in self.settings.groups.blacklist:
             return "blacklist"
         whitelist = self.settings.groups.whitelist
@@ -804,6 +815,14 @@ class Service:
         if not batch:
             return
 
+        if batch[-1].recalled_at:
+            # 触发这一轮的最后一条被撤回：整批不回复，但游标要推进，避免反复重试。
+            self.store.mark_delivered(
+                chat_type, chat_id, *[m.message_id for m in batch]
+            )
+            log.info("批次取消（末条已撤回）%s/%s", chat_id, batch[-1].message_id)
+            return
+
         ids = [m.message_id for m in batch]
         addressed_ids = [m.message_id for m in batch if m.at_bot or m.reply_to_bot]
         addressed = bool(addressed_ids)
@@ -1059,7 +1078,7 @@ class Service:
         recall_queries = [
             message.content
             for message in messages
-            if not message.is_bot and message.content.strip()
+            if not message.is_bot and not message.recalled_at and message.content.strip()
         ][-3:]
         exclude_ids = {message.message_id for message in messages}
         if injection_cfg.recall_enabled:

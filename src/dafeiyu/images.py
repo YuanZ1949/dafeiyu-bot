@@ -154,13 +154,18 @@ async def materialize(
     settings: Settings,
     *,
     fetch: FetchFn | None = None,
+    annotate: bool = True,
 ) -> int:
     """把 msg 里的 image 段落盘并把路径写进 content。返回成功张数。
 
     永不抛异常；无 image 段时零开销快路径。
+    ``annotate=False``（大脑没有 read 工具）时直接保持 ``[图片]``：
+    不下载、不写盘，避免把无用的文件路径塞进 prompt。
     """
     try:
-        return await _materialize(msg, settings, fetch=fetch or _default_fetch)
+        return await _materialize(
+            msg, settings, fetch=fetch or _default_fetch, annotate=annotate
+        )
     except Exception:  # noqa: BLE001 —— 图片绝不能打断消息入库
         log.warning("图片物化失败，回退占位：%s", msg.message_id, exc_info=True)
         return 0
@@ -171,8 +176,9 @@ async def _materialize(
     settings: Settings,
     *,
     fetch: FetchFn,
+    annotate: bool,
 ) -> int:
-    if not settings.images.enabled:
+    if not annotate or not settings.images.enabled:
         return 0
     image_segs = [s for s in msg.segments if s.type == "image"]
     if not image_segs:

@@ -264,6 +264,14 @@ class Router:
         now = now or self.clock()
         return self.is_muted(chat_type, chat_id, now) or self._in_quiet_hours(now)
 
+    def is_downshifted(
+        self, chat_type: ChatType, chat_id: int, now: datetime | None = None
+    ) -> bool:
+        """连续不说话后的降频窗口；批次模式与 rules 模式共用同一份状态。"""
+        now = now or self.clock()
+        st = self._state(chat_type, chat_id)
+        return st.downshift_until is not None and now < st.downshift_until
+
     def rule_filter(self, msg: Message, now: datetime) -> tuple[bool, str]:
         st = self._state(msg.chat_type, msg.chat_id)
 

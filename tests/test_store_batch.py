@@ -35,13 +35,14 @@ def store(tmp_path: Path) -> Iterator[Store]:
     s.close()
 
 
-def test_pending_batch_takes_oldest_not_newest(store: Store) -> None:
+def test_pending_batch_takes_newest_not_oldest(store: Store) -> None:
     for i in range(25):
         store.add_message(make_msg(i))
     store.mark_delivered(ChatType.GROUP, 1, "m0")  # 钉住游标
 
     batch = store.pending_batch(ChatType.GROUP, 1, anchor_id="m24", limit=20)
-    assert [m.message_id for m in batch] == [f"m{i}" for i in range(1, 21)]
+    # 积压超过 limit 时保最新的一段：先回最近的话题，陈旧消息让位。
+    assert [m.message_id for m in batch] == [f"m{i}" for i in range(5, 25)]
 
 
 def test_first_delivery_does_not_backfill(store: Store) -> None:

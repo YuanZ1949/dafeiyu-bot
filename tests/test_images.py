@@ -29,6 +29,7 @@ from dafeiyu.config import (
 )
 from dafeiyu.images import materialize
 from dafeiyu.memory.store import Store
+from dafeiyu.memory.workspace import Workspace
 from dafeiyu.models import ChatType, Message, Segment
 from dafeiyu.router import Router
 from dafeiyu.service import Service
@@ -110,6 +111,17 @@ async def test_disabled_keeps_placeholder(tmp_path):
     assert got == 0
     assert msg.content == "[图片]"
     assert calls == []
+
+
+async def test_annotate_false_keeps_placeholder_without_fetch(tmp_path):
+    # 大脑没有 read 工具时，路径字符串只是噪音：不下载、不写盘、不注记。
+    msg = make_msg()
+    fetch, calls = fake_fetch()
+    got = await materialize(msg, make_settings(tmp_path), fetch=fetch, annotate=False)
+    assert got == 0
+    assert msg.content == "[图片]"
+    assert calls == []
+    assert not images_dir(tmp_path).exists()
 
 
 # ---------------------------------------------------------------- 四类来源
@@ -331,6 +343,8 @@ class _FakeAdapter:
 
 
 class _FakeBrain:
+    supports_tools = True
+
     async def decide(self, system, messages, max_tokens=400):
         from dafeiyu.brain.client import BrainReply
 
@@ -351,11 +365,12 @@ async def test_handle_rewrites_content_before_store(tmp_path):
         2026, 10, 27, 12, 0, tzinfo=timezone(timedelta(hours=8))
     ))
     service = Service(
-        settings, store, _FakeBrain(), _FakeAdapter(), router, "你是溟月"
+        settings, store, _FakeBrain(), _FakeAdapter(), router, "你是溟月",
+        workspace=Workspace(tmp_path),
     )
 
     msg = make_msg(content="[图片]", message_id="img-1")
-    fetch, calls = fake_fetch()
+    fetch, _calls = fake_fetch()
     # 把 fetch 注进 materialize：service.handle 内部用默认 fetch，
     # 这里通过 monkeypatch 模块属性实现（pytest fixture 不引入，直接赋值还原）。
     import dafeiyu.images as images_mod
@@ -378,3 +393,37 @@ async def test_handle_rewrites_content_before_store(tmp_path):
     assert len(stored_paths) == 1
     assert stored_paths[0].name in content
     assert stored_paths[0].exists()
+
+async def test_handle_keeps_placeholder_without_tools(tmp_path):
+    """没有 read 工具的大脑看不到图：保持占位，不下载、不写盘、不塞路径。"""
+    from datetime import datetime, timedelta, timezone
+
+    settings = make_settings(tmp_path)
+    store = Store(str(tmp_path / "t2.db"))
+    store.init_schema()
+    router = Router(
+        settings,
+        store,
+        clock=lambda: datetime(2026, 10, 27, 12, 0, tzinfo=timezone(timedelta(hours=8))),
+    )
+    brain = _FakeBrain()
+    brain.supports_tools = False
+    service = Service(settings, store, brain, _FakeAdapter(), router, "test")
+
+    msg = make_msg(content="[图片]", message_id="img-2")
+    fetch, calls = fake_fetch()
+    import dafeiyu.images as images_mod
+
+    original = images_mod._default_fetch
+    images_mod._default_fetch = fetch
+    try:
+        await service.handle(msg)
+    finally:
+        images_mod._default_fetch = original
+
+    stored = store.recent_messages(ChatType.GROUP, 1001, 10)
+    mine = [m for m in stored if m.message_id == "img-2"]
+    assert mine, "消息没有入库"
+    assert mine[0].content == "[图片]"
+    assert calls == []
+    assert not images_dir(tmp_path).exists()

@@ -31,9 +31,21 @@ class Message:
     reply_to_message_id: str | None = None
     reply_to_user_id: int | None = None
     timestamp: int = 0
+    # 非空 = 这条消息已被撤回；时间线只显示占位，不再展示原文。
+    recalled_at: str | None = None
 
     def to_prompt_line(self) -> str:
         return f"{self.nickname}: {self.content}"
+
+
+@dataclass(frozen=True)
+class RecallEvent:
+    """OneBot notice 里的撤回事件：只带定位信息，不带原文。"""
+
+    chat_type: ChatType
+    chat_id: int
+    message_id: str
+    operator_id: int = 0
 
 
 @dataclass
