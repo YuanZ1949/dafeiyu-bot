@@ -79,8 +79,10 @@ async def test_scheduler_backfills_at_most_three_slots_per_run():
     scheduler = SummaryScheduler(store, brain, clock=lambda: NOW, hour=4)
 
     assert await scheduler.run_pending() == 3
-    assert await scheduler.run_pending() == 1
-    assert len(brain.calls) == 4
+    # 第二轮：1 个日摘要缺口 + 2 个已结束周的周汇总（与日摘要共享每轮上限）。
+    assert await scheduler.run_pending() == 3
+    assert len(brain.calls) == 6
+    assert store.count_summaries() == 4
 
 
 @pytest.mark.asyncio

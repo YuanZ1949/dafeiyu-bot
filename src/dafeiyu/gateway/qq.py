@@ -218,6 +218,8 @@ def parse_event(
         is_bot=user_id == bot_qq,
         at_bot=at_bot,
         reply_to_bot=reply_to_bot,
+        reply_to_message_id=reply_id or None,
+        reply_to_user_id=reply_qq,
         timestamp=_as_int(event.get("time")),
     )
 

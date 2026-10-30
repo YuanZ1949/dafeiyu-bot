@@ -106,7 +106,7 @@ def build_context(
     impression_lines = [
         f"{imp.content}" for imp in store.list_impressions(chat_type, chat_id, impression_topk)
     ]
-    summary = _recent_summary(
+    summary = _summary_block(
         store, chat_type, chat_id, today, SUMMARY_TOTAL_CHARS
     ) or None
 
@@ -149,28 +149,45 @@ def _clip(text: str, limit: int) -> str:
     return text[: limit - 1] + "…"
 
 
-def _recent_summary(
+def _summary_block(
     store: Store,
     chat_type: ChatType,
     chat_id: int,
     today: str,
     max_chars: int,
 ) -> str:
-    """取最近几天（含今天共 3 天）内最新的 2 条摘要，按时间正序带日期前缀渲染。"""
-    start = (
+    """周汇总在前、最近 3 天内最多 2 条日摘要；超预算先丢较早的日摘要。
+
+    没有周汇总时保持原行为：日摘要按日期正序拼接后整体截断。
+    """
+    weekly = store.latest_weekly_summary(chat_type, chat_id)
+    weekly_line = ""
+    if weekly is not None:
+        start = date.fromisoformat(weekly.week_start)
+        end = start + timedelta(days=6)
+        weekly_line = (
+            f"周汇总（{start.isoformat()[5:]}~{end.isoformat()[5:]}）：{weekly.content}"
+        )
+
+    start_day = (
         date.fromisoformat(today) - timedelta(days=SUMMARY_WINDOW_DAYS - 1)
     ).isoformat()
-    rows = [
-        summary
-        for summary in store.all_summaries(chat_type, chat_id)
-        if start <= summary.date <= today
+    daily_lines = [
+        f"{summary.date[5:]}：{summary.content}"
+        for summary in store.summaries_between(chat_type, chat_id, start_day, today)[
+            -SUMMARY_MAX_ITEMS:
+        ]
     ]
-    if not rows:
-        return ""
-    rendered = "\n".join(
-        f"{summary.date[5:]}：{summary.content}" for summary in rows[-SUMMARY_MAX_ITEMS:]
-    )
-    return _clip(rendered, max_chars)
+
+    if not weekly_line:
+        return _clip("\n".join(daily_lines), max_chars)
+
+    while daily_lines:
+        text = "\n".join([weekly_line, *daily_lines])
+        if len(text) <= max_chars:
+            return text
+        daily_lines.pop(0)
+    return _clip(weekly_line, max_chars)
 
 
 def _recall_terms(text: str) -> list[str]:
@@ -299,7 +316,7 @@ def build_injection(
             parts.append(f"{INJECTION_RECALL_HEADER}\n{INJECTION_BOUNDARY}\n{recalled}")
 
     if cfg.inject_summaries:
-        summary = _recent_summary(
+        summary = _summary_block(
             store,
             chat_type,
             chat_id,

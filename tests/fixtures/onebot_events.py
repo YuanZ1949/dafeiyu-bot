@@ -17,8 +17,11 @@ def face() -> dict:
     return {"type": "face", "data": {"id": "1"}}
 
 
-def reply(message_id: str | int) -> dict:
-    return {"type": "reply", "data": {"id": str(message_id)}}
+def reply(message_id: str | int, qq: int | None = None) -> dict:
+    data: dict = {"id": str(message_id)}
+    if qq is not None:
+        data["qq"] = qq
+    return {"type": "reply", "data": data}
 
 
 def json_card(embedded: str) -> dict:

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from dafeiyu.models import ChatType, Impression, Message, Summary
+from dafeiyu.models import ChatType, Impression, Message, Summary, WeeklySummary
 from dafeiyu.timeutil import SHANGHAI, today_shanghai
 
 # dashboard 只读面板单页上限，接口层同样按这个值校验。
@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS messages (
     -- 点名语义要跨进程存活：批次靠它决定 purpose=reply 与 prompt 标记。
     at_bot INTEGER NOT NULL DEFAULT 0,
     reply_to_bot INTEGER NOT NULL DEFAULT 0,
+    -- 回复目标：id 用于回查被回复消息的昵称，uid 是消息被清理后的退路。
+    reply_to_message_id TEXT,
+    reply_to_user_id INTEGER,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (chat_type, chat_id, message_id)
 );
@@ -89,6 +92,17 @@ CREATE TABLE IF NOT EXISTS summaries (
     content TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (chat_type, chat_id, date)
+);
+
+-- 周汇总单独建表：summaries.date 是「某一天」，用周起始日期混进去会被
+-- pending_summary_slots 的按日 LEFT JOIN 误判成那一天的日摘要。
+CREATE TABLE IF NOT EXISTS weekly_summaries (
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    week_start TEXT NOT NULL,
+    content TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_type, chat_id, week_start)
 );
 
 CREATE TABLE IF NOT EXISTS usage (
@@ -177,6 +191,8 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
     "messages": {
         "at_bot": "INTEGER NOT NULL DEFAULT 0",
         "reply_to_bot": "INTEGER NOT NULL DEFAULT 0",
+        "reply_to_message_id": "TEXT",
+        "reply_to_user_id": "INTEGER",
     },
     "brain_sessions": {
         "created_at": "TEXT",
@@ -299,6 +315,16 @@ class PendingSummary:
     chat_id: int
     date: str
     messages: int
+
+
+@dataclass(frozen=True)
+class PendingWeekly:
+    """一个「有日摘要却没周汇总」的槽位：会话 + 周起始 + 该周日摘要条数。"""
+
+    chat_type: ChatType
+    chat_id: int
+    week_start: str
+    days: int
 
 
 def _parse_day(value: str) -> datetime:
@@ -481,8 +507,8 @@ class Store:
             """
             INSERT OR IGNORE INTO messages
                 (chat_type, chat_id, message_id, user_id, nickname, content, is_bot,
-                 timestamp, at_bot, reply_to_bot)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 timestamp, at_bot, reply_to_bot, reply_to_message_id, reply_to_user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 m.chat_type.value,
@@ -495,6 +521,8 @@ class Store:
                 m.timestamp,
                 int(m.at_bot),
                 int(m.reply_to_bot),
+                m.reply_to_message_id,
+                m.reply_to_user_id,
             ),
         )
         self._conn.commit()
@@ -608,6 +636,29 @@ class Store:
             (chat_type.value, chat_id, start_ts, end_ts),
         ).fetchall()
         return [self._row_to_message(r) for r in rows]
+
+    def message_nicknames(
+        self, chat_type: ChatType, chat_id: int, message_ids: Sequence[str]
+    ) -> dict[str, str]:
+        """按 message_id 批量回查昵称；摘要补「回复 谁」时一次查完，别逐条打库。"""
+        ids = [str(mid) for mid in message_ids if mid]
+        if not ids:
+            return {}
+        found: dict[str, str] = {}
+        # SQLite 变量上限 999，按 500 一批足够覆盖单日消息量。
+        for start in range(0, len(ids), 500):
+            batch = ids[start : start + 500]
+            marks = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                f"""
+                SELECT message_id, nickname FROM messages
+                WHERE chat_type = ? AND chat_id = ? AND message_id IN ({marks})
+                """,
+                (chat_type.value, chat_id, *batch),
+            ).fetchall()
+            for row in rows:
+                found[str(row["message_id"])] = str(row["nickname"])
+        return found
 
     def active_chats_between(self, start_ts: int, end_ts: int) -> list[tuple[ChatType, int]]:
         rows = self._conn.execute(
@@ -1094,6 +1145,8 @@ class Store:
             is_bot=bool(r["is_bot"]),
             at_bot=bool(r["at_bot"]),
             reply_to_bot=bool(r["reply_to_bot"]),
+            reply_to_message_id=r["reply_to_message_id"],
+            reply_to_user_id=r["reply_to_user_id"],
             timestamp=r["timestamp"],
         )
 
@@ -1685,6 +1738,111 @@ class Store:
         摘要，这天仍算没补完。只读、无副作用。
         """
         return sorted({slot.date for slot in self.pending_summary_slots(days, until=until)})
+
+    def summaries_between(
+        self, chat_type: ChatType, chat_id: int, start: str, end: str
+    ) -> list[Summary]:
+        """按日期闭区间取日摘要，升序；周汇总的输入就是这 7 天里实际存在的条目。"""
+        rows = self._conn.execute(
+            """
+            SELECT chat_type, chat_id, date, content, updated_at FROM summaries
+            WHERE chat_type = ? AND chat_id = ? AND date >= ? AND date <= ?
+            ORDER BY date ASC
+            """,
+            (chat_type.value, chat_id, start, end),
+        ).fetchall()
+        return [
+            Summary(
+                chat_type=ChatType(r["chat_type"]),
+                chat_id=r["chat_id"],
+                date=r["date"],
+                content=r["content"],
+                updated_at=r["updated_at"],
+            )
+            for r in rows
+        ]
+
+    # ---- 周汇总 -----------------------------------------------------
+    def upsert_weekly_summary(
+        self, chat_type: ChatType, chat_id: int, week_start: str, content: str
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO weekly_summaries (chat_type, chat_id, week_start, content)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (chat_type, chat_id, week_start)
+            DO UPDATE SET content = excluded.content, updated_at = datetime('now')
+            """,
+            (chat_type.value, chat_id, week_start, content),
+        )
+        self._conn.commit()
+
+    def get_weekly_summary(
+        self, chat_type: ChatType, chat_id: int, week_start: str
+    ) -> str | None:
+        row = self._conn.execute(
+            """
+            SELECT content FROM weekly_summaries
+            WHERE chat_type = ? AND chat_id = ? AND week_start = ?
+            """,
+            (chat_type.value, chat_id, week_start),
+        ).fetchone()
+        return None if row is None else str(row["content"])
+
+    def latest_weekly_summary(
+        self, chat_type: ChatType, chat_id: int
+    ) -> WeeklySummary | None:
+        row = self._conn.execute(
+            """
+            SELECT chat_type, chat_id, week_start, content, updated_at
+            FROM weekly_summaries
+            WHERE chat_type = ? AND chat_id = ?
+            ORDER BY week_start DESC LIMIT 1
+            """,
+            (chat_type.value, chat_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return WeeklySummary(
+            chat_type=ChatType(row["chat_type"]),
+            chat_id=row["chat_id"],
+            week_start=row["week_start"],
+            content=row["content"],
+            updated_at=row["updated_at"],
+        )
+
+    def pending_weekly_slots(self, week_starts: Sequence[str]) -> list[PendingWeekly]:
+        """给定周起始里「有日摘要、还没周汇总」的会话，按周与 chat_id 排序。"""
+        pending: list[PendingWeekly] = []
+        for week_start in week_starts:
+            start = _parse_day(week_start).date()
+            end = (start + timedelta(days=6)).isoformat()
+            rows = self._conn.execute(
+                """
+                SELECT s.chat_type, s.chat_id, COUNT(*) AS n
+                FROM summaries AS s
+                WHERE s.date >= ? AND s.date <= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM weekly_summaries AS w
+                      WHERE w.chat_type = s.chat_type
+                        AND w.chat_id = s.chat_id
+                        AND w.week_start = ?
+                  )
+                GROUP BY s.chat_type, s.chat_id
+                ORDER BY s.chat_id ASC
+                """,
+                (week_start, end, week_start),
+            ).fetchall()
+            pending.extend(
+                PendingWeekly(
+                    chat_type=ChatType(row["chat_type"]),
+                    chat_id=int(row["chat_id"]),
+                    week_start=week_start,
+                    days=int(row["n"]),
+                )
+                for row in rows
+            )
+        return pending
 
     def recent_summaries(
         self,

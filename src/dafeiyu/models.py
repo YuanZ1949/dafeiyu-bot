@@ -27,6 +27,9 @@ class Message:
     is_bot: bool = False
     at_bot: bool = False
     reply_to_bot: bool = False
+    # 回复目标：id 用来回查昵称，uid 用来在消息被清理后退化成 QQ 号。
+    reply_to_message_id: str | None = None
+    reply_to_user_id: int | None = None
     timestamp: int = 0
 
     def to_prompt_line(self) -> str:
@@ -54,5 +57,14 @@ class Summary:
     chat_type: ChatType
     chat_id: int
     date: str
+    content: str
+    updated_at: str = ""
+
+
+@dataclass
+class WeeklySummary:
+    chat_type: ChatType
+    chat_id: int
+    week_start: str
     content: str
     updated_at: str = ""

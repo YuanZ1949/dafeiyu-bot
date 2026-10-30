@@ -64,6 +64,21 @@ def test_reply_to_other_is_not_reply_to_bot() -> None:
     assert m.reply_to_bot is False
 
 
+def test_reply_keeps_target_id_and_qq() -> None:
+    event = group_event(segments=[reply("888", qq=20002), text("这个怎么弄")])
+    m = parse_event(event, bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.reply_to_message_id == "888"
+    assert m.reply_to_user_id == 20002
+
+
+def test_message_without_reply_has_no_target() -> None:
+    m = parse_event(group_event(segments=[text("随便说说")]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.reply_to_message_id is None
+    assert m.reply_to_user_id is None
+
+
 def test_private_message() -> None:
     m = parse_event(private_event(segments=[text("在吗")]), bot_qq=BOT_QQ)
     assert m is not None

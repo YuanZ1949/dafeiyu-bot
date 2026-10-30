@@ -1,5 +1,5 @@
 import logging
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 
 import pytest
 
@@ -13,8 +13,12 @@ from dafeiyu.workers.summary import (
     MAX_SPLIT_DEPTH,
     MAX_SUMMARY_CHARS,
     SummaryScheduler,
+    _summary_budget,
+    completed_weeks,
     summarize_chat,
     summarize_for_rotation,
+    summarize_week,
+    week_start_of,
 )
 
 TZ = timezone(timedelta(hours=8))
@@ -39,15 +43,27 @@ def make_store() -> Store:
     return store
 
 
-def seed(store: Store, ts: datetime, content: str = "今天聊了显卡", chat_id: int = 9001) -> None:
+def seed(
+    store: Store,
+    ts: datetime,
+    content: str = "今天聊了显卡",
+    chat_id: int = 9001,
+    *,
+    nickname: str = "鱼片",
+    message_id: str | None = None,
+    reply_to_message_id: str | None = None,
+    reply_to_user_id: int | None = None,
+) -> None:
     store.add_message(
         Message(
             chat_type=ChatType.GROUP,
             chat_id=chat_id,
             user_id=42,
-            nickname="鱼片",
+            nickname=nickname,
             content=content,
-            message_id=f"m{int(ts.timestamp())}",
+            message_id=message_id or f"m{int(ts.timestamp())}",
+            reply_to_message_id=reply_to_message_id,
+            reply_to_user_id=reply_to_user_id,
             timestamp=int(ts.timestamp()),
         )
     )
@@ -56,7 +72,7 @@ def seed(store: Store, ts: datetime, content: str = "今天聊了显卡", chat_i
 @pytest.mark.asyncio
 async def test_summarize_truncates_to_200_and_stores():
     store = make_store()
-    seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ))
+    seed_many(store, 40)
     brain = FakeBrain("鱼" * 250)
 
     text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
@@ -69,7 +85,7 @@ async def test_summarize_truncates_to_200_and_stores():
 @pytest.mark.asyncio
 async def test_summarize_cuts_at_last_sentence_boundary():
     store = make_store()
-    seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ))
+    seed_many(store, 40)
     kept = "甲" * 90 + "。" + "乙" * 100 + "。"
     brain = FakeBrain(kept + "丙" * 100)
 
@@ -81,7 +97,7 @@ async def test_summarize_cuts_at_last_sentence_boundary():
 @pytest.mark.asyncio
 async def test_summarize_cuts_at_newline_boundary():
     store = make_store()
-    seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ))
+    seed_many(store, 40)
     kept = "甲" * 120
     brain = FakeBrain(kept + "\n" + "乙" * 120)
 
@@ -93,7 +109,7 @@ async def test_summarize_cuts_at_newline_boundary():
 @pytest.mark.asyncio
 async def test_summarize_hard_cut_marks_ellipsis_without_boundary():
     store = make_store()
-    seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ))
+    seed_many(store, 40)
     brain = FakeBrain("鱼" * 250)
 
     text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
@@ -105,7 +121,7 @@ async def test_summarize_hard_cut_marks_ellipsis_without_boundary():
 @pytest.mark.asyncio
 async def test_summarize_ignores_boundary_in_first_half():
     store = make_store()
-    seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ))
+    seed_many(store, 40)
     brain = FakeBrain("好。" + "鱼" * 250)
 
     text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
@@ -132,6 +148,108 @@ async def test_rotation_summary_cuts_at_sentence_boundary():
     text = await summarize_for_rotation(brain, store, ChatType.GROUP, 9001, messages)
 
     assert text == kept
+
+
+@pytest.mark.asyncio
+async def test_summary_line_shows_reply_nickname():
+    store = make_store()
+    seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ), content="今天聊了显卡", nickname="阿猫", message_id="m1")
+    seed(
+        store,
+        datetime(2026, 10, 23, 10, 1, tzinfo=TZ),
+        content="这个怎么弄",
+        message_id="m2",
+        reply_to_message_id="m1",
+        reply_to_user_id=7,
+    )
+    brain = FakeBrain("摘要")
+
+    await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    body = _prompt_lines(brain.calls[0])
+    assert body[1] == "[10:01] 鱼片: 这个怎么弄（回复 阿猫）"
+
+
+@pytest.mark.asyncio
+async def test_summary_line_falls_back_to_qq_when_nickname_missing():
+    store = make_store()
+    seed(
+        store,
+        datetime(2026, 10, 23, 10, 0, tzinfo=TZ),
+        content="这个怎么弄",
+        message_id="m2",
+        reply_to_message_id="gone",
+        reply_to_user_id=12345,
+    )
+    brain = FakeBrain("摘要")
+
+    await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    assert _prompt_lines(brain.calls[0])[0].endswith("（回复 QQ12345）")
+
+
+# ---- A2: 日摘要按当天消息量分档 ----
+
+@pytest.mark.parametrize(
+    ("count", "budget"),
+    [(0, 150), (30, 150), (31, 200), (200, 200), (201, 300), (900, 300)],
+)
+def test_summary_budget_tiers(count: int, budget: int) -> None:
+    assert _summary_budget(count) == budget
+
+
+@pytest.mark.asyncio
+async def test_quiet_day_uses_150_char_budget():
+    store = make_store()
+    seed_many(store, 10)
+    brain = FakeBrain("鱼" * 400)
+
+    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    assert len(text) == 150
+    assert "不超过 150 字" in brain.calls[0]["system"]
+
+
+@pytest.mark.asyncio
+async def test_normal_day_uses_200_char_budget():
+    store = make_store()
+    seed_many(store, 100)
+    brain = FakeBrain("鱼" * 400)
+
+    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    assert len(text) == 200
+    assert "不超过 200 字" in brain.calls[0]["system"]
+
+
+@pytest.mark.asyncio
+async def test_busy_day_uses_300_char_budget():
+    store = make_store()
+    seed_many(store, 300)
+    brain = FakeBrain("鱼" * 400)
+
+    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+
+    assert len(text) == 300
+    assert "不超过 300 字" in brain.calls[0]["system"]
+
+
+@pytest.mark.asyncio
+async def test_rotation_summary_stays_at_200_chars():
+    store = make_store()
+    seed_many(store, 10)
+    start = datetime(2026, 10, 23, tzinfo=TZ)
+    messages = store.messages_between(
+        ChatType.GROUP,
+        9001,
+        int(start.timestamp()),
+        int((start + timedelta(days=1)).timestamp()),
+    )
+    brain = FakeBrain("鱼" * 400)
+
+    text = await summarize_for_rotation(brain, store, ChatType.GROUP, 9001, messages)
+
+    assert len(text) == MAX_SUMMARY_CHARS
 
 
 @pytest.mark.asyncio
@@ -534,4 +652,126 @@ async def test_single_overlong_line_gives_up_without_split():
 
     assert text is None
     assert brain.calls == 1
+
+
+# ---- B2: 周汇总 ----
+
+MONDAY = datetime(2026, 10, 26, 4, 0, tzinfo=TZ)
+
+
+def seed_week(
+    store: Store,
+    week_start: str = "2026-10-19",
+    days: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6),
+    chat_id: int = 9001,
+) -> None:
+    start = date.fromisoformat(week_start)
+    for offset in days:
+        day = (start + timedelta(days=offset)).isoformat()
+        store.upsert_summary(ChatType.GROUP, chat_id, day, f"第{offset + 1}天摘要")
+
+
+def test_week_start_of_monday_and_sunday() -> None:
+    assert week_start_of(date(2026, 10, 19)) == date(2026, 10, 19)
+    assert week_start_of(date(2026, 10, 25)) == date(2026, 10, 19)
+
+
+def test_completed_weeks_skips_current_week_and_crosses_year() -> None:
+    assert completed_weeks(date(2026, 10, 24)) == ["2026-10-12", "2026-10-05"]
+    assert completed_weeks(date(2026, 1, 5)) == ["2025-12-29", "2025-12-22"]
+
+
+@pytest.mark.asyncio
+async def test_summarize_week_merges_seven_daily_summaries():
+    store = make_store()
+    seed_week(store)
+    brain = FakeBrain("这一周聊了显卡和猫")
+
+    text = await summarize_week(store, brain, ChatType.GROUP, 9001, "2026-10-19")
+
+    assert text == "这一周聊了显卡和猫"
+    assert store.get_weekly_summary(ChatType.GROUP, 9001, "2026-10-19") == text
+    prompt = _prompt_text(brain.calls[0])
+    assert "10-19：第1天摘要" in prompt
+    assert "10-25：第7天摘要" in prompt
+
+
+@pytest.mark.asyncio
+async def test_summarize_week_uses_only_existing_days():
+    store = make_store()
+    seed_week(store, days=(0, 1, 4))
+    brain = FakeBrain("这周只聊了三天")
+
+    await summarize_week(store, brain, ChatType.GROUP, 9001, "2026-10-19")
+
+    prompt = _prompt_text(brain.calls[0])
+    assert "10-19：第1天摘要" in prompt
+    assert "10-20：第2天摘要" in prompt
+    assert "10-23：第5天摘要" in prompt
+    assert "第3天摘要" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_summarize_week_skips_empty_week():
+    store = make_store()
+    brain = FakeBrain("不该出现")
+
+    text = await summarize_week(store, brain, ChatType.GROUP, 9001, "2026-10-19")
+
+    assert text == ""
+    assert brain.calls == []
+    assert store.get_weekly_summary(ChatType.GROUP, 9001, "2026-10-19") is None
+
+
+@pytest.mark.asyncio
+async def test_weekly_summary_clips_to_300_chars():
+    store = make_store()
+    seed_week(store)
+    brain = FakeBrain("鱼" * 400)
+
+    text = await summarize_week(store, brain, ChatType.GROUP, 9001, "2026-10-19")
+
+    assert len(text) == 300
+
+
+@pytest.mark.asyncio
+async def test_scheduler_generates_weekly_summary_once():
+    store = make_store()
+    seed_week(store)
+    brain = FakeBrain("上周回顾")
+    scheduler = SummaryScheduler(store, brain, clock=lambda: MONDAY, hour=4)
+
+    assert await scheduler.run_pending() == 1
+    assert store.get_weekly_summary(ChatType.GROUP, 9001, "2026-10-19") == "上周回顾"
+
+    assert await scheduler.run_pending() == 0
+    assert len(brain.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_weekly_failure_backs_off_without_writing():
+    store = make_store()
+    seed_week(store)
+    brain = FlakyBrain()
+    clock = {"t": 0.0}
+    scheduler = SummaryScheduler(
+        store,
+        brain,
+        clock=lambda: MONDAY,
+        hour=4,
+        backoff_seconds=60,
+        monotonic=lambda: clock["t"],
+    )
+
+    assert await scheduler.run_pending() == 0
+    assert brain.calls == 1
+    assert store.get_weekly_summary(ChatType.GROUP, 9001, "2026-10-19") is None
+
+    assert await scheduler.run_pending() == 0
+    assert brain.calls == 1
+
+    clock["t"] = 60.0
+    assert await scheduler.run_pending() == 1
+    assert brain.calls == 2
+    assert store.get_weekly_summary(ChatType.GROUP, 9001, "2026-10-19") == "恢复后的摘要"
 

@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from dafeiyu.brain.client import BrainError
@@ -22,13 +22,19 @@ from .failure import (
 
 logger = logging.getLogger(__name__)
 
-SUMMARY_SYSTEM = """你是群聊记录整理助手。请把给定日期的一段群聊整理成不超过 200 字的摘要：
+SUMMARY_SYSTEM_TEMPLATE = """你是群聊记录整理助手。请把给定日期的一段群聊整理成不超过 {limit} 字的摘要：
 - 记下主要话题、达成的结论、出现的梗和外号
 - 用第三人称陈述，不评论、不发挥
 - 只输出摘要正文，不要标题、前缀或解释
 """
 
 MAX_SUMMARY_CHARS = 200
+# 当天消息越多，摘要预算越大；闲群不必写满，忙群也不该被 200 字压平。
+SUMMARY_BUDGET_QUIET = 150
+SUMMARY_BUDGET_NORMAL = 200
+SUMMARY_BUDGET_BUSY = 300
+QUIET_DAY_MESSAGES = 30
+BUSY_DAY_MESSAGES = 200
 MAX_SOURCE_LINES = 400
 # 单次请求的经验预算：整段超时就按它切成若干块分别再摘，块内还可以继续细分。
 MAX_CHUNK_TOKENS = 1200
@@ -51,27 +57,45 @@ MERGE_SYSTEM = """你是群聊记录整理助手。下面是同一段聊天记�
 - 只输出摘要正文，不要标题、前缀或解释
 """
 
+WEEKLY_MAX_CHARS = 300
+# 周一生成失败时下一轮还能补：回补最近 2 个完整周，不只在周一跑。
+WEEKLY_BACKFILL_WEEKS = 2
+
+WEEKLY_SYSTEM = """你是群聊记录整理助手。下面是某个群一周的每日摘要，请归纳成不超过 300 字的周汇总：
+- 按话题、事件、人物关系归纳，不要逐日复述
+- 保留结论、梗和外号
+- 信息不足时宁可短，不要编造
+- 用第三人称陈述，只输出正文，不要标题、前缀或解释
+"""
+
 # 只有本地等 opencode 回包超时才值得切半重试；provider 自己报的 timeout
 # （如 provider.timeout）说明上游已明确失败，重试只会重复撞墙，交给退避。
 TIMEOUT_HINT = "OpenCode 超时"
 
 # 截断摘要时优先落在句末，避免把最后一句话切成半句。
 _CLIP_BOUNDARIES = "。！？；!?;\n"
-# 断点太靠前（不足一半）说明第一句本身很短，截到那里会丢掉大部分内容，此时宁可硬截断。
-_MIN_CLIP_CHARS = MAX_SUMMARY_CHARS // 2
 
 
-def _clip_summary(text: str) -> str:
+def _summary_budget(message_count: int) -> int:
+    """按当天全部消息数给摘要字数：≤30 条 150 字，31–200 条 200 字，更多 300 字。"""
+    if message_count <= QUIET_DAY_MESSAGES:
+        return SUMMARY_BUDGET_QUIET
+    if message_count <= BUSY_DAY_MESSAGES:
+        return SUMMARY_BUDGET_NORMAL
+    return SUMMARY_BUDGET_BUSY
+
+
+def _clip_summary(text: str, limit: int = MAX_SUMMARY_CHARS) -> str:
     """收敛模型输出：优先在句末标点处断开，找不到合适断点才硬截断并加省略号。"""
     body = (text or "").strip()
-    if len(body) <= MAX_SUMMARY_CHARS:
+    if len(body) <= limit:
         return body
-    window = body[:MAX_SUMMARY_CHARS]
+    window = body[:limit]
     cut = max(window.rfind(ch) for ch in _CLIP_BOUNDARIES)
-    if cut + 1 >= _MIN_CLIP_CHARS:
+    # 断点太靠前（不足一半）说明第一句本身很短，截到那里会丢掉大部分内容，此时宁可硬截断。
+    if cut + 1 >= limit // 2:
         return window[: cut + 1].rstrip()
-    return window[: MAX_SUMMARY_CHARS - 1].rstrip() + "…"
-
+    return window[: limit - 1].rstrip() + "…"
 
 
 def _day_bounds(date: str) -> tuple[int, int]:
@@ -79,20 +103,48 @@ def _day_bounds(date: str) -> tuple[int, int]:
     return int(start.timestamp()), int((start + timedelta(days=1)).timestamp())
 
 
+def week_start_of(day: date) -> date:
+    """该日期所在自然周的周一（Asia/Shanghai 的日历日）。"""
+    return day - timedelta(days=day.weekday())
+
+
+def completed_weeks(now: date, count: int = WEEKLY_BACKFILL_WEEKS) -> list[str]:
+    """最近 count 个「已结束」的周，返回周一日期，新的在前；当前周不算。"""
+    last_monday = week_start_of(now) - timedelta(days=7)
+    return [
+        (last_monday - timedelta(days=7 * index)).isoformat()
+        for index in range(max(1, count))
+    ]
+
+
 def _is_timeout_error(exc: BaseException) -> bool:
     return isinstance(exc, BrainError) and TIMEOUT_HINT in str(exc)
 
 
-def _summary_line(message: Message) -> str:
-    """摘要专用的记录行：带上海时刻，方便模型判断先后与间隔。"""
+def _summary_line(message: Message, reply_names: dict[str, str] | None = None) -> str:
+    """摘要专用的记录行：带上海时刻，方便模型判断先后与间隔。
+
+    被回复的消息还在库里就补「（回复 昵称）」；已清理则退化成 QQ 号，
+    比丢掉整条回复线索有用。
+    """
     stamp = datetime.fromtimestamp(message.timestamp, SHANGHAI).strftime("%H:%M")
-    return f"[{stamp}] {message.nickname}: {message.content}"
+    line = f"[{stamp}] {message.nickname}: {message.content}"
+    target = ""
+    if reply_names and message.reply_to_message_id:
+        target = reply_names.get(message.reply_to_message_id, "")
+    if not target and message.reply_to_user_id is not None:
+        target = f"QQ{message.reply_to_user_id}"
+    if target:
+        line += f"（回复 {target}）"
+    return line
 
 
-def _source_lines(messages: list[Message]) -> list[str]:
+def _source_lines(
+    messages: list[Message], reply_names: dict[str, str] | None = None
+) -> list[str]:
     """取最近 MAX_SOURCE_LINES 条；被截掉的部分用一行说明，别静默丢失。"""
     shown = messages[-MAX_SOURCE_LINES:]
-    lines = [_summary_line(m) for m in shown]
+    lines = [_summary_line(m, reply_names) for m in shown]
     hidden = len(messages) - len(shown)
     if hidden > 0:
         lines.insert(0, f"（更早还有 {hidden} 条未展开）")
@@ -195,6 +247,52 @@ async def _summarize_lines(
     return raw, prompt_tokens, completion_tokens, estimated
 
 
+def _reply_names(
+    store: Store, chat_type: ChatType, chat_id: int, messages: list[Message]
+) -> dict[str, str]:
+    """当天回复目标的昵称表；没有回复消息时直接跳过查询。"""
+    ids = [m.reply_to_message_id for m in messages if m.reply_to_message_id]
+    if not ids:
+        return {}
+    return store.message_nicknames(chat_type, chat_id, ids)
+
+
+async def summarize_week(
+    store: Store,
+    brain,
+    chat_type: ChatType,
+    chat_id: int,
+    week_start: str,
+    on_error: Callable[[BaseException], None] | None = None,
+) -> str | None:
+    """把一周内已有的日摘要归纳成周汇总；该周没有日摘要返回 ""，失败返回 None。"""
+    start = date.fromisoformat(week_start)
+    end = (start + timedelta(days=6)).isoformat()
+    rows = store.summaries_between(chat_type, chat_id, week_start, end)
+    if not rows:
+        return ""
+    lines = [f"{row.date[5:]}：{row.content}" for row in rows]
+    header = f"周起始：{week_start}\n以下是这一周的每日摘要："
+    try:
+        raw, prompt_tokens, completion_tokens, estimated = await _complete_once(
+            brain, WEEKLY_SYSTEM, f"{header}\n" + "\n".join(lines)
+        )
+    except Exception as exc:  # noqa: BLE001 - 周汇总失败不影响主链路
+        log_memory_failure(logger, f"生成周汇总 {week_start}", exc, chat_type, chat_id)
+        if on_error is not None:
+            on_error(exc)
+        return None
+
+    store.record_usage(
+        chat_type, chat_id, "summary", prompt_tokens, completion_tokens, estimated
+    )
+    text = _clip_summary(raw, WEEKLY_MAX_CHARS)
+    if not text:
+        return ""
+    store.upsert_weekly_summary(chat_type, chat_id, week_start, text)
+    return text
+
+
 async def summarize_chat(
     store: Store,
     brain,
@@ -209,11 +307,13 @@ async def summarize_chat(
     if not messages:
         return ""
 
-    lines = _source_lines(messages)
+    lines = _source_lines(messages, _reply_names(store, chat_type, chat_id, messages))
     header = f"日期：{date}\n以下是当天的群聊记录："
+    # 预算按当天全部消息数算，不受 MAX_SOURCE_LINES 截断影响。
+    budget = _summary_budget(len(messages))
     try:
         raw, prompt_tokens, completion_tokens, estimated = await _summarize_lines(
-            brain, SUMMARY_SYSTEM, MERGE_SYSTEM, header, lines
+            brain, SUMMARY_SYSTEM_TEMPLATE.format(limit=budget), MERGE_SYSTEM, header, lines
         )
     except Exception as exc:  # noqa: BLE001 - 摘要失败不影响主链路
         log_memory_failure(logger, f"生成摘要 {date}", exc, chat_type, chat_id)
@@ -224,7 +324,7 @@ async def summarize_chat(
     store.record_usage(
         chat_type, chat_id, "summary", prompt_tokens, completion_tokens, estimated
     )
-    text = _clip_summary(raw)
+    text = _clip_summary(raw, budget)
     if not text:
         return ""
     store.upsert_summary(chat_type, chat_id, date, text)
@@ -311,6 +411,40 @@ class SummaryScheduler:
         self._backoff.mark_ok(key)
         return text
 
+    async def _run_weekly(self, now: datetime, budget: int) -> int:
+        """补最近两个完整周的周汇总；与日摘要共享每轮上限和同一个退避实例。"""
+        if budget <= 0:
+            return 0
+        created = 0
+        for week_start in completed_weeks(now.date()):
+            if created >= budget or self._backoff.is_paused():
+                break
+            for slot in self._store.pending_weekly_slots([week_start]):
+                if created >= budget or self._backoff.is_paused():
+                    break
+                key = (slot.chat_type, slot.chat_id, week_start)
+                if self._store.get_weekly_summary(
+                    slot.chat_type, slot.chat_id, week_start
+                ):
+                    self._backoff.mark_ok(key)
+                    continue
+                if self._backoff.should_skip(key):
+                    continue
+                text = await summarize_week(
+                    self._store,
+                    self._current_brain(),
+                    slot.chat_type,
+                    slot.chat_id,
+                    week_start,
+                    on_error=lambda exc, key=key: self._backoff.mark_failed(key, exc),
+                )
+                if text is None:
+                    continue
+                self._backoff.mark_ok(key)
+                if text:
+                    created += 1
+        return created
+
     async def run_pending(self) -> int:
         now = self._clock()
         if now.hour < self._hour:
@@ -345,6 +479,9 @@ class SummaryScheduler:
             self._backoff.mark_ok(key)
             if text:
                 created += 1
+        created += await self._run_weekly(
+            now, budget=max(0, MAX_BACKFILL_PER_RUN - created)
+        )
         return created
 
 

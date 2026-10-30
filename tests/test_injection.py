@@ -146,3 +146,58 @@ def test_bot_messages_do_not_count_as_speakers(store, tmp_path):
         store, Workspace(tmp_path), GROUP, 1, InjectionConfig(), today="2026-10-24"
     )
     assert "丁：喜欢水" not in text
+
+
+# ---- B2: 周汇总注入 ------------------------------------------------
+
+
+def test_weekly_summary_is_injected_before_daily(store, tmp_path):
+    store.upsert_weekly_summary(GROUP, 1, "2026-10-12", "上周聊了显卡")
+    store.upsert_summary(GROUP, 1, "2026-10-22", "前天聊了猫")
+    store.upsert_summary(GROUP, 1, "2026-10-23", "昨天聊了狗")
+
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, InjectionConfig(), today="2026-10-24"
+    )
+
+    assert "周汇总（10-12~10-18）：上周聊了显卡" in text
+    assert text.index("周汇总") < text.index("10-22：") < text.index("10-23：")
+
+
+def test_weekly_summary_keeps_recent_daily_detail(store, tmp_path):
+    store.upsert_weekly_summary(GROUP, 1, "2026-10-05", "更早一周的梗")
+    store.upsert_summary(GROUP, 1, "2026-10-23", "昨天聊了猫粮")
+
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, InjectionConfig(), today="2026-10-24"
+    )
+
+    assert "更早一周的梗" in text
+    assert "昨天聊了猫粮" in text
+
+
+def test_over_budget_drops_older_daily_before_weekly(store, tmp_path):
+    store.upsert_weekly_summary(GROUP, 1, "2026-10-12", "周" * 100)
+    store.upsert_summary(GROUP, 1, "2026-10-22", "旧" * 200)
+    store.upsert_summary(GROUP, 1, "2026-10-23", "新" * 200)
+    cfg = InjectionConfig(summary_chars=250)  # 预算 500
+
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, cfg, today="2026-10-24"
+    )
+
+    assert "旧" * 10 not in text
+    assert "新" * 10 in text
+    assert "周" * 10 in text
+
+
+def test_weekly_summary_alone_is_clipped_to_budget(store, tmp_path):
+    store.upsert_weekly_summary(GROUP, 1, "2026-10-12", "周" * 600)
+    cfg = InjectionConfig(summary_chars=250)
+
+    text = build_injection(
+        store, Workspace(tmp_path), GROUP, 1, cfg, today="2026-10-24"
+    )
+
+    body = text.split("【昨日摘要】\n", 1)[1]
+    assert len(body) <= 500

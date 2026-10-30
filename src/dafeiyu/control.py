@@ -545,6 +545,8 @@ def _message_json(message: Any) -> dict[str, Any]:
         "is_bot": message.is_bot,
         "at_bot": message.at_bot,
         "reply_to_bot": message.reply_to_bot,
+        "reply_to_message_id": message.reply_to_message_id,
+        "reply_to_user_id": message.reply_to_user_id,
         "timestamp": message.timestamp,
         "at": _fmt_ts(message.timestamp),
     }

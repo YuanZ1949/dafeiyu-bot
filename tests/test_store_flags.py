@@ -86,6 +86,50 @@ def test_pending_batch_keeps_flags(store: Store) -> None:
     assert batch[1].reply_to_bot is True
 
 
+def test_reply_target_survives_roundtrip(store: Store) -> None:
+    msg = make_msg("m2")
+    msg.reply_to_message_id = "m1"
+    msg.reply_to_user_id = 77
+    store.add_message(msg)
+
+    got = store.recent_messages(ChatType.GROUP, 1, 10)[0]
+    assert got.reply_to_message_id == "m1"
+    assert got.reply_to_user_id == 77
+
+
+def test_message_nicknames_batch_lookup(store: Store) -> None:
+    store.add_message(make_msg("m1"))
+
+    assert store.message_nicknames(ChatType.GROUP, 1, ["m1", "missing"]) == {"m1": "鱼片"}
+
+
+def test_old_database_gains_reply_target_columns(tmp_path: Path) -> None:
+    path = tmp_path / "old-reply.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(OLD_MESSAGES_SCHEMA)
+    conn.execute(
+        "INSERT INTO messages (chat_type, chat_id, message_id, user_id, nickname, content)"
+        " VALUES (?, 1, 'old', 2, '鱼片', '老消息')",
+        (ChatType.GROUP.value,),
+    )
+    conn.commit()
+    conn.close()
+
+    s = Store(path)
+    s.init_schema()
+    try:
+        columns = {
+            row["name"] for row in s._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        assert {"reply_to_message_id", "reply_to_user_id"} <= columns
+
+        old = s.recent_messages(ChatType.GROUP, 1, 10)[0]
+        assert old.reply_to_message_id is None
+        assert old.reply_to_user_id is None
+    finally:
+        s.close()
+
+
 def test_old_database_gains_flag_columns(tmp_path: Path) -> None:
     path = tmp_path / "old.db"
     conn = sqlite3.connect(path)
