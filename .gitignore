@@ -5,7 +5,10 @@ __pycache__/
 data/
 logs/
 .pytest_cache/
+.ruff_cache/
 .superpowers/
+build/
+dist/
 .tamako/
 *.egg-info/
 vendor/napcat/
@@ -14,3 +17,6 @@ vendor/opencode/
 
 # 发布后 config.yaml 属于本机配置，从模板生成
 config.yaml
+
+# 内部验收记录不上传（含真实环境往返记录）
+docs/superpowers/spikes/
