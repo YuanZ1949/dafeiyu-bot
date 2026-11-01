@@ -10,11 +10,11 @@ from dafeiyu.models import ChatType
 
 class FakeAdapter:
     def __init__(self, error: Exception | None = None) -> None:
-        self.sent: list[tuple[ChatType, int, str]] = []
+        self.sent: list[tuple[ChatType, str, str]] = []
         self.error = error
         self.connected = True
 
-    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> None:
+    async def send(self, chat_type: ChatType, chat_id: str, text: str) -> None:
         if self.error is not None:
             raise self.error
         self.sent.append((chat_type, chat_id, text))
@@ -22,11 +22,11 @@ class FakeAdapter:
 
 async def test_probe_sends_private_message_to_self() -> None:
     adapter = FakeAdapter()
-    keepalive = Keepalive(adapter, 10001, 300, clock=lambda: 1000.0)
+    keepalive = Keepalive(adapter, "qq:10001", 300, clock=lambda: 1000.0)
 
     assert await keepalive.probe() is True
 
-    assert adapter.sent == [(ChatType.PRIVATE, 10001, KEEPALIVE_TEXT)]
+    assert adapter.sent == [(ChatType.PRIVATE, "qq:10001", KEEPALIVE_TEXT)]
     status = keepalive.status()
     assert status["enabled"] is True
     assert status["interval_seconds"] == 300
@@ -39,7 +39,7 @@ async def test_probe_failure_is_recorded_not_raised(
     caplog,
 ) -> None:
     adapter = FakeAdapter(error=RuntimeError("boom"))
-    keepalive = Keepalive(adapter, 1, 300)
+    keepalive = Keepalive(adapter, "qq:1", 300)
 
     with caplog.at_level(logging.WARNING):
         assert await keepalive.probe() is False
@@ -53,7 +53,7 @@ async def test_probe_failure_is_recorded_not_raised(
 async def test_run_waits_for_gateway_before_first_probe() -> None:
     adapter = FakeAdapter()
     adapter.connected = False
-    keepalive = Keepalive(adapter, 10001, 300)
+    keepalive = Keepalive(adapter, "qq:10001", 300)
 
     task = asyncio.create_task(keepalive.run())
     await asyncio.sleep(0.05)
@@ -68,4 +68,4 @@ async def test_run_waits_for_gateway_before_first_probe() -> None:
     with suppress(asyncio.CancelledError):
         await task
 
-    assert adapter.sent == [(ChatType.PRIVATE, 10001, KEEPALIVE_TEXT)]
+    assert adapter.sent == [(ChatType.PRIVATE, "qq:10001", KEEPALIVE_TEXT)]

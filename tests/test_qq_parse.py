@@ -25,8 +25,8 @@ def test_group_text_message() -> None:
     m = parse_event(event, bot_qq=BOT_QQ)
     assert m is not None
     assert m.chat_type is ChatType.GROUP
-    assert m.chat_id == 30003
-    assert m.user_id == 20002
+    assert m.chat_id == "qq:30003"
+    assert m.user_id == "qq:20002"
     assert m.nickname == "群名片"
     assert m.content == "大家好"
     assert m.message_id == "40004"
@@ -76,7 +76,7 @@ def test_reply_keeps_target_id_and_qq() -> None:
     m = parse_event(event, bot_qq=BOT_QQ)
     assert m is not None
     assert m.reply_to_message_id == "888"
-    assert m.reply_to_user_id == 20002
+    assert m.reply_to_user_id == "qq:20002"
 
 
 def test_message_without_reply_has_no_target() -> None:
@@ -90,7 +90,7 @@ def test_private_message() -> None:
     m = parse_event(private_event(segments=[text("在吗")]), bot_qq=BOT_QQ)
     assert m is not None
     assert m.chat_type is ChatType.PRIVATE
-    assert m.chat_id == 20002
+    assert m.chat_id == "qq:20002"
     assert m.content == "在吗"
 
 

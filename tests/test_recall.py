@@ -12,8 +12,11 @@ from dafeiyu.memory.store import Store
 from dafeiyu.memory.timeline import format_message_line
 from dafeiyu.models import ChatType, Message, RecallEvent
 
+# 会话 id 一律带通道前缀：裸 int 只存在于 v1 时代。
+CHAT = "qq:1"
 
-def make_msg(*, message_id: str = "m0", chat_id: int = 1) -> Message:
+
+def make_msg(*, message_id: str = "m0", chat_id: str = CHAT) -> Message:
     return Message(
         chat_type=ChatType.GROUP,
         chat_id=chat_id,
@@ -48,9 +51,9 @@ def test_parse_group_recall_event() -> None:
 
     assert isinstance(event, RecallEvent)
     assert event.chat_type is ChatType.GROUP
-    assert event.chat_id == 1001
+    assert event.chat_id == "qq:1001"
     assert event.message_id == "m7"
-    assert event.operator_id == 3
+    assert event.operator_id == "qq:3"
 
 
 def test_parse_friend_recall_event() -> None:
@@ -66,7 +69,7 @@ def test_parse_friend_recall_event() -> None:
 
     assert isinstance(event, RecallEvent)
     assert event.chat_type is ChatType.PRIVATE
-    assert event.chat_id == 2002
+    assert event.chat_id == "qq:2002"
     assert event.message_id == "p9"
 
 
@@ -80,19 +83,41 @@ def test_parse_ignores_other_notices() -> None:
     )
 
 
+def test_parsed_recall_marks_stored_message(store: Store) -> None:
+    """解析出的带前缀 id 必须能真的命中库里的消息（漏改则 rowcount 恒为 0）。"""
+    store.add_message(make_msg(message_id="m7", chat_id="qq:1001"))
+    event = parse_event(
+        {
+            "post_type": "notice",
+            "notice_type": "group_recall",
+            "group_id": 1001,
+            "user_id": 2,
+            "operator_id": 3,
+            "message_id": "m7",
+        },
+        bot_qq=999,
+    )
+
+    assert isinstance(event, RecallEvent)
+    assert store.mark_recalled(
+        event.chat_type, event.chat_id, event.message_id
+    ) is True
+    assert store.is_recalled(event.chat_type, event.chat_id, event.message_id)
+
+
 def test_mark_recalled_sets_flag(store: Store) -> None:
     store.add_message(make_msg())
 
-    assert store.mark_recalled(ChatType.GROUP, 1, "m0") is True
-    assert store.is_recalled(ChatType.GROUP, 1, "m0") is True
+    assert store.mark_recalled(ChatType.GROUP, CHAT, "m0") is True
+    assert store.is_recalled(ChatType.GROUP, CHAT, "m0") is True
 
-    got = store.recent_messages(ChatType.GROUP, 1, 1)[0]
+    got = store.recent_messages(ChatType.GROUP, CHAT, 1)[0]
     assert got.recalled_at
 
 
 def test_mark_recalled_unknown_message_is_noop(store: Store) -> None:
-    assert store.mark_recalled(ChatType.GROUP, 1, "nope") is False
-    assert store.is_recalled(ChatType.GROUP, 1, "nope") is False
+    assert store.mark_recalled(ChatType.GROUP, CHAT, "nope") is False
+    assert store.is_recalled(ChatType.GROUP, CHAT, "nope") is False
 
 
 def test_timeline_hides_recalled_content() -> None:

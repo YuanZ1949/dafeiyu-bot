@@ -14,7 +14,7 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 from dafeiyu.gateway.base import GatewayError
-from dafeiyu.models import ChatType, Message, RecallEvent, Segment
+from dafeiyu.models import QQ_PREFIX, ChatType, Message, RecallEvent, Segment
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,23 @@ def _as_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _qq_id(value: Any) -> str:
+    """OneBot 的裸数字 id -> 带通道前缀的会话 id；解析失败返回空串。"""
+    number = _as_int(value)
+    return f"{QQ_PREFIX}{number}" if number else ""
+
+
+def _bare_id(chat_id: str) -> int:
+    """send_*_msg 的 params 要原始数字：去掉通道前缀再转 int。"""
+    text = str(chat_id)
+    if text.startswith(QQ_PREFIX):
+        text = text[len(QQ_PREFIX):]
+    try:
+        return int(text)
+    except (TypeError, ValueError) as exc:
+        raise GatewayError(f"非法的 QQ 会话 id：{chat_id!r}") from exc
 
 
 def _clip(text: str, limit: int) -> str:
@@ -247,10 +264,10 @@ def _parse_recall(event: dict[str, Any]) -> RecallEvent | None:
     notice_type = event.get("notice_type")
     if notice_type == "group_recall":
         chat_type = ChatType.GROUP
-        chat_id = _as_int(event.get("group_id"))
+        chat_id = _qq_id(event.get("group_id"))
     elif notice_type == "friend_recall":
         chat_type = ChatType.PRIVATE
-        chat_id = _as_int(event.get("user_id"))
+        chat_id = _qq_id(event.get("user_id"))
     else:
         return None
     message_id = str(event.get("message_id") or "")
@@ -260,7 +277,7 @@ def _parse_recall(event: dict[str, Any]) -> RecallEvent | None:
         chat_type=chat_type,
         chat_id=chat_id,
         message_id=message_id,
-        operator_id=_as_int(event.get("operator_id")),
+        operator_id=_qq_id(event.get("operator_id")),
     )
 
 
@@ -279,18 +296,20 @@ def parse_event(
     message_type = event.get("message_type")
     if message_type == "group":
         chat_type = ChatType.GROUP
-        chat_id = _as_int(event.get("group_id"))
+        chat_id = _qq_id(event.get("group_id"))
     elif message_type == "private":
         chat_type = ChatType.PRIVATE
-        chat_id = _as_int(event.get("user_id"))
+        chat_id = _qq_id(event.get("user_id"))
     else:
         return None
 
-    user_id = _as_int(event.get("user_id"))
+    # 昵称兜底仍用裸 QQ 号：带前缀的 id 写进昵称会污染提示词。
+    raw_user_id = _as_int(event.get("user_id"))
+    user_id = _qq_id(event.get("user_id"))
     sender = event.get("sender")
     if not isinstance(sender, dict):
         sender = {}
-    nickname = str(sender.get("card") or sender.get("nickname") or user_id)
+    nickname = str(sender.get("card") or sender.get("nickname") or raw_user_id)
 
     raw_message = event.get("message", "")
     reply_id: str | None = None
@@ -323,11 +342,12 @@ def parse_event(
         content=content,
         message_id=str(event.get("message_id", "")),
         segments=segments,
-        is_bot=user_id == bot_qq,
+        # 两边都是带前缀的字符串；留成 int == str 会恒为 False（回声过滤失效）。
+        is_bot=user_id == _qq_id(bot_qq),
         at_bot=at_bot,
         reply_to_bot=reply_to_bot,
         reply_to_message_id=reply_id or None,
-        reply_to_user_id=reply_qq,
+        reply_to_user_id=_qq_id(reply_qq) if reply_qq else None,
         timestamp=_as_int(event.get("time")),
     )
 
@@ -349,7 +369,7 @@ class QQAdapter:
         self._token = token
         self._bot_qq = bot_qq
         self._send_timeout = send_timeout
-        self.bot_message_ids: deque[int] = deque(maxlen=max_bot_message_ids)
+        self.bot_message_ids: deque[str] = deque(maxlen=max_bot_message_ids)
         self._handler: Callable[[Message], Awaitable[None]] | None = None
         self._recall_handler: Callable[[RecallEvent], Awaitable[None]] | None = None
         self._server: Server | None = None
@@ -368,8 +388,13 @@ class QQAdapter:
         return self._bound_port
 
     @property
-    def bot_qq(self) -> int:
-        return self._bot_qq
+    def bot_qq(self) -> str:
+        """自己的 QQ 号（带通道前缀）：与 Message.user_id 保持同一形态。"""
+        return self.bot_id
+
+    @property
+    def bot_id(self) -> str:
+        return f"{QQ_PREFIX}{self._bot_qq}"
 
     @property
     def connected(self) -> bool:
@@ -405,13 +430,15 @@ class QQAdapter:
             await ws.close()
         self._fail_pending(GatewayError("QQ 网关已关闭"))
 
-    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> str | None:
+    async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str | None:
+        # 内部一律用带前缀的字符串 id；OneBot 协议参数仍是裸数字。
+        bare_id = _bare_id(chat_id)
         if chat_type is ChatType.GROUP:
-            action, params = "send_group_msg", {"group_id": chat_id, "message": text}
+            action, params = "send_group_msg", {"group_id": bare_id, "message": text}
         else:
-            action, params = "send_private_msg", {"user_id": chat_id, "message": text}
+            action, params = "send_private_msg", {"user_id": bare_id, "message": text}
 
-        target = f"{chat_type.value}/{chat_id}"
+        target = f"{chat_type.value}/{bare_id}"
         ws = self._ws
         if ws is None:
             logger.warning(
@@ -447,10 +474,7 @@ class QQAdapter:
             return None
         # 对账凭据：真实 id 返回给上层入库，同时记入回声过滤表。
         value = str(message_id)
-        try:
-            self.bot_message_ids.append(int(value))
-        except (TypeError, ValueError):
-            pass
+        self.bot_message_ids.append(value)
         return value
 
     def _authorized(self, request: Any) -> bool:

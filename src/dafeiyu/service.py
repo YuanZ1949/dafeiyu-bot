@@ -24,7 +24,7 @@ from .memory.rotation import apply_rotation, needs_rotation
 from .memory.store import Store
 from .memory.timeline import TIMELINE_LIMIT, build_batch_prompt
 from .memory.workspace import Workspace
-from .models import ChatType, Message, RecallEvent
+from .models import QQ_PREFIX, ChatType, Message, RecallEvent
 from .moment import analyze, answers_bot_question, reopened_by_question
 from .router import Router, now_shanghai
 from .sender import is_technical_question, segment_reply, shape_reply
@@ -211,8 +211,9 @@ class Service:
     def _start_keepalive(self) -> None:
         """启动保活：只在配置了间隔、且适配器知道自己的 QQ 号时启用。"""
         seconds = float(self.settings.napcat.keepalive_seconds)
-        bot_qq = int(getattr(self.adapter, "bot_qq", 0) or 0)
-        if seconds <= 0 or bot_qq <= 0:
+        # 适配器给的已是带前缀的字符串 id；这里不再做 int() 强转。
+        bot_qq = str(getattr(self.adapter, "bot_qq", "") or "")
+        if seconds <= 0 or not bot_qq or bot_qq == f"{QQ_PREFIX}0":
             return
         if self._keepalive_task is not None:
             return

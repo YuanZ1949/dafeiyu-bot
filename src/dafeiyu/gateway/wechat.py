@@ -31,5 +31,5 @@ class WeChatAdapter:
     async def stop(self) -> None:
         return None
 
-    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> str | None:
+    async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str | None:
         raise NotImplementedError("微信接入未实现，见 dafeiyu/gateway/wechat.py docstring")
