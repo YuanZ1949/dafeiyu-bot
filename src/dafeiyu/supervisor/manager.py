@@ -36,8 +36,15 @@ class ProcSpec:
     name: str
     command: list[str]
     cwd: str | None = None
-    env: dict[str, str] | None = None
+    # 子进程环境里可能含口令（opencode/control/wechat bridge token），
+    # repr 一律不展开，避免被日志或异常文本顺带带出去。
+    env: dict[str, str] | None = field(default=None, repr=False)
     ready_url: str = ""
+    # 没有 HTTP 端点的进程（例如微信桥是出站 WS 客户端）用同步探针代替 URL；
+    # 探针由 manager 丢到线程池执行，绝不在事件循环里同步跑。
+    ready_probe: Callable[[], bool] | None = None
+    # 单个进程的就绪窗口覆盖；None 表示沿用 Supervisor.ready_timeout。
+    ready_timeout: float | None = None
     creationflags: int = 0
     # 启动前先清掉同目录的残留进程（NapCat 的 worker 会在主进程崩溃后
     # 继续占着 QQ 登录态，新实例只会报「当前账号已登录，无法重复登录」）。
@@ -160,11 +167,12 @@ class Supervisor:
             for stream in (proc.stdout, proc.stderr)
             if stream is not None
         ]
-        if spec.ready_url:
+        if spec.ready_url or spec.ready_probe:
             if not await self._wait_ready(state):
                 await self._terminate(state)
                 state.status = FAILED
-                raise RuntimeError(f"{name} 未在 {self.ready_timeout:.0f}s 内就绪")
+                timeout = self._ready_timeout(state)
+                raise RuntimeError(f"{name} 未在 {timeout:.0f}s 内就绪")
         state.status = READY
         state.watcher = asyncio.create_task(self._watch(state))
 
@@ -181,13 +189,24 @@ class Supervisor:
             await _kill_tree(pid)
             self.logs.write(name, f"清理残留进程 pid={pid}（启动前）")
 
+    def _ready_timeout(self, state: ProcState) -> float:
+        override = state.spec.ready_timeout
+        return self.ready_timeout if override is None else override
+
     async def _wait_ready(self, state: ProcState) -> bool:
-        deadline = time.monotonic() + self.ready_timeout
+        deadline = time.monotonic() + self._ready_timeout(state)
         while time.monotonic() < deadline:
             if state.proc is None or state.proc.returncode is not None:
                 return False
             try:
-                if await self._probe(state.spec.ready_url):
+                probe = state.spec.ready_probe
+                if probe is not None:
+                    # 同步探针（HTTP GET）必须离开事件循环：否则连接超时会把
+                    # 整个 supervisor 的调度一起卡住。
+                    ready = await asyncio.to_thread(probe)
+                else:
+                    ready = await self._probe(state.spec.ready_url)
+                if ready:
                     return True
             except Exception:
                 pass

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from dafeiyu.supervisor.manager import (
     EXTERNAL,
     FAILED,
     READY,
+    STARTING,
     STOPPED,
     ProcSpec,
     Supervisor,
@@ -27,13 +29,14 @@ def make_supervisor(
     specs: dict[str, ProcSpec],
     backoff: tuple[float, ...] = (0.05,),
     max_failures: int = 3,
+    ready_timeout: float = 5.0,
 ) -> tuple[Supervisor, LogHub]:
     hub = LogHub(tmp_path / "logs")
     supervisor = Supervisor(
         specs,
         hub,
         RestartConfig(backoff_seconds=backoff, max_failures=max_failures),
-        ready_timeout=5.0,
+        ready_timeout=ready_timeout,
     )
     return supervisor, hub
 
@@ -408,3 +411,123 @@ async def test_recover_is_ignored_without_patterns(tmp_path: Path) -> None:
 
     assert not any("命中自愈模式" in line for line in hub.tail("x"))
     await supervisor.stop("x")
+
+
+# ---- ready_probe（无 HTTP 端点的进程，例如微信桥）-------------------------
+
+BRIDGE_COMMAND = [sys.executable, "-u", "-c", SLEEPER]
+
+
+def bridge_spec(
+    probe, *, ready_timeout: float | None = None
+) -> ProcSpec:
+    return ProcSpec(
+        "wechat_bridge",
+        list(BRIDGE_COMMAND),
+        ready_url="",
+        ready_probe=probe,
+        ready_timeout=ready_timeout,
+    )
+
+
+async def test_probe_is_invoked_when_ready_url_empty(tmp_path: Path) -> None:
+    """`ready_url` 为空但 `ready_probe` 有值：门必须放行并真的调用探针。"""
+    calls = 0
+
+    def probe() -> bool:
+        nonlocal calls
+        calls += 1
+        return True
+
+    supervisor, _ = make_supervisor(tmp_path, {"wechat_bridge": bridge_spec(probe)})
+    await supervisor.start("wechat_bridge")
+    try:
+        assert calls > 0
+        assert supervisor.states["wechat_bridge"].status == READY
+    finally:
+        await supervisor.stop("wechat_bridge")
+
+
+async def test_probe_false_never_readies_until_true(tmp_path: Path) -> None:
+    holder: dict[str, Supervisor] = {}
+    seen_statuses: list[str] = []
+
+    def probe() -> bool:
+        state = holder["sup"].states["wechat_bridge"]
+        seen_statuses.append(state.status)
+        return len(seen_statuses) > 2
+
+    supervisor, _ = make_supervisor(
+        tmp_path, {"wechat_bridge": bridge_spec(probe)}
+    )
+    holder["sup"] = supervisor
+    await supervisor.start("wechat_bridge")
+    try:
+        assert len(seen_statuses) == 3
+        # 前两次探针失败时进程仍是 STARTING，绝不能被当成 READY。
+        assert seen_statuses[:2] == [STARTING, STARTING]
+        assert supervisor.states["wechat_bridge"].status == READY
+    finally:
+        await supervisor.stop("wechat_bridge")
+
+
+async def test_probe_never_true_fails_with_runtime_error(tmp_path: Path) -> None:
+    """探针永远 False：ready_timeout 用尽后必须终止 + FAILED + 抛错，不能静默 READY。"""
+    calls: list[int] = []
+    loop = asyncio.get_running_loop()
+
+    def probe() -> bool:
+        calls.append(1)
+        return False
+
+    supervisor, _ = make_supervisor(
+        tmp_path,
+        {"wechat_bridge": bridge_spec(probe, ready_timeout=0.3)},
+    )
+    started = loop.time()
+    with pytest.raises(RuntimeError, match="内就绪"):
+        await supervisor.start("wechat_bridge")
+    elapsed = loop.time() - started
+
+    state = supervisor.states["wechat_bridge"]
+    assert calls
+    assert state.status == FAILED
+    assert state.proc is None or state.proc.returncode is not None
+    # 短超时必须真的生效（per-spec 覆盖），不能退化成 5s 默认值或无限重试。
+    assert elapsed < 3.0
+
+
+async def test_probe_exception_keeps_polling(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    def probe() -> bool:
+        calls.append(1)
+        if len(calls) < 3:
+            raise OSError("探针连接失败")
+        return True
+
+    supervisor, _ = make_supervisor(tmp_path, {"wechat_bridge": bridge_spec(probe)})
+    await supervisor.start("wechat_bridge")
+    try:
+        assert len(calls) == 3
+        assert supervisor.states["wechat_bridge"].status == READY
+    finally:
+        await supervisor.stop("wechat_bridge")
+
+
+async def test_probe_runs_off_the_event_loop_thread(tmp_path: Path) -> None:
+    """同步探针必须走 asyncio.to_thread：线程 id 不能等于事件循环线程。"""
+    loop_thread = threading.get_ident()
+    probe_threads: list[int] = []
+
+    def probe() -> bool:
+        probe_threads.append(threading.get_ident())
+        return True
+
+    supervisor, _ = make_supervisor(tmp_path, {"wechat_bridge": bridge_spec(probe)})
+    await supervisor.start("wechat_bridge")
+    try:
+        assert probe_threads
+        assert all(tid != loop_thread for tid in probe_threads), probe_threads
+    finally:
+        await supervisor.stop("wechat_bridge")

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import signal
 import subprocess
 import sys
+import urllib.request
 import webbrowser
 from dataclasses import replace
 from datetime import datetime
@@ -21,6 +23,7 @@ from ..brain.opencode_auth import PASSWORD_ENV, password_env, resolve_password
 from ..brain.provider_config import ensure_agent_files
 from ..brain.runtime_config import server_env
 from ..config import ConfigError, Settings, load_settings
+from ..gateway.channels import wechat_enabled_for
 from ..timeutil import now_shanghai
 from .alerts import AlertChannel, AlertManager, QQAdminChannel, WebhookChannel
 from .audit import AuditLog
@@ -43,6 +46,13 @@ QR_PATH = REPO_ROOT / "vendor" / "napcat" / "napcat" / "cache" / "qrcode.png"
 NAPCAT_DIR = REPO_ROOT / "vendor" / "napcat"
 PID_PATH = REPO_ROOT / "data" / "supervisor.pid"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# 桥进程只认这个环境变量（config.py 的 `_build_wechat` 同源读取），
+# 绝不能把 token 放进 argv 或 ProcSpec 的 repr。
+WECHAT_BRIDGE_TOKEN_ENV = "DAFEIYU_WECHAT_BRIDGE_TOKEN"
+# 默认 30s 不够：桥要先建 WS 服务，再等 bot 冷启动 + WeChatAdapter 连上，
+# 开机/升级后常见 30-60s。这里显式给 90s，避免误判 FAILED 把桥杀掉。
+WECHAT_BRIDGE_READY_TIMEOUT = 90.0
 
 
 class _HubHandler(logging.Handler):
@@ -135,6 +145,38 @@ def find_napcat_pids(directory: Path = NAPCAT_DIR) -> list[int]:
     return pids
 
 
+def _wechat_bridge_ready_probe(control_port: int, token: str) -> Callable[[], bool]:
+    """微信桥的就绪判据：bot 的 `/api/health/detail` 里微信通道已连接。
+
+    桥自己只跑 WS 服务端、没有 HTTP 端点，因此 `ready_url` 留空，改由这条
+    同步探针问 bot。`/api/health` 只有 `{"ok": true}` 且无 `channels`，不能用；
+    `/api/health/detail` 需要 token，所以控制端口与口令都从 supervisor 传进来。
+    """
+
+    url = f"http://127.0.0.1:{control_port}/api/health/detail"
+
+    def probe() -> bool:
+        headers = {"X-Control-Token": token} if token else {}
+        request = urllib.request.Request(url, headers=headers)
+        # 2s 上限：探针跑在线程池里，超时只影响本次判定，不会卡住事件循环。
+        try:
+            with urllib.request.urlopen(request, timeout=2.0) as response:
+                if getattr(response, "status", 200) != 200:
+                    return False
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 - 401/超时/非 JSON 一律视为未就绪
+            return False
+        if not isinstance(payload, dict):
+            return False
+        channels = payload.get("channels")
+        if not isinstance(channels, dict):
+            return False
+        wechat = channels.get("wechat")
+        return isinstance(wechat, dict) and wechat.get("connected") is True
+
+    return probe
+
+
 def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
     try:
         opencode_bin = resolve_opencode_bin(settings.opencode.bin)
@@ -202,6 +244,22 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
         ready_url=f"http://127.0.0.1:{control_port}/api/health",
         creationflags=CREATE_NO_WINDOW,
     )
+    # 插入顺序即启动顺序（Supervisor.start_all 按 dict 顺序）：桥必须排在 bot
+    # 之后，否则它的 ready_probe（问 bot 的 /api/health/detail）会一直空转。
+    # 只有 provider 真正选中微信时才注册：provider=qq + enabled=true 时
+    # task 20 不会构造 WeChatAdapter，拉起桥只会得到一个永远不就绪的进程。
+    if wechat_enabled_for(settings):
+        specs["wechat_bridge"] = ProcSpec(
+            name="wechat_bridge",
+            command=[sys.executable, "-m", "dafeiyu.gateway.wechat_bridge"],
+            cwd=str(REPO_ROOT),
+            env={WECHAT_BRIDGE_TOKEN_ENV: settings.wechat.bridge_token},
+            # 桥是出站 WS 客户端，没有可探的 HTTP 端点。
+            ready_url="",
+            ready_probe=_wechat_bridge_ready_probe(control_port, token),
+            ready_timeout=WECHAT_BRIDGE_READY_TIMEOUT,
+            creationflags=CREATE_NO_WINDOW,
+        )
     # -q <uin> 让 NapCat 用机器人号已有的本地票据自动登录，冷启动不必再扫码。
     # 必须显式给 uin：本机快速登录列表里还有用户的个人号 504567327，
     # 不给 -q 会按列表顺序登错号。票据失效时 NapCat 自己回落到二维码，不会卡死。
