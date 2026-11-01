@@ -272,7 +272,7 @@ async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
         assert usage["series"][-1]["calls"] == 1
         assert usage["series"][-1]["errors"] == 1
         assert usage["series"][-1]["tokens"] == 15
-        assert usage["top"][0]["chat_id"] == GROUP_ID
+        assert usage["top"][0]["chat_id"] == str(GROUP_ID)
 
         found = await (
             await dash.get("/api/memory/search", params={"q": "显卡"})
@@ -303,7 +303,9 @@ async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
         assert len(bundle["summaries"]) == 1
 
         sessions = await (await dash.get("/api/sessions")).json()
-        row = next(item for item in sessions["items"] if item["chat_id"] == GROUP_ID)
+        row = next(
+            item for item in sessions["items"] if item["chat_id"] == str(GROUP_ID)
+        )
         assert row["message_count"] == 2
         assert row["session_id"] == "ses_demo"
         assert row["summary_count"] == 1

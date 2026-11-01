@@ -179,7 +179,7 @@ async def test_summary_line_falls_back_to_qq_when_nickname_missing():
         content="这个怎么弄",
         message_id="m2",
         reply_to_message_id="gone",
-        reply_to_user_id=12345,
+        reply_to_user_id="12345",
     )
     brain = FakeBrain("摘要")
 

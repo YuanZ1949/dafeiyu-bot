@@ -89,12 +89,12 @@ def test_pending_batch_keeps_flags(store: Store) -> None:
 def test_reply_target_survives_roundtrip(store: Store) -> None:
     msg = make_msg("m2")
     msg.reply_to_message_id = "m1"
-    msg.reply_to_user_id = 77
+    msg.reply_to_user_id = "77"
     store.add_message(msg)
 
     got = store.recent_messages(ChatType.GROUP, 1, 10)[0]
     assert got.reply_to_message_id == "m1"
-    assert got.reply_to_user_id == 77
+    assert got.reply_to_user_id == "77"
 
 
 def test_message_nicknames_batch_lookup(store: Store) -> None:

@@ -346,7 +346,7 @@ class PendingSummary:
     """一个「有消息却没摘要」的槽位：会话 + 日期 + 当天消息数。"""
 
     chat_type: ChatType
-    chat_id: int
+    chat_id: str
     date: str
     messages: int
 
@@ -356,7 +356,7 @@ class PendingWeekly:
     """一个「有日摘要却没周汇总」的槽位：会话 + 周起始 + 该周日摘要条数。"""
 
     chat_type: ChatType
-    chat_id: int
+    chat_id: str
     week_start: str
     days: int
 
@@ -377,7 +377,7 @@ def _memory_scope(
         params.append(chat_type.value)
     if chat_id is not None:
         clauses.append("chat_id = ?")
-        params.append(int(chat_id))
+        params.append(chat_id)
     return ("WHERE " + " AND ".join(clauses) if clauses else ""), params
 
 
@@ -927,15 +927,19 @@ class Store:
                 found[str(row["message_id"])] = str(row["nickname"])
         return found
 
-    def active_chats_between(self, start_ts: int, end_ts: int) -> list[tuple[ChatType, int]]:
+    def active_chats_between(self, start_ts: int, end_ts: int) -> list[tuple[ChatType, str]]:
         rows = self._conn.execute(
             """
             SELECT DISTINCT chat_type, chat_id FROM messages
             WHERE timestamp >= ? AND timestamp < ?
+            ORDER BY chat_type,
+                     CASE WHEN chat_id LIKE 'qq:%' THEN 0 ELSE 1 END,
+                     CAST(SUBSTR(chat_id, 4) AS INTEGER),
+                     chat_id
             """,
             (start_ts, end_ts),
         ).fetchall()
-        return [(ChatType(r["chat_type"]), int(r["chat_id"])) for r in rows]
+        return [(ChatType(r["chat_type"]), r["chat_id"]) for r in rows]
 
     def count_messages(self, chat_type: ChatType, chat_id: int) -> int:
         row = self._conn.execute(
@@ -989,14 +993,14 @@ class Store:
                       WHERE chat_type = ? AND chat_id = ? AND user_id = ?
                   )
                 """,
-                (chat_type.value, chat_id, chat_type.value, chat_id, int(user_id)),
+                (chat_type.value, chat_id, chat_type.value, chat_id, user_id),
             )
             cur = self._conn.execute(
                 """
                 DELETE FROM messages
                 WHERE chat_type = ? AND chat_id = ? AND user_id = ?
                 """,
-                (chat_type.value, chat_id, int(user_id)),
+                (chat_type.value, chat_id, user_id),
             )
         return max(cur.rowcount, 0)
 
@@ -1038,7 +1042,7 @@ class Store:
                 params.append(chat_type.value)
             if chat_id is not None:
                 clauses.append("m.chat_id = ?")
-                params.append(int(chat_id))
+                params.append(chat_id)
             where = " AND ".join(["messages_fts MATCH ?", *clauses])
             try:
                 total_row = self._conn.execute(
@@ -1098,7 +1102,7 @@ class Store:
                 params.append(chat_type.value)
             if chat_id is not None:
                 clauses.append("m.chat_id = ?")
-                params.append(int(chat_id))
+                params.append(chat_id)
             where = " AND ".join(["messages_fts MATCH ?", *clauses])
             try:
                 total_row = self._conn.execute(
@@ -1389,7 +1393,7 @@ class Store:
         ).fetchone()
         return row is not None
 
-    def chats_with_pending(self, since_ts: int) -> list[tuple[ChatType, int]]:
+    def chats_with_pending(self, since_ts: int) -> list[tuple[ChatType, str]]:
         """哪些会话还有「游标之后、窗口内、未投递」的人类消息（无游标的会话不算）。"""
         rows = self._conn.execute(
             """
@@ -1403,11 +1407,14 @@ class Store:
                   WHERE d.chat_type = m.chat_type AND d.chat_id = m.chat_id
                     AND d.message_id = m.message_id
               )
-            ORDER BY m.chat_type, m.chat_id
+            ORDER BY m.chat_type,
+                     CASE WHEN m.chat_id LIKE 'qq:%' THEN 0 ELSE 1 END,
+                     CAST(SUBSTR(m.chat_id, 4) AS INTEGER),
+                     m.chat_id
             """,
             (since_ts,),
         ).fetchall()
-        return [(ChatType(r["chat_type"]), int(r["chat_id"])) for r in rows]
+        return [(ChatType(r["chat_type"]), r["chat_id"]) for r in rows]
 
     def mark_skipped(
         self, chat_type: ChatType, chat_id: int, message_ids: Sequence[str], reason: str
@@ -1863,13 +1870,13 @@ class Store:
         chat_type: ChatType,
         chat_id: int,
         topk: int,
-        focus_user_ids: Sequence[int] = (),
+        focus_user_ids: Sequence[str] = (),
     ) -> list[Impression]:
         """按新鲜度/置信度排序；focus_user_ids 里的人优先占名额。
 
         focus 只影响谁先入选，名额内仍按 30 天内见过 > confidence > updated_at 排。
         """
-        focus = list(dict.fromkeys(int(uid) for uid in focus_user_ids))[:32]
+        focus = list(dict.fromkeys(focus_user_ids))[:32]
         if focus:
             marks = ",".join("?" for _ in focus)
             order = f"(subject_user_id IN ({marks})) DESC,"
@@ -2114,14 +2121,17 @@ class Store:
              AND s.date = strftime('%Y-%m-%d', m.timestamp, 'unixepoch', '+8 hours')
             WHERE m.timestamp >= ? AND m.timestamp < ? AND s.date IS NULL
             GROUP BY m.chat_type, m.chat_id, day
-            ORDER BY day DESC, m.chat_id ASC
+            ORDER BY day DESC,
+                     CASE WHEN m.chat_id LIKE 'qq:%' THEN 0 ELSE 1 END,
+                     CAST(SUBSTR(m.chat_id, 4) AS INTEGER),
+                     m.chat_id ASC
             """,
             (start_ts, end_ts),
         ).fetchall()
         return [
             PendingSummary(
                 chat_type=ChatType(row["chat_type"]),
-                chat_id=int(row["chat_id"]),
+                chat_id=row["chat_id"],
                 date=str(row["day"]),
                 messages=int(row["n"]),
             )
@@ -2226,14 +2236,16 @@ class Store:
                         AND w.week_start = ?
                   )
                 GROUP BY s.chat_type, s.chat_id
-                ORDER BY s.chat_id ASC
+                ORDER BY CASE WHEN s.chat_id LIKE 'qq:%' THEN 0 ELSE 1 END,
+                         CAST(SUBSTR(s.chat_id, 4) AS INTEGER),
+                         s.chat_id ASC
                 """,
                 (week_start, end, week_start),
             ).fetchall()
             pending.extend(
                 PendingWeekly(
                     chat_type=ChatType(row["chat_type"]),
-                    chat_id=int(row["chat_id"]),
+                    chat_id=row["chat_id"],
                     week_start=week_start,
                     days=int(row["n"]),
                 )
@@ -2468,7 +2480,7 @@ class Store:
             params.append(chat_type.value)
         if chat_id is not None:
             clauses.append("chat_id = ?")
-            params.append(int(chat_id))
+            params.append(chat_id)
         where = " AND ".join(clauses)
         row = self._conn.execute(
             f"""
@@ -2568,7 +2580,7 @@ class Store:
         return [
             {
                 "chat_type": str(row["chat_type"]),
-                "chat_id": int(row["chat_id"]),
+                "chat_id": row["chat_id"],
                 "calls": int(row["calls"] or 0),
                 "errors": int(row["errors"] or 0),
                 "tokens": int(row["tokens"] or 0),
@@ -2592,7 +2604,7 @@ class Store:
         return [
             {
                 "chat_type": str(row["chat_type"]),
-                "chat_id": int(row["chat_id"]),
+                "chat_id": row["chat_id"],
                 "at": str(row["at"] or ""),
             }
             for row in rows
@@ -2605,15 +2617,15 @@ class Store:
         以消息、摘要、印象、brain_sessions 的并集为会话集合，避免“只剩摘要”的会话消失。
         按最近消息时间倒序，没有消息的排最后。
         """
-        chats: dict[tuple[str, int], dict[str, object]] = {}
+        chats: dict[tuple[str, str], dict[str, object]] = {}
 
-        def bucket(raw_type: str, raw_id: int) -> dict[str, object]:
-            key = (raw_type, int(raw_id))
+        def bucket(raw_type: str, raw_id: str) -> dict[str, object]:
+            key = (raw_type, raw_id)
             return chats.setdefault(
                 key,
                 {
                     "chat_type": raw_type,
-                    "chat_id": int(raw_id),
+                    "chat_id": raw_id,
                     "message_count": 0,
                     "last_message_at": None,
                     "summary_count": 0,
@@ -2649,9 +2661,9 @@ class Store:
             bucket(row["chat_type"], row["chat_id"])["impression_count"] = int(row["n"])
 
         # 同一会话可能有多个 provider 的映射；优先展示 opencode，其次最近更新的。
-        sessions: dict[tuple[str, int], sqlite3.Row] = {}
+        sessions: dict[tuple[str, str], sqlite3.Row] = {}
         for row in self._conn.execute("SELECT * FROM brain_sessions"):
-            key = (row["chat_type"], int(row["chat_id"]))
+            key = (row["chat_type"], row["chat_id"])
             current = sessions.get(key)
             if current is None:
                 sessions[key] = row

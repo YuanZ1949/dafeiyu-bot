@@ -998,7 +998,7 @@ async def test_usage_endpoint_fills_empty_days(tmp_path: Path) -> None:
     }
     assert payload["totals"] == {"calls": 2, "errors": 1, "tokens": 24}
     assert payload["top"] == [
-        {"chat_type": "group", "chat_id": 100, "calls": 2, "errors": 1, "tokens": 24}
+        {"chat_type": "group", "chat_id": "100", "calls": 2, "errors": 1, "tokens": 24}
     ]
     assert len(payload["recent_errors"]) == 1
     assert re.fullmatch(r"\d\d-\d\d \d\d:\d\d", payload["recent_errors"][0]["at"])
@@ -1144,7 +1144,7 @@ async def test_sessions_endpoint_and_actions(tmp_path: Path) -> None:
 
     async with running(app) as client:
         payload = await (await client.get("/api/sessions")).json()
-        assert [item["chat_id"] for item in payload["items"]] == [100, 200]
+        assert [item["chat_id"] for item in payload["items"]] == ["100", "200"]
         assert payload["items"][0]["session_id"] == "ses_abc"
         assert payload["total"] == 2
 
@@ -1154,7 +1154,7 @@ async def test_sessions_endpoint_and_actions(tmp_path: Path) -> None:
         assert page["total"] == 2
         assert page["limit"] == 1
         assert page["offset"] == 1
-        assert [item["chat_id"] for item in page["items"]] == [200]
+        assert [item["chat_id"] for item in page["items"]] == ["200"]
 
         new = await client.post("/api/sessions/group/100/new")
         assert new.status == 200

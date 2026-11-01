@@ -83,7 +83,7 @@ def test_delete_user_messages_removes_only_that_users_rows(store: Store) -> None
     assert store.count_messages(ChatType.GROUP, 100) == before_messages - 3
     remaining = store.recent_messages(ChatType.GROUP, 100, 10)
     assert [message.message_id for message in remaining] == ["u8-a", "bot-a"]
-    assert {message.user_id for message in remaining} == {8, 999}
+    assert {message.user_id for message in remaining} == {"8", "999"}
     assert _delivered_ids(store) == {"u8-a"}
     # 聚合表保留：摘要与印象无法可靠归因，不在本操作范围内。
     assert store.count_summaries(ChatType.GROUP, 100) == before_summaries

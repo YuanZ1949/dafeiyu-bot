@@ -72,7 +72,7 @@ def test_chats_with_pending_respects_window(store: Store) -> None:
     assert store.chats_with_pending(since_ts=9000) == []
 
     store.mark_delivered(ChatType.GROUP, 1, "m0")
-    assert store.chats_with_pending(since_ts=9000) == [(ChatType.GROUP, 1)]
+    assert store.chats_with_pending(since_ts=9000) == [(ChatType.GROUP, "1")]
     assert store.chats_with_pending(since_ts=20_000) == []
 
 

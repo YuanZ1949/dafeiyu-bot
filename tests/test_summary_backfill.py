@@ -122,5 +122,5 @@ def test_pending_slots_carry_chat_and_message_count() -> None:
     slots = store.pending_summary_slots()
 
     assert [(s.chat_id, s.date, s.messages) for s in slots] == [
-        (200, day.date().isoformat(), 1)
+        ("200", day.date().isoformat(), 1)
     ]

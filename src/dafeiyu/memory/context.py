@@ -273,9 +273,9 @@ def _recall_lines(
 
 def _focus_user_ids(
     store: Store, chat_type: ChatType, chat_id: int
-) -> list[int]:
+) -> list[str]:
     """最近 20 条消息的发言人（不含 bot），用于印象注入优先占名额。"""
-    seen: list[int] = []
+    seen: list[str] = []
     for message in store.recent_messages(
         chat_type, chat_id, IMPRESSION_FOCUS_MESSAGES
     ):
