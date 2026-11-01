@@ -49,6 +49,9 @@ def make_settings(**overrides) -> Settings:
 
 
 class FakeAdapter:
+    # Service 的回复入库路径按通道取 bot_id；QQ 侧就是 qq:<uin>。
+    bot_id = "qq:999"
+
     def __init__(self) -> None:
         self.sent: list[tuple[ChatType, int, str]] = []
         self.handler = None
