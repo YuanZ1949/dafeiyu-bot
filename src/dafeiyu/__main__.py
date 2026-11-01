@@ -19,7 +19,10 @@ from .brain.persona import load_persona
 from .brain.runtime_config import server_env
 from .config import ConfigError, Settings, load_settings
 from .control import MemoryActions, start_control_server
+from .gateway.base import Adapter
+from .gateway.channels import wechat_enabled_for
 from .gateway.qq import QQAdapter
+from .gateway.wechat import WeChatAdapter
 from .memory.store import Store
 from .memory.workspace import Workspace
 from .models import ChatType
@@ -171,6 +174,69 @@ def ensure_manage_server_password(settings: Settings) -> tuple[Settings, str]:
     return settings, password
 
 
+def _build_qq_adapter(settings: Settings) -> QQAdapter:
+    return QQAdapter(
+        host=settings.ws_host,
+        port=settings.ws_port,
+        token=settings.ws_token,
+        bot_qq=settings.bot_qq,
+    )
+
+
+def build_adapters(settings: Settings) -> dict[str, Adapter]:
+    """按 ``gateway.provider`` 构造启用的通道。
+
+    未启用的通道在这里完全不构造：``WeChatAdapter`` 一旦建出来，配置就会被
+    读取、桥端口就有被连接的风险；provider 没选微信时连 ``settings.wechat``
+    都不碰。
+    """
+    provider = settings.gateway.provider
+    if provider == "qq":
+        return {"qq": _build_qq_adapter(settings)}
+    if provider == "both":
+        adapters: dict[str, Adapter] = {"qq": _build_qq_adapter(settings)}
+        if wechat_enabled_for(settings):
+            adapters["wechat"] = WeChatAdapter(settings.wechat)
+        else:
+            log.warning(
+                "gateway.provider=both 但 gateway.wechat.enabled=false，"
+                "微信通道未启用，本次只上线 QQ"
+            )
+        return adapters
+    if wechat_enabled_for(settings):
+        return {"wechat": WeChatAdapter(settings.wechat)}
+    log.warning(
+        "gateway.provider=wechat 但 gateway.wechat.enabled=false，降级为 qq"
+    )
+    return {"qq": _build_qq_adapter(settings)}
+
+
+def log_active_channels(
+    settings: Settings, adapters: dict[str, Adapter], brain_provider: str
+) -> None:
+    """每个启用通道一行启动日志；微信只报适配器和桥端口，不打印 token。"""
+    if "qq" in adapters:
+        log.info(
+            "%s已上线（brain=%s），QQ 通道适配器就绪：等待 NapCat 反向 WS 连接 "
+            "ws://%s:%s（QQ %s）",
+            settings.persona.name,
+            brain_provider,
+            settings.ws_host,
+            settings.ws_port,
+            settings.bot_qq,
+        )
+    if "wechat" in adapters:
+        log.info(
+            "%s已上线（brain=%s），微信通道适配器就绪：等待桥 "
+            "ws://%s:%s/wechat-bridge（%s 个群）",
+            settings.persona.name,
+            brain_provider,
+            settings.wechat.bridge_host,
+            settings.wechat.bridge_port,
+            len(settings.wechat.group_allowlist),
+        )
+
+
 async def main() -> None:
     settings = load_settings()
     setup_logging(settings)
@@ -242,12 +308,7 @@ async def main() -> None:
             server_url=effective_server_url,
         )
 
-        adapter = QQAdapter(
-            host=settings.ws_host,
-            port=settings.ws_port,
-            token=settings.ws_token,
-            bot_qq=settings.bot_qq,
-        )
+        adapters = build_adapters(settings)
         router = Router(settings, store)
         workspace = None
         if settings.workspace.enabled:
@@ -266,9 +327,9 @@ async def main() -> None:
             settings,
             store,
             brain,
-            {"qq": adapter},
-            router,
-            persona_text,
+            adapters=adapters,
+            router=router,
+            persona_text=persona_text,
             workspace=workspace,
             injection=settings.injection,
             audit=audit,
@@ -301,17 +362,10 @@ async def main() -> None:
             settings,
             store,
             service,
-            adapter,
+            adapters.get("qq"),
             memory_actions=build_memory_actions(store, workers),
         )
-        log.info(
-            "%s已上线（brain=%s），等待 NapCat 反向 WS 连接 ws://%s:%s（QQ %s）",
-            settings.persona.name,
-            provider,
-            settings.ws_host,
-            settings.ws_port,
-            settings.bot_qq,
-        )
+        log_active_channels(settings, adapters, provider)
         try:
             await asyncio.Event().wait()
         except (KeyboardInterrupt, SystemExit):
