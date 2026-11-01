@@ -335,12 +335,23 @@ class BridgeServer:
         return receipt
 
 
-async def pump_frames(server: BridgeServer, source: Iterable[dict[str, Any]] | AsyncIterable[dict[str, Any]]) -> None:
+async def pump_frames(
+    server: BridgeServer,
+    source: Iterable[dict[str, Any]] | AsyncIterable[dict[str, Any]],
+    *,
+    idle_timeout: float | None = None,
+) -> None:
     """把帧源产出的每一帧灌进 `server.broadcast`（PART B 的下发通路）。
 
     接受同步或异步迭代器；每个 await 都有显式超时，帧源长时间不出帧按停泵
     处理，绝不把整个桥的主循环挂死。
+
+    `idle_timeout` 是「帧源多久不出帧就停泵」的显式接缝：默认 5s 保持原行为；
+    轮询循环的帧间隔可以长到 `WeChatConfig.poll_seconds`（默认 8s，且每轮至少
+    一帧 health），所以 `__main__` 会传 `max(5s, 2 * poll_seconds)`，否则健康的
+    8s 轮询会在空闲 5s 时被误停泵。
     """
+    timeout = _AWAIT_TIMEOUT if idle_timeout is None else float(idle_timeout)
     if hasattr(source, "__anext__"):
         async def _iterate() -> AsyncIterable[dict[str, Any]]:
             assert hasattr(source, "__anext__")
@@ -358,7 +369,7 @@ async def pump_frames(server: BridgeServer, source: Iterable[dict[str, Any]] | A
 
     while True:
         try:
-            frame = await asyncio.wait_for(iterator.__anext__(), _AWAIT_TIMEOUT)
+            frame = await asyncio.wait_for(iterator.__anext__(), timeout)
         except StopAsyncIteration:
             return
         except TimeoutError:

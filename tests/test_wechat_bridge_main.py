@@ -231,6 +231,78 @@ async def test_run_lifecycle_with_real_client() -> None:
                 await asyncio.wait_for(run_task, STEP)
 
 
+# ------------------ (b2) 纯消息帧源也要有无条件的初始 / 停机 health 帧
+async def test_run_emits_health_even_with_message_only_source() -> None:
+    """帧源只产消息帧时，初始 health 与停机 health 仍必须发出。
+
+    PART A 的复核缺陷：旧实现只在 `latest_health` 非空时才发停机帧，于是
+    「只推消息的帧源」既没有初始健康快照、也没有 connected:false 的停机通知，
+    客户端 `_health_connected` 会一直是 False。
+    """
+    wechat = _wechat()
+    holder: dict[str, Any] = {}
+
+    class FakeDriver:
+        """本用例不触碰驱动。"""
+
+    def server_factory(*args: Any, **kwargs: Any) -> BridgeServer:
+        server = BridgeServer(*args, **kwargs)
+        holder["server"] = server
+        return server
+
+    messages: list[dict[str, Any]] = [
+        {
+            "v": 1,
+            "type": "message",
+            "chat_id": "wxg:g1",
+            "message_id": f"1:{index}",
+            "text": f"m{index}",
+        }
+        for index in range(3)
+    ]
+    run_task = asyncio.create_task(
+        bridge_main.run(
+            settings=SimpleNamespace(wechat=wechat),
+            driver_factory=FakeDriver,
+            server_factory=server_factory,
+            frame_source=messages,
+        )
+    )
+    try:
+        server = await _wait_for_port(holder)
+        async with connect(
+            _uri(server.port), additional_headers={"Authorization": f"Bearer {TOKEN}"}
+        ) as ws:
+            health = await _recv_until(ws, lambda f: f.get("type") == "health")
+            assert health["v"] == 1
+            assert health["channel"] == "wechat"
+            # 协议 §5 的必填字段必须在场（探测降级时也一样）。
+            for key in ("connected", "logged_in", "desktop", "queue_depth"):
+                assert key in health
+
+            await asyncio.wait_for(
+                ws.send(
+                    json.dumps({"v": 1, "id": "bye", "action": "stop", "params": {}})
+                ),
+                STEP,
+            )
+            assert (await _recv_until(ws, lambda f: f.get("id") == "bye"))["ok"] is True
+            final = await _recv_until(
+                ws,
+                lambda f: f.get("type") == "health" and f.get("connected") is False,
+            )
+            assert final["v"] == 1
+            assert final["channel"] == "wechat"
+
+        assert await asyncio.wait_for(run_task, STEP) == 0
+        assert server.is_running is False
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(run_task, STEP)
+
+
 # ------------------------------------------------ (c) token 缺失/错误 -> 拒绝
 async def test_wrong_or_missing_token_is_rejected() -> None:
     server = BridgeServer(bridge_token=TOKEN)
@@ -370,6 +442,58 @@ async def test_pump_frames_feeds_broadcast() -> None:
             assert server.latest_health["type"] == "health"
     finally:
         await asyncio.wait_for(server.stop(), STEP)
+
+
+# ------------------------------- (f2) 灌帧空转上限必须覆盖一个轮询间隔
+class _RecordingServer:
+    """只记录 broadcast 的假服务器：灌帧测试不需要真端口。"""
+
+    def __init__(self) -> None:
+        self.frames: list[dict[str, Any]] = []
+        self.latest_health: dict[str, Any] | None = None
+
+    async def broadcast(self, frame: dict[str, Any]) -> None:
+        self.frames.append(frame)
+        if frame.get("type") == "health":
+            self.latest_health = dict(frame)
+
+
+async def test_pump_survives_poll_seconds_gap() -> None:
+    """poll_seconds=8 时泵必须活过 6s 无事件的窗口（旧的 5s 默认会误停泵）。
+
+    真等 8s 太慢：按 1/50 缩放——8s -> 0.16s、6s -> 0.12s、16s 超时 -> 0.32s。
+    断言的关系（超时 > 轮询间隔 > 6s > 旧默认 5s）与真实时间一一对应。
+    """
+    scale = 1 / 50
+    poll_seconds = 8.0
+    gap = 6.0 * scale
+    idle = bridge_main._pump_idle_timeout(poll_seconds) * scale
+
+    # 生产配置下的算术关系：16s 上限 > 8s 轮询间隔 > 6s 空窗 > 旧 5s 默认。
+    old_default = 5.0
+    empty_window = 6.0
+    assert bridge_main._pump_idle_timeout(8.0) == 16.0
+    assert old_default < empty_window < poll_seconds < bridge_main._pump_idle_timeout(
+        poll_seconds
+    )
+    assert idle > gap
+
+    async def source() -> Any:
+        for index in range(3):
+            if index:
+                # 每个间隔 6s（缩放后 0.12s）：比旧的 5s 默认长，比 16s 上限短。
+                await asyncio.sleep(gap)
+            yield {"type": "health", **HEALTH_FRAME}
+
+    server = _RecordingServer()
+    await asyncio.wait_for(pump_frames(server, source(), idle_timeout=idle), STEP)
+    assert len(server.frames) == 3, "泵在 6s 空窗里被误停"
+    assert server.latest_health is not None
+
+    # 反证：把上限压到空窗以下，泵确实会按超时停机（接缝没有变成「永不超时」）。
+    slow = _RecordingServer()
+    await asyncio.wait_for(pump_frames(slow, source(), idle_timeout=gap / 2), STEP)
+    assert len(slow.frames) == 1
 
 
 async def test_probe_and_bad_version_do_not_crash_loop() -> None:
