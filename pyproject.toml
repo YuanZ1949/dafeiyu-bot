@@ -21,6 +21,15 @@ dev = [
     "pytest-asyncio>=0.23",
     "respx>=0.21",
 ]
+# 桌面微信桥的可选依赖。注意：PyPI 上的 `pyweixin` 只有 0.1.0 且没有分发文件，
+# `pip install pyweixin` 会直接 No matching distribution；上游把 import 名
+# `pyweixin` 打进了 `pywechat127` 这个发行包，所以这里写 `pywechat127`。
+wechat = [
+    "pywechat127==1.9.8",
+    "pywinauto>=0.6.9",
+    "pyautogui>=0.9.54",
+    "psutil>=5.9",
+]
 
 [project.scripts]
 dafeiyu = "dafeiyu.cli:main"
