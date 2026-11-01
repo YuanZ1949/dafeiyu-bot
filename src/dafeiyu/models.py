@@ -51,6 +51,8 @@ class Message:
     timestamp: int = 0
     # 非空 = 这条消息已被撤回；时间线只显示占位，不再展示原文。
     recalled_at: str | None = None
+    # 微信引用块的原文摘要（协议可选字段）：只进提示词，不入库。
+    reply_to_text: str | None = None
 
     def to_prompt_line(self) -> str:
         return f"{self.nickname}: {self.content}"
