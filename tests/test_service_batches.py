@@ -39,7 +39,7 @@ def make_settings(*, mode: str = "model", batch_seconds: float = 45.0) -> Settin
         triggers=TriggerConfig(
             60, 0.0, ("01:00", "07:00"), ("怎么",), mode=mode, batch_seconds=batch_seconds
         ),
-        groups=GroupsConfig(frozenset(), frozenset(), frozenset({2002})),
+        groups=GroupsConfig(frozenset(), frozenset(), frozenset({"qq:2002"})),
         budget=BudgetConfig(200, 300000),
         memory=MemoryConfig(20, 5, 20),
         logging=LoggingConfig("INFO", "logs"),
@@ -47,14 +47,16 @@ def make_settings(*, mode: str = "model", batch_seconds: float = 45.0) -> Settin
 
 
 class FakeAdapter:
+    bot_id = "qq:999"
+
     def __init__(self) -> None:
-        self.sent: list[tuple[ChatType, int, str]] = []
+        self.sent: list[tuple[ChatType, str, str]] = []
         self.handler = None
 
     def on_message(self, handler) -> None:
         self.handler = handler
 
-    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> str:
+    async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str:
         self.sent.append((chat_type, chat_id, text))
         return f"bot-{len(self.sent)}"
 
@@ -68,7 +70,7 @@ class FakeAdapter:
 class FakeAdapterWithoutIds(FakeAdapter):
     """模拟网关拿不到 message_id 的退化情况。"""
 
-    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> None:
+    async def send(self, chat_type: ChatType, chat_id: str, text: str) -> None:
         self.sent.append((chat_type, chat_id, text))
 
 
@@ -77,7 +79,7 @@ class FakeOpenCodeBrain:
         self.delay = delay
         self.speak = speak
         self.text = text
-        self.calls: list[tuple[ChatType, int, str]] = []
+        self.calls: list[tuple[ChatType, str, str]] = []
 
     @property
     def reply_calls(self) -> int:
@@ -140,8 +142,8 @@ def make_msg(
     *,
     message_id: str = "m1",
     chat_type: ChatType = ChatType.GROUP,
-    chat_id: int = 1001,
-    user_id: int = 2002,
+    chat_id: str = "qq:1001",
+    user_id: str = "qq:2002",
 ) -> Message:
     return Message(
         chat_type=chat_type,
@@ -165,7 +167,7 @@ def build(tmp_path, *, mode="model", brain=None, clock=NOON, batch_seconds=45.0)
     adapter = FakeAdapter()
     brain = brain or FakeOpenCodeBrain()
     router = Router(settings, store, clock=lambda: clock)
-    service = Service(settings, store, brain, adapter, router, "你是溟月")
+    service = Service(settings, store, brain, {"qq": adapter}, router, "你是溟月")
     return service, store, brain, adapter
 
 
@@ -182,7 +184,7 @@ async def test_private_still_replies_immediately(tmp_path):
     service, _, brain, adapter = build(tmp_path)
 
     await service.handle(
-        make_msg("hi", chat_type=ChatType.PRIVATE, chat_id=2002, message_id="p1")
+        make_msg("hi", chat_type=ChatType.PRIVATE, chat_id="qq:2002", message_id="p1")
     )
 
     assert brain.reply_calls == 1
@@ -194,10 +196,10 @@ async def test_reply_stored_with_gateway_message_id(tmp_path):
     service, store, _, adapter = build(tmp_path)
 
     await service.handle(
-        make_msg("hi", chat_type=ChatType.PRIVATE, chat_id=2002, message_id="p1")
+        make_msg("hi", chat_type=ChatType.PRIVATE, chat_id="qq:2002", message_id="p1")
     )
 
-    bot = [m for m in store.recent_messages(ChatType.PRIVATE, 2002, 5) if m.is_bot]
+    bot = [m for m in store.recent_messages(ChatType.PRIVATE, "qq:2002", 5) if m.is_bot]
     assert [m.message_id for m in bot] == ["bot-1"]
     assert adapter.sent
 
@@ -209,13 +211,13 @@ async def test_reply_falls_back_to_synthetic_id_without_gateway_id(tmp_path):
     store.init_schema()
     settings = make_settings()
     router = Router(settings, store, clock=lambda: NOON)
-    service = Service(settings, store, FakeOpenCodeBrain(), adapter, router, "你是溟月")
+    service = Service(settings, store, FakeOpenCodeBrain(), {"qq": adapter}, router, "你是溟月")
 
     await service.handle(
-        make_msg("hi", chat_type=ChatType.PRIVATE, chat_id=2002, message_id="p1")
+        make_msg("hi", chat_type=ChatType.PRIVATE, chat_id="qq:2002", message_id="p1")
     )
 
-    bot = [m for m in store.recent_messages(ChatType.PRIVATE, 2002, 5) if m.is_bot]
+    bot = [m for m in store.recent_messages(ChatType.PRIVATE, "qq:2002", 5) if m.is_bot]
     assert [m.message_id for m in bot] == ["p1:bot:0"]
 
 
@@ -224,7 +226,7 @@ async def test_quiet_hours_skips_with_reason(tmp_path):
 
     await service.handle(make_msg("hi"))
 
-    assert store.skip_reason(ChatType.GROUP, 1001, "m1") == "quiet"
+    assert store.skip_reason(ChatType.GROUP, "qq:1001", "m1") == "quiet"
     assert service.scheduler.pending_chats() == []
 
 
@@ -283,7 +285,7 @@ async def test_stateless_history_contains_prior_turns(tmp_path):
     store.add_message(
         Message(
             chat_type=ChatType.GROUP,
-            chat_id=1001,
+            chat_id="qq:1001",
             user_id=999,
             nickname="溟月",
             content="旧回复",
@@ -293,7 +295,7 @@ async def test_stateless_history_contains_prior_turns(tmp_path):
     )
     current = make_msg("第二句", message_id="m1")
 
-    history = service._history_before(ChatType.GROUP, 1001, [current])
+    history = service._history_before(ChatType.GROUP, "qq:1001", [current])
 
     assert [item["role"] for item in history] == ["user", "assistant"]
     assert "第一句" in history[0]["content"]
@@ -322,7 +324,7 @@ async def test_drain_flushes_due_batch(tmp_path):
     await service.drain()
 
     assert brain.reply_calls == 1
-    assert store.last_delivered_id(ChatType.GROUP, 1001) is not None
+    assert store.last_delivered_id(ChatType.GROUP, "qq:1001") is not None
     assert adapter.sent
 
 
@@ -354,7 +356,7 @@ async def test_quota_failure_retries_in_a_fresh_session(tmp_path):
     brain = FakeQuotaBrain()
     service, _store, _, _ = build(tmp_path, brain=brain)
 
-    reply = await service._call_brain(ChatType.GROUP, 1001, [make_msg("hi")], "hi")
+    reply = await service._call_brain(ChatType.GROUP, "qq:1001", [make_msg("hi")], "hi")
 
     assert reply.reply == "新会话里回的"
     assert [c[0] for c in brain.calls] == ["reply", "fresh"]
@@ -368,6 +370,6 @@ async def test_other_errors_are_not_retried(tmp_path):
     service, _store, _, _ = build(tmp_path, brain=brain)
 
     with pytest.raises(BrainError):
-        await service._call_brain(ChatType.GROUP, 1001, [make_msg("hi")], "hi")
+        await service._call_brain(ChatType.GROUP, "qq:1001", [make_msg("hi")], "hi")
 
     assert [c[0] for c in brain.calls] == ["reply"]

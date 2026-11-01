@@ -78,7 +78,7 @@ class BudgetGuard:
     def evaluate(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         *,
         addressed: bool,
         purpose: str,
@@ -145,7 +145,7 @@ class BudgetGuard:
     def report(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         *,
         now: datetime | None = None,
     ) -> BudgetReport:
@@ -196,7 +196,7 @@ class BudgetGuard:
 
     # ---- 内部实现 -------------------------------------------------
     def _chat_usage(
-        self, chat_type: ChatType, chat_id: int, day: str
+        self, chat_type: ChatType, chat_id: str, day: str
     ) -> UsageTotals:
         return self.store.usage_between(
             day,
@@ -207,7 +207,7 @@ class BudgetGuard:
         )
 
     def _ambient_usage(
-        self, chat_type: ChatType, chat_id: int, day: str
+        self, chat_type: ChatType, chat_id: str, day: str
     ) -> UsageTotals:
         return self.store.usage_between(
             day,

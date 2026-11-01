@@ -299,7 +299,7 @@ def test_check_workspace_uses_configured_limit(tmp_path: Path) -> None:
             s,
             store,
             brain=None,
-            adapter=None,
+            adapters={"qq": None},
             router=Router(s, store),
             persona_text="",
             workspace=workspace,

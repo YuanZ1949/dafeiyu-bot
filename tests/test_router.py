@@ -85,8 +85,8 @@ def make_settings(
     *,
     sample_rate: float = 0.05,
     closed_sample_rate: float = 0.05,
-    whitelist: tuple[int, ...] = (),
-    blacklist: tuple[int, ...] = (),
+    whitelist: tuple[str, ...] = (),
+    blacklist: tuple[str, ...] = (),
     daily_calls: int = 200,
     quiet_hours: tuple[str, str] = ("01:00", "07:00"),
     keywords: tuple[str, ...] = ("怎么", "为什么", "崩了"),
@@ -132,7 +132,7 @@ def msg(
     *,
     at: bool = False,
     reply: bool = False,
-    chat_id: int = 1,
+    chat_id: str = "qq:1",
     chat_type: ChatType = ChatType.GROUP,
     is_bot: bool = False,
     timestamp: int = 0,
@@ -170,14 +170,14 @@ def test_reply_to_bot_is_hard_trigger() -> None:
 
 
 def test_blacklist_group_never_replies() -> None:
-    router, _, _ = make_router(blacklist=(1,))
+    router, _, _ = make_router(blacklist=("qq:1",))
     d = router.should_handle(msg(at=True))
     assert d.call_model is False
     assert d.reason == "blacklist"
 
 
 def test_whitelist_blocks_unlisted_group_but_not_hard_trigger() -> None:
-    router, _, _ = make_router(whitelist=(999,))
+    router, _, _ = make_router(whitelist=("qq:999",))
     plain = router.should_handle(msg("随便聊聊"))
     assert plain.call_model is False
     assert plain.reason == "whitelist"
@@ -187,7 +187,7 @@ def test_whitelist_blocks_unlisted_group_but_not_hard_trigger() -> None:
 
 def test_cooldown_blocks_then_expires() -> None:
     router, _, clock = make_router()
-    router.note_bot_spoke(ChatType.GROUP, 1)
+    router.note_bot_spoke(ChatType.GROUP, "qq:1")
     clock.advance(30)
     assert router.should_handle(msg("随便聊聊")).call_model is False
     clock.advance(31)
@@ -221,7 +221,7 @@ def test_downshift_halves_sample_rate() -> None:
     router, _, _ = make_router(sample_rate=0.2, rng=0.08)
     assert router.should_handle(msg("随便聊聊甲")).call_model is True
     for _ in range(3):
-        router.note_no_reply(ChatType.GROUP, 1)
+        router.note_no_reply(ChatType.GROUP, "qq:1")
     # 降频后阈值 0.1：0.08 仍通过，0.15 被拒
     assert router.should_handle(msg("随便聊聊乙")).reason == "sample"
     router._rng = FakeRng(0.15)
@@ -240,7 +240,7 @@ def test_question_bypasses_cooldown() -> None:
     router, _, clock = make_router(
         sample_rate=0.0, rng=0.99, keywords=("怎么", "什么")
     )
-    router.note_bot_spoke(ChatType.GROUP, 1)
+    router.note_bot_spoke(ChatType.GROUP, "qq:1")
     clock.advance(10)
     d = router.should_handle(msg("我问了你什么问题"))
     assert d.call_model is True
@@ -249,7 +249,7 @@ def test_question_bypasses_cooldown() -> None:
 
 def test_cooldown_still_blocks_non_question() -> None:
     router, _, clock = make_router(sample_rate=1.0, rng=0.0)
-    router.note_bot_spoke(ChatType.GROUP, 1)
+    router.note_bot_spoke(ChatType.GROUP, "qq:1")
     clock.advance(10)
     d = router.should_handle(msg("随便聊聊"))
     assert d.call_model is False
@@ -261,7 +261,7 @@ def test_cooldown_still_blocks_hot_group() -> None:
     store.msgs = [
         msg("热闹", timestamp=int(clock().timestamp()) - 1) for _ in range(6)
     ]
-    router.note_bot_spoke(ChatType.GROUP, 1)
+    router.note_bot_spoke(ChatType.GROUP, "qq:1")
     clock.advance(10)
     d = router.should_handle(msg("随便聊聊"))
     assert d.call_model is False
@@ -301,9 +301,9 @@ def test_duplicate_question_within_cooldown_is_skipped() -> None:
 def test_quiet_hours_wrap_across_midnight() -> None:
     router, _, clock = make_router(quiet_hours=("23:00", "07:00"))
     clock.dt = datetime(2026, 10, 24, 2, 0, tzinfo=SHANGHAI)
-    assert router.is_quiet(ChatType.GROUP, 1, clock()) is True
+    assert router.is_quiet(ChatType.GROUP, "qq:1", clock()) is True
     clock.dt = datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI)
-    assert router.is_quiet(ChatType.GROUP, 1, clock()) is False
+    assert router.is_quiet(ChatType.GROUP, "qq:1", clock()) is False
 
 
 def test_explain_hard_trigger_has_ordered_checks_and_alias_source() -> None:
@@ -365,7 +365,7 @@ def test_explain_does_not_mutate_real_state_or_rng() -> None:
     router, _, clock = make_router(sample_rate=0.9, rng=0.99)
     rng = CountingRng()
     router._rng = rng
-    state = router._state(ChatType.GROUP, 1)
+    state = router._state(ChatType.GROUP, "qq:1")
     state.last_prompt = "旧问题"
     state.last_prompt_at = clock.dt
     state.no_reply_streak = 2
@@ -381,7 +381,7 @@ def test_explain_does_not_mutate_real_state_or_rng() -> None:
 def test_explain_simulates_reply_reset_on_clone() -> None:
     router, _, clock = make_router()
     for _ in range(3):
-        router.note_no_reply(ChatType.GROUP, 1)
+        router.note_no_reply(ChatType.GROUP, "qq:1")
     before = copy.deepcopy(router._states)
 
     result = router.explain(msg("继续", reply=True), now=clock.dt, seed=0)
@@ -417,9 +417,9 @@ def test_explain_sample_is_reproducible_with_seed() -> None:
 
 def test_mute_and_wake() -> None:
     router, _, _ = make_router()
-    router.quiet(ChatType.GROUP, 1, minutes=10)
+    router.quiet(ChatType.GROUP, "qq:1", minutes=10)
     assert router.should_handle(msg()).reason == "muted"
-    router.wake(ChatType.GROUP, 1)
+    router.wake(ChatType.GROUP, "qq:1")
     assert router.should_handle(msg()).call_model is True
 
 
@@ -435,11 +435,11 @@ def test_parse_command() -> None:
 
 def test_bot_message_going_unanswered_closes_thread() -> None:
     router, _, clock = make_router(closed_sample_rate=0.0)
-    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
     clock.advance(300)
-    assert router.is_thread_closed(ChatType.GROUP, 1) is False
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is False
     clock.advance(1)
-    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is True
     decision = router.should_handle(msg("随便聊聊"))
     assert decision.call_model is False
     assert decision.reason == "closed"
@@ -447,102 +447,102 @@ def test_bot_message_going_unanswered_closes_thread() -> None:
 
 def test_addressed_message_reopens_closed_thread() -> None:
     router, _, clock = make_router()
-    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
     clock.advance(301)
-    assert router.is_thread_closed(ChatType.GROUP, 1) is True
-    router.note_user_message(ChatType.GROUP, 1, addressed=True)
-    assert router.is_thread_closed(ChatType.GROUP, 1) is False
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is True
+    router.note_user_message(ChatType.GROUP, "qq:1", addressed=True)
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is False
     assert router.should_handle(msg("大肥鱼", at=True)).hard is True
 
 
 def test_two_ambient_replies_close_thread() -> None:
     router, _, _ = make_router()
-    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
-    assert router.is_thread_closed(ChatType.GROUP, 1) is False
-    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
-    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is False
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is True
     assert router.should_handle(msg("在聊什么")).reason == "closed"
 
 
 def test_closed_window_expires_and_allows_ambient_again() -> None:
     router, _, clock = make_router()
-    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
-    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
-    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is True
     clock.advance(600)
-    assert router.is_thread_closed(ChatType.GROUP, 1) is False
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is False
     assert router.should_handle(msg("随便聊聊")).call_model is True
 
 
 def test_ambient_turns_reset_after_addressed_message() -> None:
     router, _, _ = make_router()
-    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
-    router.note_user_message(ChatType.GROUP, 1, addressed=True)
-    assert router.ambient_turns(ChatType.GROUP, 1) == 0
-    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
-    assert router.ambient_turns(ChatType.GROUP, 1) == 1
-    assert router.is_thread_closed(ChatType.GROUP, 1) is False
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
+    router.note_user_message(ChatType.GROUP, "qq:1", addressed=True)
+    assert router.ambient_turns(ChatType.GROUP, "qq:1") == 0
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
+    assert router.ambient_turns(ChatType.GROUP, "qq:1") == 1
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is False
 
 
 def test_user_message_after_bot_keeps_thread_open() -> None:
     router, _, clock = make_router()
-    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
     clock.advance(301)
     # 话题可能已经结束，但这条消息说明还有人接话：先记账再判定，不能关。
-    router.note_user_message(ChatType.GROUP, 1)
-    assert router.is_thread_closed(ChatType.GROUP, 1) is False
+    router.note_user_message(ChatType.GROUP, "qq:1")
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is False
 
 
 def close_thread(router) -> None:
-    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
-    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
 
 
 def test_mute_survives_restart() -> None:
     router, store, clock = make_router()
-    router.quiet(ChatType.GROUP, 1, 30)
+    router.quiet(ChatType.GROUP, "qq:1", 30)
 
     restarted = Router(make_settings(), store, clock=clock, rng=FakeRng(0.0))
-    assert restarted.is_muted(ChatType.GROUP, 1) is True
+    assert restarted.is_muted(ChatType.GROUP, "qq:1") is True
 
 
 def test_closed_thread_survives_restart() -> None:
     router, store, clock = make_router()
     close_thread(router)
-    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is True
 
     restarted = Router(make_settings(), store, clock=clock, rng=FakeRng(0.0))
-    assert restarted.is_thread_closed(ChatType.GROUP, 1) is True
+    assert restarted.is_thread_closed(ChatType.GROUP, "qq:1") is True
 
 
 def test_expired_closed_window_does_not_block_after_restart() -> None:
     router, store, clock = make_router()
     close_thread(router)
-    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is True
     clock.advance(601)
 
     restarted = Router(make_settings(), store, clock=clock, rng=FakeRng(0.0))
-    assert restarted.is_thread_closed(ChatType.GROUP, 1) is False
+    assert restarted.is_thread_closed(ChatType.GROUP, "qq:1") is False
 
 
 def test_downshift_survives_restart() -> None:
     router, store, clock = make_router()
     for _ in range(3):
-        router.note_no_reply(ChatType.GROUP, 1)
-    assert router.is_downshifted(ChatType.GROUP, 1) is True
+        router.note_no_reply(ChatType.GROUP, "qq:1")
+    assert router.is_downshifted(ChatType.GROUP, "qq:1") is True
 
     restarted = Router(make_settings(), store, clock=clock, rng=FakeRng(0.0))
-    assert restarted.is_downshifted(ChatType.GROUP, 1) is True
+    assert restarted.is_downshifted(ChatType.GROUP, "qq:1") is True
 
 
 def test_expired_downshift_does_not_block_after_restart() -> None:
     router, store, clock = make_router()
     for _ in range(3):
-        router.note_no_reply(ChatType.GROUP, 1)
+        router.note_no_reply(ChatType.GROUP, "qq:1")
     clock.advance(1801)
 
     restarted = Router(make_settings(), store, clock=clock, rng=FakeRng(0.0))
-    assert restarted.is_downshifted(ChatType.GROUP, 1) is False
+    assert restarted.is_downshifted(ChatType.GROUP, "qq:1") is False
 
 
 def test_duplicate_suppression_survives_restart() -> None:
@@ -570,17 +570,17 @@ def test_closed_thread_samples_once_in_rules_mode() -> None:
 def test_closed_sample_uses_closed_rate() -> None:
     router, _, _ = make_router(rng=0.01, closed_sample_rate=0.05)
     close_thread(router)
-    assert router.closed_sample(ChatType.GROUP, 1) is True
+    assert router.closed_sample(ChatType.GROUP, "qq:1") is True
 
     router, _, _ = make_router(rng=0.2, closed_sample_rate=0.05)
     close_thread(router)
-    assert router.closed_sample(ChatType.GROUP, 1) is False
+    assert router.closed_sample(ChatType.GROUP, "qq:1") is False
 
 
 def test_closed_sample_rate_zero_never_samples() -> None:
     router, _, _ = make_router(rng=0.0, closed_sample_rate=0.0)
     close_thread(router)
-    assert router.closed_sample(ChatType.GROUP, 1) is False
+    assert router.closed_sample(ChatType.GROUP, "qq:1") is False
 
 
 def test_persist_failure_does_not_break_state_updates() -> None:
@@ -590,21 +590,21 @@ def test_persist_failure_does_not_break_state_updates() -> None:
 
     clock = FakeClock(datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI))
     router = Router(make_settings(), BoomStore(), clock=clock, rng=FakeRng(0.0))
-    router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
-    assert router.ambient_turns(ChatType.GROUP, 1) == 1
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
+    assert router.ambient_turns(ChatType.GROUP, "qq:1") == 1
 
 
 def test_probe_does_not_persist() -> None:
     router, store, _clock = make_router()
     probe = router.clone(now=datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI))
-    probe.quiet(ChatType.GROUP, 1, 10)
-    assert (ChatType.GROUP, 1) not in store.states
+    probe.quiet(ChatType.GROUP, "qq:1", 10)
+    assert (ChatType.GROUP, "qq:1") not in store.states
 
 
 def test_closed_sampled_message_reaches_model_in_rules_mode() -> None:
     router, _, _ = make_router(rng=0.0, closed_sample_rate=0.05)
     close_thread(router)
-    assert router.is_thread_closed(ChatType.GROUP, 1) is True
+    assert router.is_thread_closed(ChatType.GROUP, "qq:1") is True
 
     decision = router.should_handle(msg("随便聊聊"))
     assert decision.call_model is True

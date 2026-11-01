@@ -99,6 +99,8 @@ def make_settings() -> Settings:
 
 
 class FakeAdapter:
+    bot_id = "qq:999"
+
     def __init__(self) -> None:
         self.sent: list[tuple[ChatType, int, str]] = []
 
@@ -125,7 +127,7 @@ def make_msg(
     message_id: str = "m0",
     chat_type: ChatType = ChatType.GROUP,
     chat_id: str = CHAT,
-    user_id: int = 2002,
+    user_id: str = "qq:2002",
     at_bot: bool = False,
 ) -> Message:
     return Message(
@@ -162,7 +164,7 @@ def build(tmp_path, *, server: FakeServer | None = None, clock=NOON):
         settings,
         store,
         brain,
-        adapter,
+        {"qq": adapter},
         router,
         "你是溟月",
         workspace=workspace,
@@ -188,7 +190,7 @@ async def test_e2e_batch_reaches_model_and_sends(tmp_path):
     """三条消息（其中一条 @）→ tick → 完整批次 → 模型 → 发出去。"""
     service, store, brain, adapter, server = build(tmp_path)
     store.upsert_summary(ChatType.GROUP, CHAT, yesterday(), "昨天聊了鱼缸")
-    store.upsert_impression(ChatType.GROUP, CHAT, 2002, "trait", "阿鱼：爱养鱼", 0.9)
+    store.upsert_impression(ChatType.GROUP, CHAT, "qq:2002", "trait", "阿鱼：爱养鱼", 0.9)
 
     await service.handle(make_msg("今天水草长得不错", message_id="m1"))
     await service.handle(make_msg("鱼缸该换水了", message_id="m2"))

@@ -138,13 +138,13 @@ class OpenCodeBrain:
     async def aclose(self) -> None:
         return None
 
-    async def forget(self, chat_type: ChatType, chat_id: int) -> None:
+    async def forget(self, chat_type: ChatType, chat_id: str) -> None:
         self.store.clear_opencode_session(chat_type, chat_id)
 
     async def reply(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         text: str,
     ) -> BrainReply:
         prompt = text.strip()

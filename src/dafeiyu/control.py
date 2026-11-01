@@ -449,7 +449,7 @@ def _query_scope(
                 {"error": "chat_type 必须是 group 或 private"}, status=400
             )
 
-    chat_id: int | None = None
+    chat_id: str | None = None
     raw_chat_id = (request.query.get("chat_id") or "").strip()
     if raw_chat_id:
         try:
@@ -913,7 +913,7 @@ class BrainControl:
             "errors": errors,
         }
 
-    def budget_snapshot(self, chat_type: ChatType, chat_id: int) -> dict[str, Any]:
+    def budget_snapshot(self, chat_type: ChatType, chat_id: str) -> dict[str, Any]:
         """单会话预算报告，字段与健康快照的 budget 一致并附带会话标识。"""
         report = self.budget_guard.report(chat_type, chat_id)
         return {
@@ -1287,7 +1287,7 @@ class BrainControl:
         limit: int = 20,
         offset: int = 0,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
     ) -> dict[str, Any]:
         """dashboard 只读记忆面板的数据源：最近摘要 + 最近印象。"""
         limit = max(1, min(MAX_MEMORY_PAGE, int(limit)))
@@ -1439,7 +1439,7 @@ class BrainControl:
         self,
         query: str,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -1460,7 +1460,7 @@ class BrainControl:
     def timeline_snapshot(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         limit: int = 50,
         before: int | None = None,
         anchor_message_id: str | None = None,
@@ -1509,7 +1509,7 @@ class BrainControl:
         }
 
     def export_snapshot(
-        self, chat_type: ChatType, chat_id: int, limit: int = 1000
+        self, chat_type: ChatType, chat_id: str, limit: int = 1000
     ) -> dict[str, Any]:
         total = self.store.count_messages(chat_type, chat_id)
         messages = self.store.recent_messages(chat_type, chat_id, limit)
@@ -1598,7 +1598,7 @@ class BrainControl:
         }
 
     async def session_action(
-        self, action: str, chat_type: ChatType, chat_id: int
+        self, action: str, chat_type: ChatType, chat_id: str
     ) -> dict[str, Any]:
         if action == "new":
             self.store.reset_chat(chat_type, chat_id)
@@ -1928,7 +1928,7 @@ def create_app(
                     {"error": "chat_type 必须是 group 或 private"}, status=400
                 )
 
-        chat_id: int | None = None
+        chat_id: str | None = None
         raw_chat_id = (request.query.get("chat_id") or "").strip()
         if raw_chat_id:
             try:

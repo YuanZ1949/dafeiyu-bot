@@ -47,12 +47,12 @@ def seed(
     store: Store,
     ts: datetime,
     content: str = "今天聊了显卡",
-    chat_id: int = 9001,
+    chat_id: str = "qq:9001",
     *,
     nickname: str = "鱼片",
     message_id: str | None = None,
     reply_to_message_id: str | None = None,
-    reply_to_user_id: int | None = None,
+    reply_to_user_id: str | None = None,
 ) -> None:
     store.add_message(
         Message(
@@ -75,10 +75,10 @@ async def test_summarize_truncates_to_200_and_stores():
     seed_many(store, 40)
     brain = FakeBrain("鱼" * 250)
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert len(text) == 200
-    assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) == text
+    assert store.get_summary(ChatType.GROUP, "qq:9001", YESTERDAY) == text
     assert len(brain.calls) == 1
 
 
@@ -89,7 +89,7 @@ async def test_summarize_cuts_at_last_sentence_boundary():
     kept = "甲" * 90 + "。" + "乙" * 100 + "。"
     brain = FakeBrain(kept + "丙" * 100)
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert text == kept
 
@@ -101,7 +101,7 @@ async def test_summarize_cuts_at_newline_boundary():
     kept = "甲" * 120
     brain = FakeBrain(kept + "\n" + "乙" * 120)
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert text == kept
 
@@ -112,7 +112,7 @@ async def test_summarize_hard_cut_marks_ellipsis_without_boundary():
     seed_many(store, 40)
     brain = FakeBrain("鱼" * 250)
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert len(text) == MAX_SUMMARY_CHARS
     assert text.endswith("…")
@@ -124,7 +124,7 @@ async def test_summarize_ignores_boundary_in_first_half():
     seed_many(store, 40)
     brain = FakeBrain("好。" + "鱼" * 250)
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert len(text) == MAX_SUMMARY_CHARS
     assert text.startswith("好。")
@@ -138,14 +138,14 @@ async def test_rotation_summary_cuts_at_sentence_boundary():
     start = datetime(2026, 10, 23, tzinfo=TZ)
     messages = store.messages_between(
         ChatType.GROUP,
-        9001,
+        "qq:9001",
         int(start.timestamp()),
         int((start + timedelta(days=1)).timestamp()),
     )
     kept = "甲" * 90 + "。" + "乙" * 100 + "。"
     brain = FakeBrain(kept + "丙" * 100)
 
-    text = await summarize_for_rotation(brain, store, ChatType.GROUP, 9001, messages)
+    text = await summarize_for_rotation(brain, store, ChatType.GROUP, "qq:9001", messages)
 
     assert text == kept
 
@@ -160,11 +160,11 @@ async def test_summary_line_shows_reply_nickname():
         content="这个怎么弄",
         message_id="m2",
         reply_to_message_id="m1",
-        reply_to_user_id=7,
+        reply_to_user_id="qq:7",
     )
     brain = FakeBrain("摘要")
 
-    await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     body = _prompt_lines(brain.calls[0])
     assert body[1] == "[10:01] 鱼片: 这个怎么弄（回复 阿猫）"
@@ -179,11 +179,11 @@ async def test_summary_line_falls_back_to_qq_when_nickname_missing():
         content="这个怎么弄",
         message_id="m2",
         reply_to_message_id="gone",
-        reply_to_user_id="12345",
+        reply_to_user_id="qq:12345",
     )
     brain = FakeBrain("摘要")
 
-    await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert _prompt_lines(brain.calls[0])[0].endswith("（回复 QQ12345）")
 
@@ -204,7 +204,7 @@ async def test_quiet_day_uses_150_char_budget():
     seed_many(store, 10)
     brain = FakeBrain("鱼" * 400)
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert len(text) == 150
     assert "不超过 150 字" in brain.calls[0]["system"]
@@ -216,7 +216,7 @@ async def test_normal_day_uses_200_char_budget():
     seed_many(store, 100)
     brain = FakeBrain("鱼" * 400)
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert len(text) == 200
     assert "不超过 200 字" in brain.calls[0]["system"]
@@ -228,7 +228,7 @@ async def test_busy_day_uses_300_char_budget():
     seed_many(store, 300)
     brain = FakeBrain("鱼" * 400)
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert len(text) == 300
     assert "不超过 300 字" in brain.calls[0]["system"]
@@ -241,13 +241,13 @@ async def test_rotation_summary_stays_at_200_chars():
     start = datetime(2026, 10, 23, tzinfo=TZ)
     messages = store.messages_between(
         ChatType.GROUP,
-        9001,
+        "qq:9001",
         int(start.timestamp()),
         int((start + timedelta(days=1)).timestamp()),
     )
     brain = FakeBrain("鱼" * 400)
 
-    text = await summarize_for_rotation(brain, store, ChatType.GROUP, 9001, messages)
+    text = await summarize_for_rotation(brain, store, ChatType.GROUP, "qq:9001", messages)
 
     assert len(text) == MAX_SUMMARY_CHARS
 
@@ -257,11 +257,11 @@ async def test_empty_day_does_not_call_brain():
     store = make_store()
     brain = FakeBrain("不该出现")
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert text == ""
     assert brain.calls == []
-    assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) is None
+    assert store.get_summary(ChatType.GROUP, "qq:9001", YESTERDAY) is None
 
 
 @pytest.mark.asyncio
@@ -283,7 +283,7 @@ async def test_scheduler_summarizes_yesterday_and_is_idempotent():
     scheduler = SummaryScheduler(store, brain, clock=lambda: NOW, hour=4)
 
     assert await scheduler.run_pending() == 1
-    assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) == "摘要"
+    assert store.get_summary(ChatType.GROUP, "qq:9001", YESTERDAY) == "摘要"
 
     assert await scheduler.run_pending() == 0
     assert len(brain.calls) == 1
@@ -320,7 +320,7 @@ async def test_scheduler_uses_brain_from_getter_after_switch():
 
     assert old.calls == []
     assert len(new.calls) == 1
-    assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) == "新大脑"
+    assert store.get_summary(ChatType.GROUP, "qq:9001", YESTERDAY) == "新大脑"
 
 
 class FailingBrain:
@@ -353,10 +353,10 @@ async def test_summarize_chat_provider_failure_warns_without_traceback(caplog):
     brain = FailingBrain(BrainError("provider.quota: Free usage limit reached"))
 
     with caplog.at_level(logging.WARNING, logger="dafeiyu.workers.summary"):
-        text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+        text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert text is None
-    assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) is None
+    assert store.get_summary(ChatType.GROUP, "qq:9001", YESTERDAY) is None
     records = [r for r in caplog.records if "provider.quota" in r.getMessage()]
     assert len(records) == 1
     assert records[0].exc_info is None
@@ -370,7 +370,7 @@ async def test_summarize_chat_unexpected_failure_keeps_traceback(caplog):
     brain = FailingBrain(RuntimeError("boom"))
 
     with caplog.at_level(logging.ERROR, logger="dafeiyu.workers.summary"):
-        text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+        text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert text is None
     records = [r for r in caplog.records if "boom" in r.getMessage()]
@@ -392,7 +392,7 @@ class TimeoutThenAnswer:
         return self.answers[min(len(self.calls) - 2, len(self.answers) - 1)]
 
 
-def seed_day(store: Store, count: int = 4, chat_id: int = 9001) -> None:
+def seed_day(store: Store, count: int = 4, chat_id: str = "qq:9001") -> None:
     for i in range(count):
         seed(
             store,
@@ -412,7 +412,7 @@ async def test_timeout_splits_messages_in_half_then_merges():
     seed_day(store, 4)
     brain = TimeoutThenAnswer("前半摘要", "后半摘要", "合并后的摘要")
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert text == "合并后的摘要"
     assert len(brain.calls) == 4  # 整段超时 + 两个半段 + 合并
@@ -423,7 +423,7 @@ async def test_timeout_splits_messages_in_half_then_merges():
     assert "第3条消息" in second_half and "第4条消息" in second_half
     merge_prompt = _prompt_text(brain.calls[3])
     assert "前半摘要" in merge_prompt and "后半摘要" in merge_prompt
-    assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) == text
+    assert store.get_summary(ChatType.GROUP, "qq:9001", YESTERDAY) == text
 
 
 @pytest.mark.asyncio
@@ -432,7 +432,7 @@ async def test_timeout_with_single_message_gives_up_without_split():
     seed_day(store, 1)
     brain = TimeoutThenAnswer("不该出现")
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert text is None
     assert len(brain.calls) == 1
@@ -453,10 +453,10 @@ async def test_timeout_at_max_depth_gives_up_without_infinite_recursion():
             raise BrainError("OpenCode 超时（120 秒），本条放弃")
 
     brain = AlwaysTimeout()
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert text is None
-    assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) is None
+    assert store.get_summary(ChatType.GROUP, "qq:9001", YESTERDAY) is None
     # 整段 → 第一半 → 深度到顶的单行块，超时立刻上抛，不再尝试后半段。
     assert brain.calls <= 2 ** (MAX_SPLIT_DEPTH + 1)
 
@@ -477,7 +477,7 @@ async def test_merge_timeout_falls_back_to_joined_halves():
             return "前半" if self.calls == 2 else "后半"
 
     brain = MergeTimeout()
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert text == "前半\n后半"
     assert brain.calls == 4
@@ -506,7 +506,7 @@ async def test_scheduler_backs_off_failed_chat_until_window_expires():
     clock["t"] = 60.0
     assert await scheduler.run_pending() == 1
     assert brain.calls == 2
-    assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) == "恢复后的摘要"
+    assert store.get_summary(ChatType.GROUP, "qq:9001", YESTERDAY) == "恢复后的摘要"
 
 
 # ---- B2/B5: 截断可见、按 token 分块、行首时间 ----
@@ -519,7 +519,7 @@ def seed_many(
     count: int,
     *,
     content: str | None = None,
-    chat_id: int = 9001,
+    chat_id: str = "qq:9001",
 ) -> None:
     base = datetime(2026, 10, 23, 0, 0, tzinfo=TZ)
     for i in range(count):
@@ -566,7 +566,7 @@ async def test_truncation_notice_counts_hidden_messages():
     seed_many(store, MAX_SOURCE_LINES + hidden)
     brain = FakeBrain("摘要")
 
-    await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     body = _prompt_lines(brain.calls[0])
     assert body[0] == f"（更早还有 {hidden} 条未展开）"
@@ -584,13 +584,13 @@ async def test_rotation_truncation_notice_counts_hidden_messages():
     start = datetime(2026, 10, 23, tzinfo=TZ)
     messages = store.messages_between(
         ChatType.GROUP,
-        9001,
+        "qq:9001",
         int(start.timestamp()),
         int((start + timedelta(days=1)).timestamp()),
     )
     brain = FakeBrain("摘要")
 
-    await summarize_for_rotation(brain, store, ChatType.GROUP, 9001, messages)
+    await summarize_for_rotation(brain, store, ChatType.GROUP, "qq:9001", messages)
 
     prompt = _prompt_text(brain.calls[0])
     assert f"（更早还有 {hidden} 条未展开）" in prompt
@@ -604,7 +604,7 @@ async def test_summary_prompt_lines_start_with_shanghai_time():
     seed(store, datetime(2026, 10, 23, 0, 31, tzinfo=UTC), content="还聊了猫粮")
     brain = FakeBrain("摘要")
 
-    await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     body = _prompt_lines(brain.calls[0])
     assert body == ["[08:30] 鱼片: 今天聊了显卡", "[08:31] 鱼片: 还聊了猫粮"]
@@ -617,10 +617,10 @@ async def test_timeout_splits_by_tokens_and_retries_each_chunk():
     seed_many(store, 6, content="鱼" * 600)  # 每行约 400 tokens，两块装不下
     brain = FirstChunkTimeout()
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert text == "递归摘要"
-    assert store.get_summary(ChatType.GROUP, 9001, YESTERDAY) == "递归摘要"
+    assert store.get_summary(ChatType.GROUP, "qq:9001", YESTERDAY) == "递归摘要"
     assert len(brain.calls) > 2  # 整段超时 → 分块 → 块内再分 → 合并
     body_sizes = [len(_prompt_lines(call)) for call in brain.calls[1:]]
     assert min(body_sizes) == 1  # 真的细分到了单行块
@@ -635,7 +635,7 @@ async def test_split_depth_is_bounded_when_every_call_times_out():
     seed_many(store, 60, content="鱼" * 600)
     brain = AlwaysTimeout()
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert text is None
     # 深度上限 2：1 次整段 + 每层少量尝试，远小于逐行重试的 60 次。
@@ -648,7 +648,7 @@ async def test_single_overlong_line_gives_up_without_split():
     seed(store, datetime(2026, 10, 23, 10, 0, tzinfo=TZ), content="鱼" * 5000)
     brain = AlwaysTimeout()
 
-    text = await summarize_chat(store, brain, ChatType.GROUP, 9001, YESTERDAY)
+    text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
     assert text is None
     assert brain.calls == 1
@@ -663,7 +663,7 @@ def seed_week(
     store: Store,
     week_start: str = "2026-10-19",
     days: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6),
-    chat_id: int = 9001,
+    chat_id: str = "qq:9001",
 ) -> None:
     start = date.fromisoformat(week_start)
     for offset in days:
@@ -687,10 +687,10 @@ async def test_summarize_week_merges_seven_daily_summaries():
     seed_week(store)
     brain = FakeBrain("这一周聊了显卡和猫")
 
-    text = await summarize_week(store, brain, ChatType.GROUP, 9001, "2026-10-19")
+    text = await summarize_week(store, brain, ChatType.GROUP, "qq:9001", "2026-10-19")
 
     assert text == "这一周聊了显卡和猫"
-    assert store.get_weekly_summary(ChatType.GROUP, 9001, "2026-10-19") == text
+    assert store.get_weekly_summary(ChatType.GROUP, "qq:9001", "2026-10-19") == text
     prompt = _prompt_text(brain.calls[0])
     assert "10-19：第1天摘要" in prompt
     assert "10-25：第7天摘要" in prompt
@@ -702,7 +702,7 @@ async def test_summarize_week_uses_only_existing_days():
     seed_week(store, days=(0, 1, 4))
     brain = FakeBrain("这周只聊了三天")
 
-    await summarize_week(store, brain, ChatType.GROUP, 9001, "2026-10-19")
+    await summarize_week(store, brain, ChatType.GROUP, "qq:9001", "2026-10-19")
 
     prompt = _prompt_text(brain.calls[0])
     assert "10-19：第1天摘要" in prompt
@@ -716,11 +716,11 @@ async def test_summarize_week_skips_empty_week():
     store = make_store()
     brain = FakeBrain("不该出现")
 
-    text = await summarize_week(store, brain, ChatType.GROUP, 9001, "2026-10-19")
+    text = await summarize_week(store, brain, ChatType.GROUP, "qq:9001", "2026-10-19")
 
     assert text == ""
     assert brain.calls == []
-    assert store.get_weekly_summary(ChatType.GROUP, 9001, "2026-10-19") is None
+    assert store.get_weekly_summary(ChatType.GROUP, "qq:9001", "2026-10-19") is None
 
 
 @pytest.mark.asyncio
@@ -729,7 +729,7 @@ async def test_weekly_summary_clips_to_300_chars():
     seed_week(store)
     brain = FakeBrain("鱼" * 400)
 
-    text = await summarize_week(store, brain, ChatType.GROUP, 9001, "2026-10-19")
+    text = await summarize_week(store, brain, ChatType.GROUP, "qq:9001", "2026-10-19")
 
     assert len(text) == 300
 
@@ -742,7 +742,7 @@ async def test_scheduler_generates_weekly_summary_once():
     scheduler = SummaryScheduler(store, brain, clock=lambda: MONDAY, hour=4)
 
     assert await scheduler.run_pending() == 1
-    assert store.get_weekly_summary(ChatType.GROUP, 9001, "2026-10-19") == "上周回顾"
+    assert store.get_weekly_summary(ChatType.GROUP, "qq:9001", "2026-10-19") == "上周回顾"
 
     assert await scheduler.run_pending() == 0
     assert len(brain.calls) == 1
@@ -765,7 +765,7 @@ async def test_weekly_failure_backs_off_without_writing():
 
     assert await scheduler.run_pending() == 0
     assert brain.calls == 1
-    assert store.get_weekly_summary(ChatType.GROUP, 9001, "2026-10-19") is None
+    assert store.get_weekly_summary(ChatType.GROUP, "qq:9001", "2026-10-19") is None
 
     assert await scheduler.run_pending() == 0
     assert brain.calls == 1
@@ -773,5 +773,5 @@ async def test_weekly_failure_backs_off_without_writing():
     clock["t"] = 60.0
     assert await scheduler.run_pending() == 1
     assert brain.calls == 2
-    assert store.get_weekly_summary(ChatType.GROUP, 9001, "2026-10-19") == "恢复后的摘要"
+    assert store.get_weekly_summary(ChatType.GROUP, "qq:9001", "2026-10-19") == "恢复后的摘要"
 

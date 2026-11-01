@@ -110,7 +110,7 @@ class ImpressionWorker:
     def paused(self) -> bool:
         return self._backoff.is_paused()
 
-    async def maybe_extract(self, chat_type: ChatType, chat_id: int) -> int:
+    async def maybe_extract(self, chat_type: ChatType, chat_id: str) -> int:
         """按会话累计消息数触发；同一批消息不会重复抽取。"""
         key = (chat_type, chat_id)
         if self._backoff.is_paused():
@@ -144,7 +144,7 @@ class ImpressionWorker:
     async def extract(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         messages: list[Message] | None = None,
     ) -> int | None:
         """抽取并写入印象；调用失败返回 None，供上层决定是否退避。

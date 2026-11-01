@@ -367,7 +367,7 @@ def _parse_day(value: str) -> datetime:
 
 
 def _memory_scope(
-    chat_type: ChatType | None, chat_id: int | None
+    chat_type: ChatType | None, chat_id: str | None
 ) -> tuple[str, list[object]]:
     """只读面板的会话过滤条件；两个参数都可为空。"""
     clauses: list[str] = []
@@ -777,7 +777,7 @@ class Store:
         return cur.rowcount > 0
 
     def is_bot_message(
-        self, chat_type: ChatType, chat_id: int, message_id: str
+        self, chat_type: ChatType, chat_id: str, message_id: str
     ) -> bool:
         """这条 message_id 是否是本会话里 bot 自己发的消息。
 
@@ -798,7 +798,7 @@ class Store:
     def recent_messages(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         limit: int,
         upto_message_id: str | None = None,
     ) -> list[Message]:
@@ -837,7 +837,7 @@ class Store:
     def messages_page(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         limit: int = 50,
         before: int | None = None,
         anchor_message_id: str | None = None,
@@ -892,7 +892,7 @@ class Store:
         )
 
     def messages_between(
-        self, chat_type: ChatType, chat_id: int, start_ts: int, end_ts: int
+        self, chat_type: ChatType, chat_id: str, start_ts: int, end_ts: int
     ) -> list[Message]:
         rows = self._conn.execute(
             """
@@ -905,7 +905,7 @@ class Store:
         return [self._row_to_message(r) for r in rows]
 
     def message_nicknames(
-        self, chat_type: ChatType, chat_id: int, message_ids: Sequence[str]
+        self, chat_type: ChatType, chat_id: str, message_ids: Sequence[str]
     ) -> dict[str, str]:
         """按 message_id 批量回查昵称；摘要补「回复 谁」时一次查完，别逐条打库。"""
         ids = [str(mid) for mid in message_ids if mid]
@@ -941,7 +941,7 @@ class Store:
         ).fetchall()
         return [(ChatType(r["chat_type"]), r["chat_id"]) for r in rows]
 
-    def count_messages(self, chat_type: ChatType, chat_id: int) -> int:
+    def count_messages(self, chat_type: ChatType, chat_id: str) -> int:
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM messages WHERE chat_type = ? AND chat_id = ?",
             (chat_type.value, chat_id),
@@ -976,7 +976,7 @@ class Store:
         return deleted
 
     def delete_user_messages(
-        self, chat_type: ChatType, chat_id: int, user_id: int
+        self, chat_type: ChatType, chat_id: str, user_id: str
     ) -> int:
         """按用户删除某会话的原始消息，并清理对应投递记录。
 
@@ -1008,7 +1008,7 @@ class Store:
         self,
         query: str,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[int, list[Message]]:
@@ -1020,7 +1020,7 @@ class Store:
         self,
         query: str,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[int, list[tuple[Message, str]]]:
@@ -1079,7 +1079,7 @@ class Store:
         self,
         terms: Sequence[str],
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[int, list[tuple[Message, str]]]:
@@ -1169,7 +1169,7 @@ class Store:
         self,
         query: str,
         chat_type: ChatType | None,
-        chat_id: int | None,
+        chat_id: str | None,
         limit: int,
         offset: int,
     ) -> tuple[int, list[tuple[Message, str]]]:
@@ -1212,7 +1212,7 @@ class Store:
         )
 
     # ---- delivery cursors -----------------------------------------
-    def _row_id(self, chat_type: ChatType, chat_id: int, message_id: str) -> int | None:
+    def _row_id(self, chat_type: ChatType, chat_id: str, message_id: str) -> int | None:
         row = self._conn.execute(
             """
             SELECT id FROM messages
@@ -1222,7 +1222,7 @@ class Store:
         ).fetchone()
         return None if row is None else int(row["id"])
 
-    def last_delivered_id(self, chat_type: ChatType, chat_id: int) -> int | None:
+    def last_delivered_id(self, chat_type: ChatType, chat_id: str) -> int | None:
         row = self._conn.execute(
             "SELECT last_message_id FROM delivered_cursors WHERE chat_type = ? AND chat_id = ?",
             (chat_type.value, chat_id),
@@ -1230,7 +1230,7 @@ class Store:
         return None if row is None else int(row["last_message_id"])
 
     def pending_messages(
-        self, chat_type: ChatType, chat_id: int, upto_message_id: str, limit: int
+        self, chat_type: ChatType, chat_id: str, upto_message_id: str, limit: int
     ) -> tuple[int, list[Message]]:
         """取「模型还没看过」的人类消息，按时间正序，最多 limit 条。
 
@@ -1276,7 +1276,7 @@ class Store:
             return 0, ([] if row is None else [self._row_to_message(row)])
         return max(0, total - len(messages)), messages
 
-    def mark_delivered(self, chat_type: ChatType, chat_id: int, *message_ids: str) -> None:
+    def mark_delivered(self, chat_type: ChatType, chat_id: str, *message_ids: str) -> None:
         """把一批消息记为「已送达模型」；首次投递同时钉住回溯下限。"""
         rows = [self._row_id(chat_type, chat_id, mid) for mid in message_ids]
         present = [(mid, row) for mid, row in zip(message_ids, rows) if row is not None]
@@ -1303,7 +1303,7 @@ class Store:
     def pending_batch(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         anchor_id: str,
         limit: int = 20,
     ) -> list[Message]:
@@ -1341,7 +1341,7 @@ class Store:
         return [self._row_to_message(r) for r in reversed(rows)]
 
     def count_undelivered_before(
-        self, chat_type: ChatType, chat_id: int, message_id: str
+        self, chat_type: ChatType, chat_id: str, message_id: str
     ) -> int:
         """投递窗口之前还有多少条未投递消息。
 
@@ -1369,7 +1369,7 @@ class Store:
         ).fetchone()
         return int(row["n"]) if row is not None else 0
 
-    def mark_recalled(self, chat_type: ChatType, chat_id: int, message_id: str) -> bool:
+    def mark_recalled(self, chat_type: ChatType, chat_id: str, message_id: str) -> bool:
         """把一条已入库消息标记为撤回；原文保留，只是不再进入 prompt。"""
         cur = self._conn.execute(
             """
@@ -1382,7 +1382,7 @@ class Store:
         self._conn.commit()
         return cur.rowcount > 0
 
-    def is_recalled(self, chat_type: ChatType, chat_id: int, message_id: str) -> bool:
+    def is_recalled(self, chat_type: ChatType, chat_id: str, message_id: str) -> bool:
         row = self._conn.execute(
             """
             SELECT 1 FROM messages
@@ -1417,7 +1417,7 @@ class Store:
         return [(ChatType(r["chat_type"]), r["chat_id"]) for r in rows]
 
     def mark_skipped(
-        self, chat_type: ChatType, chat_id: int, message_ids: Sequence[str], reason: str
+        self, chat_type: ChatType, chat_id: str, message_ids: Sequence[str], reason: str
     ) -> None:
         """把一批消息标成「已处理但不投递」，并记下原因（quiet/budget/error…）。
 
@@ -1451,7 +1451,7 @@ class Store:
         )
         self._conn.commit()
 
-    def skip_reason(self, chat_type: ChatType, chat_id: int, message_id: str) -> str | None:
+    def skip_reason(self, chat_type: ChatType, chat_id: str, message_id: str) -> str | None:
         row = self._conn.execute(
             """
             SELECT skipped_reason FROM delivered_messages
@@ -1492,7 +1492,7 @@ class Store:
         return cur.rowcount
 
     def get_brain_session(
-        self, provider: str, chat_type: ChatType, chat_id: int
+        self, provider: str, chat_type: ChatType, chat_id: str
     ) -> str | None:
         row = self._conn.execute(
             """
@@ -1504,7 +1504,7 @@ class Store:
         return None if row is None else str(row["session_id"])
 
     def set_brain_session(
-        self, provider: str, chat_type: ChatType, chat_id: int, session_id: str
+        self, provider: str, chat_type: ChatType, chat_id: str, session_id: str
     ) -> None:
         """写入/更新会话 id；created_at 是这一轮 session 的起点，只落一次。
 
@@ -1526,7 +1526,7 @@ class Store:
         self._conn.commit()
 
     def clear_brain_session(
-        self, provider: str, chat_type: ChatType, chat_id: int
+        self, provider: str, chat_type: ChatType, chat_id: str
     ) -> None:
         self._conn.execute(
             """
@@ -1538,7 +1538,7 @@ class Store:
         self._conn.commit()
 
     # ---- session stats (轮换判据) ----------------------------------
-    def session_stats(self, chat_type: ChatType, chat_id: int) -> SessionStats:
+    def session_stats(self, chat_type: ChatType, chat_id: str) -> SessionStats:
         row = self._conn.execute(
             """
             SELECT delivered_count, token_estimate, created_at FROM brain_sessions
@@ -1555,7 +1555,7 @@ class Store:
         )
 
     def bump_session_stats(
-        self, chat_type: ChatType, chat_id: int, *, messages: int, tokens: int
+        self, chat_type: ChatType, chat_id: str, *, messages: int, tokens: int
     ) -> None:
         """累计本轮投递：无行则建（created_at 只写这一次），有行则累加。"""
         self._conn.execute(
@@ -1580,7 +1580,7 @@ class Store:
         )
         self._conn.commit()
 
-    def reset_session_stats(self, chat_type: ChatType, chat_id: int) -> None:
+    def reset_session_stats(self, chat_type: ChatType, chat_id: str) -> None:
         """轮换后清零；created_at 跟着新 session 重算。"""
         self._conn.execute(
             """
@@ -1592,15 +1592,15 @@ class Store:
         )
         self._conn.commit()
 
-    def get_opencode_session(self, chat_type: ChatType, chat_id: int) -> str | None:
+    def get_opencode_session(self, chat_type: ChatType, chat_id: str) -> str | None:
         return self.get_brain_session("opencode", chat_type, chat_id)
 
     def set_opencode_session(
-        self, chat_type: ChatType, chat_id: int, session_id: str
+        self, chat_type: ChatType, chat_id: str, session_id: str
     ) -> None:
         self.set_brain_session("opencode", chat_type, chat_id, session_id)
 
-    def clear_opencode_session(self, chat_type: ChatType, chat_id: int) -> None:
+    def clear_opencode_session(self, chat_type: ChatType, chat_id: str) -> None:
         self.clear_brain_session("opencode", chat_type, chat_id)
 
     def clear_opencode_sessions(self) -> int:
@@ -1620,7 +1620,7 @@ class Store:
     def upsert_impression(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         subject_user_id: str | None,
         kind: str,
         content: str,
@@ -1832,7 +1832,7 @@ class Store:
         return cur.rowcount > 0
 
     def search_impressions(
-        self, chat_type: ChatType, chat_id: int, query: str, topk: int
+        self, chat_type: ChatType, chat_id: str, query: str, topk: int
     ) -> list[Impression]:
         rows: list[sqlite3.Row] = []
         if self._fts and query.strip():
@@ -1869,7 +1869,7 @@ class Store:
     def list_impressions(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         topk: int,
         focus_user_ids: Sequence[str] = (),
     ) -> list[Impression]:
@@ -1902,7 +1902,7 @@ class Store:
         limit: int = 20,
         offset: int = 0,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
     ) -> list[Impression]:
         """跨会话的最近印象，仅供 dashboard 只读展示；可按会话过滤与分页。"""
         scope, params = _memory_scope(chat_type, chat_id)
@@ -1919,7 +1919,7 @@ class Store:
         return [self._row_to_impression(r) for r in rows]
 
     def count_impressions(
-        self, chat_type: ChatType | None = None, chat_id: int | None = None
+        self, chat_type: ChatType | None = None, chat_id: str | None = None
     ) -> int:
         scope, params = _memory_scope(chat_type, chat_id)
         row = self._conn.execute(
@@ -1928,7 +1928,7 @@ class Store:
         return int(row["total"] or 0)
 
     # ---- 印象抽取游标 ----------------------------------------------
-    def get_impression_cursor(self, chat_type: ChatType, chat_id: int) -> int:
+    def get_impression_cursor(self, chat_type: ChatType, chat_id: str) -> int:
         """已抽取到的消息条数；没有记录时返回 0。"""
         row = self._conn.execute(
             """
@@ -1940,7 +1940,7 @@ class Store:
         return 0 if row is None else int(row["last_count"] or 0)
 
     def set_impression_cursor(
-        self, chat_type: ChatType, chat_id: int, last_count: int
+        self, chat_type: ChatType, chat_id: str, last_count: int
     ) -> None:
         self._conn.execute(
             """
@@ -1956,7 +1956,7 @@ class Store:
 
     # ---- 会话运行状态 ----------------------------------------------
     def load_chat_state(
-        self, chat_type: ChatType, chat_id: int
+        self, chat_type: ChatType, chat_id: str
     ) -> dict[str, object] | None:
         """静音/话题收尾等运行状态；没有记录返回 None。"""
         row = self._conn.execute(
@@ -1988,7 +1988,7 @@ class Store:
     def save_chat_state(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         state: dict[str, object],
     ) -> None:
         self._conn.execute(
@@ -2048,7 +2048,7 @@ class Store:
         )
 
     # ---- summaries ------------------------------------------------
-    def all_summaries(self, chat_type: ChatType, chat_id: int) -> list[Summary]:
+    def all_summaries(self, chat_type: ChatType, chat_id: str) -> list[Summary]:
         """导出用：某会话全部按日摘要，时间正序。"""
         rows = self._conn.execute(
             """
@@ -2069,7 +2069,7 @@ class Store:
             for r in rows
         ]
 
-    def upsert_summary(self, chat_type: ChatType, chat_id: int, date: str, content: str) -> None:
+    def upsert_summary(self, chat_type: ChatType, chat_id: str, date: str, content: str) -> None:
         self._conn.execute(
             """
             INSERT INTO summaries (chat_type, chat_id, date, content)
@@ -2081,7 +2081,7 @@ class Store:
         )
         self._conn.commit()
 
-    def get_summary(self, chat_type: ChatType, chat_id: int, date: str) -> str | None:
+    def get_summary(self, chat_type: ChatType, chat_id: str, date: str) -> str | None:
         row = self._conn.execute(
             "SELECT content FROM summaries WHERE chat_type = ? AND chat_id = ? AND date = ?",
             (chat_type.value, chat_id, date),
@@ -2089,7 +2089,7 @@ class Store:
         return None if row is None else str(row["content"])
 
     def count_summaries(
-        self, chat_type: ChatType | None = None, chat_id: int | None = None
+        self, chat_type: ChatType | None = None, chat_id: str | None = None
     ) -> int:
         scope, params = _memory_scope(chat_type, chat_id)
         row = self._conn.execute(
@@ -2150,7 +2150,7 @@ class Store:
         return sorted({slot.date for slot in self.pending_summary_slots(days, until=until)})
 
     def summaries_between(
-        self, chat_type: ChatType, chat_id: int, start: str, end: str
+        self, chat_type: ChatType, chat_id: str, start: str, end: str
     ) -> list[Summary]:
         """按日期闭区间取日摘要，升序；周汇总的输入就是这 7 天里实际存在的条目。"""
         rows = self._conn.execute(
@@ -2174,7 +2174,7 @@ class Store:
 
     # ---- 周汇总 -----------------------------------------------------
     def upsert_weekly_summary(
-        self, chat_type: ChatType, chat_id: int, week_start: str, content: str
+        self, chat_type: ChatType, chat_id: str, week_start: str, content: str
     ) -> None:
         self._conn.execute(
             """
@@ -2188,7 +2188,7 @@ class Store:
         self._conn.commit()
 
     def get_weekly_summary(
-        self, chat_type: ChatType, chat_id: int, week_start: str
+        self, chat_type: ChatType, chat_id: str, week_start: str
     ) -> str | None:
         row = self._conn.execute(
             """
@@ -2200,7 +2200,7 @@ class Store:
         return None if row is None else str(row["content"])
 
     def latest_weekly_summary(
-        self, chat_type: ChatType, chat_id: int
+        self, chat_type: ChatType, chat_id: str
     ) -> WeeklySummary | None:
         row = self._conn.execute(
             """
@@ -2261,7 +2261,7 @@ class Store:
         limit: int = 20,
         offset: int = 0,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
     ) -> list[Summary]:
         """跨会话的最近按日摘要，仅供 dashboard 只读展示；可按会话过滤与分页。"""
         scope, params = _memory_scope(chat_type, chat_id)
@@ -2287,7 +2287,7 @@ class Store:
         ]
 
     # ---- 轮换摘要（一次性接续，与按日 summaries 分开） --------------
-    def add_session_summary(self, chat_type: ChatType, chat_id: int, content: str) -> None:
+    def add_session_summary(self, chat_type: ChatType, chat_id: str, content: str) -> None:
         self._conn.execute(
             """
             INSERT INTO session_summaries (chat_type, chat_id, content)
@@ -2297,7 +2297,7 @@ class Store:
         )
         self._conn.commit()
 
-    def latest_session_summary(self, chat_type: ChatType, chat_id: int) -> str | None:
+    def latest_session_summary(self, chat_type: ChatType, chat_id: str) -> str | None:
         row = self._conn.execute(
             """
             SELECT content FROM session_summaries
@@ -2309,7 +2309,7 @@ class Store:
         return None if row is None else str(row["content"])
 
     def recent_session_summary(
-        self, chat_type: ChatType, chat_id: int, within_hours: float = 24
+        self, chat_type: ChatType, chat_id: str, within_hours: float = 24
     ) -> str | None:
         """`within_hours` 内的最新接续摘要；重启后靠它把轮换接续语捞回来。
 
@@ -2384,7 +2384,7 @@ class Store:
     def record_usage(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         purpose: str,
         prompt_tokens: int,
         completion_tokens: int,
@@ -2408,7 +2408,7 @@ class Store:
         )
         self._conn.commit()
 
-    def usage_today(self, chat_type: ChatType, chat_id: int, today: str) -> tuple[int, int]:
+    def usage_today(self, chat_type: ChatType, chat_id: str, today: str) -> tuple[int, int]:
         row = self._conn.execute(
             """
             SELECT COUNT(*) AS calls,
@@ -2423,7 +2423,7 @@ class Store:
     def usage_today_by_purpose(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         today: str,
         purposes: Sequence[str],
     ) -> tuple[int, int]:
@@ -2463,7 +2463,7 @@ class Store:
         *,
         purposes: Sequence[str] | None = None,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
     ) -> UsageTotals:
         """日期闭区间内的用量合计；``purposes=None`` 表示所有用途。
 
@@ -2696,7 +2696,7 @@ class Store:
             reverse=True,
         )
 
-    def forget_messages(self, chat_type: ChatType, chat_id: int) -> None:
+    def forget_messages(self, chat_type: ChatType, chat_id: str) -> None:
         """软忘记：清消息与 session 映射，保留按日摘要、印象和用量。"""
         for table in (
             "messages",
@@ -2712,7 +2712,7 @@ class Store:
             )
         self._conn.commit()
 
-    def reset_chat(self, chat_type: ChatType, chat_id: int) -> None:
+    def reset_chat(self, chat_type: ChatType, chat_id: str) -> None:
         """只换 session：消息、摘要、印象、用量全部保留。"""
         for table in ("opencode_sessions", "brain_sessions", "session_summaries"):
             self._conn.execute(
@@ -2721,7 +2721,7 @@ class Store:
             )
         self._conn.commit()
 
-    def forget_chat(self, chat_type: ChatType, chat_id: int) -> None:
+    def forget_chat(self, chat_type: ChatType, chat_id: str) -> None:
         for table in (
             "messages",
             "impressions",

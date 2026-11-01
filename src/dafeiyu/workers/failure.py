@@ -34,7 +34,7 @@ def log_memory_failure(
     label: str,
     exc: BaseException,
     chat_type: ChatType,
-    chat_id: int,
+    chat_id: str,
 ) -> None:
     """记忆类任务失败时的日志分级。
 

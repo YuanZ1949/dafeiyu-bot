@@ -168,7 +168,7 @@ class OpenCodeHttpBrain:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def forget(self, chat_type: ChatType, chat_id: int) -> None:
+    async def forget(self, chat_type: ChatType, chat_id: str) -> None:
         """删掉远端 session 再清映射：/forget 之后不该留下可被翻出来的历史。
 
         映射一定清：远端删失败（网络、服务端异常）时若留着映射，下一轮会把
@@ -184,7 +184,7 @@ class OpenCodeHttpBrain:
                 log.warning("删除 opencode 会话失败，仍清空映射：%s", exc)
         self.store.clear_opencode_session(chat_type, chat_id)
 
-    def reset_session(self, chat_type: ChatType, chat_id: int) -> None:
+    def reset_session(self, chat_type: ChatType, chat_id: str) -> None:
         """只断开映射；远端 session 由轮换流程决定何时废弃。"""
         self.store.clear_opencode_session(chat_type, chat_id)
 
@@ -263,7 +263,7 @@ class OpenCodeHttpBrain:
     async def reply(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         text: str,
         *,
         on_tool: Callable[[str], Awaitable[None]] | None = None,
@@ -304,7 +304,7 @@ class OpenCodeHttpBrain:
     async def reply_fresh(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         text: str,
         *,
         system: str = "",

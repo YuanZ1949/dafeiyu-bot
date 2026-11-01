@@ -51,13 +51,15 @@ def make_settings(**overrides) -> Settings:
 
 
 class FakeAdapter:
+    bot_id = "qq:999"
+
     def __init__(self) -> None:
-        self.sent: list[tuple[ChatType, int, str]] = []
+        self.sent: list[tuple[ChatType, str, str]] = []
 
     def on_message(self, handler) -> None:
         self.handler = handler
 
-    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> str:
+    async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str:
         self.sent.append((chat_type, chat_id, text))
         return f"bot-{len(self.sent)}"
 
@@ -84,8 +86,8 @@ class FakeBrain:
 def msg(
     text: str,
     *,
-    chat_id: int = 1,
-    user_id: int = 2,
+    chat_id: str = "qq:1",
+    user_id: str = "qq:2",
     message_id: str = "m1",
     at_bot: bool = False,
     is_bot: bool = False,
@@ -113,7 +115,7 @@ def service(settings=None, brain=None, store=None, adapter=None, impressions=Non
     adapter = adapter or FakeAdapter()
     router = Router(settings, store, clock=lambda: CLOCK)
     svc = Service(
-        settings, store, brain, adapter, router, "人设", impressions
+        settings, store, brain, {"qq": adapter}, router, "人设", impressions
     )
     return svc, store, brain, adapter
 
@@ -124,12 +126,12 @@ def service(settings=None, brain=None, store=None, adapter=None, impressions=Non
 def test_context_keeps_impressions_summary_and_scene_with_real_persona():
     store = Store(":memory:")
     store.init_schema()
-    store.upsert_impression(GROUP, 1, 2, "nickname", "外号叫电鱼佬", 0.9)
-    store.upsert_summary(GROUP, 1, "2026-10-23", "RTX5090装机")
+    store.upsert_impression(GROUP, "qq:1", 2, "nickname", "外号叫电鱼佬", 0.9)
+    store.upsert_summary(GROUP, "qq:1", "2026-10-23", "RTX5090装机")
     store.add_message(msg("在吗"))
 
     system = build_system_prompt(load_persona(), "测试群", "2026-10-24", 120, 300)
-    ctx = build_context(store, GROUP, 1, 20, 5, system, "2026-10-24")
+    ctx = build_context(store, GROUP, "qq:1", 20, 5, system, "2026-10-24")
 
     assert "外号叫电鱼佬" in ctx.system
     assert "RTX5090装机" in ctx.system
@@ -169,7 +171,7 @@ async def test_bot_reply_is_stored_and_visible_as_assistant_turn():
     await svc.handle(msg("你好", message_id="u1", at_bot=True))
     assert adapter.sent
 
-    history = store.recent_messages(GROUP, 1, 10)
+    history = store.recent_messages(GROUP, "qq:1", 10)
     assert any(m.is_bot for m in history)
     assert history[-1].content == "在呢"
 
@@ -178,7 +180,7 @@ async def test_bot_reply_is_stored_and_visible_as_assistant_turn():
 
 
 def test_at_bot_bypasses_whitelist_but_plain_message_does_not():
-    settings = make_settings(groups=GroupsConfig(frozenset({777}), frozenset(), frozenset()))
+    settings = make_settings(groups=GroupsConfig(frozenset({"qq:777"}), frozenset(), frozenset()))
     store = Store(":memory:")
     store.init_schema()
     router = Router(settings, store, clock=lambda: CLOCK)
@@ -196,7 +198,7 @@ def test_budget_blocks_when_daily_tokens_exhausted(monkeypatch):
     store.init_schema()
     # usage 的日期来自 Store.today()，必须和 Router 的 CLOCK 对齐，否则预算看不到今天。
     monkeypatch.setattr("dafeiyu.memory.store.today_shanghai", lambda: CLOCK.date())
-    store.record_usage(GROUP, 1, "reply", 60, 50)
+    store.record_usage(GROUP, "qq:1", "reply", 60, 50)
     router = Router(settings, store, clock=lambda: CLOCK)
     decision = router.should_handle(msg("怎么办", message_id="m3"))
     assert decision.call_model is False
@@ -207,7 +209,7 @@ def test_budget_blocks_when_daily_tokens_exhausted(monkeypatch):
 async def test_brain_error_records_usage():
     svc, store, _, _ = service(brain=FakeBrain(error=BrainError("boom")))
     await svc.handle(msg("你好", message_id="u1", at_bot=True))
-    calls, _ = store.usage_today(GROUP, 1, now_shanghai().date().isoformat())
+    calls, _ = store.usage_today(GROUP, "qq:1", now_shanghai().date().isoformat())
     assert calls == 1
 
 
@@ -218,8 +220,8 @@ async def test_impression_worker_records_usage():
     store.add_message(msg("我喜欢吃鱼"))
     brain = FakeBrain()
     worker = ImpressionWorker(store, brain, every=1)
-    await worker.maybe_extract(GROUP, 1)
-    calls, tokens = store.usage_today(GROUP, 1, now_shanghai().date().isoformat())
+    await worker.maybe_extract(GROUP, "qq:1")
+    calls, tokens = store.usage_today(GROUP, "qq:1", now_shanghai().date().isoformat())
     assert calls == 1
     assert tokens == 10
 
@@ -229,14 +231,14 @@ async def test_impression_worker_records_usage():
 
 @pytest.mark.asyncio
 async def test_group_command_requires_admin():
-    settings = make_settings(groups=GroupsConfig(frozenset(), frozenset(), frozenset({42})))
+    settings = make_settings(groups=GroupsConfig(frozenset(), frozenset(), frozenset({"qq:42"})))
     svc, _, _, _ = service(settings=settings)
 
-    await svc.handle(msg("/闭嘴", user_id=7, message_id="c1"))
-    assert svc.router.is_quiet(GROUP, 1) is False
+    await svc.handle(msg("/闭嘴", user_id="qq:7", message_id="c1"))
+    assert svc.router.is_quiet(GROUP, "qq:1") is False
 
-    await svc.handle(msg("/闭嘴", user_id=42, message_id="c2"))
-    assert svc.router.is_quiet(GROUP, 1) is True
+    await svc.handle(msg("/闭嘴", user_id="qq:42", message_id="c2"))
+    assert svc.router.is_quiet(GROUP, "qq:1") is True
 
 
 # ---- I4: reply 段自带的 qq 也能判定 reply_to_bot ----------------------
@@ -273,10 +275,10 @@ async def test_impression_counts_messages_not_replies():
     for i in range(3):
         store.add_message(msg(f"消息{i}", message_id=f"m{i}"))
 
-    assert await worker.maybe_extract(GROUP, 1) == 0
+    assert await worker.maybe_extract(GROUP, "qq:1") == 0
     assert brain.complete_calls == 1
 
-    await worker.maybe_extract(GROUP, 1)
+    await worker.maybe_extract(GROUP, "qq:1")
     assert brain.complete_calls == 1  # 同一批消息不重复抽取
 
 
@@ -308,7 +310,7 @@ def test_context_anchors_to_current_message():
     store.add_message(msg("问题A", message_id="a"))
     store.add_message(msg("问题B", message_id="b"))
     ctx = build_context(
-        store, GROUP, 1, window_size=20, impression_topk=5, system="系统", today="2026-10-24",
+        store, GROUP, "qq:1", window_size=20, impression_topk=5, system="系统", today="2026-10-24",
         upto_message_id="a",
     )
     assert len(ctx.messages) == 1

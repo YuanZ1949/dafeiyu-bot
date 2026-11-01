@@ -88,7 +88,7 @@ def _compose_system(base: str, impressions: list[str], summary: str | None) -> s
 def build_context(
     store: Store,
     chat_type: ChatType,
-    chat_id: int,
+    chat_id: str,
     window_size: int,
     impression_topk: int,
     system: str,
@@ -155,7 +155,7 @@ def _clip(text: str, limit: int) -> str:
 def _summary_block(
     store: Store,
     chat_type: ChatType,
-    chat_id: int,
+    chat_id: str,
     today: str,
     max_chars: int,
 ) -> str:
@@ -233,7 +233,7 @@ def _recall_terms(text: str) -> list[str]:
 def _recall_lines(
     store: Store,
     chat_type: ChatType,
-    chat_id: int,
+    chat_id: str,
     queries: Sequence[str],
     topk: int,
     exclude_ids: set[str] | None,
@@ -272,7 +272,7 @@ def _recall_lines(
 
 
 def _focus_user_ids(
-    store: Store, chat_type: ChatType, chat_id: int
+    store: Store, chat_type: ChatType, chat_id: str
 ) -> list[str]:
     """最近 20 条消息的发言人（不含 bot），用于印象注入优先占名额。"""
     seen: list[str] = []
@@ -289,7 +289,7 @@ def build_injection(
     store: Store,
     workspace: Workspace | None,
     chat_type: ChatType,
-    chat_id: int,
+    chat_id: str,
     cfg: InjectionConfig,
     *,
     today: str,

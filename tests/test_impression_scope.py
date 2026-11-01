@@ -22,8 +22,8 @@ from dafeiyu.router import Router
 from dafeiyu.service import Service
 from dafeiyu.workers.impressions import ImpressionWorker
 
-GROUP_ID = 1001
-PRIVATE_ID = 2002
+GROUP_ID = "qq:1001"
+PRIVATE_ID = "qq:2002"
 EVERY = 3
 NOW = datetime(2026, 10, 24, 12, 0, tzinfo=timezone(timedelta(hours=8)))
 EXTRACTED = json.dumps(
@@ -32,10 +32,12 @@ EXTRACTED = json.dumps(
 
 
 class FakeAdapter:
+    bot_id = "qq:999"
+
     def on_message(self, handler) -> None:
         self.handler = handler
 
-    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> str:
+    async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str:
         return "bot-1"
 
 
@@ -83,14 +85,14 @@ def make_service(store: Store, brain: FakeBrain) -> Service:
         settings,
         store,
         brain,
-        FakeAdapter(),
+        {"qq": FakeAdapter()},
         router,
         "你是溟月",
         impressions=worker,
     )
 
 
-def make_msg(i: int, chat_type: ChatType, chat_id: int) -> Message:
+def make_msg(i: int, chat_type: ChatType, chat_id: str) -> Message:
     return Message(
         chat_type=chat_type,
         chat_id=chat_id,
@@ -114,7 +116,7 @@ async def settle() -> None:
         await asyncio.sleep(0)
 
 
-async def trigger(service: Service, store: Store, chat_type: ChatType, chat_id: int) -> None:
+async def trigger(service: Service, store: Store, chat_type: ChatType, chat_id: str) -> None:
     last = None
     for i in range(EVERY):
         last = make_msg(i, chat_type, chat_id)
@@ -124,7 +126,7 @@ async def trigger(service: Service, store: Store, chat_type: ChatType, chat_id: 
     await settle()
 
 
-def impression_usage(store: Store, chat_type: ChatType, chat_id: int) -> int:
+def impression_usage(store: Store, chat_type: ChatType, chat_id: str) -> int:
     calls, _ = store.usage_today_by_purpose(
         chat_type, chat_id, store.today(), ("impression",)
     )

@@ -89,12 +89,12 @@ def build_memory_actions(store: Store, workers: Workers) -> MemoryActions | None
     if workers.impressions is None and workers.scheduler is None:
         return None
 
-    async def summarize(chat_type: ChatType, chat_id: int, date: str):
+    async def summarize(chat_type: ChatType, chat_id: str, date: str):
         if workers.scheduler is None:
             raise RuntimeError("摘要旁路未启用（当前 brain 无 complete_detailed）")
         return await workers.scheduler.summarize_now(chat_type, chat_id, date)
 
-    async def extract(chat_type: ChatType, chat_id: int):
+    async def extract(chat_type: ChatType, chat_id: str):
         if workers.impressions is None:
             raise RuntimeError("印象旁路未启用（当前 brain 无 complete_detailed）")
         if workers.impressions.paused:
@@ -266,7 +266,7 @@ async def main() -> None:
             settings,
             store,
             brain,
-            adapter,
+            {"qq": adapter},
             router,
             persona_text,
             workspace=workspace,

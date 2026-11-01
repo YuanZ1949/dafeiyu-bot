@@ -49,8 +49,8 @@ async def test_debug_trigger_returns_service_result_and_builds_message(
     msg, seed = captured[0]
     assert seed == 7
     assert msg.chat_type is ChatType.GROUP
-    assert msg.chat_id == 1001
-    assert msg.user_id == 2002
+    assert str(msg.chat_id) == "1001"
+    assert str(msg.user_id) == "2002"
     assert msg.nickname == "阿伟"
     assert msg.content == "大肥鱼在吗"
     assert msg.at_bot is True

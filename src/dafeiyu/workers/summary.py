@@ -10,7 +10,7 @@ from typing import Any
 from dafeiyu.brain.client import BrainError
 from dafeiyu.brain.tokens import estimate_tokens, resolve_usage
 from dafeiyu.memory.store import Store
-from dafeiyu.models import ChatType, Message
+from dafeiyu.models import ChatType, Message, channel_of
 from dafeiyu.timeutil import SHANGHAI, now_shanghai
 
 from .failure import (
@@ -121,10 +121,17 @@ def _is_timeout_error(exc: BaseException) -> bool:
     return isinstance(exc, BrainError) and TIMEOUT_HINT in str(exc)
 
 
+def _reply_target_label(user_id: str) -> str:
+    """回复目标已被清理时退化成人可读的 id：按通道加标签，如 QQ123 / 微信ab12。"""
+    channel = channel_of(user_id)
+    raw = user_id.split(":", 1)[1]
+    return f"{'微信' if channel == 'wechat' else 'QQ'}{raw}"
+
+
 def _summary_line(message: Message, reply_names: dict[str, str] | None = None) -> str:
     """摘要专用的记录行：带上海时刻，方便模型判断先后与间隔。
 
-    被回复的消息还在库里就补「（回复 昵称）」；已清理则退化成 QQ 号，
+    被回复的消息还在库里就补「（回复 昵称）」；已清理则退化成带通道标签的 id，
     比丢掉整条回复线索有用。
     """
     stamp = datetime.fromtimestamp(message.timestamp, SHANGHAI).strftime("%H:%M")
@@ -132,8 +139,8 @@ def _summary_line(message: Message, reply_names: dict[str, str] | None = None) -
     target = ""
     if reply_names and message.reply_to_message_id:
         target = reply_names.get(message.reply_to_message_id, "")
-    if not target and message.reply_to_user_id is not None:
-        target = f"QQ{message.reply_to_user_id}"
+    if not target and message.reply_to_user_id:
+        target = _reply_target_label(message.reply_to_user_id)
     if target:
         line += f"（回复 {target}）"
     return line
@@ -248,7 +255,7 @@ async def _summarize_lines(
 
 
 def _reply_names(
-    store: Store, chat_type: ChatType, chat_id: int, messages: list[Message]
+    store: Store, chat_type: ChatType, chat_id: str, messages: list[Message]
 ) -> dict[str, str]:
     """当天回复目标的昵称表；没有回复消息时直接跳过查询。"""
     ids = [m.reply_to_message_id for m in messages if m.reply_to_message_id]
@@ -261,7 +268,7 @@ async def summarize_week(
     store: Store,
     brain,
     chat_type: ChatType,
-    chat_id: int,
+    chat_id: str,
     week_start: str,
     on_error: Callable[[BaseException], None] | None = None,
 ) -> str | None:
@@ -297,7 +304,7 @@ async def summarize_chat(
     store: Store,
     brain,
     chat_type: ChatType,
-    chat_id: int,
+    chat_id: str,
     date: str,
     on_error: Callable[[BaseException], None] | None = None,
 ) -> str | None:
@@ -335,7 +342,7 @@ async def summarize_for_rotation(
     brain,
     store: Store,
     chat_type: ChatType,
-    chat_id: int,
+    chat_id: str,
     messages: list[Message],
 ) -> str:
     """换 session 前的一次性交接摘要；失败返回空串，调用方据此放弃轮换。"""
@@ -392,7 +399,7 @@ class SummaryScheduler:
         return self._backoff.is_paused()
 
     async def summarize_now(
-        self, chat_type: ChatType, chat_id: int, date: str
+        self, chat_type: ChatType, chat_id: str, date: str
     ) -> str | None:
         """面板手动触发：跳过「已存在」与按会话退避，但仍尊重全局配额熔断。"""
         if self._backoff.is_paused():

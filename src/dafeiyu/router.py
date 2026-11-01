@@ -200,7 +200,7 @@ class Router:
         self.budget_guard = BudgetGuard(self.store, self.settings.budget)
 
     # ---- state ----------------------------------------------------
-    def _state(self, chat_type: ChatType, chat_id: int) -> _ChatState:
+    def _state(self, chat_type: ChatType, chat_id: str) -> _ChatState:
         key = (chat_type, chat_id)
         st = self._states.get(key)
         if st is not None:
@@ -212,7 +212,7 @@ class Router:
         self._states[key] = st
         return st
 
-    def _hydrate(self, st: _ChatState, chat_type: ChatType, chat_id: int) -> None:
+    def _hydrate(self, st: _ChatState, chat_type: ChatType, chat_id: str) -> None:
         """首次访问时从库里恢复；读不到就按空状态起步。"""
         loader = getattr(self.store, "load_chat_state", None)
         if loader is None:
@@ -235,7 +235,7 @@ class Router:
         st.thread_closed_until = self._from_epoch(row.get("thread_closed_until"))
         st.last_closed_at = self._from_epoch(row.get("last_closed_at"))
 
-    def _persist(self, chat_type: ChatType, chat_id: int, st: _ChatState) -> None:
+    def _persist(self, chat_type: ChatType, chat_id: str, st: _ChatState) -> None:
         """把会跨重启保留的字段写回；失败只记日志，不影响当前消息。"""
         if not self._persist_enabled:
             return
@@ -275,7 +275,7 @@ class Router:
             return None
 
     def note_bot_spoke(
-        self, chat_type: ChatType, chat_id: int, *, ambient: bool = False
+        self, chat_type: ChatType, chat_id: str, *, ambient: bool = False
     ) -> None:
         st = self._state(chat_type, chat_id)
         st.last_bot_spoke = self.clock()
@@ -283,7 +283,7 @@ class Router:
         self._persist(chat_type, chat_id, st)
 
     def note_user_message(
-        self, chat_type: ChatType, chat_id: int, *, addressed: bool = False
+        self, chat_type: ChatType, chat_id: str, *, addressed: bool = False
     ) -> None:
         """记录用户消息；被点名等于话题重新开始，清掉收尾与降频状态。"""
         st = self._state(chat_type, chat_id)
@@ -299,11 +299,11 @@ class Router:
         if addressed or was_closed:
             self._persist(chat_type, chat_id, st)
 
-    def ambient_turns(self, chat_type: ChatType, chat_id: int) -> int:
+    def ambient_turns(self, chat_type: ChatType, chat_id: str) -> int:
         return self._state(chat_type, chat_id).ambient_streak
 
     def is_thread_closed(
-        self, chat_type: ChatType, chat_id: int, now: datetime | None = None
+        self, chat_type: ChatType, chat_id: str, now: datetime | None = None
     ) -> bool:
         """话题是否已经收尾：连续 ambient 发言超限，或发言后无人回应。"""
         now = now or self.clock()
@@ -343,7 +343,7 @@ class Router:
         return float(getattr(self.settings.triggers, "closed_sample_rate", 0.05))
 
     def closed_sample(
-        self, chat_type: ChatType, chat_id: int, now: datetime | None = None
+        self, chat_type: ChatType, chat_id: str, now: datetime | None = None
     ) -> bool:
         """话题已收尾时，非点名消息是否还要送模型；0 表示彻底静默。"""
         if not self.is_thread_closed(chat_type, chat_id, now):
@@ -351,25 +351,25 @@ class Router:
         rate = self.closed_sample_rate()
         return rate > 0 and self._rng.random() < rate
 
-    def note_reply(self, chat_type: ChatType, chat_id: int) -> None:
+    def note_reply(self, chat_type: ChatType, chat_id: str) -> None:
         st = self._state(chat_type, chat_id)
         st.no_reply_streak = 0
         st.downshift_until = None
         self._persist(chat_type, chat_id, st)
 
-    def note_no_reply(self, chat_type: ChatType, chat_id: int) -> None:
+    def note_no_reply(self, chat_type: ChatType, chat_id: str) -> None:
         st = self._state(chat_type, chat_id)
         st.no_reply_streak += 1
         if st.no_reply_streak >= 3:
             st.downshift_until = self.clock() + timedelta(minutes=30)
         self._persist(chat_type, chat_id, st)
 
-    def quiet(self, chat_type: ChatType, chat_id: int, minutes: int) -> None:
+    def quiet(self, chat_type: ChatType, chat_id: str, minutes: int) -> None:
         st = self._state(chat_type, chat_id)
         st.muted_until = self.clock() + timedelta(minutes=minutes)
         self._persist(chat_type, chat_id, st)
 
-    def wake(self, chat_type: ChatType, chat_id: int) -> None:
+    def wake(self, chat_type: ChatType, chat_id: str) -> None:
         st = self._state(chat_type, chat_id)
         st.muted_until = None
         self._persist(chat_type, chat_id, st)
@@ -425,20 +425,20 @@ class Router:
         hours, minutes = hhmm.split(":")
         return int(hours) * 60 + int(minutes)
 
-    def is_muted(self, chat_type: ChatType, chat_id: int, now: datetime | None = None) -> bool:
+    def is_muted(self, chat_type: ChatType, chat_id: str, now: datetime | None = None) -> bool:
         """只判 /闭嘴 的静音，不含夜间静音时段。"""
         now = now or self.clock()
         st = self._state(chat_type, chat_id)
         return st.muted_until is not None and now < st.muted_until
 
     def is_quiet(
-        self, chat_type: ChatType, chat_id: int, now: datetime | None = None
+        self, chat_type: ChatType, chat_id: str, now: datetime | None = None
     ) -> bool:
         now = now or self.clock()
         return self.is_muted(chat_type, chat_id, now) or self._in_quiet_hours(now)
 
     def is_downshifted(
-        self, chat_type: ChatType, chat_id: int, now: datetime | None = None
+        self, chat_type: ChatType, chat_id: str, now: datetime | None = None
     ) -> bool:
         """连续不说话后的降频窗口；批次模式与 rules 模式共用同一份状态。"""
         now = now or self.clock()
@@ -498,7 +498,7 @@ class Router:
     def _remember_prompt(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         st: _ChatState,
         content: str,
         now: datetime,

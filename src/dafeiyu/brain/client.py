@@ -272,7 +272,7 @@ class BrainClient:
     async def reply(
         self,
         chat_type: object,
-        chat_id: int,
+        chat_id: str,
         prompt: str,
         *,
         system: str = "",

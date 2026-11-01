@@ -39,7 +39,7 @@ def make_settings(**overrides) -> Settings:
         db_path=":memory:",
         persona=PersonaConfig("溟月", ("大肥鱼",), 120, 300, 0.05),
         triggers=TriggerConfig(60, 0.0, ("01:00", "07:00"), ("怎么",)),
-        groups=GroupsConfig(frozenset(), frozenset(), frozenset({2002})),
+        groups=GroupsConfig(frozenset(), frozenset(), frozenset({"qq:2002"})),
         budget=BudgetConfig(200, 300000),
         memory=MemoryConfig(20, 5, 20),
         logging=LoggingConfig("INFO", "logs"),
@@ -53,13 +53,13 @@ class FakeAdapter:
     bot_id = "qq:999"
 
     def __init__(self) -> None:
-        self.sent: list[tuple[ChatType, int, str]] = []
+        self.sent: list[tuple[ChatType, str, str]] = []
         self.handler = None
 
     def on_message(self, handler) -> None:
         self.handler = handler
 
-    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> str:
+    async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str:
         self.sent.append((chat_type, chat_id, text))
         return f"bot-{len(self.sent)}"
 
@@ -84,7 +84,7 @@ class FakeBrain:
         pass
 
 
-def make_msg(chat_id=1001, user_id=2002, content="@溟月 在吗", message_id="m1",
+def make_msg(chat_id="qq:1001", user_id="qq:2002", content="@溟月 在吗", message_id="m1",
              chat_type=ChatType.GROUP, timestamp=0) -> Message:
     return Message(
         chat_type=chat_type,
@@ -112,7 +112,7 @@ def build(tmp_path, brain=None, adapter=None, settings=None, audit=None):
         settings,
         store,
         brain,
-        adapter,
+        {"qq": adapter},
         router,
         "你是溟月 $max_chars $max_reply_chars_technical",
         audit=audit,
@@ -125,7 +125,7 @@ async def test_hard_trigger_calls_brain_and_sends(tmp_path):
     await service.handle(make_msg())
     assert brain.calls == 1
     assert len(adapter.sent) == 1
-    calls, _ = store.usage_today(ChatType.GROUP, 1001, now_shanghai().date().isoformat())
+    calls, _ = store.usage_today(ChatType.GROUP, "qq:1001", now_shanghai().date().isoformat())
     assert calls == 1
 
 
@@ -133,7 +133,7 @@ async def test_speak_false_records_usage_without_sending(tmp_path):
     service, store, brain, adapter, _ = build(tmp_path, brain=FakeBrain(speak=False))
     await service.handle(make_msg())
     assert adapter.sent == []
-    calls, _ = store.usage_today(ChatType.GROUP, 1001, now_shanghai().date().isoformat())
+    calls, _ = store.usage_today(ChatType.GROUP, "qq:1001", now_shanghai().date().isoformat())
     assert calls == 1
 
 
@@ -197,14 +197,14 @@ async def test_brain_error_records_usage_without_sending(tmp_path):
         tmp_path, brain=FakeBrain(error=BrainError("boom"))
     )
 
-    await service._reply(make_msg(chat_type=ChatType.PRIVATE, chat_id=2002))
+    await service._reply(make_msg(chat_type=ChatType.PRIVATE, chat_id="qq:2002"))
     await service._reply(
-        make_msg(chat_type=ChatType.PRIVATE, chat_id=2002, message_id="m2")
+        make_msg(chat_type=ChatType.PRIVATE, chat_id="qq:2002", message_id="m2")
     )
 
     assert adapter.sent == []
     calls, _ = store.usage_today_by_purpose(
-        ChatType.PRIVATE, 2002, store.today(), ("error",)
+        ChatType.PRIVATE, "qq:2002", store.today(), ("error",)
     )
     assert calls == 2
 
@@ -214,7 +214,7 @@ async def test_short_answer_to_bot_question_is_addressed(tmp_path):
     service, store, _, _, _ = build(tmp_path)
     bot = Message(
         chat_type=ChatType.GROUP,
-        chat_id=1001,
+        chat_id="qq:1001",
         user_id=999,
         nickname="溟月",
         content="你用的什么卡？",
@@ -247,7 +247,7 @@ async def test_reply_to_old_bot_message_is_resolved_from_db(tmp_path):
     store.add_message(
         Message(
             chat_type=ChatType.GROUP,
-            chat_id=1001,
+            chat_id="qq:1001",
             user_id=999,
             nickname="溟月",
             content="在呢",
@@ -258,8 +258,8 @@ async def test_reply_to_old_bot_message_is_resolved_from_db(tmp_path):
     )
     user = Message(
         chat_type=ChatType.GROUP,
-        chat_id=1001,
-        user_id=2002,
+        chat_id="qq:1001",
+        user_id="qq:2002",
         nickname="阿鱼",
         content="继续",
         message_id="u1",
@@ -298,7 +298,7 @@ async def test_agent_missing_error_rebuilds_session_and_replies(tmp_path):
     await service.handle(make_msg())
 
     assert brain.fresh_calls == 1
-    assert adapter.sent == [(ChatType.GROUP, 1001, "换好了")]
+    assert adapter.sent == [(ChatType.GROUP, "qq:1001", "换好了")]
 
 
 async def test_concurrent_same_group_sends_only_once(tmp_path):
@@ -313,9 +313,9 @@ async def test_concurrent_same_group_sends_only_once(tmp_path):
 
 async def test_stats_private_only(tmp_path):
     service, store, brain, adapter, _ = build(tmp_path)
-    store.record_usage(ChatType.PRIVATE, 2002, "reply", 100, 50)
+    store.record_usage(ChatType.PRIVATE, "qq:2002", "reply", 100, 50)
     await service.handle(
-        make_msg(chat_type=ChatType.PRIVATE, chat_id=2002, content="/stats", message_id="s1")
+        make_msg(chat_type=ChatType.PRIVATE, chat_id="qq:2002", content="/stats", message_id="s1")
     )
     assert brain.calls == 0
     assert len(adapter.sent) == 1
@@ -325,12 +325,12 @@ async def test_stats_private_only(tmp_path):
 async def test_forget_private_clears_memory(tmp_path):
     service, store, _, adapter, _ = build(tmp_path)
     await service.handle(
-        make_msg(chat_type=ChatType.PRIVATE, chat_id=2002, content="记住我", message_id="f1")
+        make_msg(chat_type=ChatType.PRIVATE, chat_id="qq:2002", content="记住我", message_id="f1")
     )
     await service.handle(
-        make_msg(chat_type=ChatType.PRIVATE, chat_id=2002, content="/forget", message_id="f2")
+        make_msg(chat_type=ChatType.PRIVATE, chat_id="qq:2002", content="/forget", message_id="f2")
     )
-    assert store.count_messages(ChatType.PRIVATE, 2002) == 0
+    assert store.count_messages(ChatType.PRIVATE, "qq:2002") == 0
     assert len(adapter.sent) == 2
 
 
@@ -338,14 +338,14 @@ class FakeOpenCodeBrain:
     def __init__(self, text: str = "在呢", speak: bool = True) -> None:
         self.text = text
         self.speak = speak
-        self.calls: list[tuple[ChatType, int, str]] = []
-        self.forgotten: list[tuple[ChatType, int]] = []
+        self.calls: list[tuple[ChatType, str, str]] = []
+        self.forgotten: list[tuple[ChatType, str]] = []
 
-    async def reply(self, chat_type: ChatType, chat_id: int, text: str) -> BrainReply:
+    async def reply(self, chat_type: ChatType, chat_id: str, text: str) -> BrainReply:
         self.calls.append((chat_type, chat_id, text))
         return BrainReply(self.speak, self.text, "test", 0, 0)
 
-    async def forget(self, chat_type: ChatType, chat_id: int) -> None:
+    async def forget(self, chat_type: ChatType, chat_id: str) -> None:
         self.forgotten.append((chat_type, chat_id))
 
 
@@ -355,9 +355,9 @@ async def test_opencode_brain_receives_speaker_and_chat(tmp_path):
     await service.handle(make_msg())
     # 单条消息也走批次构建器：带时间线表头，行内仍标出说话人与 @。
     assert brain.calls == [
-        (ChatType.GROUP, 1001, "—— 以下是自你上次开口以来的新消息 ——\n阿鱼：@溟月 在吗（@了你）")
+        (ChatType.GROUP, "qq:1001", "—— 以下是自你上次开口以来的新消息 ——\n阿鱼：@溟月 在吗（@了你）")
     ]
-    assert adapter.sent == [(ChatType.GROUP, 1001, "在呢")]
+    assert adapter.sent == [(ChatType.GROUP, "qq:1001", "在呢")]
     assert "[人设覆盖]" not in brain.calls[0][2]
 
 
@@ -444,7 +444,7 @@ async def test_speak_false_still_advances_cursor(tmp_path):
     await service.handle(make_msg(content="到底怎么弄", message_id="m2"))
 
     assert adapter.sent == []
-    assert store.last_delivered_id(ChatType.GROUP, 1001) is not None
+    assert store.last_delivered_id(ChatType.GROUP, "qq:1001") is not None
     assert "在吗" not in brain.calls[-1][2]
 
 
@@ -453,10 +453,10 @@ async def test_private_prompt_stays_single_line(tmp_path):
     service, _, _, _, _ = build(tmp_path, brain=brain, settings=timeline_settings())
 
     await service.handle(
-        make_msg(chat_type=ChatType.PRIVATE, chat_id=2002, content="在吗", message_id="p1")
+        make_msg(chat_type=ChatType.PRIVATE, chat_id="qq:2002", content="在吗", message_id="p1")
     )
     await service.handle(
-        make_msg(chat_type=ChatType.PRIVATE, chat_id=2002, content="帮我看看", message_id="p2")
+        make_msg(chat_type=ChatType.PRIVATE, chat_id="qq:2002", content="帮我看看", message_id="p2")
     )
 
     prompt = brain.calls[-1][2]
@@ -467,51 +467,51 @@ async def test_private_prompt_stays_single_line(tmp_path):
 async def test_forget_clears_opencode_session(tmp_path):
     brain = FakeOpenCodeBrain()
     service, store, _, _, _ = build(tmp_path, brain=brain)
-    store.set_opencode_session(ChatType.PRIVATE, 1001, "ses_x")
+    store.set_opencode_session(ChatType.PRIVATE, "qq:1001", "ses_x")
     await service.handle(
         make_msg(
             chat_type=ChatType.PRIVATE,
-            chat_id=1001,
+            chat_id="qq:1001",
             content="/forget",
             message_id="f1",
         )
     )
-    assert store.get_opencode_session(ChatType.PRIVATE, 1001) is None
-    assert brain.forgotten == [(ChatType.PRIVATE, 1001)]
+    assert store.get_opencode_session(ChatType.PRIVATE, "qq:1001") is None
+    assert brain.forgotten == [(ChatType.PRIVATE, "qq:1001")]
 
 
 async def test_forget_group_clears_memory_for_admin(tmp_path):
     settings = make_settings(
-        groups=GroupsConfig(frozenset(), frozenset(), frozenset({2002}))
+        groups=GroupsConfig(frozenset(), frozenset(), frozenset({"qq:2002"}))
     )
     service, store, brain, adapter, _ = build(
         tmp_path, settings=settings, brain=FakeOpenCodeBrain()
     )
-    store.set_opencode_session(ChatType.GROUP, 1001, "ses_group")
+    store.set_opencode_session(ChatType.GROUP, "qq:1001", "ses_group")
     store.add_message(make_msg(content="记住我", message_id="gf0"))
 
     await service.handle(make_msg(content="/forget", message_id="gf1"))
 
-    assert store.get_opencode_session(ChatType.GROUP, 1001) is None
-    assert store.count_messages(ChatType.GROUP, 1001) == 0
-    assert brain.forgotten == [(ChatType.GROUP, 1001)]
-    assert adapter.sent[-1] == (ChatType.GROUP, 1001, FORGET_REPLY)
+    assert store.get_opencode_session(ChatType.GROUP, "qq:1001") is None
+    assert store.count_messages(ChatType.GROUP, "qq:1001") == 0
+    assert brain.forgotten == [(ChatType.GROUP, "qq:1001")]
+    assert adapter.sent[-1] == (ChatType.GROUP, "qq:1001", FORGET_REPLY)
 
 
 async def test_forget_group_requires_admin(tmp_path):
     settings = make_settings(
-        groups=GroupsConfig(frozenset(), frozenset(), frozenset({2002}))
+        groups=GroupsConfig(frozenset(), frozenset(), frozenset({"qq:2002"}))
     )
     service, store, brain, adapter, _ = build(
         tmp_path, settings=settings, brain=FakeOpenCodeBrain()
     )
-    store.set_opencode_session(ChatType.GROUP, 1001, "ses_group")
+    store.set_opencode_session(ChatType.GROUP, "qq:1001", "ses_group")
 
     await service.handle(
-        make_msg(user_id=99, content="/forget", message_id="gf2")
+        make_msg(user_id="qq:99", content="/forget", message_id="gf2")
     )
 
-    assert store.get_opencode_session(ChatType.GROUP, 1001) == "ses_group"
+    assert store.get_opencode_session(ChatType.GROUP, "qq:1001") == "ses_group"
     assert brain.forgotten == []
     assert adapter.sent == []
 
@@ -533,7 +533,7 @@ class BrokenAudit:
 async def test_non_admin_group_budget_is_silent_and_not_audited(tmp_path):
     audit = FakeAudit()
     service, _, brain, adapter, _ = build(tmp_path, audit=audit)
-    msg = make_msg(user_id=99, content="/budget", message_id="b0")
+    msg = make_msg(user_id="qq:99", content="/budget", message_id="b0")
     matched = service.commands.match(msg.content, msg.chat_type)
     assert matched is not None
 
@@ -548,7 +548,7 @@ async def test_non_admin_group_budget_is_silent_and_not_audited(tmp_path):
 async def test_admin_budget_reports_and_writes_audit(tmp_path):
     audit = FakeAudit()
     service, store, brain, adapter, _ = build(tmp_path, audit=audit)
-    store.record_usage(ChatType.GROUP, 1001, "reply", 120, 80)
+    store.record_usage(ChatType.GROUP, "qq:1001", "reply", 120, 80)
 
     await service.handle(make_msg(content="/budget", message_id="b1"))
 
@@ -562,15 +562,15 @@ async def test_admin_budget_reports_and_writes_audit(tmp_path):
     action, kwargs = audit.events[0]
     assert action == "command.admin"
     assert kwargs["target"] == "/budget"
-    assert kwargs["actor"] == "2002"
+    assert kwargs["actor"] == "qq:2002"
     detail = kwargs["detail"]
-    assert detail == {"chat_type": "group", "chat_id": 1001, "user_id": 2002}
+    assert detail == {"chat_type": "group", "chat_id": "qq:1001", "user_id": "qq:2002"}
     assert "阿鱼" not in repr(detail)
 
 
 async def test_blacklisted_group_commands_are_silent(tmp_path):
     settings = make_settings(
-        groups=GroupsConfig(frozenset(), frozenset({1001}), frozenset({2002}))
+        groups=GroupsConfig(frozenset(), frozenset({"qq:1001"}), frozenset({"qq:2002"}))
     )
     service, _, brain, adapter, _ = build(tmp_path, settings=settings)
 
@@ -583,26 +583,26 @@ async def test_blacklisted_group_commands_are_silent(tmp_path):
 
 async def test_non_whitelisted_group_commands_are_silent(tmp_path):
     settings = make_settings(
-        groups=GroupsConfig(frozenset({2001}), frozenset(), frozenset({2002}))
+        groups=GroupsConfig(frozenset({"qq:2001"}), frozenset(), frozenset({"qq:2002"}))
     )
     service, _, brain, adapter, _ = build(tmp_path, settings=settings)
 
     await service.handle(make_msg(content="/help", message_id="wl1"))
     await service.handle(
-        make_msg(chat_id=2001, content="/help", message_id="wl2")
+        make_msg(chat_id="qq:2001", content="/help", message_id="wl2")
     )
 
     assert brain.calls == 0
     assert len(adapter.sent) == 1
-    assert adapter.sent[0][1] == 2001
+    assert adapter.sent[0][1] == "qq:2001"
 
 
 async def test_stats_group_has_usage_and_no_cost_words(tmp_path):
     audit = FakeAudit()
     service, store, brain, adapter, _ = build(tmp_path, audit=audit)
-    store.record_usage(ChatType.GROUP, 1001, "reply", 120, 80)
+    store.record_usage(ChatType.GROUP, "qq:1001", "reply", 120, 80)
 
-    await service.handle(make_msg(user_id=99, content="/stats", message_id="st1"))
+    await service.handle(make_msg(user_id="qq:99", content="/stats", message_id="st1"))
 
     assert brain.calls == 0
     text = adapter.sent[0][2]
@@ -638,15 +638,15 @@ async def test_stats_cooldown_is_sixty_seconds_in_group(tmp_path):
     now = {"value": 2000.0}
     service._command_clock = lambda: now["value"]
 
-    await service.handle(make_msg(user_id=99, content="/stats", message_id="sg1"))
+    await service.handle(make_msg(user_id="qq:99", content="/stats", message_id="sg1"))
     assert len(adapter.sent) == 1
 
     now["value"] += 59
-    await service.handle(make_msg(user_id=99, content="/stats", message_id="sg2"))
+    await service.handle(make_msg(user_id="qq:99", content="/stats", message_id="sg2"))
     assert len(adapter.sent) == 1
 
     now["value"] += 1
-    await service.handle(make_msg(user_id=99, content="/stats", message_id="sg3"))
+    await service.handle(make_msg(user_id="qq:99", content="/stats", message_id="sg3"))
     assert len(adapter.sent) == 2
 
 
@@ -658,8 +658,8 @@ async def test_stats_cooldown_is_five_seconds_in_private(tmp_path):
     def private_msg(message_id: str) -> Message:
         return make_msg(
             chat_type=ChatType.PRIVATE,
-            chat_id=2002,
-            user_id=2002,
+            chat_id="qq:2002",
+            user_id="qq:2002",
             content="/stats",
             message_id=message_id,
         )
@@ -681,10 +681,10 @@ async def test_help_cooldown_is_isolated_by_group_chat_id(tmp_path):
     service._command_clock = lambda: 4000.0
 
     await service.handle(
-        make_msg(user_id=99, chat_id=1001, content="/help", message_id="ci-g1")
+        make_msg(user_id="qq:99", chat_id="qq:1001", content="/help", message_id="ci-g1")
     )
     await service.handle(
-        make_msg(user_id=99, chat_id=1002, content="/help", message_id="ci-g2")
+        make_msg(user_id="qq:99", chat_id="qq:1002", content="/help", message_id="ci-g2")
     )
 
     assert len(adapter.sent) == 2
@@ -694,7 +694,7 @@ async def test_help_cooldown_is_isolated_by_private_user_id(tmp_path):
     service, _, _, adapter, _ = build(tmp_path)
     service._command_clock = lambda: 5000.0
 
-    for user_id, message_id in ((99, "ci-p1"), (98, "ci-p2")):
+    for user_id, message_id in (("qq:99", "ci-p1"), ("qq:98", "ci-p2")):
         await service.handle(
             make_msg(
                 chat_type=ChatType.PRIVATE,
@@ -722,20 +722,20 @@ async def test_status_private_non_admin_replies_with_fixed_hint(tmp_path):
     await service.handle(
         make_msg(
             chat_type=ChatType.PRIVATE,
-            chat_id=99,
-            user_id=99,
+            chat_id="qq:99",
+            user_id="qq:99",
             content="/status",
             message_id="ps1",
         )
     )
 
     assert brain.calls == 0
-    assert adapter.sent == [(ChatType.PRIVATE, 99, "这个命令只有管理员能用。")]
+    assert adapter.sent == [(ChatType.PRIVATE, "qq:99", "这个命令只有管理员能用。")]
 
 
 async def test_status_reports_live_state_without_model_name(tmp_path):
     service, store, brain, adapter, _ = build(tmp_path)
-    service.adapter.connected = True
+    service.adapters["qq"].connected = True
     store.save_backoff(QUOTA_KEY, time.time() + 60)
 
     await service.handle(make_msg(content="/status", message_id="stt1"))
@@ -772,7 +772,7 @@ async def test_status_reads_scheduler_attribute_and_callable_counts(tmp_path):
 async def test_help_replies_in_group_and_private_with_scope_filter(tmp_path):
     service, _, brain, adapter, _ = build(tmp_path)
 
-    await service.handle(make_msg(user_id=99, content="/help", message_id="help-g"))
+    await service.handle(make_msg(user_id="qq:99", content="/help", message_id="help-g"))
     group_text = adapter.sent[-1][2]
     assert "/stats" in group_text
     assert "/budget" not in group_text
@@ -782,8 +782,8 @@ async def test_help_replies_in_group_and_private_with_scope_filter(tmp_path):
     await service.handle(
         make_msg(
             chat_type=ChatType.PRIVATE,
-            chat_id=99,
-            user_id=99,
+            chat_id="qq:99",
+            user_id="qq:99",
             content="/help",
             message_id="help-p",
         )
@@ -810,8 +810,8 @@ async def test_private_forget_allows_non_admin_without_admin_audit(tmp_path):
     store.add_message(
         make_msg(
             chat_type=ChatType.PRIVATE,
-            chat_id=99,
-            user_id=99,
+            chat_id="qq:99",
+            user_id="qq:99",
             content="记住我",
             message_id="pf0",
         )
@@ -820,15 +820,15 @@ async def test_private_forget_allows_non_admin_without_admin_audit(tmp_path):
     await service.handle(
         make_msg(
             chat_type=ChatType.PRIVATE,
-            chat_id=99,
-            user_id=99,
+            chat_id="qq:99",
+            user_id="qq:99",
             content="/forget",
             message_id="pf1",
         )
     )
 
-    assert store.count_messages(ChatType.PRIVATE, 99) == 0
-    assert adapter.sent[-1] == (ChatType.PRIVATE, 99, FORGET_REPLY)
+    assert store.count_messages(ChatType.PRIVATE, "qq:99") == 0
+    assert adapter.sent[-1] == (ChatType.PRIVATE, "qq:99", FORGET_REPLY)
     assert audit.events == []
 
 
@@ -838,8 +838,8 @@ async def test_private_admin_forget_writes_admin_audit(tmp_path):
     store.add_message(
         make_msg(
             chat_type=ChatType.PRIVATE,
-            chat_id=2002,
-            user_id=2002,
+            chat_id="qq:2002",
+            user_id="qq:2002",
             content="记住我",
             message_id="pfa0",
         )
@@ -848,23 +848,23 @@ async def test_private_admin_forget_writes_admin_audit(tmp_path):
     await service.handle(
         make_msg(
             chat_type=ChatType.PRIVATE,
-            chat_id=2002,
-            user_id=2002,
+            chat_id="qq:2002",
+            user_id="qq:2002",
             content="/forget",
             message_id="pfa1",
         )
     )
 
-    assert store.count_messages(ChatType.PRIVATE, 2002) == 0
-    assert adapter.sent[-1] == (ChatType.PRIVATE, 2002, FORGET_REPLY)
+    assert store.count_messages(ChatType.PRIVATE, "qq:2002") == 0
+    assert adapter.sent[-1] == (ChatType.PRIVATE, "qq:2002", FORGET_REPLY)
     assert len(audit.events) == 1
     action, kwargs = audit.events[0]
     assert action == "command.admin"
     assert kwargs["target"] == "/forget"
     assert kwargs["detail"] == {
         "chat_type": "private",
-        "chat_id": 2002,
-        "user_id": 2002,
+        "chat_id": "qq:2002",
+        "user_id": "qq:2002",
     }
 
 
@@ -874,8 +874,8 @@ async def test_unknown_and_wrong_scope_slash_fall_through_to_model(tmp_path):
     await service.handle(
         make_msg(
             chat_type=ChatType.PRIVATE,
-            chat_id=2002,
-            user_id=2002,
+            chat_id="qq:2002",
+            user_id="qq:2002",
             content="/nope",
             message_id="pp1",
         )
@@ -884,8 +884,8 @@ async def test_unknown_and_wrong_scope_slash_fall_through_to_model(tmp_path):
     await service.handle(
         make_msg(
             chat_type=ChatType.PRIVATE,
-            chat_id=2002,
-            user_id=2002,
+            chat_id="qq:2002",
+            user_id="qq:2002",
             content="/shutup",
             message_id="pp2",
         )
@@ -922,10 +922,10 @@ async def test_audit_failure_does_not_block_admin_command(tmp_path):
 @pytest.mark.parametrize(
     ("content", "chat_type", "chat_id", "user_id"),
     [
-        ("/help", ChatType.GROUP, 1001, 2002),
-        ("/预算", ChatType.GROUP, 1001, 2002),
-        ("/status", ChatType.PRIVATE, 99, 99),
-        ("/stats", ChatType.GROUP, 1001, 99),
+        ("/help", ChatType.GROUP, "qq:1001", "qq:2002"),
+        ("/预算", ChatType.GROUP, "qq:1001", "qq:2002"),
+        ("/status", ChatType.PRIVATE, "qq:99", "qq:99"),
+        ("/stats", ChatType.GROUP, "qq:1001", "qq:99"),
     ],
 )
 def test_explain_trigger_recognizes_registry_commands(
