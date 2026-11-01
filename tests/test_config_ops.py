@@ -51,6 +51,7 @@ def test_ops_config_defaults(tmp_path: Path) -> None:
     assert settings.alerts.webhook.format == "generic"
     assert settings.alerts.qq_admin == 0
     assert settings.alerts.rules.bot_down_seconds == 120
+    assert settings.alerts.rules.wechat_down_seconds == 180
     assert settings.alerts.rules.disk_free_percent == 10
 
     assert settings.backup.enabled is True
@@ -80,6 +81,7 @@ alerts:
   qq_admin: 12345
   rules:
     bot_down_seconds: 30
+    wechat_down_seconds: 90
     disk_free_percent: 5
 backup:
   dir: data/custom-backups
@@ -94,6 +96,7 @@ audit:
     assert settings.alerts.webhook.format == "ntfy"
     assert settings.alerts.qq_admin == 12345
     assert settings.alerts.rules.bot_down_seconds == 30
+    assert settings.alerts.rules.wechat_down_seconds == 90
     assert settings.backup.dir == "data/custom-backups"
     assert settings.backup.daily_keep == 3
     assert settings.audit.path == "data/custom-audit.jsonl"
@@ -110,6 +113,7 @@ audit:
         ("alerts:\n  qq_admin: -1\n", "alerts.qq_admin"),
         ("alerts:\n  rules:\n    disk_free_percent: 0\n", "alerts.rules.disk_free_percent"),
         ("alerts:\n  rules:\n    reply_error_count: 0\n", "alerts.rules.reply_error_count"),
+        ("alerts:\n  rules:\n    wechat_down_seconds: 0\n", "alerts.rules.wechat_down_seconds"),
         ("backup:\n  dir: ''\n", "backup.dir"),
         ("backup:\n  schedule_hour: 24\n", "backup.schedule_hour"),
         ("backup:\n  daily_keep: -1\n", "backup.daily_keep"),

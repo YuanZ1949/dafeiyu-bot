@@ -67,6 +67,25 @@ def down_snapshot():
     return snapshot
 
 
+def wechat_snapshot(*, bridge: str = "running", wechat: dict | None = None):
+    snapshot = base_snapshot()
+    snapshot["processes"]["wechat_bridge"] = {
+        "status": bridge,
+        "restart_count": 0,
+    }
+    snapshot["bot"]["channels"] = {
+        "wechat": wechat
+        if wechat is not None
+        else {
+            "connected": True,
+            "degraded": False,
+            "logged_in": True,
+            "desktop": "interactive",
+        }
+    }
+    return snapshot
+
+
 def manager(tmp_path: Path, clock: Clock, channel, *, cfg: AlertsConfig | None = None):
     return AlertManager(
         cfg or AlertsConfig(),
@@ -195,6 +214,112 @@ async def test_all_rules_activate(tmp_path: Path) -> None:
         "disk_low",
         "backup_failed",
     }
+
+
+async def test_wechat_down_fires_after_threshold(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = wechat_snapshot(
+        wechat={"connected": False, "logged_in": True, "desktop": "interactive"}
+    )
+
+    await mgr.evaluate(snapshot)
+    assert channel.sent == []
+
+    clock.advance(179)
+    await mgr.evaluate(snapshot)
+    assert channel.sent == []
+
+    clock.advance(1)
+    await mgr.evaluate(snapshot)
+    assert len(channel.sent) == 1
+    incident, event = channel.sent[0]
+    assert event == "firing"
+    assert incident.rule == "wechat_down"
+    assert incident.severity == "critical"
+    assert incident.title == "微信通道不在线"
+    assert incident.detail == "微信桥连接已断开"
+
+
+@pytest.mark.parametrize(
+    ("snapshot_kwargs", "expected"),
+    [
+        ({"bridge": "failed"}, "微信桥进程不在线（状态：failed）"),
+        (
+            {
+                "wechat": {
+                    "connected": True,
+                    "logged_in": True,
+                    "desktop": "locked",
+                }
+            },
+            "桌面已锁定，微信无法操作",
+        ),
+        (
+            {
+                "wechat": {
+                    "connected": True,
+                    "logged_in": False,
+                    "desktop": "interactive",
+                }
+            },
+            "微信未登录",
+        ),
+    ],
+)
+async def test_wechat_down_detail_matches_failure_mode(
+    tmp_path: Path, snapshot_kwargs: dict, expected: str
+) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = wechat_snapshot(**snapshot_kwargs)
+
+    await mgr.evaluate(snapshot)
+    clock.advance(181)
+    await mgr.evaluate(snapshot)
+
+    fired = [
+        incident
+        for incident, event in channel.sent
+        if incident.rule == "wechat_down" and event == "firing"
+    ]
+    assert len(fired) == 1
+    incident = fired[0]
+    assert incident.detail == expected
+    assert "napcat" not in incident.detail.casefold()
+
+
+async def test_wechat_down_skipped_when_bridge_disabled(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = wechat_snapshot(
+        bridge="disabled",
+        wechat={"connected": False, "logged_in": False, "desktop": "locked"},
+    )
+
+    await mgr.evaluate(snapshot)
+    clock.advance(181)
+    await mgr.evaluate(snapshot)
+
+    assert channel.sent == []
+    assert mgr.summary()["firing"] == 0
+
+
+async def test_wechat_down_not_raised_for_qq_only(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["bot"]["channels"] = {"qq": {"connected": True, "degraded": False}}
+
+    await mgr.evaluate(snapshot)
+    clock.advance(181)
+    await mgr.evaluate(snapshot)
+
+    assert all(incident.rule != "wechat_down" for incident, _event in channel.sent)
 
 
 async def test_half_offline_alerts_after_pending(tmp_path: Path) -> None:

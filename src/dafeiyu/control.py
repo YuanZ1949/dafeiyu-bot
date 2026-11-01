@@ -875,6 +875,34 @@ class BrainControl:
             budget["cost"] = dict(report.cost)
             budget["warnings"] = [dict(item) for item in report.warnings]
 
+        channels: dict[str, Any] = {}
+        channel_status = getattr(self.service, "channel_status", None)
+        if callable(channel_status):
+            try:
+                raw_channels = channel_status()
+            except Exception as exc:  # noqa: BLE001 - 通道状态失败不能让探活 500
+                log.warning("读取通道状态失败：%s", exc)
+            else:
+                if isinstance(raw_channels, dict):
+                    for name, item in raw_channels.items():
+                        if not isinstance(item, dict):
+                            item = {}
+                        entry: dict[str, Any] = {
+                            "connected": bool(item.get("connected")),
+                            "degraded": bool(item.get("degraded")),
+                            "last_event_at": _iso_ts(item.get("last_event_at")),
+                            "last_disconnect_at": _iso_ts(
+                                item.get("last_disconnect_at")
+                            ),
+                            "last_send_at": _iso_ts(item.get("last_send_at")),
+                        }
+                        # 微信适配器额外暴露登录态与桌面状态；QQ 没有这两个属性，
+                        # 只按状态字典里真实存在的键补，避免凭空造字段。
+                        for extra in ("logged_in", "desktop"):
+                            if extra in item:
+                                entry[extra] = item[extra]
+                        channels[str(name)] = entry
+
         return {
             "ok": ok,
             "generated_at": generated_at,
@@ -887,6 +915,7 @@ class BrainControl:
                     getattr(self.adapter, "last_disconnect_at", None)
                 ),
             },
+            "channels": channels,
             "keepalive": (
                 self.service.keepalive_status()
                 if callable(getattr(self.service, "keepalive_status", None))

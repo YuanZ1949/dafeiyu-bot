@@ -85,6 +85,54 @@ async def test_channel_status_covers_every_adapter(tmp_path):
     assert status["qq"]["degraded"] is False
 
 
+def test_channel_status_raw_fallback_adds_wechat_extras(tmp_path):
+    """没有 snapshot() 时走裸属性：微信多两个键，QQ 保持 5 键。"""
+
+    class RawChannelAdapter:
+        def __init__(self, *, wechat: bool) -> None:
+            self.connected = True
+            self.degraded = False
+            self.last_event_at = 123.0
+            self.last_disconnect_at = None
+            self.last_send_at = 456.0
+            if wechat:
+                self.logged_in = False
+                self.desktop = "locked"
+
+    store = Store(str(tmp_path / "t.db"))
+    store.init_schema()
+    settings = make_settings()
+    qq = RawChannelAdapter(wechat=False)
+    wx = RawChannelAdapter(wechat=True)
+    service = Service(
+        settings,
+        store,
+        None,
+        {"qq": qq, "wechat": wx},
+        Router(settings, store, clock=lambda: None),
+        "test",
+    )
+
+    status = service.channel_status()
+
+    assert status["wechat"] == {
+        "connected": True,
+        "degraded": False,
+        "last_event_at": 123.0,
+        "last_disconnect_at": None,
+        "last_send_at": 456.0,
+        "logged_in": False,
+        "desktop": "locked",
+    }
+    assert set(status["qq"]) == {
+        "connected",
+        "degraded",
+        "last_event_at",
+        "last_disconnect_at",
+        "last_send_at",
+    }
+
+
 async def test_start_and_stop_visit_every_adapter(tmp_path):
     service, _store, qq, wx = make_service(tmp_path)
 

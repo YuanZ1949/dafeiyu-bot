@@ -178,6 +178,12 @@ class Service:
                 "last_disconnect_at": getattr(adapter, "last_disconnect_at", None),
                 "last_send_at": getattr(adapter, "last_send_at", None),
             }
+            # 微信形态的适配器额外暴露登录态/桌面状态；QQ 没有这两个属性，
+            # 保持原来的 5 键，避免健康快照凭空多出字段。
+            if hasattr(adapter, "logged_in"):
+                status[channel]["logged_in"] = adapter.logged_in
+            if hasattr(adapter, "desktop"):
+                status[channel]["desktop"] = adapter.desktop
         return status
 
     async def start(self) -> None:

@@ -322,6 +322,7 @@ class SupervisorConfig:
 class AlertRulesConfig:
     bot_down_seconds: int = 120
     napcat_down_seconds: int = 180
+    wechat_down_seconds: int = 180
     opencode_down_seconds: int = 120
     quota_pause: bool = True
     disk_free_percent: int = 10
@@ -565,6 +566,9 @@ def _build_alerts(raw: dict[str, Any]) -> AlertsConfig:
         ),
         napcat_down_seconds=_positive_int(
             rules_raw.get("napcat_down_seconds"), "alerts.rules.napcat_down_seconds", 180
+        ),
+        wechat_down_seconds=_positive_int(
+            rules_raw.get("wechat_down_seconds"), "alerts.rules.wechat_down_seconds", 180
         ),
         opencode_down_seconds=_positive_int(
             rules_raw.get("opencode_down_seconds"),

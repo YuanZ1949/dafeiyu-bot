@@ -265,6 +265,41 @@ class AlertManager:
                 True, "critical", "NapCat 不在线", detail
             )
 
+        channels = bot.get("channels") or {}
+        if not isinstance(channels, dict):
+            channels = {}
+        # 微信桥是可选进程：没有该 spec 时 supervisor 会注入 disabled。
+        # 只有桥 spec 存在且未禁用，或 bot 自报启用了微信通道时才评估，
+        # 避免 provider=qq / 纯 QQ 部署被误报。
+        bridge_status = (
+            self._process_status(processes, "wechat_bridge")
+            if "wechat_bridge" in processes
+            else None
+        )
+        expected_wechat = bridge_status not in (None, "disabled") or (
+            bridge_status is None and "wechat" in channels
+        )
+        if expected_wechat:
+            wechat = channels.get("wechat") or {}
+            if not isinstance(wechat, dict):
+                wechat = {}
+            bridge_down = bridge_status != "running"
+            desktop_locked = wechat.get("desktop") == "locked"
+            disconnected = wechat.get("connected") is False
+            logged_out = wechat.get("logged_in") is False
+            if bridge_down or desktop_locked or disconnected or logged_out:
+                if bridge_down:
+                    detail = f"微信桥进程不在线（状态：{bridge_status}）"
+                elif desktop_locked:
+                    detail = "桌面已锁定，微信无法操作"
+                elif disconnected:
+                    detail = "微信桥连接已断开"
+                else:
+                    detail = "微信未登录"
+                conditions["wechat_down"] = Condition(
+                    True, "critical", "微信通道不在线", detail
+                )
+
         napcat = snapshot.get("napcat") or {}
         if not isinstance(napcat, dict):
             napcat = {}
@@ -380,6 +415,7 @@ class AlertManager:
             "opencode_down": rules.opencode_down_seconds,
             "napcat_down": rules.napcat_down_seconds,
             "napcat_offline": rules.napcat_down_seconds,
+            "wechat_down": rules.wechat_down_seconds,
         }.get(rule, 0)
 
     def _repeat_seconds(self, rule: str) -> int:

@@ -218,6 +218,7 @@ alerts:
   rules:
     bot_down_seconds: 120
     napcat_down_seconds: 180
+    wechat_down_seconds: 180
     opencode_down_seconds: 120
     quota_pause: true
     disk_free_percent: 10
