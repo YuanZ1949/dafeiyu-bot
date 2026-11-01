@@ -262,18 +262,129 @@ def test_gateway_defaults_to_qq(tmp_path: Path) -> None:
     assert load(tmp_path).gateway.provider == "qq"
 
 
-def test_gateway_wechat_fails_at_startup_with_three_paths(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="微信接入未实现") as exc:
-        load(tmp_path, "gateway:\n  provider: wechat\n")
-    message = str(exc.value)
-    assert "WeChatPadPro" in message
-    assert "wxauto" in message
-    assert "继续用 QQ" in message
+def test_gateway_wechat_without_enabled_degrades_to_qq(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="dafeiyu.config"):
+        settings = load(tmp_path, "gateway:\n  provider: wechat\n")
+    assert settings.gateway.provider == "qq"
+    assert settings.wechat.enabled is False
+    assert "降级为 qq" in caplog.text
 
 
 def test_gateway_rejects_unknown_provider(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="只能是 qq 或 wechat"):
+    with pytest.raises(ConfigError, match="只能是 qq、wechat 或 both"):
         load(tmp_path, "gateway:\n  provider: telegram\n")
+
+
+WECHAT_READY = """\
+gateway:
+  provider: both
+  wechat:
+    enabled: true
+    account_nickname: 小鲸鱼
+    group_allowlist: ["123456", "wxg:0d5c1f2a3b4c"]
+"""
+
+
+def test_wechat_block_defaults(tmp_path: Path) -> None:
+    cfg = load(tmp_path).wechat
+    assert cfg.enabled is False
+    assert cfg.bridge_host == "127.0.0.1"
+    assert cfg.bridge_port == 8790
+    assert cfg.bridge_token == ""
+    assert cfg.account_nickname == ""
+    assert cfg.group_allowlist == frozenset()
+    assert cfg.max_groups == 3
+    assert cfg.poll_seconds == 8.0
+    assert cfg.send_min_interval_seconds == 20.0
+    assert cfg.send_max_per_hour == 20
+    assert cfg.send_max_per_day == 60
+    assert cfg.quiet_hours == ("23:30", "08:00")
+    assert cfg.typing_delay_seconds == (0.6, 1.2)
+    assert cfg.ack_requires_observed is True
+    assert cfg.echo_window_seconds == 120.0
+    assert cfg.keepalive is False
+    assert cfg.require_foreground_idle is True
+    assert cfg.kill_switch_file == "data/wechat.stop"
+    assert cfg.version_min == "4.1.6"
+    assert cfg.language == "zh-CN"
+    assert cfg.allow_test_inject is False
+    # 配置里没有会话别名：别名由桥本地铸造。
+    assert not hasattr(cfg, "account_alias")
+
+
+def test_wechat_ready_config_loads(tmp_path: Path) -> None:
+    settings = load(tmp_path, WECHAT_READY)
+    assert settings.gateway.provider == "both"
+    assert settings.wechat.enabled is True
+    assert settings.wechat.account_nickname == "小鲸鱼"
+    assert settings.wechat.group_allowlist == frozenset(
+        {"qq:123456", "wxg:0d5c1f2a3b4c"}
+    )
+
+
+def test_wechat_empty_allowlist_only_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="dafeiyu.config"):
+        settings = load(
+            tmp_path,
+            "gateway:\n"
+            "  provider: wechat\n"
+            "  wechat:\n"
+            "    enabled: true\n"
+            "    account_nickname: 小鲸鱼\n",
+        )
+    assert settings.wechat.enabled is True
+    assert settings.wechat.group_allowlist == frozenset()
+    assert settings.gateway.provider == "wechat"
+    assert "group_allowlist 为空" in caplog.text
+
+
+def test_wechat_empty_nickname_only_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="dafeiyu.config"):
+        settings = load(
+            tmp_path,
+            "gateway:\n"
+            "  wechat:\n"
+            "    enabled: true\n"
+            '    group_allowlist: ["wxg:abc"]\n',
+        )
+    assert settings.wechat.enabled is True
+    assert settings.wechat.account_nickname == ""
+    assert "account_nickname 为空" in caplog.text
+
+
+def test_wechat_token_never_in_repr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DAFEIYU_WECHAT_BRIDGE_TOKEN", "sentinel-token-9f3a")
+    settings = load(tmp_path, WECHAT_READY)
+    assert settings.wechat.bridge_token == "sentinel-token-9f3a"
+    assert "sentinel-token-9f3a" not in repr(settings)
+    assert "sentinel-token-9f3a" not in repr(settings.wechat)
+    assert "sentinel-token-9f3a" not in str(settings.wechat)
+
+
+def test_group_ids_normalize_to_channel_prefixes(tmp_path: Path) -> None:
+    settings = load(
+        tmp_path,
+        "groups:\n"
+        '  whitelist: [123456, "qq:777", "WXG:AbC"]\n'
+        "  blacklist: [42]\n"
+        "  admins: [42]\n",
+    )
+    assert settings.groups.whitelist == frozenset({"qq:123456", "qq:777", "wxg:abc"})
+    assert settings.groups.blacklist == frozenset({"qq:42"})
+    assert settings.groups.admins == frozenset({"qq:42"})
+
+
+def test_group_id_without_prefix_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="qq:/wxg: 前缀"):
+        load(tmp_path, 'groups:\n  whitelist: ["not-an-id"]\n')
 
 
 def test_example_config_defaults_to_free_opencode():

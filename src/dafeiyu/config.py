@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,10 @@ from .settings_local import (
 
 # 仪表盘写下的覆盖层；测试与嵌入方可以改写这个模块级路径。
 OVERRIDES_PATH = DEFAULT_PATH
+
+# 配置侧的告警只走日志：doctor 需要能加载一份「不完整」的配置来出报告，
+# 所以加载阶段不允许因为微信就绪度缺失而抛错（拒绝在 Adapter.start()）。
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -66,9 +72,10 @@ class TriggerConfig:
 
 @dataclass(frozen=True)
 class GroupsConfig:
-    whitelist: frozenset[int]
-    blacklist: frozenset[int]
-    admins: frozenset[int] = frozenset()
+    # 跨通道的会话/用户 id 一律带通道前缀（`qq:123456` / `wxg:0d5c...`）。
+    whitelist: frozenset[str]
+    blacklist: frozenset[str]
+    admins: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -169,6 +176,39 @@ class BrainConfig:
 @dataclass(frozen=True)
 class GatewayConfig:
     provider: str = "qq"
+
+
+@dataclass(frozen=True)
+class WeChatConfig:
+    """桌面微信小号通道（UIA 桥）的配置。
+
+    注意这里只有人可读的 `account_nickname`（小号在群里的微信显示昵称），
+    **没有**会话别名：alias 由桥本地铸造（task 14），两者混用会让 `at_bot`
+    退化成「任何 @ 都算」。`bridge_token` 只从 env 读，且不进 repr：配置对象
+    常被打印进日志/异常文本。
+    """
+
+    enabled: bool = False
+    bridge_host: str = "127.0.0.1"
+    bridge_port: int = 8790
+    bridge_token: str = field(default="", repr=False)
+    account_nickname: str = ""
+    group_allowlist: frozenset[str] = frozenset()
+    max_groups: int = 3
+    poll_seconds: float = 8.0
+    send_min_interval_seconds: float = 20.0
+    send_max_per_hour: int = 20
+    send_max_per_day: int = 60
+    quiet_hours: tuple[str, str] = ("23:30", "08:00")
+    typing_delay_seconds: tuple[float, float] = (0.6, 1.2)
+    ack_requires_observed: bool = True
+    echo_window_seconds: float = 120.0
+    keepalive: bool = False
+    require_foreground_idle: bool = True
+    kill_switch_file: str = "data/wechat.stop"
+    version_min: str = "4.1.6"
+    language: str = "zh-CN"
+    allow_test_inject: bool = False
 
 
 @dataclass(frozen=True)
@@ -346,6 +386,7 @@ class Settings:
     images: ImagesConfig = field(default_factory=ImagesConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
+    wechat: WeChatConfig = field(default_factory=WeChatConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
     local_model: LocalModelConfig = field(default_factory=LocalModelConfig)
     napcat: NapCatConfig = field(default_factory=NapCatConfig)
@@ -660,12 +701,127 @@ def _bool(value: Any, field: str) -> bool:
     return value
 
 
-def _int_set(value: Any, field: str) -> frozenset[int]:
+_NUMERIC_ID = re.compile(r"^[0-9]+$")
+_ID_PREFIXES = ("qq:", "wxg:")
+_QUIET_HOUR = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
+
+
+def _id_set(value: Any, field: str) -> frozenset[str]:
+    """跨通道 id 集合：纯数字补 `qq:` 前缀，带前缀的原样保留，统一 casefold。"""
     if value is None:
         return frozenset()
     if not isinstance(value, list):
         raise ConfigError(f"{field} 必须是列表")
-    return frozenset(_int(v, field) for v in value)
+    ids: set[str] = set()
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, str)):
+            raise ConfigError(f"{field} 的元素必须是数字或字符串 id")
+        text = str(item).strip()
+        if not text:
+            raise ConfigError(f"{field} 的元素不能为空")
+        if _NUMERIC_ID.match(text):
+            text = f"qq:{text}"
+        lowered = text.casefold()
+        if not lowered.startswith(_ID_PREFIXES):
+            raise ConfigError(
+                f"{field} 的元素必须是纯数字或带 qq:/wxg: 前缀：{str(item)!r}"
+            )
+        prefix, _, rest = lowered.partition(":")
+        if not rest:
+            raise ConfigError(f"{field} 的元素缺少冒号后的 id：{str(item)!r}")
+        ids.add(f"{prefix}:{rest}")
+    return frozenset(ids)
+
+
+def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
+    """解析 `gateway.wechat`；就绪度缺失只告警，不在加载阶段拒绝。"""
+    section: dict[str, Any] = {}
+    if raw is not None:
+        if not isinstance(raw, dict):
+            raise ConfigError("gateway.wechat 必须是映射")
+        section = raw
+
+    token = str(env.get("DAFEIYU_WECHAT_BRIDGE_TOKEN", "") or section.get("bridge_token") or "")
+    host = str(section.get("bridge_host") or "127.0.0.1").strip()
+    port = _int(section.get("bridge_port", 8790), "gateway.wechat.bridge_port")
+    if not 0 < port < 65536:
+        raise ConfigError("gateway.wechat.bridge_port 必须在 1-65535 之间")
+    poll_seconds = _float(section.get("poll_seconds", 8.0), "gateway.wechat.poll_seconds")
+    if poll_seconds <= 0:
+        raise ConfigError("gateway.wechat.poll_seconds 必须大于 0")
+    send_interval = _float(
+        section.get("send_min_interval_seconds", 20.0),
+        "gateway.wechat.send_min_interval_seconds",
+    )
+    if send_interval < 0:
+        raise ConfigError("gateway.wechat.send_min_interval_seconds 不能为负")
+    echo_window = _float(
+        section.get("echo_window_seconds", 120.0), "gateway.wechat.echo_window_seconds"
+    )
+    if echo_window < 0:
+        raise ConfigError("gateway.wechat.echo_window_seconds 不能为负")
+
+    quiet_hours = section.get("quiet_hours", ["23:30", "08:00"])
+    if not isinstance(quiet_hours, (list, tuple)) or len(quiet_hours) != 2:
+        raise ConfigError("gateway.wechat.quiet_hours 必须是两个 HH:MM 字符串")
+    quiet: list[str] = []
+    for item in quiet_hours:
+        text = str(item).strip()
+        if not _QUIET_HOUR.match(text):
+            raise ConfigError("gateway.wechat.quiet_hours 必须是 HH:MM（00:00-23:59）")
+        quiet.append(text)
+
+    delays = section.get("typing_delay_seconds", [0.6, 1.2])
+    if not isinstance(delays, (list, tuple)) or len(delays) != 2:
+        raise ConfigError("gateway.wechat.typing_delay_seconds 必须是两个数字")
+    low = _float(delays[0], "gateway.wechat.typing_delay_seconds")
+    high = _float(delays[1], "gateway.wechat.typing_delay_seconds")
+    if low < 0 or high < low:
+        raise ConfigError("gateway.wechat.typing_delay_seconds 必须满足 0 <= 下限 <= 上限")
+
+    kill_switch = str(section.get("kill_switch_file") or "data/wechat.stop").strip()
+    if not kill_switch:
+        raise ConfigError("gateway.wechat.kill_switch_file 不能为空")
+
+    return WeChatConfig(
+        enabled=_bool(section.get("enabled", False), "gateway.wechat.enabled"),
+        bridge_host=host,
+        bridge_port=port,
+        bridge_token=token,
+        account_nickname=str(section.get("account_nickname") or "").strip(),
+        group_allowlist=_id_set(
+            section.get("group_allowlist"), "gateway.wechat.group_allowlist"
+        ),
+        max_groups=_positive_int(
+            section.get("max_groups"), "gateway.wechat.max_groups", 3
+        ),
+        poll_seconds=poll_seconds,
+        send_min_interval_seconds=send_interval,
+        send_max_per_hour=_positive_int(
+            section.get("send_max_per_hour"), "gateway.wechat.send_max_per_hour", 20
+        ),
+        send_max_per_day=_positive_int(
+            section.get("send_max_per_day"), "gateway.wechat.send_max_per_day", 60
+        ),
+        quiet_hours=(quiet[0], quiet[1]),
+        typing_delay_seconds=(low, high),
+        ack_requires_observed=_bool(
+            section.get("ack_requires_observed", True),
+            "gateway.wechat.ack_requires_observed",
+        ),
+        echo_window_seconds=echo_window,
+        keepalive=_bool(section.get("keepalive", False), "gateway.wechat.keepalive"),
+        require_foreground_idle=_bool(
+            section.get("require_foreground_idle", True),
+            "gateway.wechat.require_foreground_idle",
+        ),
+        kill_switch_file=kill_switch,
+        version_min=str(section.get("version_min") or "4.1.6").strip(),
+        language=str(section.get("language") or "zh-CN").strip(),
+        allow_test_inject=_bool(
+            section.get("allow_test_inject", False), "gateway.wechat.allow_test_inject"
+        ),
+    )
 
 
 def _build_persona(raw: dict[str, Any]) -> PersonaConfig:
@@ -939,14 +1095,25 @@ def load_settings(
     if not isinstance(gateway_raw, dict):
         raise ConfigError("config.yaml 的 gateway 必须是映射")
     gateway_provider = str(gateway_raw.get("provider") or "qq").strip().casefold()
-    if gateway_provider not in ("qq", "wechat"):
-        raise ConfigError("gateway.provider 只能是 qq 或 wechat")
-    if gateway_provider == "wechat":
-        raise ConfigError(
-            "gateway.provider=wechat 暂不可用：微信接入未实现。可选路径只有三条："
-            "1) WeChatPadPro（付费 iPad 协议，LangBot 内置 wechatpad_api）；"
-            "2) wechatauto-replica / wxauto（Windows 桌面 RPA，依赖微信窗口常驻）；"
-            "3) 继续用 QQ（gateway.provider=qq）。"
+    if gateway_provider not in ("qq", "wechat", "both"):
+        raise ConfigError("gateway.provider 只能是 qq、wechat 或 both")
+    wechat = _build_wechat(gateway_raw.get("wechat"), env)
+    if gateway_provider in ("wechat", "both") and not wechat.enabled:
+        logger.warning(
+            "gateway.provider=%s 但 gateway.wechat.enabled=false，降级为 qq",
+            gateway_provider,
+        )
+        gateway_provider = "qq"
+    if wechat.enabled and not wechat.group_allowlist:
+        # 不继承「空白名单=所有群」语义：微信通道必须显式点名群，否则一个都不发。
+        logger.warning(
+            "gateway.wechat.enabled=true 但 group_allowlist 为空：微信通道不会发送任何消息"
+            "（WeChatAdapter.start() 会抛 ConfigError，dafeiyu doctor 第 ⑧ 项会 FAIL）"
+        )
+    if wechat.enabled and not wechat.account_nickname:
+        logger.warning(
+            "gateway.wechat.enabled=true 但 account_nickname 为空：无法判定是否被 @"
+            "（WeChatAdapter.start() 会抛 ConfigError，dafeiyu doctor 第 ⑧ 项会 FAIL）"
         )
 
     local_model_raw = raw.get("local_model") or {}
@@ -1175,9 +1342,9 @@ def load_settings(
         persona=_build_persona(_section(raw, "persona")),
         triggers=_build_triggers(_section(raw, "triggers")),
         groups=GroupsConfig(
-            whitelist=_int_set(_section(raw, "groups").get("whitelist"), "groups.whitelist"),
-            blacklist=_int_set(_section(raw, "groups").get("blacklist"), "groups.blacklist"),
-            admins=_int_set(_section(raw, "groups").get("admins"), "groups.admins"),
+            whitelist=_id_set(_section(raw, "groups").get("whitelist"), "groups.whitelist"),
+            blacklist=_id_set(_section(raw, "groups").get("blacklist"), "groups.blacklist"),
+            admins=_id_set(_section(raw, "groups").get("admins"), "groups.admins"),
         ),
         budget=_build_budget(budget_raw),
         memory=MemoryConfig(
@@ -1212,6 +1379,7 @@ def load_settings(
             mode_from_overrides=mode_from_overrides,
         ),
         gateway=GatewayConfig(provider=gateway_provider),
+        wechat=wechat,
         opencode=OpenCodeConfig(
             bin=str(opencode_raw.get("bin") or "").strip(),
             agent=opencode_agent,
