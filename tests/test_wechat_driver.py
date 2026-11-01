@@ -162,7 +162,16 @@ def test_is_running_is_false_without_pyweixin(monkeypatch) -> None:
 
 def test_list_sessions_normalises_entries(fake) -> None:
     assert driver.list_sessions() == {
-        "测试群": [{"nickname": "阿猫", "text": "你好", "kind": "text", "reply_to": ""}]
+        "测试群": [
+            {
+                "nickname": "阿猫",
+                "text": "你好",
+                "kind": "text",
+                "reply_to": "",
+                "reply_author": "",
+                "ts": 0,
+            }
+        ]
     }
 
     fake.Messages.new_messages = {}
@@ -197,6 +206,8 @@ def test_snapshot_pulls_and_normalises(fake) -> None:
         "text": "你好",
         "kind": "text",
         "reply_to": "上一条",
+        "reply_author": "",
+        "ts": 0,
     }
     # 裸字符串条目：不猜发送人，只保留文本。
     assert result["messages"][1] == {
@@ -204,6 +215,8 @@ def test_snapshot_pulls_and_normalises(fake) -> None:
         "text": "裸字符串条目",
         "kind": "text",
         "reply_to": "",
+        "reply_author": "",
+        "ts": 0,
     }
 
 

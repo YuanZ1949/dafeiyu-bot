@@ -144,6 +144,8 @@ _TEXT_KEYS = ("text", "content", "内容", "消息内容", "文本内容", "mess
 _SENDER_KEYS = ("nickname", "sender", "from", "发送人", "昵称", "群昵称", "备注")
 _KIND_KEYS = ("kind", "type", "类型", "消息类型")
 _REPLY_KEYS = ("reply_to", "quote", "引用", "被引用内容", "引用内容")
+_REPLY_AUTHOR_KEYS = ("reply_author", "quote_author", "引用人", "被引用人", "引用者")
+_TS_KEYS = ("ts", "time", "timestamp", "时间", "发送时间")
 
 
 def _about_raw() -> Any:
@@ -217,29 +219,54 @@ def is_running() -> bool:
     return True
 
 
-def _normalize_entry(entry: Any) -> dict[str, str]:
-    """把一条消息条目规整成 `{nickname, text, kind, reply_to}`。
+def _normalize_entry(entry: Any) -> dict[str, Any]:
+    """把一条消息条目规整成 `{nickname, text, kind, reply_to, reply_author, ts}`。
 
     桥的数据是从屏幕刮出来再拼的：缺字段就是一条静默丢数据的路径，所以这里
     只把**没有**的东西留成空串，不做假设性填充（尤其不猜发送人）。
+
+    `reply_author` 单独留着：上层只有拿到「引用块作者」才能判定「这是不是回复
+    机器人」（task 15）；只有引用原文时一律按非回复处理。
     """
     if isinstance(entry, str):
-        return {"nickname": "", "text": entry, "kind": "text", "reply_to": ""}
+        return {
+            "nickname": "",
+            "text": entry,
+            "kind": "text",
+            "reply_to": "",
+            "reply_author": "",
+            "ts": 0,
+        }
     if not isinstance(entry, dict):
-        return {"nickname": "", "text": str(entry), "kind": "text", "reply_to": ""}
+        return {
+            "nickname": "",
+            "text": str(entry),
+            "kind": "text",
+            "reply_to": "",
+            "reply_author": "",
+            "ts": 0,
+        }
     sender = _pick(entry, _SENDER_KEYS)
     text = _pick(entry, _TEXT_KEYS)
     kind = _pick(entry, _KIND_KEYS)
     reply = _pick(entry, _REPLY_KEYS)
+    reply_author = _pick(entry, _REPLY_AUTHOR_KEYS)
+    ts = _pick(entry, _TS_KEYS)
+    try:
+        timestamp = int(ts) if ts is not None else 0
+    except (TypeError, ValueError):
+        timestamp = 0
     return {
         "nickname": str(sender) if sender is not None else "",
         "text": str(text) if text is not None else "",
         "kind": str(kind or "text"),
         "reply_to": str(reply) if reply is not None else "",
+        "reply_author": str(reply_author) if reply_author is not None else "",
+        "ts": timestamp,
     }
 
 
-def _normalize_entries(entries: Any) -> list[dict[str, str]]:
+def _normalize_entries(entries: Any) -> list[dict[str, Any]]:
     if entries is None:
         return []
     if isinstance(entries, str):
@@ -250,7 +277,7 @@ def _normalize_entries(entries: Any) -> list[dict[str, str]]:
         raise DriverError("bad_response", f"消息条目不是可迭代对象: {entries!r}") from exc
 
 
-def list_sessions() -> dict[str, list[dict[str, str]]]:
+def list_sessions() -> dict[str, list[dict[str, Any]]]:
     """当前有新消息的会话：`{显示名: [规整后的消息条目]}`。
 
     这是「哪些会话值得轮询」的发现入口；空 dict 表示没有新消息。
