@@ -304,9 +304,9 @@ def test_check_workspace_uses_configured_limit(tmp_path: Path) -> None:
             persona_text="",
             workspace=workspace,
         )
-        target = workspace.chat_path(ChatType.PRIVATE, 1)
+        target = workspace.chat_path(ChatType.PRIVATE, "qq:1")
         target.write_text("# 标题\n" + ("- 很长的条目\n" * 200), encoding="utf-8")
-        service._check_workspace(ChatType.PRIVATE, 1)
+        service._check_workspace(ChatType.PRIVATE, "qq:1")
         assert target.stat().st_size <= 400
         assert "truncated" in target.read_text(encoding="utf-8")
     finally:
