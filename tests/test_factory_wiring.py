@@ -139,7 +139,7 @@ async def test_memory_workers_follow_brain_switch(tmp_path: Path) -> None:
         )
         old = RecordingBrain()
         new = RecordingBrain(
-            '[{"user_id": 1, "kind": "preference", "content": "喜欢钓鱼", "confidence": 0.9}]'
+            '[{"user_id": "qq:1", "kind": "preference", "content": "喜欢钓鱼", "confidence": 0.9}]'
         )
         current = {"brain": old}
         workers = build_workers(

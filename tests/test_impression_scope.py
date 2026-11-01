@@ -27,7 +27,7 @@ PRIVATE_ID = 2002
 EVERY = 3
 NOW = datetime(2026, 10, 24, 12, 0, tzinfo=timezone(timedelta(hours=8)))
 EXTRACTED = json.dumps(
-    [{"user_id": 123, "kind": "nickname", "content": "外号叫鱼片", "confidence": 0.8}]
+    [{"user_id": "qq:123", "kind": "nickname", "content": "外号叫鱼片", "confidence": 0.8}]
 )
 
 
@@ -94,7 +94,7 @@ def make_msg(i: int, chat_type: ChatType, chat_id: int) -> Message:
     return Message(
         chat_type=chat_type,
         chat_id=chat_id,
-        user_id=123,
+        user_id="qq:123",
         nickname="鱼片",
         content=f"消息 {i}",
         message_id=f"m{i}",

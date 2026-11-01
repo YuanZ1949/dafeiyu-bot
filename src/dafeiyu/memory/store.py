@@ -1621,7 +1621,7 @@ class Store:
         self,
         chat_type: ChatType,
         chat_id: int,
-        subject_user_id: int | None,
+        subject_user_id: str | None,
         kind: str,
         content: str,
         confidence: float,
@@ -1629,7 +1629,8 @@ class Store:
         source_excerpt: str = "",
         subject_nickname: str = "",
     ) -> None:
-        subject = subject_user_id or 0
+        # 空值哨兵是空串（列默认 ''），不是 0：NULL subject 表示「整群印象」。
+        subject = subject_user_id if subject_user_id is not None else ""
         nickname = subject_nickname.strip()[:40]
         if kind == "nickname":
             # 昵称是「唯一称呼」：同一用户只留最新一条，旧行交给 DELETE 让 FTS 触发器同步。
@@ -2030,10 +2031,12 @@ class Store:
 
     @staticmethod
     def _row_to_impression(r: sqlite3.Row) -> Impression:
+        # v1 的整数 0 经 TEXT 重建已是字符串 '0'，同样按「无 subject」读回。
+        v = r["subject_user_id"]
         return Impression(
             chat_type=ChatType(r["chat_type"]),
             chat_id=r["chat_id"],
-            subject_user_id=r["subject_user_id"] or None,
+            subject_user_id=None if v in ("", "0") else v,
             kind=r["kind"],
             content=r["content"],
             confidence=r["confidence"],

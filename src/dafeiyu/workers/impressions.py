@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from dafeiyu.brain.tokens import resolve_usage
 from dafeiyu.memory.store import Store
-from dafeiyu.models import ChatType, Message
+from dafeiyu.models import ChatType, Message, channel_of
 
 from .failure import FAILURE_BACKOFF_SECONDS, FailureBackoff, log_memory_failure
 
@@ -18,8 +18,9 @@ EXTRACT_SYSTEM = """\
 抽取值得长期记住的群友信息：外号/称呼（kind=nickname）、偏好与雷点（kind=preference）、
 稳定的事实（kind=fact，如职业、所在城市、养猫）。
 不要抽取一次性情绪、玩笑、隐私敏感信息（身份证、住址门牌、手机号、密码）。
+user_id 必须原样复制输入行里的前缀 id（含 "qq:"/"wxg:" 前缀），不要改写、不要漏掉前缀。
 只输出 JSON 数组，不要解释、不要代码围栏：
-[{"user_id": 123, "kind": "nickname", "content": "外号叫鱼片", "confidence": 0.8}]
+[{"user_id": "qq:123", "kind": "nickname", "content": "外号叫鱼片", "confidence": 0.8}]
 content 不超过 60 字。没有值得记的就输出 []。"""
 
 MAX_SOURCE_MESSAGES = 40
@@ -50,11 +51,16 @@ def _parse_items(raw: str) -> list[dict]:
     return [item for item in data if isinstance(item, dict)]
 
 
-def _valid_item(item: dict) -> tuple[int, str, str, float] | None:
+def _valid_item(item: dict) -> tuple[str, str, str, float] | None:
     user_id = item.get("user_id")
     kind = item.get("kind")
     content = item.get("content")
-    if not isinstance(user_id, int) or isinstance(user_id, bool):
+    # 平台 id 统一带前缀（"qq:123"/"wxg:abc"）：裸 int、空串或丢前缀的值一律丢弃。
+    if not isinstance(user_id, str):
+        return None
+    try:
+        channel_of(user_id)
+    except ValueError:
         return None
     if not isinstance(kind, str) or kind not in VALID_KINDS:
         return None

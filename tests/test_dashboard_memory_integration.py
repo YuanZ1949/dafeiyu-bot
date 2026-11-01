@@ -79,8 +79,8 @@ class FakeSupervisor:
 def seed(store: Store) -> None:
     store.upsert_summary(ChatType.GROUP, GROUP_ID, "2026-10-24", "群里聊了显卡和钓鱼")
     store.upsert_summary(ChatType.PRIVATE, PRIVATE_ID, "2026-10-23", "私聊聊了晚饭")
-    store.upsert_impression(ChatType.GROUP, GROUP_ID, 42, "nickname", "外号叫鱼片", 0.9)
-    store.upsert_impression(ChatType.GROUP, GROUP_ID, 43, "preference", "喜欢猫", 0.8)
+    store.upsert_impression(ChatType.GROUP, GROUP_ID, "qq:42", "nickname", "外号叫鱼片", 0.9)
+    store.upsert_impression(ChatType.GROUP, GROUP_ID, "qq:43", "preference", "喜欢猫", 0.8)
 
 
 async def test_dashboard_memory_reads_seeded_store_end_to_end(tmp_path: Path) -> None:
@@ -348,11 +348,11 @@ async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
 async def test_dashboard_impression_edit_and_merge_proxy(tmp_path: Path) -> None:
     group = ChatType.GROUP
     async with boot(tmp_path) as (dash, store):
-        store.upsert_impression(group, GROUP_ID, 42, "preference", "喜欢狗", 0.5)
+        store.upsert_impression(group, GROUP_ID, "qq:42", "preference", "喜欢狗", 0.5)
         rows = [
             row
             for row in store.list_impressions(group, GROUP_ID, topk=100)
-            if row.subject_user_id == 42
+            if row.subject_user_id == "qq:42"
         ]
         assert len(rows) == 2
         edit_id = rows[0].id
@@ -379,7 +379,7 @@ async def test_dashboard_impression_edit_and_merge_proxy(tmp_path: Path) -> None
             [
                 row
                 for row in store.list_impressions(group, GROUP_ID, topk=100)
-                if row.subject_user_id == 42
+                if row.subject_user_id == "qq:42"
             ]
         ) == 1
 

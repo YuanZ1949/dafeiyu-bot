@@ -31,7 +31,7 @@ class FakeBrain:
 def make_message(
     i: int,
     chat_id: int = CHAT_ID,
-    user_id: int = 123,
+    user_id: str = "qq:123",
     *,
     content: str | None = None,
     is_bot: bool = False,
@@ -65,7 +65,7 @@ async def test_no_extraction_before_every(store: Store) -> None:
 
 
 async def test_twentieth_message_triggers_extraction(store: Store) -> None:
-    brain = FakeBrain(json.dumps([{"user_id": 123, "kind": "nickname", "content": "外号叫鱼片", "confidence": 0.8}]))
+    brain = FakeBrain(json.dumps([{"user_id": "qq:123", "kind": "nickname", "content": "外号叫鱼片", "confidence": 0.8}]))
     worker = ImpressionWorker(store, brain, every=20)
     for i in range(20):
         store.add_message(make_message(i))
@@ -87,9 +87,9 @@ async def test_invalid_json_returns_zero(store: Store) -> None:
 async def test_invalid_items_are_skipped(store: Store) -> None:
     brain = FakeBrain(json.dumps([
         {"kind": "nickname", "content": "缺 user_id"},
-        {"user_id": 123, "content": "缺 kind"},
-        {"user_id": 123, "kind": "nickname", "content": ""},
-        {"user_id": 123, "kind": "fact", "content": ""},
+        {"user_id": "qq:123", "content": "缺 kind"},
+        {"user_id": "qq:123", "kind": "nickname", "content": ""},
+        {"user_id": "qq:123", "kind": "fact", "content": ""},
     ]))
     worker = ImpressionWorker(store, brain, every=1)
     store.add_message(make_message(1))
@@ -98,7 +98,7 @@ async def test_invalid_items_are_skipped(store: Store) -> None:
 
 
 async def test_duplicate_extraction_does_not_duplicate_rows(store: Store) -> None:
-    brain = FakeBrain(json.dumps([{"user_id": 123, "kind": "nickname", "content": "外号叫鱼片", "confidence": 0.8}]))
+    brain = FakeBrain(json.dumps([{"user_id": "qq:123", "kind": "nickname", "content": "外号叫鱼片", "confidence": 0.8}]))
     worker = ImpressionWorker(store, brain, every=1)
     store.add_message(make_message(1))
 
@@ -110,16 +110,16 @@ async def test_duplicate_extraction_does_not_duplicate_rows(store: Store) -> Non
 async def test_extraction_records_latest_human_source(store: Store) -> None:
     brain = FakeBrain(
         json.dumps(
-            [{"user_id": 123, "kind": "fact", "content": "住在杭州", "confidence": 0.8}]
+            [{"user_id": "qq:123", "kind": "fact", "content": "住在杭州", "confidence": 0.8}]
         )
     )
     worker = ImpressionWorker(store, brain, every=1)
     long_source = "杭州" + "补充" * 50
-    store.add_message(make_message(1, user_id=123, content="我先说一句"))
-    store.add_message(make_message(2, user_id=456, content="别人说的"))
-    store.add_message(make_message(3, user_id=123, content=long_source))
+    store.add_message(make_message(1, user_id="qq:123", content="我先说一句"))
+    store.add_message(make_message(2, user_id="qq:456", content="别人说的"))
+    store.add_message(make_message(3, user_id="qq:123", content=long_source))
     store.add_message(
-        make_message(4, user_id=123, content="bot 的最后一句", is_bot=True)
+        make_message(4, user_id="qq:123", content="bot 的最后一句", is_bot=True)
     )
 
     assert await worker.maybe_extract(CHAT, CHAT_ID) == 1
@@ -131,7 +131,7 @@ async def test_extraction_records_latest_human_source(store: Store) -> None:
 
 async def test_content_is_truncated_to_60_chars(store: Store) -> None:
     long_text = "鱼" * 100
-    brain = FakeBrain(json.dumps([{"user_id": 123, "kind": "fact", "content": long_text, "confidence": 0.5}]))
+    brain = FakeBrain(json.dumps([{"user_id": "qq:123", "kind": "fact", "content": long_text, "confidence": 0.5}]))
     worker = ImpressionWorker(store, brain, every=1)
     store.add_message(make_message(1))
     await worker.maybe_extract(CHAT, CHAT_ID)
@@ -147,7 +147,7 @@ async def test_brain_error_returns_zero(store: Store) -> None:
 
 
 async def test_missing_content_is_treated_as_empty(store: Store) -> None:
-    brain = FakeBrain(json.dumps([{"user_id": 123, "kind": "nickname", "content": None, "confidence": 0.8}]))
+    brain = FakeBrain(json.dumps([{"user_id": "qq:123", "kind": "nickname", "content": None, "confidence": 0.8}]))
     worker = ImpressionWorker(store, brain, every=1)
     store.add_message(make_message(1))
     assert await worker.maybe_extract(CHAT, CHAT_ID) == 0
@@ -207,25 +207,25 @@ async def test_failure_cooldown_blocks_retry_until_expired(store: Store) -> None
 
 
 def test_nickname_keeps_only_latest_per_user(store: Store) -> None:
-    store.upsert_impression(CHAT, CHAT_ID, 456, "nickname", "外号叫鱼干", 0.7)
-    store.upsert_impression(CHAT, CHAT_ID, 123, "nickname", "外号叫鱼片", 0.8)
-    store.upsert_impression(CHAT, CHAT_ID, 123, "nickname", "外号叫小鱼", 0.6)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:456", "nickname", "外号叫鱼干", 0.7)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:123", "nickname", "外号叫鱼片", 0.8)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:123", "nickname", "外号叫小鱼", 0.6)
 
     impressions = store.list_impressions(CHAT, CHAT_ID, topk=10)
-    mine = [im for im in impressions if im.subject_user_id == 123]
+    mine = [im for im in impressions if im.subject_user_id == "qq:123"]
     assert [im.content for im in mine] == ["外号叫小鱼"]
-    others = [im for im in impressions if im.subject_user_id == 456]
+    others = [im for im in impressions if im.subject_user_id == "qq:456"]
     assert [im.content for im in others] == ["外号叫鱼干"]
 
 
 def test_preference_dedupes_normalized_copy(store: Store) -> None:
     store.upsert_impression(
-        CHAT, CHAT_ID, 123, "preference", "喜欢 Coffee 。", 0.6, source_message_id="m1"
+        CHAT, CHAT_ID, "qq:123", "preference", "喜欢 Coffee 。", 0.6, source_message_id="m1"
     )
     first = store.list_impressions(CHAT, CHAT_ID, topk=10)[0]
 
     store.upsert_impression(
-        CHAT, CHAT_ID, 123, "preference", "喜欢coffee！", 0.9, source_message_id="m2"
+        CHAT, CHAT_ID, "qq:123", "preference", "喜欢coffee！", 0.9, source_message_id="m2"
     )
     impressions = store.list_impressions(CHAT, CHAT_ID, topk=10)
 
@@ -237,16 +237,16 @@ def test_preference_dedupes_normalized_copy(store: Store) -> None:
 
 
 def test_distinct_preferences_are_kept(store: Store) -> None:
-    store.upsert_impression(CHAT, CHAT_ID, 123, "preference", "喜欢咖啡", 0.6)
-    store.upsert_impression(CHAT, CHAT_ID, 123, "preference", "喜欢茶", 0.6)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:123", "preference", "喜欢咖啡", 0.6)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:123", "preference", "喜欢茶", 0.6)
 
     contents = {im.content for im in store.list_impressions(CHAT, CHAT_ID, topk=10)}
     assert contents == {"喜欢咖啡", "喜欢茶"}
 
 
 def test_stale_impression_ranks_after_fresh(store: Store) -> None:
-    store.upsert_impression(CHAT, CHAT_ID, 123, "preference", "喜欢咖啡", 0.9)
-    store.upsert_impression(CHAT, CHAT_ID, 123, "preference", "喜欢茶", 0.2)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:123", "preference", "喜欢咖啡", 0.9)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:123", "preference", "喜欢茶", 0.2)
     stale = next(
         im
         for im in store.list_impressions(CHAT, CHAT_ID, topk=10)
@@ -263,8 +263,8 @@ def test_stale_impression_ranks_after_fresh(store: Store) -> None:
 
 
 def test_stale_impression_still_searchable_but_ranked_last(store: Store) -> None:
-    store.upsert_impression(CHAT, CHAT_ID, 123, "preference", "喜欢咖啡", 0.9)
-    store.upsert_impression(CHAT, CHAT_ID, 123, "preference", "喜欢茶", 0.2)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:123", "preference", "喜欢咖啡", 0.9)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:123", "preference", "喜欢茶", 0.2)
     stale = next(
         im
         for im in store.list_impressions(CHAT, CHAT_ID, topk=10)
@@ -281,11 +281,11 @@ def test_stale_impression_still_searchable_but_ranked_last(store: Store) -> None
 
 
 def test_repeat_write_refreshes_last_seen_at(store: Store) -> None:
-    store.upsert_impression(CHAT, CHAT_ID, 123, "nickname", "外号叫鱼片", 0.8)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:123", "nickname", "外号叫鱼片", 0.8)
     store._conn.execute("UPDATE impressions SET last_seen_at = datetime('now', '-40 days')")
     store._conn.commit()
 
-    store.upsert_impression(CHAT, CHAT_ID, 123, "nickname", "外号叫鱼片", 0.8)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:123", "nickname", "外号叫鱼片", 0.8)
 
     row = store._conn.execute(
         "SELECT last_seen_at >= datetime('now', '-30 days') AS fresh FROM impressions"
@@ -296,7 +296,7 @@ def test_repeat_write_refreshes_last_seen_at(store: Store) -> None:
 async def test_restart_resumes_from_persisted_cursor(store: Store) -> None:
     brain = FakeBrain(
         json.dumps(
-            [{"user_id": 123, "kind": "fact", "content": "住在杭州", "confidence": 0.8}]
+            [{"user_id": "qq:123", "kind": "fact", "content": "住在杭州", "confidence": 0.8}]
         )
     )
     worker = ImpressionWorker(store, brain, every=20)
@@ -318,7 +318,7 @@ async def test_restart_resumes_from_persisted_cursor(store: Store) -> None:
 async def test_extraction_stores_subject_nickname(store: Store) -> None:
     brain = FakeBrain(
         json.dumps(
-            [{"user_id": 123, "kind": "preference", "content": "喜欢猫", "confidence": 0.9}]
+            [{"user_id": "qq:123", "kind": "preference", "content": "喜欢猫", "confidence": 0.9}]
         )
     )
     worker = ImpressionWorker(store, brain, every=1)
@@ -387,15 +387,35 @@ async def test_manual_extract_uses_recent_window(store: Store) -> None:
 
 
 def test_list_impressions_prioritizes_focus_users(store: Store) -> None:
-    store.upsert_impression(CHAT, CHAT_ID, 1, "preference", "甲喜欢咖啡", 0.9)
-    store.upsert_impression(CHAT, CHAT_ID, 2, "preference", "乙喜欢茶", 0.8)
-    store.upsert_impression(CHAT, CHAT_ID, 3, "preference", "丙喜欢酒", 0.7)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:1", "preference", "甲喜欢咖啡", 0.9)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:2", "preference", "乙喜欢茶", 0.8)
+    store.upsert_impression(CHAT, CHAT_ID, "qq:3", "preference", "丙喜欢酒", 0.7)
 
-    focused = store.list_impressions(CHAT, CHAT_ID, 2, focus_user_ids=[3])
-    assert [im.subject_user_id for im in focused] == [3, 1]
+    focused = store.list_impressions(CHAT, CHAT_ID, 2, focus_user_ids=["qq:3"])
+    assert [im.subject_user_id for im in focused] == ["qq:3", "qq:1"]
     assert [
         im.subject_user_id for im in store.list_impressions(CHAT, CHAT_ID, 2)
-    ] == [1, 2]
+    ] == ["qq:1", "qq:2"]
+
+
+async def test_batch_of_impressions_inserts_all_rows(store: Store) -> None:
+    """漏改 user_id 前缀时 3 条抽取结果会被静默丢弃（0 行落库），必须插入 3 行。"""
+    brain = FakeBrain(
+        json.dumps(
+            [
+                {"user_id": "qq:123", "kind": "nickname", "content": "外号叫鱼片", "confidence": 0.8},
+                {"user_id": "qq:123", "kind": "preference", "content": "喜欢咖啡", "confidence": 0.9},
+                {"user_id": "qq:456", "kind": "fact", "content": "住在杭州", "confidence": 0.7},
+            ]
+        )
+    )
+    worker = ImpressionWorker(store, brain, every=20)
+    for i in range(20):
+        store.add_message(make_message(i))
+    assert await worker.maybe_extract(CHAT, CHAT_ID) == 3
+
+    row = store._conn.execute("SELECT COUNT(*) AS n FROM impressions").fetchone()
+    assert row["n"] == 3
 
 
 

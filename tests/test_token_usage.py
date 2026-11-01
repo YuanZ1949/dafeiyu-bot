@@ -82,7 +82,7 @@ async def test_impression_records_estimated_usage() -> None:
     store = make_store()
     store.add_message(Message(ChatType.GROUP, 1, 1, "鱼片", "我喜欢钓鱼", "m1"))
     brain = ZeroUsageBrain(
-        '[{"user_id": 1, "kind": "preference", "content": "喜欢钓鱼", "confidence": 0.9}]'
+        '[{"user_id": "qq:1", "kind": "preference", "content": "喜欢钓鱼", "confidence": 0.9}]'
     )
     worker = ImpressionWorker(store, brain, every=1)
 

@@ -176,9 +176,9 @@ def test_recent_summaries_paginates_and_filters(store: Store) -> None:
 
 
 def test_recent_impressions_paginates_and_filters(store: Store) -> None:
-    store.upsert_impression(ChatType.GROUP, 1, 42, "fact", "喜欢猫", 0.9)
-    store.upsert_impression(ChatType.PRIVATE, 2, 43, "fact", "住杭州", 0.8)
-    store.upsert_impression(ChatType.GROUP, 3, 44, "nickname", "外号鱼片", 0.7)
+    store.upsert_impression(ChatType.GROUP, 1, "qq:42", "fact", "喜欢猫", 0.9)
+    store.upsert_impression(ChatType.PRIVATE, 2, "qq:43", "fact", "住杭州", 0.8)
+    store.upsert_impression(ChatType.GROUP, 3, "qq:44", "nickname", "外号鱼片", 0.7)
 
     assert [i.chat_id for i in store.recent_impressions(limit=10)] == ["3", "2", "1"]
     assert [i.chat_id for i in store.recent_impressions(limit=1, offset=1)] == ["2"]
