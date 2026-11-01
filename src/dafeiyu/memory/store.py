@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import re
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -30,13 +31,15 @@ class MessagePage:
     next_before: int | None
     anchor_found: bool
 
+# v2 布局：chat_id / user_id 系列一律 TEXT（会话 id 带通道前缀，如 qq:123）。
+# 老库升级走 _rebuild_v2_tables：v1 的整数值由 TEXT 亲和性隐式转成十进制字符串。
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
-    user_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
     nickname TEXT NOT NULL,
     content TEXT NOT NULL,
     is_bot INTEGER NOT NULL DEFAULT 0,
@@ -46,7 +49,7 @@ CREATE TABLE IF NOT EXISTS messages (
     reply_to_bot INTEGER NOT NULL DEFAULT 0,
     -- 回复目标：id 用于回查被回复消息的昵称，uid 是消息被清理后的退路。
     reply_to_message_id TEXT,
-    reply_to_user_id INTEGER,
+    reply_to_user_id TEXT,
     -- 非空 = 已被撤回；原文保留但不再进入 prompt。
     recalled_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -61,8 +64,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages (timestamp);
 CREATE TABLE IF NOT EXISTS impressions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
-    subject_user_id INTEGER NOT NULL DEFAULT 0,
+    chat_id TEXT NOT NULL,
+    -- v1 是 INTEGER DEFAULT 0；v2 改 TEXT 后空值哨兵是 ''（0/'0' 都算空）。
+    subject_user_id TEXT NOT NULL DEFAULT '',
     kind TEXT NOT NULL,
     content TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 0.5,
@@ -82,7 +86,7 @@ CREATE INDEX IF NOT EXISTS idx_impressions_chat ON impressions (chat_type, chat_
 -- 避免 _last_count 只存在内存导致每个活跃会话立刻白跑一次。
 CREATE TABLE IF NOT EXISTS impression_cursors (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     last_count INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (chat_type, chat_id)
@@ -92,7 +96,7 @@ CREATE TABLE IF NOT EXISTS impression_cursors (
 -- 避免重启后时区/夏令时转换把窗口算歪。
 CREATE TABLE IF NOT EXISTS chat_state (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     last_bot_spoke REAL,
     last_user_message REAL,
     muted_until REAL,
@@ -109,7 +113,7 @@ CREATE TABLE IF NOT EXISTS chat_state (
 
 CREATE TABLE IF NOT EXISTS summaries (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     date TEXT NOT NULL,
     content TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -120,7 +124,7 @@ CREATE TABLE IF NOT EXISTS summaries (
 -- pending_summary_slots 的按日 LEFT JOIN 误判成那一天的日摘要。
 CREATE TABLE IF NOT EXISTS weekly_summaries (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     week_start TEXT NOT NULL,
     content TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -130,7 +134,7 @@ CREATE TABLE IF NOT EXISTS weekly_summaries (
 CREATE TABLE IF NOT EXISTS usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     date TEXT NOT NULL,
     purpose TEXT NOT NULL,
     prompt_tokens INTEGER NOT NULL DEFAULT 0,
@@ -157,7 +161,7 @@ CREATE TABLE IF NOT EXISTS memory_rate_limit (
 
 CREATE TABLE IF NOT EXISTS opencode_sessions (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (chat_type, chat_id)
@@ -166,7 +170,7 @@ CREATE TABLE IF NOT EXISTS opencode_sessions (
 CREATE TABLE IF NOT EXISTS brain_sessions (
     provider TEXT NOT NULL,
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT,
@@ -179,7 +183,7 @@ CREATE TABLE IF NOT EXISTS brain_sessions (
 CREATE TABLE IF NOT EXISTS session_summaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -192,7 +196,7 @@ CREATE INDEX IF NOT EXISTS idx_session_summaries_chat
 --     下一次投递时自动补上（单靠单调游标会跨过空洞，漏掉更早的缺口）。
 CREATE TABLE IF NOT EXISTS delivered_cursors (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     last_message_id INTEGER NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (chat_type, chat_id)
@@ -200,7 +204,7 @@ CREATE TABLE IF NOT EXISTS delivered_cursors (
 
 CREATE TABLE IF NOT EXISTS delivered_messages (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
     delivered_at TEXT NOT NULL DEFAULT (datetime('now')),
     skipped_reason TEXT,
@@ -214,7 +218,7 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         "at_bot": "INTEGER NOT NULL DEFAULT 0",
         "reply_to_bot": "INTEGER NOT NULL DEFAULT 0",
         "reply_to_message_id": "TEXT",
-        "reply_to_user_id": "INTEGER",
+        "reply_to_user_id": "TEXT",
         "recalled_at": "TEXT",
     },
     "brain_sessions": {
@@ -510,15 +514,146 @@ class Store:
         point = str(backups[-1]) if backups else "<备份路径>"
         raise ConfigError(f"迁移未完成，请用 {point} 恢复")
 
-    def _rebuild_v2_tables(self) -> None:
-        """v2 十二张表的 TEXT 化重建（含 FTS5 与触发器按序重建），在 todo 5 中填充。
+    # v2 重建的 12 张表（顺序即执行顺序）：chat_id / user_id 系列全部 TEXT 化。
+    # messages/impressions 先重建 —— 两块外部内容 FTS 表靠它们才有可指的内容表。
+    _V2_REBUILD_TABLES: tuple[str, ...] = (
+        "messages",
+        "impressions",
+        "impression_cursors",
+        "chat_state",
+        "summaries",
+        "weekly_summaries",
+        "usage",
+        "opencode_sessions",
+        "brain_sessions",
+        "session_summaries",
+        "delivered_cursors",
+        "delivered_messages",
+    )
 
-        当前刻意留空：本任务只落地 v2 迁移骨架（备份 → 标记 → 单事务 → 版本号
-        最后写），事务顺序与崩溃恢复路径已由 tests/test_store_migration.py 独立
-        验证；库里表结构在本次迁移中保持 v1 原样，重建方法必须运行在
-        ``BEGIN IMMEDIATE`` 事务内。
+    def _rebuild_v2_tables(self) -> None:
+        """v1 → v2 的表重建：12 张表的 id 列 TEXT 化，FTS5 与触发器按序还原。
+
+        必须运行在 ``BEGIN IMMEDIATE`` 事务内（调用方保证）：任何一步失败整体
+        回滚，库里要么完整是 v1、要么完整是 v2。固定顺序：
+
+        1. 从 ``sqlite_master`` 把两个 FTS5 表、6 个触发器、这 12 张表上的全部
+           普通索引的 DDL **原样抄下来**（不手写 —— trigram/unicode61 两个
+           tokenizer 必须逐字保留，统一或重写会改变中文子串检索语义）；
+        2. ``DROP TRIGGER`` 拆掉 6 个 FTS 触发器，``DROP TABLE`` 拆掉两个 FTS 表
+           —— 不先拆会在随后 DROP/RENAME 正文表时把它们的 schema 改歪；
+        3. 逐表 ``CREATE <t>_new``（重声明完整 DDL，取自 _SCHEMA 的 v2 版）→
+           ``INSERT ... SELECT`` 显式点名（老库经 _MIGRATIONS 补列的列序与
+           _SCHEMA 不同，``SELECT *`` 会按位置错位）→ ``DROP`` 旧表 →
+           ``RENAME`` 回原名。
+           不用 ``ALTER TABLE ... RENAME`` 直接改名再迁数据：SQLite ≥3.25 会把
+           触发器体/视图里的没改引用重写到临时名上。TEXT 亲和性在 INSERT 时把
+           v1 的整数值隐式转成十进制字符串（例如 100 → ``'100'``）；
+        4. 清掉 impressions 的空值哨兵：v1 的 ``0`` 会变成字符串 ``'0'``，
+           与真实 subject 撞车，统一改成 ``''``（新 DDL 默认值也是 ``''``）；
+        5. 按抄录的 DDL 原样重建索引、FTS 表与触发器，再各跑一次
+           ``INSERT INTO <fts>(<fts>) VALUES('rebuild')`` 回填索引；
+        6. ``PRAGMA foreign_key_check`` 必须为空，否则回滚拒迁。
         """
-        return None
+        conn = self._conn
+        # 步骤 1：DROP 之前先把要保留的 DDL 从 sqlite_master 原样抄下来。
+        fts_sql: dict[str, str | None] = {}
+        for name in ("messages_fts", "impressions_fts"):
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (name,),
+            ).fetchone()
+            fts_sql[name] = None if row is None else row["sql"]
+        trigger_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger'"
+            " AND tbl_name IN ('messages', 'impressions')"
+        ).fetchall()
+        index_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+            " AND tbl_name IN ('" + "', '".join(self._V2_REBUILD_TABLES) + "')"
+        ).fetchall()
+
+        # 步骤 2：拆触发器与两个 FTS 表。
+        for name in (
+            "messages_ai", "messages_ad", "messages_au",
+            "impressions_ai", "impressions_ad", "impressions_au",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        for name in ("messages_fts", "impressions_fts"):
+            conn.execute(f"DROP TABLE IF EXISTS {name}")
+
+        # 步骤 3：逐表 CREATE _new → INSERT SELECT（显式点名）→ DROP → RENAME。
+        # 重建前先补齐 _MIGRATIONS 声明的列：老库可能缺某一列，显式列清单要求
+        # 新旧两侧列名并集一致。
+        self._ensure_columns()
+        for table in self._V2_REBUILD_TABLES:
+            ddl = self._v2_new_table_ddl(table)
+            conn.execute(ddl)
+            new_cols = [
+                row["name"]
+                for row in conn.execute(f"PRAGMA table_info({table}_new)").fetchall()
+            ]
+            old_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            if old_info:
+                # DROP／RENAME 前先把 _new 里声明、旧表却没有的列找出来：迁移是
+                # 数据不可丢的操作，缺列宁可中止回滚，也不能把值错位塞进去。
+                old_cols = {row["name"] for row in old_info}
+                missing = [name for name in new_cols if name not in old_cols]
+                if missing:
+                    raise RuntimeError(
+                        f"v2 迁移中止：表 {table} 缺列 {missing}，"
+                        "请回滚后核对 _MIGRATIONS 列清单"
+                    )
+                cols = ", ".join(new_cols)
+                conn.execute(
+                    f"INSERT INTO {table}_new ({cols}) SELECT {cols} FROM {table}"
+                )
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+            conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+
+        # 步骤 4：清空值哨兵（在同一个事务里，和重建一起原子生效）。
+        conn.execute(
+            "UPDATE impressions SET subject_user_id = '' WHERE subject_user_id = '0'"
+        )
+
+        # 步骤 5：按 sqlite_master 抄录的 DDL 原样还原索引、FTS 表与触发器；
+        # 索引先于触发器无要求，但 FTS 表必须先建 —— 触发器体往里写。
+        for row in index_sql:
+            conn.execute(row["sql"])
+        for name in ("messages_fts", "impressions_fts"):
+            if fts_sql[name] is not None:
+                conn.execute(fts_sql[name])
+        for row in trigger_sql:
+            conn.execute(row["sql"])
+        for name in ("messages_fts", "impressions_fts"):
+            if fts_sql[name] is not None:
+                conn.execute(f"INSERT INTO {name}({name}) VALUES('rebuild')")
+
+        # 步骤 6：提交前自检；有违例说明重建歪了，回滚回 v1 拒绝半迁移。
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(
+                f"v2 迁移后 PRAGMA foreign_key_check 有 {len(violations)} 行违例"
+            )
+
+    @staticmethod
+    def _v2_new_table_ddl(table: str) -> str:
+        """从 `_SCHEMA` 抽出该表的 v2 DDL，把表名变成 ``<t>_new``。
+
+        单一来源：迁移目标布局必须与空库直建的 v2 完全一致（plan 的
+        「新装库同构」要求），所以 ``_new`` 的 DDL 直接取自 _SCHEMA 本身而不是
+        再维护一份拷贝；test_fresh_and_migrated_layout_identical 兜底防漂移。
+        """
+        match = re.search(
+            rf"CREATE TABLE IF NOT EXISTS {re.escape(table)} \(.*?^\);",
+            _SCHEMA,
+            re.MULTILINE | re.DOTALL,
+        )
+        if match is None:
+            raise RuntimeError(f"_SCHEMA 里找不到表 {table} 的 DDL")
+        return match.group(0).replace(
+            f"IF NOT EXISTS {table}", f"{table}_new", 1
+        )
 
     def db_stats(self) -> dict[str, Any]:
         """健康快照用的轻量库统计；不读消息正文。"""

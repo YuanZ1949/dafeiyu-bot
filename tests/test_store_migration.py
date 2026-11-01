@@ -6,8 +6,12 @@ from pathlib import Path
 import pytest
 
 from dafeiyu.config import ConfigError
-from dafeiyu.memory.store import Store
-from dafeiyu.models import ChatType
+from dafeiyu.memory.store import (
+    Store,
+    _IMPRESSION_FTS_SCHEMA,
+    _MESSAGE_FTS_SCHEMA,
+)
+from dafeiyu.models import ChatType, Message
 
 
 def test_old_impressions_table_gets_source_columns(tmp_path: Path) -> None:
@@ -103,9 +107,13 @@ def test_old_chat_state_table_gets_new_columns(tmp_path: Path) -> None:
     finally:
         store.close()
 
-# v1 夹具 DDL：与 task 5 改造前的 _SCHEMA 逐字一致（INTEGER user_id 布局）。
-# 这是「真 schema-1 库」的快照，故故意不随 _SCHEMA 演化；task 5 负责
-# 在重建落地的同一把提交里更新夹具，让旧版本列布局一直有真实代表。
+# v1 夹具 DDL：与 task 5 改造前的 _SCHEMA 逐字一致（INTEGER chat_id/user_id 布局），
+# 含全部 12 张会被 v2 重建的表与其索引（memory_backoff/memory_rate_limit 无整型
+# id、不参与重建，留给 init_schema 建）。这是「真 schema-1 库」的快照，故故意
+# 不随 _SCHEMA 演化；task 5 负责在重建落地的同一把提交里更新夹具，让旧版本列
+# 布局一直有真实代表。
+# FTS5 部分直接复用模块常量：v1 → v2 只把正文表 id 列 TEXT 化，两个外部内容
+# FTS 表与其触发器的 DDL（含各自 tokenizer）有意原样保留。
 _V1_SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,8 +133,7 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (chat_type, chat_id, message_id)
 );
-CREATE INDEX IF NOT EXISTS idx_messages_chat
-    ON messages (chat_type, chat_id, id);
+CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages (chat_type, chat_id, id);
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts
     ON messages (chat_type, chat_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages (timestamp);
@@ -147,14 +154,128 @@ CREATE TABLE IF NOT EXISTS impressions (
     UNIQUE (chat_type, chat_id, subject_user_id, kind, content)
 );
 CREATE INDEX IF NOT EXISTS idx_impressions_chat ON impressions (chat_type, chat_id);
+
+CREATE TABLE IF NOT EXISTS impression_cursors (
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    last_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_type, chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS chat_state (
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    last_bot_spoke REAL,
+    last_user_message REAL,
+    muted_until REAL,
+    ambient_streak INTEGER NOT NULL DEFAULT 0,
+    no_reply_streak INTEGER NOT NULL DEFAULT 0,
+    downshift_until REAL,
+    last_prompt TEXT NOT NULL DEFAULT '',
+    last_prompt_at REAL,
+    thread_closed_until REAL,
+    last_closed_at REAL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_type, chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS summaries (
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    content TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_type, chat_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS weekly_summaries (
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    week_start TEXT NOT NULL,
+    content TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_type, chat_id, week_start)
+);
+
+CREATE TABLE IF NOT EXISTS usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_usage_chat_date ON usage (chat_type, chat_id, date);
+CREATE INDEX IF NOT EXISTS idx_usage_date ON usage (date);
+
+CREATE TABLE IF NOT EXISTS opencode_sessions (
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_type, chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS brain_sessions (
+    provider TEXT NOT NULL,
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT,
+    delivered_count INTEGER NOT NULL DEFAULT 0,
+    token_estimate INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (provider, chat_type, chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_session_summaries_chat
+    ON session_summaries (chat_type, chat_id, id);
+
+CREATE TABLE IF NOT EXISTS delivered_cursors (
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    last_message_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_type, chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS delivered_messages (
+    chat_type TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id TEXT NOT NULL,
+    delivered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    skipped_reason TEXT,
+    PRIMARY KEY (chat_type, chat_id, message_id)
+);
 """
 
 
 def make_v1_db(path: Path) -> None:
-    """直接拼出 schema-1 库（绕开 init_schema，不然测试对象自己盖了自己的前身）。"""
+    """直接拼出 schema-1 库（绕开 init_schema，不然测试对象自己盖了自己的前身）。
+
+    含 FTS5：v1 运行库里两个外部内容 FTS 表与 6 个触发器本来就存在，迁移要
+    靠 sqlite_master 逐字抄录的正是它们。
+    """
     conn = sqlite3.connect(path)
     try:
         conn.executescript(_V1_SCHEMA)
+        conn.executescript(_IMPRESSION_FTS_SCHEMA)
+        conn.executescript(_MESSAGE_FTS_SCHEMA)
+        conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        conn.execute(
+            "INSERT INTO impressions_fts(impressions_fts) VALUES('rebuild')"
+        )
         conn.execute("PRAGMA user_version = 1")
         conn.commit()
     finally:
@@ -229,3 +350,232 @@ def test_migration_interrupted(
     message = str(excinfo.value)
     assert "迁移未完成" in message
     assert backup_name in message
+
+
+def test_rebuild_fts_after_v2_migration(tmp_path: Path) -> None:
+    """v1 → v2 重建：数据一条不丢，FTS/trigram/触发器/哨兵清零全部就位。"""
+    db = tmp_path / "memory.db"
+    make_v1_db(db)
+
+    conn = sqlite3.connect(db)
+    try:
+        for i in range(20):
+            conn.execute(
+                """
+                INSERT INTO messages
+                    (chat_type, chat_id, message_id, user_id, nickname,
+                     content, timestamp)
+                VALUES ('group', 100, ?, '7', '测试员', ?, ?)
+                """,
+                (
+                    f"m{i}",
+                    f"飞鱼提醒{i}：天气预报说明天多云出门记得带伞。",
+                    i,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO impressions
+                    (chat_type, chat_id, subject_user_id, kind, content)
+                VALUES ('group', 100, 0, 'fact', ?)
+                """,
+                (f"历史印象第{i}条，无主语",),
+            )
+        conn.execute(
+            """
+            INSERT INTO impressions
+                (chat_type, chat_id, subject_user_id, kind, content)
+            VALUES ('group', 100, 42, 'preference', '喜欢聊天气')
+            """
+        )
+        # 迁移前先回填 v1 索引，保证「迁移后 FTS 命中」测到 rebuild 环节本身。
+        conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        conn.execute(
+            "INSERT INTO impressions_fts(impressions_fts) VALUES('rebuild')"
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM messages_fts"
+        ).fetchone()[0] == 20
+    finally:
+        conn.close()
+
+    store = Store(db)
+    try:
+        store.init_schema()
+        # 迁移后新写入仍要被触发器同步进 FTS（触发器体没有被 RENAME 改歪）。
+        store.add_message(
+            Message(
+                chat_type=ChatType.GROUP,
+                chat_id="100",
+                user_id="7",
+                message_id="mafter",
+                nickname="测试员",
+                content="迁移后新增的天气预报一条。",
+                timestamp=99,
+            )
+        )
+        total, hits = store.search_messages("天气预报")
+        assert total == 21
+        assert all("天气预报" in hit.content for hit in hits)
+    finally:
+        store.close()
+
+    conn = sqlite3.connect(db)
+    try:
+        # 数据一条不丢。
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 21
+        assert conn.execute(
+            "SELECT COUNT(*) FROM impressions"
+        ).fetchone()[0] == 21
+        # 重建后的值是字符串（TEXT 亲和性隐式转换，不再整型回读）。
+        assert conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE chat_id = '100'"
+        ).fetchone()[0] == 21
+        # 恰好 3 个 messages 触发器，6 个全量。
+        triggers = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            " AND name LIKE 'messages_%'"
+        ).fetchall()
+        assert sorted(r[0] for r in triggers) == [
+            "messages_ad", "messages_ai", "messages_au",
+        ]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master"
+            " WHERE type = 'trigger' AND name LIKE 'impressions_%'"
+        ).fetchone()[0] == 3
+        # 两个 tokenizer 原样保留（不许统一成同一个）。
+        m_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'"
+        ).fetchone()[0]
+        i_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'impressions_fts'"
+        ).fetchone()[0]
+        assert "tokenize='trigram'" in m_sql
+        assert "content='messages'" in m_sql and "content_rowid='id'" in m_sql
+        assert "tokenize='unicode61'" in i_sql
+        assert "content='impressions'" in i_sql
+        # 空值哨兵清零：v1 的 0 → '0' 被改成 ''，真实 subject 原样保留。
+        assert conn.execute(
+            "SELECT COUNT(*) FROM impressions WHERE subject_user_id = '0'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM impressions WHERE subject_user_id = ''"
+        ).fetchone()[0] == 20
+        assert conn.execute(
+            "SELECT COUNT(*) FROM impressions WHERE subject_user_id = '42'"
+        ).fetchone()[0] == 1
+        # 完整性。
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        # id 列类型抽查（TEXT 声明）。
+        for table, column in (
+            ("messages", "chat_id"),
+            ("messages", "user_id"),
+            ("messages", "reply_to_user_id"),
+            ("impressions", "subject_user_id"),
+            ("impression_cursors", "chat_id"),
+            ("summaries", "chat_id"),
+            ("delivered_cursors", "chat_id"),
+        ):
+            row = conn.execute(
+                "SELECT type FROM pragma_table_info(?) WHERE name = ?",
+                (table, column),
+            ).fetchone()
+            assert row is not None and row[0].lower() == "text"
+        assert db_version(conn) == 2
+    finally:
+        conn.close()
+
+
+def test_migrated_db_after_drop_of_messages_is_not_malformed(tmp_path: Path) -> None:
+    """重建顺序保险：正文表被删掉的残缺库迁移后，检索不许报 malformed。
+
+    messages 是外部内容 FTS5 的内容表。若迁移先动了 FTS（或重建后内容表
+    缺失），search_messages 会直接抛「database disk image is malformed」。
+    """
+    db = tmp_path / "memory.db"
+    make_v1_db(db)
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DROP TABLE messages")
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = Store(db)
+    try:
+        store.init_schema()
+        total, hits = store.search_messages("天气预报")
+        assert total == 0
+        assert hits == []
+    finally:
+        store.close()
+
+
+def test_fresh_and_migrated_layout_identical(tmp_path: Path) -> None:
+    """同构保证：空库直建 v2 与 v1 迁移出 v2 的结构必须一致（防 _SCHEMA 漂移）。"""
+    fresh_db = tmp_path / "fresh.db"
+    migrated_db = tmp_path / "migrated.db"
+
+    store = Store(fresh_db)
+    try:
+        store.init_schema()
+    finally:
+        store.close()
+    make_v1_db(migrated_db)
+    store = Store(migrated_db)
+    try:
+        store.init_schema()
+    finally:
+        store.close()
+
+    def layout(path: Path) -> tuple[dict[str, list[tuple]], list[tuple]]:
+        conn = sqlite3.connect(path)
+        try:
+            tables = {
+                table: [
+                    tuple(row)
+                    for row in conn.execute(
+                        """
+                        SELECT name, type, "notnull", dflt_value, pk
+                        FROM pragma_table_info(?)
+                        """,
+                        (table,),
+                    ).fetchall()
+                ]
+                for table in Store._V2_REBUILD_TABLES
+            }
+            master = [
+                (row[0], row[1], row[2])
+                for row in conn.execute(
+                    "SELECT type, name, tbl_name FROM sqlite_master"
+                    " WHERE name <> 'migration_marker'"
+                    " AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            ]
+            return tables, sorted(master)
+        finally:
+            conn.close()
+
+    fresh_tables, fresh_master = layout(fresh_db)
+    migrated_tables, migrated_master = layout(migrated_db)
+    assert fresh_tables == migrated_tables
+    assert fresh_master == migrated_master
+
+    # 触发器体逐字一致（RENAME 不许把触发器改写到临时表名）。
+    def trigger_sql(path: Path) -> list[tuple[str, str]]:
+        conn = sqlite3.connect(path)
+        try:
+            return sorted(
+                (row[0], row[1])
+                for row in conn.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+
+    assert trigger_sql(fresh_db) == trigger_sql(migrated_db)
+
