@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from dafeiyu.config import ConfigError
 from dafeiyu.models import ChatType, Impression, Message, Summary, WeeklySummary
 from dafeiyu.timeutil import SHANGHAI, today_shanghai
 
@@ -381,7 +382,7 @@ def _page_bounds(limit: int, offset: int) -> tuple[int, int]:
 
 
 class Store:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
@@ -400,6 +401,11 @@ class Store:
             raise RuntimeError(
                 f"数据库版本 {version} 高于程序支持版本 {self.SCHEMA_VERSION}"
             )
+        # 上一次迁移中途崩溃的库：启动即拒绝，绝不能带残留标记继续跑/自愈。
+        self._refuse_incomplete_migration()
+        if version == 1:
+            self._migrate_v2()
+            version = self.SCHEMA_VERSION
         self._conn.executescript(_SCHEMA)
         self._ensure_columns()
         self._backfill_session_created_at()
@@ -435,6 +441,84 @@ class Store:
         if version < self.SCHEMA_VERSION:
             self._conn.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
         self._conn.commit()
+
+    def _migrate_v2(self) -> None:
+        """v1 → v2 迁移：备份不成功不动库、标记先落库、重建走单事务、版本号最后写。
+
+        顺序本身就是崩溃安全的下限：
+
+        1. 备份失败 → 直接 raise 中止（没有备份就没有回退手段，绝不半迁移）；
+        2. 标记行先于事务单独提交，之后任何一步崩溃，重开库都能凭标记残留
+           拒绝启动（处理手段只有一个：用备份恢复，不是修复半个库）；
+        3. 重建 + 删标记在同一个 ``BEGIN IMMEDIATE`` 事务里，要么整体提交、
+           要么整体回滚；
+        4. ``user_version = 2`` 写在 COMMIT 之后 —— 任何时刻读到的库要么是
+           完整 v1、要么是完整 v2。
+
+        全程用 ``execute`` 显式控制事务，**不得**改用 ``executescript()``：
+        它会在执行脚本前隐式提交，把这里的事务边界打散。
+        """
+        conn = self._conn
+        # 隐式事务陷阱：进入迁移前可能已有未提交的写挂在 legacy sqlite3 的隐式
+        # 事务里（init_schema 之前路径的 UPDATE/ALTER，如 _backfill_session_created_at）。
+        # Python 3.12 legacy 模式下直接 BEGIN IMMEDIATE 会抛
+        # "OperationalError: cannot start a transaction within a transaction"，
+        # 必须先 commit 清掉隐式事务。
+        conn.commit()
+        db = Path(self.path)
+        backup = db.with_name(
+            f"{db.name}.pre-wechat-"
+            f"{datetime.now(SHANGHAI).strftime('%Y%m%dT%H%M%S')}"
+        )
+        self.backup_to(backup)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS migration_marker"
+            " (step TEXT PRIMARY KEY, started_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO migration_marker VALUES ('v2', ?)",
+            (datetime.now(SHANGHAI).isoformat(timespec="seconds"),),
+        )
+        # 标记必须独立提交：重建事务回滚不能把「库是半个」的证据一并抹掉。
+        conn.commit()
+        # WAL 未 checkpoint 就重建表，老数据仍留在 WAL 里；重建前先收敛。
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._rebuild_v2_tables()
+            conn.execute("DELETE FROM migration_marker WHERE step = 'v2'")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
+
+    def _refuse_incomplete_migration(self) -> None:
+        """崩溃恢复：migration_marker 有残留行 → 拒绝启动，指定备份文件。"""
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+            " AND name = 'migration_marker'"
+        ).fetchone()
+        if exists is None:
+            return
+        row = self._conn.execute("SELECT 1 FROM migration_marker").fetchone()
+        if row is None:
+            return
+        db = Path(self.path)
+        # 标记在备份之后、事务之前落库，所以名称最新的备份就是本次迁移的快照。
+        backups = sorted(db.parent.glob(f"{db.name}.pre-wechat-*"))
+        point = str(backups[-1]) if backups else "<备份路径>"
+        raise ConfigError(f"迁移未完成，请用 {point} 恢复")
+
+    def _rebuild_v2_tables(self) -> None:
+        """v2 十二张表的 TEXT 化重建（含 FTS5 与触发器按序重建），在 todo 5 中填充。
+
+        当前刻意留空：本任务只落地 v2 迁移骨架（备份 → 标记 → 单事务 → 版本号
+        最后写），事务顺序与崩溃恢复路径已由 tests/test_store_migration.py 独立
+        验证；库里表结构在本次迁移中保持 v1 原样，重建方法必须运行在
+        ``BEGIN IMMEDIATE`` 事务内。
+        """
+        return None
 
     def db_stats(self) -> dict[str, Any]:
         """健康快照用的轻量库统计；不读消息正文。"""

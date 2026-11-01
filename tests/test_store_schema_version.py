@@ -29,7 +29,7 @@ def message(content: str = "hi") -> Message:
 
 def test_new_db_sets_schema_version(tmp_path: Path) -> None:
     store = make_store(tmp_path / "t.db")
-    assert store.db_stats()["schema_version"] == 1
+    assert store.db_stats()["schema_version"] == 2
     store.close()
 
 
@@ -45,7 +45,7 @@ def test_old_db_is_upgraded_to_schema_version(tmp_path: Path) -> None:
 
     store = Store(path)
     store.init_schema()
-    assert store.db_stats()["schema_version"] == 1
+    assert store.db_stats()["schema_version"] == 2
     store.close()
 
 
