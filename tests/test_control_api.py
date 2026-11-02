@@ -443,13 +443,13 @@ async def test_memory_endpoint_returns_store_rows(tmp_path: Path) -> None:
     assert resp.status == 200
     summary = payload["summaries"][0]
     assert summary["chat_type"] == "group"
-    assert summary["chat_id"] == 100
+    assert summary["chat_id"] == "100"
     assert summary["date"] == "2026-10-24"
     assert summary["content"] == "昨天聊了钓鱼"
     impression = payload["impressions"][0]
     assert impression["chat_type"] == "group"
-    assert impression["chat_id"] == 100
-    assert impression["subject_user_id"] == 42
+    assert impression["chat_id"] == "100"
+    assert impression["subject_user_id"] == "42"
     assert impression["kind"] == "preference"
     assert impression["content"] == "喜欢猫"
     assert impression["confidence"] == 0.9
@@ -518,7 +518,7 @@ async def test_memory_endpoint_filters_by_chat_type_and_chat_id(tmp_path: Path) 
 
     assert resp.status == 200
     assert [i["content"] for i in payload["impressions"]] == ["私聊印象"]
-    assert [i["chat_id"] for i in group_payload["impressions"]] == [100]
+    assert [i["chat_id"] for i in group_payload["impressions"]] == ["100"]
 
 
 async def test_memory_endpoint_pages_with_offset(tmp_path: Path) -> None:
@@ -1401,7 +1401,7 @@ async def test_delete_user_messages_returns_count_and_is_idempotent(
     assert second_data == {"ok": True, "deleted_messages": 0}
     assert control.store.count_messages(ChatType.GROUP, 100) == 1
     remaining = control.store.recent_messages(ChatType.GROUP, 100, 10)
-    assert [message.user_id for message in remaining] == [8]
+    assert [message.user_id for message in remaining] == ["8"]
 
 
 async def test_delete_user_messages_rejects_invalid_target(tmp_path: Path) -> None:

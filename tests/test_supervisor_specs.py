@@ -130,6 +130,12 @@ def test_opencode_spec_without_config_home_keeps_inherited_env(tmp_path: Path) -
 def build_with_opencode(tmp_path: Path, opencode_yaml: str):
     config = tmp_path / "config.yaml"
     config.write_text(BASE + "\nopencode:\n" + opencode_yaml, encoding="utf-8")
+    env_file = tmp_path / "test.env"
+    env_file.write_text(ENV, encoding="utf-8")
+    settings = load_settings(env_file=env_file, config_file=config)
+    return settings, build_specs(settings, "token-abc")
+
+
 WECHAT_TOKEN = "wx-bridge-secret-6f1c"
 
 
