@@ -10,6 +10,14 @@
 
 本模块**不允许** import pyweixin / pywinauto / pyautogui：微信桥的桌面依赖
 只存在于 `gateway/wechat_bridge/`，这里必须能在没装桥依赖的机器上导入。
+
+选型已在 2026-11-01 复核后定稿：走**免费 UIA 桥**（`wechat_bridge` + `pyweixin`，
+PyPI 包名 `pywechat127`，支持微信 4.1.6+），不再保留「三条候选路径」的说法。
+hook 系方案均已不可用（WeChatFerry 2026-07-10 归档、Gewechat 停止维护、
+wxhook 锁 3.9.5.81），wxauto 开源版止于 3.9.X，WeChatPadPro 付费且受 DMCA 压力，
+腾讯官方 ClawBot/iLink 仅支持 1v1 私聊、进不了群。代价与边界（无真实 message_id、
+无撤回、同名群需人工区分、锁屏掉线、封号自担）见
+`docs/superpowers/specs/2026-10-24-im-bot-design.md` 第 3.1 节「已更新」段落。
 """
 
 from __future__ import annotations

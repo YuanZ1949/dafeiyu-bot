@@ -46,6 +46,35 @@
 
 结论：**开源、稳定、合规三者在个人微信上不可兼得。**
 
+#### 3.1.1 已更新：2026-11-01 复核
+
+> 以下为 2026-11-01 逐项复核后的事实，**保留上面的 2026-10-24 结论作为历史**。
+
+| 项目 | 2026-11-01 状态 | 仓库 / 来源 |
+|---|---|---|
+| WeChatFerry | 仓库已归档（归档日 **2026-07-10**），最后 release v39.5.2 仅配微信 3.9.12.51 | https://github.com/lich0821/WeChatFerry |
+| Gewechat | README 明写「本项目已停止维护」，服务、镜像、技术支持均不再提供 | https://github.com/Devo919/Gewechat |
+| WeChatPadPro | 仍活跃（最近 push **2026-08-20**），核心能力需赞助付费解锁；生态受 DMCA 下架压力 | https://github.com/WeChatPadPro/WeChatPadPro |
+| 开源 wxhook | DLL 注入方案，锁死微信 **3.9.5.81**，无 4.x | https://github.com/miloira/wxhook |
+| wxauto 开源版 | 仓库定位 3.9 archive（`pyproject` 版本 39.2.1），止于微信 3.9.X；4.x 走独立付费/激活线 | https://github.com/cluic/wxauto |
+| pyweixin（`pywechat127` **1.9.8**，**2026-06-10** 发布） | 纯 UIA、不注入，适用微信 3.9.12.x 与 **4.1.6+**，本项目采用 | https://pypi.org/project/pywechat127/ |
+| 腾讯官方 ClawBot / iLink | 仅 **1v1 私聊**；bot 账号无法进群，协议不支持 @ 提醒，覆盖不了群聊场景 | https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin |
+
+**本项目选择：免费 UIA（`wechat_bridge` + `pyweixin`）。**
+
+理由：
+- 群里可用的方案只剩 UIA/RPA 一条：hook 系全部归档/停更/锁旧版本，iPad 协议付费且违规，官方 iLink 进不了群。
+- 成本最低：不买授权、不依赖私服，桥只在本机 `127.0.0.1` 跑，token 鉴权。
+- 边界可控：桥把 UIA 的脏活隔离在独立进程，主进程只走本地 HTTP/WS 信封；急停、限速、白名单可在配置层硬拦。
+
+代价（必须承认）：
+- 没有真实 `message_id`，id 由桥本地铸造；不支持撤回/编辑事件；同名群需人工区分。
+- 依赖解锁的交互式桌面会话，锁屏/远程断开即掉线，不能跑成服务（Session 0）。
+- 微信客户端升级可能让 UIA 失效；封号风险由使用者自担。
+- @ 触发依赖轮询，存在 `poll_seconds` 级延迟。
+
+协议与实现细节见 `2026-11-01-wechat-bridge-protocol.md`；运维边界见 README「3.5 接入微信」。
+
 ### 3.2 QQ：通道成熟
 
 NapCat（NapNeko/NapCatQQ）基于 NTQQ 实现 OneBot v11 协议，活跃维护，Windows 下可直接运行 Shell 版并扫码登录。AstrBot、LangBot、Kirara 等主流框架均原生支持。
@@ -416,6 +445,11 @@ class WeChatAdapter:
 3. **企业微信 / 公众号** —— 合规稳定，但进不了普通微信群。
 
 选型留到用户决定承担风险时再做，本设计不预设。
+
+> **已更新（2026-11-01）**：选型已定，改为免费 UIA 桥（`wechat_bridge` + `pyweixin`），
+> 实现见 `gateway/wechat.py` 与 `gateway/wechat_bridge/`，协议见
+> `2026-11-01-wechat-bridge-protocol.md`。上面的三条候选路径保留作为 2026-10-24 的历史结论；
+> 其中 WeChatPadPro 仍付费且受 DMCA 压力，wxauto 开源版止于 3.9.X，企业微信/公众号进不了普通微信群。
 
 ## 19. 开放问题
 
