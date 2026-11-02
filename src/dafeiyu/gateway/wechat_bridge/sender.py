@@ -74,6 +74,13 @@ class _Job:
     future: Future[SendResult] = field(default_factory=Future)
 
 
+def _completed(result: SendResult) -> Future[SendResult]:
+    """已完成的 future：把校验失败/已关闭也统一成 future 接口。"""
+    future: Future[SendResult] = Future()
+    future.set_result(result)
+    return future
+
+
 def get_foreground_window() -> int | None:
     """当前前台窗口句柄；非 Windows / API 不可用时返回 None（调用方 fail-closed）。"""
     if sys.platform != "win32":
@@ -305,16 +312,54 @@ class Sender:
         self.close()
 
     def close(self, timeout: float = 5.0) -> None:
-        """停止工作线程；队列里已入队的任务会先执行完（FIFO 语义）。"""
+        """停止工作线程；队列里已入队的任务会先执行完（FIFO 语义）。
+
+        幂等：abort() 之后仍会 join 工作线程（旧实现看到 ``_closed`` 就直接
+        return，会让 stop 路径漏掉 join）。
+        """
         with self._worker_lock:
-            if self._closed:
-                return
             self._closed = True
             worker = self._worker
             if worker is not None and worker.is_alive():
                 self._queue.put(None)
         if worker is not None:
             worker.join(timeout)
+
+    def abort(self) -> int:
+        """非阻塞地关闭发送器并丢弃队列里还没开始的发送，返回丢弃条数。
+
+        与 ``close()`` 的 FIFO 语义不同：停机时不能把队列里的发送一条条发完
+        （20s 节奏下可能拖几分钟）。已入队的 future 用 ``closed`` 结果完成，
+        而不是 cancel —— ``concurrent.futures.CancelledError`` 会让调用方误报
+        internal_error。正在 ``_execute`` 里的单次发送无法从外部打断，但驱动
+        代理会在下一次 UI 调用前发现桥已停止并失败。
+        """
+        cancelled = 0
+        with self._worker_lock:
+            self._closed = True
+            worker = self._worker
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if item is not None and item.future.set_running_or_notify_cancel():
+                        item.future.set_result(
+                            SendResult(
+                                False,
+                                "closed",
+                                "failed",
+                                chat_name=item.chat_name,
+                                detail="发送器已中止",
+                            )
+                        )
+                        cancelled += 1
+                finally:
+                    self._queue.task_done()
+            if worker is not None and worker.is_alive():
+                self._queue.put(None)
+        return cancelled
 
     @property
     def connected(self) -> bool:
@@ -340,19 +385,37 @@ class Sender:
         `submit()` 可以并发调用；返回顺序不必等于完成顺序，但驱动调用严格按入队
         顺序串行执行，不会交叉。
         """
+        return self.submit_async(chat_name, text).result()
+
+    def submit_async(self, chat_name: str, text: str) -> Future[SendResult]:
+        """入队并立即返回 future；不阻塞调用线程。
+
+        生产桥用 ``await asyncio.wrap_future(sender.submit_async(...))``：事件
+        循环线程只等 future，真正的驱动调用仍在 Sender 自己的 worker 上（再经
+        UiThread 代理回到 STA 线程）。等待超时取消 future 时，尚未被 worker
+        取走的发送会被跳过，不会出现「回执超时但消息仍发出」。
+        """
         name = str(chat_name or "").strip()
         body = "" if text is None else str(text)
         if not name:
-            return SendResult(False, "invalid_argument", "failed", detail="会话显示名为空")
+            return _completed(
+                SendResult(False, "invalid_argument", "failed", detail="会话显示名为空")
+            )
         if not body:
-            return SendResult(False, "invalid_argument", "failed", detail="消息内容为空")
+            return _completed(
+                SendResult(False, "invalid_argument", "failed", detail="消息内容为空")
+            )
         if self._closed:
-            return SendResult(False, "closed", "failed", detail="发送器已关闭")
+            return _completed(
+                SendResult(False, "closed", "failed", detail="发送器已关闭")
+            )
 
         job = _Job(name, body)
         with self._worker_lock:
             if self._closed:
-                return SendResult(False, "closed", "failed", detail="发送器已关闭")
+                return _completed(
+                    SendResult(False, "closed", "failed", detail="发送器已关闭")
+                )
             if self._worker is None or not self._worker.is_alive():
                 self._worker = threading.Thread(
                     target=self._run,
@@ -361,7 +424,7 @@ class Sender:
                 )
                 self._worker.start()
             self._queue.put(job)
-        return job.future.result()
+        return job.future
 
     def _run(self) -> None:
         while True:
@@ -429,6 +492,12 @@ class Sender:
 
     # ------------------------------------------------------------- 闸门 + 发送
     def _execute(self, chat_name: str, text: str) -> SendResult:
+        # 已 abort/close：worker 可能刚取到 job 还没开始执行，直接回 closed。
+        if self._closed:
+            return SendResult(
+                False, "closed", "failed", chat_name=chat_name, detail="发送器已关闭"
+            )
+
         # (a) 急停文件：连驱动都不碰。
         kill_raw = str(_cfg(self._config, "kill_switch_file", "") or "")
         kill_switch = Path(kill_raw) if kill_raw else None

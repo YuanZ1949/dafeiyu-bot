@@ -16,7 +16,9 @@ PART B 接线：
     `server.pump_frames`；
 -   `frame_source=` 仍可注入（PART A 测试/离线回放），此时不启动 UIA 线程；
 -   `poller_factory=` 是测试接缝（默认 `PollingLoop(wechat, driver)`）；
--   `command_handler=` 仍是可注入的占位实现，发送器接线留给后续任务。
+-   `command_handler=` 注入时由调用方全权接管所有动作；默认走内置发送路径：
+    `wxg:<alias>` -> 注册表显示名 -> `Sender` -> `_UiThreadDriver`（投递到
+    轮询循环的 STA/UIA 线程），事件循环线程永不直接执行 UIA/pyweixin。
 
 停机语义（SIGINT 与 `action:"stop"` 等价）：`stop` 指令第一步先
 `PollingLoop.abort_sends()`（丢掉排队中的发送、停止发起新的 UI op；已在执行的
@@ -29,10 +31,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import logging
 import signal
 import sys
+import threading
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any
@@ -46,8 +50,11 @@ __all__ = ["main", "run"]
 DEFAULT_CONFIG_PATH = "config.yaml"
 DEFAULT_ENV_FILE = ".env"
 
-# 反挂死护栏：每一个 await 都有显式超时（<= 5s）。
+# 反挂死护栏：正常指令的每一个 await 都有显式超时（<= 5s）。
 _AWAIT_TIMEOUT = 5.0
+# 发送指令单独放宽：Sender 默认 20s 节奏，5s 会在消息仍要发出时先回 timeout，
+# 客户端按 §7.6 换新 id 重试就会重复发送。客户端 _SEND_TIMEOUT 必须更大。
+_SEND_ACTIONS = ("send_text", "send_at")
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +69,181 @@ FrameSource = Iterable[dict[str, Any]] | AsyncIterable[dict[str, Any]]
 #: 轮询循环工厂：`(wechat, driver) -> PollingLoop`（鸭子类型，测试可注入）。
 PollerFactory = Callable[[WeChatConfig, Any], Any]
 
+#: 发送器工厂：`(wechat, poller, driver) -> Sender`（测试与停机缝可注入）。
+SenderFactory = Callable[[WeChatConfig, Any, Any], Any]
+
+
+class _CommandError(Exception):
+    """指令参数/会话解析失败；``code`` 直接作为回执的 error_code。"""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class _UiThreadDriver:
+    """把 Sender 的驱动调用路由到轮询循环的单 STA/UIA 线程。
+
+    Sender 的 worker 是普通线程；桌面微信的 UIA 调用必须在 `PollingLoop.ui` 的
+    COM/STA 线程上执行，否则会抛 COM 初始化错误。本代理只做一件事：把
+    `open_chat/send_text/snapshot` 投进 UI 线程的发送优先队列并等结果。
+
+    `Sender.__init__` 会探测 ``_force_global_config`` + ``_pyweixin_or_none``；
+    两个都提供（且 ``_pyweixin_or_none`` 也走 UI 线程）时，Sender 不会再在自己
+    的构造线程上 import pyweixin。
+    """
+
+    #: 单次 UI 调用的本地等待上限；必须小于服务器/客户端对发送的整体超时。
+    _TIMEOUT = 60.0
+
+    def __init__(self, poller: Any, raw: Any) -> None:
+        self._poller = poller
+        self._raw = raw
+
+    def open_chat(self, name: str) -> Any:
+        return self._call("open_chat", lambda: self._raw.open_chat(name))
+
+    def send_text(self, name: str, text: str, delay: float) -> Any:
+        return self._call(
+            "send_text", lambda: self._raw.send_text(name, text, delay)
+        )
+
+    def snapshot(self, handle: Any) -> Any:
+        return self._call("snapshot", lambda: self._raw.snapshot(handle))
+
+    def _call(self, label: str, fn: Callable[[], Any]) -> Any:
+        from .driver import DriverError
+
+        # 桥已在停机：不要再往 UI 线程投递新 op。
+        if getattr(self._poller, "stopped", False):
+            raise DriverError("aborted", "bridge is stopping")
+        ui = getattr(self._poller, "ui", None)
+        if ui is None or not getattr(ui, "running", False):
+            raise DriverError("uia_unavailable", f"{label}: UIA 线程未运行")
+        # 死锁护栏：`request_send(lambda: sender.submit(...))` 会在 UI 线程里再等
+        # UI 线程，必须立刻失败而不是挂住。
+        if threading.get_ident() == getattr(ui, "thread_ident", None):
+            raise DriverError("deadlock_guard", f"{label}: 不能从 UIA 线程再投递")
+        try:
+            enqueue = getattr(self._poller, "enqueue_send", None)
+            if callable(enqueue):
+                future = enqueue(fn)
+            else:
+                future = ui.submit(fn, kind="send")
+        except RuntimeError as exc:
+            raise DriverError("uia_unavailable", f"{label}: {exc}") from exc
+        try:
+            return future.result(timeout=self._TIMEOUT)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise DriverError("timeout", label) from exc
+        except concurrent.futures.CancelledError as exc:
+            raise DriverError("aborted", label) from exc
+
+    def _pyweixin_or_none(self) -> Any:
+        getter = getattr(self._raw, "_pyweixin_or_none", None)
+        if not callable(getter):
+            return None
+        return self._call("pyweixin", getter)
+
+    def _force_global_config(self, wx: Any) -> None:
+        force = getattr(self._raw, "_force_global_config", None)
+        if callable(force):
+            force(wx)
+
+
+def _default_sender_factory(wechat: WeChatConfig, poller: Any, driver: Any) -> Any:
+    """生产发送器：惰性 import Sender，驱动换成 STA 代理。
+
+    不传 `health=`：HealthProbe 会直接调 pyweixin，必须在 UI 线程，P0 先走
+    `desktop_state()`/前台检查的实时路径（见计划 P1 项）。
+    """
+    from .sender import Sender
+
+    return Sender(wechat, driver=_UiThreadDriver(poller, raw=driver))
+
+
+def _failed(code: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error_code": code,
+        "delivered": "failed",
+        "message_id": None,
+    }
+
+
+def _validate_send(
+    action: str, params: dict[str, Any]
+) -> tuple[str, str, tuple[str, ...]]:
+    """校验 send_text / send_at 的入参，返回 ``(chat_id, text, at)``。"""
+    chat_id = params.get("chat_id")
+    if not isinstance(chat_id, str) or not chat_id.strip().startswith("wxg:"):
+        raise _CommandError("bad_params")
+    text = params.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise _CommandError("bad_params")
+    at: tuple[str, ...] = ()
+    if action == "send_at":
+        raw = params.get("at")
+        if not isinstance(raw, (list, tuple)):
+            raise _CommandError("bad_params")
+        if any(not isinstance(item, str) or not item.strip() for item in raw):
+            raise _CommandError("bad_params")
+        at = tuple(item.strip() for item in raw)
+    return chat_id.strip(), text, at
+
+
+def _resolve_chat_name(
+    poller: Any, allowlist: Any, chat_id: str
+) -> str:
+    """`wxg:<alias>` -> 微信显示名；只读注册表，绝不 resolve 出新别名。"""
+    alias = chat_id[4:].strip()
+    if not alias or alias == "self":
+        raise _CommandError("bad_params")
+    registry = getattr(poller, "registry", None)
+    if registry is None:
+        raise _CommandError("chat_name_unresolved")
+    peer = registry.by_alias(alias)
+    name = str(getattr(peer, "display_name", "") or "").strip()
+    if peer is None or not getattr(peer, "live", False) or not name:
+        raise _CommandError("chat_name_unresolved")
+    allowed = {str(group).strip() for group in (allowlist or ())}
+    if getattr(peer, "kind", "group") != "group" or name not in allowed:
+        raise _CommandError("chat_not_allowed")
+    return name
+
+
+def _receipt_from_result(result: Any) -> dict[str, Any]:
+    """`SendResult` -> 协议回执（§4 的四个字段）。"""
+    ok = bool(getattr(result, "ok", False))
+    code = getattr(result, "error_code", None)
+    delivered = str(getattr(result, "delivered", "failed") or "failed")
+    message_id = getattr(result, "message_id", None)
+    if ok:
+        return {
+            "ok": True,
+            "error_code": None,
+            "delivered": delivered,
+            "message_id": message_id,
+        }
+    # 已打进输入框但回轮询没看到气泡：send_text 已经成功，按 typed 回执，
+    # 映射成失败会诱发客户端换 id 重发（协议 §7.6）。
+    if code == "not_observed":
+        return {
+            "ok": True,
+            "error_code": "not_observed",
+            "delivered": "typed",
+            "message_id": None,
+        }
+    if code in ("not_friend", "chat_not_found"):
+        code = "chat_name_unresolved"
+    return {
+        "ok": False,
+        "error_code": code or "send_failed",
+        "delivered": "failed",
+        "message_id": None,
+    }
+
 
 async def run(
     argv: list[str] | None = None,
@@ -72,6 +254,7 @@ async def run(
     command_handler: CommandHandler | None = None,
     frame_source: FrameSource | None = None,
     poller_factory: PollerFactory | None = None,
+    sender_factory: SenderFactory | None = None,
 ) -> int:
     """加载配置、fail-closed 检查、起服务器、轮询、等待停机。
 
@@ -100,12 +283,16 @@ async def run(
     stop = loop.create_future()
     # poller 在服务器工厂之后才构造：回调要能引用到它（action:"stop" 先 abort）。
     poller_holder: list[Any] = []
+    sender_holder: list[Any] = []
     # 必须早于 server / resume 闭包初始化，否则 resume 可能撞上 UnboundLocalError。
     poller: Any | None = None
     pump_task: asyncio.Task[None] | None = None
 
     def _signal_stop() -> None:
         # §7 / PART B：stop 的第一件事是中止发送（丢排队 job、停止新 UI op）。
+        for sender in sender_holder:
+            with contextlib.suppress(Exception):
+                sender.abort()
         for poller in poller_holder:
             with contextlib.suppress(Exception):
                 poller.abort_sends()
@@ -127,14 +314,43 @@ async def run(
         logger.info("微信桥收到 resume 指令，轮询已恢复")
         return {"ok": True}
 
+    async def _builtin_send(
+        action: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """生产发送路径：解析 alias -> 提交 Sender -> 映射回执。"""
+        try:
+            chat_id, text, at = _validate_send(action, params)
+            if at:
+                # P0 不支持定向 @：明确失败，绝不悄悄丢掉 @ 当普通消息发。
+                return _failed("unsupported_at")
+            name = _resolve_chat_name(
+                poller, getattr(wechat, "group_allowlist", ()), chat_id
+            )
+            if not sender_holder:
+                raise _CommandError("not_ready")
+            sender = sender_holder[0]
+            # 只等 future：驱动调用在 Sender worker -> UiThread 上，事件循环
+            # 线程绝不直接碰 UIA。
+            result = await asyncio.wrap_future(sender.submit_async(name, text))
+        except asyncio.CancelledError:
+            raise
+        except _CommandError as exc:
+            return _failed(exc.code)
+        except Exception:
+            logger.exception("微信桥发送异常 action=%s", action)
+            return _failed("internal_error")
+        return _receipt_from_result(result)
+
     async def _handle_command(
         action: str, params: dict[str, Any], command_id: str
     ) -> dict[str, Any] | None:
         if action == "resume":
             return await _resume_bridge()
-        if command_handler is None:
+        if command_handler is not None:
+            return await command_handler(action, params, command_id)
+        if action not in _SEND_ACTIONS:
             return None
-        return await command_handler(action, params, command_id)
+        return await _builtin_send(action, params)
 
     server = (server_factory or BridgeServer)(
         wechat.bridge_host,
@@ -159,6 +375,13 @@ async def run(
             poller = (poller_factory or _default_poller_factory)(wechat, driver)
             poller_holder.append(poller)
             await asyncio.wait_for(poller.start(), _AWAIT_TIMEOUT)
+            # 默认指令处理器 = 内置发送路径；注入 handler 时由调用方全权接管，
+            # 注入 frame_source 时没有轮询循环，也就没有可解析的 alias。
+            if command_handler is None:
+                sender = (sender_factory or _default_sender_factory)(
+                    wechat, poller, driver
+                )
+                sender_holder.append(sender)
             source = poller.frames()
         else:
             source = frame_source
@@ -166,6 +389,10 @@ async def run(
         await _wait_for_stop(stop, loop)
     finally:
         # 1) 让轮询循环和排队中的发送一起停手（幂等，可在异常路径重复调用）。
+        #    先 abort 发送器：丢弃 Sender 队列里还没开始的 job，再停 UIA 侧的发送队列。
+        for sender in sender_holder:
+            with contextlib.suppress(Exception):
+                sender.abort()
         if poller is not None:
             with contextlib.suppress(Exception):
                 poller.abort_sends()
@@ -180,6 +407,10 @@ async def run(
         if poller is not None:
             with contextlib.suppress(Exception):
                 poller.stop(timeout=_AWAIT_TIMEOUT)
+        # 3.5) join 发送器 worker：abort() 之后 close() 仍会 join（幂等）。
+        for sender in sender_holder:
+            with contextlib.suppress(Exception):
+                sender.close(timeout=_AWAIT_TIMEOUT)
         # 4) 最终健康帧：**无条件**发出（协议 §7 / 计划 task 18 都要求停机时
         #    自报断链）。优先用最近快照；一帧 health 都没推过时用启动帧兜底，
         #    绝不因为 frame_source 只产消息帧就跳过停机通知。

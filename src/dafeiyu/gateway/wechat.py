@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 _BRIDGE_PATH = "/wechat-bridge"
 _PROTOCOL_VERSION = 1
-_SEND_TIMEOUT = 15.0
+_SEND_TIMEOUT = 150.0  # 必须大于桥服务器的发送超时 120s，否则客户端先重试造成重复发送
 _STOP_TIMEOUT = 1.0
 _MAX_FRAME = 1 << 20
 _RECONNECT_DELAYS = (1, 2, 4, 8, 16, 30)

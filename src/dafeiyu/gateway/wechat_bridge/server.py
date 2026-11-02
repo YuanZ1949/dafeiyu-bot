@@ -49,8 +49,12 @@ PROTOCOL_VERSION = 1
 _KNOWN_ACTIONS = ("send_text", "send_at", "probe", "stop", "resume")
 _MAX_FRAME = 1 << 20
 
-# 反挂死护栏：服务器内的每一个 await 都有显式超时（<= 5s）。
+# 反挂死护栏：服务器内的每一个 await 都有显式超时（发送除外，见下）。
 _AWAIT_TIMEOUT = 5.0
+# 发送指令单独放宽：Sender 默认 20s 节奏，5s 会在消息仍要发出时先回 timeout，
+# 客户端按 §7.6 换新 id 重试就会重复发送。客户端 _SEND_TIMEOUT 必须更大。
+_SEND_AWAIT_TIMEOUT = 120.0
+_SEND_ACTIONS = ("send_text", "send_at")
 _CLOSE_CODE_VERSION_MISMATCH = 1002
 _CLOSE_CODE_GOING_AWAY = 1001
 
@@ -98,6 +102,7 @@ class BridgeServer:
         bridge_token: str = "",
         command_handler: CommandHandler | None = None,
         on_stop_requested: Callable[[], None] | None = None,
+        send_timeout: float | None = None,
     ) -> None:
         self.host = host
         self._requested_port = int(port)
@@ -105,6 +110,10 @@ class BridgeServer:
         self._bridge_token = str(bridge_token or "")
         self.command_handler = command_handler
         self._on_stop_requested = on_stop_requested
+        # 发送指令的等待上限：默认 120s（Sender 20s 节奏）；测试可注入更短值。
+        self._send_timeout = (
+            _SEND_AWAIT_TIMEOUT if send_timeout is None else float(send_timeout)
+        )
         self._server: Any | None = None
         self._stop: asyncio.Future[None] | None = None
         self._closed = False
@@ -311,10 +320,11 @@ class BridgeServer:
     ) -> dict[str, Any]:
         handler = self.command_handler
         result: dict[str, Any] | None = None
+        timeout = self._send_timeout if action in _SEND_ACTIONS else _AWAIT_TIMEOUT
         if handler is not None:
             try:
                 result = await asyncio.wait_for(
-                    handler(action, params, command_id), _AWAIT_TIMEOUT
+                    handler(action, params, command_id), timeout
                 )
             except TimeoutError:
                 return _receipt(command_id, False, "timeout")

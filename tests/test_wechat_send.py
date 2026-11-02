@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import subprocess
 import sys
@@ -389,3 +390,97 @@ def test_sender_imports_without_pyweixin() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "ok dafeiyu.gateway.wechat_bridge.sender" in result.stdout
+
+
+# ------------------------------------------------------- 异步提交 / 中止（P0 #34）
+class BlockingDriver(FakeDriver):
+    """`open_chat` 卡在 gate 上，稳定复现「一条 in-flight + 若干排队」。"""
+
+    def __init__(self, clock: FakeClock, gate: threading.Event) -> None:
+        super().__init__(clock)
+        self.gate = gate
+        self.started = threading.Event()
+
+    def open_chat(self, name: str) -> ChatHandle:
+        self.started.set()
+        assert self.gate.wait(5.0)
+        return super().open_chat(name)
+
+
+def test_submit_async_returns_future_and_completes(harness) -> None:
+    h = harness(send_min_interval_seconds=0.0)
+
+    future = h.sender.submit_async("测试群", "异步")
+
+    assert isinstance(future, concurrent.futures.Future)
+    result = future.result(timeout=5.0)
+    assert result.ok is True
+    assert result.delivered == "observed"
+
+
+def test_cancel_before_worker_starts_skips_driver(tmp_path: Path) -> None:
+    clock = FakeClock()
+    gate = threading.Event()
+    fake = BlockingDriver(clock, gate)
+    instance = Sender(
+        make_config(tmp_path, send_min_interval_seconds=0.0),
+        driver=fake,
+        clock=clock,
+        sleep=clock.sleep,
+        uniform=lambda low, high: high,
+        session_epoch=7,
+    )
+    try:
+        first = instance.submit_async("测试群", "第一条")
+        assert fake.started.wait(5.0)
+        second = instance.submit_async("测试群", "第二条")
+        assert second.cancel() is True
+        gate.set()
+
+        assert first.result(timeout=5.0).ok is True
+        with pytest.raises(concurrent.futures.CancelledError):
+            second.result(timeout=5.0)
+        texts = [call["text"] for call in fake.calls if call["action"] == "send_text"]
+        assert texts == ["第一条"]
+    finally:
+        gate.set()
+        instance.close(timeout=5.0)
+
+
+def test_abort_fails_queued_jobs_as_closed_and_close_still_joins(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    gate = threading.Event()
+    fake = BlockingDriver(clock, gate)
+    instance = Sender(
+        make_config(tmp_path, send_min_interval_seconds=0.0),
+        driver=fake,
+        clock=clock,
+        sleep=clock.sleep,
+        uniform=lambda low, high: high,
+        session_epoch=7,
+    )
+    try:
+        first = instance.submit_async("测试群", "第一条")
+        assert fake.started.wait(5.0)
+        second = instance.submit_async("测试群", "第二条")
+        third = instance.submit_async("测试群", "第三条")
+
+        assert instance.abort() == 2
+        gate.set()
+
+        assert first.result(timeout=5.0).ok is True
+        for future in (second, third):
+            # abort 用 closed 结果完成 future，而不是 cancel（CancelledError 会被
+            # 桥误报成 internal_error）。
+            result = future.result(timeout=5.0)
+            assert result.ok is False
+            assert result.error_code == "closed"
+
+        # abort 之后 close 仍然 join，不抛异常；此后提交直接 closed。
+        instance.close(timeout=5.0)
+        assert instance.submit("测试群", "关闭后").error_code == "closed"
+    finally:
+        gate.set()
+        instance.close(timeout=5.0)
