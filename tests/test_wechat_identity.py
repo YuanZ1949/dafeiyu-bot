@@ -15,6 +15,8 @@ from dafeiyu.gateway.wechat_bridge.identity import (
     IdentityError,
     PeerRegistry,
 )
+from dafeiyu.memory.store import Store
+from dafeiyu.models import ChatType, Message
 
 
 def make_registry(tmp_path: Path, alerts: list | None = None) -> PeerRegistry:
@@ -175,6 +177,71 @@ def test_observe_with_disjoint_members_stays_silent(tmp_path: Path) -> None:
     registry.observe("甲群", {"阿猫"})
     registry.observe("乙群", {"阿狗"})
 
+    assert alerts == []
+
+
+def test_same_name_with_disjoint_members_mints_distinct_alias(
+    tmp_path: Path,
+) -> None:
+    """IS-2：同名不同成员的两个群绝不许共用 alias（也就不共用记忆）。"""
+    alerts: list = []
+    registry = make_registry(tmp_path, alerts)
+
+    first = registry.observe("同名群", {"甲", "乙"})
+    second = registry.observe("同名群", {"丙", "丁"})
+
+    assert first != second
+    assert f"wxg:{first}" != f"wxg:{second}"
+    mismatch = [payload for code, payload in alerts if payload.get("reason") == "member_mismatch"]
+    assert mismatch, "同名不重叠必须发 wechat_alias_ambiguous"
+    assert mismatch[0]["names"] == ["同名群"]
+    assert sorted([first, second]) == mismatch[0]["aliases"]
+
+    # 重复观测各自回到自己的 alias：轮询每轮都调 observe，不能每轮换 id。
+    assert registry.observe("同名群", {"甲", "乙"}) == first
+    assert registry.observe("同名群", {"丙", "丁"}) == second
+    # 同名多存活时，按名发送的路径 fail-closed。
+    with pytest.raises(AliasConflictError):
+        registry.resolve("同名群")
+
+
+def test_same_name_groups_keep_separate_memory(tmp_path: Path) -> None:
+    registry = make_registry(tmp_path)
+    first = registry.observe("同名群", {"甲", "乙"})
+    second = registry.observe("同名群", {"丙", "丁"})
+
+    store = Store(tmp_path / "memory.db")
+    store.init_schema()
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id=f"wxg:{first}",
+            user_id="wxg:u1",
+            nickname="阿甲",
+            content="第一群的记忆",
+            message_id="m1",
+            segments=[],
+            is_bot=False,
+            at_bot=False,
+            reply_to_bot=False,
+            timestamp=1,
+        )
+    )
+
+    kept = store.recent_messages(ChatType.GROUP, f"wxg:{first}", 10)
+    assert [message.content for message in kept] == ["第一群的记忆"]
+    assert store.recent_messages(ChatType.GROUP, f"wxg:{second}", 10) == []
+
+
+def test_observe_same_name_with_evolving_members_keeps_alias(tmp_path: Path) -> None:
+    """成员增减不是换群：同名 + 成员重叠时不许铸新别名。"""
+    alerts: list = []
+    registry = make_registry(tmp_path, alerts)
+
+    first = registry.observe("老群", {"甲", "乙"})
+    second = registry.observe("老群", {"甲", "乙", "丙"})
+
+    assert first == second
     assert alerts == []
 
 
