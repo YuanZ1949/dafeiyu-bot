@@ -254,8 +254,117 @@ def test_default_desktop_with_foreground_is_interactive(monkeypatch) -> None:
     monkeypatch.setattr(health, "_desktop_name", lambda handle: "Default")
     monkeypatch.setattr(health, "_foreground_window", lambda: 999)
     monkeypatch.setattr(health, "_close_desktop", lambda handle: None)
+    # 无害前台 + 没有 LogonUI 进程，锁屏补充检查必须放行。
+    monkeypatch.setattr(health, "_foreground_pid", lambda hwnd: 0)
+    monkeypatch.setattr(health, "_process_names", list)
 
     assert health._detect_desktop() == "interactive"
+
+
+# ---- 锁屏假前台（#36）----------------------------------------------------
+def _patch_unlocked_desktop(monkeypatch) -> None:
+    """搭好「Default 桌面 + 有前台窗口，但锁屏探针待定」的底座。"""
+    monkeypatch.setattr(health, "_open_input_desktop", lambda: 123)
+    monkeypatch.setattr(health, "_desktop_name", lambda handle: "Default")
+    monkeypatch.setattr(health, "_foreground_window", lambda: 999)
+    monkeypatch.setattr(health, "_close_desktop", lambda handle: None)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Desktop APIs are Windows-only")
+def test_lockapp_foreground_is_locked(monkeypatch) -> None:
+    """回归 F3：锁屏会话里 LockApp 抢走前台，不能因此判成 interactive。"""
+    _patch_unlocked_desktop(monkeypatch)
+    monkeypatch.setattr(health, "_foreground_pid", lambda hwnd: 4242)
+    monkeypatch.setattr(
+        health,
+        "_process_image_name",
+        lambda pid: "C:\\Windows\\SystemApps\\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\\LockApp.exe",
+    )
+    monkeypatch.setattr(health, "_process_names", list)
+
+    assert health._detect_desktop() == "locked"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Desktop APIs are Windows-only")
+def test_logonui_process_present_is_locked(monkeypatch) -> None:
+    _patch_unlocked_desktop(monkeypatch)
+    monkeypatch.setattr(health, "_foreground_pid", lambda hwnd: 4242)
+    monkeypatch.setattr(
+        health, "_process_image_name", lambda pid: "C:\\Apps\\Weixin.exe"
+    )
+    monkeypatch.setattr(
+        health, "_process_names", lambda: ["explorer.exe", "LogonUI.exe"]
+    )
+
+    assert health._detect_desktop() == "locked"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Desktop APIs are Windows-only")
+def test_foreground_pid_unavailable_falls_back_to_interactive(monkeypatch) -> None:
+    """新探针读不到前台 pid 时不算「正面检出锁屏」，沿用旧结论（interactive）。"""
+    _patch_unlocked_desktop(monkeypatch)
+    monkeypatch.setattr(health, "_foreground_pid", lambda hwnd: 0)
+    monkeypatch.setattr(
+        health,
+        "_process_image_name",
+        lambda pid: pytest.fail("pid 为 0 时不应读进程镜像"),
+    )
+    monkeypatch.setattr(
+        health, "_process_names", lambda: ["explorer.exe", "Weixin.exe"]
+    )
+
+    assert health._detect_desktop() == "interactive"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Desktop APIs are Windows-only")
+def test_lock_ui_probe_exception_keeps_previous_conclusion(monkeypatch) -> None:
+    """探针 API 抛错 ≠ 检出锁屏：不能把已确认 interactive 的会话翻转成 locked。"""
+    _patch_unlocked_desktop(monkeypatch)
+
+    def boom(hwnd: int) -> int:
+        raise OSError("GetWindowThreadProcessId unavailable")
+
+    monkeypatch.setattr(health, "_foreground_pid", boom)
+    monkeypatch.setattr(
+        health,
+        "_process_image_name",
+        lambda pid: pytest.fail("探针失败后不应再读镜像"),
+    )
+    monkeypatch.setattr(health, "_process_names", list)
+
+    assert health._detect_desktop() == "interactive"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Desktop APIs are Windows-only")
+def test_harmless_foreground_process_is_interactive(monkeypatch) -> None:
+    """前台是微信自己（Weixin.exe）这类无害进程时保持 interactive。"""
+    _patch_unlocked_desktop(monkeypatch)
+    monkeypatch.setattr(health, "_foreground_pid", lambda hwnd: 4242)
+    monkeypatch.setattr(
+        health, "_process_image_name", lambda pid: "C:\\Apps\\Weixin.exe"
+    )
+    monkeypatch.setattr(
+        health, "_process_names", lambda: ["Weixin.exe", "explorer.exe"]
+    )
+
+    assert health._detect_desktop() == "interactive"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("LockApp.exe", True),
+        ("LogonUI.exe", True),
+        ("lockapp.exe", True),
+        ("LOGONUI.EXE", True),
+        ("C:\\Windows\\SystemApps\\...\\LockApp.exe", True),
+        ("explorer.exe", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_is_lock_ui_exe(name: str, expected: bool) -> None:
+    assert health._is_lock_ui_exe(name) is expected
 
 
 def test_locked_to_interactive_does_not_resend_refused_messages(
@@ -357,3 +466,13 @@ def test_wechat_pids_match_weixin_and_wechat_names(monkeypatch) -> None:
     monkeypatch.setattr(health, "_snap_processes", lambda: iter(entries))
 
     assert health._wechat_pids() == [101, 102, 103]
+
+
+def test_process_names_lists_snapshot_names(monkeypatch) -> None:
+    monkeypatch.setattr(
+        health,
+        "_snap_processes",
+        lambda: iter([("explorer.exe", 1), ("Weixin.exe", 2)]),
+    )
+
+    assert health._process_names() == ["explorer.exe", "Weixin.exe"]

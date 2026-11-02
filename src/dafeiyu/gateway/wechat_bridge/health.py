@@ -61,6 +61,9 @@ WECHAT_EXE = "wechat.exe"
 WEIXIN_EXE = "weixin.exe"
 WECHAT_EXES = frozenset({WECHAT_EXE, WEIXIN_EXE})
 
+# 锁屏 UI 进程名：LockApp.exe（锁屏壳）/ LogonUI.exe（登录安全界面）。
+_LOCK_UI_EXES = frozenset({"lockapp.exe", "logonui.exe"})
+
 _TOKEN_QUERY = 0x0008
 _TOKEN_INTEGRITY_LEVEL = 25
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -117,12 +120,18 @@ def _as_int_or_none(value: Any) -> int | None:
         return None
 
 
-# ---- Windows 平台封装 -------------------------------------------------
 def _is_wechat_exe(name: Any) -> bool:
     """进程名是否是微信客户端：4.x ``Weixin.exe`` / 3.x ``WeChat.exe``，大小写不敏感。"""
     return str(name or "").strip().casefold() in WECHAT_EXES
 
 
+def _is_lock_ui_exe(name: Any) -> bool:
+    """进程镜像名是否属于锁屏 UI（``LockApp.exe`` / ``LogonUI.exe``，大小写不敏感；
+    允许传入完整路径，按最后一段 ``\\`` 之后的文件名判断）。"""
+    return str(name or "").strip().casefold().rsplit("\\", 1)[-1] in _LOCK_UI_EXES
+
+
+# ---- Windows 平台封装 -------------------------------------------------
 def _win_dll(name: str) -> Any | None:
     """非 Windows 返回 None；Windows 上取 DLL 句柄（不在此处抛异常）。"""
     if sys.platform != "win32":
@@ -201,6 +210,63 @@ def _foreground_window() -> int:
     return int(user32.GetForegroundWindow() or 0)
 
 
+def _foreground_pid(hwnd: int) -> int:
+    """前台窗口所属进程 pid（GetWindowThreadProcessId）；读不到返回 0。"""
+    user32 = _win_dll("user32")
+    if user32 is None or not hwnd:
+        return 0
+    wintypes = _wintypes()
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return int(pid.value)
+
+
+def _process_image_name(pid: int) -> str:
+    """读进程完整映像路径（OpenProcess + QueryFullProcessImageNameW）；失败返回空串。"""
+    if sys.platform != "win32" or not pid:
+        return ""
+    kernel32 = _win_dll("kernel32")
+    if kernel32 is None:
+        return ""
+    wintypes = _wintypes()
+    kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    process = kernel32.OpenProcess(
+        _PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid)
+    )
+    if not process:
+        return ""
+    try:
+        size = wintypes.DWORD(260)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(
+            process, 0, buffer, ctypes.byref(size)
+        ):
+            return ""
+        return buffer.value or ""
+    finally:
+        kernel32.CloseHandle(process)
+
+
 def _close_desktop(handle: int) -> None:
     user32 = _win_dll("user32")
     if user32 is None or not handle:
@@ -209,6 +275,22 @@ def _close_desktop(handle: int) -> None:
     user32.CloseDesktop.argtypes = [wintypes.HANDLE]
     user32.CloseDesktop.restype = wintypes.BOOL
     user32.CloseDesktop(handle)
+
+
+def _desktop_locked_by_lock_ui(foreground: int) -> bool:
+    """补充检查：前台窗口属于锁屏 UI，或 ``LogonUI.exe`` 正在运行。
+
+    读不到 pid / 映像名视为「未检出」，交给调用方沿用旧判断；只要正面命中
+    ``LockApp.exe`` / ``LogonUI.exe`` 就返回 True——锁屏会话里 LockApp 会
+    抢占前台，仅凭「Default 桌面 + 有前台」会误判成 interactive。
+    """
+    pid = _foreground_pid(foreground)
+    if pid:
+        image = _process_image_name(pid)
+        if image and _is_lock_ui_exe(image):
+            return True
+    # LogonUI.exe 存在即登录安全界面在跑（前台窗口读不到时也能兜住）。
+    return any(_is_lock_ui_exe(name) for name in _process_names())
 
 
 def _detect_desktop() -> str:
@@ -234,6 +316,14 @@ def _detect_desktop() -> str:
         return DESKTOP_LOCKED
     if not foreground:
         return DESKTOP_LOCKED
+    # 到这里按旧规则已是 interactive；再挡一道假前台：锁屏会话里前台窗口
+    # 多半是 LockApp/LogonUI 的。新探针抛错时不能把已确认 interactive 的
+    # 结论翻转成 locked（未检出 ≠ 检出）；一旦正面检出锁屏 UI 必须判 locked。
+    try:
+        if _desktop_locked_by_lock_ui(foreground):
+            return DESKTOP_LOCKED
+    except (OSError, ValueError, AttributeError):
+        pass
     return DESKTOP_INTERACTIVE
 
 
@@ -294,6 +384,11 @@ def _snap_processes() -> Iterator[tuple[str, int]]:
             found = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         kernel32.CloseHandle(snapshot)
+
+
+def _process_names() -> list[str]:
+    """当前正在运行的进程映像名列表；非 Windows / 快照失败返回空列表。"""
+    return [name for name, _ in _snap_processes()]
 
 
 def _wechat_pids() -> list[int]:
