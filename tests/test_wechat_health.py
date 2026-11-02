@@ -331,3 +331,29 @@ def test_compare_versions(left: str, right: str, expected: int) -> None:
 
 def test_compare_versions_rejects_non_numeric() -> None:
     assert health._compare_versions("unknown", "4.1.6") is None
+
+
+# ---- 微信进程名（#35：4.x 改名 Weixin.exe）--------------------------------
+def test_is_wechat_exe_matches_both_names_case_insensitively() -> None:
+    assert health.WECHAT_EXE == "wechat.exe"  # 旧单名常量保持不变
+    assert health._is_wechat_exe("Weixin.exe") is True
+    assert health._is_wechat_exe("WEIXIN.EXE") is True
+    assert health._is_wechat_exe("WeChat.exe") is True
+    assert health._is_wechat_exe("wechat.exe ") is True  # 首尾空白不影响
+    assert health._is_wechat_exe("explorer.exe") is False
+    assert health._is_wechat_exe("Weibo.exe") is False
+    assert health._is_wechat_exe("") is False
+    assert health._is_wechat_exe(None) is False
+
+
+def test_wechat_pids_match_weixin_and_wechat_names(monkeypatch) -> None:
+    entries = [
+        ("Weixin.exe", 101),
+        ("weixin.exe", 102),
+        ("WeChat.exe", 103),
+        ("explorer.exe", 104),
+        ("Weixin-updater.exe", 105),
+    ]
+    monkeypatch.setattr(health, "_snap_processes", lambda: iter(entries))
+
+    assert health._wechat_pids() == [101, 102, 103]

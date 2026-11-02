@@ -55,8 +55,11 @@ _DEFAULT_VERSION_MIN = "4.1.6"
 _DEFAULT_LANGUAGE = "zh-CN"
 _DEFAULT_POLL_SECONDS = 8.0
 
-# 微信 Windows 客户端进程名。
+# 微信 Windows 客户端进程名：3.x 是 WeChat.exe，4.x（2024 起改版）是 Weixin.exe。
+# WECHAT_EXE 保留旧的单名常量向后兼容；实际匹配用 WECHAT_EXES 集合（均小写）。
 WECHAT_EXE = "wechat.exe"
+WEIXIN_EXE = "weixin.exe"
+WECHAT_EXES = frozenset({WECHAT_EXE, WEIXIN_EXE})
 
 _TOKEN_QUERY = 0x0008
 _TOKEN_INTEGRITY_LEVEL = 25
@@ -115,6 +118,11 @@ def _as_int_or_none(value: Any) -> int | None:
 
 
 # ---- Windows 平台封装 -------------------------------------------------
+def _is_wechat_exe(name: Any) -> bool:
+    """进程名是否是微信客户端：4.x ``Weixin.exe`` / 3.x ``WeChat.exe``，大小写不敏感。"""
+    return str(name or "").strip().casefold() in WECHAT_EXES
+
+
 def _win_dll(name: str) -> Any | None:
     """非 Windows 返回 None；Windows 上取 DLL 句柄（不在此处抛异常）。"""
     if sys.platform != "win32":
@@ -229,13 +237,17 @@ def _detect_desktop() -> str:
     return DESKTOP_INTERACTIVE
 
 
-def _wechat_pids() -> list[int]:
-    """枚举 ``WeChat.exe`` 进程；非 Windows / 失败返回空列表。"""
+def _snap_processes() -> Iterator[tuple[str, int]]:
+    """Toolhelp 枚举全部进程，产出 ``(进程名, pid)``；非 Windows 直接结束。
+
+    快照失败（权限/资源不足）向上抛异常，由调用方按各自契约降级——与
+    旧 ``_wechat_pids`` 的行为一致。
+    """
     if sys.platform != "win32":
-        return []
+        return
     kernel32 = _win_dll("kernel32")
     if kernel32 is None:
-        return []
+        return
     wintypes = _wintypes()
 
     class PROCESSENTRY32W(ctypes.Structure):
@@ -271,20 +283,23 @@ def _wechat_pids() -> list[int]:
     snapshot_value = int(snapshot or 0)
     invalid_handle = int(ctypes.c_void_p(-1).value or 0)
     if snapshot_value in (0, invalid_handle):
-        return []
+        return
 
     entry = PROCESSENTRY32W()
     entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-    pids: list[int] = []
     try:
         found = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
         while found:
-            if str(entry.szExeFile).casefold() == WECHAT_EXE:
-                pids.append(int(entry.th32ProcessID))
+            yield str(entry.szExeFile), int(entry.th32ProcessID)
             found = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         kernel32.CloseHandle(snapshot)
-    return pids
+
+
+def _wechat_pids() -> list[int]:
+    """枚举微信客户端进程：4.x 是 ``Weixin.exe``，3.x 是 ``WeChat.exe``（大小写
+    不敏感）；非 Windows / 失败返回空列表。"""
+    return [pid for name, pid in _snap_processes() if _is_wechat_exe(name)]
 
 
 def _process_integrity_sid(pid: int) -> str:
