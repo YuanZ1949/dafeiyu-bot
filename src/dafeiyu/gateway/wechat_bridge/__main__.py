@@ -88,9 +88,9 @@ class _UiThreadDriver:
     COM/STA 线程上执行，否则会抛 COM 初始化错误。本代理只做一件事：把
     `open_chat/send_text/snapshot` 投进 UI 线程的发送优先队列并等结果。
 
-    `Sender.__init__` 会探测 ``_force_global_config`` + ``_pyweixin_or_none``；
-    两个都提供（且 ``_pyweixin_or_none`` 也走 UI 线程）时，Sender 不会再在自己
-    的构造线程上 import pyweixin。
+    `Sender.__init__` 会探测 ``force_global_config``（其次回退到
+    ``_force_global_config`` + ``_pyweixin_or_none``）；两条路径都投到 UI 线程，
+    Sender 不会再在自己的构造线程上 import pyweixin。
     """
 
     #: 单次 UI 调用的本地等待上限；必须小于服务器/客户端对发送的整体超时。
@@ -139,6 +139,11 @@ class _UiThreadDriver:
             raise DriverError("timeout", label) from exc
         except concurrent.futures.CancelledError as exc:
             raise DriverError("aborted", label) from exc
+
+    def force_global_config(self) -> None:
+        return self._call(
+            "force_global_config", lambda: self._raw.force_global_config()
+        )
 
     def _pyweixin_or_none(self) -> Any:
         getter = getattr(self._raw, "_pyweixin_or_none", None)

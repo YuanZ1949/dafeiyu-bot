@@ -19,7 +19,6 @@
 
 from __future__ import annotations
 
-import importlib
 import logging
 import os
 import queue
@@ -453,11 +452,18 @@ class Sender:
     def _force_global_config_at_startup(self) -> None:
         """启动时显式把 `close_weixin` / `is_maximize` 置 False。
 
-        优先走 `driver._force_global_config(wx)`（driver 已把 pyweixin 的惰性 import
-        与异常翻译封好）；驱动没有这个入口时，才在 sender 内部惰性 import。
-        ``pyweixin`` 未安装时静默跳过：发送前 driver 还会再设置一次，这里只是
-        把「启动即固定」这件事显式做掉，不赌上游默认值。
+        全部走 driver 的能力：优先 `driver.force_global_config()`（生产路径由
+        `_UiThreadDriver` 路由到 STA/UIA 线程），其次兼容 `_force_global_config` +
+        `_pyweixin_or_none` 这对旧入口。sender 自身（以及任何非 driver 模块）绝不
+        加载 pyweixin；两条路都不可用时只记告警，因为 `send_text` 前还会再固定一次。
         """
+        force_all = getattr(self._driver, "force_global_config", None)
+        if callable(force_all):
+            try:
+                force_all()
+            except Exception:  # noqa: BLE001
+                log.warning("启动时固定 GlobalConfig 失败", exc_info=True)
+            return
         force = getattr(self._driver, "_force_global_config", None)
         getter = getattr(self._driver, "_pyweixin_or_none", None)
         if callable(force) and callable(getter):
@@ -465,30 +471,10 @@ class Sender:
                 wx = getter()
                 if wx is not None:
                     force(wx)
-                return
             except Exception:  # noqa: BLE001
                 log.warning("启动时固定 GlobalConfig 失败", exc_info=True)
-                return
-        self._force_global_config_fallback()
-
-    def _force_global_config_fallback(self) -> None:
-        # 用 importlib 而不是 import 语句：`test_only_driver_module_mentions_pyweixin`
-        # 把「模块里出现 pyweixin import」限定在 driver.py；这里仍是运行期惰性加载。
-        try:
-            module = importlib.import_module("pyweixin")
-        except ImportError:
             return
-        except Exception:  # noqa: BLE001
-            log.warning("导入 pyweixin 失败，无法固定 GlobalConfig", exc_info=True)
-            return
-        config = getattr(module, "GlobalConfig", None)
-        if config is None:
-            return
-        for attr in ("close_weixin", "is_maximize"):
-            try:
-                setattr(config, attr, False)
-            except Exception:  # noqa: BLE001
-                log.warning("无法设置 GlobalConfig.%s", attr, exc_info=True)
+        log.warning("driver 缺少 force_global_config 能力，跳过启动固定 GlobalConfig")
 
     # ------------------------------------------------------------- 闸门 + 发送
     def _execute(self, chat_name: str, text: str) -> SendResult:

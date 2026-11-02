@@ -357,6 +357,18 @@ def _force_global_config(wx: Any) -> None:
             raise _translate(exc, "config_write_failed") from exc
 
 
+def force_global_config() -> None:
+    """启动时固定 GlobalConfig 默认值（`pyweixin` 的惰性 import 只在 driver 内部）。
+
+    ``pyweixin`` 未安装时静默跳过（`send_text` 前还会再固定一次）；
+    `GlobalConfig` 不可用或写入失败时抛 `DriverError`，由调用方记录。
+    """
+    wx = _pyweixin_or_none()
+    if wx is None:
+        return
+    _force_global_config(wx)
+
+
 def _call_first_kwarg(fn: Callable[..., Any], names: tuple[str, ...], value: Any) -> Any:
     """不同版本的 `get_groupMembers_info` 形参名不一致，按候选名逐个试。"""
     for name in names:

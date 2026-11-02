@@ -311,14 +311,24 @@ def test_package_imports_without_pyweixin() -> None:
     assert "ok dafeiyu.gateway.wechat_bridge.driver" in result.stdout
 
 
-def test_only_driver_module_mentions_pyweixin() -> None:
-    package = Path(driver.__file__).resolve().parent
-    pattern = re.compile(r"^\s*(?:import|from)\s+pyweixin\b", re.MULTILINE)
+_PYWEIXIN_IMPORT_FORMS = (
+    re.compile(r"^\s*(?:import|from)\s+pyweixin\b", re.MULTILINE),
+    re.compile(r"importlib\.import_module\(\s*[\"']pyweixin[\"']"),
+    re.compile(r"__import__\(\s*[\"']pyweixin[\"']"),
+)
 
-    offenders = [
-        path.name
-        for path in sorted(package.glob("*.py"))
-        if path.name != "driver.py" and pattern.search(path.read_text(encoding="utf-8"))
-    ]
+
+def test_only_driver_module_mentions_pyweixin() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    this_file = Path(__file__).resolve()
+    offenders = []
+
+    for root in (repo / "src" / "dafeiyu", repo / "tests"):
+        for path in sorted(root.rglob("*.py")):
+            if path.resolve() in {this_file, Path(driver.__file__).resolve()}:
+                continue
+            text = path.read_text(encoding="utf-8")
+            if any(form.search(text) for form in _PYWEIXIN_IMPORT_FORMS):
+                offenders.append(str(path.relative_to(repo)))
 
     assert offenders == []
