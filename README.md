@@ -4,7 +4,7 @@
 
 - **模型**：DeepSeek（OpenAI 兼容接口），模型名可配
 - **QQ 接入**：NapCat（OneBot v11 反向 WebSocket）
-- **微信**：v1 只留适配器占位，未实现（见 `src/dafeiyu/gateway/wechat.py` 里的三条候选路线）
+- **微信（可选，默认关闭）**：桌面微信**小号**通道（UIA 桥 `wechat_bridge` + `pyweixin`）；只支持普通微信群，需要**桌面解锁**且保持交互的会话，RPA 有已知上限（见「3.5 接入微信」）
 - **记忆**：每群最近 20 条对话 + 群友印象 + 昨日摘要，SQLite 落盘，重启不失忆；
   消息用 trigram FTS5 建索引，可按关键词检索并在回复前召回同会话旧消息
 
@@ -67,24 +67,26 @@ doctor 不只看配置/依赖/端口，还会检查 `.env` / `config.yaml` 是�
 ## 架构
 
 ```
-QQ 群
-  │  @ / 普通消息
+微信群
+  │  @ / 普通消息（桥轮询，默认 8s）
   ▼
-NapCat（QQ 协议端，独立进程）
-  │  OneBot v11 反向 WebSocket
+wechat_bridge（桌面微信 UIA 桥，独立进程，127.0.0.1:8790，token 鉴权）
+  │  本地 HTTP 帧
   ▼
-QQAdapter ── parse_event ──▶ Router（三层闸门）
-                               │  ① 硬触发：@ / 引用 / 叫名字 → 必回
-                               │  ② 规则筛：白名单、冷却、静默、预算、关键词、热度、采样
-                               │  ③ 模型判断：一次调用同时决定「说不说 + 说什么」
-                               ▼
-                        Context（20 条窗口 + 印象 top5 + 昨日摘要，预算 2500 token）
-                               ▼
-                        DeepSeek API（JSON：{speak, reply, reason}）
-                               ▼
-                        Sender（截断 120 字 / 技术问题 300 字，超长分片）
-                               ▼
-                        QQAdapter.send → send_group_msg
+WeChatAdapter ────────┐
+                      ├─▶ Router（三层闸门，按通道独立急停）
+QQAdapter ────────────┘
+  ▲                        │  ① 硬触发：@ / 引用 / 叫名字 → 必回
+  │  OneBot v11 反向 WS    │  ② 规则筛：白名单、冷却、静默、预算、关键词、热度、采样
+NapCat（QQ 协议端，独立进程）│  ③ 模型判断：一次调用同时决定「说不说 + 说什么」
+                                     ▼
+                            Context（20 条窗口 + 印象 top5 + 昨日摘要，预算 2500 token）
+                                     ▼
+                            DeepSeek API（JSON：{speak, reply, reason}）
+                                     ▼
+                            Sender（截断 120 字 / 技术问题 300 字，超长分片）
+                                     ▼
+                            各通道适配器回群：QQ 走 send_group_msg，微信由桥代发
 ```
 
 旁路任务：每 20 条新消息异步抽取群友印象；每日 04:00 生成昨日摘要。
@@ -98,6 +100,8 @@ QQAdapter ── parse_event ──▶ Router（三层闸门）
 | [NapCat](https://github.com/NapNeko/NapCatQQ/releases) | QQ 协议端，需单独下载运行 |
 | QQ 小号 | **强烈建议用小号**，不要用主号 |
 | DeepSeek API Key | https://platform.deepseek.com 申请 |
+| 微信小号 + 桌面微信 4.1.6+ | 可选；仅当 `gateway.provider` 为 `wechat` / `both`。**小号专用**，封号风险自担 |
+| 解锁且交互的桌面会话 | 可选；微信通道要求**桌面解锁**，锁屏/远程断开即掉线，不能跑成服务（Session 0） |
 
 ## 1. 配置 NapCat
 
@@ -312,6 +316,65 @@ powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -Target D:\dafeiyu-r
 `dafeiyu doctor`（配置/编码/沙箱降权/脚本 BOM），有阻塞项就直接回滚，不会把服务停在半套代码上；
 健康检查以 `gateway.connected=true`（QQ 网关真的连上）为准，不看 HTTP 200。扫码/网关未连期间
 可用 `-AllowDisconnected` 显式放行，只拷文件不重启用 `-NoRestart`。
+
+## 3.5 接入微信（可选，默认关闭）
+
+**默认路径**：不开启微信就什么都不用做——`gateway.provider: qq`、`gateway.wechat.enabled: false`（模板默认值），QQ 侧行为与之前完全一致；本节可以整个跳过。
+
+先认清边界：这里接的是**普通微信群**，不支持企业微信、公众号，也不支持小程序/视频号私信。实现不是官方协议，而是桌面客户端 RPA（UIA 自动化）：一个独立小进程 `wechat_bridge` 替代人手操作真实微信窗口。
+
+### 开通前必读
+
+- **小号专用**：必须让一张单独的**微信小号**登录桌面客户端（4.1.6+，中文界面），**不要用主号**；封号风险由使用者自担。
+- **桌面解锁**：RPA 只能在**已解锁且可交互的桌面会话**里工作。锁屏、切换用户、远程桌面断开都会让桥掉线；因此不能作为 Windows 服务运行，也不能跑在 Session 0。
+
+### 安装与配置
+
+1. 安装依赖：`pip install -e ".[wechat]"`。extra 实际安装 `pywechat127` / `pywinauto` / `pyautogui` / `psutil`（代码里 import 名是 `pyweixin`，由 `pywechat127` 提供）。
+
+2. 配置 `.env`：设 `DAFEIYU_WECHAT_BRIDGE_TOKEN`。桥绑非回环地址时必填；留空 = 不校验 token，仅限桥只听本机回环的场景。
+
+3. 配置 `config.yaml`：
+   - `gateway.provider`: `wechat`（仅微信）或 `both`（QQ + 微信双通道）；
+   - `gateway.wechat.enabled: true`；
+   - `account_nickname`：小号在目标群里的显示昵称，用于识别 @；
+   - `group_allowlist`：允许的群，支持 `123456` 数字群号或 `wxg:别名` 两种写法。**空白名单 = 拒绝启动**（语义是「拒绝」，不是「放行所有群」）。同名群没法用数字区分，`wxg:` 条目需要你人工核对。
+
+4. 预检：`.venv\Scripts\python -m dafeiyu.cli doctor` 有 8 项微信前置检查（进程 / 版本 / 语言 / 完整性 / 桌面 / pyweixin / 端口 / 配置），**全部通过再进入下一步**。
+
+### 启动
+
+先起桥，再起 bot / supervisor：
+
+```powershell
+# 桥是独立进程，默认读 config.yaml 与 .env，可加 --config / --env-file
+.venv\Scripts\python -m dafeiyu.gateway.wechat_bridge
+
+# 正常整套启动（supervisor + bot + NapCat）
+powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
+```
+
+桥只监听 `127.0.0.1:8790`，带 token 鉴权；不要把它暴露到局域网。
+
+### 已知上限（不承诺与 QQ 完全一致）
+
+- **无真实 message_id**：桥为会话/消息在本地铸造 id，跨重启不保证稳定。
+- 不支持撤回 / 编辑事件。
+- 同名群只能靠别名 / 人工区分，`group_allowlist` 里的 `wxg:` 条目要人工核对。
+- `@` 触发依赖轮询，最坏有约一个 `poll_seconds`（默认 8 秒）的延迟。
+- 发送有频率上限：`send_min_interval_seconds`（默认 20 秒）、`send_max_per_hour`（20）、`send_max_per_day`（60）。
+- 桌面锁屏即掉线。RPA 可能误点，`require_foreground_idle` 默认要求微信窗口前台且空闲才执行操作；开启微信通道时别在那台机器上干重要的事。
+
+### 急停
+
+- 面板「微信通道」卡片的**停用**按钮，立即生效；
+- 也可以手动创建 `data/wechat.stop` 文件，下一次发送前生效；
+- 恢复 = 面板「恢复」按钮，或删掉这个文件。
+- 急停只停微信通道，QQ 完全不受影响。
+
+### 风险
+
+封号、RPA 误操作、桌面客户端升级导致 UIA 失效——这些是桌面 RPA 接入的固有代价，**均由使用者自担**。
 
 ## 4. 用法
 
@@ -540,7 +603,7 @@ src/dafeiyu/
   __main__.py        装配与常驻
   config.py          .env + config.yaml 加载与校验
   models.py          Message / Segment / ChatType
-  gateway/           qq.py（OneBot 反向 WS）、wechat.py（占位）、base.py
+  gateway/           qq.py（OneBot 反向 WS）、wechat.py（微信适配器）、wechat_bridge/（UIA 桥，独立进程）、base.py
   router.py          三层闸门、冷却、预算、静默、指令解析
   memory/            store.py（SQLite）、context.py（上下文预算）
   brain/             client.py（DeepSeek）、persona.py + persona.md（人设）
