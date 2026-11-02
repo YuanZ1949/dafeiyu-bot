@@ -30,8 +30,51 @@ brain:
   #   model: ""
 
 gateway:
-  # 只支持 qq；wechat 会在启动期直接报 ConfigError（协议未实现，不假装能跑）。
+  # 频道选择：qq（仅 NapCat）/ wechat（仅桌面微信小号）/ both（qq+wechat 双通道，
+  # 面板里每条通道可单独停用）。
   provider: qq
+  # 桌面微信小号通道（UIA 桥）。小号专用、封号自担；默认关闭（wechat.enabled=false），
+  # 启用前先跑 `dafeiyu doctor` 的 8 项预检；group_allowlist 为空时拒绝启动
+  # （语义是「拒绝」，不是「放开所有群」）。
+  wechat:
+    # 默认关闭；启用前先跑 `dafeiyu doctor` 的 8 项预检。
+    enabled: false
+    # UIA 桥监听地址；gateway.wechat.bridge_host 绑非回环地址时 bridge_token 必填。
+    bridge_host: 127.0.0.1
+    bridge_port: 8790
+    # 桥鉴权 token（gateway.wechat.bridge_token）：从 env 读 DAFEIYU_WECHAT_BRIDGE_TOKEN
+    # （env 优先于配置文件）。桥绑回环时留空也可以；不要把真 token 写进模板。
+    bridge_token: ""
+    # 小号在群里的微信显示昵称（不是会话别名，别名由桥本地铸造）；启用时必填。
+    account_nickname: ""
+    # 接受 `123456`（QQ 风格数字群号）或 `wxg:别名`（gateway.wechat 会话别名）；
+    # 留空 = gateway.wechat.group_allowlist 为空 = 拒绝启动。
+    group_allowlist: []
+    # 最多参与的微信群数上限。
+    max_groups: 3
+    # RPA 侧轮询间隔（秒）。
+    poll_seconds: 8.0
+    # 防封限速：相邻两次发送的最小间隔 / 每小时上限 / 每天上限。
+    send_min_interval_seconds: 20.0
+    send_max_per_hour: 20
+    send_max_per_day: 60
+    # 静默时段 [start, end]，HH:MM，起止相同 = 不静默。
+    quiet_hours: ["23:30", "08:00"]
+    # 模拟打字的延迟区间（秒）。
+    typing_delay_seconds: [0.6, 1.2]
+    # 发送后必须观察到已发出的消息才算成功；超时按失败处理。
+    ack_requires_observed: true
+    # 观察回声消息的时间窗口（秒）。
+    echo_window_seconds: 120.0
+    keepalive: false
+    # 发送前要求微信窗口前台且空闲（防误操作到别的窗口）。
+    require_foreground_idle: true
+    # 急停文件：该文件出现即停发。
+    kill_switch_file: data/wechat.stop
+    # 桌面客户端版本下限，低于则拒绝启动。
+    version_min: "4.1.6"
+    language: zh-CN
+    allow_test_inject: false
 
 opencode:
   # 留空自动找 npm 全局安装的 opencode.exe
@@ -123,7 +166,9 @@ triggers:
   closed_sample_rate: 0.05
 
 groups:
-  # 留空 = 所有群都参与；填了就只在这些群里说话。号之间用逗号分隔。
+  # 接受 `123456`（QQ 风格数字群号）或 `wxg:别名`（微信会话，语义同
+  # gateway.wechat.group_allowlist）。留空 = 所有群都参与；填了就只在这些群里说话。
+  # 号之间用逗号分隔。
   whitelist: []
   blacklist: []
   # 群指令（/闭嘴、/醒来）只允许这些 QQ 号执行；留空 = 谁都不能用。
