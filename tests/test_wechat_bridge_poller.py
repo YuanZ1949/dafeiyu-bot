@@ -498,6 +498,10 @@ async def test_request_stop_shutdown_joins_ui_thread(tmp_path: Path) -> None:
         server = await _wait_for_port(holder)
         # SIGINT hook 最终也是让这个 future 完成：request_stop 是同一条收摊路径。
         await _wait_until(lambda: bool(_ui_threads()))
+        # 启动健康帧走完（poller.start() 之后的 UIA 线程探测）再停：否则
+        # request_stop 的 abort_sends 会取消仍在等待的探测 future，run() 收到
+        # CancelledError 而无法走到正常收摊。
+        await _wait_until(lambda: server.latest_health is not None)
         server.request_stop()
         assert await asyncio.wait_for(run_task, STEP) == 0
     finally:
