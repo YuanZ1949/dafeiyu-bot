@@ -23,7 +23,7 @@ from ..brain.opencode_auth import PASSWORD_ENV, password_env, resolve_password
 from ..brain.provider_config import ensure_agent_files
 from ..brain.runtime_config import server_env
 from ..config import ConfigError, Settings, load_settings
-from ..gateway.channels import wechat_enabled_for
+from ..gateway.channels import qq_enabled_for, wechat_enabled_for
 from ..timeutil import now_shanghai
 from .alerts import AlertChannel, AlertManager, QQAdminChannel, WebhookChannel
 from .audit import AuditLog
@@ -186,12 +186,6 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
             f"找不到 OpenCode 可执行文件：{exc}。请先 npm i -g opencode-ai"
         ) from exc
 
-    node = NAPCAT_DIR / "node.exe"
-    if not node.exists():
-        raise ConfigError(
-            f"NapCat 未安装：{node} 不存在。请先运行 scripts/setup-napcat.ps1"
-        )
-
     db_path = Path(settings.opencode.db_path)
     if not db_path.is_absolute():
         db_path = REPO_ROOT / db_path
@@ -261,27 +255,36 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
             ready_timeout=WECHAT_BRIDGE_READY_TIMEOUT,
             creationflags=CREATE_NO_WINDOW,
         )
-    # -q <uin> 让 NapCat 用机器人号已有的本地票据自动登录，冷启动不必再扫码。
-    # 必须显式给 uin：本机快速登录列表里还有用户的个人号 504567327，
-    # 不给 -q 会按列表顺序登错号。票据失效时 NapCat 自己回落到二维码，不会卡死。
-    # 配了密码时，快登失败会自动走一次密码回退（napcat.mjs:83224）。
-    napcat_env: dict[str, str] = {}
-    if settings.napcat.quick_password:
-        napcat_env["NAPCAT_QUICK_PASSWORD"] = settings.napcat.quick_password
-    if settings.napcat.quick_password_md5:
-        napcat_env["NAPCAT_QUICK_PASSWORD_MD5"] = settings.napcat.quick_password_md5
-    specs["napcat"] = ProcSpec(
-        name="napcat",
-        command=[str(node), "index.js", "-q", str(settings.bot_qq)],
-        cwd=str(NAPCAT_DIR),
-        env=napcat_env or None,
-        creationflags=CREATE_NO_WINDOW,
-        # 主进程被 NapCat 自己的 kill EPERM 打崩后，worker 会继续占着 QQ 登录态；
-        # 不先清掉，新实例只会报「当前账号已登录，无法重复登录」然后卡住。
-        sweep_pids=lambda: find_napcat_pids(NAPCAT_DIR),
-        # 真出现这句时说明已经有残留占着登录态：清干净再重启一次。
-        recover_patterns=("无法重复登录",),
-    )
+    # NapCat 只为 QQ 通道服务：provider=wechat 且微信启用时 bot 不监听 QQ 的 WS
+    # 端口，拉起 NapCat 只会每 5 秒刷一条 `ECONNREFUSED 127.0.0.1:8080`。
+    # 反过来，纯微信部署也不该因为「没装 NapCat」而起不来。
+    if qq_enabled_for(settings):
+        node = NAPCAT_DIR / "node.exe"
+        if not node.exists():
+            raise ConfigError(
+                f"NapCat 未安装：{node} 不存在。请先运行 scripts/setup-napcat.ps1"
+            )
+        # -q <uin> 让 NapCat 用机器人号已有的本地票据自动登录，冷启动不必再扫码。
+        # 必须显式给 uin：本机快速登录列表里还有用户的个人号 504567327，
+        # 不给 -q 会按列表顺序登错号。票据失效时 NapCat 自己回落到二维码，不会卡死。
+        # 配了密码时，快登失败会自动走一次密码回退（napcat.mjs:83224）。
+        napcat_env: dict[str, str] = {}
+        if settings.napcat.quick_password:
+            napcat_env["NAPCAT_QUICK_PASSWORD"] = settings.napcat.quick_password
+        if settings.napcat.quick_password_md5:
+            napcat_env["NAPCAT_QUICK_PASSWORD_MD5"] = settings.napcat.quick_password_md5
+        specs["napcat"] = ProcSpec(
+            name="napcat",
+            command=[str(node), "index.js", "-q", str(settings.bot_qq)],
+            cwd=str(NAPCAT_DIR),
+            env=napcat_env or None,
+            creationflags=CREATE_NO_WINDOW,
+            # 主进程被 NapCat 自己的 kill EPERM 打崩后，worker 会继续占着 QQ 登录态；
+            # 不先清掉，新实例只会报「当前账号已登录，无法重复登录」然后卡住。
+            sweep_pids=lambda: find_napcat_pids(NAPCAT_DIR),
+            # 真出现这句时说明已经有残留占着登录态：清干净再重启一次。
+            recover_patterns=("无法重复登录",),
+        )
     return specs
 
 
@@ -557,10 +560,11 @@ async def run() -> int:
         ready_timeout=float(settings.opencode.startup_timeout_seconds),
     )
 
-    owner = find_napcat_pid()
-    if owner is not None:
-        supervisor.mark_external("napcat", owner)
-        logs.write("supervisor", f"NapCat 已在外运行（pid={owner}），接管为外部实例")
+    if "napcat" in specs:
+        owner = find_napcat_pid()
+        if owner is not None:
+            supervisor.mark_external("napcat", owner)
+            logs.write("supervisor", f"NapCat 已在外运行（pid={owner}），接管为外部实例")
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

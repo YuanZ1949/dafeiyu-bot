@@ -18,6 +18,7 @@ from dafeiyu.__main__ import (
 from dafeiyu.brain import factory
 from dafeiyu.brain.client import BrainClient
 from dafeiyu.config import GatewayConfig, load_settings
+from dafeiyu.gateway.channels import qq_enabled_for
 from dafeiyu.gateway.wechat import WeChatAdapter
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
@@ -275,6 +276,19 @@ def test_provider_both_constructs_both_adapters(tmp_path: Path) -> None:
 
     assert set(adapters) == {"qq", "wechat"}
     assert isinstance(adapters["wechat"], WeChatAdapter)
+
+
+def test_qq_enabled_for_mirrors_adapter_wiring(tmp_path: Path) -> None:
+    """supervisor 用它决定是否拉起 NapCat，必须与 build_adapters 逐条对齐。"""
+    assert qq_enabled_for(make_gateway_settings(tmp_path, "qq", enabled=True)) is True
+    assert qq_enabled_for(make_gateway_settings(tmp_path, "both", enabled=True)) is True
+    assert (
+        qq_enabled_for(make_gateway_settings(tmp_path, "wechat", enabled=True)) is False
+    )
+    # 微信没启用时 build_adapters 会回落 QQ，NapCat 必须照常启动。
+    assert (
+        qq_enabled_for(make_gateway_settings(tmp_path, "wechat", enabled=False)) is True
+    )
 
 
 def test_provider_wechat_without_enabled_degrades_with_warning(

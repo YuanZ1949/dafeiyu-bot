@@ -217,6 +217,39 @@ async def test_all_rules_activate(tmp_path: Path) -> None:
     }
 
 
+async def test_napcat_down_silent_when_qq_channel_disabled(tmp_path: Path) -> None:
+    """纯微信部署没有 napcat spec：不能每轮都报一条假的 critical。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = wechat_snapshot()
+    snapshot["processes"].pop("napcat")
+    snapshot["napcat"] = {"reachable": False, "logged_in": False}
+
+    await mgr.evaluate(snapshot)
+    clock.advance(200)
+    await mgr.evaluate(snapshot)
+
+    assert channel.sent == []
+
+
+async def test_napcat_down_fires_when_bot_expects_qq(tmp_path: Path) -> None:
+    """spec 缺失但 bot 自报 qq 通道：配置不一致，仍要告警。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = wechat_snapshot()
+    snapshot["processes"].pop("napcat")
+    snapshot["bot"]["channels"]["qq"] = {"connected": False}
+
+    await mgr.evaluate(snapshot)
+    clock.advance(200)
+    await mgr.evaluate(snapshot)
+
+    rules = {incident.rule for incident, _event in channel.sent}
+    assert "napcat_down" in rules
+
+
 async def test_wechat_down_fires_after_threshold(tmp_path: Path) -> None:
     clock = Clock()
     channel = FakeChannel()

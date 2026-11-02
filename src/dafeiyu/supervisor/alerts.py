@@ -251,24 +251,33 @@ class AlertManager:
                 f"opencode 进程状态：{opencode_status}",
             )
 
-        gateway = bot.get("gateway") or {}
-        if not isinstance(gateway, dict):
-            gateway = {}
-        napcat_status = self._process_status(processes, "napcat")
-        disconnected = gateway.get("connected") is False
-        if napcat_status != "running" or disconnected:
-            detail = (
-                f"napcat 进程状态：{napcat_status}"
-                if napcat_status != "running"
-                else "QQ 网关连接已断开"
-            )
-            conditions["napcat_down"] = Condition(
-                True, "critical", "NapCat 不在线", detail
-            )
-
         channels = bot.get("channels") or {}
         if not isinstance(channels, dict):
             channels = {}
+
+        gateway = bot.get("gateway") or {}
+        if not isinstance(gateway, dict):
+            gateway = {}
+        # NapCat 只为 QQ 通道服务：纯微信部署没有这个 spec，不能按「进程不在线」
+        # 误报 critical（否则面板永远挂着一条假告警）。判定与 build_specs 同源。
+        napcat_status = (
+            self._process_status(processes, "napcat") if "napcat" in processes else None
+        )
+        expected_qq = napcat_status not in (None, "disabled") or (
+            napcat_status is None and "qq" in channels
+        )
+        if expected_qq:
+            disconnected = gateway.get("connected") is False
+            if napcat_status != "running" or disconnected:
+                detail = (
+                    f"napcat 进程状态：{napcat_status}"
+                    if napcat_status != "running"
+                    else "QQ 网关连接已断开"
+                )
+                conditions["napcat_down"] = Condition(
+                    True, "critical", "NapCat 不在线", detail
+                )
+
         # 微信桥是可选进程：没有该 spec 时 supervisor 会注入 disabled。
         # 只有桥 spec 存在且未禁用，或 bot 自报启用了微信通道时才评估，
         # 避免 provider=qq / 纯 QQ 部署被误报。

@@ -191,7 +191,7 @@ def test_wechat_bridge_registered_when_provider_selects_wechat(tmp_path: Path) -
     settings, specs = build_wechat(tmp_path)
 
     assert settings.gateway.provider == "wechat"
-    assert set(specs) == {"opencode", "bot", "wechat_bridge", "napcat"}
+    assert set(specs) == {"opencode", "bot", "wechat_bridge"}
     assert list(specs).index("wechat_bridge") > list(specs).index("bot")
 
 
@@ -199,6 +199,33 @@ def test_wechat_bridge_registered_for_provider_both(tmp_path: Path) -> None:
     _settings, specs = build_wechat(tmp_path, provider="both")
 
     assert "wechat_bridge" in specs
+    # both = QQ + 微信都在线：NapCat 必须同时注册，否则 QQ 半残。
+    assert "napcat" in specs
+
+
+def test_pure_wechat_does_not_need_napcat_installed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """纯微信部署不该因为「没装 NapCat」而起不来（NapCat 只为 QQ 服务）。"""
+    import dafeiyu.supervisor.main as main_mod
+
+    monkeypatch.setattr(main_mod, "NAPCAT_DIR", tmp_path / "missing-napcat")
+
+    _settings, specs = build_wechat(tmp_path, provider="wechat")
+
+    assert "napcat" not in specs
+    assert "wechat_bridge" in specs
+
+
+def test_qq_provider_still_requires_napcat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dafeiyu.supervisor.main as main_mod
+
+    monkeypatch.setattr(main_mod, "NAPCAT_DIR", tmp_path / "missing-napcat")
+
+    with pytest.raises(ConfigError):
+        build_wechat(tmp_path, provider="qq", enabled=True)
 
 
 def test_wechat_bridge_absent_when_disabled(tmp_path: Path) -> None:
