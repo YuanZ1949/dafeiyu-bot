@@ -710,6 +710,16 @@ def create_app(
     async def config(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/config")
 
+    async def behavior(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/behavior")
+
+    async def save_behavior(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call("PUT", "/api/behavior", payload)
+        return web.json_response(data, status=code)
+
     def _session_target(
         request: web.Request,
     ) -> tuple[str, str, web.Response | None]:
@@ -1072,6 +1082,8 @@ def create_app(
     app.router.add_post("/api/sessions/{chat_type}/{chat_id}/{action}", session_action)
     app.router.add_delete("/api/sessions/{chat_type}/{chat_id}", session_delete)
     app.router.add_get("/api/config", config)
+    app.router.add_get("/api/behavior", behavior)
+    app.router.add_put("/api/behavior", save_behavior)
     app.router.add_get("/api/backup", backup)
     app.router.add_post("/api/memory/summaries", memory_summary)
     app.router.add_post("/api/memory/impressions", memory_impressions)

@@ -15,6 +15,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from conftest import TEST_CONFIG_YAML
 
 from dafeiyu import control as control_module
+from dafeiyu.behavior import BehaviorSettings
 from dafeiyu.brain.client import BrainClient
 from dafeiyu.brain.factory import mode_status
 from dafeiyu.config import load_settings
@@ -39,11 +40,15 @@ class FakeService:
     def __init__(self) -> None:
         self.brain = FakeBrain()
         self.impressions = None
+        self.behavior = BehaviorSettings()
 
     def set_brain(self, brain):
         previous = self.brain
         self.brain = brain
         return previous
+
+    def set_behavior(self, behavior):
+        self.behavior = behavior
 
 
 class FakeAdapter:
@@ -1197,7 +1202,9 @@ async def test_config_endpoint_has_thresholds_and_no_secrets(tmp_path: Path) -> 
     assert "api_key" not in raw
     assert payload["brain"]["provider"] == "token"
     assert payload["persona"]["os_probability"] == 0.05
-    assert payload["cooldown"]["brain_error_seconds"] == 30.0
+    assert payload["cooldown"] == {"tool_hint_seconds": 60.0}
+    assert payload["behavior"]["chat_intensity"] == "normal"
+    assert payload["behavior"]["restriction_mode"] == "off"
     assert payload["rate_limit"] == {
         "threshold": 3,
         "window_seconds": 600.0,
@@ -1206,6 +1213,61 @@ async def test_config_endpoint_has_thresholds_and_no_secrets(tmp_path: Path) -> 
     }
     assert payload["budget"]["daily_calls"] == 200
     assert payload["memory"] == {"window_size": 20, "retention_days": 180}
+
+
+async def test_behavior_get_and_put_persists_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    overrides = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_module, "OVERRIDES_PATH", overrides)
+    _, service, app = make_control(tmp_path)
+    async with running(app) as client:
+        default = await (await client.get("/api/behavior")).json()
+        assert default["chat_intensity"] == "normal"
+        assert default["restriction_mode"] == "off"
+
+        resp = await client.put(
+            "/api/behavior",
+            json={
+                "chat_intensity": "quiet",
+                "restriction_mode": "strict",
+                "banned_phrases": ["内部黑话"],
+                "banned_topics": ["股票", "股票"],
+            },
+        )
+        assert resp.status == 200
+        saved = await resp.json()
+
+    assert saved["chat_intensity"] == "quiet"
+    assert saved["restriction_mode"] == "strict"
+    assert saved["banned_phrases"] == ["内部黑话"]
+    assert saved["banned_topics"] == ["股票"]
+    assert service.behavior.chat_intensity == "quiet"
+    assert overrides.exists()
+    assert "内部黑话" in overrides.read_text(encoding="utf-8")
+
+
+async def test_behavior_put_rejects_invalid_values(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        control_module, "OVERRIDES_PATH", tmp_path / "settings.local.yaml"
+    )
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        bad_intensity = await client.put(
+            "/api/behavior", json={"chat_intensity": "loud"}
+        )
+        bad_mode = await client.put(
+            "/api/behavior", json={"restriction_mode": "block"}
+        )
+        too_long = await client.put(
+            "/api/behavior", json={"banned_phrases": ["长" * 60]}
+        )
+        not_object = await client.put("/api/behavior", data="[]")
+
+    assert bad_intensity.status == 400
+    assert bad_mode.status == 400
+    assert too_long.status == 400
+    assert not_object.status == 400
 
 
 def test_dashboard_exposes_new_panels() -> None:
@@ -1223,6 +1285,10 @@ def test_dashboard_exposes_new_panels() -> None:
         'id="config-body"',
         'id="btn-restart-bot"',
         'id="btn-backup"',
+        'id="behavior-intensity"',
+        'id="behavior-restriction-mode"',
+        'id="behavior-banned-phrases"',
+        'id="btn-save-behavior"',
     ):
         assert anchor in html, f"面板缺少 {anchor}"
     assert "/api/usage?days=" in html
@@ -1230,6 +1296,7 @@ def test_dashboard_exposes_new_panels() -> None:
     assert "/api/memory/export?" in html
     assert "/api/sessions?limit=" in html
     assert "/api/config" in html
+    assert "/api/behavior" in html
     assert "/api/backup" in html
     assert "loadSessions(true)" in html
     assert "c.memory.retention_days" in html

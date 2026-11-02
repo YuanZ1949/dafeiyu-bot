@@ -808,6 +808,39 @@
     <div class="kv cfg-grid" id="config-body"></div>
   </section>
 
+  <section class="card">
+    <div class="row card-head">
+      <h2>聊天行为</h2>
+      <span class="kv" id="behavior-hint">即时生效 · 重启后保留</span>
+      <span class="spacer"></span>
+      <button class="btn" id="btn-refresh-behavior">刷新</button>
+      <button class="btn primary" id="btn-save-behavior">保存</button>
+    </div>
+    <div class="debug-form">
+      <label>聊天强度
+        <select id="behavior-intensity">
+          <option value="quiet">安静（只回点名）</option>
+          <option value="normal">正常</option>
+          <option value="active">活跃（更愿意接话）</option>
+        </select>
+      </label>
+      <label>言论限制
+        <select id="behavior-restriction-mode">
+          <option value="off">关闭</option>
+          <option value="soft">提示模型（仍可能说出）</option>
+          <option value="strict">严格（命中关键词整条不发）</option>
+        </select>
+      </label>
+      <label class="debug-wide">禁词（一行一个，子串匹配）
+        <textarea id="behavior-banned-phrases" rows="3" placeholder="例如：某个公司名&#10;某句内部黑话"></textarea>
+      </label>
+      <label class="debug-wide">禁话题（一行一个，注入提示；严格模式下也做关键词拦截）
+        <textarea id="behavior-banned-topics" rows="3" placeholder="例如：政治&#10;股票推荐"></textarea>
+      </label>
+    </div>
+    <div class="kv" style="margin-top:8px">安静 = 只有 @ / 引用 / 叫名字才进模型；正常 = 当前行为；活跃 = 放开话题收尾与降频闸门。言论限制是关键词级兜底，不是语义审核。</div>
+  </section>
+
   <section class="card span-full">
     <h2>日志</h2>
     <div class="log-head" id="log-tabs" role="tablist" aria-label="日志来源"></div>
@@ -2492,7 +2525,7 @@ async function loadConfig() {
     const rows = [
       ["大脑", providerModel + agent],
       ["人设", `${c.persona.name} · 回复 ${c.persona.max_reply_chars}/${c.persona.max_reply_chars_technical} 字 · OS ${(c.persona.os_probability * 100).toFixed(1)}%`],
-      ["冷却", `错误回复 ${c.cooldown.brain_error_seconds}s · 工具提示 ${c.cooldown.tool_hint_seconds}s`],
+      ["冷却", `工具提示 ${c.cooldown.tool_hint_seconds}s`],
       ["限流", `${c.rate_limit.window_seconds / 60} 分钟内 ${c.rate_limit.threshold} 次 429 → 退避 ${c.rate_limit.backoff_seconds}s · 配额暂停 ${Math.round(c.rate_limit.quota_pause_seconds / 60)} 分钟`],
       ["预算", `每日 ${c.budget.daily_calls} 次 / ${fmtTokens(c.budget.daily_tokens)} token`],
       ["记忆", `窗口 ${c.memory.window_size} 条 · 保留 ${c.memory.retention_days > 0 ? `${c.memory.retention_days} 天` : "永久"}`],
@@ -2504,6 +2537,45 @@ async function loadConfig() {
     $("config-hint").textContent = "只读 · 改配置需编辑 config.yaml";
   } catch (err) {
     $("config-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+const INTENSITY_LABELS = { quiet: "安静", normal: "正常", active: "活跃" };
+const RESTRICTION_LABELS = { off: "关闭", soft: "提示模型", strict: "严格拦截" };
+
+async function loadBehavior() {
+  try {
+    const b = await api("/api/behavior");
+    $("behavior-intensity").value = b.chat_intensity || "normal";
+    $("behavior-restriction-mode").value = b.restriction_mode || "off";
+    $("behavior-banned-phrases").value = (b.banned_phrases || []).join("\n");
+    $("behavior-banned-topics").value = (b.banned_topics || []).join("\n");
+    $("behavior-hint").textContent = "即时生效 · 重启后保留";
+  } catch (err) {
+    $("behavior-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+function behaviorLines(id) {
+  return $(id).value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+async function saveBehavior() {
+  const payload = {
+    chat_intensity: $("behavior-intensity").value,
+    restriction_mode: $("behavior-restriction-mode").value,
+    banned_phrases: behaviorLines("behavior-banned-phrases"),
+    banned_topics: behaviorLines("behavior-banned-topics"),
+  };
+  try {
+    const b = await api("/api/behavior", { method: "PUT", body: JSON.stringify(payload) });
+    const intensity = INTENSITY_LABELS[b.chat_intensity] || b.chat_intensity;
+    const restriction = RESTRICTION_LABELS[b.restriction_mode] || b.restriction_mode;
+    $("behavior-hint").textContent = `已保存 · ${intensity} / ${restriction}`;
+    toast("聊天行为已更新");
+  } catch (err) {
+    $("behavior-hint").textContent = `保存失败：${err.message}`;
+    toast(`保存失败：${err.message}`, true);
   }
 }
 
@@ -3100,6 +3172,8 @@ $("debug-content").addEventListener("keydown", (event) => {
 });
 $("btn-backup").addEventListener("click", downloadBackup);
 $("btn-refresh-config").addEventListener("click", loadConfig);
+$("btn-refresh-behavior").addEventListener("click", loadBehavior);
+$("btn-save-behavior").addEventListener("click", saveBehavior);
 $("btn-shutdown").addEventListener("click", async () => {
   if (!confirm("将停止 OpenCode / Bot / NapCat 三个进程并退出控制台，确定吗？")) return;
   try {
@@ -3163,6 +3237,7 @@ loadUsage();
 loadBudget();
 loadSessions();
 loadConfig();
+loadBehavior();
 setInterval(refresh, 5000);
 setInterval(() => { if (!document.hidden) refreshHealth(); }, 10000);
 setInterval(() => { if (!document.hidden && !alertsDisabled) refreshAlerts(); }, 10000);

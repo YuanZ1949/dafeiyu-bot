@@ -25,7 +25,16 @@ _PLACEHOLDERS = {
     "record": "[语音]",
     "video": "[视频]",
     "file": "[文件]",
+    "poke": "[戳一戳]",
+    "shake": "[窗口抖动]",
+    "anonymous": "[匿名消息]",
+    "keyboard": "[卡片]",
+    "template": "[卡片]",
+    "qqmusic": "[音乐]",
+    "node": "[合并转发]",
 }
+
+_RPS_NAMES = {1: "石头", 2: "剪刀", 3: "布"}
 
 _CARD_FALLBACK = "[小程序卡片]"
 _XML_FALLBACK = "[卡片]"
@@ -94,7 +103,59 @@ def _render_xml_card(data: dict[str, Any]) -> str:
         return _XML_FALLBACK
 
 
-def _render_forward(data: dict[str, Any], depth: int) -> str:
+def _clip_first(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    return _clip(text, limit) if text else ""
+
+
+def _render_at(data: dict[str, Any], bot_qq: int) -> str:
+    """@ 段渲染成文字：@你 / @全体成员 / @群友。
+
+    OneBot 的 at 段只带 QQ 号、不带昵称，所以非 bot 的 @ 不把裸号塞进
+    模型上下文，只保留「这句话在点名某人」的结构。
+    """
+    target = str(data.get("qq") or "").strip()
+    if target == "all":
+        return "@全体成员 "
+    if bot_qq and target == str(bot_qq):
+        return "@你 "
+    return "@群友 "
+
+
+def _render_rich_segment(seg_type: str, data: dict[str, Any]) -> str:
+    """分享/位置/名片/音乐/骰子/猜拳/markdown 这类消息的可读摘要。"""
+    if seg_type == "share":
+        title = _clip_first(data.get("title"), 60) or _clip_first(
+            data.get("url"), 60
+        )
+        return f"[分享] {title}".rstrip()
+    if seg_type == "location":
+        title = _clip_first(data.get("title") or data.get("content"), 60)
+        return f"[位置] {title}".rstrip()
+    if seg_type == "contact":
+        name = _clip_first(data.get("name") or data.get("nickname"), 40)
+        return f"[名片] {name}".rstrip()
+    if seg_type == "music":
+        title = _clip_first(data.get("title"), 60)
+        return f"[音乐] {title}".rstrip()
+    if seg_type == "dice":
+        return f"[骰子:{data.get('result', '?')}]"
+    if seg_type == "rps":
+        result = data.get("result")
+        try:
+            name = _RPS_NAMES.get(int(result), str(result))
+        except (TypeError, ValueError):
+            name = str(result or "?")
+        return f"[猜拳:{name}]"
+    if seg_type == "markdown":
+        body = _clip_first(data.get("content") or data.get("text"), 200)
+        return f"[Markdown] {body}".rstrip()
+    return ""
+
+
+def _render_forward(
+    data: dict[str, Any], depth: int, bot_qq: int = 0
+) -> str:
     """合并转发：内联节点递归渲染成「昵称: 内容」，超限回退占位。"""
     if depth >= _FORWARD_MAX_DEPTH:
         return _FORWARD_FALLBACK
@@ -115,7 +176,9 @@ def _render_forward(data: dict[str, Any], depth: int) -> str:
             if isinstance(message, str):
                 body = message.strip()
             elif isinstance(message, list):
-                body, _segs, _rid, _rqq = _render_segments(message, depth + 1)
+                body, _segs, _rid, _rqq = _render_segments(
+                    message, depth + 1, bot_qq=bot_qq
+                )
             else:
                 body = ""
             lines.append(f"{name}: {_clip(body, _FORWARD_NODE_CLIP)}")
@@ -129,6 +192,8 @@ def _render_forward(data: dict[str, Any], depth: int) -> str:
 def _render_segments(
     raw_segments: list[Any],
     depth: int = 0,
+    *,
+    bot_qq: int = 0,
 ) -> tuple[str, list[Segment], str | None, int | None]:
     parts: list[str] = []
     segments: list[Segment] = []
@@ -146,6 +211,11 @@ def _render_segments(
 
         if seg_type == "text":
             parts.append(str(data.get("text", "")))
+        elif seg_type == "at":
+            parts.append(_render_at(data, bot_qq))
+        elif seg_type == "file":
+            name = _clip_first(data.get("name") or data.get("file"), 60)
+            parts.append(f"[文件] {name}".rstrip())
         elif seg_type in _PLACEHOLDERS:
             parts.append(_PLACEHOLDERS[seg_type])
         elif seg_type == "reply":
@@ -156,7 +226,17 @@ def _render_segments(
         elif seg_type == "xml":
             parts.append(_render_xml_card(data))
         elif seg_type == "forward":
-            parts.append(_render_forward(data, depth))
+            parts.append(_render_forward(data, depth, bot_qq))
+        elif seg_type in (
+            "share",
+            "location",
+            "contact",
+            "music",
+            "dice",
+            "rps",
+            "markdown",
+        ):
+            parts.append(_render_rich_segment(seg_type, data))
         # 其余未知段类型一律忽略，不抛异常
 
     return "".join(parts).strip(), segments, reply_id, reply_qq
@@ -221,7 +301,9 @@ def parse_event(
         content = raw_message.strip()
         at_bot = False
     elif isinstance(raw_message, list):
-        content, segments, reply_id, reply_qq = _render_segments(raw_message)
+        content, segments, reply_id, reply_qq = _render_segments(
+            raw_message, bot_qq=bot_qq
+        )
         at_bot = any(
             seg.type == "at" and str(seg.data.get("qq", "")) == str(bot_qq) for seg in segments
         )

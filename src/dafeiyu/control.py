@@ -60,7 +60,8 @@ from .secrets_store import (
     secret_exists,
     write_secret,
 )
-from .service import BRAIN_ERROR_COOLDOWN_SECONDS, TOOL_HINT_INTERVAL_SECONDS
+from .behavior import BehaviorError, as_payload, parse_behavior
+from .service import TOOL_HINT_INTERVAL_SECONDS
 from .settings_local import OverrideError, read_overrides, write_overrides
 from .supervisor.reload_client import reload_opencode
 from .timeutil import SHANGHAI, now_shanghai
@@ -1623,6 +1624,37 @@ class BrainControl:
             self.store.forget_chat(chat_type, chat_id)
         return {"ok": True, "action": action}
 
+    def _behavior(self):
+        """当前生效的行为快照：优先 Service 的运行时值，兜底启动配置。"""
+        return getattr(self.service, "behavior", self.settings.behavior)
+
+    def behavior_snapshot(self) -> dict[str, Any]:
+        return as_payload(self._behavior())
+
+    def save_behavior(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """校验 → 落覆盖层 → 即时应用；任一步失败都不改线上行为。"""
+        behavior = parse_behavior(payload)
+        try:
+            existing = read_overrides(OVERRIDES_PATH)
+        except OverrideError as exc:
+            raise OverrideError(str(exc)) from exc
+        current = existing.get("behavior")
+        section = dict(current) if isinstance(current, dict) else {}
+        section.update(
+            {
+                "chat_intensity": behavior.chat_intensity,
+                "restriction_mode": behavior.restriction_mode,
+                "banned_phrases": list(behavior.banned_phrases),
+                "banned_topics": list(behavior.banned_topics),
+            }
+        )
+        existing["behavior"] = section
+        write_overrides(existing, OVERRIDES_PATH)
+        setter = getattr(self.service, "set_behavior", None)
+        if callable(setter):
+            setter(behavior)
+        return as_payload(behavior)
+
     def config_snapshot(self) -> dict[str, Any]:
         state = self.snapshot()
         persona = self.settings.persona
@@ -1640,9 +1672,9 @@ class BrainControl:
                 "os_probability": persona.os_probability,
             },
             "cooldown": {
-                "brain_error_seconds": BRAIN_ERROR_COOLDOWN_SECONDS,
                 "tool_hint_seconds": TOOL_HINT_INTERVAL_SECONDS,
             },
+            "behavior": self.behavior_snapshot(),
             "rate_limit": {
                 "threshold": RATE_LIMIT_THRESHOLD,
                 "window_seconds": RATE_LIMIT_WINDOW_SECONDS,
@@ -2324,6 +2356,37 @@ def create_app(
                 {"error": f"读取配置失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def get_behavior(_: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.behavior_snapshot())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取聊天行为失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取聊天行为失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def put_behavior(request: web.Request) -> web.Response:
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        try:
+            return web.json_response(control.save_behavior(payload))
+        except BehaviorError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except OverrideError as exc:
+            return web.json_response(
+                {"error": f"覆盖层读写失败：{exc}"}, status=500
+            )
+        except OSError as exc:
+            return web.json_response(
+                {"error": f"覆盖层写入失败：{exc.__class__.__name__}"}, status=500
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("保存聊天行为失败：%s", exc)
+            return web.json_response(
+                {"error": f"保存聊天行为失败：{exc.__class__.__name__}"}, status=500
+            )
+
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/health/detail", health_detail)
     app.router.add_post("/api/notify/admin", notify_admin)
@@ -2358,6 +2421,8 @@ def create_app(
     app.router.add_post("/api/sessions/{chat_type}/{chat_id}/{action}", session_action)
     app.router.add_delete("/api/sessions/{chat_type}/{chat_id}", delete_session)
     app.router.add_get("/api/config", config)
+    app.router.add_get("/api/behavior", get_behavior)
+    app.router.add_put("/api/behavior", put_behavior)
     app.router.add_get("/api/backup", backup)
     return app
 

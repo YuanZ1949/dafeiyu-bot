@@ -17,6 +17,7 @@ import aiohttp
 
 from ..brain.client import BrainError
 from ..brain.opencode import resolve_opencode_bin
+from ..brain.opencode_auth import PASSWORD_ENV, password_env, resolve_password
 from ..brain.provider_config import ensure_agent_files
 from ..brain.runtime_config import server_env
 from ..config import ConfigError, Settings, load_settings
@@ -157,10 +158,17 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
     control_port = settings.supervisor.control_port
 
     specs: dict[str, ProcSpec] = {}
-    # 真正拉起 serve 的是 supervisor（bot 侧 manage_server=false），
-    # 所以配置隔离必须在这里注入；留空时 server_env 返回 None，保持软回滚。
+    # P7：opencode v2 的 serve 强制 Basic 认证（用户名固定 opencode，密码由
+    # OPENCODE_SERVER_PASSWORD 决定）。真正拉起 serve 的是 supervisor（bot 侧
+    # manage_server=false），所以口令必须在这里注入：只靠 runtime-launcher.ps1
+    # 手动 set 的话，绕过启动器直接跑 start-all/start.bat 就会让 serve 随机生成
+    # 口令、bot 全 401。同一个口令同时给 opencode 与 bot 两个子进程；配置留空时
+    # 每次启动生成一个新的 32 位十六进制口令（只放进程环境，不落盘、不写日志）。
+    server_password = resolve_password(settings.opencode.server_password)
+    # 配置隔离同样必须在这里注入；留空时 server_env 返回 None，保持软回滚。
     opencode_env: dict[str, str] = {"OPENCODE_DB": str(db_path), "NO_COLOR": "1"}
     opencode_env.update(server_env(settings.opencode.config_home) or {})
+    opencode_env.update(password_env(server_password))
     specs["opencode"] = ProcSpec(
         name="opencode",
         command=[
@@ -184,6 +192,10 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
             "DAFEIYU_CONTROL_HOST": control_host,
             "DAFEIYU_CONTROL_PORT": str(control_port),
             "DAFEIYU_CONTROL_TOKEN": token,
+            # P7：bot 靠这条环境变量读到和 serve 完全一致的口令（config.py 缺省
+            # 就是回退同名环境变量）。显式注入而不是依赖继承：启动器没 set 时，
+            # supervisor 生成的口令只有这样才能传到 bot。
+            PASSWORD_ENV: server_password,
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUNBUFFERED": "1",
         },

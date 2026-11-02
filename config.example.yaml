@@ -43,6 +43,11 @@ opencode:
   # 由 supervisor 拉起 serve，bot 只当客户端
   manage_server: false
   server_url: http://127.0.0.1:24310
+  # serve 的 Basic 认证口令（用户名固定 opencode）。通常留空：supervisor 每次启动
+  # 生成一个随机 32 位十六进制口令，并同时注入 opencode 与 bot 两个子进程（P7），
+  # 不再依赖启动器手动 set 环境变量。也可以在 .env 里设 OPENCODE_SERVER_PASSWORD
+  # （这里的显式值优先）。只有外部/手动跑 serve 时才需要填，保证 bot 与 serve 一致。
+  server_password: ""
   db_path: data/opencode-bot.db
   host: 127.0.0.1
   port: 24310
@@ -178,6 +183,19 @@ memory:
   recall_enabled: true
   recall_topk: 3
   recall_chars: 300
+
+# 面板「聊天行为」卡片可实时改；这里的值只是默认值，面板改动写
+# data/settings.local.yaml，重启后仍然保留。
+behavior:
+  # quiet：只回点名（@/引用/叫名字）；normal：当前行为；
+  # active：放开「话题收尾」和「连续空转降频」两个软闸门。
+  chat_intensity: normal
+  # off：不限制；soft：只把限制注入提示；strict：命中关键词的整条回复丢弃。
+  # 注意：YAML 里裸 off 会被解析成布尔值，想手改请像下面这样加引号。
+  restriction_mode: "off"
+  # 关键词级子串匹配（不是语义审核）；面板一行一个。
+  banned_phrases: []
+  banned_topics: []
 
 logging:
   level: INFO

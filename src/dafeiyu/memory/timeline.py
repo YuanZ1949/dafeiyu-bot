@@ -30,8 +30,17 @@ def time_label(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, SHANGHAI).strftime("%m-%d %H:%M")
 
 
-def format_message_line(msg: Message, *, current: Message | None = None) -> str:
-    """一行一条消息；当前这条额外标出 @ 与引用，模型才知道话是对它说的。"""
+def format_message_line(
+    msg: Message,
+    *,
+    current: Message | None = None,
+    reply_names: dict[str, str] | None = None,
+) -> str:
+    """一行一条消息；当前这条额外标出 @ 与引用，其他消息补「回复 谁」。
+
+    群友之间的互回是判断「这句话在接谁」的关键线索；旧实现只标当前消息
+    对 bot 的 @/引用，A 回 B 的关系在时间线里完全丢失。
+    """
     if msg.recalled_at:
         content = "[已撤回]"
     else:
@@ -44,6 +53,10 @@ def format_message_line(msg: Message, *, current: Message | None = None) -> str:
             marks = "（引用回复你）"
         elif current.at_bot:
             marks = "（@了你）"
+    elif reply_names and msg.reply_to_message_id:
+        target = reply_names.get(msg.reply_to_message_id, "")
+        if target:
+            marks = f"（回复 {target}）"
     return f"{prefix}{msg.nickname}：{content}{marks}"
 
 
@@ -80,6 +93,7 @@ def build_batch_prompt(
     *,
     continuation: str | None = None,
     omitted: int = 0,
+    reply_names: dict[str, str] | None = None,
 ) -> str:
     """批次 prompt：注入段 →（接续）→ 新消息时间线。
 
@@ -87,6 +101,7 @@ def build_batch_prompt(
     at_bot / reply_to_bot 随消息一起落库，每条按自己的标志渲染标记，
     模型才知道哪几句是对它说的、是 @ 还是引用回复。
     单条路径复用同一构建器，omitted 是更早未展开的消息数（由 pending 查询给出）。
+    reply_names 是「被回复消息 id → 昵称」，用来渲染群友之间的「（回复 X）」。
     """
     parts: list[str] = []
     if injection.strip():
@@ -101,7 +116,9 @@ def build_batch_prompt(
         lines.append(BATCH_HEADER)
         for msg in messages:
             current = msg if (msg.at_bot or msg.reply_to_bot) else None
-            lines.append(format_message_line(msg, current=current))
+            lines.append(
+                format_message_line(msg, current=current, reply_names=reply_names)
+            )
         if len(messages) > 1:
             lines.append(TIMELINE_HINT)
         parts.append("\n".join(lines))

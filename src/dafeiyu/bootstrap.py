@@ -16,6 +16,7 @@ from pathlib import Path
 from .brain.client import BrainError
 from .brain.opencode import resolve_opencode_bin
 from .config import ConfigError, load_settings
+from .env_probe import LOW, probe_environment
 
 INSTALL_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG = INSTALL_ROOT / "config.example.yaml"
@@ -73,6 +74,56 @@ def _port_free(port: int, host: str = "127.0.0.1") -> bool:
     return True
 
 
+def _env_encoding_issue(env_path: Path) -> Issue | None:
+    """``.env`` 存在但不是合法 UTF-8 时给出阻塞项；正常/不存在返回 None。
+
+    P10：从旧机器拷来的 .env 常是 GBK/有损编码，dotenv 会解析出空凭据，
+    最后只表现为「缺 DEEPSEEK_API_KEY」，很容易查错方向。
+    """
+    if not env_path.is_file():
+        return None
+    try:
+        env_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return Issue(
+            "error",
+            "`.env` 编码不是 UTF-8",
+            f"{env_path} 不是合法的 UTF-8（从旧机器拷来的 GBK/有损编码最常见）；"
+            "凭据会解析为空或只读到一半，例如 DEEPSEEK_API_KEY 看起来「没填」",
+            "用记事本「另存为」选 UTF-8 重存，或按 .env.example 重写 .env（保留原有键值）",
+        )
+    except OSError:
+        return None
+    return None
+
+
+def _missing_bom_scripts(root_path: Path) -> list[str]:
+    """列出「含非 ASCII 但没有 UTF-8 BOM」的 .ps1（P8）。
+
+    只看 scripts/*.ps1 和 data/runtime-launcher.ps1（后者是任务计划的实际入口，
+    存在才查）。纯 ASCII 的脚本不受 PowerShell 5.1 的 ANSI 解码影响，不算问题。
+    """
+    candidates: list[Path] = []
+    scripts_dir = root_path / "scripts"
+    if scripts_dir.is_dir():
+        candidates.extend(sorted(scripts_dir.glob("*.ps1"), key=lambda p: p.name))
+    launcher = root_path / "data" / "runtime-launcher.ps1"
+    if launcher.is_file():
+        candidates.append(launcher)
+
+    missing: list[str] = []
+    for path in candidates:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if not data or data.startswith(b"\xef\xbb\xbf"):
+            continue
+        if any(byte > 0x7F for byte in data):
+            missing.append(path.name)
+    return missing
+
+
 def preflight(
     config_path: Path | str | None = None,
     env_file: Path | str | None = None,
@@ -108,8 +159,24 @@ def preflight(
         )
         return issues
 
+    # P10：编码坏掉的 .env 会让后面所有凭据解析失真，先修编码再谈别的。
+    env_issue = _env_encoding_issue(env_path)
+    if env_issue is not None:
+        issues.append(env_issue)
+        return issues
+
     try:
         settings = load_settings(env_file=env_path, config_file=config)
+    except UnicodeDecodeError:
+        issues.append(
+            Issue(
+                "error",
+                "`config.yaml` 编码不是 UTF-8",
+                f"{config} 不是合法的 UTF-8（中文注释被存成 ANSI/GBK 时常见）",
+                "用 UTF-8（无 BOM）另存 config.yaml，或运行 dafeiyu init --force 重新生成",
+            )
+        )
+        return issues
     except ConfigError as exc:
         issues.append(
             Issue(
@@ -120,6 +187,21 @@ def preflight(
             )
         )
         return issues
+
+    # P4/P5：工作区里的可执行文件可能被沙箱打成 Low 完整性，写用户目录/临时目录
+    # EPERM，经常被误诊成杀毒软件拦截。这里提前把真实原因指出来。
+    probe = probe_environment()
+    if probe.integrity == LOW or not probe.temp_writable:
+        issues.append(
+            Issue(
+                "warn",
+                "运行环境疑似被沙箱降权（Low 完整性）",
+                f"完整性级别 {probe.integrity}；{probe.detail}",
+                "写用户目录/临时目录出现 EPERM 时先查完整性级别，别怀疑杀毒软件；"
+                "把 DSH 权限切成「完全访问」或换一个干净工作区后重建 .venv，"
+                "详见 docs/deployment-notes-windows.md 的 P4/P5",
+            )
+        )
 
     napcat_node = root_path / "vendor" / "napcat" / "node.exe"
     if not napcat_node.is_file():
@@ -176,6 +258,24 @@ def preflight(
                 "数据目录不可写",
                 f"{data_dir}：{exc}",
                 "换一个可写位置，或用 DAFEIYU_DB_PATH 指定",
+            )
+        )
+
+    # P8：PowerShell 5.1 对无 BOM 的 UTF-8 中文脚本按 ANSI 解码，可能把中文
+    # 注释的下一行吞掉（曾导致 OPENCODE_SERVER_PASSWORD 赋值整行丢失）。
+    missing_bom = _missing_bom_scripts(root_path)
+    if missing_bom:
+        shown = "、".join(missing_bom[:5])
+        if len(missing_bom) > 5:
+            shown += f" 等 {len(missing_bom)} 个文件"
+        issues.append(
+            Issue(
+                "warn",
+                "PowerShell 脚本缺少 UTF-8 BOM",
+                f"{shown} 含中文但不是 UTF-8 with BOM；PowerShell 5.1 会按 ANSI 解码，"
+                "可能吞掉中文注释的下一行（P8）",
+                "按 P8 转存为 UTF-8 with BOM：$t=[IO.File]::ReadAllText($p,[Text.UTF8Encoding]::new($false)); "
+                "[IO.File]::WriteAllText($p,$t,[Text.UTF8Encoding]::new($true))",
             )
         )
 

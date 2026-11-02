@@ -17,7 +17,7 @@ from dafeiyu.config import (
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router, TriggerDecision, now_shanghai
-from dafeiyu.service import BRAIN_ERROR_REPLY, FORGET_REPLY, Service
+from dafeiyu.service import FORGET_REPLY, Service
 from dafeiyu.workers.failure import QUOTA_KEY
 
 SHANGHAI = timezone(timedelta(hours=8))
@@ -179,18 +179,17 @@ async def test_duplicate_message_id_is_ignored(tmp_path):
     assert brain.calls == 1
 
 
-async def test_brain_error_sends_short_reply(tmp_path):
+async def test_brain_error_stays_silent(tmp_path):
     service, _, _, adapter, _ = build(
         tmp_path, brain=FakeBrain(error=BrainError("boom"))
     )
     await service.handle(make_msg())
 
-    assert adapter.sent == [(ChatType.GROUP, 1001, BRAIN_ERROR_REPLY)]
+    # 用户明确不要「本鱼断线了」这类失败提示：失败只记账、不发言。
+    assert adapter.sent == []
 
 
-async def test_brain_error_reply_has_30s_cooldown_per_chat(tmp_path, monkeypatch):
-    clock = {"now": 1000.0}
-    monkeypatch.setattr("dafeiyu.service.time.monotonic", lambda: clock["now"])
+async def test_brain_error_records_usage_without_sending(tmp_path):
     service, store, _, adapter, _ = build(
         tmp_path, brain=FakeBrain(error=BrainError("boom"))
     )
@@ -200,17 +199,103 @@ async def test_brain_error_reply_has_30s_cooldown_per_chat(tmp_path, monkeypatch
         make_msg(chat_type=ChatType.PRIVATE, chat_id=2002, message_id="m2")
     )
 
-    assert adapter.sent == [(ChatType.PRIVATE, 2002, BRAIN_ERROR_REPLY)]
+    assert adapter.sent == []
     calls, _ = store.usage_today_by_purpose(
         ChatType.PRIVATE, 2002, store.today(), ("error",)
     )
     assert calls == 2
 
-    clock["now"] += 31
-    await service._reply(
-        make_msg(chat_type=ChatType.PRIVATE, chat_id=2002, message_id="m3")
+
+async def test_short_answer_to_bot_question_is_addressed(tmp_path):
+    """bot 刚问完「你用的什么卡？」，下一句「4060」算隐式点名。"""
+    service, store, _, _, _ = build(tmp_path)
+    bot = Message(
+        chat_type=ChatType.GROUP,
+        chat_id=1001,
+        user_id=999,
+        nickname="溟月",
+        content="你用的什么卡？",
+        message_id="b1",
+        is_bot=True,
+        timestamp=1000,
     )
-    assert len(adapter.sent) == 2
+    store.add_message(bot)
+
+    assert service._is_addressed(make_msg(content="4060", message_id="m2", timestamp=1005))
+    # 中间隔了 10 分钟、或回答太长，都不再算接它的话。
+    assert not service._is_addressed(
+        make_msg(content="4060", message_id="m3", timestamp=1605)
+    )
+    assert not service._is_addressed(
+        make_msg(
+            content=(
+                "4060 但是我觉得驱动也得换一下，顺便电源可能也不够，"
+                "最好先看看整机功耗再决定要不要升级，不然白折腾"
+            ),
+            message_id="m4",
+            timestamp=1006,
+        )
+    )
+
+
+async def test_reply_to_old_bot_message_is_resolved_from_db(tmp_path):
+    """重启后网关的 bot_message_ids 清空，引用老消息仍要按点名处理。"""
+    service, store, brain, _, _ = build(tmp_path)
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id=1001,
+            user_id=999,
+            nickname="溟月",
+            content="在呢",
+            message_id="b1",
+            is_bot=True,
+            timestamp=1000,
+        )
+    )
+    user = Message(
+        chat_type=ChatType.GROUP,
+        chat_id=1001,
+        user_id=2002,
+        nickname="阿鱼",
+        content="继续",
+        message_id="u1",
+        reply_to_message_id="b1",
+        timestamp=1005,
+    )
+
+    await service.handle(user)
+
+    assert user.reply_to_bot is True
+    assert brain.calls == 1
+
+
+async def test_agent_missing_error_rebuilds_session_and_replies(tmp_path):
+    """仓库移动后旧 opencode session 会报 Agent not found：应自动换新会话。"""
+
+    class AgentMissingBrain(FakeBrain):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fresh_calls = 0
+
+        async def reply(self, chat_type, chat_id, text, *, on_tool=None):
+            raise BrainError(
+                'OpenCode 调用失败（unknown）：Agent not found: "deepseek-qq"'
+            )
+
+        async def reply_fresh(
+            self, chat_type, chat_id, text, *, system="", history=None, on_tool=None
+        ):
+            self.fresh_calls += 1
+            return BrainReply(True, "换好了", "fresh", 1, 1)
+
+    brain = AgentMissingBrain()
+    service, _, _, adapter, _ = build(tmp_path, brain=brain)
+
+    await service.handle(make_msg())
+
+    assert brain.fresh_calls == 1
+    assert adapter.sent == [(ChatType.GROUP, 1001, "换好了")]
 
 
 async def test_concurrent_same_group_sends_only_once(tmp_path):

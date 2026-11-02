@@ -188,6 +188,18 @@ def test_rate_limit_detection() -> None:
     assert not is_rate_limit_error(None)
 
 
+def test_agent_missing_error_detection() -> None:
+    """opencode 旧 session 绑定的目录没了：要能识别并换新 session。"""
+    from dafeiyu.workers.failure import is_agent_missing_error
+
+    assert is_agent_missing_error(
+        BrainError('OpenCode 调用失败（unknown）：Agent not found: "deepseek-qq"')
+    )
+    assert is_agent_missing_error(BrainError("agent NOT found"))
+    assert not is_agent_missing_error(BrainError("network down"))
+    assert not is_agent_missing_error(None)
+
+
 def test_free_limit_is_treated_as_quota() -> None:
     """opencode 免费档的额度耗尽文案不含 "quota"，只按 429 处理会每 10 分钟撞一次。"""
     from dafeiyu.workers.failure import is_quota_error

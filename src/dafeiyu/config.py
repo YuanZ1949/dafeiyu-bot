@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 from dotenv import dotenv_values
 
+from .behavior import BehaviorError, BehaviorSettings, parse_behavior
 from .settings_local import (
     DEFAULT_PATH,
     VALID_MODES,
@@ -352,6 +353,8 @@ class Settings:
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
     backup: BackupConfig = field(default_factory=BackupConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
+    # 面板可改的运行时行为；默认值等价于当前线上行为。
+    behavior: BehaviorSettings = field(default_factory=BehaviorSettings)
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -813,12 +816,31 @@ def _overlay_bool(value: Any, field: str) -> bool:
     return value
 
 
+def _apply_behavior_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """面板改的聊天强度/言论限制单独一段；没有 brain 覆盖时也要生效。"""
+    section = overrides.get("behavior")
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        raise ConfigError("覆盖层的 behavior 必须是映射")
+    target = _overlay_target(raw, "behavior")
+    for name in (
+        "chat_intensity",
+        "restriction_mode",
+        "banned_phrases",
+        "banned_topics",
+    ):
+        if name in section:
+            target[name] = section[name]
+
+
 def _apply_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> bool:
     """把覆盖层白名单键盖到 raw 上，返回覆盖层是否显式给了 brain.mode。
 
     白名单之外的键（包括 brain.provider、brain.local_model.api_key）一律忽略：
     覆盖层由面板生成，出现别的键说明版本不一致，静默跳过比报错更稳。
     """
+    _apply_behavior_overrides(raw, overrides)
     brain_override = overrides.get("brain")
     if brain_override is None:
         return False
@@ -1135,6 +1157,11 @@ def load_settings(
             "缺少 BOT_QQ：请在 .env 里填写机器人 QQ 号（BOT_QQ=123456789）"
         )
 
+    try:
+        behavior = parse_behavior(raw.get("behavior") or {})
+    except BehaviorError as exc:
+        raise ConfigError(str(exc)) from exc
+
     return Settings(
         api_key=api_key,
         base_url=env.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
@@ -1225,4 +1252,5 @@ def load_settings(
         alerts=_build_alerts(raw.get("alerts") or {}),
         backup=_build_backup(raw.get("backup") or {}),
         audit=_build_audit(raw.get("audit") or {}),
+        behavior=behavior,
     )

@@ -2,6 +2,7 @@
 
 from datetime import date, datetime, timedelta, timezone
 
+from dafeiyu.behavior import BehaviorSettings
 from dafeiyu.brain.client import BrainError, BrainReply
 from dafeiyu.config import (
     BudgetConfig,
@@ -17,7 +18,7 @@ from dafeiyu.memory.store import Store
 from dafeiyu.memory.workspace import Workspace
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router
-from dafeiyu.service import BRAIN_ERROR_REPLY, FOLLOWUP_REPLY, Service
+from dafeiyu.service import FOLLOWUP_REPLY, Service
 from dafeiyu.timeutil import today_shanghai
 
 SHANGHAI = timezone(timedelta(hours=8))
@@ -211,6 +212,62 @@ async def test_batch_marks_delivered_and_records_ambient(tmp_path):
     assert adapter.sent
 
 
+async def test_quiet_intensity_keeps_ambient_batch_pending(tmp_path):
+    service, store, brain, adapter = build(tmp_path)
+    service.set_behavior(BehaviorSettings(chat_intensity="quiet"))
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    # 非点名批次不送模型，也不标成已投递：下次被点名时还要能一起看到。
+    assert brain.reply_calls == 0
+    assert batch_ids(service) == ["m0", "m1"]
+    assert adapter.sent == []
+    calls, _ = store.usage_today_by_purpose(
+        ChatType.GROUP, 1001, store.today(), ("reply", "ambient")
+    )
+    assert calls == 0
+
+
+async def test_active_intensity_injects_framing(tmp_path):
+    service, _, brain, _ = build(tmp_path)
+    service.set_behavior(BehaviorSettings(chat_intensity="active"))
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert "【聊天强度：活跃】" in brain.last_prompt
+
+
+async def test_strict_restriction_drops_matching_reply(tmp_path):
+    service, _, _, adapter = build(
+        tmp_path, brain=FakeBrain(text="这是内部黑话，不能说")
+    )
+    service.set_behavior(
+        BehaviorSettings(
+            restriction_mode="strict", banned_phrases=("内部黑话",)
+        )
+    )
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert adapter.sent == []
+
+
+async def test_soft_restriction_still_sends_but_injects_hint(tmp_path):
+    service, _, brain, adapter = build(
+        tmp_path, brain=FakeBrain(text="这是内部黑话，悄悄说")
+    )
+    service.set_behavior(
+        BehaviorSettings(
+            restriction_mode="soft", banned_phrases=("内部黑话",)
+        )
+    )
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert "【言论限制】" in brain.last_prompt
+    assert adapter.texts() == ["这是内部黑话，悄悄说"]
+
+
 async def test_batch_injects_recalled_old_messages_when_enabled(tmp_path):
     service, store, brain, _ = build(
         tmp_path,
@@ -304,12 +361,13 @@ async def test_addressed_state_survives_service_restart(tmp_path):
     assert "（@了你）" in brain.last_prompt
 
 
-async def test_brain_error_does_not_requeue_and_sends_fallback(tmp_path):
+async def test_brain_error_does_not_requeue_and_stays_silent(tmp_path):
     service, store, _, adapter = build(tmp_path, brain=FakeBrain(error=True))
 
     await service._run_batch(ChatType.GROUP, 1001)
 
-    assert BRAIN_ERROR_REPLY in adapter.texts()
+    # 不再发「本鱼断线了」：失败只记账 + mark_skipped，群里保持安静。
+    assert adapter.texts() == []
     assert batch_ids(service) == []
     assert store.skip_reason(ChatType.GROUP, 1001, "m0") == "error"
 
@@ -414,6 +472,90 @@ async def test_recalled_anchor_skips_batch(tmp_path):
 
     assert brain.reply_calls == 0
     assert adapter.texts() == []
+
+
+async def test_closed_thread_reopens_on_question(tmp_path):
+    """收尾窗口里出现明确问句：应该重新叫醒模型，而不是按 5% 抽签。"""
+    service, store, brain, _adapter = build(tmp_path, rng=_FixedRng(0.9))
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    service.router.note_bot_spoke(ChatType.GROUP, 1001, ambient=True)
+    assert service.router.is_thread_closed(ChatType.GROUP, 1001) is True
+
+    msg = make_msg("这个报错怎么弄？", message_id="m3")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert brain.reply_calls == 1
+
+
+async def test_alias_mention_counts_as_addressed_in_batch(tmp_path):
+    """叫名字不像 @/引用那样带标记，批次也要按点名处理（reply 预算/收尾重开）。"""
+    service, store, brain, _adapter = build(tmp_path)
+    msg = make_msg("大肥鱼在吗", message_id="m3")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert brain.reply_calls == 1
+    calls, _ = store.usage_today_by_purpose(
+        ChatType.GROUP, 1001, store.today(), ("reply",)
+    )
+    assert calls == 1
+
+
+async def test_question_batch_prompt_has_timing_hint(tmp_path):
+    service, store, brain, _adapter = build(tmp_path)
+    store.add_message(make_msg("这个报错怎么弄？", message_id="m3"))
+
+    await service._run_batch(ChatType.GROUP, 1001)
+
+    assert "【时机】" in brain.last_prompt
+
+
+async def test_prompt_tells_model_to_read_latest_image(tmp_path):
+    service, _store, _brain, _adapter = build(tmp_path)
+    image = make_msg(
+        "[图片]（图存 data/bot-workspace/images/20261031-210535-x.gif，"
+        "动图，可用 read 查看）",
+        message_id="m3",
+    )
+
+    prompt = service._build_prompt(ChatType.GROUP, 1001, [image])
+
+    assert "【图片】" in prompt
+    assert "最近一张" in prompt
+    assert "read" in prompt
+    assert "首帧" in prompt
+
+
+async def test_prompt_flags_missing_image(tmp_path):
+    service, _store, _brain, _adapter = build(tmp_path)
+    prompt = service._build_prompt(
+        ChatType.GROUP, 1001, [make_msg("[图片]", message_id="m3")]
+    )
+
+    assert "没有取到内容" in prompt
+    assert "不要编造" in prompt
+
+
+async def test_prompt_finds_recent_image_when_batch_has_no_image(tmp_path):
+    """轮换/批次之后才问「刚才那张图」：要从最近消息里把图片路径补回来。"""
+    service, store, _brain, _adapter = build(tmp_path)
+    store.add_message(
+        make_msg(
+            "[图片]（图存 data/bot-workspace/images/earlier.jpg，可用 read 查看）",
+            message_id="img1",
+        )
+    )
+
+    prompt = service._build_prompt(
+        ChatType.GROUP, 1001, [make_msg("刚才那张图是猫吗", message_id="m3")]
+    )
+
+    assert "最近发过的图" in prompt
+    assert "earlier.jpg" in prompt
+    assert "read" in prompt
 
 
 async def test_downshift_skips_batch(tmp_path):

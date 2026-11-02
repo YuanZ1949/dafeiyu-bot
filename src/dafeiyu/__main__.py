@@ -5,7 +5,7 @@ import contextlib
 import logging
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,7 @@ from .brain.client import BrainError
 from .brain.factory import build_brain, current_provider, local_model_name
 from .brain.lmstudio import ensure_server
 from .brain.opencode import resolve_opencode_bin
+from .brain.opencode_auth import password_env, resolve_password
 from .brain.opencode_server import OpenCodeServer
 from .brain.persona import load_persona
 from .brain.runtime_config import server_env
@@ -153,6 +154,23 @@ async def checkpoint_loop(
             log.exception("WAL checkpoint 失败")
 
 
+def ensure_manage_server_password(settings: Settings) -> tuple[Settings, str]:
+    """bot 自己拉起 serve（manage_server）时统一 serve 口令（P7）。
+
+    口令优先取配置值（config.py 已把 OPENCODE_SERVER_PASSWORD 作为缺省回退读进
+    ``settings.opencode.server_password``）；都没有就生成一个 32 位十六进制口令，
+    并写回 settings，保证随后 build_brain 建 HTTP 客户端时用的是同一份口令。
+    返回 (可能被替换的 settings, 口令)，口令只进子进程 env，不落盘不写日志。
+    """
+    password = resolve_password(settings.opencode.server_password)
+    if not settings.opencode.server_password:
+        settings = replace(
+            settings,
+            opencode=replace(settings.opencode, server_password=password),
+        )
+    return settings, password
+
+
 async def main() -> None:
     settings = load_settings()
     setup_logging(settings)
@@ -191,10 +209,16 @@ async def main() -> None:
             )
         effective_server_url = settings.opencode.server_url
         if provider == "opencode" and settings.opencode.manage_server:
+            # P7：bot 自己拉起 serve 时也要把 Basic 口令同时给 serve 与 HTTP 客户端，
+            # 否则客户端没口令、serve 随机生成，仍然全 401。
+            settings, server_password = ensure_manage_server_password(settings)
             try:
                 opencode_bin = resolve_opencode_bin(settings.opencode.bin)
             except BrainError as exc:
                 raise ConfigError(str(exc)) from exc
+            # server_env 留空时返回 None（沿用启动环境）；口令必须叠加在它上面。
+            server_proc_env = server_env(settings.opencode.config_home) or {}
+            server_proc_env.update(password_env(server_password))
             server = OpenCodeServer(
                 bin_path=opencode_bin,
                 project_dir=settings.opencode.project_dir,
@@ -202,7 +226,7 @@ async def main() -> None:
                 host=settings.opencode.host,
                 port=settings.opencode.port,
                 startup_timeout=settings.opencode.startup_timeout_seconds,
-                env=server_env(settings.opencode.config_home),
+                env=server_proc_env,
             )
             try:
                 await server.start()

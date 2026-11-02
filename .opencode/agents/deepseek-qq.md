@@ -4,7 +4,7 @@ mode: primary
 # 4 步给「查网页 → 读结果 → 写笔记 → 出 JSON」留余量；最后一步仍会移除工具。
 steps: 4
 # 钉住模型：全局默认变了也不该静默改变 bot 行为。
-model: opencode/deepseek-v4.1-flash-free
+model: dafeiyu-key/deepseek-flash
 permissions:
   # 通配 deny 必须放最前：规则是「最后匹配者胜」，后面才能用 allow 开例外。
   # 逐项写 read/shell 会漏掉 MCP 工具（ast_* 之类），将来接上就漏。

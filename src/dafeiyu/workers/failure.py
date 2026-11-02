@@ -57,6 +57,10 @@ def log_memory_failure(
 # 前者，于是账号级耗尽被当成单会话 429 短歇，每 10 分钟重试一次撞两小时。
 QUOTA_HINTS = ("quota", "free-limit", "free limit", "usage limit", "insufficient credit")
 
+# opencode 的 session 绑定创建时的 project 目录；项目被移动/复制后，旧 session
+# 会在一个空目录里找 agent，必然报 Agent not found。清掉映射重建 session 即可恢复。
+AGENT_MISSING_HINTS = ("agent not found",)
+
 
 def is_quota_error(exc: BaseException | None) -> bool:
     """配额耗尽的错误文本来自各 provider 的 BrainError，统一按关键词识别。"""
@@ -78,6 +82,14 @@ def is_rate_limit_error(exc: BaseException | None) -> bool:
         pass
     text = str(exc).casefold()
     return "429" in text or "rate limit" in text or "too many requests" in text
+
+
+def is_agent_missing_error(exc: BaseException | None) -> bool:
+    """opencode 旧 session 指向已不存在的项目目录时，会报 Agent not found。"""
+    if exc is None:
+        return False
+    text = str(exc).casefold()
+    return any(hint in text for hint in AGENT_MISSING_HINTS)
 
 
 def _normalize_key(key: Hashable) -> Hashable:

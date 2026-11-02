@@ -226,6 +226,38 @@ try {
     }
     Write-Host "SHA256 校验通过：$($files.Count)/$($files.Count)" -ForegroundColor Green
 
+    # ---- 3.5 部署前体检：目标目录先跑一遍 doctor，早失败早回滚 ----
+    # 位置刻意放在 SHA256 校验之后、重启之前：文件已经就位但服务还没切过去，
+    # doctor 返回非 0 直接 throw，由下面的 catch 回滚到部署前的文件。
+    # -NoRestart 同样执行；目标 python 不可运行或缺 config.yaml（如测试里的假
+    # release）时只提示后跳过，不能因此让整次部署失败。
+    $targetConfig = Join-Path $Target "config.yaml"
+    $targetPythonOk = $false
+    try {
+        & $targetPython --version | Out-Null
+        $targetPythonOk = ($LASTEXITCODE -eq 0)
+    } catch {
+        $targetPythonOk = $false
+    }
+    if ($targetPythonOk -and (Test-Path -LiteralPath $targetConfig)) {
+        Write-Host "部署前体检：在目标目录运行 doctor ..." -ForegroundColor Cyan
+        Clear-DeployPythonPath
+        Push-Location $Target
+        try {
+            & $targetPython -m dafeiyu.cli doctor --no-ports | Out-Host
+            $doctorCode = $LASTEXITCODE
+        } finally {
+            Pop-Location
+            Clear-DeployPythonPath
+        }
+        if ($doctorCode -ne 0) {
+            throw "目标目录体检未通过（doctor 退出码 $doctorCode）；已停止部署并回滚。请先按上面的提示修好目标目录，再重新部署。"
+        }
+        Write-Host "部署前体检通过：目标目录 doctor 无阻塞项" -ForegroundColor Green
+    } else {
+        Write-Host "跳过部署前体检：目标 python 不可运行或缺少 config.yaml（$Target）" -ForegroundColor DarkGray
+    }
+
     if (-not $NoRestart) {
         # ---- 4. 启动（start-all 自己会等面板 /login 就绪）----
         if (-not (Invoke-TargetStart)) {

@@ -142,6 +142,19 @@ async def test_http_url_annotates_and_writes_file(tmp_path):
     assert stored[0].name in msg.content
 
 
+async def test_gif_annotation_marks_animated(tmp_path):
+    gif = b"GIF89a" + b"0" * 64
+
+    async def fetch(url, timeout, max_bytes):
+        return gif
+
+    msg = make_msg()
+    got = await materialize(msg, make_settings(tmp_path), fetch=fetch)
+    assert got == 1
+    assert "动图" in msg.content
+    assert next(images_dir(tmp_path).iterdir()).suffix == ".gif"
+
+
 async def test_file_http_source(tmp_path):
     msg = make_msg(segs=[Segment("image", {"file": "http://x/b.jpg"})])
     fetch, calls = fake_fetch()

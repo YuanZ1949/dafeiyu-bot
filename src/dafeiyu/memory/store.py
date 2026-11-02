@@ -557,6 +557,25 @@ class Store:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def is_bot_message(
+        self, chat_type: ChatType, chat_id: int, message_id: str
+    ) -> bool:
+        """这条 message_id 是否是本会话里 bot 自己发的消息。
+
+        重启后网关内存里的 bot_message_ids 是空的；引用回复老消息时只能靠库
+        判断「被引用的是不是我」，否则会把对 bot 的引用当成普通回复。
+        """
+        if not message_id:
+            return False
+        row = self._conn.execute(
+            """
+            SELECT is_bot FROM messages
+            WHERE chat_type = ? AND chat_id = ? AND message_id = ?
+            """,
+            (chat_type.value, chat_id, message_id),
+        ).fetchone()
+        return bool(row and row["is_bot"])
+
     def recent_messages(
         self,
         chat_type: ChatType,

@@ -46,7 +46,14 @@ def test_at_all_is_not_at_bot() -> None:
     m = parse_event(group_event(segments=[at("all"), text("在吗")]), bot_qq=BOT_QQ)
     assert m is not None
     assert m.at_bot is False
-    assert m.content == "在吗"
+    assert m.content == "@全体成员 在吗"
+
+
+def test_at_other_is_rendered_as_group_member() -> None:
+    m = parse_event(group_event(segments=[at(20002), text("看这个")]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.at_bot is False
+    assert m.content == "@群友 看这个"
 
 
 def test_reply_to_bot_sets_flag() -> None:
@@ -245,3 +252,53 @@ def test_card_segments_mixed_with_text_do_not_raise() -> None:
     )
     assert m is not None
     assert m.content.startswith("标题党[卡片] 摘要")
+
+
+# --- 更多消息类型 ---
+
+def test_file_segment_includes_name() -> None:
+    m = parse_event(
+        group_event(segments=[{"type": "file", "data": {"name": "报告.pdf"}}]),
+        bot_qq=BOT_QQ,
+    )
+    assert m is not None
+    assert m.content == "[文件] 报告.pdf"
+
+
+def test_dice_and_rps_segments() -> None:
+    dice = parse_event(
+        group_event(segments=[{"type": "dice", "data": {"result": 4}}]),
+        bot_qq=BOT_QQ,
+    )
+    rps = parse_event(
+        group_event(segments=[{"type": "rps", "data": {"result": 2}}]),
+        bot_qq=BOT_QQ,
+    )
+    assert dice is not None and dice.content == "[骰子:4]"
+    assert rps is not None and rps.content == "[猜拳:剪刀]"
+
+
+def test_share_location_contact_music_segments() -> None:
+    event = group_event(
+        segments=[
+            {"type": "share", "data": {"title": "一篇文章"}},
+            {"type": "location", "data": {"title": "公司楼下"}},
+            {"type": "contact", "data": {"name": "阿猫"}},
+            {"type": "music", "data": {"title": "海底"}},
+        ]
+    )
+    m = parse_event(event, bot_qq=BOT_QQ)
+    assert m is not None
+    assert "[分享] 一篇文章" in m.content
+    assert "[位置] 公司楼下" in m.content
+    assert "[名片] 阿猫" in m.content
+    assert "[音乐] 海底" in m.content
+
+
+def test_markdown_segment_is_readable() -> None:
+    m = parse_event(
+        group_event(segments=[{"type": "markdown", "data": {"content": "**重点**"}}]),
+        bot_qq=BOT_QQ,
+    )
+    assert m is not None
+    assert m.content == "[Markdown] **重点**"

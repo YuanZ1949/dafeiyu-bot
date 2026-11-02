@@ -34,6 +34,16 @@
    DEEPSEEK_API_KEY=sk-...
    ```
 
+   > `.env` / `config.yaml` 是纯文本，但 Windows 默认没有关联程序，双击没反应属正常：
+   > 用 `notepad .env` 或编辑器打开，**保存为 UTF-8**（用 GBK 或有损编码保存会让凭据解析为空）。
+   >
+   > 默认档位是 `brain.provider=opencode` + `mode=free`：依赖 opencode 侧有可用免费模型。
+   > 不可用时在面板切「自备 Key」并填 `DEEPSEEK_API_KEY`，或切「本地模型」并先启动 LM Studio
+   > （默认 `http://127.0.0.1:1234/v1`）。
+   >
+   > 面板账号固定 `admin`，口令优先取 `.env` 的 `DAFEIYU_DASHBOARD_PASSWORD`；没配时 supervisor
+   > 启动会自动生成到 `data\dashboard.password`，启动日志会打印路径。
+
 4. **启动**：双击 `scripts\start.bat`，或
 
    ```powershell
@@ -42,11 +52,15 @@
 
    面板默认监听 `0.0.0.0:8787`（局域网可访问）；没配口令时会自动生成到 `data\dashboard.password`。
 
-随时自检（配置、依赖、端口一次列全）：
+随时自检：
 
 ```powershell
 .venv\Scripts\python -m dafeiyu.cli doctor
 ```
+
+doctor 不只看配置/依赖/端口，还会检查 `.env` / `config.yaml` 是否为 UTF-8、PowerShell 脚本是否带 UTF-8 BOM，
+以及当前 Python 是否被沙箱降权成 Low 完整性（写 `%TEMP%` 失败、写用户目录 EPERM 的元凶）。
+有阻塞项时按每条 `→` 修；先跑 doctor，再怀疑杀软/网络。
 
 `config.yaml` 是**本机配置，不进版本库**；模板是 `config.example.yaml`，要调行为就改前者。
 
@@ -232,6 +246,10 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `memory.recall_enabled` | `false` | 回复前按当前批次检索同会话旧消息，注入「相关旧记忆」；代码默认关，`config.yaml` 示例已显式开启 |
 | `memory.recall_topk` | `3` | 相关旧记忆最多注入几条 |
 | `memory.recall_chars` | `300` | 相关旧记忆段落的字符预算 |
+| `behavior.chat_intensity` | `normal` | 聊天强度：`quiet` 只回点名、`normal` 当前行为、`active` 放开话题收尾/降频闸门 |
+| `behavior.restriction_mode` | `off` | 言论限制：`off` 关闭、`soft` 只注入提示、`strict` 命中关键词的整条回复丢弃 |
+| `behavior.banned_phrases` | `[]` | 禁词（关键词级子串匹配，非语义审核） |
+| `behavior.banned_topics` | `[]` | 禁话题（注入提示；strict 模式也做关键词拦截） |
 
 预算分四层：每群每日、全局每日、自然月、月度费用。所有 `0` 都表示「未启用/不限制」。
 `degrade` 会保留 @/引用/叫名字的回复，只停普通插话；`stop` 连点名也不回；`notify`
@@ -277,6 +295,24 @@ NapCat 已连接
 
 日志同时写入 `logs/dafeiyu.log`。
 
+### 更新部署到 release 目录
+
+改了代码后要更新正在跑的 release（例如 `C:\MyFile\AICoding\dafeiyu-release`）：
+
+```powershell
+# 只列出将拷贝哪些文件
+powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -Plan
+
+# 备份 -> 停服 -> 拷贝 -> SHA256 校验 -> 目标目录体检 -> 启动 -> 健康检查
+powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -Target D:\dafeiyu-release
+```
+
+部署脚本只覆盖发布白名单（`src/scripts/.opencode` 与示例配置等），**从不碰**目标目录的
+`config.yaml`、`.env`、`data/`、`logs/`、`vendor/`、`.venv`。SHA256 校验后会先在目标目录跑
+`dafeiyu doctor`（配置/编码/沙箱降权/脚本 BOM），有阻塞项就直接回滚，不会把服务停在半套代码上；
+健康检查以 `gateway.connected=true`（QQ 网关真的连上）为准，不看 HTTP 200。扫码/网关未连期间
+可用 `-AllowDisconnected` 显式放行，只拷文件不重启用 `-NoRestart`。
+
 ## 4. 用法
 
 群里：
@@ -285,7 +321,13 @@ NapCat 已连接
 - 直接叫「大肥鱼」「小鲸鱼」「鱼鱼」—— 必回
 - 引用她的消息继续问 —— 必回
 - 其他消息 —— 她按规则 + 模型判断决定要不要插话
+- 判断「是不是在跟她说话」比以前更宽：@、引用、叫名字，以及**紧接着回答她上一句提问**都算点名；被点名会重开已收尾的话题
+- 话题收尾窗口里，明确问句/求助会重新叫醒她，不再只靠 5% 随机抽样
 - 被规则跳过的消息不会丢：下次接话时会把这些漏掉的消息按 `[时:分] 昵称：内容` 的时间线一起交给模型
+- 时间线会标出群友之间的「（回复 谁）」，模型能看出这句话在接谁
+- 支持的消息段：文字、@、图片、表情/商城表情、语音、视频、文件、分享、位置、名片、音乐、骰子/猜拳、Markdown、合并转发、小程序/网页卡片；语音/视频/文件本体不做识别，只保留可读占位与文件名
+- 图片会落到 `data/bot-workspace/images/` 并把路径写进 prompt；模型有 `read` 时会被告知**先读最近一张图再回答**，动图按首帧理解。模型没有视觉/工具时只保留 `[图片]` 占位
+- 模型调用失败时保持安静，不再往群里发「本鱼断线了」；失败照常计入日志与错误统计
 - `/闭嘴`（或 `/shutup`）—— 本群静音 60 分钟（仅 `groups.admins` 可用）
 - `/醒来`（或 `/wake`）—— 解除静音（仅 `groups.admins` 可用）
 
@@ -379,6 +421,9 @@ Bot 控制口（8788）与 OneBot 反向 WS（8080）仍只监听本机。**
   bot 并写审计。轮换完成后旧口令返回 401，新口令返回 200。
 - **运行配置**：只读展示当前模型、人设、冷却、限流、预算、记忆窗口与保留天数。
   要改配置请编辑 `config.yaml` 后重启；面板提供「重启 Bot」和「下载备份」。
+- **聊天行为**：手动切换聊天强度（安静 / 正常 / 活跃），设置言论限制（禁词、禁话题，
+  关闭 / 提示模型 / 严格拦截）。保存后即时生效，并写入 `data/settings.local.yaml`，
+  重启后保留；不会改动 `config.yaml` 的注释。
 
 ### 运维 runbook（健康 / 告警 / 备份 / 恢复 / 审计）
 
@@ -461,7 +506,16 @@ bot 与 supervisor 会写同一文件，写入和轮转通过 `.audit.jsonl.lock
 | 记忆面板不更新、提示「配额暂停中」 | 账号级熔断：10 分钟内累计 3 次 429 或 provider 报 quota 后，摘要/印象暂停 1 小时，面板显示恢复时间；日志搜「429」可见触发原因 |
 | 回复被截断 | 这是设计行为：闲聊 120 字、技术问题 300 字，改 `config.yaml` 即可 |
 | 中文日志乱码 | 用 `scripts/start.bat` 或 `scripts/start-all.ps1` 启动（已设 UTF-8），不要直接双击 python |
+| 面板新卡片保存返回 404 | 控制台（supervisor）还是旧进程：`index.html` 每次请求现读，卡片会先出现，但 `/api/behavior` 等路由只在启动时注册。用 `scripts/stop.ps1` + `scripts/start-all.ps1` 重启整套；只点「重启 Bot」不够 |
+| 群里 @ 也不回、日志有 `Agent not found: "deepseek-qq"` | opencode 的 session 绑定创建时的项目目录；仓库被移动/复制（如 `C:\AICoding` → `C:\AIWork`）后旧 session 会在空目录里找 agent。面板「会话管理」对每个会话点「新建会话」，或清掉 `brain_sessions` 后重启；新代码会自动换新 session 重试一次 |
 | 启动后没反应/端口占用 | 先 `scripts/stop.ps1` 停掉旧实例；`start.ps1` 不能和 supervisor 同时跑 |
+| 双击 `.env` / `config.yaml` 没反应 | Windows 没关联程序，不是文件坏了；用 `notepad .env` 或编辑器打开，保存为 UTF-8 |
+| python / node / opencode 写用户目录或 `%TEMP%` 报 EPERM | 多半是工作区被沙箱降权成 Low 完整性，不是杀软；先跑 `doctor`，再按 `docs/deployment-notes-windows.md` P4/P5 查进程完整性级别 |
+| opencode 401 /「免费模型探测失败」/ 切档失败 | supervisor 会自动给 serve 和 bot 注入同一个 `OPENCODE_SERVER_PASSWORD`；只有手工/外部跑 `opencode serve` 时才需要在 `.env` 设它（P7） |
+| `.env` 中文注释变 `???` 或键丢失 | 文件编码不是 UTF-8；`doctor` 会报「编码不是 UTF-8」，按 `.env.example` 用 UTF-8 重写（P10） |
+
+> Windows 受限环境（沙箱降权、杀软、无管理员、opencode 认证、任务计划自启等）的实际部署
+> 踩坑记录见 [docs/deployment-notes-windows.md](docs/deployment-notes-windows.md)。
 
 ## 8. 隐私与风险
 

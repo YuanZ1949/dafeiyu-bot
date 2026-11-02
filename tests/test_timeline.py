@@ -36,6 +36,7 @@ def make_msg(
     chat_id: int = GROUP,
     at_bot: bool = False,
     reply_to_bot: bool = False,
+    reply_to_message_id: str | None = None,
     is_bot: bool = False,
 ) -> Message:
     return Message(
@@ -47,6 +48,7 @@ def make_msg(
         message_id=message_id,
         at_bot=at_bot,
         reply_to_bot=reply_to_bot,
+        reply_to_message_id=reply_to_message_id,
         is_bot=is_bot,
         timestamp=timestamp,
     )
@@ -154,6 +156,26 @@ def test_current_message_marks_addressing(tmp_path) -> None:
     reply_msg = make_msg("继续", "m2", timestamp=at(21, 2), reply_to_bot=True)
     store.add_message(reply_msg)
     assert format_message_line(reply_msg, current=reply_msg).endswith("（引用回复你）")
+
+
+def test_group_reply_target_is_rendered(tmp_path) -> None:
+    """群友之间「谁回谁」要进时间线，模型才能判断这句话在接谁。"""
+    line = format_message_line(
+        make_msg("对，就是那个", "m2", reply_to_message_id="m1"),
+        reply_names={"m1": "阿猫"},
+    )
+    assert line.endswith("（回复 阿猫）")
+
+
+def test_batch_prompt_renders_reply_names() -> None:
+    from dafeiyu.memory.timeline import build_batch_prompt
+
+    prompt = build_batch_prompt(
+        [make_msg("我也觉得", "m2", reply_to_message_id="m1")],
+        "",
+        reply_names={"m1": "鱼片"},
+    )
+    assert "（回复 鱼片）" in prompt
 
 
 def test_empty_content_is_labelled(tmp_path) -> None:

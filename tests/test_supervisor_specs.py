@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
+from dafeiyu.brain.opencode_auth import PASSWORD_ENV
 from dafeiyu.config import ConfigError, load_settings
 from dafeiyu.supervisor.main import build_specs
 
@@ -116,6 +118,40 @@ def test_opencode_spec_without_config_home_keeps_inherited_env(tmp_path: Path) -
     env = specs["opencode"].env or {}
     assert "XDG_CONFIG_HOME" not in env
     assert "OPENCODE_CONFIG" not in env
+
+
+def build_with_opencode(tmp_path: Path, opencode_yaml: str):
+    config = tmp_path / "config.yaml"
+    config.write_text(BASE + "\nopencode:\n" + opencode_yaml, encoding="utf-8")
+    env_file = tmp_path / "test.env"
+    env_file.write_text(ENV, encoding="utf-8")
+    settings = load_settings(env_file=env_file, config_file=config)
+    return settings, build_specs(settings, "token-abc")
+
+
+def test_opencode_server_password_injected_into_serve_and_bot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P7：真正拉起 serve 的是 supervisor，配置里的口令必须同时给两个子进程。"""
+    monkeypatch.delenv(PASSWORD_ENV, raising=False)
+    _settings, specs = build_with_opencode(
+        tmp_path, '  server_password: "fixed-pass"\n'
+    )
+
+    assert (specs["opencode"].env or {})[PASSWORD_ENV] == "fixed-pass"
+    assert (specs["bot"].env or {})[PASSWORD_ENV] == "fixed-pass"
+
+
+def test_opencode_server_password_generated_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没配口令时 supervisor 生成一次，opencode 与 bot 必须拿到同一个 32 位口令。"""
+    monkeypatch.delenv(PASSWORD_ENV, raising=False)
+    _settings, specs = build(tmp_path)
+
+    password = (specs["opencode"].env or {})[PASSWORD_ENV]
+    assert re.fullmatch(r"[0-9a-f]{32}", password)
+    assert (specs["bot"].env or {})[PASSWORD_ENV] == password
 
 
 def test_find_napcat_pids_returns_every_match(monkeypatch: pytest.MonkeyPatch) -> None:

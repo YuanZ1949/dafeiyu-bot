@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 
 _PLACEHOLDER = "[图片]"
 _ANNOTATED = "[图片]（图存 {path}，可用 read 查看）"
+_ANNOTATED_ANIMATED = "[图片]（图存 {path}，动图，可用 read 查看）"
 
 _HTTP_RE = re.compile(r"^https?://", re.I)
 _DATA_URI_RE = re.compile(r"^data:image/[\w.+-]+;base64,", re.I)
@@ -224,8 +225,11 @@ async def _materialize(
             continue
         rel = target.as_posix()
         if _PLACEHOLDER in msg.content:
+            template = (
+                _ANNOTATED_ANIMATED if target.suffix.lower() == ".gif" else _ANNOTATED
+            )
             msg.content = msg.content.replace(
-                _PLACEHOLDER, _ANNOTATED.format(path=rel), 1
+                _PLACEHOLDER, template.format(path=rel), 1
             )
         done += 1
     if done:

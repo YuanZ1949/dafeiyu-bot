@@ -102,6 +102,34 @@ if ($pyMajor -lt 3 -or ($pyMajor -eq 3 -and $pyMinor -lt 11)) {
 }
 Write-Host "      Python $pyMajor.$pyMinor 可用" -ForegroundColor Green
 
+# ---- 0.5 运行环境（沙箱 / 权限）自检 --------------------------------
+# P4/P5：工作区里的 python/node/opencode 可能被 DSH 沙箱打成 Low 完整性，
+# 表现是写 %TEMP% / 用户目录 EPERM，常被误诊成杀毒软件。这里用刚检查过的
+# 系统 python 跑仓库里的探测器（依赖还没装，临时把 src 放进 PYTHONPATH）。
+# 自检失败只警告、不中断：先把安装走完，用户再按提示换干净工作区重跑。
+Write-Host "[0/8] 自检运行环境（沙箱 / 权限）..." -ForegroundColor Cyan
+$probeRoot = Join-Path $root "src"
+$savedPythonPath = $env:PYTHONPATH
+$env:PYTHONPATH = $probeRoot
+$probeCode = 0
+try {
+    & python -m dafeiyu.env_probe
+    $probeCode = $LASTEXITCODE
+} catch {
+    $probeCode = 1
+} finally {
+    if ($null -eq $savedPythonPath) {
+        Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+    } else {
+        $env:PYTHONPATH = $savedPythonPath
+    }
+}
+if ($probeCode -ne 0) {
+    Write-Host "      警告：运行环境自检未通过（退出码 $probeCode）。" -ForegroundColor Yellow
+    Write-Host "      如果上面提示写 %TEMP% 失败，先查进程完整性级别，别怀疑杀毒软件。" -ForegroundColor Yellow
+    Write-Host "      详见 docs/deployment-notes-windows.md 的 P4/P5；这里只警告，安装会继续。" -ForegroundColor Yellow
+}
+
 # ---- 1. venv ------------------------------------------------------------
 Write-Host "[1/8] 准备虚拟环境 .venv ..." -ForegroundColor Cyan
 if (-not (Test-Path ".venv\Scripts\python.exe")) {

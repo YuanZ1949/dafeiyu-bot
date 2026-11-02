@@ -195,3 +195,25 @@ def test_deploy_allow_disconnected_is_opt_in() -> None:
     assert "已按 -AllowDisconnected 放行" in text
     # 强判据仍在：默认分支仍以 gateway.connected 为准
     assert "$gatewayConnected = $true" in text
+
+
+def test_deploy_runs_target_doctor_after_checksum_before_restart() -> None:
+    """部署前体检：SHA256 之后、重启之前跑目标目录的 doctor，非 0 要回滚。
+
+    放太早（拷贝前）检查的是旧代码；放太晚（重启后）已经来不及回滚。
+    """
+    text = SCRIPT.read_text(encoding="utf-8-sig")
+
+    assert "dafeiyu.cli doctor" in text
+    assert "--no-ports" in text
+    assert "体检" in text
+    assert "体检未通过" in text
+    # 不可运行的目标 python（如测试里的假 release）只能跳过，不能报错。
+    assert "跳过部署前体检" in text
+
+    checksum = text.index("SHA256 校验通过")
+    doctor = text.index("dafeiyu.cli doctor")
+    restart = text.index("if (-not (Invoke-TargetStart))")
+    assert checksum < doctor < restart, (
+        f"部署前体检位置不对：SHA256={checksum}, doctor={doctor}, start={restart}"
+    )

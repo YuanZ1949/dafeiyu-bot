@@ -4,10 +4,12 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import re
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from .behavior import BehaviorSettings
 from .brain.client import BrainError, BrainReply
 from .brain.persona import build_system_prompt, os_probability_hint
 from .budget import BudgetAction
@@ -23,9 +25,15 @@ from .memory.store import Store
 from .memory.timeline import TIMELINE_LIMIT, build_batch_prompt
 from .memory.workspace import Workspace
 from .models import ChatType, Message, RecallEvent
+from .moment import analyze, answers_bot_question, reopened_by_question
 from .router import Router, now_shanghai
 from .sender import is_technical_question, segment_reply, shape_reply
-from .workers.failure import QUOTA_KEY, is_quota_error, is_rate_limit_error
+from .workers.failure import (
+    QUOTA_KEY,
+    is_agent_missing_error,
+    is_quota_error,
+    is_rate_limit_error,
+)
 from .workers.summary import summarize_for_rotation
 
 if TYPE_CHECKING:
@@ -33,16 +41,16 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# images.materialize 写进 content 的路径注记；这里反过来抽取路径做「图片」提示。
+_IMAGE_PATH_RE = re.compile(r"图存\s+([^\s，)）]+)")
+
 SHUTUP_MINUTES = 60
 ADMIN_ONLY_REPLY = "这个命令只有管理员能用。"
 FORGET_REPLY = "记忆清空了，本鱼失忆中……🫧"
-BRAIN_ERROR_REPLY = "本鱼刚刚和大脑断线了…你过一会儿再问我？🐋"
 TOOL_HINT_REPLY = "本鱼去网上查一下，稍等…"
 FOLLOWUP_REPLY = "没查到什么有用的，本鱼先不瞎说了"
 # 同一会话 60s 内不重复发「去查一下」；每轮最多一次由 brain 侧保证。
 TOOL_HINT_INTERVAL_SECONDS = 60.0
-# 同一会话 30s 内不重复发「和大脑断线了」；失败本身照常记账。
-BRAIN_ERROR_COOLDOWN_SECONDS = 30.0
 # 轮换摘要的输入窗口（spec §9.2：最近 40 条）。
 ROTATION_WINDOW = 40
 # 批次被跳过的原因。error 与 record_usage(purpose="error") 同口径
@@ -144,7 +152,8 @@ class Service:
         # 会再从 session_summaries 捞一次，然后同样只注入一次）。
         self._continuation_used: set[tuple[ChatType, int]] = set()
         self._hint_at: dict[tuple[ChatType, int], float] = {}
-        self._error_reply_at: dict[tuple[ChatType, int], float] = {}
+        # 面板可改的聊天强度/言论限制：整体替换，避免逐字段同步。
+        self.behavior: BehaviorSettings = settings.behavior
 
     async def start(self) -> None:
         self._start_scheduler()
@@ -227,6 +236,33 @@ class Service:
             worker.brain = brain
         return previous
 
+    def set_behavior(self, behavior: BehaviorSettings) -> None:
+        """面板保存后即时替换行为快照；下一批消息就按新设置走。"""
+        self.behavior = behavior
+
+    def _previous_message(self, msg: Message) -> Message | None:
+        """紧挨着当前消息的前一条（含 bot）；查不到时返回 None。"""
+        rows = self.store.recent_messages(
+            msg.chat_type,
+            msg.chat_id,
+            2,
+            upto_message_id=msg.message_id,
+        )
+        for index, row in enumerate(rows):
+            if row.message_id == msg.message_id:
+                return rows[index - 1] if index > 0 else None
+        return rows[-1] if rows else None
+
+    def _answers_bot_question(self, msg: Message) -> bool:
+        """隐式点名：紧接在 bot 的提问后面回了一句，视为在跟它说话。"""
+        if msg.chat_type is not ChatType.GROUP or msg.is_bot:
+            return False
+        return answers_bot_question(msg, self._previous_message(msg))
+
+    def _is_addressed(self, msg: Message) -> bool:
+        """显式点名（@/引用/别名）+ 隐式接话（回答 bot 的上一句提问）。"""
+        return self.router.is_addressed(msg) or self._answers_bot_question(msg)
+
     def _lock(self, chat_type: ChatType, chat_id: int) -> asyncio.Lock:
         return self._locks.setdefault((chat_type, chat_id), asyncio.Lock())
 
@@ -241,6 +277,18 @@ class Service:
         if msg.is_bot:
             return
 
+        # 重启后网关内存里的 bot_message_ids 是空的；引用老消息时回库确认
+        # 「被引用的是不是我」，否则会漏掉一次点名。
+        if (
+            msg.chat_type is ChatType.GROUP
+            and not msg.reply_to_bot
+            and msg.reply_to_message_id
+            and self.store.is_bot_message(
+                msg.chat_type, msg.chat_id, msg.reply_to_message_id
+            )
+        ):
+            msg.reply_to_bot = True
+
         # 印象抽取按消息条数触发，与是否回复无关，必须在早退分支之前调度；
         # 只对群聊抽印象（私聊内容不进 impressions，也不花抽取配额）。
         self._schedule_impressions(msg)
@@ -250,7 +298,7 @@ class Service:
             self.router.note_user_message(
                 msg.chat_type,
                 msg.chat_id,
-                addressed=self.router.is_addressed(msg),
+                addressed=self._is_addressed(msg),
             )
             if msg.reply_to_bot:
                 self.router.note_reply(msg.chat_type, msg.chat_id)
@@ -275,6 +323,13 @@ class Service:
     async def _handle_sync(self, msg: Message) -> None:
         """rules 模式：规则判定通过就同步等模型（旧行为，回滚用）。"""
         if msg.chat_type is ChatType.GROUP:
+            # 安静强度：非点名消息连规则筛都不进，直接留在库里等下次点名。
+            if (
+                self.behavior.chat_intensity == "quiet"
+                and not self._is_addressed(msg)
+            ):
+                log.debug("skip %s/%s: intensity_quiet", msg.chat_id, msg.message_id)
+                return
             decision = self.router.should_handle(msg)
             if not decision.call_model:
                 log.debug("skip %s/%s: %s", msg.chat_id, msg.message_id, decision.reason)
@@ -295,8 +350,12 @@ class Service:
             await self._reply(msg)
             return
 
-        addressed = self.router.is_addressed(msg)
+        addressed = self._is_addressed(msg)
         reason = self._group_skip_reason(msg, addressed=addressed)
+        if reason == "intensity_quiet":
+            # 安静强度不是终局：消息留在待投队列，下次被点名时一起送模型。
+            log.debug("skip %s/%s: intensity_quiet", msg.chat_id, msg.message_id)
+            return
         if reason is not None:
             self.store.mark_skipped(msg.chat_type, msg.chat_id, [msg.message_id], reason)
             log.debug("skip %s/%s: %s", msg.chat_id, msg.message_id, reason)
@@ -318,16 +377,32 @@ class Service:
             return "muted"
         if self.router.is_quiet(msg.chat_type, msg.chat_id):
             return "quiet"
-        # 话题已收尾：不再硬拦，按低概率抽样放行，让模型自己判断要不要接。
-        if (
-            not addressed
-            and self.router.is_thread_closed(msg.chat_type, msg.chat_id)
-            and not self.router.closed_sample(msg.chat_type, msg.chat_id)
-        ):
-            return "closed"
-        # 连续三次选择不说后进入降频窗口：批次模式也必须认，否则降频是死状态。
-        if not addressed and self.router.is_downshifted(msg.chat_type, msg.chat_id):
-            return "downshift"
+        # 安静强度：非点名消息不进批次。对消息不做 mark_skipped，留在待投队列，
+        # 等下次点名时一起给模型看，避免「这条永远不进 prompt」。
+        if not addressed and self.behavior.chat_intensity == "quiet":
+            return "intensity_quiet"
+        # 活跃强度：放开「话题收尾」和「连续空转降频」两个软闸门；
+        # 静音、黑白名单、预算仍然照旧。
+        if self.behavior.chat_intensity != "active":
+            reopened = (
+                reopened_by_question(msg.content)
+                or self._answers_bot_question(msg)
+            )
+            # 话题已收尾：明确问句/求助/回答 bot 的提问可以重开，否则按低概率抽样。
+            if (
+                not addressed
+                and self.router.is_thread_closed(msg.chat_type, msg.chat_id)
+                and not reopened
+                and not self.router.closed_sample(msg.chat_type, msg.chat_id)
+            ):
+                return "closed"
+            # 连续三次选择不说后进入降频窗口：问句仍然可以破例，避免追问被吞。
+            if (
+                not addressed
+                and not reopened
+                and self.router.is_downshifted(msg.chat_type, msg.chat_id)
+            ):
+                return "downshift"
         if msg.chat_id in self.settings.groups.blacklist:
             return "blacklist"
         whitelist = self.settings.groups.whitelist
@@ -849,10 +924,18 @@ class Service:
                 backlog,
                 len(ids),
             )
-        addressed_ids = [m.message_id for m in batch if m.at_bot or m.reply_to_bot]
+        addressed_ids = [
+            m.message_id for m in batch if self._is_addressed(m)
+        ]
         addressed = bool(addressed_ids)
         current_id = addressed_ids[-1] if addressed_ids else ids[-1]
         key = (chat_type, chat_id)
+
+        # 切到安静强度前已经排队的批次：非点名也不送模型。不 mark_skipped，
+        # 消息留在待投队列里，等下一次点名再一起看。
+        if not addressed and self.behavior.chat_intensity == "quiet":
+            log.debug("批次跳过（安静强度）%s/%s", chat_id, current_id)
+            return
 
         budget = self._chat_budget_decision(chat_type, chat_id, addressed=addressed)
         if not self._budget_allows(budget, addressed):
@@ -890,13 +973,17 @@ class Service:
                 chat_type, chat_id, batch, prompt, on_tool=hint
             )
         except BrainError as exc:
-            # 失败也占一次调用额度；游标随 mark_skipped 推进，不重投（补话已经告诉用户了）。
+            # 失败也占一次调用额度；游标随 mark_skipped 推进，不重投。
+            # 不再往群里发「断线了」这类失败提示：用户明确不要，失败只留日志。
             self.store.record_usage(chat_type, chat_id, "error", 0, 0)
             self.store.mark_skipped(chat_type, chat_id, ids, SKIP_ERROR)
             log.warning("批次调用失败 %s/%s: %s", chat_id, current_id, exc)
-            await self.adapter.send(
-                chat_type, chat_id, FOLLOWUP_REPLY if hint.sent else BRAIN_ERROR_REPLY
-            )
+            if hint.sent:
+                # 已经开口说「去查一下」，不能没有下文。
+                try:
+                    await self.adapter.send(chat_type, chat_id, FOLLOWUP_REPLY)
+                except Exception as send_exc:  # noqa: BLE001 - 补话失败不影响记账
+                    log.warning("补话发送失败 %s/%s: %s", chat_id, current_id, send_exc)
             self._check_workspace(chat_type, chat_id)
             return
 
@@ -945,6 +1032,8 @@ class Service:
                 (reply.reason or "-").strip()[:120],
             )
             return []
+        if not self._restrictions_allow(reply.reply):
+            return []
         chunks = shape_reply(
             reply.reply,
             self.settings.persona.max_reply_chars,
@@ -967,12 +1056,26 @@ class Service:
         except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
             log.warning("发送失败 %s/%s: %s", chat_id, batch[-1].message_id, exc)
         else:
-            addressed = any(self.router.is_addressed(m) for m in batch)
+            addressed = any(self._is_addressed(m) for m in batch)
             self.router.note_bot_spoke(chat_type, chat_id, ambient=not addressed)
         finally:
             # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
             self._store_bot_chunks(batch[-1], sent)
         return sent
+
+    def _restrictions_allow(self, text: str) -> bool:
+        """言论限制的最后一道网：strict 命中就整条不发；soft 只记警告。
+
+        关键词级匹配是兜底，不保证语义审核；真正的约束在注入的提示里。
+        """
+        violation = self.behavior.match(text)
+        if violation is None:
+            return True
+        if self.behavior.restriction_mode == "strict":
+            log.warning("回复命中言论限制，整条丢弃：%s", violation)
+            return False
+        log.warning("回复触及言论限制（提示模式，仍发送）：%s", violation)
+        return True
 
     def _chat_budget_decision(
         self, chat_type: ChatType, chat_id: int, *, addressed: bool
@@ -1097,6 +1200,76 @@ class Service:
         )
         return reply
 
+    def _image_hint(
+        self, chat_type: ChatType, chat_id: int, messages: list[Message]
+    ) -> str:
+        """本轮或最近提到图时，给模型一段「先 read 再看」的硬提示。
+
+        只靠 content 里的「可用 read 查看」不够：模型会跳过图片，直接回
+        「图没传到我这儿」。这里把最近一张点名，并要求先读再答；如果图在
+        更早的会话里（轮换后不在 batch 中），就从最近消息里补出来。
+        """
+        paths: list[tuple[Message, str]] = []
+        missing = 0
+        for message in messages:
+            if message.recalled_at:
+                continue
+            found = _IMAGE_PATH_RE.findall(message.content or "")
+            if found:
+                for path in found:
+                    paths.append((message, path))
+            elif "[图片]" in (message.content or ""):
+                missing += 1
+
+        if not paths and not missing:
+            # 当前 batch 没有图，但有人在问图：把最近发过的图补进来。
+            asked = any(
+                word in (m.content or "")
+                for m in messages
+                for word in ("图", "照片", "截图", "看图", "上面", "刚才")
+            )
+            if not asked:
+                return ""
+            rows = self.store.recent_messages(chat_type, chat_id, 60)
+            seen: set[str] = set()
+            for row in rows:
+                if row.recalled_at:
+                    continue
+                for path in _IMAGE_PATH_RE.findall(row.content or ""):
+                    if path in seen:
+                        continue
+                    seen.add(path)
+                    paths.append((row, path))
+            paths = paths[-3:]
+            if not paths:
+                return ""
+
+        if not paths:
+            return (
+                "【图片】本轮有图片没有取到内容（下载失败或无可用来源），"
+                "只能确认有图，不要编造图里是什么。"
+            )
+
+        shown = paths[-4:]
+        parts: list[str] = ["【图片】"]
+        parts.append(f"最近发过的图（共 {len(shown)} 张）：")
+        for index, (message, path) in enumerate(shown):
+            suffix = "（最近一张）" if index == len(shown) - 1 else ""
+            parts.append(f"- {path}（来自 {message.nickname}）{suffix}")
+        parts.append(
+            "涉及图片内容的问题，必须先用 read 打开最近那张再回答；"
+            "如果问题明显指更早的图，再读对应那张。"
+            "不要凭想象描述，也不要说“看不到”。"
+        )
+        if shown[-1][1].lower().endswith(".gif"):
+            parts.append("最近一张是动图，read 后按首帧理解即可。")
+        if missing:
+            parts.append(
+                f"另有 {missing} 张图片没有取到内容（下载失败或无可用来源），"
+                "只能确认有图，不要编造图里是什么。"
+            )
+        return "".join(parts)
+
     def _build_prompt(
         self,
         chat_type: ChatType,
@@ -1131,8 +1304,40 @@ class Service:
             recall_queries=recall_queries,
             exclude_ids=exclude_ids,
         )
+        framing = self.behavior.framing()
+        if framing:
+            injection = f"{injection}\n\n{framing}" if injection.strip() else framing
+
+        # 时机提示只给群聊：私聊无所谓「插不插嘴」。
+        if chat_type is ChatType.GROUP and messages:
+            signals = analyze(
+                messages,
+                now_ts=int(now_shanghai().timestamp()),
+                addressed=any(self._is_addressed(m) for m in messages),
+                followed_up=any(self._answers_bot_question(m) for m in messages),
+            )
+            hint = signals.hint()
+            if hint:
+                injection = f"{injection}\n\n{hint}" if injection.strip() else hint
+
+        image_hint = self._image_hint(chat_type, chat_id, messages)
+        if image_hint:
+            injection = f"{injection}\n\n{image_hint}" if injection.strip() else image_hint
+
+        reply_ids = [
+            m.reply_to_message_id for m in messages if m.reply_to_message_id
+        ]
+        reply_names = (
+            self.store.message_nicknames(chat_type, chat_id, reply_ids)
+            if reply_ids
+            else None
+        )
         return build_batch_prompt(
-            messages, injection, continuation=continuation, omitted=omitted
+            messages,
+            injection,
+            continuation=continuation,
+            omitted=omitted,
+            reply_names=reply_names,
         )
 
     async def _call_brain(
@@ -1186,13 +1391,18 @@ class Service:
         *,
         on_tool: Any = None,
     ) -> BrainReply:
-        """额度/限流失败：换新会话重放本地历史再试一次，其余错误原样抛。
+        """额度/限流/旧 session 失败：换新会话重放本地历史再试一次。
 
         免费额度、账号配额这类失败不会因为重试同一会话就好转；换一个干净的
-        session 并补上本地窗口，至少还能把这一轮聊完。普通网络错误不重试，
-        避免一次超时变成两次计费。
+        session 并补上本地窗口，至少还能把这一轮聊完。opencode 的 session 还会
+        绑定创建时的项目目录——仓库被移动后旧 session 会报 Agent not found，
+        同样清掉重建即可恢复。普通网络错误不重试，避免一次超时变成两次计费。
         """
-        if not (is_quota_error(exc) or is_rate_limit_error(exc)):
+        if not (
+            is_quota_error(exc)
+            or is_rate_limit_error(exc)
+            or is_agent_missing_error(exc)
+        ):
             raise exc
         fresh = getattr(self.brain, "reply_fresh", None)
         if not callable(fresh):
@@ -1275,17 +1485,9 @@ class Service:
         try:
             reply = await self._ask_brain(msg)
         except BrainError as exc:
-            # 失败也占一次调用额度，避免异常时无限重试烧钱。
+            # 失败也占一次调用额度，避免异常时无限重试烧钱；静默失败，不发提示。
             self.store.record_usage(msg.chat_type, msg.chat_id, "error", 0, 0)
             log.warning("模型调用失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
-            key = (msg.chat_type, msg.chat_id)
-            now = time.monotonic()
-            last = self._error_reply_at.get(key)
-            if last is not None and now - last < BRAIN_ERROR_COOLDOWN_SECONDS:
-                log.debug("错误回复冷却中，跳过 %s/%s", msg.chat_id, msg.message_id)
-                return
-            self._error_reply_at[key] = now
-            await self.adapter.send(msg.chat_type, msg.chat_id, BRAIN_ERROR_REPLY)
             return
 
         self.store.record_usage(
@@ -1305,6 +1507,10 @@ class Service:
                 msg.message_id,
                 (reply.reason or "-").strip()[:120],
             )
+            self.router.note_no_reply(msg.chat_type, msg.chat_id)
+            return
+
+        if not self._restrictions_allow(reply.reply):
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
 
@@ -1335,7 +1541,7 @@ class Service:
                 msg.chat_type,
                 msg.chat_id,
                 ambient=msg.chat_type is ChatType.GROUP
-                and not self.router.is_addressed(msg),
+                and not self._is_addressed(msg),
             )
         finally:
             # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
