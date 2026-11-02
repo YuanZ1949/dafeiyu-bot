@@ -29,7 +29,7 @@ import logging
 import time
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from websockets.asyncio.client import connect
@@ -63,6 +63,7 @@ class WeChatAdapter:
         self._task: asyncio.Task[None] | None = None
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._sent_echo: deque[tuple[str, str, float]] = deque(maxlen=_SENT_ECHO_MAX)
+        self._echo_seed: Callable[[], Sequence[tuple[str, str, int]]] | None = None
         self._stopping = False
         self._socket_open = False
         self._health_connected = True
@@ -104,6 +105,16 @@ class WeChatAdapter:
 
     def on_recall(self, handler: Callable[[RecallEvent], Awaitable[None]]) -> None:
         self._recall_handler = handler
+
+    def set_echo_seed(
+        self, provider: Callable[[], Sequence[tuple[str, str, int]]] | None
+    ) -> None:
+        """注册回声重建源（通常来自 Service → store.recent_bot_messages）。
+
+        provider 返回 ``(chat_id, text, timestamp)``；`timestamp` 是本地 epoch
+        秒（messages 表落库值，不是 UTC 的 created_at），resync 时按它比较窗口。
+        """
+        self._echo_seed = provider
 
     # ------------------------------------------------------------- 生命周期
     async def start(self) -> None:
@@ -270,12 +281,31 @@ class WeChatAdapter:
             self._apply_health(envelope)
             return
         if kind == "resync":
-            # 只清本地回声表，绝不回溯补发历史（否则批次调度器洪水）。
+            # 只清本地回声表，绝不回溯补发历史（否则批次调度器洪水）；
+            # 随后按 seed 取回 messages 窗口内的机器人消息重建回声表。
+            # 种子的 timestamp 是本地 epoch 秒（不是 created_at 的 UTC），
+            # 窗口判断直接按它算。core 不回填、不触发批次调度器。
             self._sent_echo.clear()
             logger.info(
                 "收到 resync（reason=%s），已清空回声表",
                 envelope.get("reason"),
             )
+            if self._echo_seed is not None:
+                try:
+                    seed_rows = self._echo_seed()
+                except Exception:
+                    logger.warning("回声重建 seed 失败，按空回声表继续", exc_info=True)
+                    return
+                now_real = time.time()
+                now_mono = time.monotonic()
+                # 必须按 timestamp 从旧到新入队：`_is_echo` 的窗口清理只从
+                # 队首 popleft，队首一旦不是最旧的一条，过期条目就永远删不掉，
+                # 旧回复会被误判成回声（store 的 seed 是 newest-first）。
+                for chat_id, text, ts in sorted(seed_rows, key=lambda row: float(row[2])):
+                    age = max(0.0, now_real - float(ts))
+                    if age > self._config.echo_window_seconds:
+                        continue
+                    self._sent_echo.append((str(chat_id), str(text), now_mono - age))
             return
         if "id" in envelope:
             self._dispatch_receipt(envelope)

@@ -193,6 +193,11 @@ class Service:
             on_recall = getattr(adapter, "on_recall", None)
             if callable(on_recall):
                 on_recall(self.handle_recall)
+            # 微信桥重启后 resync 时靠它从 messages 表重建回声；没有该接口的
+            # 假/旧适配器自然跳过，不影响 QQ。
+            seed = getattr(adapter, "set_echo_seed", None)
+            if callable(seed):
+                seed(self._wechat_echo_seed)
         for adapter in self.adapters.values():
             await adapter.start()
         self._start_keepalive()
@@ -256,6 +261,11 @@ class Service:
             return
         self.keepalive = Keepalive(adapter, bot_qq, seconds)
         self._keepalive_task = asyncio.create_task(self.keepalive.run())
+
+    def _wechat_echo_seed(self) -> list[tuple[str, str, int]]:
+        """回声重建源：echo_window 内的机器人消息（messages 表 is_bot=1）。"""
+        window = int(self.settings.wechat.echo_window_seconds)
+        return self.store.recent_bot_messages(int(time.time()) - window)
 
     def keepalive_status(self) -> dict[str, Any]:
         if self.keepalive is None:

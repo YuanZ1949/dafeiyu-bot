@@ -834,6 +834,28 @@ class Store:
         ).fetchall()
         return [self._row_to_message(r) for r in reversed(rows)]
 
+    def recent_bot_messages(self, since_ts: int, limit: int = 200) -> list[tuple[str, str, int]]:
+        """回声表重建源：最近的机器人消息（必须带文本）。
+
+        微信桥重启 resync 后，主进程从 `messages WHERE is_bot=1` 取种子；
+        SQL 里 LIMIT 固定 200（与回声表容量一致），窗口在 Python 侧按
+        ``timestamp`` 比较——`timestamp` 是本地 epoch 秒（service 落库时写入），
+        **不是** UTC 字符串 `created_at`。绝不查 `delivered_messages`：它没有
+        文本列，重建不出 ``(chat_id, text)`` 匹配键。返回 newest-first 元组。
+        """
+        limit = max(1, min(int(limit), 200))
+        rows = self._conn.execute(
+            "SELECT chat_id, content, timestamp FROM messages WHERE is_bot=1 ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+        since = int(since_ts)
+        results: list[tuple[str, str, int]] = []
+        for row in rows:
+            ts = int(row["timestamp"])
+            if ts < since:
+                continue
+            results.append((str(row["chat_id"]), str(row["content"]), ts))
+        return results[:limit]
+
     def messages_page(
         self,
         chat_type: ChatType,
