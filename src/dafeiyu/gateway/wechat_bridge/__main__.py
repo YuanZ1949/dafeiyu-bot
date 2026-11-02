@@ -157,6 +157,24 @@ class _UiThreadDriver:
         if callable(force):
             force(wx)
 
+    def last_synthetic_input_age(self) -> float | None:
+        """桥自己注入键鼠是多久以前；纯读模块里的时间戳，不碰 UIA。
+
+        `sender` 的前台保护会在 worker 线程里比对「最后一次系统输入」和这个值，
+        用来区分「人刚按的」和「我们自己刚按的」。这里不能走 `_call`（那会把
+        worker 线程的查询再投回 UIA 线程，纯读没有这个必要）。
+        """
+        probe = getattr(self._raw, "last_synthetic_input_age", None)
+        if not callable(probe):
+            return None
+        try:
+            value = probe()
+        except Exception:  # noqa: BLE001 - 读不到就按「不是自己按的」处理
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
 
 def _default_sender_factory(wechat: WeChatConfig, poller: Any, driver: Any) -> Any:
     """生产发送器：惰性 import Sender，驱动换成 STA 代理。

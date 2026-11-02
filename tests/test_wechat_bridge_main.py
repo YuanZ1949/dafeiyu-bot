@@ -652,3 +652,17 @@ async def test_run_resume_restarts_pump(tmp_path: Path) -> None:
             run_task.cancel()
             with contextlib.suppress(BaseException):
                 await asyncio.wait_for(run_task, STEP)
+
+
+def test_ui_thread_driver_exposes_self_input_age_without_ui_call() -> None:
+    """前台保护要在 worker 线程里读这个值：纯委托，不投递 UIA op。"""
+    raw = SimpleNamespace(last_synthetic_input_age=lambda: 0.4)
+    facade = bridge_main._UiThreadDriver(SimpleNamespace(), raw)
+
+    assert facade.last_synthetic_input_age() == 0.4
+
+
+def test_ui_thread_driver_self_input_age_is_none_without_hook() -> None:
+    facade = bridge_main._UiThreadDriver(SimpleNamespace(), SimpleNamespace())
+
+    assert facade.last_synthetic_input_age() is None

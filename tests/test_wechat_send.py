@@ -53,6 +53,11 @@ class FakeDriver:
         self.calls: list[dict] = []
         self.threads: set[str] = set()
         self.fail_send: Exception | None = None
+        #: 桥自己注入键鼠是多久以前；None = 从未注入（按「是用户输入」处理）。
+        self.self_input_age: float | None = None
+
+    def last_synthetic_input_age(self) -> float | None:
+        return self.self_input_age
 
     def _record(self, action: str, **fields) -> None:
         fields["action"] = action
@@ -242,6 +247,31 @@ def test_foreground_conflict_opens_chat_first_but_never_sends(
 def test_foreground_busy_rejects_recent_user_input(harness, monkeypatch) -> None:
     monkeypatch.setattr(sender, "last_input_age", lambda: 0.2)
     h = harness(require_foreground_idle=True)
+
+    result = h.sender.submit("测试群", "在吗")
+
+    assert result.error_code == "foreground_busy"
+    assert "send_text" not in h.driver.actions()
+
+
+def test_foreground_busy_ignores_our_own_injected_keys(harness, monkeypatch) -> None:
+    """轮询的 pull_messages 会按最多 30 次 'up'；这些键不能当成用户输入。"""
+    monkeypatch.setattr(sender, "last_input_age", lambda: 0.2)
+    h = harness(require_foreground_idle=True)
+    h.driver.self_input_age = 0.2
+
+    result = h.sender.submit("测试群", "在吗")
+
+    assert result.ok is True
+    assert "send_text" in h.driver.actions()
+
+
+def test_foreground_busy_still_blocks_when_user_typed_after_us(
+    harness, monkeypatch
+) -> None:
+    monkeypatch.setattr(sender, "last_input_age", lambda: 0.2)
+    h = harness(require_foreground_idle=True)
+    h.driver.self_input_age = 5.0
 
     result = h.sender.submit("测试群", "在吗")
 

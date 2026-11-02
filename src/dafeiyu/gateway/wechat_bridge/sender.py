@@ -51,6 +51,9 @@ __all__ = [
 #: 距最后一次用户输入小于这个秒数就认为用户正在操作，前台不可抢占。
 FOREGROUND_IDLE_SECONDS = 1.5
 
+#: 比较「我们注入的时刻」与「最后一次输入的时刻」时允许的时钟误差（秒）。
+_SELF_INPUT_TOLERANCE_SECONDS = 0.05
+
 #: `OpenInputDesktop` 需要的访问权限：只查询当前输入桌面是否可切换。
 _DESKTOP_SWITCHDESKTOP = 0x0100
 
@@ -127,6 +130,31 @@ def last_input_age() -> float | None:
     except Exception:
         log.debug("GetLastInputInfo 不可用", exc_info=True)
         return None
+
+
+def input_was_self_injected(age: float, driver: Any) -> bool:
+    """最近一次系统输入是不是桥自己注入的（而不是人）。
+
+    `GetLastInputInfo` 只告诉我们「多久没输入」，不区分来源；pyautogui 用
+    SendInput 注入按键，同样会刷新这个计时。驱动的
+    `last_synthetic_input_age()` 给出「我们上一次注入距现在多久」：若我们的注入
+    时刻不早于最后一次输入（`own_age <= age`），这次输入就是我们自己的，不该
+    拦住回复。驱动没提供该钩子、或探测抛异常时一律按「是用户输入」处理
+    （fail-closed，宁可少发一条也不抢人的前台）。
+    """
+    probe = getattr(driver, "last_synthetic_input_age", None)
+    if not callable(probe):
+        return False
+    try:
+        own = probe()
+    except Exception:  # noqa: BLE001 - 探测失败按用户输入处理
+        log.debug("last_synthetic_input_age 探测失败", exc_info=True)
+        return False
+    if own is None:
+        return False
+    if isinstance(own, bool) or not isinstance(own, (int, float)):
+        return False
+    return float(own) <= age + _SELF_INPUT_TOLERANCE_SECONDS
 
 
 def desktop_state() -> str:
@@ -542,10 +570,16 @@ class Sender:
                 detail=f"target={target} foreground={foreground}",
             )
 
-        # (c) 用户刚有输入就不抢前台。
+        # (c) 用户刚有输入就不抢前台。注意：pyautogui 的按键同样会刷新系统空闲
+        #     计时，轮询刚翻完消息时这里的 age 会是 0.0x 秒——必须先把「自己按的」
+        #     排除掉，否则每条回复都会被自己的轮询拦成 foreground_busy。
         if bool(_cfg(self._config, "require_foreground_idle", True)):
             age = last_input_age()
-            if age is not None and age < FOREGROUND_IDLE_SECONDS:
+            if (
+                age is not None
+                and age < FOREGROUND_IDLE_SECONDS
+                and not input_was_self_injected(age, self._driver)
+            ):
                 log.info("用户前台有输入（%.2fs），拒绝发送 %s", age, chat_name)
                 return SendResult(
                     False,

@@ -33,9 +33,13 @@ class FakeTools:
             "平台": "windows",
         }
         self.language_value = "简体中文"
+        self.version_value: object = None
 
     def about_weixin(self) -> object:
         return self.about_value
+
+    def get_weixin_version(self) -> object:
+        return self.version_value
 
     def get_weixin_language(self) -> str:
         return self.language_value
@@ -47,6 +51,8 @@ class FakeTools:
 class FakeMessages:
     def __init__(self) -> None:
         self.sent: list[dict] = []
+        # pyweixin 的 pull_messages 是「新 → 旧」：先选中最新一条，再逐条按 'up'
+        # 往上翻（utils.traverse_message）。snapshot() 负责翻回时间正序。
         self.pulled: dict[str, object] = {
             "测试群": [
                 {"发送人": "阿猫", "内容": "你好", "引用": "上一条"},
@@ -56,15 +62,17 @@ class FakeMessages:
         self.new_messages: object = {
             "测试群": [{"昵称": "阿猫", "文本内容": "你好", "类型": "text"}]
         }
+        self.pulled_numbers: list[int] = []
 
     def check_new_messages(self) -> object:
         return self.new_messages
 
-    def pull_messages(self, friend: str) -> object:
+    def pull_messages(self, friend: str, number: int) -> object:
+        self.pulled_numbers.append(number)
         return self.pulled.get(friend, [])
 
     def send_messages_to_friend(
-        self, friend: str, messages: str, close_weixin: bool | None = None
+        self, friend: str, messages: list[str], close_weixin: bool | None = None
     ) -> None:
         self.sent.append(
             {"friend": friend, "messages": messages, "close_weixin": close_weixin}
@@ -109,6 +117,18 @@ def test_about_normalises_chinese_keys(fake) -> None:
         "nickname": "小助手",
         "platform": "windows",
     }
+
+
+def test_about_prefers_dedicated_version_api(fake) -> None:
+    fake.Tools.version_value = "4.1.15.13"
+
+    assert driver.about()["version"] == "4.1.15.13"
+
+
+def test_about_reads_bare_chinese_version_key(fake) -> None:
+    fake.Tools.about_value = {"版本": "4.1.15.13", "语言": "简体中文"}
+
+    assert driver.about()["version"] == "4.1.15.13"
 
 
 def test_about_tolerates_non_dict_response(fake) -> None:
@@ -201,16 +221,10 @@ def test_snapshot_pulls_and_normalises(fake) -> None:
 
     assert result["chat_name"] == "测试群"
     assert result["counts"] == {"total": 2}
-    assert result["messages"][0] == {
-        "nickname": "阿猫",
-        "text": "你好",
-        "kind": "text",
-        "reply_to": "上一条",
-        "reply_author": "",
-        "ts": 0,
-    }
+    assert fake.Messages.pulled_numbers == [driver.PULL_MESSAGES]
+    # 驱动给的是「新 → 旧」，snapshot 必须翻成时间正序（旧 → 新）。
     # 裸字符串条目：不猜发送人，只保留文本。
-    assert result["messages"][1] == {
+    assert result["messages"][0] == {
         "nickname": "",
         "text": "裸字符串条目",
         "kind": "text",
@@ -218,6 +232,48 @@ def test_snapshot_pulls_and_normalises(fake) -> None:
         "reply_author": "",
         "ts": 0,
     }
+    assert result["messages"][1] == {
+        "nickname": "阿猫",
+        "text": "你好",
+        "kind": "text",
+        "reply_to": "上一条",
+        "reply_author": "",
+        "ts": 0,
+    }
+
+
+def test_snapshot_returns_chronological_order(fake) -> None:
+    """回归：顺序反了会让 align 每轮 overlap=0，把每条新消息都当 resync 丢掉。"""
+    fake.Messages.pulled["测试群"] = [
+        {"发送人": "阿猫", "内容": "第三条"},
+        {"发送人": "阿猫", "内容": "第二条"},
+        {"发送人": "阿猫", "内容": "第一条"},
+    ]
+
+    result = driver.snapshot(ChatHandle(name="测试群", window=None))
+
+    assert [m["text"] for m in result["messages"]] == ["第一条", "第二条", "第三条"]
+
+
+def test_snapshot_marks_self_injected_input(fake, monkeypatch) -> None:
+    """`pull_messages` 会按 'up' 翻消息，要留下「这是我们自己按的」时间戳。"""
+    times = iter([100.0, 100.25])
+    monkeypatch.setattr(driver, "_wall_clock", lambda: next(times))
+
+    driver.snapshot(ChatHandle(name="测试群", window=None))
+
+    assert driver.last_synthetic_input_age() == pytest.approx(0.25)
+
+
+def test_snapshot_reads_installed_chinese_sender_key(fake) -> None:
+    fake.Messages.pulled["测试群"] = [
+        {"消息发送人": "小菜鱼", "消息内容": "hi", "消息类型": "text"}
+    ]
+
+    result = driver.snapshot(ChatHandle(name="测试群", window=None))
+
+    assert result["messages"][0]["nickname"] == "小菜鱼"
+    assert result["messages"][0]["text"] == "hi"
 
 
 def test_snapshot_requires_handle_name(fake) -> None:
@@ -244,7 +300,7 @@ def test_send_text_forces_global_config_and_applies_delay(
 
     assert clock.sleeps == [0.8]
     assert fake.Messages.sent == [
-        {"friend": "测试群", "messages": "在吗", "close_weixin": False}
+        {"friend": "测试群", "messages": ["在吗"], "close_weixin": False}
     ]
     assert fake.GlobalConfig.close_weixin is False
     assert fake.GlobalConfig.is_maximize is False
@@ -264,7 +320,7 @@ def test_send_text_skips_zero_delay(fake, monkeypatch) -> None:
     driver.send_text("测试群", "在吗", 0)
 
     assert clock.sleeps == []
-    assert fake.Messages.sent[0]["messages"] == "在吗"
+    assert fake.Messages.sent[0]["messages"] == ["在吗"]
 
 
 def test_at_members_dedupes_in_order(fake) -> None:

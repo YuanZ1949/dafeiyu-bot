@@ -11,9 +11,13 @@
 实际版本的签名为准，若有出入改这里并更新本文档）：
 
 - ``Tools.about_weixin()`` -> 版本/昵称等信息的 dict（中文键）
-- ``Messages.send_messages_to_friend(friend=显示名, messages=文本, close_weixin=False)``
-  —— 按**显示名**寻址，没有返回值
-- ``Messages.pull_messages(friend=显示名)``、``Messages.check_new_messages()``
+- ``Tools.get_weixin_version()`` -> 版本字符串（优先用它；旧版没有时回退 about）
+- ``Messages.send_messages_to_friend(friend=显示名, messages=[文本], close_weixin=False)``
+  —— 按**显示名**寻址，没有返回值；`messages` 必须是 **list**，传字符串会逐字符发送
+- ``Messages.pull_messages(friend=显示名, number=N)``（实测 1.9.8 要求 `number`）、
+  ``Messages.check_new_messages()``；`pull_messages` 内部走
+  ``utils.traverse_message``——**从最新一条开始、逐条按 'up' 往上翻**，所以原始返回
+  顺序是「新 → 旧」，本模块在 ``snapshot`` 里翻成时间正序（旧 → 新）再交给上层
 - ``Monitor.listen_on_chat(dialog_window, duration, groupMembers)`` 返回 7 个计数键
   （新消息总数/文本数量/文件数量/图片数量/视频数量/链接数量/文本内容），
   **没有「消息发送人」键**，发送人只能从条目字段里取
@@ -36,15 +40,43 @@ from typing import Any
 __all__ = [
     "ChatHandle",
     "DriverError",
+    "PULL_MESSAGES",
     "about",
     "at_members",
     "is_running",
     "language",
+    "last_synthetic_input_age",
     "list_sessions",
     "open_chat",
     "send_text",
     "snapshot",
 ]
+
+#: 每轮快照拉取的最近消息条数。太小会漏消息，太大每 8 秒滚动 UI 代价高。
+PULL_MESSAGES = 30
+
+#: 捕获一次时钟函数：测试替换 ``driver.time`` 时不影响这里，也避免和
+#: ``send_text`` 的 ``time.sleep`` 打桩互相牵连。
+_wall_clock = time.time
+
+#: 桥自己最近一次注入键鼠事件的时间戳（wall clock）。
+#: pyautogui 的按键/点击走 SendInput，同样会刷新 Windows 的空闲计时，所以
+#: ``sender`` 的前台保护必须能把「自己刚按的」和「人刚按的」区分开——否则轮询
+#: 刚翻完消息，紧接着的回复就会被自己按的键拦成 ``foreground_busy``。
+_last_synthetic_input_at: float | None = None
+
+
+def _mark_synthetic_input() -> None:
+    global _last_synthetic_input_at
+    _last_synthetic_input_at = _wall_clock()
+
+
+def last_synthetic_input_age() -> float | None:
+    """桥自己上一次注入键鼠事件距今多少秒；从未注入过返回 None。"""
+    mark = _last_synthetic_input_at
+    if mark is None:
+        return None
+    return max(0.0, _wall_clock() - mark)
 
 
 class DriverError(Exception):
@@ -137,12 +169,28 @@ def _pick(mapping: Any, keys: tuple[str, ...]) -> Any:
     return None
 
 
-_VERSION_KEYS = ("version", "Version", "微信版本", "WeChat Version")
+_VERSION_KEYS = (
+    "version",
+    "Version",
+    "微信版本",
+    "版本",
+    "版本号",
+    "WeChat Version",
+)
 _NICKNAME_KEYS = ("nickname", "NickName", "微信昵称", "昵称")
 _PLATFORM_KEYS = ("platform", "Platform", "平台")
 _LANGUAGE_KEYS = ("language", "Language", "语言", "语言设置")
 _TEXT_KEYS = ("text", "content", "内容", "消息内容", "文本内容", "message", "msg")
-_SENDER_KEYS = ("nickname", "sender", "from", "发送人", "昵称", "群昵称", "备注")
+_SENDER_KEYS = (
+    "nickname",
+    "sender",
+    "from",
+    "消息发送人",
+    "发送人",
+    "昵称",
+    "群昵称",
+    "备注",
+)
 _KIND_KEYS = ("kind", "type", "类型", "消息类型")
 _REPLY_KEYS = ("reply_to", "quote", "引用", "被引用内容", "引用内容")
 _REPLY_AUTHOR_KEYS = ("reply_author", "quote_author", "引用人", "被引用人", "引用者")
@@ -153,18 +201,30 @@ def _about_raw() -> Any:
     return _call(lambda: _pyweixin().Tools.about_weixin(), "about_failed")
 
 
+def _version_raw() -> str | None:
+    """优先用 `Tools.get_weixin_version()`；旧版/替身没有时回退 about_weixin。"""
+    tools = _attr(_pyweixin(), "Tools")
+    getter = _attr(tools, "get_weixin_version")
+    if not callable(getter):
+        return None
+    value = _call(getter, "about_failed")
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
 def about() -> dict[str, str | None]:
     """微信版本/昵称/平台。只返回可以安全塞进 health 信封的字符串。"""
+    version = _version_raw()
     raw = _about_raw()
     if not isinstance(raw, dict):
         text = str(raw).strip() if raw else ""
-        return {"version": text or None, "nickname": None, "platform": None}
+        return {"version": version or text or None, "nickname": None, "platform": None}
     def _text(keys: tuple[str, ...]) -> str | None:
         value = _pick(raw, keys)
         return str(value) if value is not None else None
 
     return {
-        "version": _text(_VERSION_KEYS),
+        "version": version or _text(_VERSION_KEYS),
         "nickname": _text(_NICKNAME_KEYS),
         "platform": _text(_PLATFORM_KEYS),
     }
@@ -296,10 +356,14 @@ def open_chat(name: str) -> ChatHandle:
     if not str(name or "").strip():
         raise DriverError("invalid_argument", "会话显示名为空")
     wx = _pyweixin()
-    window = _call(
-        lambda: wx.Navigator.open_dialog_window(friend=name),
-        "open_chat_failed",
-    )
+    try:
+        window = _call(
+            lambda: wx.Navigator.open_dialog_window(friend=name),
+            "open_chat_failed",
+        )
+    finally:
+        # 搜索/点击会话都会注入键鼠事件，记一笔供前台保护区分来源。
+        _mark_synthetic_input()
     if window is None:
         raise DriverError("chat_not_found", f"打不开会话：{name}")
     return ChatHandle(name=str(name), window=window)
@@ -309,14 +373,28 @@ def snapshot(handle: ChatHandle) -> dict[str, Any]:
     """拉取目标会话最近的消息（供 align 层做最长后缀对齐）。
 
     返回 `{"chat_name", "messages", "counts": {"total"}}`；`messages` 是规整后的
-    `{nickname, text, kind, reply_to}` 列表。哪个字段缺就留空，绝不猜。
+    `{nickname, text, kind, reply_to}` 列表，**按时间正序（旧 → 新）**。哪个字段缺
+    就留空，绝不猜。
+
+    `pull_messages` 底层是「选中最新一条、再按 'up' 往上翻」，原始顺序是
+    **新 → 旧**；这里翻转一次，因为 `align.SessionAligner` 的最长后缀=前缀匹配和
+    `sender._bubble_present` 的「从新往旧找」都假定列表是时间正序。
     """
     name = getattr(handle, "name", "")
     if not name:
         raise DriverError("invalid_argument", "snapshot 需要一个带 name 的 ChatHandle")
     wx = _pyweixin()
-    raw = _call(lambda: wx.Messages.pull_messages(friend=name), "snapshot_failed")
-    messages = _normalize_entries(raw)
+    try:
+        raw = _call(
+            lambda: wx.Messages.pull_messages(friend=name, number=PULL_MESSAGES),
+            "snapshot_failed",
+        )
+    finally:
+        # `pull_messages` 会按最多 30 次 'up' 翻消息，这些按键会刷新系统空闲计时。
+        _mark_synthetic_input()
+    # pyweixin 返回「新 → 旧」，翻成时间正序；不这么做 align 每次都只能看到
+    # overlap=0，于是把每条新消息都当成 resync 静默丢掉。
+    messages = list(reversed(_normalize_entries(raw)))
     return {
         "chat_name": str(name),
         "messages": messages,
@@ -339,12 +417,16 @@ def send_text(name: str, text: str, delay: float) -> None:
     _force_global_config(wx)
     if delay > 0:
         time.sleep(delay)
-    _call(
-        lambda: wx.Messages.send_messages_to_friend(
-            friend=name, messages=text, close_weixin=False
-        ),
-        "send_failed",
-    )
+    try:
+        _call(
+            lambda: wx.Messages.send_messages_to_friend(
+                friend=name, messages=[text], close_weixin=False
+            ),
+            "send_failed",
+        )
+    finally:
+        # 粘贴 + Enter 同样是注入输入；后续的发送判断不该被它自己拦住。
+        _mark_synthetic_input()
 
 
 def _force_global_config(wx: Any) -> None:
