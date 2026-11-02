@@ -526,11 +526,15 @@ def probe(
     queue_depth: int = 0,
     last_event_at: int | None = None,
     last_send_at: int | None = None,
+    driver_impl: Any | None = None,
 ) -> dict[str, Any]:
     """生成一帧 v1 health 信封（字段见协议 §5）。
 
     ``connected`` 由调用方（持有 socket 的桥主循环）传入；本模块不碰网络。
+    ``driver_impl`` 让调用方注入驱动（生产桥传真实 driver 并在 UIA 线程上执行）；
+    缺省用模块级 ``driver`` 只为兼容旧调用。
     """
+    drv = driver if driver_impl is None else driver_impl
     version_min = str(_cfg(config, "version_min", _DEFAULT_VERSION_MIN))
     expected_language = _normalize_language(
         _cfg(config, "language", _DEFAULT_LANGUAGE)
@@ -539,7 +543,7 @@ def probe(
     reasons: list[str] = []
 
     try:
-        running = bool(driver.is_running())
+        running = bool(drv.is_running())
     except Exception:  # noqa: BLE001 - 探测失败必须变成健康数据，不能崩主循环
         running = False
         reasons.append("is_running_failed")
@@ -560,7 +564,7 @@ def probe(
             reasons.append("desktop_probe_failed")
 
         try:
-            info = driver.about()
+            info = drv.about()
         except Exception:  # noqa: BLE001 - 读不到就降级，不吞掉
             info = None
             reasons.append("about_failed")
@@ -572,7 +576,7 @@ def probe(
             logged_in = True
 
         try:
-            language = driver.language()
+            language = drv.language()
         except Exception:  # noqa: BLE001
             language = None
             reasons.append("language_unknown")

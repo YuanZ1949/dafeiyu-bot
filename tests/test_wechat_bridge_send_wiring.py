@@ -142,6 +142,19 @@ class WiringDriver:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, int]] = []
         self.messages: list[dict[str, Any]] = []
+        self.probe_threads: list[int] = []
+
+    def is_running(self) -> bool:
+        self.probe_threads.append(threading.get_ident())
+        return False
+
+    def about(self) -> Any:
+        self.probe_threads.append(threading.get_ident())
+        return None
+
+    def language(self) -> Any:
+        self.probe_threads.append(threading.get_ident())
+        return None
 
     def open_chat(self, name: str) -> Any:
         self.calls.append(("open_chat", name, threading.get_ident()))
@@ -193,6 +206,9 @@ class FakePoller:
 
     def enqueue_send(self, fn: Any) -> Any:
         return self.ui.submit(fn, kind="send")
+
+    async def request_send(self, fn: Any) -> Any:
+        return await asyncio.wrap_future(self.enqueue_send(fn))
 
     async def frames(self):
         while not self.stopped:
@@ -301,6 +317,19 @@ async def test_run_send_text_reaches_driver_on_sta_thread(tmp_path: Path) -> Non
         assert ui_ident is not None
         assert {call[2] for call in harness.driver.calls} == {ui_ident}
         assert threading.get_ident() not in {call[2] for call in harness.driver.calls}
+
+
+async def test_startup_health_probe_runs_on_ui_thread_with_injected_driver(
+    tmp_path: Path,
+) -> None:
+    """启动探测必须投到 UIA 线程，并用 run() 注入的 driver（不是模块全局）。"""
+    async with _bridge(tmp_path) as harness:
+        assert harness.poller is not None
+        ui_ident = harness.poller.ui.thread_ident
+        assert ui_ident is not None
+        assert harness.driver.probe_threads
+        assert set(harness.driver.probe_threads) == {ui_ident}
+        assert threading.get_ident() not in harness.driver.probe_threads
 
 
 async def test_unknown_alias_and_not_allowlisted_never_touch_driver(

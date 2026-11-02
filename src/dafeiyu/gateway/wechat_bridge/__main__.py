@@ -141,9 +141,10 @@ class _UiThreadDriver:
             raise DriverError("aborted", label) from exc
 
     def force_global_config(self) -> None:
-        return self._call(
-            "force_global_config", lambda: self._raw.force_global_config()
-        )
+        force = getattr(self._raw, "force_global_config", None)
+        if not callable(force):
+            return
+        self._call("force_global_config", force)
 
     def _pyweixin_or_none(self) -> Any:
         getter = getattr(self._raw, "_pyweixin_or_none", None)
@@ -370,9 +371,9 @@ async def run(
     # 初始 health 帧与帧源无关：注入纯 message 帧源时也必须先有健康快照，
     # 否则客户端 `_health_connected` 一直是 False（wechat.py:168/291-293）。
     # 探测不可用时按 fail-closed 降级（logged_in False / desktop no_wechat）。
-    startup_health = _health_frame(wechat, connected=True)
-    with contextlib.suppress(Exception):
-        await asyncio.wait_for(server.broadcast(startup_health), _AWAIT_TIMEOUT)
+    # 生产路径的探测在 poller 启动后投到 UIA 线程执行；只有注入 frame_source
+    # 的测试/替身路径（无 poller）用 fail-closed 帧，不做任何驱动调用。
+    startup_health: dict[str, Any] | None = None
 
     try:
         if frame_source is None:
@@ -387,9 +388,15 @@ async def run(
                     wechat, poller, driver
                 )
                 sender_holder.append(sender)
+            startup_health = await _startup_health_frame(poller, wechat, driver)
             source = poller.frames()
         else:
+            startup_health = _fallback_health_frame(connected=True)
             source = frame_source
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(server.broadcast(startup_health), _AWAIT_TIMEOUT)
+
         pump_task = _spawn_pump(server, source, wechat)
         await _wait_for_stop(stop, loop)
     finally:
@@ -422,7 +429,9 @@ async def run(
         getter = getattr(server, "latest_health", None)
         # latest_health 是 property（取到的是 dict），不是方法；两种形态都兼容。
         snapshot = getter() if callable(getter) else getter
-        final = dict(snapshot) if isinstance(snapshot, dict) else dict(startup_health)
+        final = dict(snapshot) if isinstance(snapshot, dict) else dict(
+            startup_health or _fallback_health_frame(connected=True)
+        )
         final.setdefault("type", "health")
         final.setdefault("channel", "wechat")
         final["v"] = 1
@@ -435,17 +444,21 @@ async def run(
     return 0
 
 
-def _health_frame(wechat: WeChatConfig, *, connected: bool) -> dict[str, Any]:
+def _health_frame(
+    wechat: WeChatConfig, *, connected: bool, driver_impl: Any | None = None
+) -> dict[str, Any]:
     """一帧 v1 health：优先用 `health.probe` 的真实快照，探测不可用时降级。
 
     降级帧是 fail-closed 的：`logged_in=False` + `desktop="no_wechat"`，客户端
     据此停止发送（wechat.py:85-90 的 `_health_connected` 与 send 闸门），
     绝不为了「看起来健康」而伪造 interactive/logged_in。
+
+    ``driver_impl`` 传生产驱动的真实实现；调用方负责把它跑在 UI 线程上。
     """
     try:
         from .health import probe
 
-        frame = probe(wechat, connected=connected)
+        frame = probe(wechat, connected=connected, driver_impl=driver_impl)
         if isinstance(frame, dict):
             snapshot = dict(frame)
             snapshot["v"] = 1
@@ -455,6 +468,10 @@ def _health_frame(wechat: WeChatConfig, *, connected: bool) -> dict[str, Any]:
             return snapshot
     except Exception:
         logger.warning("微信桥健康探测不可用，按 fail-closed 降级", exc_info=True)
+    return _fallback_health_frame(connected=connected)
+
+
+def _fallback_health_frame(*, connected: bool) -> dict[str, Any]:
     return {
         "v": 1,
         "type": "health",
@@ -466,6 +483,20 @@ def _health_frame(wechat: WeChatConfig, *, connected: bool) -> dict[str, Any]:
         "language": None,
         "queue_depth": 0,
     }
+
+
+async def _startup_health_frame(
+    poller: Any, wechat: WeChatConfig, driver_impl: Any
+) -> dict[str, Any]:
+    """在 UI 线程上跑启动探测：UIA/ctypes 调用绝不留事件循环线程。"""
+    def _probe() -> dict[str, Any]:
+        return _health_frame(wechat, connected=True, driver_impl=driver_impl)
+
+    try:
+        return await asyncio.wait_for(poller.request_send(_probe), _AWAIT_TIMEOUT)
+    except Exception:  # noqa: BLE001 - 探测失败按 fail-closed 降级，不能拖垮启动
+        logger.warning("启动健康探测失败，按 fail-closed 降级", exc_info=True)
+        return _fallback_health_frame(connected=True)
 
 
 def _pump_idle_timeout(poll_seconds: float) -> float:
