@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import importlib.util
 import json
+import os
 import shutil
+import socket
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -41,6 +44,18 @@ _TOKEN_INTEGRITY_LEVEL = 25
 
 # 临时目录探测失败时，detail 里统一带上这个前缀，方便测试与提示文案复用。
 TEMP_FAILURE_PREFIX = "临时目录写入失败"
+
+# 微信通道前置检查的固定 id 与顺序（doctor 输出据此稳定）。
+WECHAT_CHECK_IDS = (
+    "wechat.process_running",
+    "wechat.version_ok",
+    "wechat.language_ok",
+    "wechat.integrity_match",
+    "wechat.desktop_interactive",
+    "wechat.driver_importable",
+    "wechat.bridge_port_free",
+    "wechat.config_ready",
+)
 
 
 @dataclass(frozen=True)
@@ -224,6 +239,458 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(format_report(probe))
     return 1 if _has_problem(probe) else 0
+
+
+# ---- 微信通道前置检查 ------------------------------------------------
+
+def _check(check_id: str, status: str, detail: str) -> dict[str, str]:
+    return {"id": check_id, "status": status, "detail": detail}
+
+
+def _as_wechat_config(config):
+    """接受 WeChatConfig / Settings / None，统一取到 WeChatConfig（或 None）。"""
+    if config is None:
+        return None
+    inner = getattr(config, "wechat", None)
+    return inner if inner is not None else config
+
+
+def _wechat_pids() -> list[int]:
+    from .gateway.wechat_bridge import health
+
+    return list(health._wechat_pids())
+
+
+def _wechat_about() -> dict:
+    from .gateway.wechat_bridge import driver
+
+    return driver.about()
+
+
+def _wechat_language() -> str:
+    from .gateway.wechat_bridge import driver
+
+    return driver.language()
+
+
+def _wechat_desktop() -> str:
+    from .gateway.wechat_bridge import health
+
+    return health._detect_desktop()
+
+
+def _wechat_integrity_state(running: bool) -> str:
+    from .gateway.wechat_bridge import health
+
+    return health._integrity_state(running)
+
+
+def _compare_versions(left, right):
+    from .gateway.wechat_bridge import health
+
+    return health._compare_versions(left, right)
+
+
+def _normalize_language(value):
+    from .gateway.wechat_bridge import health
+
+    return health._normalize_language(value)
+
+
+def _pyweixin_available() -> bool:
+    try:
+        return importlib.util.find_spec("pyweixin") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _port_free(port: int, host: str = "127.0.0.1") -> bool:
+    # 与 bootstrap._port_free 语义一致：故意不设 SO_REUSEADDR（Windows 下会让
+    # 端口被占用时 bind 也成功）；0.0.0.0 / :: / * 用空 host 试所有地址。
+    bind_host = "" if host in {"", "0.0.0.0", "::", "*"} else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((bind_host, port))
+        except OSError:
+            return False
+    return True
+
+
+def _current_session_id() -> int | None:
+    """返回当前进程所在 Windows Session ID；非 Windows 或失败返回 None。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.ProcessIdToSessionId.argtypes = [
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
+        session = wintypes.DWORD()
+        if not kernel32.ProcessIdToSessionId(
+            wintypes.DWORD(os.getpid()), ctypes.byref(session)
+        ):
+            return None
+        return int(session.value)
+    except (OSError, AttributeError, ValueError):  # pragma: no cover - 平台相关
+        return None
+
+
+def probe_wechat(config=None) -> list[dict[str, str]]:
+    """跑 8 项微信通道前置检查，固定顺序返回。
+
+    ``config`` 可以是 ``WeChatConfig``、``Settings``（取 ``.wechat``）或
+    ``None``。``enabled=false`` 时 8 项全部 SKIP，不触发任何真实探测。
+    """
+    cfg = _as_wechat_config(config)
+    if cfg is None or not bool(getattr(cfg, "enabled", False)):
+        detail = "gateway.wechat.enabled=false，跳过微信前置检查"
+        return [_check(cid, "SKIP", detail) for cid in WECHAT_CHECK_IDS]
+
+    version_min = str(getattr(cfg, "version_min", "4.1.6") or "4.1.6")
+    expected_language = _normalize_language(
+        getattr(cfg, "language", "zh-CN") or "zh-CN"
+    )
+    checks: list[dict[str, str]] = []
+
+    # (1) process
+    pids: list[int] = []
+    try:
+        pids = _wechat_pids()
+    except Exception as exc:  # noqa: BLE001
+        checks.append(
+            _check("wechat.process_running", "FAIL", f"枚举微信进程失败：{exc}")
+        )
+    else:
+        if pids:
+            shown = ", ".join(str(pid) for pid in pids[:5])
+            checks.append(
+                _check(
+                    "wechat.process_running",
+                    "PASS",
+                    f"发现 {len(pids)} 个 WeChat.exe 进程（PID {shown}）",
+                )
+            )
+        else:
+            checks.append(
+                _check("wechat.process_running", "FAIL", "未发现 WeChat.exe 进程")
+            )
+    running = bool(pids)
+
+    driver_ok = False
+    try:
+        driver_ok = _pyweixin_available()
+    except Exception:  # noqa: BLE001
+        driver_ok = False
+
+    # (2) version
+    if not running:
+        checks.append(
+            _check("wechat.version_ok", "SKIP", "微信进程未运行，跳过版本检查")
+        )
+    elif not driver_ok:
+        checks.append(
+            _check(
+                "wechat.version_ok",
+                "SKIP",
+                "pyweixin 未安装，无法读取微信版本（见 wechat.driver_importable）",
+            )
+        )
+    else:
+        try:
+            info = _wechat_about()
+            version = (
+                str((info or {}).get("version") or "").strip()
+                if isinstance(info, dict)
+                else ""
+            )
+        except Exception as exc:  # noqa: BLE001
+            checks.append(
+                _check("wechat.version_ok", "FAIL", f"读取微信版本失败：{exc}")
+            )
+        else:
+            if not version:
+                checks.append(_check("wechat.version_ok", "FAIL", "读不到微信版本"))
+            else:
+                comparison = _compare_versions(version, version_min)
+                if comparison is None:
+                    checks.append(
+                        _check(
+                            "wechat.version_ok",
+                            "FAIL",
+                            f"微信版本无法解析：{version}",
+                        )
+                    )
+                elif comparison < 0:
+                    checks.append(
+                        _check(
+                            "wechat.version_ok",
+                            "FAIL",
+                            f"微信版本 {version} 低于要求 {version_min}",
+                        )
+                    )
+                else:
+                    checks.append(
+                        _check(
+                            "wechat.version_ok",
+                            "PASS",
+                            f"微信版本 {version} >= {version_min}",
+                        )
+                    )
+
+    # (3) language
+    if not running:
+        checks.append(
+            _check("wechat.language_ok", "SKIP", "微信进程未运行，跳过语言检查")
+        )
+    elif not driver_ok:
+        checks.append(
+            _check(
+                "wechat.language_ok", "SKIP", "pyweixin 未安装，无法读取界面语言"
+            )
+        )
+    else:
+        try:
+            actual_language = _wechat_language()
+        except Exception as exc:  # noqa: BLE001
+            checks.append(
+                _check("wechat.language_ok", "FAIL", f"读取微信界面语言失败：{exc}")
+            )
+        else:
+            if _normalize_language(actual_language) != expected_language:
+                checks.append(
+                    _check(
+                        "wechat.language_ok",
+                        "FAIL",
+                        f"微信界面语言 {actual_language} != 配置 {expected_language}",
+                    )
+                )
+            else:
+                checks.append(
+                    _check(
+                        "wechat.language_ok",
+                        "PASS",
+                        f"微信界面语言 {actual_language} 与配置一致",
+                    )
+                )
+
+    # (4) integrity
+    if not running:
+        checks.append(
+            _check("wechat.integrity_match", "SKIP", "微信进程未运行，跳过完整性检查")
+        )
+    else:
+        try:
+            integrity = _wechat_integrity_state(True)
+        except Exception:  # noqa: BLE001
+            integrity = "unknown"
+        if integrity == "matching":
+            checks.append(
+                _check(
+                    "wechat.integrity_match",
+                    "PASS",
+                    "桥进程与 WeChat.exe 完整性级别一致",
+                )
+            )
+        elif integrity == "mismatched":
+            checks.append(
+                _check(
+                    "wechat.integrity_match",
+                    "FAIL",
+                    "桥进程与 WeChat.exe 完整性级别不一致，RPA 可能无法操作微信",
+                )
+            )
+        else:
+            checks.append(
+                _check(
+                    "wechat.integrity_match",
+                    "SKIP",
+                    "无法读取完整性级别（微信未运行或权限不足）",
+                )
+            )
+
+    # (5) desktop
+    if not running:
+        checks.append(
+            _check("wechat.desktop_interactive", "SKIP", "微信进程未运行，跳过桌面检查")
+        )
+    else:
+        try:
+            desktop = _wechat_desktop()
+        except Exception:  # noqa: BLE001
+            desktop = "locked"
+        if desktop != "interactive":
+            checks.append(
+                _check(
+                    "wechat.desktop_interactive",
+                    "FAIL",
+                    f"微信桌面状态：{desktop}（需要已解锁的交互桌面）",
+                )
+            )
+        else:
+            session_id = _current_session_id()
+            if session_id == 0:
+                checks.append(
+                    _check(
+                        "wechat.desktop_interactive",
+                        "FAIL",
+                        "当前进程在 Session 0（服务会话），不是交互桌面",
+                    )
+                )
+            else:
+                shown = "未知" if session_id is None else str(session_id)
+                checks.append(
+                    _check(
+                        "wechat.desktop_interactive",
+                        "PASS",
+                        f"桌面可交互（Session {shown}）",
+                    )
+                )
+
+    # (6) pyweixin
+    if driver_ok:
+        checks.append(
+            _check("wechat.driver_importable", "PASS", "pyweixin 已安装，可导入")
+        )
+    else:
+        checks.append(
+            _check(
+                "wechat.driver_importable",
+                "FAIL",
+                "pyweixin 未安装：pip install 'dafeiyu[wechat]'",
+            )
+        )
+
+    # (7) port
+    host = str(getattr(cfg, "bridge_host", "127.0.0.1") or "127.0.0.1")
+    try:
+        port = int(getattr(cfg, "bridge_port", 8790))
+    except (TypeError, ValueError):
+        checks.append(
+            _check(
+                "wechat.bridge_port_free",
+                "FAIL",
+                "gateway.wechat.bridge_port 不是整数",
+            )
+        )
+    else:
+        try:
+            free = _port_free(port, host)
+        except Exception as exc:  # noqa: BLE001
+            checks.append(
+                _check("wechat.bridge_port_free", "FAIL", f"检测端口失败：{exc}")
+            )
+        else:
+            if free:
+                checks.append(
+                    _check("wechat.bridge_port_free", "PASS", f"{host}:{port} 空闲")
+                )
+            else:
+                checks.append(
+                    _check(
+                        "wechat.bridge_port_free",
+                        "FAIL",
+                        f"{host}:{port} 已被占用",
+                    )
+                )
+
+    # (8) config readiness
+    allowlist = getattr(cfg, "group_allowlist", None) or ()
+    nickname = str(getattr(cfg, "account_nickname", "") or "").strip()
+    missing: list[str] = []
+    if not allowlist:
+        missing.append("group_allowlist")
+    if not nickname:
+        missing.append("account_nickname")
+    if missing:
+        checks.append(
+            _check(
+                "wechat.config_ready",
+                "FAIL",
+                f"gateway.wechat.enabled=true 但缺少：{'、'.join(missing)}",
+            )
+        )
+    else:
+        checks.append(
+            _check(
+                "wechat.config_ready",
+                "PASS",
+                f"配置齐备（白名单 {len(allowlist)} 个群，昵称 {nickname}）",
+            )
+        )
+
+    return checks
+
+
+def wechat_ok(checks: list[dict[str, str]]) -> bool:
+    """没有 FAIL 即视为通过；SKIP 不算失败。"""
+    return not any(check["status"] == "FAIL" for check in checks)
+
+
+def _bool_text(value) -> str:
+    return "true" if bool(value) else "false"
+
+
+def format_wechat_config(config) -> str:
+    """打印微信通道生效配置（bridge_token 只显示是否配置，绝不显示值）。"""
+    cfg = _as_wechat_config(config)
+    if cfg is None:
+        return "微信通道生效配置（gateway.wechat）\n  （未加载配置）"
+
+    host = str(getattr(cfg, "bridge_host", "127.0.0.1") or "127.0.0.1")
+    port = getattr(cfg, "bridge_port", 8790)
+    token = getattr(cfg, "bridge_token", "") or ""
+    nickname = str(getattr(cfg, "account_nickname", "") or "").strip() or "—"
+    allowlist = getattr(cfg, "group_allowlist", None) or ()
+    groups = sorted(str(group) for group in allowlist)
+    allowlist_text = (
+        f"{len(groups)} 个：{'、'.join(groups)}" if groups else "0 个"
+    )
+    version_min = str(getattr(cfg, "version_min", "4.1.6") or "4.1.6")
+    language = str(getattr(cfg, "language", "zh-CN") or "zh-CN")
+    kill_switch_file = str(
+        getattr(cfg, "kill_switch_file", "data/wechat.stop") or "data/wechat.stop"
+    )
+    allow_test_inject = _bool_text(getattr(cfg, "allow_test_inject", False))
+
+    lines = [
+        "微信通道生效配置（gateway.wechat）",
+        f"  enabled：{_bool_text(getattr(cfg, 'enabled', False))}",
+        f"  bridge_host：{host}",
+        f"  bridge_port：{port}",
+        f"  bridge_token：{'已配置（不显示）' if token else '未配置'}",
+        f"  account_nickname：{nickname}",
+        f"  group_allowlist：{allowlist_text}",
+        f"  version_min：{version_min}",
+        f"  language：{language}",
+        f"  kill_switch_file：{kill_switch_file}",
+        f"  allow_test_inject：{allow_test_inject}",
+    ]
+    return "\n".join(lines)
+
+
+def format_wechat_report(checks: list[dict[str, str]]) -> str:
+    """把 8 项微信前置检查排成给人看的报告。"""
+    checks = list(checks)
+    lines = [f"微信前置检查（{len(checks)} 项）"]
+    for check in checks:
+        lines.append(f"  [{check['status']}] {check['id']}：{check['detail']}")
+
+    fail_count = sum(1 for check in checks if check["status"] == "FAIL")
+    skip_count = sum(1 for check in checks if check["status"] == "SKIP")
+    if fail_count:
+        lines.append(f"  结论：微信前置检查失败（{fail_count} 项 FAIL）")
+    elif skip_count:
+        lines.append(
+            f"  结论：微信前置检查通过（{len(checks) - skip_count} 项 PASS，"
+            f"{skip_count} 项 SKIP）"
+        )
+    else:
+        lines.append(f"  结论：微信前置检查通过（{len(checks)} 项全部 PASS）")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

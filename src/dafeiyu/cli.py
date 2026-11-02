@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from pathlib import Path
 
 from .bootstrap import (
     CONFIG_NAME,
@@ -14,6 +16,12 @@ from .bootstrap import (
     preflight,
 )
 from .config import ConfigError, load_settings
+from .env_probe import (
+    format_wechat_config,
+    format_wechat_report,
+    probe_wechat,
+    wechat_ok,
+)
 from .ids import normalize_chat_id
 from .memory.store import Store
 from .models import ChatType
@@ -54,6 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--config", default=CONFIG_NAME, help="配置文件路径")
     doctor.add_argument("--env-file", default=ENV_NAME, help="环境变量文件路径")
     doctor.add_argument("--no-ports", action="store_true", help="跳过端口占用检查")
+    doctor.add_argument(
+        "--json", action="store_true", help="以 JSON 输出体检结果（供脚本解析）"
+    )
     return parser
 
 
@@ -72,9 +83,36 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
+    # Windows 重定向时 stdout 默认是 locale（GBK），报告里的 ✗ 和中文会直接
+    # UnicodeEncodeError；固定 UTF-8，脚本解析和管道输出都能拿到合法文本。
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        try:
+            reconfigure(encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
     issues = preflight(args.config, args.env_file, check_ports=not args.no_ports)
+    try:
+        settings = load_settings(
+            env_file=Path(args.env_file), config_file=Path(args.config)
+        )
+    except (ConfigError, UnicodeDecodeError, OSError):
+        # preflight 已经在 issues 里报告了配置问题，这里只降级为「无微信配置」。
+        settings = None
+
+    checks = probe_wechat(settings.wechat if settings is not None else None)
+    ok = wechat_ok(checks)
+
+    if args.json:
+        print(json.dumps({"checks": checks, "ok": ok}, ensure_ascii=False))
+        return 0 if ok and not has_errors(issues) else 1
+
     print(format_issues(issues))
-    return 1 if has_errors(issues) else 0
+    if settings is not None:
+        print(format_wechat_config(settings.wechat))
+    print(format_wechat_report(checks))
+    return 1 if has_errors(issues) or not ok else 0
 
 
 def main(argv: list[str] | None = None) -> int:

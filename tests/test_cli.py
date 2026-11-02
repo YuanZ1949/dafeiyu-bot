@@ -1,9 +1,11 @@
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from dafeiyu import cli
-from dafeiyu.config import load_settings
+from dafeiyu import cli, env_probe
+from dafeiyu.config import WeChatConfig, load_settings
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 
@@ -114,3 +116,118 @@ def test_config_error_returns_1(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     (tmp_path / "config.yaml").write_text(CONFIG, encoding="utf-8")
     assert cli.main(["stats", "--chat", "1"]) == 1
+
+
+# ---- doctor：微信前置检查与 --json ---------------------------------------
+
+
+def _doctor_config(**overrides) -> WeChatConfig:
+    values = dict(
+        enabled=True,
+        bridge_host="127.0.0.1",
+        bridge_port=8790,
+        bridge_token="",
+        account_nickname="小号",
+        group_allowlist=frozenset({"群一"}),
+    )
+    values.update(overrides)
+    return WeChatConfig(**values)
+
+
+def _patch_doctor_probes(monkeypatch) -> None:
+    monkeypatch.setattr(env_probe, "_wechat_pids", lambda: [1234])
+    monkeypatch.setattr(env_probe, "_wechat_about", lambda: {"version": "4.1.6.14"})
+    monkeypatch.setattr(env_probe, "_wechat_language", lambda: "zh-CN")
+    monkeypatch.setattr(env_probe, "_wechat_desktop", lambda: "interactive")
+    monkeypatch.setattr(
+        env_probe, "_wechat_integrity_state", lambda running: "matching"
+    )
+    monkeypatch.setattr(env_probe, "_current_session_id", lambda: 1)
+    monkeypatch.setattr(env_probe, "_pyweixin_available", lambda: True)
+    monkeypatch.setattr(
+        env_probe, "_port_free", lambda port, host="127.0.0.1": True
+    )
+
+
+def _patch_doctor_config(monkeypatch, cfg) -> None:
+    monkeypatch.setattr(cli, "preflight", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        cli, "load_settings", lambda **kwargs: SimpleNamespace(wechat=cfg)
+    )
+
+
+def test_doctor_json_has_eight_wechat_checks(monkeypatch, capsys) -> None:
+    _patch_doctor_config(monkeypatch, _doctor_config())
+    _patch_doctor_probes(monkeypatch)
+
+    rc = cli.main(["doctor", "--json"])
+
+    out = capsys.readouterr().out
+    assert len(out.strip().splitlines()) == 1
+    payload = json.loads(out)
+    assert payload["ok"] is True
+    assert [check["id"] for check in payload["checks"]] == list(
+        env_probe.WECHAT_CHECK_IDS
+    )
+    assert all(check["status"] == "PASS" for check in payload["checks"])
+    assert rc == 0
+
+
+def test_doctor_json_missing_allowlist_fails(monkeypatch, capsys) -> None:
+    _patch_doctor_config(
+        monkeypatch, _doctor_config(group_allowlist=frozenset())
+    )
+    _patch_doctor_probes(monkeypatch)
+
+    rc = cli.main(["doctor", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert rc == 1
+    details = " ".join(check["detail"] for check in payload["checks"])
+    assert "group_allowlist" in details
+
+
+def test_doctor_json_disabled_all_skip_ok_true(monkeypatch, capsys) -> None:
+    _patch_doctor_config(monkeypatch, _doctor_config(enabled=False))
+    # 禁用时不应触发任何真实探测。
+    monkeypatch.setattr(
+        env_probe, "_wechat_pids", lambda: pytest.fail("不应探测进程")
+    )
+
+    rc = cli.main(["doctor", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert rc == 0
+    assert [check["status"] for check in payload["checks"]] == ["SKIP"] * 8
+
+
+def test_doctor_text_hides_bridge_token(monkeypatch, capsys) -> None:
+    _patch_doctor_config(
+        monkeypatch, _doctor_config(bridge_token="super-secret-token")
+    )
+    _patch_doctor_probes(monkeypatch)
+
+    rc = cli.main(["doctor"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "super-secret-token" not in out
+    assert "已配置（不显示）" in out
+    assert "wechat.process_running" in out
+    assert "微信通道生效配置" in out
+
+
+def test_doctor_json_hides_bridge_token(monkeypatch, capsys) -> None:
+    _patch_doctor_config(
+        monkeypatch, _doctor_config(bridge_token="super-secret-token")
+    )
+    _patch_doctor_probes(monkeypatch)
+
+    cli.main(["doctor", "--json"])
+
+    out = capsys.readouterr().out
+    assert "super-secret-token" not in out
+    payload = json.loads(out)
+    assert "bridge_token" not in json.dumps(payload, ensure_ascii=False)
