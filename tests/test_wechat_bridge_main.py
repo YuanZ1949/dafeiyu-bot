@@ -528,3 +528,127 @@ async def test_probe_and_bad_version_do_not_crash_loop() -> None:
                 await asyncio.wait_for(ws.recv(), STEP)
     finally:
         await asyncio.wait_for(server.stop(), STEP)
+
+
+# ------------------------------------------- (g) resume 指令重建 pump 任务
+async def test_run_resume_restarts_pump(tmp_path: Path) -> None:
+    """kill 文件存在时 resume 必须拒绝；删文件后必须重建灌帧任务。"""
+    wechat = _wechat(kill_switch_file=str(tmp_path / "wechat.stop"))
+    holder: dict[str, Any] = {}
+
+    class FakeDriver:
+        """本用例不触碰驱动。"""
+
+    class FakePoller:
+        def __init__(self) -> None:
+            self.frames_calls = 0
+            self.resets = 0
+            self.abort_calls = 0
+            self.stop_calls = 0
+
+        async def start(self) -> None:
+            return None
+
+        async def frames(self) -> Any:
+            self.frames_calls += 1
+            yield {
+                "v": 1,
+                "type": "health",
+                "connected": True,
+                "logged_in": True,
+                "desktop": "interactive",
+            }
+            return
+
+        def reset_for_resume(self) -> bool:
+            self.resets += 1
+            return True
+
+        def abort_sends(self) -> int:
+            self.abort_calls += 1
+            return 0
+
+        def stop(self, *, timeout: float = STEP) -> bool:
+            self.stop_calls += 1
+            return True
+
+    poller = FakePoller()
+
+    def poller_factory(_config: WeChatConfig, _driver: Any) -> FakePoller:
+        return poller
+
+    def server_factory(*args: Any, **kwargs: Any) -> BridgeServer:
+        server = BridgeServer(*args, **kwargs)
+        holder["server"] = server
+        return server
+
+    kill_path = Path(wechat.kill_switch_file)
+    run_task = asyncio.create_task(
+        bridge_main.run(
+            settings=SimpleNamespace(wechat=wechat),
+            driver_factory=FakeDriver,
+            server_factory=server_factory,
+            poller_factory=poller_factory,
+        )
+    )
+    try:
+        server = await _wait_for_port(holder)
+        async with connect(
+            _uri(server.port), additional_headers={"Authorization": f"Bearer {TOKEN}"}
+        ) as ws:
+            # 等第一轮 pump 结束（FakePoller.frames 只产一帧就返回）。
+            async def _wait_first_pump() -> None:
+                while poller.frames_calls < 1:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(_wait_first_pump(), STEP)
+
+            kill_path.write_text("stop\n", encoding="utf-8")
+            await asyncio.wait_for(
+                ws.send(
+                    json.dumps(
+                        {"v": 1, "id": "r0", "action": "resume", "params": {}}
+                    )
+                ),
+                STEP,
+            )
+            blocked = await _recv_until(ws, lambda f: f.get("id") == "r0")
+            assert blocked["ok"] is False
+            assert blocked["error_code"] == "kill_switch_active"
+
+            kill_path.unlink()
+            await asyncio.wait_for(
+                ws.send(
+                    json.dumps(
+                        {"v": 1, "id": "r1", "action": "resume", "params": {}}
+                    )
+                ),
+                STEP,
+            )
+            resumed = await _recv_until(ws, lambda f: f.get("id") == "r1")
+            assert resumed["ok"] is True
+            assert poller.resets == 1
+
+            async def _wait_second_pump() -> None:
+                while poller.frames_calls < 2:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(_wait_second_pump(), STEP)
+            assert poller.frames_calls == 2
+
+            await asyncio.wait_for(
+                ws.send(
+                    json.dumps(
+                        {"v": 1, "id": "bye", "action": "stop", "params": {}}
+                    )
+                ),
+                STEP,
+            )
+            assert (await _recv_until(ws, lambda f: f.get("id") == "bye"))["ok"] is True
+
+        assert await asyncio.wait_for(run_task, STEP) == 0
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(run_task, STEP)

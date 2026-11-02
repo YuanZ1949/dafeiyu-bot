@@ -570,3 +570,26 @@ async def test_poller_never_blocks_event_loop(tmp_path: Path, seconds: float) ->
         with contextlib.suppress(BaseException):
             await asyncio.wait_for(source.aclose(), STEP)
     assert ticks >= 12
+
+
+# ------------------------------------------------ (h) resume 只在删文件后生效
+def test_reset_for_resume_only_after_kill_file_removed(tmp_path: Path) -> None:
+    wechat = _wechat(tmp_path)
+    poller = PollingLoop(
+        wechat,
+        FakeDriver(),
+        probe=_probe,
+        registry=_Registry(),
+        poll_seconds=0.02,
+    )
+    kill_path = Path(wechat.kill_switch_file)
+    kill_path.write_text("stop\n", encoding="utf-8")
+
+    poller.abort_sends()
+    assert poller.stopped is True
+    assert poller.reset_for_resume() is False
+    assert poller.stopped is True
+
+    kill_path.unlink()
+    assert poller.reset_for_resume() is True
+    assert poller.stopped is False

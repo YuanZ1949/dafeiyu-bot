@@ -376,6 +376,13 @@ class PollingLoop:
         self._stopped.set()
         return self.ui.cancel_pending(_JOB_SEND)
 
+    def reset_for_resume(self) -> bool:
+        """删除急停文件后恢复轮询；文件仍在时返回 False（不改状态）。"""
+        if self.kill_switch_path.exists():
+            return False
+        self._stopped.clear()
+        return True
+
     # ------------------------------------------------------------- 发送
     def enqueue_send(self, fn: Callable[[], Any]) -> concurrent.futures.Future[Any]:
         """把一次发送 op 投进优先队列；worker 会在下一个轮询 op 之前执行它。"""
@@ -392,9 +399,11 @@ class PollingLoop:
         try:
             while not self._stopped.is_set():
                 if self.kill_switch_path.exists():
+                    # 急停时立刻丢掉排队中的发送：别让急停前排队的消息继续操作桌面。
+                    self.abort_sends()
                     yield await self._kill_switch_frame()
                     logger.warning(
-                        "检测到杀开关 %s：停止轮询（删除文件不会自动恢复，需重启桥进程）",
+                        "检测到杀开关 %s：已单向停止轮询；删除文件后可用 resume 指令恢复，或重启桥进程",
                         self.kill_switch_path,
                     )
                     # 单向停机：标记为已停止，删掉文件也不会让循环复活。

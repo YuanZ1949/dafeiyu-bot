@@ -40,6 +40,8 @@ from .brain.provider_config import (
 from .brain.runtime_config import ensure_isolated_config
 from .budget import BudgetGuard
 from .config import OVERRIDES_PATH, ConfigError, Settings
+from .gateway.base import GatewayError
+from .ids import normalize_chat_id
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
 from .model_probe import (
     FREE_PROBE_TTL,
@@ -50,7 +52,7 @@ from .model_probe import (
     probe_free_model_detail,
     probe_models,
 )
-from .models import ChatType, Message
+from .models import ChatType, Message, channel_of
 from .runtime import RuntimeState, load_runtime, save_runtime
 from .secrets_store import (
     INSTALL_ROOT,
@@ -180,22 +182,16 @@ async def _read_json_object(
 
 def _chat_target(
     payload: dict[str, Any],
-) -> tuple[ChatType | None, int | None, web.Response | None]:
+) -> tuple[ChatType | None, str | None, web.Response | None]:
     raw_type = str(payload.get("chat_type") or "").strip()
     if raw_type not in ("group", "private"):
         return None, None, web.json_response(
             {"error": "chat_type 必须是 group 或 private"}, status=400
         )
     try:
-        chat_id = int(payload.get("chat_id"))
-    except (TypeError, ValueError):
-        return None, None, web.json_response(
-            {"error": "chat_id 必须是整数"}, status=400
-        )
-    if chat_id <= 0:
-        return None, None, web.json_response(
-            {"error": "chat_id 必须是正整数"}, status=400
-        )
+        chat_id = normalize_chat_id(payload.get("chat_id"))
+    except ValueError as exc:
+        return None, None, web.json_response({"error": str(exc)}, status=400)
     return ChatType(raw_type), chat_id, None
 
 
@@ -438,7 +434,7 @@ def _query_int(request: web.Request, name: str, default: int) -> int:
 
 def _query_scope(
     request: web.Request,
-) -> tuple[ChatType | None, int | None, web.Response | None]:
+) -> tuple[ChatType | None, str | None, web.Response | None]:
     raw_chat_type = (request.query.get("chat_type") or "").strip()
     chat_type: ChatType | None = None
     if raw_chat_type:
@@ -453,15 +449,9 @@ def _query_scope(
     raw_chat_id = (request.query.get("chat_id") or "").strip()
     if raw_chat_id:
         try:
-            chat_id = int(raw_chat_id)
-        except ValueError:
-            return None, None, web.json_response(
-                {"error": "chat_id 必须是整数"}, status=400
-            )
-        if chat_id <= 0:
-            return None, None, web.json_response(
-                {"error": "chat_id 必须是正整数"}, status=400
-            )
+            chat_id = normalize_chat_id(raw_chat_id)
+        except ValueError as exc:
+            return None, None, web.json_response({"error": str(exc)}, status=400)
     if chat_id is not None and chat_type is None:
         return None, None, web.json_response(
             {"error": "指定 chat_id 时必须同时指定 chat_type"}, status=400
@@ -471,7 +461,7 @@ def _query_scope(
 
 def _path_target(
     request: web.Request,
-) -> tuple[ChatType | None, int | None, web.Response | None]:
+) -> tuple[ChatType | None, str | None, web.Response | None]:
     raw_type = request.match_info.get("chat_type", "")
     try:
         chat_type = ChatType(raw_type)
@@ -481,38 +471,26 @@ def _path_target(
         )
     raw_id = request.match_info.get("chat_id", "")
     try:
-        chat_id = int(raw_id)
-    except ValueError:
-        return None, None, web.json_response(
-            {"error": "chat_id 必须是整数"}, status=400
-        )
-    if chat_id <= 0:
-        return None, None, web.json_response(
-            {"error": "chat_id 必须是正整数"}, status=400
-        )
+        chat_id = normalize_chat_id(raw_id)
+    except ValueError as exc:
+        return None, None, web.json_response({"error": str(exc)}, status=400)
     return chat_type, chat_id, None
 
 
-def _positive_path_int(
+def _path_id(
     request: web.Request, name: str, label: str
-) -> tuple[int | None, web.Response | None]:
+) -> tuple[str | None, web.Response | None]:
     raw = request.match_info.get(name, "")
     try:
-        value = int(raw)
-    except ValueError:
-        return None, web.json_response(
-            {"error": f"{label} 必须是整数"}, status=400
-        )
-    if value <= 0:
-        return None, web.json_response(
-            {"error": f"{label} 必须是正整数"}, status=400
-        )
+        value = normalize_chat_id(raw, label=label)
+    except ValueError as exc:
+        return None, web.json_response({"error": str(exc)}, status=400)
     return value, None
 
 
 def _user_target(
     request: web.Request,
-) -> tuple[ChatType | None, int | None, int | None, web.Response | None]:
+) -> tuple[ChatType | None, str | None, str | None, web.Response | None]:
     raw_type = request.match_info.get("chat_type", "")
     try:
         chat_type = ChatType(raw_type)
@@ -520,13 +498,26 @@ def _user_target(
         return None, None, None, web.json_response(
             {"error": "chat_type 必须是 group 或 private"}, status=400
         )
-    chat_id, error = _positive_path_int(request, "chat_id", "chat_id")
+    chat_id, error = _path_id(request, "chat_id", "chat_id")
     if error is not None:
         return None, None, None, error
-    user_id, error = _positive_path_int(request, "user_id", "user_id")
+    user_id, error = _path_id(request, "user_id", "user_id")
     if error is not None:
         return None, None, None, error
     return chat_type, chat_id, user_id, None
+
+
+def _wechat_adapter(control: Any) -> Any | None:
+    adapters = getattr(control.service, "adapters", None)
+    if isinstance(adapters, dict):
+        adapter = adapters.get("wechat")
+        if adapter is not None:
+            return adapter
+    return None
+
+
+def _kill_switch_path(control: Any) -> Path:
+    return Path(str(control.settings.wechat.kill_switch_file))
 
 
 def _fmt_ts(timestamp: int | None) -> str:
@@ -1777,8 +1768,26 @@ def create_app(
         admins = sorted(control.settings.groups.admins)
         if not admins:
             return web.json_response({"error": "未配置管理员"}, status=503)
-        if not bool(getattr(control.adapter, "connected", False)):
-            return web.json_response({"error": "QQ 网关未连接"}, status=503)
+        adapters = getattr(control.service, "adapters", None)
+
+        def _pick_adapter(target: Any) -> tuple[Any, str]:
+            if isinstance(adapters, dict) and adapters:
+                try:
+                    channel = channel_of(str(target))
+                except ValueError:
+                    channel = "qq"
+                found = adapters.get(channel)
+                if found is not None:
+                    return found, channel
+                if len(adapters) == 1:
+                    only = next(iter(adapters.items()))
+                    return only[1], only[0]
+                return None, channel
+            return control.adapter, "qq"
+
+        adapter, channel = _pick_adapter(admins[0])
+        if adapter is None or not bool(getattr(adapter, "connected", False)):
+            return web.json_response({"error": f"{channel} 网关未连接"}, status=503)
         now = time.monotonic()
         last = control._last_notify_at
         if last is not None and now - last < NOTIFY_MIN_INTERVAL_SECONDS:
@@ -1788,12 +1797,59 @@ def create_app(
 
         target = admins[0]
         try:
-            await control.adapter.send(ChatType.PRIVATE, target, text)
+            await adapter.send(ChatType.PRIVATE, target, text)
         except Exception as exc:  # noqa: BLE001 - 发送失败回 503，不打断告警循环
             log.warning("管理员通知发送失败：%s", exc)
             return web.json_response({"error": "管理员通知发送失败"}, status=503)
         control._last_notify_at = now
         return web.json_response({"ok": True, "target": target})
+
+    async def wechat_stop(_: web.Request) -> web.Response:
+        path = _kill_switch_path(control)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("stop\n", encoding="utf-8")
+        log.warning("wechat_stopped: 急停已触发（%s）", path)
+        adapter = _wechat_adapter(control)
+        if adapter is not None:
+            enter = getattr(adapter, "enter_kill_switch", None)
+            if callable(enter):
+                enter()
+        return web.json_response({"ok": True, "event": "wechat_stopped"})
+
+    async def wechat_resume(_: web.Request) -> web.Response:
+        path = _kill_switch_path(control)
+        if path.exists():
+            return web.json_response(
+                {"error": f"急停文件仍存在，请先删除 {path}"}, status=409
+            )
+        adapter = _wechat_adapter(control)
+        if adapter is None:
+            raise web.HTTPNotFound()
+        resume = getattr(adapter, "resume", None)
+        if not callable(resume):
+            raise web.HTTPNotFound()
+        try:
+            await resume()
+        except GatewayError as exc:
+            return web.json_response({"error": str(exc)}, status=503)
+        return web.json_response({"ok": True, "event": "wechat_resumed"})
+
+    async def wechat_inject(request: web.Request) -> web.Response:
+        if not bool(control.settings.wechat.allow_test_inject):
+            raise web.HTTPNotFound()
+        adapter = _wechat_adapter(control)
+        if adapter is None:
+            raise web.HTTPNotFound()
+        path = _kill_switch_path(control)
+        if path.exists() or not bool(getattr(adapter, "connected", False)):
+            return web.json_response(
+                {"error": "微信通道已急停或未连接"}, status=409
+            )
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        await adapter.dispatch_envelope(payload)
+        return web.json_response({"ok": True})
 
     async def status(_: web.Request) -> web.Response:
         return web.json_response(control.snapshot())
@@ -1849,14 +1905,10 @@ def create_app(
             )
 
         raw_user_id = payload.get("user_id")
-        if isinstance(raw_user_id, bool):
-            return web.json_response({"error": "user_id 必须是正整数"}, status=400)
         try:
-            user_id = int(raw_user_id)
-        except (TypeError, ValueError):
-            return web.json_response({"error": "user_id 必须是正整数"}, status=400)
-        if user_id <= 0:
-            return web.json_response({"error": "user_id 必须是正整数"}, status=400)
+            user_id = normalize_chat_id(raw_user_id, label="user_id")
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
 
         raw_nickname = payload.get("nickname", "调试用户")
         if not isinstance(raw_nickname, str):
@@ -1961,11 +2013,9 @@ def create_app(
         raw_chat_id = (request.query.get("chat_id") or "").strip()
         if raw_chat_id:
             try:
-                chat_id = int(raw_chat_id)
-            except ValueError:
-                return web.json_response({"error": "chat_id 必须是整数"}, status=400)
-            if chat_id <= 0:
-                return web.json_response({"error": "chat_id 必须是正整数"}, status=400)
+                chat_id = normalize_chat_id(raw_chat_id)
+            except ValueError as exc:
+                return web.json_response({"error": str(exc)}, status=400)
 
         try:
             return web.json_response(
@@ -2419,6 +2469,9 @@ def create_app(
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/health/detail", health_detail)
     app.router.add_post("/api/notify/admin", notify_admin)
+    app.router.add_post("/api/channels/wechat/stop", wechat_stop)
+    app.router.add_post("/api/channels/wechat/resume", wechat_resume)
+    app.router.add_post("/api/channels/wechat/inject", wechat_inject)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/brain", get_brain)
     app.router.add_post("/api/brain", post_brain)

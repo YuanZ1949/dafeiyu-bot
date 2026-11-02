@@ -46,7 +46,7 @@ __all__ = [
 # 与 wechat.py 客户端逐字一致的三件套。
 BRIDGE_PATH = "/wechat-bridge"
 PROTOCOL_VERSION = 1
-_KNOWN_ACTIONS = ("send_text", "send_at", "probe", "stop")
+_KNOWN_ACTIONS = ("send_text", "send_at", "probe", "stop", "resume")
 _MAX_FRAME = 1 << 20
 
 # 反挂死护栏：服务器内的每一个 await 都有显式超时（<= 5s）。

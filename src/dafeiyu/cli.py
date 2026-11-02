@@ -14,10 +14,18 @@ from .bootstrap import (
     preflight,
 )
 from .config import ConfigError, load_settings
+from .ids import normalize_chat_id
 from .memory.store import Store
 from .models import ChatType
 
 CHAT_TYPES = ["group", "private"]
+
+
+def _chat_id_arg(raw: str) -> str:
+    try:
+        return normalize_chat_id(raw, label="--chat")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,16 +33,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     forget = sub.add_parser("forget", help="清空会话记忆")
-    forget.add_argument("--chat", type=int, help="群号或用户号")
+    forget.add_argument("--chat", type=_chat_id_arg, help="群号或用户号")
     forget.add_argument("--type", choices=CHAT_TYPES, default="group")
     forget.add_argument("--all", action="store_true", help="清空所有会话")
 
     stats = sub.add_parser("stats", help="查看今日调用与 token")
-    stats.add_argument("--chat", type=int, required=True)
+    stats.add_argument("--chat", type=_chat_id_arg, required=True)
     stats.add_argument("--type", choices=CHAT_TYPES, default="group")
 
     summary = sub.add_parser("summary", help="查看某天的群摘要")
-    summary.add_argument("--chat", type=int, required=True)
+    summary.add_argument("--chat", type=_chat_id_arg, required=True)
     summary.add_argument("--date", required=True, help="YYYY-MM-DD")
     summary.add_argument("--type", choices=CHAT_TYPES, default="group")
 

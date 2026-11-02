@@ -122,6 +122,41 @@ class WeChatAdapter:
                 await task
         self._fail_pending(GatewayError("微信桥已关闭"))
 
+    def enter_kill_switch(self) -> None:
+        """急停：立即在本地标记断线并失败在途发送，不关 WS、不杀任务。"""
+        self._health_connected = False
+        self.last_disconnect_at = time.time()
+        self._fail_pending(GatewayError("微信已急停"))
+
+    async def resume(self) -> None:
+        """让桥进程恢复轮询（kill 文件必须已被删除，由调用方保证）。"""
+        ws = self._ws
+        if ws is None:
+            raise GatewayError("微信桥未连接")
+        command_id = uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        self._pending[command_id] = future
+        envelope = {
+            "v": _PROTOCOL_VERSION,
+            "id": command_id,
+            "action": "resume",
+            "params": {},
+        }
+        try:
+            await ws.send(json.dumps(envelope, ensure_ascii=False))
+            receipt = await asyncio.wait_for(future, _SEND_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            raise GatewayError("微信恢复等待回执超时") from exc
+        except ConnectionClosed as exc:
+            raise GatewayError("微信桥连接已断开") from exc
+        finally:
+            self._pending.pop(command_id, None)
+        if not bool(receipt.get("ok", False)):
+            raise GatewayError(f"微信恢复失败：{receipt.get('error_code') or 'unknown'}")
+        self._health_connected = True
+        self._last_health_at = time.monotonic()
+        logger.info("微信通道已恢复轮询")
+
     def _validate_config(self) -> None:
         """就绪度在加载阶段只告警，真正拒绝发生在这里（doctor 仍能出报告）。"""
         if not self._config.group_allowlist:

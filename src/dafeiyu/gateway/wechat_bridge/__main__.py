@@ -100,6 +100,9 @@ async def run(
     stop = loop.create_future()
     # poller 在服务器工厂之后才构造：回调要能引用到它（action:"stop" 先 abort）。
     poller_holder: list[Any] = []
+    # 必须早于 server / resume 闭包初始化，否则 resume 可能撞上 UnboundLocalError。
+    poller: Any | None = None
+    pump_task: asyncio.Task[None] | None = None
 
     def _signal_stop() -> None:
         # §7 / PART B：stop 的第一件事是中止发送（丢排队 job、停止新 UI op）。
@@ -109,11 +112,35 @@ async def run(
         if not stop.done():
             stop.set_result(None)
 
+    async def _resume_bridge() -> dict[str, Any]:
+        nonlocal pump_task
+        raw_kill = str(getattr(wechat, "kill_switch_file", "") or "")
+        if raw_kill and Path(raw_kill).exists():
+            return {"ok": False, "error_code": "kill_switch_active"}
+        if poller is None:
+            return {"ok": False, "error_code": "not_resumable"}
+        reset = getattr(poller, "reset_for_resume", None)
+        if not callable(reset) or not reset():
+            return {"ok": False, "error_code": "not_resumable"}
+        if pump_task is None or pump_task.done():
+            pump_task = _spawn_pump(server, poller.frames(), wechat)
+        logger.info("微信桥收到 resume 指令，轮询已恢复")
+        return {"ok": True}
+
+    async def _handle_command(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any] | None:
+        if action == "resume":
+            return await _resume_bridge()
+        if command_handler is None:
+            return None
+        return await command_handler(action, params, command_id)
+
     server = (server_factory or BridgeServer)(
         wechat.bridge_host,
         wechat.bridge_port,
         bridge_token=wechat.bridge_token,
-        command_handler=command_handler,
+        command_handler=_handle_command,
         on_stop_requested=_signal_stop,
     )
     bound_port = await asyncio.wait_for(server.start(), _AWAIT_TIMEOUT)
@@ -126,8 +153,6 @@ async def run(
     with contextlib.suppress(Exception):
         await asyncio.wait_for(server.broadcast(startup_health), _AWAIT_TIMEOUT)
 
-    poller: Any | None = None
-    pump_task: asyncio.Task[None] | None = None
     try:
         if frame_source is None:
             # UI 线程必须在服务器监听之后启动；它只通过 PollingLoop 的队列被使用。
@@ -137,14 +162,7 @@ async def run(
             source = poller.frames()
         else:
             source = frame_source
-        pump_task = asyncio.create_task(
-            _pump_until_stopped(
-                server,
-                source,
-                idle_timeout=_pump_idle_timeout(wechat.poll_seconds),
-            ),
-            name="wechat-bridge-pump",
-        )
+        pump_task = _spawn_pump(server, source, wechat)
         await _wait_for_stop(stop, loop)
     finally:
         # 1) 让轮询循环和排队中的发送一起停手（幂等，可在异常路径重复调用）。
@@ -231,6 +249,20 @@ async def _pump_until_stopped(
     server: Any, source: FrameSource, *, idle_timeout: float | None = None
 ) -> None:
     await pump_frames(server, source, idle_timeout=idle_timeout)
+
+
+def _spawn_pump(
+    server: Any, source: FrameSource, wechat: WeChatConfig
+) -> asyncio.Task[None]:
+    """创建灌帧任务；首轮与 resume 重建共用同一入口。"""
+    return asyncio.create_task(
+        _pump_until_stopped(
+            server,
+            source,
+            idle_timeout=_pump_idle_timeout(wechat.poll_seconds),
+        ),
+        name="wechat-bridge-pump",
+    )
 
 
 async def _wait_for_stop(stop: asyncio.Future[None], loop: asyncio.AbstractEventLoop) -> None:

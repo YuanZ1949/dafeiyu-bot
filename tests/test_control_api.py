@@ -542,8 +542,8 @@ async def test_memory_endpoint_pages_with_offset(tmp_path: Path) -> None:
         "offset=-1",
         "offset=abc",
         "chat_type=bad",
-        "chat_id=0",
-        "chat_id=abc",
+        "chat_id=bad%20id",
+        "chat_id=..%2Fx",
     ],
 )
 async def test_memory_endpoint_rejects_invalid_query(tmp_path: Path, query: str) -> None:
@@ -602,7 +602,7 @@ async def test_post_summary_runs_action_with_target(tmp_path: Path) -> None:
     assert payload == {"ok": True, "date": "2026-10-24", "summary": "昨天聊了钓鱼"}
     assert seen == {
         "chat_type": ChatType.PRIVATE,
-        "chat_id": 200,
+        "chat_id": "200",
         "date": "2026-10-24",
     }
 
@@ -664,8 +664,8 @@ async def test_post_summary_reports_quota_pause(tmp_path: Path) -> None:
     [
         {"chat_type": "channel", "chat_id": 100},
         {"chat_type": "group"},
-        {"chat_type": "group", "chat_id": 0},
-        {"chat_type": "group", "chat_id": "abc"},
+        {"chat_type": "group", "chat_id": "bad id"},
+        {"chat_type": "group", "chat_id": "../etc"},
         {"chat_type": "group", "chat_id": 100, "date": "2026/10/24"},
     ],
 )
@@ -694,7 +694,7 @@ async def test_post_impressions_returns_added_count(tmp_path: Path) -> None:
 
     assert resp.status == 200
     assert payload == {"ok": True, "added": 3}
-    assert seen == {"chat_type": ChatType.GROUP, "chat_id": 100}
+    assert seen == {"chat_type": ChatType.GROUP, "chat_id": "100"}
 
 
 async def test_post_impressions_reports_failure(tmp_path: Path) -> None:
@@ -1101,7 +1101,7 @@ async def test_export_endpoint_validates_scope_and_format(tmp_path: Path) -> Non
     async with running(app) as client:
         assert (await client.get("/api/memory/export")).status == 400
         assert (
-            await client.get("/api/memory/export?chat_type=group&chat_id=0")
+            await client.get("/api/memory/export?chat_type=group&chat_id=bad%20id")
         ).status == 400
         assert (
             await client.get(
@@ -1166,16 +1166,16 @@ async def test_sessions_endpoint_and_actions(tmp_path: Path) -> None:
         assert control.store.count_messages(ChatType.GROUP, 100) == 0
         assert control.store.get_summary(ChatType.GROUP, 200, "2026-10-23") is not None
 
-        calls: list[tuple[ChatType, int]] = []
+        calls: list[tuple[ChatType, str]] = []
 
-        async def forget_chat(chat_type: ChatType, chat_id: int) -> None:
+        async def forget_chat(chat_type: ChatType, chat_id: str) -> None:
             calls.append((chat_type, chat_id))
             control.store.forget_chat(chat_type, chat_id)
 
         service.forget_chat = forget_chat
         deleted = await client.delete("/api/sessions/group/100")
         assert deleted.status == 200
-        assert calls == [(ChatType.GROUP, 100)]
+        assert calls == [(ChatType.GROUP, "100")]
         assert control.store.count_summaries(ChatType.GROUP, 100) == 0
 
 
@@ -1184,7 +1184,7 @@ async def test_session_action_rejects_unknown(tmp_path: Path) -> None:
     async with running(app) as client:
         assert (await client.post("/api/sessions/group/1/rotate")).status == 400
         assert (await client.post("/api/sessions/team/1/new")).status == 400
-        assert (await client.delete("/api/sessions/group/abc")).status == 400
+        assert (await client.delete("/api/sessions/group/bad%20id")).status == 400
         assert (await client.get("/api/sessions?limit=0")).status == 400
         assert (await client.get("/api/sessions?limit=201")).status == 400
         assert (await client.get("/api/sessions?offset=-1")).status == 400
@@ -1324,7 +1324,7 @@ async def test_budget_endpoint_returns_report(tmp_path: Path) -> None:
 
     assert resp.status == 200
     assert data["chat_type"] == "group"
-    assert data["chat_id"] == 100
+    assert data["chat_id"] == "100"
     assert data["per_chat"]["calls"] == 1
     assert data["per_chat"]["tokens"] == 2000
     assert {
@@ -1344,8 +1344,8 @@ async def test_budget_endpoint_returns_report(tmp_path: Path) -> None:
     "query",
     [
         "chat_type=channel&chat_id=1",
-        "chat_type=group&chat_id=abc",
-        "chat_type=group&chat_id=0",
+        "chat_type=group&chat_id=bad%20id",
+        "chat_type=group&chat_id=..%2Fx",
         "chat_type=group",
         "chat_id=1",
     ],
@@ -1414,10 +1414,10 @@ async def test_delete_user_messages_rejects_invalid_target(tmp_path: Path) -> No
                 "/api/memory/channel/100/user/7", json={"confirm": "DELETE_USER"}
             ),
             await client.delete(
-                "/api/memory/group/0/user/7", json={"confirm": "DELETE_USER"}
+                "/api/memory/group/bad%20id/user/7", json={"confirm": "DELETE_USER"}
             ),
             await client.delete(
-                "/api/memory/group/100/user/0", json={"confirm": "DELETE_USER"}
+                "/api/memory/group/100/user/bad%20id", json={"confirm": "DELETE_USER"}
             ),
         ]
 
