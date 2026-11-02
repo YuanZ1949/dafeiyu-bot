@@ -79,11 +79,60 @@ class FakeMessages:
         )
 
 
+class FakeWindow:
+    """模拟 pywinauto WindowSpecification 里驱动会用到的最小面。"""
+
+    def __init__(self, class_name: str = "mmui::MainWindow") -> None:
+        self._class_name = class_name
+        self.alive = True
+
+    def exists(self, timeout: float | None = None) -> bool:
+        return self.alive
+
+    def class_name(self) -> str:
+        if not self.alive:
+            raise RuntimeError("window gone")
+        return self._class_name
+
+
 class FakeNavigator:
+    def __init__(self) -> None:
+        self.window = FakeWindow()
+        self.open_weixin_calls = 0
+
+    def open_weixin(self, is_maximize: bool | None = None, window_size=None):
+        # 真实实现会 restore + 置顶 + 居中，这是轮询时窗口乱跳的来源。
+        self.open_weixin_calls += 1
+        return self.window
+
     def open_dialog_window(self, friend: str) -> dict:
+        # pyweixin 的 open_dialog_window 内部会先解析主窗口。
+        self.open_weixin()
         if friend == "查无此人":
             raise NotFriendError("no such friend")
         return {"title": friend}
+
+
+class FakeWeChatAuto:
+    """`pyweixin.WeChatAuto` 里的模块级函数（未读探测用）。"""
+
+    def __init__(self) -> None:
+        self.unread_total_value: object = 0
+        self.unread_sessions_value: object = {}
+        self.window_seen: object = None
+
+    def get_new_message_num(self, main_window=None, close_weixin: bool | None = None):
+        self.window_seen = main_window
+        return self.unread_total_value
+
+    def scan_for_new_messages(
+        self,
+        main_window=None,
+        delay: float = 0.1,
+        close_weixin: bool | None = None,
+    ):
+        self.window_seen = main_window
+        return self.unread_sessions_value
 
 
 class FakeContacts:
@@ -107,7 +156,11 @@ def fake(monkeypatch) -> types.ModuleType:
     module.Navigator = FakeNavigator()
     module.Contacts = FakeContacts()
     module.GlobalConfig = FakeGlobalConfig()
+    module.WeChatAuto = FakeWeChatAuto()
     monkeypatch.setitem(sys.modules, "pyweixin", module)
+    # 主窗口缓存是模块级全局：每个用例从「未缓存」开始，避免互相串味。
+    monkeypatch.setattr(driver, "_main_window_cache", None)
+    monkeypatch.setattr(driver, "_last_synthetic_input_at", None)
     return module
 
 
@@ -325,6 +378,87 @@ def test_send_text_skips_zero_delay(fake, monkeypatch) -> None:
 
 def test_at_members_dedupes_in_order(fake) -> None:
     assert driver.at_members(ChatHandle(name="测试群", window=None)) == ["阿猫", "阿狗"]
+
+
+def test_unread_total_reads_sidebar_badge(fake) -> None:
+    fake.WeChatAuto.unread_total_value = "7"
+
+    assert driver.unread_total() == 7
+    assert fake.WeChatAuto.window_seen is fake.Navigator.window
+
+
+def test_unread_total_tolerates_unparsable_badge(fake) -> None:
+    fake.WeChatAuto.unread_total_value = None
+
+    assert driver.unread_total() == 0
+
+
+def test_unread_sessions_returns_counts(fake) -> None:
+    fake.WeChatAuto.unread_sessions_value = {"测试群": 3, "坏值": "x", "另一个群": "2"}
+
+    assert driver.unread_sessions() == {"测试群": 3, "另一个群": 2}
+    assert fake.WeChatAuto.window_seen is fake.Navigator.window
+
+
+def test_unread_sessions_scalar_response_is_loud(fake) -> None:
+    fake.WeChatAuto.unread_sessions_value = 3
+
+    with pytest.raises(DriverError) as excinfo:
+        driver.unread_sessions()
+    assert excinfo.value.code == "bad_response"
+
+
+def test_main_window_is_cached_between_calls(fake) -> None:
+    first = driver.unread_total()
+    second = driver.unread_sessions()
+
+    assert first == 0 and second == {}
+    # 只解析一次主窗口：第二次走缓存，不再触发 restore/置顶/居中。
+    assert fake.Navigator.open_weixin_calls == 1
+
+
+def test_main_window_is_re_resolved_when_window_dies(fake) -> None:
+    driver.unread_total()
+    fake.Navigator.window.alive = False
+    fake.Navigator.window = FakeWindow()
+
+    driver.unread_total()
+
+    assert fake.Navigator.open_weixin_calls == 2
+
+
+def test_open_chat_does_not_reopen_main_window(fake) -> None:
+    """回归：每次 open_chat 都会 restore + 置顶 + 居中，轮询时窗口反复乱跳。"""
+    driver.open_chat("测试群")
+    driver.open_chat("测试群")
+
+    assert fake.Navigator.open_weixin_calls == 1
+
+
+def test_open_chat_restores_open_weixin_after_use(fake) -> None:
+    driver.open_chat("测试群")
+    before = fake.Navigator.open_weixin_calls
+
+    fake.Navigator.open_weixin()
+
+    assert fake.Navigator.open_weixin_calls == before + 1
+
+
+def test_snapshot_and_send_also_reuse_main_window(fake) -> None:
+    driver.snapshot(ChatHandle(name="测试群", window=None))
+    driver.send_text("测试群", "在吗", 0)
+
+    assert fake.Navigator.open_weixin_calls == 1
+
+
+def test_no_window_jump_falls_back_when_window_unavailable(fake, monkeypatch) -> None:
+    def boom(*args, **kwargs):
+        raise driver.DriverError("not_logged_in", "微信停在登录窗口")
+
+    monkeypatch.setattr(driver, "_main_window", boom)
+
+    # 拿不到主窗口时不能把轮询整个搞挂：按原行为继续打开会话。
+    assert driver.open_chat("测试群").name == "测试群"
 
 
 def test_driver_functions_raise_pyweixin_missing(monkeypatch) -> None:

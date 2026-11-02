@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -50,6 +51,8 @@ __all__ = [
     "open_chat",
     "send_text",
     "snapshot",
+    "unread_sessions",
+    "unread_total",
 ]
 
 #: 每轮快照拉取的最近消息条数。太小会漏消息，太大每 8 秒滚动 UI 代价高。
@@ -351,16 +354,125 @@ def list_sessions() -> dict[str, list[dict[str, Any]]]:
     return {str(name): _normalize_entries(entries) for name, entries in raw.items()}
 
 
+#: 缓存微信主窗口 spec。`Navigator.open_weixin()` 会 restore + 置顶 + 居中，
+#: 每 8 秒调一遍等于不停把用户的窗口拽回屏幕中央；只在窗口失效时重新解析。
+_main_window_cache: Any | None = None
+
+
+def _main_window() -> Any:
+    """取微信主窗口（带缓存）：未读探测只需要一个窗口句柄，不做任何激活。"""
+    global _main_window_cache
+    cached = _main_window_cache
+    if cached is not None:
+        try:
+            checker = getattr(cached, "exists", None)
+            alive = True if not callable(checker) else bool(checker(timeout=0.1))
+            namer = getattr(cached, "class_name", None)
+            is_main = (
+                True if not callable(namer) else namer() == "mmui::MainWindow"
+            )
+            if alive and is_main:
+                return cached
+        except Exception:  # noqa: BLE001 - 失效判断失败就重新解析
+            pass
+        _main_window_cache = None
+
+    wx = _pyweixin()
+    window = _call(lambda: wx.Navigator.open_weixin(), "main_window_failed")
+    if window is None:
+        raise DriverError("window_unavailable", "微信主窗口不可用")
+    _main_window_cache = window
+    return window
+
+
+@contextlib.contextmanager
+def _no_window_jump(wx: Any) -> Any:
+    """让 pyweixin 内部的 `open_weixin` 复用缓存窗口，跳过 restore/置顶/居中。
+
+    `open_dialog_window` / `pull_messages` / `send_messages_to_friend` 内部都会
+    调 `Navigator.open_weixin()`；它每次把窗口 restore 到 1000x1000、移到屏幕
+    中央并设为置顶。轮询每 8 秒触发一次，用户正在用电脑时非常难受，而且这
+    一步本身就要几百毫秒。这里只替换「解析窗口」这一步，查找会话/翻消息的
+    逻辑保持 pyweixin 原样；拿不到缓存窗口时退化为原行为。
+    """
+    navigator = _attr(wx, "Navigator")
+    original = _attr(navigator, "open_weixin")
+    if navigator is None or original is None:
+        yield
+        return
+    try:
+        window = _main_window()
+    except DriverError:
+        yield
+        return
+    # 普通函数，不用 staticmethod：类属性上取到就是未绑定函数，实例属性上取到
+    # 也不会被绑定，两种情况 pyweixin 的 `Navigator.open_weixin(...)` 都能直接调。
+    try:
+        navigator.open_weixin = lambda *args, **kwargs: window
+        yield
+    finally:
+        navigator.open_weixin = original
+
+
+def unread_total() -> int:
+    """侧边栏「微信」按钮上的未读总数（一次 UIA 属性读，实测约 20ms）。
+
+    这是轮询门控的 cheapest probe：0 = 没有任何新消息，整轮都可以跳过。
+    """
+    wx = _pyweixin()
+    window = _main_window()
+    raw = _call(
+        lambda: wx.WeChatAuto.get_new_message_num(window, close_weixin=False),
+        "unread_failed",
+    )
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def unread_sessions() -> dict[str, int]:
+    """会话列表里带未读红点的会话：`{显示名: 未读条数}`，不打开任何会话。
+
+    底层 `scan_for_new_messages` 只遍历左侧会话列表；**免打扰会话不计入**，
+    所以上层仍需周期性全量兜底。空 dict 表示没有可识别的未读会话。
+    """
+    wx = _pyweixin()
+    window = _main_window()
+    raw = _call(
+        lambda: wx.WeChatAuto.scan_for_new_messages(
+            main_window=window, delay=0.1, close_weixin=False
+        ),
+        "unread_scan_failed",
+    )
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise DriverError(
+            "bad_response", f"scan_for_new_messages 返回 {type(raw).__name__}"
+        )
+    out: dict[str, int] = {}
+    for name, count in raw.items():
+        try:
+            out[str(name)] = int(count)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def open_chat(name: str) -> ChatHandle:
     """按显示名打开会话窗口，返回句柄；找不到人/群时 `code="not_friend"`。"""
     if not str(name or "").strip():
         raise DriverError("invalid_argument", "会话显示名为空")
     wx = _pyweixin()
     try:
-        window = _call(
-            lambda: wx.Navigator.open_dialog_window(friend=name),
-            "open_chat_failed",
-        )
+        # `open_dialog_window` 内部会调 `Navigator.open_weixin()`（restore + 置顶 +
+        # 居中），每 8 秒一次会把用户窗口反复拽到屏幕中央；这里复用缓存主窗口。
+        with _no_window_jump(wx):
+            window = _call(
+                lambda: wx.Navigator.open_dialog_window(friend=name),
+                "open_chat_failed",
+            )
     finally:
         # 搜索/点击会话都会注入键鼠事件，记一笔供前台保护区分来源。
         _mark_synthetic_input()
@@ -385,10 +497,11 @@ def snapshot(handle: ChatHandle) -> dict[str, Any]:
         raise DriverError("invalid_argument", "snapshot 需要一个带 name 的 ChatHandle")
     wx = _pyweixin()
     try:
-        raw = _call(
-            lambda: wx.Messages.pull_messages(friend=name, number=PULL_MESSAGES),
-            "snapshot_failed",
-        )
+        with _no_window_jump(wx):
+            raw = _call(
+                lambda: wx.Messages.pull_messages(friend=name, number=PULL_MESSAGES),
+                "snapshot_failed",
+            )
     finally:
         # `pull_messages` 会按最多 30 次 'up' 翻消息，这些按键会刷新系统空闲计时。
         _mark_synthetic_input()
@@ -418,12 +531,13 @@ def send_text(name: str, text: str, delay: float) -> None:
     if delay > 0:
         time.sleep(delay)
     try:
-        _call(
-            lambda: wx.Messages.send_messages_to_friend(
-                friend=name, messages=[text], close_weixin=False
-            ),
-            "send_failed",
-        )
+        with _no_window_jump(wx):
+            _call(
+                lambda: wx.Messages.send_messages_to_friend(
+                    friend=name, messages=[text], close_weixin=False
+                ),
+                "send_failed",
+            )
     finally:
         # 粘贴 + Enter 同样是注入输入；后续的发送判断不该被它自己拦住。
         _mark_synthetic_input()

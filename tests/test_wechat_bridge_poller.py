@@ -634,3 +634,209 @@ def test_reset_for_resume_only_after_kill_file_removed(tmp_path: Path) -> None:
     kill_path.unlink()
     assert poller.reset_for_resume() is True
     assert poller.stopped is False
+
+
+def test_reset_for_resume_resets_sweep_state(tmp_path: Path) -> None:
+    """急停期间可能积压消息：恢复后第一轮必须全量，而不是继续吃旧的红点缓存。"""
+    poller = PollingLoop(
+        _wechat(tmp_path),
+        FakeDriver(),
+        probe=_probe,
+        registry=_Registry(),
+        poll_seconds=0.02,
+    )
+    poller._last_full_sweep = 42.0
+    poller._skip_scan_until = 99.0
+
+    assert poller.reset_for_resume() is True
+    assert poller._last_full_sweep == 0.0
+    assert poller._skip_scan_until == 0.0
+
+
+# ------------------------------------------------ (i) 未读门控
+class _Clock:
+    """可控时钟：门控测试不能靠真实时间等 full_sweep_seconds。"""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class UnreadDriver(FakeDriver):
+    """在 FakeDriver 上补未读探测面，并记录探测/扫描次数。"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.unread_total_value: Any = 0
+        self.unread_sessions_value: Any = {}
+        self.unread_calls = 0
+        self.scan_calls = 0
+        self.probe_error: BaseException | None = None
+        self.scan_error: BaseException | None = None
+
+    def unread_total(self) -> Any:
+        self.unread_calls += 1
+        if self.probe_error is not None:
+            raise self.probe_error
+        return self.unread_total_value
+
+    def unread_sessions(self) -> Any:
+        self.scan_calls += 1
+        if self.scan_error is not None:
+            raise self.scan_error
+        return self.unread_sessions_value
+
+
+@contextlib.asynccontextmanager
+async def _running_poller(wechat: WeChatConfig, driver: Any, clock: Any):
+    poller = PollingLoop(
+        wechat,
+        driver,
+        probe=_probe,
+        registry=_Registry(),
+        poll_seconds=0.02,
+        clock=clock,
+    )
+    await poller.start()
+    try:
+        yield poller
+    finally:
+        poller.stop()
+
+
+async def test_unread_gate_skips_round_without_unread(tmp_path: Path) -> None:
+    clock = _Clock()
+    driver = UnreadDriver()
+    wechat = _wechat(tmp_path, unread_gate=True, full_sweep_seconds=120.0)
+
+    async with _running_poller(wechat, driver, clock) as poller:
+        poller._last_full_sweep = clock.now  # 预热那一轮已经全量过
+        assert await poller._targets() == ()
+
+    assert driver.opened == []
+    assert driver.unread_calls == 1
+    assert driver.scan_calls == 0
+
+
+async def test_unread_gate_opens_only_groups_with_unread(tmp_path: Path) -> None:
+    clock = _Clock()
+    driver = UnreadDriver()
+    driver.unread_total_value = 3
+    driver.unread_sessions_value = {"同事群": 2, "白名单外的群": 5}
+    wechat = _wechat(tmp_path, unread_gate=True, full_sweep_seconds=120.0)
+
+    async with _running_poller(wechat, driver, clock) as poller:
+        poller._last_full_sweep = clock.now
+        assert await poller._targets() == ("同事群",)
+
+
+async def test_unread_gate_falls_back_when_probe_fails(tmp_path: Path) -> None:
+    clock = _Clock()
+    driver = UnreadDriver()
+    driver.probe_error = RuntimeError("红点读不到")
+    wechat = _wechat(tmp_path, unread_gate=True, full_sweep_seconds=120.0)
+
+    async with _running_poller(wechat, driver, clock) as poller:
+        poller._last_full_sweep = clock.now
+        assert await poller._targets() == poller.allowlist
+
+
+async def test_unread_gate_falls_back_when_scan_fails(tmp_path: Path) -> None:
+    clock = _Clock()
+    driver = UnreadDriver()
+    driver.unread_total_value = 1
+    driver.scan_error = RuntimeError("会话列表读不到")
+    wechat = _wechat(tmp_path, unread_gate=True, full_sweep_seconds=120.0)
+
+    async with _running_poller(wechat, driver, clock) as poller:
+        poller._last_full_sweep = clock.now
+        assert await poller._targets() == poller.allowlist
+
+
+async def test_unread_outside_allowlist_is_not_rescanned_every_tick(
+    tmp_path: Path,
+) -> None:
+    """免打扰/白名单外的未读清不掉红点，不能每个 tick 都去翻会话列表。"""
+    clock = _Clock()
+    driver = UnreadDriver()
+    driver.unread_total_value = 1
+    driver.unread_sessions_value = {"白名单外的群": 2}
+    wechat = _wechat(tmp_path, unread_gate=True, full_sweep_seconds=120.0)
+
+    async with _running_poller(wechat, driver, clock) as poller:
+        poller._last_full_sweep = clock.now
+        assert await poller._targets() == ()
+        assert await poller._targets() == ()
+
+        assert driver.unread_calls == 1
+        assert driver.scan_calls == 1
+
+        # 到点仍要全量兜底：红点可能永久清不掉。
+        clock.now += poller.full_sweep_seconds
+        assert await poller._targets() == poller.allowlist
+
+
+async def test_full_sweep_runs_even_without_unread(tmp_path: Path) -> None:
+    clock = _Clock()
+    driver = UnreadDriver()
+    wechat = _wechat(tmp_path, unread_gate=True, full_sweep_seconds=60.0)
+
+    async with _running_poller(wechat, driver, clock) as poller:
+        poller._last_full_sweep = clock.now
+        clock.now += poller.full_sweep_seconds
+
+        assert await poller._targets() == poller.allowlist
+    # 全量兜底不需要再看红点。
+    assert driver.unread_calls == 0
+
+
+async def test_unread_gate_disabled_polls_all_groups(tmp_path: Path) -> None:
+    clock = _Clock()
+    driver = UnreadDriver()
+    wechat = _wechat(tmp_path, unread_gate=False)
+
+    async with _running_poller(wechat, driver, clock) as poller:
+        assert await poller._targets() == poller.allowlist
+    assert driver.unread_calls == 0
+
+
+async def test_driver_without_unread_probe_keeps_full_polling(tmp_path: Path) -> None:
+    """旧驱动/替身没有未读探测面时，行为必须和以前完全一致。"""
+    clock = _Clock()
+    driver = FakeDriver()
+    wechat = _wechat(tmp_path, unread_gate=True, full_sweep_seconds=120.0)
+
+    async with _running_poller(wechat, driver, clock) as poller:
+        poller._last_full_sweep = clock.now
+        assert await poller._targets() == poller.allowlist
+
+
+async def test_gated_round_still_emits_health_frames(tmp_path: Path) -> None:
+    """门控只跳过开窗，不能把帧源饿死：桩泵超时靠这些 health 帧判断存活。"""
+    clock = _Clock()
+    driver = UnreadDriver()
+    wechat = _wechat(tmp_path, unread_gate=True, full_sweep_seconds=120.0)
+    poller = PollingLoop(
+        wechat,
+        driver,
+        probe=_probe,
+        registry=_Registry(),
+        poll_seconds=0.01,
+        clock=clock,
+    )
+    poller._last_full_sweep = clock.now
+    await poller.start()
+    source = poller.frames()
+    frames: list[dict[str, Any]] = []
+    try:
+        while len(frames) < 3:
+            frames.append(await asyncio.wait_for(source.__anext__(), STEP))
+    finally:
+        poller.stop()
+        with contextlib.suppress(BaseException):
+            await source.aclose()
+
+    assert [f.get("type") for f in frames] == ["health", "health", "health"]
+    assert driver.opened == []

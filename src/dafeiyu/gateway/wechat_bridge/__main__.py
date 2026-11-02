@@ -554,13 +554,14 @@ def _pump_idle_timeout(poll_seconds: float) -> float:
     """灌帧空转上限：必须大于一个完整轮询间隔（默认 8s）才不会误停泵。
 
     轮询循环每群之后都产出一帧 health，所以最长帧间隔是「单群耗时 + 轮询
-    间隔」；给两倍 `poll_seconds` 余量，且不低于 PART A 的 5s 默认值。
+    间隔」。单群最坏情况 = 开窗 5s + 快照 5s（两个 UIA 调用各自的超时），
+    因此下限取 3 倍 await 超时；同时给两倍 `poll_seconds` 余量。
     """
     try:
         interval = float(poll_seconds)
     except (TypeError, ValueError):
         interval = 8.0
-    return max(_AWAIT_TIMEOUT, interval * 2.0)
+    return max(_AWAIT_TIMEOUT * 3.0, interval * 2.0)
 
 
 async def _pump_until_stopped(

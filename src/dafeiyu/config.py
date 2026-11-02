@@ -196,6 +196,10 @@ class WeChatConfig:
     group_allowlist: frozenset[str] = frozenset()
     max_groups: int = 3
     poll_seconds: float = 8.0
+    # 未读门控：先用侧边栏红点判断「有没有新消息」，只打开有未读的白名单群。
+    # 免打扰会话不计红点，所以每 full_sweep_seconds 仍做一次全量轮询兜底。
+    unread_gate: bool = True
+    full_sweep_seconds: float = 120.0
     send_min_interval_seconds: float = 20.0
     send_max_per_hour: int = 20
     send_max_per_day: int = 60
@@ -778,6 +782,12 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
     poll_seconds = _float(section.get("poll_seconds", 8.0), "gateway.wechat.poll_seconds")
     if poll_seconds <= 0:
         raise ConfigError("gateway.wechat.poll_seconds 必须大于 0")
+    full_sweep = _float(
+        section.get("full_sweep_seconds", 120.0),
+        "gateway.wechat.full_sweep_seconds",
+    )
+    if full_sweep <= 0:
+        raise ConfigError("gateway.wechat.full_sweep_seconds 必须大于 0")
     send_interval = _float(
         section.get("send_min_interval_seconds", 20.0),
         "gateway.wechat.send_min_interval_seconds",
@@ -825,6 +835,10 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
             section.get("max_groups"), "gateway.wechat.max_groups", 3
         ),
         poll_seconds=poll_seconds,
+        unread_gate=_bool(
+            section.get("unread_gate", True), "gateway.wechat.unread_gate"
+        ),
+        full_sweep_seconds=full_sweep,
         send_min_interval_seconds=send_interval,
         # 0 = 不限制（发送端 _rate_available 已按 >0 判断）；默认值保持不变。
         send_max_per_hour=_non_negative_int(

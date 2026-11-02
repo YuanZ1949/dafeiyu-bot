@@ -55,6 +55,11 @@ gateway:
     max_groups: 3
     # RPA 侧轮询间隔（秒）。
     poll_seconds: 8.0
+    # 未读门控：每个 tick 先读一次侧边栏红点（约 20ms），只有存在未读时才打开
+    # 白名单群；false = 退回每轮全量打开（旧行为）。
+    unread_gate: true
+    # 免打扰会话不计红点，所以每隔这么多秒强制全量扫一遍白名单兜底。
+    full_sweep_seconds: 120.0
     # 防封限速：相邻两次发送的最小间隔 / 每小时上限 / 每天上限；
     # 三者均可设为 0 = 不限制；quiet_hours 起止相同 = 关闭静默时段。
     send_min_interval_seconds: 20.0

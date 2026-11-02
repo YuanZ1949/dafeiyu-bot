@@ -49,7 +49,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -328,6 +328,17 @@ class PollingLoop:
         if raw_poll is None:
             raw_poll = getattr(wechat, "poll_seconds", 8.0)
         self.poll_seconds = max(0.0, float(raw_poll))
+        # 未读门控：轮询 tick 只读一次侧边栏红点（~20ms），有未读才打开会话。
+        # 门控只是省开销，绝不牺牲正确性：免打扰不计红点，所以每
+        # `full_sweep_seconds` 仍全量扫一遍白名单。
+        self.unread_gate = bool(getattr(wechat, "unread_gate", True))
+        try:
+            sweep = float(getattr(wechat, "full_sweep_seconds", 120.0))
+        except (TypeError, ValueError):
+            sweep = 120.0
+        self.full_sweep_seconds = max(0.0, sweep)
+        self._last_full_sweep = 0.0
+        self._skip_scan_until = 0.0
         # 稳定顺序 + 绝不截断：allowlist 是什么就轮询什么，不做「只取前 N 个」。
         self.allowlist: tuple[str, ...] = tuple(
             sorted(str(group) for group in (getattr(wechat, "group_allowlist", ()) or ()))
@@ -381,6 +392,9 @@ class PollingLoop:
         if self.kill_switch_path.exists():
             return False
         self._stopped.clear()
+        # 恢复后第一轮必须全量：急停期间可能积压了消息，红点也可能已被清掉。
+        self._last_full_sweep = 0.0
+        self._skip_scan_until = 0.0
         return True
 
     # ------------------------------------------------------------- 发送
@@ -415,7 +429,7 @@ class PollingLoop:
                     return
 
                 self._rounds += 1
-                async for frame in self._poll_round():
+                async for frame in self._poll_round(await self._targets()):
                     yield frame
 
                 if self._stopped.is_set():
@@ -433,8 +447,57 @@ class PollingLoop:
             if hasattr(result, "__await__"):
                 await result
 
-    async def _poll_round(self) -> AsyncIterator[dict[str, Any]]:
-        for group in self.allowlist:
+    async def _targets(self) -> tuple[str, ...]:
+        """本轮该打开哪些群：未读门控 + 周期性全量兜底。
+
+        空元组 = 没有任何未读，整轮跳过（只保留一帧 health）。门控关闭、驱动
+        没有未读探测能力、或探测/扫描抛错时一律退回全量轮询——省开销可以，
+        漏消息不行。免打扰会话不计入红点，所以 `full_sweep_seconds` 到点必全量。
+        """
+        if not self.unread_gate:
+            return self.allowlist
+
+        now = self._clock()
+        if now - self._last_full_sweep >= self.full_sweep_seconds:
+            self._last_full_sweep = now
+            return self.allowlist
+        if now < self._skip_scan_until:
+            return ()
+
+        probe = getattr(self.driver, "unread_total", None)
+        scan = getattr(self.driver, "unread_sessions", None)
+        if not callable(probe) or not callable(scan):
+            # 替身驱动/旧驱动没有这个能力：保持原来的全量轮询语义。
+            return self.allowlist
+
+        try:
+            total = await self._ui_call(probe)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 探测失败只能退回全量
+            logger.warning("未读红点探测失败，退回全量轮询：%s", exc)
+            return self.allowlist
+        if not total:
+            return ()
+
+        try:
+            pending = await self._ui_call(scan)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 扫描失败只能退回全量
+            logger.warning("未读会话扫描失败，退回全量轮询：%s", exc)
+            return self.allowlist
+
+        targets = tuple(group for group in self.allowlist if group in pending)
+        if not targets:
+            # 未读都在白名单外：别每个 tick 都去翻会话列表，等下一轮全量兜底。
+            self._skip_scan_until = now + self.full_sweep_seconds
+        return targets
+
+    async def _poll_round(
+        self, groups: Iterable[str] | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
+        for group in self.allowlist if groups is None else groups:
             if self._stopped.is_set():
                 return
             # 双保险：永远不碰 allowlist 之外的会话。
