@@ -822,10 +822,11 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
         ),
         poll_seconds=poll_seconds,
         send_min_interval_seconds=send_interval,
-        send_max_per_hour=_positive_int(
+        # 0 = 不限制（发送端 _rate_available 已按 >0 判断）；默认值保持不变。
+        send_max_per_hour=_non_negative_int(
             section.get("send_max_per_hour"), "gateway.wechat.send_max_per_hour", 20
         ),
-        send_max_per_day=_positive_int(
+        send_max_per_day=_non_negative_int(
             section.get("send_max_per_day"), "gateway.wechat.send_max_per_day", 60
         ),
         quiet_hours=(quiet[0], quiet[1]),

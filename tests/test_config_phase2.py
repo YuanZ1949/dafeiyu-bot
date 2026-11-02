@@ -314,6 +314,28 @@ def test_wechat_block_defaults(tmp_path: Path) -> None:
     assert not hasattr(cfg, "account_alias")
 
 
+def test_wechat_send_caps_zero_means_unlimited(tmp_path: Path) -> None:
+    settings = load(
+        tmp_path,
+        "gateway:\n"
+        "  wechat:\n"
+        "    enabled: true\n"
+        "    send_max_per_hour: 0\n"
+        "    send_max_per_day: 0\n",
+    )
+    assert settings.wechat.send_max_per_hour == 0
+    assert settings.wechat.send_max_per_day == 0
+
+
+def test_wechat_send_caps_reject_negative(tmp_path: Path) -> None:
+    for field in ("send_max_per_hour", "send_max_per_day"):
+        with pytest.raises(ConfigError, match=field):
+            load(
+                tmp_path,
+                f"gateway:\n  wechat:\n    enabled: true\n    {field}: -1\n",
+            )
+
+
 def test_wechat_ready_config_loads(tmp_path: Path) -> None:
     settings = load(tmp_path, WECHAT_READY)
     assert settings.gateway.provider == "both"
