@@ -41,7 +41,13 @@ from .brain.provider_config import (
 )
 from .brain.runtime_config import ensure_isolated_config
 from .budget import BudgetGuard
-from .config import OVERRIDES_PATH, ConfigError, Settings
+from .config import (
+    OVERRIDES_PATH,
+    ConfigError,
+    GroupsConfig,
+    Settings,
+    parse_group_ids,
+)
 from .gateway.base import GatewayError
 from .ids import normalize_chat_id
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
@@ -570,12 +576,16 @@ class BrainControl:
         service: Any,
         adapter: Any,
         runtime_path: str = "data/runtime.json",
+        chat_titles: Callable[[str], str] | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.service = service
         self.adapter = adapter
         self.runtime_path = runtime_path
+        # 群白名单卡片要显示「wxg:<alias>」对应的微信群名；由启动方注入，
+        # 读不到就退回显示裸 id（不影响保存）。
+        self._chat_titles = chat_titles
         self.runtime: RuntimeState = load_runtime(runtime_path)
         self._lock = asyncio.Lock()
         self._last_notify_at: float | None = None
@@ -1676,6 +1686,79 @@ class BrainControl:
             setter(behavior)
         return as_payload(behavior)
 
+    def _groups(self) -> GroupsConfig:
+        """当前生效的群白名单：优先 Service 的运行时值，兜底启动配置。"""
+        runtime = getattr(self.service, "groups", None)
+        if isinstance(runtime, GroupsConfig):
+            return runtime
+        service_settings = getattr(self.service, "settings", None)
+        groups = getattr(service_settings, "groups", None)
+        if isinstance(groups, GroupsConfig):
+            return groups
+        return self.settings.groups
+
+    def groups_snapshot(self) -> dict[str, Any]:
+        groups = self._groups()
+        known: list[dict[str, Any]] = []
+        for item in self.store.chat_overview():
+            if str(item.get("chat_type") or "") != "group":
+                continue
+            chat_id = str(item.get("chat_id") or "")
+            if not chat_id:
+                continue
+            channel = chat_id.split(":", 1)[0] if ":" in chat_id else "qq"
+            title = ""
+            if self._chat_titles is not None:
+                try:
+                    title = str(self._chat_titles(chat_id) or "").strip()
+                except Exception:  # noqa: BLE001 - 群名只是展示信息，读不到不影响白名单
+                    title = ""
+            known.append(
+                {
+                    "chat_id": chat_id,
+                    "channel": channel,
+                    "title": title,
+                    "message_count": int(item.get("message_count") or 0),
+                    "last_message_at": item.get("last_message_at"),
+                }
+            )
+        return {
+            "whitelist": sorted(groups.whitelist),
+            "blacklist": sorted(groups.blacklist),
+            # 前端据此显示「留空 = 不限制回复对象」，语义与 Service 判定一致。
+            "empty_means": "all",
+            "known": known,
+        }
+
+    def save_groups(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """校验 → 落覆盖层 → 即时应用；任一步失败都不改线上白名单。"""
+        if not isinstance(payload, dict):
+            raise ConfigError("请求体必须是对象")
+        if "whitelist" not in payload:
+            raise ConfigError("缺少 groups.whitelist")
+        whitelist = parse_group_ids(payload["whitelist"], "groups.whitelist")
+        current = self._groups()
+        groups = GroupsConfig(
+            whitelist=whitelist,
+            blacklist=current.blacklist,
+            admins=current.admins,
+        )
+        try:
+            existing = read_overrides(OVERRIDES_PATH)
+        except OverrideError as exc:
+            raise OverrideError(str(exc)) from exc
+        section = existing.get("groups")
+        section = dict(section) if isinstance(section, dict) else {}
+        section["whitelist"] = sorted(whitelist)
+        existing["groups"] = section
+        write_overrides(existing, OVERRIDES_PATH)
+        setter = getattr(self.service, "set_groups", None)
+        if callable(setter):
+            setter(groups)
+        else:
+            self.settings = replace(self.settings, groups=groups)
+        return self.groups_snapshot()
+
     def config_snapshot(self) -> dict[str, Any]:
         state = self.snapshot()
         persona = self.settings.persona
@@ -2471,6 +2554,39 @@ def create_app(
                 {"error": f"保存聊天行为失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def get_groups(_: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.groups_snapshot())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取群白名单失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取群白名单失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def put_groups(request: web.Request) -> web.Response:
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        try:
+            return web.json_response(control.save_groups(payload))
+        except ConfigError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except OverrideError as exc:
+            return web.json_response(
+                {"error": f"覆盖层读写失败：{exc}"}, status=500
+            )
+        except OSError as exc:
+            return web.json_response(
+                {"error": f"覆盖层写入失败：{exc.__class__.__name__}"}, status=500
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("保存群白名单失败：%s", exc)
+            return web.json_response(
+                {"error": f"保存群白名单失败：{exc.__class__.__name__}"}, status=500
+            )
+
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/health/detail", health_detail)
     app.router.add_post("/api/notify/admin", notify_admin)
@@ -2510,6 +2626,8 @@ def create_app(
     app.router.add_get("/api/config", config)
     app.router.add_get("/api/behavior", get_behavior)
     app.router.add_put("/api/behavior", put_behavior)
+    app.router.add_get("/api/groups", get_groups)
+    app.router.add_put("/api/groups", put_groups)
     app.router.add_get("/api/backup", backup)
     return app
 
@@ -2521,6 +2639,7 @@ async def start_control_server(
     adapter: Any,
     runtime_path: str = "data/runtime.json",
     memory_actions: MemoryActions | None = None,
+    chat_titles: Callable[[str], str] | None = None,
 ) -> web.AppRunner | None:
     """按环境变量启动控制口；返回 Runner 供退出时 cleanup。"""
     raw_port = os.environ.get("DAFEIYU_CONTROL_PORT", "").strip()
@@ -2535,7 +2654,9 @@ async def start_control_server(
     host = os.environ.get("DAFEIYU_CONTROL_HOST", "127.0.0.1").strip() or "127.0.0.1"
     token = os.environ.get("DAFEIYU_CONTROL_TOKEN", "").strip()
 
-    control = BrainControl(settings, store, service, adapter, runtime_path)
+    control = BrainControl(
+        settings, store, service, adapter, runtime_path, chat_titles=chat_titles
+    )
     # 切档后必须重启 opencode 才真的换模型：配置由本进程写，进程归 supervisor 管。
     control.opencode_reload = partial(
         reload_opencode, settings.supervisor.dashboard.port

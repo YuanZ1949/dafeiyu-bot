@@ -21,3 +21,6 @@ config.yaml
 # 内部验收记录不上传（含真实环境往返记录）
 docs/superpowers/spikes/
 .codegraph/
+
+# 计划与证据（worktree 本地，不随分支入库）
+.omo/

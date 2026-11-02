@@ -362,7 +362,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 - 不支持撤回 / 编辑事件。
 - 同名群只能靠显示名 / 人工区分，`group_allowlist` 里的显示名要人工核对。
 - `@` 触发依赖轮询，最坏有约一个 `poll_seconds`（默认 8 秒）的延迟。
-- 发送有频率上限：`send_min_interval_seconds`（默认 20 秒）、`send_max_per_hour`（20）、`send_max_per_day`（60）。
+- 发送有频率上限：`send_min_interval_seconds`（默认 20 秒）、`send_max_per_hour`（20）、`send_max_per_day`（60）；三者设为 `0` = 不限制。
 - 桌面锁屏即掉线。RPA 可能误点，`require_foreground_idle` 默认要求微信窗口前台且空闲才执行操作；开启微信通道时别在那台机器上干重要的事。
 
 ### 急停
@@ -487,6 +487,11 @@ Bot 控制口（8788）与 OneBot 反向 WS（8080）仍只监听本机。**
 - **聊天行为**：手动切换聊天强度（安静 / 正常 / 活跃），设置言论限制（禁词、禁话题，
   关闭 / 提示模型 / 严格拦截）。保存后即时生效，并写入 `data/settings.local.yaml`，
   重启后保留；不会改动 `config.yaml` 的注释。
+- **群白名单**：编辑 `groups.whitelist`（QQ 群号或微信群 alias，即 `qq:<号>` / `wxg:<别名>`），保存到
+  `data/settings.local.yaml`，即时生效，重启后保留。默认为空 = 不限制回复对象；非空 =
+  只有名单内的群会被主动回复，@ / 引用 / 叫名字仍然必回。QQ 与微信同名群用通道前缀区分
+  （`qq:<号>` / `wxg:<别名>`），不会互相覆盖。注意这里只决定「回不回」，
+  抓哪些微信群仍由 `gateway.wechat.group_allowlist` 决定。
 
 ### 运维 runbook（健康 / 告警 / 备份 / 恢复 / 审计）
 

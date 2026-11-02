@@ -710,8 +710,12 @@ _ID_PREFIXES = ("qq:", "wxg:")
 _QUIET_HOUR = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
 
 
-def _id_set(value: Any, field: str) -> frozenset[str]:
-    """跨通道 id 集合：纯数字补 `qq:` 前缀，带前缀的原样保留，统一 casefold。"""
+def parse_group_ids(value: Any, field: str) -> frozenset[str]:
+    """跨通道 id 集合：纯数字补 `qq:` 前缀，带前缀的原样保留，统一 casefold。
+
+    面板保存群白名单时也走这里：同一套校验，避免 API 放进了启动时会被
+    `load_settings` 拒绝的值。
+    """
     if value is None:
         return frozenset()
     if not isinstance(value, list):
@@ -1016,6 +1020,21 @@ def _apply_behavior_overrides(raw: dict[str, Any], overrides: dict[str, Any]) ->
             target[name] = section[name]
 
 
+def _apply_groups_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """面板保存的群白名单：只认 whitelist，空列表 = 清空（不限制回复对象）。
+
+    其它键（blacklist / admins）仍由 config.yaml 管，避免面板误写扩大权限。
+    """
+    section = overrides.get("groups")
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        raise ConfigError("覆盖层的 groups 必须是映射")
+    if "whitelist" not in section:
+        return
+    _overlay_target(raw, "groups")["whitelist"] = section["whitelist"]
+
+
 def _apply_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> bool:
     """把覆盖层白名单键盖到 raw 上，返回覆盖层是否显式给了 brain.mode。
 
@@ -1023,6 +1042,7 @@ def _apply_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> bool:
     覆盖层由面板生成，出现别的键说明版本不一致，静默跳过比报错更稳。
     """
     _apply_behavior_overrides(raw, overrides)
+    _apply_groups_overrides(raw, overrides)
     brain_override = overrides.get("brain")
     if brain_override is None:
         return False
@@ -1368,9 +1388,15 @@ def load_settings(
         persona=_build_persona(_section(raw, "persona")),
         triggers=_build_triggers(_section(raw, "triggers")),
         groups=GroupsConfig(
-            whitelist=_id_set(_section(raw, "groups").get("whitelist"), "groups.whitelist"),
-            blacklist=_id_set(_section(raw, "groups").get("blacklist"), "groups.blacklist"),
-            admins=_id_set(_section(raw, "groups").get("admins"), "groups.admins"),
+            whitelist=parse_group_ids(
+                _section(raw, "groups").get("whitelist"), "groups.whitelist"
+            ),
+            blacklist=parse_group_ids(
+                _section(raw, "groups").get("blacklist"), "groups.blacklist"
+            ),
+            admins=parse_group_ids(
+                _section(raw, "groups").get("admins"), "groups.admins"
+            ),
         ),
         budget=_build_budget(budget_raw),
         memory=MemoryConfig(

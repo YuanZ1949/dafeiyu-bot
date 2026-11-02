@@ -850,6 +850,23 @@
     <div class="kv" style="margin-top:8px">安静 = 只有 @ / 引用 / 叫名字才进模型；正常 = 当前行为；活跃 = 放开话题收尾与降频闸门。言论限制是关键词级兜底，不是语义审核。</div>
   </section>
 
+  <section class="card">
+    <div class="row card-head">
+      <h2>群白名单</h2>
+      <span class="kv" id="groups-hint">留空 = 不限制回复对象</span>
+      <span class="spacer"></span>
+      <button class="btn" id="btn-refresh-groups">刷新</button>
+      <button class="btn primary" id="btn-save-groups">保存</button>
+    </div>
+    <div class="debug-form">
+      <label class="debug-wide">回复白名单（一行一个，必须带通道前缀；留空 = 不限制）
+        <textarea id="groups-whitelist" rows="4" placeholder="例如：qq:123456&#10;wxg:46034f826c8b"></textarea>
+      </label>
+    </div>
+    <div class="kv" style="margin-top:8px">留空 = 所有群都按判定回复；非空 = 只有名单内的群会被主动回复，@ / 引用 / 叫名字仍然必回。这里只决定「回不回」，抓哪些微信群仍看 gateway.wechat.group_allowlist。</div>
+    <div class="kv" id="groups-known" style="margin-top:8px">已知群：（暂无）</div>
+  </section>
+
   <section class="card span-full">
     <h2>日志</h2>
     <div class="log-head" id="log-tabs" role="tablist" aria-label="日志来源"></div>
@@ -2656,6 +2673,56 @@ async function saveBehavior() {
   }
 }
 
+async function loadGroups() {
+  try {
+    const g = await api("/api/groups");
+    const whitelist = g.whitelist || [];
+    $("groups-whitelist").value = whitelist.join("\n");
+    renderKnownGroups(g.known || []);
+    $("groups-hint").textContent = whitelist.length
+      ? `白名单 ${whitelist.length} 个群`
+      : "留空 = 不限制回复对象";
+  } catch (err) {
+    $("groups-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+function renderKnownGroups(known) {
+  const box = $("groups-known");
+  if (!known.length) {
+    box.textContent = "已知群：（暂无）";
+    return;
+  }
+  const buttons = known.map((item) => {
+    const label = item.title ? `${item.title} · ${item.channel}` : item.chat_id;
+    return `<button class="btn" type="button" data-chat-id="${escapeHtml(item.chat_id)}">${escapeHtml(label)}</button>`;
+  });
+  box.innerHTML = `已知群（点击加入白名单）：${buttons.join(" ")}`;
+}
+
+async function saveGroups() {
+  const whitelist = $("groups-whitelist")
+    .value.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  try {
+    const g = await api("/api/groups", {
+      method: "PUT",
+      body: JSON.stringify({ whitelist }),
+    });
+    const saved = g.whitelist || [];
+    $("groups-whitelist").value = saved.join("\n");
+    renderKnownGroups(g.known || []);
+    $("groups-hint").textContent = saved.length
+      ? `已保存 · ${saved.length} 个群`
+      : "已保存 · 留空 = 不限制回复对象";
+    toast("群白名单已更新");
+  } catch (err) {
+    $("groups-hint").textContent = `保存失败：${err.message}`;
+    toast(`保存失败：${err.message}`, true);
+  }
+}
+
 
 async function wechatStop() {
   if (!confirm("急停微信通道？会写入急停文件并立即停止微信轮询（QQ 不受影响）。")) return;
@@ -3279,6 +3346,21 @@ $("btn-backup").addEventListener("click", downloadBackup);
 $("btn-refresh-config").addEventListener("click", loadConfig);
 $("btn-refresh-behavior").addEventListener("click", loadBehavior);
 $("btn-save-behavior").addEventListener("click", saveBehavior);
+$("btn-refresh-groups").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadGroups));
+$("btn-save-groups").addEventListener("click", (ev) => withBusy(ev.currentTarget, saveGroups));
+$("groups-known").addEventListener("click", (ev) => {
+  const target = ev.target;
+  const button = target instanceof Element ? target.closest("button[data-chat-id]") : null;
+  if (!button) return;
+  const chatId = button.dataset.chatId;
+  const kept = $("groups-whitelist")
+    .value.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!kept.includes(chatId)) kept.push(chatId);
+  $("groups-whitelist").value = kept.join("\n");
+  $("groups-whitelist").focus();
+});
 $("btn-shutdown").addEventListener("click", async () => {
   if (!confirm("将停止 OpenCode / Bot / NapCat 三个进程并退出控制台，确定吗？")) return;
   try {
@@ -3343,6 +3425,7 @@ loadBudget();
 loadSessions();
 loadConfig();
 loadBehavior();
+loadGroups();
 setInterval(refresh, 5000);
 setInterval(() => { if (!document.hidden) refreshHealth(); }, 10000);
 setInterval(() => { if (!document.hidden && !alertsDisabled) refreshAlerts(); }, 10000);
@@ -3358,6 +3441,7 @@ document.addEventListener("visibilitychange", () => {
   refreshBackups();
   loadMemory();
   loadSessions();
+  loadGroups();
 });
 })();
 </script>

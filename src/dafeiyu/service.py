@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from .behavior import BehaviorSettings
@@ -14,7 +15,7 @@ from .brain.client import BrainError, BrainReply
 from .brain.persona import build_system_prompt, os_probability_hint
 from .budget import BudgetAction
 from .commands import CommandRegistry, CommandSpec
-from .config import InjectionConfig, Settings
+from .config import GroupsConfig, InjectionConfig, Settings
 from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
 from .images import materialize
@@ -155,6 +156,8 @@ class Service:
         self._hint_at: dict[tuple[ChatType, int], float] = {}
         # 面板可改的聊天强度/言论限制：整体替换，避免逐字段同步。
         self.behavior: BehaviorSettings = settings.behavior
+        # 面板可改的群白名单：Service 与 Router 都读这一份，整体替换。
+        self.groups: GroupsConfig = settings.groups
 
     def _adapter_for(self, chat_id: str) -> Adapter:
         """按会话 id 的通道前缀选适配器；单一派生点是 channel_of。"""
@@ -287,6 +290,12 @@ class Service:
     def set_behavior(self, behavior: BehaviorSettings) -> None:
         """面板保存后即时替换行为快照；下一批消息就按新设置走。"""
         self.behavior = behavior
+
+    def set_groups(self, groups: GroupsConfig) -> None:
+        """面板保存群白名单后即时生效；Service 与 Router 必须同时看到新值。"""
+        self.groups = groups
+        self.settings = replace(self.settings, groups=groups)
+        self.router.settings = replace(self.router.settings, groups=groups)
 
     def _previous_message(self, msg: Message) -> Message | None:
         """紧挨着当前消息的前一条（含 bot）；查不到时返回 None。"""

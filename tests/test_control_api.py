@@ -18,7 +18,7 @@ from dafeiyu import control as control_module
 from dafeiyu.behavior import BehaviorSettings
 from dafeiyu.brain.client import BrainClient
 from dafeiyu.brain.factory import mode_status
-from dafeiyu.config import load_settings
+from dafeiyu.config import GroupsConfig, load_settings
 from dafeiyu.control import BrainControl, MemoryActions, create_app
 from dafeiyu.memory.store import MAX_MEMORY_PAGE, Store
 from dafeiyu.models import ChatType, Message
@@ -41,6 +41,7 @@ class FakeService:
         self.brain = FakeBrain()
         self.impressions = None
         self.behavior = BehaviorSettings()
+        self.groups = GroupsConfig(frozenset(), frozenset(), frozenset())
 
     def set_brain(self, brain):
         previous = self.brain
@@ -49,6 +50,9 @@ class FakeService:
 
     def set_behavior(self, behavior):
         self.behavior = behavior
+
+    def set_groups(self, groups):
+        self.groups = groups
 
 
 class FakeAdapter:
@@ -1270,6 +1274,129 @@ async def test_behavior_put_rejects_invalid_values(tmp_path: Path, monkeypatch) 
     assert not_object.status == 400
 
 
+def _seed_group_chat(store: Store, chat_id: str, message_id: str) -> None:
+    """直接写一条群消息，让 chat_overview() 能列出这个会话。"""
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id=chat_id,
+            user_id="42",
+            nickname="鱼片",
+            content="hi",
+            message_id=message_id,
+            timestamp=1_700_000_000,
+        )
+    )
+
+
+async def test_groups_get_defaults_to_unrestricted_and_lists_known(
+    tmp_path: Path,
+) -> None:
+    """默认为空白名单：empty_means=all 是前端「留空 = 不限制」文案的来源。"""
+    control, _, app = make_control(tmp_path)
+    _seed_group_chat(control.store, "qq:1001", "g1")
+    control.store.add_message(
+        Message(
+            chat_type=ChatType.PRIVATE,
+            chat_id="qq:1001",
+            user_id="42",
+            nickname="鱼片",
+            content="private",
+            message_id="p1",
+            timestamp=1_700_000_001,
+        )
+    )
+    async with running(app) as client:
+        payload = await (await client.get("/api/groups")).json()
+
+    assert payload["whitelist"] == []
+    assert payload["blacklist"] == []
+    assert payload["empty_means"] == "all"
+    assert [item["chat_id"] for item in payload["known"]] == ["qq:1001"]
+    assert payload["known"][0]["channel"] == "qq"
+    assert payload["known"][0]["title"] == ""
+
+
+async def test_groups_put_persists_and_applies_runtime_whitelist(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """保存后覆盖层落盘、Service 即时看到新值；数字补 qq:、大小写归一。"""
+    overrides = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_module, "OVERRIDES_PATH", overrides)
+    _, service, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.put(
+            "/api/groups", json={"whitelist": [123456, "wxg:AbC"]}
+        )
+        assert resp.status == 200
+        saved = await resp.json()
+
+    assert saved["whitelist"] == ["qq:123456", "wxg:abc"]
+    assert service.groups.whitelist == frozenset({"qq:123456", "wxg:abc"})
+    text = overrides.read_text(encoding="utf-8")
+    assert "qq:123456" in text
+    assert "wxg:abc" in text
+
+
+async def test_groups_put_empty_clears_whitelist(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """空列表必须盖掉已有白名单（留空 = 不限制回复对象）。"""
+    monkeypatch.setattr(
+        control_module, "OVERRIDES_PATH", tmp_path / "settings.local.yaml"
+    )
+    _, service, app = make_control(tmp_path)
+    async with running(app) as client:
+        await client.put("/api/groups", json={"whitelist": ["qq:1"]})
+        resp = await client.put("/api/groups", json={"whitelist": []})
+        saved = await resp.json()
+
+    assert saved["whitelist"] == []
+    assert service.groups.whitelist == frozenset()
+
+
+async def test_groups_put_rejects_invalid_id_without_changing_runtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """校验失败不能改线上白名单，也不能留下半份覆盖层。"""
+    monkeypatch.setattr(
+        control_module, "OVERRIDES_PATH", tmp_path / "settings.local.yaml"
+    )
+    _, service, app = make_control(tmp_path)
+    async with running(app) as client:
+        await client.put("/api/groups", json={"whitelist": ["qq:1"]})
+        bad = await client.put("/api/groups", json={"whitelist": ["not-an-id"]})
+        missing = await client.put("/api/groups", json={})
+        not_object = await client.put("/api/groups", data="[]")
+
+    assert bad.status == 400
+    assert missing.status == 400
+    assert not_object.status == 400
+    assert service.groups.whitelist == frozenset({"qq:1"})
+
+
+async def test_groups_snapshot_resolves_wxg_title_for_panel(tmp_path: Path) -> None:
+    """wxg 别名本身不可读；面板靠注入的 resolver 显示群名。"""
+    settings = make_settings(tmp_path)
+    store = Store(tmp_path / "test.db")
+    store.init_schema()
+    _seed_group_chat(store, "wxg:abc", "g1")
+    service = FakeService()
+    control = BrainControl(
+        settings,
+        store,
+        service,
+        FakeAdapter(),
+        runtime_path=str(tmp_path / "runtime.json"),
+        chat_titles=lambda chat_id: "锦绣壹号9#1101" if chat_id == "wxg:abc" else "",
+    )
+
+    payload = control.groups_snapshot()
+
+    assert payload["known"][0]["channel"] == "wxg"
+    assert payload["known"][0]["title"] == "锦绣壹号9#1101"
+
+
 def test_dashboard_exposes_new_panels() -> None:
     html = (
         Path(__file__).resolve().parents[1]
@@ -1289,6 +1416,10 @@ def test_dashboard_exposes_new_panels() -> None:
         'id="behavior-restriction-mode"',
         'id="behavior-banned-phrases"',
         'id="btn-save-behavior"',
+        'id="groups-whitelist"',
+        'id="groups-known"',
+        'id="btn-save-groups"',
+        'id="btn-refresh-groups"',
     ):
         assert anchor in html, f"面板缺少 {anchor}"
     assert "/api/usage?days=" in html
@@ -1297,6 +1428,7 @@ def test_dashboard_exposes_new_panels() -> None:
     assert "/api/sessions?limit=" in html
     assert "/api/config" in html
     assert "/api/behavior" in html
+    assert "/api/groups" in html
     assert "/api/backup" in html
     assert "loadSessions(true)" in html
     assert "c.memory.retention_days" in html

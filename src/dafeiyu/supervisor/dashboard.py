@@ -722,6 +722,16 @@ def create_app(
         code, data = await bot_call("PUT", "/api/behavior", payload)
         return web.json_response(data, status=code)
 
+    async def groups(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/groups")
+
+    async def save_groups(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call("PUT", "/api/groups", payload)
+        return web.json_response(data, status=code)
+
     async def wechat_stop(_: web.Request) -> web.Response:
         code, data = await bot_call("POST", "/api/channels/wechat/stop", {})
         return web.json_response(data, status=code)
@@ -1110,6 +1120,8 @@ def create_app(
     app.router.add_get("/api/config", config)
     app.router.add_get("/api/behavior", behavior)
     app.router.add_put("/api/behavior", save_behavior)
+    app.router.add_get("/api/groups", groups)
+    app.router.add_put("/api/groups", save_groups)
     app.router.add_post("/api/channels/wechat/stop", wechat_stop)
     app.router.add_post("/api/channels/wechat/resume", wechat_resume)
     app.router.add_get("/api/backup", backup)

@@ -237,6 +237,31 @@ def log_active_channels(
         )
 
 
+def make_chat_titles() -> Callable[[str], str]:
+    """`wxg:<alias>` → 微信群显示名；只用于面板展示，读不到就返回空串。
+
+    QQ 的 `qq:<号>` 本来就是可读的群号，不需要翻译。peers.json 由微信桥
+    维护；它缺失或损坏时白名单功能不受影响，面板只显示裸 id。
+    """
+    registry: Any = None
+
+    def resolve(chat_id: str) -> str:
+        nonlocal registry
+        if not chat_id.startswith("wxg:") or chat_id == "wxg:self":
+            return ""
+        if registry is None:
+            try:
+                from .gateway.wechat_bridge.identity import PeerRegistry
+
+                registry = PeerRegistry()
+            except Exception:  # noqa: BLE001 - 展示信息失败不影响白名单
+                return ""
+        peer = registry.by_alias(chat_id[4:])
+        return str(getattr(peer, "display_name", "") or "").strip()
+
+    return resolve
+
+
 async def main() -> None:
     settings = load_settings()
     setup_logging(settings)
@@ -364,6 +389,7 @@ async def main() -> None:
             service,
             adapters.get("qq"),
             memory_actions=build_memory_actions(store, workers),
+            chat_titles=make_chat_titles(),
         )
         log_active_channels(settings, adapters, provider)
         try:

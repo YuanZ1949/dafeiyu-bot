@@ -55,7 +55,8 @@ gateway:
     max_groups: 3
     # RPA 侧轮询间隔（秒）。
     poll_seconds: 8.0
-    # 防封限速：相邻两次发送的最小间隔 / 每小时上限 / 每天上限。
+    # 防封限速：相邻两次发送的最小间隔 / 每小时上限 / 每天上限；
+    # 三者均可设为 0 = 不限制；quiet_hours 起止相同 = 关闭静默时段。
     send_min_interval_seconds: 20.0
     send_max_per_hour: 20
     send_max_per_day: 60
@@ -168,7 +169,8 @@ triggers:
 
 groups:
   # 接受 `123456`（QQ 群号）或 `wxg:别名`（微信会话 id，由桥本地铸造）。
-  # 留空 = 所有群都参与；填了就只在这些群里说话。
+  # 留空 = 所有群都参与（不限制回复对象）；填了就只在名单内的群里主动回复。
+  # 面板「群白名单」卡片也可编辑本项，保存到 data/settings.local.yaml，即时生效，留空 = 不限制。
   # 号之间用逗号分隔。
   whitelist: []
   blacklist: []
