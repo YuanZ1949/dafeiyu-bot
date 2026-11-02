@@ -3,9 +3,10 @@ from __future__ import annotations
 import copy
 import logging
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Any
 
 from dafeiyu.budget import BudgetAction, BudgetGuard
 from dafeiyu.config import Settings
@@ -376,7 +377,7 @@ class Router:
 
     def clone(
         self, *, now: datetime | None = None, seed: int | None = None
-    ) -> "Router":
+    ) -> Router:
         """复制一份路由状态用于只读推演，绝不改真实状态和真实 RNG。"""
         probe = Router(
             settings=self.settings,

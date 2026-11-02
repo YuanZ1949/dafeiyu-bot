@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime
-from typing import Awaitable, Callable
 
 from dafeiyu.memory.store import SessionStats, Store
 from dafeiyu.models import ChatType, Message

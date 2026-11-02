@@ -348,7 +348,7 @@ async def test_notify_admin_unavailable_without_admin_or_gateway(
         ).status == 503
 
     (tmp_path / "second").mkdir()
-    control, adapter, _store, app = make_control(
+    _control, adapter, _store, app = make_control(
         tmp_path / "second", admins=frozenset({1}), token="t"
     )
     adapter.connected = False

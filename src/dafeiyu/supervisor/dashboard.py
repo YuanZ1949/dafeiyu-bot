@@ -7,9 +7,10 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 from urllib.parse import quote
 
 import aiohttp
@@ -216,7 +217,7 @@ def create_app(
                 except ValueError:
                     data = {"error": "bot 返回非 JSON"}
                 return status, data
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return 504, {"error": "bot 响应超时"}
         except aiohttp.ClientError as exc:
             return 502, {"error": f"bot 不可达：{exc.__class__.__name__}"}
@@ -239,7 +240,7 @@ def create_app(
                     if value:
                         headers[name] = value
                 return resp.status, body, headers
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return 504, b'{"error":"bot timeout"}', {
                 "Content-Type": "application/json"
             }
@@ -615,7 +616,7 @@ def create_app(
             while not closing.is_set():
                 try:
                     seq, line = await asyncio.wait_for(queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     idle += 1
                     if idle >= 15:
                         await response.write(b": ping\n\n")
@@ -917,7 +918,8 @@ def create_app(
                     await supervisor.stop(name)
                 else:
                     await supervisor.restart(name)
-            except Exception as exc:  # 单个失败不影响其它进程
+            # 单个失败不影响其它进程
+            except Exception as exc:  # noqa: BLE001
                 errors.append(f"{name}: {exc}")
         result: dict[str, Any] = {
             "ok": not errors,
@@ -1149,7 +1151,7 @@ def _qr_meta(path: Path) -> dict[str, Any]:
 
 def _sse(line: str, event_id: int | None = None) -> bytes:
     prefix = f"id: {event_id}\n" if event_id is not None else ""
-    return f"{prefix}data: {json.dumps(line, ensure_ascii=False)}\n\n".encode("utf-8")
+    return f"{prefix}data: {json.dumps(line, ensure_ascii=False)}\n\n".encode()
 
 
 async def _json_body(request: web.Request) -> dict | None:

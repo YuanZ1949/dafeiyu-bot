@@ -5,7 +5,12 @@ import time
 import httpx
 import pytest
 
-from dafeiyu.brain.client import FALLBACK_REPLY, BrainError, parse_brain_reply, salvage_reply
+from dafeiyu.brain.client import (
+    FALLBACK_REPLY,
+    BrainError,
+    parse_brain_reply,
+    salvage_reply,
+)
 from dafeiyu.brain.opencode_http import OpenCodeHttpBrain
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType

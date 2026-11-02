@@ -494,7 +494,7 @@ async def _startup_health_frame(
 
     try:
         return await asyncio.wait_for(poller.request_send(_probe), _AWAIT_TIMEOUT)
-    except Exception:  # noqa: BLE001 - 探测失败按 fail-closed 降级，不能拖垮启动
+    except Exception:
         logger.warning("启动健康探测失败，按 fail-closed 降级", exc_info=True)
         return _fallback_health_frame(connected=True)
 

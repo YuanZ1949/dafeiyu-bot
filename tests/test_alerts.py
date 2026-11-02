@@ -8,6 +8,7 @@ import pytest
 
 from dafeiyu.config import AlertRulesConfig, AlertsConfig
 from dafeiyu.supervisor.alerts import (
+    AlertChannelError,
     AlertManager,
     Incident,
     QQAdminChannel,
@@ -626,7 +627,7 @@ async def test_qq_admin_channel_raises_on_error_status() -> None:
         first_seen_at="",
         last_seen_at="",
     )
-    with pytest.raises(Exception):
+    with pytest.raises(AlertChannelError):
         await channel.send(incident, "firing")
 
 

@@ -60,8 +60,7 @@ def _qq_id(value: Any) -> str:
 def _bare_id(chat_id: str) -> int:
     """send_*_msg 的 params 要原始数字：去掉通道前缀再转 int。"""
     text = str(chat_id)
-    if text.startswith(QQ_PREFIX):
-        text = text[len(QQ_PREFIX):]
+    text = text.removeprefix(QQ_PREFIX)
     try:
         return int(text)
     except (TypeError, ValueError) as exc:
@@ -90,7 +89,8 @@ def _render_json_card(data: dict[str, Any]) -> str:
         if not title:
             return _CARD_FALLBACK
         return f"[卡片] {_clip(title, 80)}"
-    except Exception:
+    # 畸形卡片段渲染降级为占位符，绝不让解析异常冒泡。
+    except Exception:  # noqa: BLE001
         return _CARD_FALLBACK
 
 
@@ -116,7 +116,8 @@ def _render_xml_card(data: dict[str, Any]) -> str:
         if not summary:
             return _XML_FALLBACK
         return f"{_XML_FALLBACK} {_clip(summary, 80)}"
-    except Exception:
+    # 畸形 XML 段渲染降级为占位符，绝不让解析异常冒泡。
+    except Exception:  # noqa: BLE001
         return _XML_FALLBACK
 
 
@@ -202,7 +203,8 @@ def _render_forward(
         if not lines:
             return _FORWARD_FALLBACK
         return "[聊天记录]\n" + "\n".join(lines)
-    except Exception:
+    # 转发记录渲染降级为占位符，绝不让解析异常冒泡。
+    except Exception:  # noqa: BLE001
         return _FORWARD_FALLBACK
 
 
@@ -452,7 +454,7 @@ class QQAdapter:
         try:
             await ws.send(json.dumps({"action": action, "params": params, "echo": echo}, ensure_ascii=False))
             data = await asyncio.wait_for(future, self._send_timeout)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             logger.warning(
                 "消息发送失败 %s %s chars=%d：等待响应超时", action, target, len(text)
             )

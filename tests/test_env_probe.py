@@ -111,31 +111,31 @@ def test_main_json_output(monkeypatch, capsys) -> None:
 
 
 def _wechat_config(**overrides) -> WeChatConfig:
-    values = dict(
-        enabled=True,
-        bridge_host="127.0.0.1",
-        bridge_port=8790,
-        bridge_token="",
-        account_nickname="小号",
-        group_allowlist=frozenset({"群一"}),
-        version_min="4.1.6",
-        language="zh-CN",
-    )
+    values = {
+        "enabled": True,
+        "bridge_host": "127.0.0.1",
+        "bridge_port": 8790,
+        "bridge_token": "",
+        "account_nickname": "小号",
+        "group_allowlist": frozenset({"群一"}),
+        "version_min": "4.1.6",
+        "language": "zh-CN",
+    }
     values.update(overrides)
     return WeChatConfig(**values)
 
 
 def _patch_probes(monkeypatch, **overrides) -> None:
-    defaults = dict(
-        pids=[1234],
-        about={"version": "4.1.6.14"},
-        language="zh-CN",
-        desktop="interactive",
-        integrity="matching",
-        session=1,
-        driver=True,
-        port_free=True,
-    )
+    defaults = {
+        "pids": [1234],
+        "about": {"version": "4.1.6.14"},
+        "language": "zh-CN",
+        "desktop": "interactive",
+        "integrity": "matching",
+        "session": 1,
+        "driver": True,
+        "port_free": True,
+    }
     defaults.update(overrides)
     monkeypatch.setattr(env_probe, "_wechat_pids", lambda: list(defaults["pids"]))
     monkeypatch.setattr(env_probe, "_wechat_about", lambda: defaults["about"])

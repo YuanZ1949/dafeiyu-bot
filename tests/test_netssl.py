@@ -56,9 +56,7 @@ def _httpx_client_calls() -> list[tuple[Path, int]]:
             if not isinstance(func, ast.Attribute) or func.attr not in {"Client", "AsyncClient"}:
                 continue
             owner = func.value
-            if isinstance(owner, ast.Attribute) and owner.attr == "httpx":
-                found.append((path, node.lineno))
-            elif isinstance(owner, ast.Name) and owner.id == "httpx":
+            if isinstance(owner, ast.Attribute) and owner.attr == "httpx" or isinstance(owner, ast.Name) and owner.id == "httpx":
                 found.append((path, node.lineno))
     return found
 

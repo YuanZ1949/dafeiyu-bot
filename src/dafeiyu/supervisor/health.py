@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 import logging
 import shutil
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import aiohttp
 
@@ -116,7 +116,7 @@ class HealthMonitor:
                 if resp.status >= 400:
                     return {"ok": False, "error": f"HTTP {resp.status}"}
                 data = await resp.json(content_type=None)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return {"ok": False, "error": "探活超时"}
         except Exception as exc:  # noqa: BLE001 - 连接失败只降级
             return {"ok": False, "error": exc.__class__.__name__}
@@ -203,4 +203,4 @@ def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(float(epoch), SHANGHAI).isoformat(timespec="seconds")
 
 
-__all__ = ["HealthMonitor", "BOT_PROBE_TIMEOUT"]
+__all__ = ["BOT_PROBE_TIMEOUT", "HealthMonitor"]

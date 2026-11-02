@@ -103,7 +103,8 @@ class BudgetGuard:
             cost = estimate_cost(
                 monthly.prompt_tokens, monthly.completion_tokens, self.config
             )
-        except Exception as exc:  # 读库失败不能拦死点名回复，但也不能放开环境发言。
+        # 读库失败不能拦死点名回复，但也不能放开环境发言。
+        except Exception as exc:  # noqa: BLE001
             log.warning("预算检查读库失败，降级处理: %s", type(exc).__name__)
             return BudgetDecision(
                 BudgetAction.DEGRADE,
@@ -420,10 +421,7 @@ class BudgetGuard:
         if scope == "global_daily":
             calls = _remaining_count(config.global_daily_calls, global_daily.calls)
             tokens = _remaining_count(config.global_daily_tokens, global_daily.tokens)
-        elif scope == "monthly":
-            calls = _remaining_count(config.monthly_calls, monthly.calls)
-            tokens = _remaining_count(config.monthly_tokens, monthly.tokens)
-        elif scope == "cost":
+        elif scope == "monthly" or scope == "cost":
             calls = _remaining_count(config.monthly_calls, monthly.calls)
             tokens = _remaining_count(config.monthly_tokens, monthly.tokens)
         elif action is BudgetAction.DENY:

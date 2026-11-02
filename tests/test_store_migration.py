@@ -7,9 +7,9 @@ import pytest
 
 from dafeiyu.config import ConfigError
 from dafeiyu.memory.store import (
-    Store,
     _IMPRESSION_FTS_SCHEMA,
     _MESSAGE_FTS_SCHEMA,
+    Store,
 )
 from dafeiyu.models import ChatType, Message, channel_of
 

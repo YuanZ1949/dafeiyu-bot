@@ -29,8 +29,9 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 __all__ = [
     "ChatHandle",
@@ -95,14 +96,14 @@ def _call(fn: Callable[[], Any], default: str = "driver_error") -> Any:
         return fn()
     except DriverError:
         raise
-    except BaseException as exc:  # noqa: BLE001 - 边界层就是要兜住一切
+    except BaseException as exc:
         raise _translate(exc, default) from exc
 
 
 def _pyweixin() -> Any:
     """惰性 import：只有真正调用驱动函数时才需要桌面依赖。"""
     try:
-        import pyweixin  # noqa: PLC0415 - 惰性 import 是本模块的硬约束
+        import pyweixin
     except ImportError as exc:
         raise DriverError(
             "pyweixin_missing",
@@ -353,7 +354,7 @@ def _force_global_config(wx: Any) -> None:
     for attr in ("close_weixin", "is_maximize"):
         try:
             setattr(config, attr, False)
-        except Exception as exc:  # noqa: BLE001 - 只读属性也算驱动不可用
+        except Exception as exc:
             raise _translate(exc, "config_write_failed") from exc
 
 
@@ -378,7 +379,7 @@ def _call_first_kwarg(fn: Callable[..., Any], names: tuple[str, ...], value: Any
             continue
     try:
         return fn(value)
-    except BaseException as exc:  # noqa: BLE001
+    except BaseException as exc:
         raise _translate(exc, "members_failed") from exc
 
 

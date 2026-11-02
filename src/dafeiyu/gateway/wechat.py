@@ -164,7 +164,7 @@ class WeChatAdapter:
         try:
             await ws.send(json.dumps(envelope, ensure_ascii=False))
             receipt = await asyncio.wait_for(future, _SEND_TIMEOUT)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise GatewayError("微信恢复等待回执超时") from exc
         except ConnectionClosed as exc:
             raise GatewayError("微信桥连接已断开") from exc
@@ -201,10 +201,7 @@ class WeChatAdapter:
                 break
             delay = _RECONNECT_DELAYS[min(delay_index, len(_RECONNECT_DELAYS) - 1)]
             delay_index += 1
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                raise
+            await asyncio.sleep(delay)
 
     async def _connect_once(self) -> None:
         headers = None
@@ -427,7 +424,7 @@ class WeChatAdapter:
         try:
             await ws.send(json.dumps(envelope, ensure_ascii=False))
             receipt = await asyncio.wait_for(future, _SEND_TIMEOUT)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise GatewayError("微信发送等待回执超时") from exc
         except ConnectionClosed as exc:
             raise GatewayError("微信桥连接已断开") from exc

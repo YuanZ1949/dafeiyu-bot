@@ -321,7 +321,7 @@ async def test_restore_with_file_and_confirm(tmp_path: Path) -> None:
 
 
 async def test_audit_endpoint_and_process_control(tmp_path: Path) -> None:
-    app, supervisor, _ops, audit = make_app(tmp_path)
+    app, supervisor, _ops, _audit = make_app(tmp_path)
     client = TestClient(TestServer(app))
     await client.start_server()
     try:

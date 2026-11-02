@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from test_opencode_http import FakeServer
 
 from dafeiyu.brain import factory
 from dafeiyu.config import ConfigError, load_settings
@@ -15,7 +16,6 @@ from dafeiyu.memory.workspace import Workspace
 from dafeiyu.models import ChatType
 from dafeiyu.router import Router
 from dafeiyu.service import Service
-from test_opencode_http import FakeServer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_FILE = REPO_ROOT / ".opencode" / "agents" / "deepseek-qq.md"

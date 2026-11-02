@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import itertools
 import os
 import subprocess
 import sys
@@ -155,7 +156,7 @@ def test_pacing_of_five_sends_is_at_least_min_interval(harness) -> None:
     assert all(result.ok and result.delivered == "observed" for result in results)
     times = h.driver.send_times()
     assert len(times) == 5
-    gaps = [later - earlier for earlier, later in zip(times, times[1:])]
+    gaps = [later - earlier for earlier, later in itertools.pairwise(times)]
     assert all(gap >= 20.0 - 1e-9 for gap in gaps), gaps
     # 打字延迟取注入的 uniform 上界，并真的传给了驱动。
     delays = [call["delay"] for call in h.driver.calls if call["action"] == "send_text"]
@@ -386,6 +387,7 @@ def test_sender_imports_without_pyweixin() -> None:
         text=True,
         env=env,
         timeout=60,
+        check=False,
     )
 
     assert result.returncode == 0, result.stderr

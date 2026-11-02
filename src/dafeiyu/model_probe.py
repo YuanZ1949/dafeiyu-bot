@@ -118,7 +118,7 @@ async def _messages_once(
         )
         response.raise_for_status()
         payload = response.json()
-    except Exception:  # noqa: BLE001 - 读失败只算「没看到」
+    except Exception:
         # 吞掉是对的，但要留痕：否则探测结果突然变 True 时无从追。
         log.debug("探测消息读取失败", exc_info=True)
         return None
@@ -257,7 +257,7 @@ async def probe_free_model_detail(
                 await client.delete(
                     f"/api/session/{session_id}", timeout=min(1.0, _budget())
                 )
-            except Exception:  # noqa: BLE001 - 清理失败不影响判定
+            except Exception:
                 log.debug("探测 session 删除失败：%s", session_id, exc_info=True)
 
 

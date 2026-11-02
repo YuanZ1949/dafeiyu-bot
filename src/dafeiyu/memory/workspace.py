@@ -131,7 +131,7 @@ class Workspace:
         head = f"{title}\n{comment}\n"
         if len(head.encode("utf-8")) > max_bytes:
             # 极端情况下标题本身就超限：先裁标题，保证结果仍不越界。
-            room = max(0, max_bytes - len(f"{comment}\n".encode("utf-8")))
+            room = max(0, max_bytes - len(f"{comment}\n".encode()))
             title = title.encode("utf-8")[:room].decode("utf-8", errors="ignore")
             head = f"{title}\n{comment}\n"
 

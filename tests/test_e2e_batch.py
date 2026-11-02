@@ -14,6 +14,7 @@ import json
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
+from test_opencode_http import FakeServer, make_brain
 
 from dafeiyu.config import (
     BudgetConfig,
@@ -31,8 +32,6 @@ from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router
 from dafeiyu.service import Service
 from dafeiyu.timeutil import today_shanghai
-
-from test_opencode_http import FakeServer, make_brain
 
 SHANGHAI = timezone(timedelta(hours=8))
 

@@ -20,8 +20,9 @@ import ctypes
 import re
 import sys
 import time
+from collections.abc import Callable, Iterator
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any
 
 from dafeiyu.env_probe import _integrity_from_sid, _read_integrity_sid
 
@@ -695,10 +696,10 @@ class HealthProbe:
             return False, frame["reason"] or "degraded"
         return True, None
 
-    def mark_event(self, ts: int | float | None = None) -> None:
+    def mark_event(self, ts: float | None = None) -> None:
         self.last_event_at = int(self._clock() if ts is None else ts)
 
-    def mark_send(self, ts: int | float | None = None) -> None:
+    def mark_send(self, ts: float | None = None) -> None:
         self.last_send_at = int(self._clock() if ts is None else ts)
 
     def frames(self, iterations: int | None = None) -> Iterator[dict[str, Any]]:

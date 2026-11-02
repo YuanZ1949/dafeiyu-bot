@@ -31,7 +31,8 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 
 from dafeiyu.gateway.wechat_bridge import driver as _default_driver
 from dafeiyu.gateway.wechat_bridge.driver import DriverError
@@ -92,7 +93,7 @@ def get_foreground_window() -> int | None:
         user32.GetForegroundWindow.restype = wintypes.HWND
         handle = user32.GetForegroundWindow()
         return int(handle) if handle else None
-    except Exception:  # noqa: BLE001 - 平台 API 不可用不是崩溃点
+    except Exception:
         log.debug("GetForegroundWindow 不可用", exc_info=True)
         return None
 
@@ -123,7 +124,7 @@ def last_input_age() -> float | None:
         # 负数（回绕时差值会变成负数，下面夹到 0）。
         age = (now_ms - int(info.dwTime)) / 1000.0
         return max(0.0, age)
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.debug("GetLastInputInfo 不可用", exc_info=True)
         return None
 
@@ -145,7 +146,7 @@ def desktop_state() -> str:
             return "locked"
         user32.CloseDesktop(handle)
         return "interactive"
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.debug("OpenInputDesktop 不可用", exc_info=True)
         return "locked"
 
@@ -165,7 +166,7 @@ def _window_handle(window: Any) -> int | None:
     if callable(handle):
         try:
             handle = handle()
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.debug("读取窗口 handle 失败", exc_info=True)
             return None
     if isinstance(handle, int):
@@ -175,7 +176,9 @@ def _window_handle(window: Any) -> int | None:
         if callable(value):
             try:
                 value = value()
-            except Exception:  # noqa: BLE001
+            except Exception:
+                # 某个候选属性取不到就试下一个（仅调试级日志，避免刷屏）。
+                log.debug("读取窗口 handle 属性 %s 失败", name, exc_info=True)
                 continue
         if isinstance(value, int):
             return value
@@ -304,10 +307,15 @@ class Sender:
         self._force_global_config_at_startup()
 
     # ------------------------------------------------------------- 生命周期
-    def __enter__(self) -> Sender:
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def close(self, timeout: float = 5.0) -> None:
@@ -435,7 +443,7 @@ class Sender:
                     continue
                 try:
                     result = self._execute(item.chat_name, item.text)
-                except BaseException as exc:  # noqa: BLE001 - 工作线程不能静默死亡
+                except BaseException as exc:
                     log.exception("发送器内部错误：%s", item.chat_name)
                     result = SendResult(
                         False,
@@ -461,7 +469,7 @@ class Sender:
         if callable(force_all):
             try:
                 force_all()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 log.warning("启动时固定 GlobalConfig 失败", exc_info=True)
             return
         force = getattr(self._driver, "_force_global_config", None)
@@ -471,7 +479,7 @@ class Sender:
                 wx = getter()
                 if wx is not None:
                     force(wx)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 log.warning("启动时固定 GlobalConfig 失败", exc_info=True)
             return
         log.warning("driver 缺少 force_global_config 能力，跳过启动固定 GlobalConfig")
@@ -507,7 +515,7 @@ class Sender:
             return SendResult(
                 False, exc.code, "failed", chat_name=chat_name, detail=str(exc)
             )
-        except Exception as exc:  # noqa: BLE001 - 驱动边界，记日志并回失败
+        except Exception as exc:
             log.exception("打开会话异常 %s", chat_name)
             return SendResult(
                 False,
@@ -569,7 +577,7 @@ class Sender:
                 degraded = bool(getattr(self._health, "degraded", False))
                 may_send = getattr(self._health, "may_send", None)
                 ready = bool(may_send()) if callable(may_send) else not degraded
-            except Exception:  # noqa: BLE001 - 探测异常按不可发送处理
+            except Exception:
                 log.exception("健康探测异常，按降级处理")
                 degraded, ready = True, False
             if degraded or not ready:
@@ -626,7 +634,7 @@ class Sender:
             return SendResult(
                 False, exc.code, "failed", chat_name=chat_name, detail=str(exc)
             )
-        except Exception as exc:  # noqa: BLE001 - 不吞，翻译成失败结果
+        except Exception as exc:
             self._last_send_at = float(self._clock())
             log.exception("发送异常 %s", chat_name)
             return SendResult(
@@ -650,7 +658,7 @@ class Sender:
                 chat_name=chat_name,
                 detail=f"snapshot failed: {exc.code}",
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.exception("发送后回轮询异常 %s", chat_name)
             return SendResult(
                 False,
@@ -724,7 +732,7 @@ class Sender:
         if self._on_alert is not None:
             try:
                 self._on_alert(code, payload)
-            except Exception:  # noqa: BLE001 - 告警回调不能反过来打断发送
+            except Exception:
                 log.exception("告警回调失败")
 
 

@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from conftest import TEST_CONFIG_YAML
 
 from dafeiyu.config import load_settings
 from dafeiyu.supervisor.health import HealthMonitor
 from dafeiyu.supervisor.ops import OpsServices
-from conftest import TEST_CONFIG_YAML
 
 
 class FakeSupervisor:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import ClassVar, Self
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -44,7 +45,7 @@ class StubNapCat:
         self.info_calls = 0
         self._server: TestServer | None = None
 
-    async def __aenter__(self) -> "StubNapCat":
+    async def __aenter__(self) -> Self:
         app = web.Application()
         app.router.add_post("/api/auth/login", self._login)
         app.router.add_post("/api/QQLogin/CheckLoginStatus", self._status)
@@ -229,7 +230,11 @@ async def test_state_relogins_after_credential_rejected() -> None:
 
 
 class _FakeSupervisor:
-    specs = {"opencode": object(), "bot": object(), "napcat": object()}
+    specs: ClassVar[dict[str, object]] = {
+        "opencode": object(),
+        "bot": object(),
+        "napcat": object(),
+    }
 
     def status(self):
         return []

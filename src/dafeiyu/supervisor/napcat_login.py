@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import time
 from dataclasses import dataclass
@@ -159,7 +158,7 @@ class NapCatLogin:
             return self._cached
         try:
             value = await self._fetch()
-        except asyncio.TimeoutError:
+        except TimeoutError:
             value = _unreachable("NapCat WebUI 响应超时")
         except aiohttp.ClientError as exc:
             value = _unreachable(f"NapCat WebUI 不可达：{exc.__class__.__name__}")
@@ -189,7 +188,7 @@ class NapCatLogin:
     async def _account(self) -> dict[str, str]:
         try:
             info = await self._post("/QQLogin/GetQQLoginInfo", {})
-        except (_Unauthorized, ValueError, aiohttp.ClientError, asyncio.TimeoutError):
+        except (TimeoutError, _Unauthorized, ValueError, aiohttp.ClientError):
             return {}
         if not isinstance(info, dict):
             return {}

@@ -37,11 +37,11 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "SELF_ALIAS",
     "AliasConflictError",
     "IdentityError",
     "Peer",
     "PeerRegistry",
-    "SELF_ALIAS",
     "default_peers_path",
 ]
 

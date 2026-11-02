@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from dafeiyu import cli, env_probe
-from dafeiyu.config import WeChatConfig, load_settings
+from dafeiyu.config import WeChatConfig
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 
@@ -122,14 +122,14 @@ def test_config_error_returns_1(tmp_path: Path, monkeypatch) -> None:
 
 
 def _doctor_config(**overrides) -> WeChatConfig:
-    values = dict(
-        enabled=True,
-        bridge_host="127.0.0.1",
-        bridge_port=8790,
-        bridge_token="",
-        account_nickname="小号",
-        group_allowlist=frozenset({"群一"}),
-    )
+    values = {
+        "enabled": True,
+        "bridge_host": "127.0.0.1",
+        "bridge_port": 8790,
+        "bridge_token": "",
+        "account_nickname": "小号",
+        "group_allowlist": frozenset({"群一"}),
+    }
     values.update(overrides)
     return WeChatConfig(**values)
 

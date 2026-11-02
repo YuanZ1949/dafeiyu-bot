@@ -28,22 +28,22 @@ NOON = datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI)
 
 
 def make_settings(**overrides) -> Settings:
-    base = dict(
-        api_key="sk-test",
-        base_url="https://api.deepseek.com",
-        model="deepseek-chat",
-        bot_qq=999,
-        ws_host="127.0.0.1",
-        ws_port=8080,
-        ws_token="",
-        db_path=":memory:",
-        persona=PersonaConfig("溟月", ("大肥鱼",), 120, 300, 0.05),
-        triggers=TriggerConfig(60, 0.0, ("01:00", "07:00"), ("怎么",)),
-        groups=GroupsConfig(frozenset(), frozenset(), frozenset({"qq:2002"})),
-        budget=BudgetConfig(200, 300000),
-        memory=MemoryConfig(20, 5, 20),
-        logging=LoggingConfig("INFO", "logs"),
-    )
+    base = {
+        "api_key": "sk-test",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat",
+        "bot_qq": 999,
+        "ws_host": "127.0.0.1",
+        "ws_port": 8080,
+        "ws_token": "",
+        "db_path": ":memory:",
+        "persona": PersonaConfig("溟月", ("大肥鱼",), 120, 300, 0.05),
+        "triggers": TriggerConfig(60, 0.0, ("01:00", "07:00"), ("怎么",)),
+        "groups": GroupsConfig(frozenset(), frozenset(), frozenset({"qq:2002"})),
+        "budget": BudgetConfig(200, 300000),
+        "memory": MemoryConfig(20, 5, 20),
+        "logging": LoggingConfig("INFO", "logs"),
+    }
     base.update(overrides)
     return Settings(**base)
 
@@ -130,7 +130,7 @@ async def test_hard_trigger_calls_brain_and_sends(tmp_path):
 
 
 async def test_speak_false_records_usage_without_sending(tmp_path):
-    service, store, brain, adapter, _ = build(tmp_path, brain=FakeBrain(speak=False))
+    service, store, _brain, adapter, _ = build(tmp_path, brain=FakeBrain(speak=False))
     await service.handle(make_msg())
     assert adapter.sent == []
     calls, _ = store.usage_today(ChatType.GROUP, "qq:1001", now_shanghai().date().isoformat())
@@ -167,7 +167,7 @@ async def test_shut_up_command_mutes_without_model_call(tmp_path):
 
 
 async def test_wake_command_unmutes(tmp_path):
-    service, _, brain, adapter, _ = build(tmp_path)
+    service, _, brain, _adapter, _ = build(tmp_path)
     await service.handle(make_msg(content="/闭嘴", message_id="c1"))
     await service.handle(make_msg(content="/醒来", message_id="c2"))
     await service.handle(make_msg(content="@溟月 在吗", message_id="c3"))

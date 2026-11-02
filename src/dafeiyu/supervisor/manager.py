@@ -6,9 +6,10 @@ import logging
 import os
 import socket
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from ..config import RestartConfig
 from .logs import LogHub
@@ -126,7 +127,8 @@ class Supervisor:
         try:
             async with self._probe_session.get(url) as resp:
                 return resp.status < 500
-        except Exception:
+        # 就绪探测失败等价于「不可达」，由 start() 负责超时与失败状态。
+        except Exception:  # noqa: BLE001
             return False
 
     # ---- lifecycle -------------------------------------------------
@@ -167,12 +169,11 @@ class Supervisor:
             for stream in (proc.stdout, proc.stderr)
             if stream is not None
         ]
-        if spec.ready_url or spec.ready_probe:
-            if not await self._wait_ready(state):
-                await self._terminate(state)
-                state.status = FAILED
-                timeout = self._ready_timeout(state)
-                raise RuntimeError(f"{name} 未在 {timeout:.0f}s 内就绪")
+        if (spec.ready_url or spec.ready_probe) and not await self._wait_ready(state):
+            await self._terminate(state)
+            state.status = FAILED
+            timeout = self._ready_timeout(state)
+            raise RuntimeError(f"{name} 未在 {timeout:.0f}s 内就绪")
         state.status = READY
         state.watcher = asyncio.create_task(self._watch(state))
 
@@ -208,7 +209,8 @@ class Supervisor:
                     ready = await self._probe(state.spec.ready_url)
                 if ready:
                     return True
-            except Exception:
+            # 等待就绪期间探测异常按「未就绪」处理，继续重试直到超时。
+            except Exception:  # noqa: BLE001, S110
                 pass
             await asyncio.sleep(0.25)
         return False
@@ -257,7 +259,8 @@ class Supervisor:
             return
         try:
             await self.start(state.name)
-        except Exception as exc:
+        # 自动重启失败标记 FAILED 并写日志，不能让看门狗线程退出。
+        except Exception as exc:  # noqa: BLE001
             state.status = FAILED
             self.logs.write(state.name, f"重启失败：{exc}")
 
@@ -285,7 +288,7 @@ class Supervisor:
         try:
             await asyncio.wait_for(proc.wait(), timeout=STOP_TIMEOUT)
             return
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self.logs.write(
                 state.name,
                 f"{STOP_TIMEOUT:.0f}s 内未退出（pid={pid}），强制结束进程树",
@@ -313,7 +316,8 @@ class Supervisor:
         for name in self.specs:
             try:
                 await self.start(name)
-            except Exception as exc:
+            # start_all 中单个进程失败只记日志，不阻断其余进程。
+            except Exception as exc:  # noqa: BLE001
                 self.logs.write("supervisor", f"{name} 启动失败：{exc}")
 
     async def stop_all(self) -> None:
@@ -455,10 +459,10 @@ async def _http_probe(url: str, timeout: float = 1.0) -> bool:
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=timeout)
-        ) as client:
-            async with client.get(url) as resp:
-                return resp.status < 500
-    except Exception:
+        ) as client, client.get(url) as resp:
+            return resp.status < 500
+    # 无会话就绪探测失败按「不可达」处理。
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -512,8 +516,9 @@ def _find_listener_pid(port: int) -> int | None:
             timeout=5,
             encoding="mbcs",
             errors="replace",
+            check=False,
         ).stdout
-    except Exception:
+    except Exception:  # noqa: BLE001 - 探测失败只表示「查不到」，调用方按无 PID 处理
         return None
     for line in out.splitlines():
         parts = line.split()

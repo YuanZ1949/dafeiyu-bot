@@ -30,9 +30,9 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "CHAT_TYPES",
-    "K",
     "MIN_OVERLAP_RATIO",
     "Entry",
+    "K",
     "PollResult",
     "SessionAligner",
 ]

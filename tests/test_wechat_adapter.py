@@ -10,15 +10,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from typing import Self
 
 import pytest
+from websockets.asyncio.server import serve
 
 import dafeiyu.gateway.wechat as wechat_module
 from dafeiyu.config import ConfigError, WeChatConfig
 from dafeiyu.gateway.base import GatewayError
 from dafeiyu.gateway.wechat import WeChatAdapter
 from dafeiyu.models import ChatType, Message, RecallEvent
-from websockets.asyncio.server import serve
 
 GROUP_CHAT = "wxg:abc123"
 EPOCH = 3
@@ -38,7 +39,7 @@ class FakeBridge:
         self.receipt_id_override: str | None = None
         self.silent = False
 
-    async def __aenter__(self) -> FakeBridge:
+    async def __aenter__(self) -> Self:
         self.server = await serve(self._handle, "127.0.0.1", 0)
         # 端口由内核分配，测试里绝不硬编码。
         self.port = self.server.sockets[0].getsockname()[1]
@@ -345,14 +346,13 @@ async def test_health_connected_false_reaches_adapter_and_blocks_send() -> None:
 
 
 async def test_stale_health_expires_connected() -> None:
-    async with FakeBridge() as bridge:
-        async with running(bridge, poll_seconds=0.1) as adapter:
-            assert adapter.connected is True
-            # 新鲜度预算 3 × 0.1 = 0.3s；期间没有任何健康帧。
-            await asyncio.sleep(0.5)
-            assert adapter.connected is False
-            with pytest.raises(GatewayError, match="未连接"):
-                await adapter.send(ChatType.GROUP, GROUP_CHAT, "过期不发")
+    async with FakeBridge() as bridge, running(bridge, poll_seconds=0.1) as adapter:
+        assert adapter.connected is True
+        # 新鲜度预算 3 × 0.1 = 0.3s；期间没有任何健康帧。
+        await asyncio.sleep(0.5)
+        assert adapter.connected is False
+        with pytest.raises(GatewayError, match="未连接"):
+            await adapter.send(ChatType.GROUP, GROUP_CHAT, "过期不发")
 
 
 async def test_stop_sends_stop_action_and_closes_socket() -> None:

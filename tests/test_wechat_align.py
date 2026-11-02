@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from dafeiyu.gateway.wechat_bridge.align import (
-    K,
     MIN_OVERLAP_RATIO,
+    K,
     SessionAligner,
 )
 

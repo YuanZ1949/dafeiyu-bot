@@ -20,8 +20,8 @@ from typing import Any
 import httpx
 
 from ..memory.store import Store
-from ..netssl import default_ssl_context
 from ..models import ChatType
+from ..netssl import default_ssl_context
 from .client import BrainError, BrainReply, parse_brain_reply
 from .tokens import resolve_usage
 
@@ -153,7 +153,7 @@ class OpenCodeHttpBrain:
 
         headers: dict[str, str] = {}
         if password:
-            raw = f"{AUTH_USERNAME}:{password}".encode("utf-8")
+            raw = f"{AUTH_USERNAME}:{password}".encode()
             headers["Authorization"] = (
                 "Basic " + base64.b64encode(raw).decode("ascii")
             )
@@ -229,7 +229,7 @@ class OpenCodeHttpBrain:
         finally:
             try:
                 await self._request("DELETE", f"/api/session/{session_id}")
-            except Exception:  # noqa: BLE001 - 清理失败不该影响旁路结果
+            except Exception:
                 log.debug("临时 session 删除失败：%s", session_id, exc_info=True)
 
     async def _audit_round(
@@ -409,7 +409,7 @@ class OpenCodeHttpBrain:
                 idle = await asyncio.wait_for(
                     self._wait(session_id), timeout=WAIT_SLICE_SECONDS
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # 服务端挂到会话空闲才回 204：切片超时说明本轮还在跑，
                 # 直接回到循环顶部重新读消息，工具 part 才能被看到。
                 sliced = True

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
-from dafeiyu.delivery.window import ChatWindow, due_at, note as note_window, on_flushed
+from dafeiyu.delivery.window import ChatWindow, due_at, on_flushed
+from dafeiyu.delivery.window import note as note_window
 from dafeiyu.models import ChatType, Message
 
 ChatKey = tuple[ChatType, int]

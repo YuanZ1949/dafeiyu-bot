@@ -71,7 +71,7 @@ class DashboardAuth:
             supplied_user, expected_user
         ) and hmac.compare_digest(supplied_password, expected_password)
 
-    def issue_cookie(self, now: int | float | None = None) -> str:
+    def issue_cookie(self, now: float | None = None) -> str:
         issued_at = int(time.time() if now is None else now)
         payload = json.dumps(
             {
@@ -85,7 +85,7 @@ class DashboardAuth:
         signature = hmac.new(self.secret, payload, hashlib.sha256).digest()
         return f"{_b64encode(payload)}.{_b64encode(signature)}"
 
-    def verify_cookie(self, token: str, now: int | float | None = None) -> bool:
+    def verify_cookie(self, token: str, now: float | None = None) -> bool:
         if not token:
             return False
         try:
@@ -104,7 +104,7 @@ class DashboardAuth:
         current = int(time.time() if now is None else now)
         return issued_at <= current + 60 and current <= expires_at
 
-    def is_rate_limited(self, ip: str, now: int | float | None = None) -> bool:
+    def is_rate_limited(self, ip: str, now: float | None = None) -> bool:
         current = float(time.time() if now is None else now)
         attempts = [
             stamp
@@ -117,7 +117,7 @@ class DashboardAuth:
             self._failures.pop(ip, None)
         return len(attempts) >= FAILURE_LIMIT
 
-    def record_failure(self, ip: str, now: int | float | None = None) -> None:
+    def record_failure(self, ip: str, now: float | None = None) -> None:
         current = float(time.time() if now is None else now)
         attempts = [
             stamp

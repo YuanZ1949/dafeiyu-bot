@@ -8,10 +8,11 @@ import os
 import re
 import sqlite3
 import zipfile
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .. import __version__
 from ..timeutil import now_shanghai

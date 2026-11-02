@@ -2,13 +2,13 @@ import pytest
 
 from dafeiyu.models import ChatType, Message, channel_of
 
-MSG_KWARGS = dict(
-    chat_type=ChatType.GROUP,
-    user_id="456",
-    nickname="测试",
-    content="你好",
-    message_id="m-1",
-)
+MSG_KWARGS = {
+    "chat_type": ChatType.GROUP,
+    "user_id": "456",
+    "nickname": "测试",
+    "content": "你好",
+    "message_id": "m-1",
+}
 
 
 def _message(chat_id: str) -> Message:
@@ -56,7 +56,7 @@ def test_message_channel_matches_channel_of():
 def test_message_channel_raises_for_unprefixed_id():
     msg = _message("123")
     with pytest.raises(ValueError):
-        msg.channel
+        _ = msg.channel
 
 
 def test_channel_is_not_a_persisted_dataclass_field():

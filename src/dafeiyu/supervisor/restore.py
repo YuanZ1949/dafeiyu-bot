@@ -6,8 +6,9 @@ import logging
 import os
 import shutil
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from .audit import AuditLog
 from .backup import BackupError, BackupManager, validate_database
@@ -73,7 +74,7 @@ class RestoreService:
 
             try:
                 await self.supervisor.stop(self.bot_name)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 raise RestoreError(
                     "stop", f"无法停止 bot：{exc.__class__.__name__}", 500
                 ) from exc
@@ -87,7 +88,7 @@ class RestoreService:
             try:
                 await self.supervisor.start(self.bot_name)
                 await self._wait_ready()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 await self._rollback(pre.filename, started, actor, ip, request_id)
                 raise RestoreError(
                     "health", f"恢复后启动失败：{exc.__class__.__name__}", 500
@@ -150,7 +151,7 @@ class RestoreService:
                 await self.supervisor.start(self.bot_name)
             result = "rolled_back"
             detail = {"stage": "rollback", "ok": True}
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.exception("恢复回滚失败")
             result = "rollback_failed"
             detail = {"stage": "rollback", "ok": False, "error": str(exc)}

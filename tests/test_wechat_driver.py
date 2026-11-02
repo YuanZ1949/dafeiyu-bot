@@ -305,6 +305,7 @@ def test_package_imports_without_pyweixin() -> None:
         text=True,
         env=env,
         timeout=60,
+        check=False,
     )
 
     assert result.returncode == 0, result.stderr

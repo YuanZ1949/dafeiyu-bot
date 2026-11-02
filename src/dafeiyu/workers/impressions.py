@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from dafeiyu.brain.tokens import resolve_usage
 from dafeiyu.memory.store import Store
@@ -179,7 +180,8 @@ class ImpressionWorker:
                     max_tokens=600,
                 )
                 prompt_tokens = completion_tokens = 0
-        except Exception as exc:
+        # 失败已写日志并进入退避，后台 worker 不能被打挂。
+        except Exception as exc:  # noqa: BLE001
             log_memory_failure(log, "印象抽取", exc, chat_type, chat_id)
             self._backoff.mark_failed((chat_type, chat_id), exc)
             return None

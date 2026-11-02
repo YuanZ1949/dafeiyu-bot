@@ -233,7 +233,7 @@ async def test_control_reports_partial_failure(tmp_path: Path) -> None:
             if name == "bot":
                 raise RuntimeError("端口被占用")
 
-    app, supervisor, _ = make_app(tmp_path, supervisor=Failing())
+    app, _supervisor, _ = make_app(tmp_path, supervisor=Failing())
     async with running(app) as client:
         resp = await client.post("/api/control/start", json={"target": "all"})
         data = await resp.json()

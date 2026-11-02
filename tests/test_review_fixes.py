@@ -21,7 +21,7 @@ from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router, now_shanghai
 from dafeiyu.service import Service
 from dafeiyu.workers.impressions import ImpressionWorker
-from dafeiyu.workers.summary import SummaryScheduler, summary_loop
+from dafeiyu.workers.summary import summary_loop
 
 GROUP = ChatType.GROUP
 NOW = 1_760_000_000
@@ -30,22 +30,22 @@ CLOCK = datetime(2026, 10, 24, 12, 0, tzinfo=timezone(timedelta(hours=8)))
 
 
 def make_settings(**overrides) -> Settings:
-    base = dict(
-        api_key="sk-test",
-        base_url="https://api.deepseek.com",
-        model="deepseek-chat",
-        bot_qq=999,
-        ws_host="127.0.0.1",
-        ws_port=8080,
-        ws_token="",
-        db_path=":memory:",
-        persona=PersonaConfig("溟月", ("大肥鱼",), 120, 300, 0.05),
-        triggers=TriggerConfig(60, 0.0, ("01:00", "07:00"), ("怎么",)),
-        groups=GroupsConfig(frozenset(), frozenset(), frozenset()),
-        budget=BudgetConfig(200, 300000),
-        memory=MemoryConfig(20, 5, 20),
-        logging=LoggingConfig("INFO", "logs"),
-    )
+    base = {
+        "api_key": "sk-test",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat",
+        "bot_qq": 999,
+        "ws_host": "127.0.0.1",
+        "ws_port": 8080,
+        "ws_token": "",
+        "db_path": ":memory:",
+        "persona": PersonaConfig("溟月", ("大肥鱼",), 120, 300, 0.05),
+        "triggers": TriggerConfig(60, 0.0, ("01:00", "07:00"), ("怎么",)),
+        "groups": GroupsConfig(frozenset(), frozenset(), frozenset()),
+        "budget": BudgetConfig(200, 300000),
+        "memory": MemoryConfig(20, 5, 20),
+        "logging": LoggingConfig("INFO", "logs"),
+    }
     base.update(overrides)
     return Settings(**base)
 

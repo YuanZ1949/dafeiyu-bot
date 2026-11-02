@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Callable, Hashable
+from collections.abc import Callable, Hashable
+from typing import Any
 
 from dafeiyu.brain.client import BrainError
 from dafeiyu.models import ChatType

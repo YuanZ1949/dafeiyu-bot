@@ -60,7 +60,7 @@ def _spawn_detached(args: list[str]) -> None:
     kwargs: dict[str, object] = {}
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-    subprocess.Popen(  # noqa: S603 - 参数由本模块拼装，不经过 shell
+    subprocess.Popen(
         args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

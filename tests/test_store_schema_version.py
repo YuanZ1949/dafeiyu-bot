@@ -5,12 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from dafeiyu.memory.store import Store
-from dafeiyu.models import ChatType, Message
-
 # 真 schema-1 夹具：复用 test_store_migration 的 v1 库拼装（INTEGER id 布局 +
 # FTS），替代旧版「把 v2 库重置 user_version=0」的假升级用例。
 from test_store_migration import make_v1_db
+
+from dafeiyu.memory.store import Store
+from dafeiyu.models import ChatType, Message
 
 
 def make_store(path: Path) -> Store:

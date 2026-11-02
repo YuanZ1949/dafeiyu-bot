@@ -61,7 +61,7 @@ async def test_debug_trigger_returns_service_result_and_builds_message(
 
 
 async def test_debug_trigger_accepts_wechat_string_ids(tmp_path: Path) -> None:
-    control, service, app = make_control(tmp_path)
+    _control, service, app = make_control(tmp_path)
     captured = []
 
     def explain(msg, *, seed=None):
@@ -88,7 +88,7 @@ async def test_debug_trigger_accepts_wechat_string_ids(tmp_path: Path) -> None:
 
 
 async def test_debug_trigger_rejects_bad_payload(tmp_path: Path) -> None:
-    control, service, app = make_control(tmp_path)
+    _control, service, app = make_control(tmp_path)
     service.explain_trigger = lambda msg, *, seed=None: {"verdict": "model"}
 
     bad_bodies = [

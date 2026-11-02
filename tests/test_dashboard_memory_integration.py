@@ -17,7 +17,8 @@ from aiohttp.test_utils import TestClient, TestServer
 from conftest import TEST_CONFIG_YAML, TEST_DASHBOARD_LOOPBACK_YAML
 
 from dafeiyu.config import load_settings
-from dafeiyu.control import BrainControl, create_app as create_bot_app
+from dafeiyu.control import BrainControl
+from dafeiyu.control import create_app as create_bot_app
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.supervisor.dashboard import create_app as create_dashboard_app
@@ -211,7 +212,7 @@ async def boot(tmp_path: Path):
 
 
 async def test_dashboard_timeline_proxy_end_to_end(tmp_path: Path) -> None:
-    async with boot(tmp_path) as (dash, store):
+    async with boot(tmp_path) as (dash, _store):
         resp = await dash.get(
             f"/api/sessions/group/{GROUP_ID}/timeline?limit=1"
         )

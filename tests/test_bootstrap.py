@@ -209,7 +209,7 @@ def test_preflight_warns_on_ps1_without_utf8_bom(tmp_path, monkeypatch):
     config, env = _ready_project(tmp_path, monkeypatch)
     scripts = tmp_path / "scripts"
     scripts.mkdir()
-    (scripts / "foo.ps1").write_bytes("Write-Host '中文'\n".encode("utf-8"))
+    (scripts / "foo.ps1").write_bytes("Write-Host '中文'\n".encode())
 
     issues = preflight(config, env, root=tmp_path, check_ports=False)
 
@@ -226,7 +226,7 @@ def test_preflight_accepts_ps1_with_utf8_bom(tmp_path, monkeypatch):
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     (scripts / "foo.ps1").write_bytes(
-        b"\xef\xbb\xbf" + "Write-Host '中文'\n".encode("utf-8")
+        b"\xef\xbb\xbf" + "Write-Host '中文'\n".encode()
     )
 
     issues = preflight(config, env, root=tmp_path, check_ports=False)
@@ -238,7 +238,7 @@ def test_preflight_checks_runtime_launcher_bom(tmp_path, monkeypatch):
     config, env = _ready_project(tmp_path, monkeypatch)
     data = tmp_path / "data"
     data.mkdir()
-    (data / "runtime-launcher.ps1").write_bytes("Write-Host '中文'\n".encode("utf-8"))
+    (data / "runtime-launcher.ps1").write_bytes("Write-Host '中文'\n".encode())
 
     issues = preflight(config, env, root=tmp_path, check_ports=False)
 

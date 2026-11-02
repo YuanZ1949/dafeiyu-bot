@@ -10,10 +10,10 @@ import subprocess
 import sys
 import urllib.request
 import webbrowser
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 import aiohttp
 
@@ -65,7 +65,8 @@ class _HubHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             self.hub.write("supervisor", self.format(record))
-        except Exception:  # 日志系统本身不能把主流程带崩
+        # 日志系统本身不能把主流程带崩
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -298,12 +299,11 @@ async def _bot_ready(bot_url: str, token: str, timeout: float = 5.0) -> bool:
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=timeout)
-        ) as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status != 200:
-                    return False
-                data = await resp.json(content_type=None)
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        ) as session, session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                return False
+            data = await resp.json(content_type=None)
+    except (TimeoutError, aiohttp.ClientError, ValueError):
         return False
     return isinstance(data, dict) and data.get("ok") is True
 
@@ -395,7 +395,7 @@ def build_ops(
 async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
     try:
         await asyncio.wait_for(stop.wait(), timeout=max(0.0, seconds))
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pass
 
 
@@ -650,12 +650,12 @@ async def run() -> int:
         logs.write("supervisor", "正在关闭所有进程…")
         try:
             await asyncio.wait_for(supervisor.shutdown(), timeout=45)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logs.write("supervisor", "停止子进程超时，强制退出")
         logs.write("supervisor", "子进程已停止，关闭 dashboard")
         try:
             await asyncio.wait_for(runner.cleanup(), timeout=15)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logs.write("supervisor", "dashboard 关闭超时，强制退出")
         with contextlib.suppress(Exception):
             await ops.health.close()

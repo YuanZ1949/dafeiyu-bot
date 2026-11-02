@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 
@@ -190,7 +189,7 @@ def test_write_crash_keeps_original_file_and_rolls_back(
     alias = registry.resolve("甲群")
     before = registry.path.read_text(encoding="utf-8")
 
-    def boom(*args, **kwargs):  # noqa: ANN002, ANN003
+    def boom(*args, **kwargs):
         raise OSError("disk full")
 
     monkeypatch.setattr(identity.os, "replace", boom)

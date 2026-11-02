@@ -5,10 +5,11 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 import aiohttp
 

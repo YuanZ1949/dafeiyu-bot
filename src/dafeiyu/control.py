@@ -9,15 +9,17 @@ import os
 import sqlite3
 import tempfile
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from aiohttp import web
 
 from . import __version__
+from .behavior import BehaviorError, as_payload, parse_behavior
 from .brain.factory import (
     build_brain,
     current_provider,
@@ -62,7 +64,6 @@ from .secrets_store import (
     secret_exists,
     write_secret,
 )
-from .behavior import BehaviorError, as_payload, parse_behavior
 from .service import TOOL_HINT_INTERVAL_SECONDS
 from .settings_local import OverrideError, read_overrides, write_overrides
 from .supervisor.reload_client import reload_opencode
@@ -695,7 +696,7 @@ class BrainControl:
             return
         try:
             result = await probe_free_model_detail(client)
-        except Exception:  # noqa: BLE001 - 自检永远不允许打断启动
+        except Exception:
             log.warning("免费模型自检异常", exc_info=True)
             result = FreeProbeResult(False, "探测异常")
         available, reason = result.available, result.reason
@@ -1930,11 +1931,12 @@ def create_app(
             flags[field] = value
 
         seed = payload.get("seed")
-        if seed is not None:
-            if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
-                return web.json_response(
-                    {"error": "seed 必须是非负整数"}, status=400
-                )
+        if seed is not None and (
+            isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
+        ):
+            return web.json_response(
+                {"error": "seed 必须是非负整数"}, status=400
+            )
 
         msg = Message(
             chat_type=chat_type,
@@ -1952,7 +1954,8 @@ def create_app(
             return web.json_response(control.explain_trigger(msg, seed=seed))
         except NotImplementedError as exc:
             return web.json_response({"error": str(exc)}, status=503)
-        except Exception as exc:  # 调试器读失败不能把控制口打挂
+        # 调试器读失败不能把控制口打挂
+        except Exception as exc:  # noqa: BLE001
             log.warning("触发调试失败：%s", exc)
             return web.json_response(
                 {"error": f"触发调试失败：{exc.__class__.__name__}"}, status=500
@@ -2021,7 +2024,8 @@ def create_app(
             return web.json_response(
                 control.memory_snapshot(limit, offset, chat_type, chat_id)
             )
-        except Exception as exc:  # 读库失败不能把控制口打挂
+        # 读库失败不能把控制口打挂
+        except Exception as exc:  # noqa: BLE001
             log.warning("读取记忆失败：%s", exc)
             return web.json_response(
                 {"error": f"读取记忆失败：{exc.__class__.__name__}"}, status=500
@@ -2030,7 +2034,8 @@ def create_app(
     async def memory_health(request: web.Request) -> web.Response:
         try:
             return web.json_response(control.memory_health())
-        except Exception as exc:  # 体检读库失败同样不能把控制口打挂
+        # 体检读库失败同样不能把控制口打挂
+        except Exception as exc:  # noqa: BLE001
             log.warning("读取记忆健康失败：%s", exc)
             return web.json_response(
                 {"error": f"读取记忆健康失败：{exc.__class__.__name__}"}, status=500
@@ -2310,8 +2315,8 @@ def create_app(
         os.close(fd)
         try:
             control.store.backup_to(tmp)
-            with open(tmp, "rb") as fh:
-                body = fh.read()
+            # 读临时文件放到线程里：handler 在事件循环上跑，不能用阻塞 open 卡住 loop。
+            body = await asyncio.to_thread(Path(tmp).read_bytes)
         except Exception as exc:  # noqa: BLE001
             log.warning("备份数据库失败：%s", exc)
             return web.json_response(
