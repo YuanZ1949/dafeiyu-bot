@@ -1,4 +1,4 @@
-"""pyweixin 的唯一入口：8 个函数，全部惰性 import。
+"""pyweixin 的唯一入口：门面函数都在这里，pyweixin 全部惰性 import。
 
 安装的发行包是 `pywechat127`，import 名仍然是 `pyweixin`（`pip install pywechat127`
 之后 `import pyweixin` 才可用）。本模块之外**禁止** `import pyweixin`，这样：
@@ -22,6 +22,10 @@
   （新消息总数/文本数量/文件数量/图片数量/视频数量/链接数量/文本内容），
   **没有「消息发送人」键**，发送人只能从条目字段里取
 - ``Navigator.open_dialog_window(friend=显示名)``、``Navigator.open_seperate_dialog_window``
+- ``WeChatAuto.get_new_message_num(main_window, close_weixin=False)`` -> 侧边栏红点总数
+  （实测 ~20ms，未读门控的 cheapest probe）
+- ``WeChatAuto.scan_for_new_messages(main_window=..., delay=...)`` -> 会话列表中带未读的
+  会话；**免打扰会话不计入**，且会滚动会话列表，所以只作门控、不能当唯一真相
 - ``Contacts.get_groupMembers_info(...)``
 - ``GlobalConfig.close_weixin`` / ``GlobalConfig.is_maximize``
 
