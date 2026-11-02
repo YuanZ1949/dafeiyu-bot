@@ -73,7 +73,58 @@ def test_self_display_name_never_becomes_self_alias(tmp_path: Path) -> None:
     assert all(peer["alias"] != "self" for peer in raw["peers"])
 
 
+def test_observe_keeps_alias_and_chat_id_across_rename(tmp_path: Path) -> None:
+    """IS-5：改名不是新会话——成员重叠达阈值时复用原 alias，`chat_id` 不变。"""
+    registry = make_registry(tmp_path)
+    old_alias = registry.observe("测试群", {"甲", "乙", "丙", "丁"})
+    old_chat_id = registry.chat_id("测试群")
+
+    new_alias = registry.observe("测试群（新）", {"甲", "乙", "丙", "丁", "戊"})
+
+    assert new_alias == old_alias
+    assert registry.chat_id("测试群（新）") == old_chat_id == f"wxg:{old_alias}"
+    # 旧名仍解析回同一会话：历史消息渲染不会断。
+    assert registry.resolve("测试群") == old_alias
+    peer = registry.by_alias(old_alias)
+    assert peer is not None
+    assert peer.display_name == "测试群（新）"
+    assert "测试群" in peer.former_names
+    # 旧 alias 不删除、不退休。
+    assert peer.retired_at is None
+
+
+def test_rename_survives_registry_restart(tmp_path: Path) -> None:
+    registry = make_registry(tmp_path)
+    alias = registry.observe("群旧名", {"甲", "乙", "丙", "丁"})
+    registry.observe("群新名", {"甲", "乙", "丙", "丁", "戊"})
+
+    reloaded = make_registry(tmp_path)
+
+    assert reloaded.resolve("群新名") == alias
+    assert reloaded.resolve("群旧名") == alias
+    assert len(reloaded.all_peers()) == 1
+
+
+def test_rename_with_ambiguous_overlap_fails_closed(tmp_path: Path) -> None:
+    alerts: list = []
+    registry = make_registry(tmp_path, alerts)
+    members = {"甲", "乙", "丙", "丁", "戊", "己", "庚"}
+    left = set(members) - {"庚"} | {"辛"}
+    right = set(members) - {"己"} | {"壬"}
+    registry.observe("群一", left)
+    registry.observe("群二", right)
+    alerts.clear()
+
+    with pytest.raises(AliasConflictError) as excinfo:
+        registry.observe("群三", members)
+
+    assert excinfo.value.display_name == "群三"
+    assert len(excinfo.value.aliases) == 2
+    assert any(payload.get("reason") == "rename_tie" for code, payload in alerts)
+
+
 def test_retire_leaves_tombstone_and_mints_new_alias(tmp_path: Path) -> None:
+    """显式 retire ≠ 改名：墓碑后按名解析必须铸新别名（旧 alias 永不复用）。"""
     registry = make_registry(tmp_path)
     old_alias = registry.resolve("测试群", kind="group")
 
