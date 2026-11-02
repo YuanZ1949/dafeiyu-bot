@@ -538,8 +538,8 @@ async def test_user_delete_forwards_confirmation_and_writes_audit(
     assert rows[0]["detail"] == {
         "deleted_messages": 3,
         "chat_type": "group",
-        "chat_id": 100,
-        "user_id": 7,
+        "chat_id": "100",
+        "user_id": "7",
     }
     raw_audit = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
     assert "不能进审计的消息正文" not in raw_audit

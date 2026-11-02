@@ -16,6 +16,7 @@ import aiohttp
 from aiohttp import web
 
 from ..config import Settings
+from ..ids import normalize_chat_id
 from .auth import COOKIE_NAME, DashboardAuth, safe_next_path
 from .backup import REASONS, BackupError
 from .control_token import ControlToken
@@ -720,6 +721,14 @@ def create_app(
         code, data = await bot_call("PUT", "/api/behavior", payload)
         return web.json_response(data, status=code)
 
+    async def wechat_stop(_: web.Request) -> web.Response:
+        code, data = await bot_call("POST", "/api/channels/wechat/stop", {})
+        return web.json_response(data, status=code)
+
+    async def wechat_resume(_: web.Request) -> web.Response:
+        code, data = await bot_call("POST", "/api/channels/wechat/resume", {})
+        return web.json_response(data, status=code)
+
     def _session_target(
         request: web.Request,
     ) -> tuple[str, str, web.Response | None]:
@@ -729,9 +738,17 @@ def create_app(
             return "", "", web.json_response(
                 {"error": "chat_type 必须是 group 或 private"}, status=400
             )
-        if not chat_id.isdigit() or int(chat_id) <= 0:
+        try:
+            chat_id = normalize_chat_id(chat_id, label="chat_id")
+        except ValueError as exc:
+            return "", "", web.json_response({"error": str(exc)}, status=400)
+        # 纯数字 QQ id 仍须为正：normalize 允许 '-' 字符，这里补回旧语义。
+        numeric = chat_id.isdecimal() or (
+            chat_id.startswith("-") and chat_id[1:].isdecimal()
+        )
+        if numeric and int(chat_id) <= 0:
             return "", "", web.json_response(
-                {"error": "chat_id 必须是正整数"}, status=400
+                {"error": "chat_id 格式非法：必须是正整数"}, status=400
             )
         return chat_type, chat_id, None
 
@@ -742,9 +759,16 @@ def create_app(
         if error is not None:
             return "", "", "", error
         user_id = request.match_info.get("user_id", "")
-        if not user_id.isdigit() or int(user_id) <= 0:
+        try:
+            user_id = normalize_chat_id(user_id, label="user_id")
+        except ValueError as exc:
+            return "", "", "", web.json_response({"error": str(exc)}, status=400)
+        numeric = user_id.isdecimal() or (
+            user_id.startswith("-") and user_id[1:].isdecimal()
+        )
+        if numeric and int(user_id) <= 0:
             return "", "", "", web.json_response(
-                {"error": "user_id 必须是正整数"}, status=400
+                {"error": "user_id 格式非法：必须是正整数"}, status=400
             )
         return chat_type, chat_id, user_id, None
 
@@ -866,8 +890,8 @@ def create_app(
             detail={
                 "deleted_messages": deleted,
                 "chat_type": chat_type,
-                "chat_id": int(chat_id),
-                "user_id": int(user_id),
+                "chat_id": chat_id,
+                "user_id": user_id,
             },
         )
         return web.json_response(data, status=code)
@@ -1084,6 +1108,8 @@ def create_app(
     app.router.add_get("/api/config", config)
     app.router.add_get("/api/behavior", behavior)
     app.router.add_put("/api/behavior", save_behavior)
+    app.router.add_post("/api/channels/wechat/stop", wechat_stop)
+    app.router.add_post("/api/channels/wechat/resume", wechat_resume)
     app.router.add_get("/api/backup", backup)
     app.router.add_post("/api/memory/summaries", memory_summary)
     app.router.add_post("/api/memory/impressions", memory_impressions)

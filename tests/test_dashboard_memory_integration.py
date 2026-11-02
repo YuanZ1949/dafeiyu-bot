@@ -345,6 +345,27 @@ async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
         assert store.count_summaries(ChatType.GROUP, GROUP_ID) == 0
 
 
+async def test_dashboard_timeline_proxy_accepts_wechat_id(tmp_path: Path) -> None:
+    async with boot(tmp_path) as (dash, store):
+        store.add_message(
+            Message(
+                chat_type=ChatType.GROUP,
+                chat_id="wxg:abc",
+                user_id="wxg:abc",
+                nickname="鱼片",
+                content="微信消息",
+                message_id="w0",
+                timestamp=1_700_000_100,
+            )
+        )
+        resp = await dash.get("/api/sessions/group/wxg:abc/timeline")
+        data = await resp.json()
+
+    assert resp.status == 200
+    assert data["chat"]["chat_id"] == "wxg:abc"
+    assert [m["content"] for m in data["messages"]] == ["微信消息"]
+
+
 async def test_dashboard_impression_edit_and_merge_proxy(tmp_path: Path) -> None:
     group = ChatType.GROUP
     async with boot(tmp_path) as (dash, store):
