@@ -68,7 +68,7 @@ def make_wx_config(**overrides: object) -> WeChatConfig:
         "bridge_port": 8790,
         "bridge_token": "",
         "account_nickname": "小号",
-        "group_allowlist": frozenset({"wxg:g1"}),
+        "group_allowlist": frozenset({"g1"}),
         # poll_seconds 要小：陈旧健康判定是 3 × poll_seconds。
         "poll_seconds": 0.2,
         "echo_window_seconds": 120.0,
@@ -126,7 +126,7 @@ async def test_empty_allowlist_start_raises_config_error_with_key_name() -> None
 
 async def test_empty_nickname_start_raises_config_error_with_key_name() -> None:
     # 闸门 ③：account_nickname 为空同样拒绝，且消息里点名这个键。
-    adapter = WeChatAdapter(WeChatConfig(group_allowlist=frozenset({"wxg:g1"})))
+    adapter = WeChatAdapter(WeChatConfig(group_allowlist=frozenset({"g1"})))
 
     with pytest.raises(ConfigError, match="account_nickname"):
         await adapter.start()

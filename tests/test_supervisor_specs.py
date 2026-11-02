@@ -154,7 +154,7 @@ def build_wechat(
         + "  wechat:\n"
         + f"    enabled: {'true' if enabled else 'false'}\n"
         + f"    bridge_token: {token}\n"
-        + '    group_allowlist: ["wxg:filehelper"]\n'
+        + '    group_allowlist: ["大肥鱼测试群"]\n'
         + "    account_nickname: 大肥鱼\n",
         encoding="utf-8",
     )

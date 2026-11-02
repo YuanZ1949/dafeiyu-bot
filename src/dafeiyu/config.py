@@ -737,6 +737,27 @@ def _id_set(value: Any, field: str) -> frozenset[str]:
     return frozenset(ids)
 
 
+def _display_names(value: Any, field: str) -> frozenset[str]:
+    """微信群显示名集合：只做去空白/去空项，保持原样（显示名区分大小写）。
+
+    `group_allowlist` 不是跨通道 id 集合：桥只拿它当 `open_chat` 的群名，
+    而会话别名（`wxg:<alias>`）由桥首次轮询时随机铸造，无法预先写进配置。
+    """
+    if value is None:
+        return frozenset()
+    if not isinstance(value, list):
+        raise ConfigError(f"{field} 必须是列表")
+    names: set[str] = set()
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, str)):
+            raise ConfigError(f"{field} 的元素必须是群显示名")
+        text = str(item).strip()
+        if not text:
+            raise ConfigError(f"{field} 的元素不能为空")
+        names.add(text)
+    return frozenset(names)
+
+
 def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
     """解析 `gateway.wechat`；就绪度缺失只告警，不在加载阶段拒绝。"""
     section: dict[str, Any] = {}
@@ -793,7 +814,7 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
         bridge_port=port,
         bridge_token=token,
         account_nickname=str(section.get("account_nickname") or "").strip(),
-        group_allowlist=_id_set(
+        group_allowlist=_display_names(
             section.get("group_allowlist"), "gateway.wechat.group_allowlist"
         ),
         max_groups=_positive_int(

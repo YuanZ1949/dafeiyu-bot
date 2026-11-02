@@ -278,20 +278,52 @@ def _close_desktop(handle: int) -> None:
     user32.CloseDesktop(handle)
 
 
+def _visible_lock_ui_window() -> bool:
+    """锁屏 UI 是否还有**可见**顶层窗口。
+
+    Windows 解锁后 ``LockApp.exe`` 常以挂起状态残留（线程全 Suspended、
+    ``MainWindowHandle == 0``）；只看进程名会把正常桌面误判成锁屏。
+    """
+    user32 = _win_dll("user32")
+    if user32 is None:
+        return False
+    wintypes = _wintypes()
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [enum_proc, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    found = False
+
+    def _visit(hwnd: int, _lparam: int) -> bool:
+        nonlocal found
+        if found or not user32.IsWindowVisible(hwnd):
+            return True
+        image = _process_image_name(_foreground_pid(hwnd))
+        if image and _is_lock_ui_exe(image):
+            found = True
+            return False
+        return True
+
+    callback = enum_proc(_visit)
+    user32.EnumWindows(callback, 0)
+    return found
+
+
 def _desktop_locked_by_lock_ui(foreground: int) -> bool:
-    """补充检查：前台窗口属于锁屏 UI，或 ``LogonUI.exe`` 正在运行。
+    """补充检查：前台窗口属于锁屏 UI，或锁屏 UI 仍有可见窗口。
 
     读不到 pid / 映像名视为「未检出」，交给调用方沿用旧判断；只要正面命中
-    ``LockApp.exe`` / ``LogonUI.exe`` 就返回 True——锁屏会话里 LockApp 会
-    抢占前台，仅凭「Default 桌面 + 有前台」会误判成 interactive。
+    ``LockApp.exe`` / ``LogonUI.exe`` 的**可见窗口**就返回 True——锁屏会话里
+    LockApp 会抢占前台，仅凭「Default 桌面 + 有前台」会误判成 interactive。
+    进程存在本身不算证据：解锁后 LockApp 可能保持挂起，不能因此永久锁死发送。
     """
     pid = _foreground_pid(foreground)
     if pid:
         image = _process_image_name(pid)
         if image and _is_lock_ui_exe(image):
             return True
-    # LogonUI.exe 存在即登录安全界面在跑（前台窗口读不到时也能兜住）。
-    return any(_is_lock_ui_exe(name) for name in _process_names())
+    return _visible_lock_ui_window()
 
 
 def _detect_desktop() -> str:

@@ -338,7 +338,7 @@ powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -Target D:\dafeiyu-r
    - `gateway.provider`: `wechat`（仅微信）或 `both`（QQ + 微信双通道）；
    - `gateway.wechat.enabled: true`；
    - `account_nickname`：小号在目标群里的显示昵称，用于识别 @；
-   - `group_allowlist`：允许的群，支持 `123456` 数字群号或 `wxg:别名` 两种写法。**空白名单 = 拒绝启动**（语义是「拒绝」，不是「放行所有群」）。同名群没法用数字区分，`wxg:` 条目需要你人工核对。
+   - `group_allowlist`：允许的群，填**群在微信里的显示名**（桥按显示名 `open_chat`）；会话别名由桥本地铸造，不能预先写这里。**空白名单 = 拒绝启动**（语义是「拒绝」，不是「放行所有群」）。同名群没法自动区分。
 
 4. 预检：`.venv\Scripts\python -m dafeiyu.cli doctor` 有 8 项微信前置检查（进程 / 版本 / 语言 / 完整性 / 桌面 / pyweixin / 端口 / 配置），**全部通过再进入下一步**。
 
@@ -360,7 +360,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 
 - **无真实 message_id**：桥为会话/消息在本地铸造 id，跨重启不保证稳定。
 - 不支持撤回 / 编辑事件。
-- 同名群只能靠别名 / 人工区分，`group_allowlist` 里的 `wxg:` 条目要人工核对。
+- 同名群只能靠显示名 / 人工区分，`group_allowlist` 里的显示名要人工核对。
 - `@` 触发依赖轮询，最坏有约一个 `poll_seconds`（默认 8 秒）的延迟。
 - 发送有频率上限：`send_min_interval_seconds`（默认 20 秒）、`send_max_per_hour`（20）、`send_max_per_day`（60）。
 - 桌面锁屏即掉线。RPA 可能误点，`require_foreground_idle` 默认要求微信窗口前台且空闲才执行操作；开启微信通道时别在那台机器上干重要的事。

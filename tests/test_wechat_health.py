@@ -254,9 +254,9 @@ def test_default_desktop_with_foreground_is_interactive(monkeypatch) -> None:
     monkeypatch.setattr(health, "_desktop_name", lambda handle: "Default")
     monkeypatch.setattr(health, "_foreground_window", lambda: 999)
     monkeypatch.setattr(health, "_close_desktop", lambda handle: None)
-    # 无害前台 + 没有 LogonUI 进程，锁屏补充检查必须放行。
+    # 无害前台 + 没有可见锁屏窗口，锁屏补充检查必须放行。
     monkeypatch.setattr(health, "_foreground_pid", lambda hwnd: 0)
-    monkeypatch.setattr(health, "_process_names", list)
+    monkeypatch.setattr(health, "_visible_lock_ui_window", lambda: False)
 
     assert health._detect_desktop() == "interactive"
 
@@ -286,17 +286,32 @@ def test_lockapp_foreground_is_locked(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Desktop APIs are Windows-only")
-def test_logonui_process_present_is_locked(monkeypatch) -> None:
+def test_visible_lock_ui_window_is_locked(monkeypatch) -> None:
     _patch_unlocked_desktop(monkeypatch)
     monkeypatch.setattr(health, "_foreground_pid", lambda hwnd: 4242)
     monkeypatch.setattr(
         health, "_process_image_name", lambda pid: "C:\\Apps\\Weixin.exe"
     )
-    monkeypatch.setattr(
-        health, "_process_names", lambda: ["explorer.exe", "LogonUI.exe"]
-    )
+    monkeypatch.setattr(health, "_visible_lock_ui_window", lambda: True)
 
     assert health._detect_desktop() == "locked"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Desktop APIs are Windows-only")
+def test_suspended_lockapp_leftover_is_not_locked(monkeypatch) -> None:
+    """解锁后 LockApp 可能以挂起状态残留；进程存在 ≠ 正在锁屏。"""
+    _patch_unlocked_desktop(monkeypatch)
+    monkeypatch.setattr(health, "_foreground_pid", lambda hwnd: 4242)
+    monkeypatch.setattr(
+        health, "_process_image_name", lambda pid: "C:\\Apps\\Weixin.exe"
+    )
+    monkeypatch.setattr(health, "_visible_lock_ui_window", lambda: False)
+    # 仅进程名命中，没有可见窗口：不能据此永久锁死发送。
+    monkeypatch.setattr(
+        health, "_process_names", lambda: ["explorer.exe", "LockApp.exe"]
+    )
+
+    assert health._detect_desktop() == "interactive"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Desktop APIs are Windows-only")
@@ -309,9 +324,7 @@ def test_foreground_pid_unavailable_falls_back_to_interactive(monkeypatch) -> No
         "_process_image_name",
         lambda pid: pytest.fail("pid 为 0 时不应读进程镜像"),
     )
-    monkeypatch.setattr(
-        health, "_process_names", lambda: ["explorer.exe", "Weixin.exe"]
-    )
+    monkeypatch.setattr(health, "_visible_lock_ui_window", lambda: False)
 
     assert health._detect_desktop() == "interactive"
 
@@ -330,7 +343,7 @@ def test_lock_ui_probe_exception_keeps_previous_conclusion(monkeypatch) -> None:
         "_process_image_name",
         lambda pid: pytest.fail("探针失败后不应再读镜像"),
     )
-    monkeypatch.setattr(health, "_process_names", list)
+    monkeypatch.setattr(health, "_visible_lock_ui_window", lambda: False)
 
     assert health._detect_desktop() == "interactive"
 
@@ -343,9 +356,7 @@ def test_harmless_foreground_process_is_interactive(monkeypatch) -> None:
     monkeypatch.setattr(
         health, "_process_image_name", lambda pid: "C:\\Apps\\Weixin.exe"
     )
-    monkeypatch.setattr(
-        health, "_process_names", lambda: ["Weixin.exe", "explorer.exe"]
-    )
+    monkeypatch.setattr(health, "_visible_lock_ui_window", lambda: False)
 
     assert health._detect_desktop() == "interactive"
 

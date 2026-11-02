@@ -47,7 +47,8 @@ gateway:
     bridge_token: ""
     # 小号在群里的微信显示昵称（不是会话别名，别名由桥本地铸造）；启用时必填。
     account_nickname: ""
-    # 接受 `123456`（QQ 风格数字群号）或 `wxg:别名`（gateway.wechat 会话别名）；
+    # 目标群的**微信显示名**（桥用 `open_chat` 按显示名打开会话）；别名由桥
+    # 本地铸造、首次轮询前不存在，不能写在这里。
     # 留空 = gateway.wechat.group_allowlist 为空 = 拒绝启动。
     group_allowlist: []
     # 最多参与的微信群数上限。
@@ -166,8 +167,8 @@ triggers:
   closed_sample_rate: 0.05
 
 groups:
-  # 接受 `123456`（QQ 风格数字群号）或 `wxg:别名`（微信会话，语义同
-  # gateway.wechat.group_allowlist）。留空 = 所有群都参与；填了就只在这些群里说话。
+  # 接受 `123456`（QQ 群号）或 `wxg:别名`（微信会话 id，由桥本地铸造）。
+  # 留空 = 所有群都参与；填了就只在这些群里说话。
   # 号之间用逗号分隔。
   whitelist: []
   blacklist: []
