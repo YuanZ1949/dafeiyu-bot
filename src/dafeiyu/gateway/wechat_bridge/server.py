@@ -29,7 +29,7 @@ import json
 import logging
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
 from http import HTTPStatus
-from typing import Any
+from typing import Any, cast
 
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
@@ -345,44 +345,94 @@ class BridgeServer:
         return receipt
 
 
+class _FrameSourceFailure:
+    """帧源迭代异常的中转信封：把生产任务里的异常原样抛回消费侧。"""
+
+    __slots__ = ("exc",)
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+
+_FRAME_SOURCE_END = object()
+
+
 async def pump_frames(
     server: BridgeServer,
     source: Iterable[dict[str, Any]] | AsyncIterable[dict[str, Any]],
     *,
     idle_timeout: float | None = None,
+    stall_limit: int = 0,
 ) -> None:
     """把帧源产出的每一帧灌进 `server.broadcast`（PART B 的下发通路）。
 
-    接受同步或异步迭代器；每个 await 都有显式超时，帧源长时间不出帧按停泵
-    处理，绝不把整个桥的主循环挂死。
+    接受同步或异步迭代器。帧源由独立的生产者任务驱动，消费侧只等队列：
+    `asyncio.wait_for` 超时会取消被等待的协程，直接取消 `__anext__` 会让
+    异步生成器进入不可恢复的状态，进而静默停泵——经队列中转后超时只取消
+    `Queue.get()`，帧源本身毫发无损。
 
-    `idle_timeout` 是「帧源多久不出帧就停泵」的显式接缝：默认 5s 保持原行为；
-    轮询循环的帧间隔可以长到 `WeChatConfig.poll_seconds`（默认 8s，且每轮至少
-    一帧 health），所以 `__main__` 会传 `max(5s, 2 * poll_seconds)`，否则健康的
-    8s 轮询会在空闲 5s 时被误停泵。
+    `idle_timeout` 是「帧源多久不出帧算一次空转」的显式接缝：默认 5s；
+    轮询循环每轮至少一帧 health，帧间隔约等于 `WeChatConfig.poll_seconds`，
+    所以 `__main__` 传 `max(5s, 2 * poll_seconds)`。
+
+    `stall_limit` 决定连续空转几次才真正停泵：默认 0 = 旧行为（第一次超时即
+    返回）；生产路径传 3——单次慢轮询只记警告并继续等待，连续 3 次才放弃。
+    真卡死时泵仍会退出，由 `__main__` 的完成回调请求停机、交给 supervisor
+    重启，不会出现「进程活着但永不推帧」的假活。
     """
     timeout = _AWAIT_TIMEOUT if idle_timeout is None else float(idle_timeout)
-    if hasattr(source, "__anext__"):
-        async def _iterate() -> AsyncIterable[dict[str, Any]]:
-            assert hasattr(source, "__anext__")
-            async for frame in source:  # type: ignore[union-attr]
-                yield frame
+    limit = max(0, int(stall_limit))
+    queue: asyncio.Queue[Any] = asyncio.Queue()
 
-        iterator = _iterate()
-    else:
-
-        async def _iterate() -> AsyncIterable[dict[str, Any]]:
-            for frame in source:
-                yield frame
-
-        iterator = _iterate()
-
-    while True:
+    async def _produce() -> None:
         try:
-            frame = await asyncio.wait_for(iterator.__anext__(), timeout)
-        except StopAsyncIteration:
-            return
-        except TimeoutError:
-            logger.warning("微信桥帧源超时无产出，停止灌帧")
-            return
-        await asyncio.wait_for(server.broadcast(frame), _AWAIT_TIMEOUT)
+            if hasattr(source, "__anext__"):
+                async_source = cast(AsyncIterable[dict[str, Any]], source)
+                async for frame in async_source:
+                    queue.put_nowait(frame)
+            else:
+                sync_source = cast(Iterable[dict[str, Any]], source)
+                for frame in sync_source:
+                    queue.put_nowait(frame)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - 原样转交给消费侧抛出
+            queue.put_nowait(_FrameSourceFailure(exc))
+        finally:
+            queue.put_nowait(_FRAME_SOURCE_END)
+
+    producer = asyncio.create_task(_produce(), name="wechat-bridge-frame-source")
+    stalls = 0
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout)
+            except TimeoutError:
+                stalls += 1
+                if limit <= 0:
+                    logger.warning("微信桥帧源超时无产出，停止灌帧")
+                    return
+                logger.warning(
+                    "微信桥帧源 %.1fs 无产出（%d/%d），继续等待",
+                    timeout,
+                    stalls,
+                    limit,
+                )
+                if stalls >= limit:
+                    logger.error(
+                        "微信桥帧源连续 %d 次无产出（%.1fs），停止灌帧",
+                        stalls,
+                        timeout,
+                    )
+                    return
+                continue
+            if item is _FRAME_SOURCE_END:
+                return
+            if isinstance(item, _FrameSourceFailure):
+                raise item.exc
+            stalls = 0
+            await asyncio.wait_for(server.broadcast(item), _AWAIT_TIMEOUT)
+    finally:
+        producer.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await producer

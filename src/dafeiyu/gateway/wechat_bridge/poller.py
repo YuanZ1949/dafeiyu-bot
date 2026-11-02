@@ -394,7 +394,7 @@ class PollingLoop:
 
     # ------------------------------------------------------------- 轮询
     async def frames(self) -> AsyncIterator[dict[str, Any]]:
-        """帧源：每轮先查杀开关，再逐群轮询，每轮结尾一帧 health。"""
+        """帧源：每轮先查杀开关，再逐群轮询，每群之后一帧 health。"""
         await self.start()
         try:
             while not self._stopped.is_set():
@@ -446,9 +446,15 @@ class PollingLoop:
                 raise
             except Exception as exc:  # noqa: BLE001 - 单群失败不该打断整轮
                 logger.warning("轮询会话 %r 失败，跳过本轮：%s", group, exc)
-                continue
-            for frame in frames:
-                yield frame
+            else:
+                for frame in frames:
+                    yield frame
+            if self._stopped.is_set():
+                return
+            # 每群之后补一帧心跳：把最大帧间隔钉在「单群耗时」（开窗+快照约 5s）
+            # 上。3 个群串行一轮 15s+，若只在轮末发心跳，帧泵的空转看门狗就会
+            # 把健康的多群轮询误判成卡死。
+            yield await self._health_frame(connected=True)
 
     async def _poll_group(self, group: str) -> list[dict[str, Any]]:
         handle = await self._ui_call(self.driver.open_chat, group)

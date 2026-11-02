@@ -496,6 +496,92 @@ async def test_pump_survives_poll_seconds_gap() -> None:
     assert len(slow.frames) == 1
 
 
+async def test_pump_stall_limit_tolerates_transient_gap() -> None:
+    """stall_limit>0：单次空转只记警告，慢轮询不该让帧泵退出。"""
+    server = _RecordingServer()
+
+    async def source() -> Any:
+        yield {"type": "health", **HEALTH_FRAME}
+        # 空窗 = 2.5 个 idle_timeout：连续超时 2 次 < stall_limit 3，随后恢复。
+        await asyncio.sleep(0.15)
+        yield {"type": "message", "chat_id": "wxg:g", "text": "迟到的帧"}
+
+    await asyncio.wait_for(
+        pump_frames(server, source(), idle_timeout=0.06, stall_limit=3), STEP
+    )
+    assert [frame["type"] for frame in server.frames] == ["health", "message"]
+
+
+async def test_pump_stall_limit_stops_pump_when_source_is_dead() -> None:
+    """连续空转达到 stall_limit 才停泵：真卡死仍会退出，不会无限等。"""
+    server = _RecordingServer()
+
+    async def source() -> Any:
+        yield {"type": "health", **HEALTH_FRAME}
+        await asyncio.Event().wait()  # 之后永不产出
+
+    started = asyncio.get_running_loop().time()
+    await asyncio.wait_for(
+        pump_frames(server, source(), idle_timeout=0.05, stall_limit=2), STEP
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+    assert len(server.frames) == 1
+    assert elapsed >= 0.10, "没等满 stall_limit 次空转就停泵了"
+
+
+async def test_run_exits_nonzero_when_pump_dies(tmp_path: Path) -> None:
+    """帧泵在轮询仍应继续时结束 = 入站静默失效：非 0 退出交给 supervisor 重启。"""
+    wechat = _wechat(kill_switch_file=str(tmp_path / "wechat.stop"))
+
+    class FakeDriver:
+        """本用例不触碰驱动。"""
+
+    class DeadPoller:
+        """帧源产一帧就结束，且没有 stop / 急停：模拟帧泵意外死亡。"""
+
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        async def start(self) -> None:
+            return None
+
+        async def request_send(self, fn: Any) -> Any:
+            return {"v": 1, "type": "health", "connected": True}
+
+        async def frames(self) -> Any:
+            yield {"v": 1, "type": "health", "connected": True, "logged_in": True}
+            return
+
+        @property
+        def stopped(self) -> bool:
+            return False
+
+        def abort_sends(self) -> int:
+            return 0
+
+        def stop(self, *, timeout: float = STEP) -> bool:
+            self.stop_calls += 1
+            return True
+
+    poller = DeadPoller()
+
+    async def command_handler(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any] | None:
+        return {"ok": True, "error_code": None, "delivered": "typed", "message_id": None}
+
+    run_task = asyncio.create_task(
+        bridge_main.run(
+            settings=SimpleNamespace(wechat=wechat),
+            driver_factory=FakeDriver,
+            command_handler=command_handler,
+            poller_factory=lambda _config, _driver: poller,
+        )
+    )
+    assert await asyncio.wait_for(run_task, STEP) == 1
+    assert poller.stop_calls == 1
+
+
 async def test_probe_and_bad_version_do_not_crash_loop() -> None:
     server = BridgeServer()
     port = await asyncio.wait_for(server.start(), STEP)
@@ -545,6 +631,11 @@ async def test_run_resume_restarts_pump(tmp_path: Path) -> None:
             self.resets = 0
             self.abort_calls = 0
             self.stop_calls = 0
+            self._stopped = False
+
+        @property
+        def stopped(self) -> bool:
+            return self._stopped
 
         async def start(self) -> None:
             return None
@@ -558,10 +649,13 @@ async def test_run_resume_restarts_pump(tmp_path: Path) -> None:
                 "logged_in": True,
                 "desktop": "interactive",
             }
-            return
+            # 真实轮询只会在 stop / 急停之后结束：单帧帧源等价于「已被急停」，
+            # 所以结束即置 stopped，别让 run() 把它判成「帧泵意外死亡」。
+            self._stopped = True
 
         def reset_for_resume(self) -> bool:
             self.resets += 1
+            self._stopped = False
             return True
 
         def abort_sends(self) -> int:

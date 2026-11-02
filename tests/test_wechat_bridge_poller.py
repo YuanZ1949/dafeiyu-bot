@@ -350,11 +350,13 @@ async def test_only_allowlisted_groups_are_polled_and_list_is_not_truncated(
     source = poller.frames()
     try:
         async def _one_round() -> None:
-            while True:
+            # 每群之后都有一帧 health，所以「一轮」= allowlist 长度帧心跳。
+            health_seen = 0
+            while health_seen < len(poller.allowlist):
                 frame = await _next_frame(source)
                 frames.append(frame)
                 if frame.get("type") == "health":
-                    return
+                    health_seen += 1
 
         await asyncio.wait_for(_one_round(), STEP)
     finally:
@@ -365,6 +367,41 @@ async def test_only_allowlisted_groups_are_polled_and_list_is_not_truncated(
     assert set(driver.opened) == {"群甲", "群乙"}
     assert all(name in wechat.group_allowlist for _, name in driver.calls)
     assert not any(name == "外部群" for _, name in driver.calls)
+
+
+async def test_poll_round_emits_health_after_each_group(tmp_path: Path) -> None:
+    """每群之后一帧心跳：多群串行轮询的最大帧间隔 = 单群耗时，而不是整轮耗时。
+
+    帧泵的空转看门狗按「单群耗时」量级设值；若只在轮末发心跳，3 个群一轮
+    15s+ 会把健康的多群轮询误判成卡死（正是入站静默停摆的根因）。
+    """
+    wechat = _wechat(tmp_path)
+    driver = FakeDriver()
+    poller = PollingLoop(
+        wechat,
+        driver,
+        probe=_probe,
+        registry=_Registry(),
+        poll_seconds=0.02,
+    )
+    await poller.start()
+    try:
+        async def _collect() -> list[str]:
+            seen: list[str] = []
+            async for frame in poller._poll_round():
+                seen.append(frame["type"])
+                if frame["type"] == "health":
+                    # 第 k 帧心跳必须在第 k 个群开窗之后立刻到达：证明心跳是按群
+                    # 发出的，而不是整轮结束才补一帧。
+                    assert len(driver.opened) == seen.count("health")
+            return seen
+
+        types = await asyncio.wait_for(_collect(), STEP)
+    finally:
+        poller.stop()
+
+    assert types.count("health") == len(poller.allowlist)
+    assert types[-1] == "health", "群循环必须以心跳收尾"
 
 
 # ------------------------------------------------ (d) 杀开关

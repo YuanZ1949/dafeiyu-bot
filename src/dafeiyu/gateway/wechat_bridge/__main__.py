@@ -55,6 +55,10 @@ _AWAIT_TIMEOUT = 5.0
 # 发送指令单独放宽：Sender 默认 20s 节奏，5s 会在消息仍要发出时先回 timeout，
 # 客户端按 §7.6 换新 id 重试就会重复发送。客户端 _SEND_TIMEOUT 必须更大。
 _SEND_ACTIONS = ("send_text", "send_at")
+#: 帧泵连续空转多少次才停泵。1 次 = 单次慢轮询就自杀，正是之前「帧源超时即
+#: return」导致假活的根源；3 次（≈ 6 × poll_seconds）给慢轮询留足余量，真卡死
+#: 时仍会退出，由 run() 的完成回调请求停机、交给 supervisor 重启。
+_PUMP_STALL_LIMIT = 3
 
 logger = logging.getLogger(__name__)
 
@@ -284,8 +288,9 @@ async def run(
 
     停机信号：SIGINT（进程收到 Ctrl+C）或动作 == "stop" 的指令；两者都会
     先中止发送/轮询，再广播一帧最终健康帧，join UIA 线程、关服务器并返回
-    exit code 0。拒绝启动时抛 `ConfigError`（消息含具体配置键名），由 `main`
-    兜底打印并退出非 0。
+    exit code 0。若帧泵在轮询仍应继续时意外结束（帧源耗尽/异常），请求停机
+    并返回 1，让 supervisor 重启进程；拒绝启动时抛 `ConfigError`（消息含具体
+    配置键名），由 `main` 兜底打印并退出非 0。
 
     `frame_source` 显式注入时按 PART A 的帧源通路运行（不启动 UIA 线程）；
     未注入时使用轮询循环（PART B 的默认路径）。
@@ -311,6 +316,9 @@ async def run(
     # 必须早于 server / resume 闭包初始化，否则 resume 可能撞上 UnboundLocalError。
     poller: Any | None = None
     pump_task: asyncio.Task[None] | None = None
+    # 帧泵意外死亡 = 入站通道静默失效（进程还活着但永不推帧）。这种状态必须在
+    # 本进程内可见：置标志 -> 请求停机 -> 非 0 退出，让 supervisor 自动重启。
+    pump_fatal = False
 
     def _signal_stop() -> None:
         # §7 / PART B：stop 的第一件事是中止发送（丢排队 job、停止新 UI op）。
@@ -323,6 +331,31 @@ async def run(
         if not stop.done():
             stop.set_result(None)
 
+    def _on_pump_done(task: asyncio.Task[None]) -> None:
+        nonlocal pump_fatal
+        if task.cancelled() or stop.done():
+            return
+        # 注入 frame_source 的测试/替身路径没有 poller：帧源耗尽属于正常结束。
+        if poller is None:
+            return
+        # 急停（kill switch）与主动停机已把 poller 置为 stopped，属于预期退出。
+        if getattr(poller, "stopped", False):
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "微信桥帧泵异常退出，请求停机等待 supervisor 重启", exc_info=exc
+            )
+        else:
+            logger.error("微信桥帧泵意外结束（帧源不再产出），请求停机等待 supervisor 重启")
+        pump_fatal = True
+        _signal_stop()
+
+    def _start_pump(source: FrameSource) -> asyncio.Task[None]:
+        pump = _spawn_pump(server, source, wechat)
+        pump.add_done_callback(_on_pump_done)
+        return pump
+
     async def _resume_bridge() -> dict[str, Any]:
         nonlocal pump_task
         raw_kill = str(getattr(wechat, "kill_switch_file", "") or "")
@@ -334,7 +367,7 @@ async def run(
         if not callable(reset) or not reset():
             return {"ok": False, "error_code": "not_resumable"}
         if pump_task is None or pump_task.done():
-            pump_task = _spawn_pump(server, poller.frames(), wechat)
+            pump_task = _start_pump(poller.frames())
         logger.info("微信桥收到 resume 指令，轮询已恢复")
         return {"ok": True}
 
@@ -415,7 +448,7 @@ async def run(
         with contextlib.suppress(Exception):
             await asyncio.wait_for(server.broadcast(startup_health), _AWAIT_TIMEOUT)
 
-        pump_task = _spawn_pump(server, source, wechat)
+        pump_task = _start_pump(source)
         await _wait_for_stop(stop, loop)
     finally:
         # 1) 让轮询循环和排队中的发送一起停手（幂等，可在异常路径重复调用）。
@@ -459,7 +492,7 @@ async def run(
         with contextlib.suppress(Exception):
             await asyncio.wait_for(server.stop(), _AWAIT_TIMEOUT)
             logger.info("微信桥已关闭")
-    return 0
+    return 1 if pump_fatal else 0
 
 
 def _health_frame(
@@ -520,8 +553,8 @@ async def _startup_health_frame(
 def _pump_idle_timeout(poll_seconds: float) -> float:
     """灌帧空转上限：必须大于一个完整轮询间隔（默认 8s）才不会误停泵。
 
-    轮询循环每轮至少产出一帧 health，所以最长帧间隔约等于 `poll_seconds`；
-    给两倍余量，且不低于 PART A 的 5s 默认值。
+    轮询循环每群之后都产出一帧 health，所以最长帧间隔是「单群耗时 + 轮询
+    间隔」；给两倍 `poll_seconds` 余量，且不低于 PART A 的 5s 默认值。
     """
     try:
         interval = float(poll_seconds)
@@ -533,7 +566,12 @@ def _pump_idle_timeout(poll_seconds: float) -> float:
 async def _pump_until_stopped(
     server: Any, source: FrameSource, *, idle_timeout: float | None = None
 ) -> None:
-    await pump_frames(server, source, idle_timeout=idle_timeout)
+    await pump_frames(
+        server,
+        source,
+        idle_timeout=idle_timeout,
+        stall_limit=_PUMP_STALL_LIMIT,
+    )
 
 
 def _spawn_pump(
