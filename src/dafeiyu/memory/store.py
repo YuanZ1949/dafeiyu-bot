@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from dafeiyu.config import ConfigError
 from dafeiyu.models import ChatType, Impression, Message, Summary, WeeklySummary
@@ -531,8 +531,54 @@ class Store:
         "delivered_messages",
     )
 
+    # v2 迁移要补 'qq:' 通道前缀的 channel-scoped id 列（表 → 列清单，逐表对应
+    # 上面的重建表）。v1 里 QQ 是唯一通道，这些列落库的是裸整数，TEXT 化只会变成
+    # '100'/'7' —— 不补前缀，老 QQ 记忆对 recent_messages('qq:100') 等查询全部
+    # 失联，channel_of('100') 还会直接抛错。只列 id 列：message_id/session_id/
+    # content 不带通道语义，绝不加前缀。
+    _V2_QQ_PREFIX_COLUMNS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "messages": ("chat_id", "user_id", "reply_to_user_id"),
+        "impressions": ("chat_id", "subject_user_id"),
+        "impression_cursors": ("chat_id",),
+        "chat_state": ("chat_id",),
+        "summaries": ("chat_id",),
+        "weekly_summaries": ("chat_id",),
+        "usage": ("chat_id",),
+        "opencode_sessions": ("chat_id",),
+        "brain_sessions": ("chat_id",),
+        "session_summaries": ("chat_id",),
+        "delivered_cursors": ("chat_id",),
+        "delivered_messages": ("chat_id",),
+    }
+
+    @staticmethod
+    def _qq_prefix_expr(column: str) -> str:
+        """SELECT 里给 id 列补 'qq:' 前缀的 CASE 表达式；对已带前缀的值幂等。"""
+        if column == "reply_to_user_id":
+            # 可空列：NULL 必须保持 NULL（掉进 ELSE 会拼出 'qq:' 垃圾），
+            # '' 保持 ''，其余补前缀。
+            return (
+                f"CASE WHEN {column} IS NULL THEN NULL"
+                f" WHEN {column} = '' THEN ''"
+                f" WHEN {column} LIKE 'qq:%' THEN {column}"
+                f" ELSE 'qq:' || {column} END"
+            )
+        if column == "subject_user_id":
+            # 空值哨兵：'' 与 empty-TEXT 化的 '0' 都解析成 ''，
+            # 绝不能变 'qq:0' 与真实 subject 撞车。
+            return (
+                f"CASE WHEN {column} IN ('', '0') THEN ''"
+                f" WHEN {column} LIKE 'qq:%' THEN {column}"
+                f" ELSE 'qq:' || {column} END"
+            )
+        return (
+            f"CASE WHEN {column} = '' THEN ''"
+            f" WHEN {column} LIKE 'qq:%' THEN {column}"
+            f" ELSE 'qq:' || {column} END"
+        )
+
     def _rebuild_v2_tables(self) -> None:
-        """v1 → v2 的表重建：12 张表的 id 列 TEXT 化，FTS5 与触发器按序还原。
+        """v1 → v2 的表重建：12 张表的 id 列 TEXT 化并补 'qq:' 前缀，FTS5 与触发器还原。
 
         必须运行在 ``BEGIN IMMEDIATE`` 事务内（调用方保证）：任何一步失败整体
         回滚，库里要么完整是 v1、要么完整是 v2。固定顺序：
@@ -548,9 +594,13 @@ class Store:
            ``RENAME`` 回原名。
            不用 ``ALTER TABLE ... RENAME`` 直接改名再迁数据：SQLite ≥3.25 会把
            触发器体/视图里的没改引用重写到临时名上。TEXT 亲和性在 INSERT 时把
-           v1 的整数值隐式转成十进制字符串（例如 100 → ``'100'``）；
+           v1 的整数值隐式转成十进制字符串（例如 100 → ``'100'``）；channel-scoped
+           id 列（_V2_QQ_PREFIX_COLUMNS）再用 CASE 补 ``'qq:'`` 通道前缀 —— 裸
+           '100' 对 ``recent_messages('qq:100')`` 是查不到的。旧表里已经有前缀的
+           值（幂等重跑）与 NULL/空值哨兵原样保留；
         4. 清掉 impressions 的空值哨兵：v1 的 ``0`` 会变成字符串 ``'0'``，
-           与真实 subject 撞车，统一改成 ``''``（新 DDL 默认值也是 ``''``）；
+           与真实 subject 撞车，统一改成 ``''``（新 DDL 默认值也是 ``''``；
+           步骤 3 的 CASE 已把哨兵解析成 ''，这条 UPDATE 是兜底，一并保留）；
         5. 按抄录的 DDL 原样重建索引、FTS 表与触发器，再各跑一次
            ``INSERT INTO <fts>(<fts>) VALUES('rebuild')`` 回填索引；
         6. ``PRAGMA foreign_key_check`` 必须为空，否则回滚拒迁。
@@ -605,8 +655,16 @@ class Store:
                         "请回滚后核对 _MIGRATIONS 列清单"
                     )
                 cols = ", ".join(new_cols)
+                # channel-scoped id 列用 CASE 补 'qq:' 前缀（幂等，哨兵不碰），
+                # 其余列原点搬 —— message_id/session_id/content 不带通道语义。
+                prefix_cols = self._V2_QQ_PREFIX_COLUMNS[table]
+                select_items = [
+                    self._qq_prefix_expr(col) if col in prefix_cols else col
+                    for col in new_cols
+                ]
                 conn.execute(
-                    f"INSERT INTO {table}_new ({cols}) SELECT {cols} FROM {table}"
+                    f"INSERT INTO {table}_new ({cols})"
+                    f" SELECT {', '.join(select_items)} FROM {table}"
                 )
             conn.execute(f"DROP TABLE IF EXISTS {table}")
             conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")

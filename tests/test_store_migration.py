@@ -11,7 +11,7 @@ from dafeiyu.memory.store import (
     _IMPRESSION_FTS_SCHEMA,
     _MESSAGE_FTS_SCHEMA,
 )
-from dafeiyu.models import ChatType, Message
+from dafeiyu.models import ChatType, Message, channel_of
 
 
 def test_old_impressions_table_gets_source_columns(tmp_path: Path) -> None:
@@ -407,8 +407,8 @@ def test_rebuild_fts_after_v2_migration(tmp_path: Path) -> None:
         store.add_message(
             Message(
                 chat_type=ChatType.GROUP,
-                chat_id="100",
-                user_id="7",
+                chat_id="qq:100",
+                user_id="qq:7",
                 message_id="mafter",
                 nickname="测试员",
                 content="迁移后新增的天气预报一条。",
@@ -428,9 +428,9 @@ def test_rebuild_fts_after_v2_migration(tmp_path: Path) -> None:
         assert conn.execute(
             "SELECT COUNT(*) FROM impressions"
         ).fetchone()[0] == 21
-        # 重建后的值是字符串（TEXT 亲和性隐式转换，不再整型回读）。
+        # 重建后的值是字符串且带 'qq:' 前缀（TEXT 亲和性 + CASE 补前缀）。
         assert conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE chat_id = '100'"
+            "SELECT COUNT(*) FROM messages WHERE chat_id = 'qq:100'"
         ).fetchone()[0] == 21
         # 恰好 3 个 messages 触发器，6 个全量。
         triggers = conn.execute(
@@ -455,7 +455,7 @@ def test_rebuild_fts_after_v2_migration(tmp_path: Path) -> None:
         assert "content='messages'" in m_sql and "content_rowid='id'" in m_sql
         assert "tokenize='unicode61'" in i_sql
         assert "content='impressions'" in i_sql
-        # 空值哨兵清零：v1 的 0 → '0' 被改成 ''，真实 subject 原样保留。
+        # 空值哨兵清零：v1 的 0 → '0' 被改成 ''，真实 subject 原样保留（带前缀）。
         assert conn.execute(
             "SELECT COUNT(*) FROM impressions WHERE subject_user_id = '0'"
         ).fetchone()[0] == 0
@@ -463,7 +463,7 @@ def test_rebuild_fts_after_v2_migration(tmp_path: Path) -> None:
             "SELECT COUNT(*) FROM impressions WHERE subject_user_id = ''"
         ).fetchone()[0] == 20
         assert conn.execute(
-            "SELECT COUNT(*) FROM impressions WHERE subject_user_id = '42'"
+            "SELECT COUNT(*) FROM impressions WHERE subject_user_id = 'qq:42'"
         ).fetchone()[0] == 1
         # 完整性。
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -579,3 +579,133 @@ def test_fresh_and_migrated_layout_identical(tmp_path: Path) -> None:
 
     assert trigger_sql(fresh_db) == trigger_sql(migrated_db)
 
+
+def test_migration_prefixes_legacy_qq_ids(tmp_path: Path) -> None:
+    """v1 裸整数 id 迁移后必须带 'qq:' 前缀：老 QQ 记忆不许失联。
+
+    只覆盖 TEXT 化（'100'）而不补前缀的话，recent_messages('qq:100') 返回
+    空、channel_of('100') 直接抛错。这里把 channel-scoped id 列全查一遍，
+    并验证 NULL/哨兵不受影响、FTS 命中数不变、重复初始化不二次加前缀。
+    """
+    db = tmp_path / "memory.db"
+    make_v1_db(db)
+
+    # 本测试局部扩种 v1 数据：含 reply_to_user_id 的 NULL 与 7 两例、
+    # impressions 的哨兵 0 与真实 42、以及四张带 chat_id 的状态表。
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            """
+            INSERT INTO messages
+                (chat_type, chat_id, message_id, user_id, nickname,
+                 content, timestamp)
+            VALUES ('group', 100, 'm-none', 7, '测试员', '天气预报多云带伞。', 1)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO messages
+                (chat_type, chat_id, message_id, user_id, nickname,
+                 content, timestamp, reply_to_user_id)
+            VALUES ('group', 100, 'm-reply', 7, '测试员', '回复也提天气预报', 2, 7)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO impressions
+                (chat_type, chat_id, subject_user_id, kind, content)
+            VALUES ('group', 100, 0, 'fact', '无主语印象')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO impressions
+                (chat_type, chat_id, subject_user_id, kind, content)
+            VALUES ('group', 100, 42, 'preference', '喜欢聊天气')
+            """
+        )
+        conn.execute(
+            "INSERT INTO chat_state (chat_type, chat_id, ambient_streak)"
+            " VALUES ('group', 100, 1)"
+        )
+        conn.execute(
+            "INSERT INTO summaries (chat_type, chat_id, date, content)"
+            " VALUES ('group', 100, '2026-01-01', '旧日程')"
+        )
+        conn.execute(
+            "INSERT INTO usage (chat_type, chat_id, date, purpose)"
+            " VALUES ('group', 100, '2026-01-01', 'chat')"
+        )
+        conn.execute(
+            "INSERT INTO delivered_cursors (chat_type, chat_id, last_message_id)"
+            " VALUES ('group', 100, 3)"
+        )
+        # 迁移前回填 v1 FTS 索引，记录内容命中水平：迁移必须只动 id，不动检索。
+        conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+    store = Store(db)
+    try:
+        store.init_schema()
+
+        # 老消息按 'qq:100' 重新可见，派生通道是 qq。
+        msgs = store.recent_messages(ChatType.GROUP, "qq:100", 10)
+        assert [m.message_id for m in msgs] == ["m-none", "m-reply"]
+        assert channel_of("qq:100") == "qq"
+
+        # FTS 内容检索照常：迁移前后命中数一致，且可按新 id 过滤。
+        total, hits = store.search_messages("天气预报", ChatType.GROUP, "qq:100")
+        assert total == 2
+        assert all("天气预报" in hit.content for hit in hits)
+
+        # 哨兵与可空列不受前缀污染。
+        conn2 = store._conn
+        assert conn2.execute(
+            "SELECT COUNT(*) FROM messages WHERE reply_to_user_id IS NULL"
+        ).fetchone()[0] == 1
+        assert conn2.execute(
+            "SELECT COUNT(*) FROM messages WHERE reply_to_user_id = 'qq:7'"
+        ).fetchone()[0] == 1
+        assert conn2.execute(
+            "SELECT COUNT(*) FROM impressions WHERE subject_user_id = ''"
+        ).fetchone()[0] == 1
+        assert conn2.execute(
+            "SELECT COUNT(*) FROM impressions WHERE subject_user_id = 'qq:42'"
+        ).fetchone()[0] == 1
+
+        def assert_all_ids_prefixed() -> None:
+            """全表全列：无裸 id、无二次前缀；非 id 列不许被加前缀。"""
+            for table, cols in Store._V2_QQ_PREFIX_COLUMNS.items():
+                for col in cols:
+                    row = conn2.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                        f" WHERE ({col} LIKE 'qq:qq:%' OR"
+                        f"  ({col} IS NOT NULL AND {col} <> ''"
+                        f"   AND {col} NOT LIKE 'qq:%'))"
+                    ).fetchone()
+                    assert row[0] == 0, f"{table}.{col} 前缀不对"
+            assert conn2.execute(
+                "SELECT COUNT(*) FROM messages WHERE message_id LIKE 'qq:%'"
+            ).fetchone()[0] == 0
+
+        assert_all_ids_prefixed()
+
+        # 状态表的 chat_id 落点抽查：旧行全部归到 'qq:100' 名下。
+        for table in ("chat_state", "summaries", "usage", "delivered_cursors"):
+            row = conn2.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE chat_id = 'qq:100'"
+            ).fetchone()
+            assert row[0] == 1, table
+
+        # 重复 init_schema 不许二次加前缀（'qq:qq:100' 不得出现）。
+        store.init_schema()
+        assert conn2.execute(
+            "SELECT COUNT(*) FROM messages WHERE chat_id = 'qq:100'"
+        ).fetchone()[0] == 2
+        assert_all_ids_prefixed()
+        assert db_version(conn2) == 2
+    finally:
+        store.close()
