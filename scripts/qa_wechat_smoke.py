@@ -108,11 +108,13 @@ DEFAULT_EVIDENCE_DIR = Path(
     os.environ.get("F3_EVIDENCE_DIR")
     or (REPO_ROOT / ".omo" / "evidence" / "F3-wechat-integration" / "raw")
 )
+#: 桥的本地身份表（cwd 相对路径，见 `identity.default_peers_path`）。
+PEERS_PATH = REPO_ROOT / "data" / "wechat-bridge" / "peers.json"
 
 _ALLOW_RE = re.compile(
     r"(?m)^(?P<indent>[ \t]*)allow_test_inject[ \t]*:[ \t]*"
     r"(?P<value>true|false|True|False|yes|no|on|off)"
-    r"(?P<suffix>[ \t]*(?:#.*)?)$"
+    r"(?P<suffix>[ \t]*(?:#.*)?\r?)$"
 )
 
 
@@ -286,6 +288,50 @@ def resolve_chat_id(allowlist: list[Any], alias_arg: str | None) -> str:
     if not alias:
         return ""
     return alias if alias.startswith("wxg:") else f"wxg:{alias}"
+
+
+def peers_chat_id(raw: Any, allowlist: list[Any]) -> str:
+    """从 `peers.json` 快照解析 allowlist 显示名对应的 `wxg:<alias>`。
+
+    桥只在首次轮询时铸造随机别名，配置里只能写群显示名；因此冒烟脚本必须
+    在桥启动后从身份表取真实 chat_id。同一群有多个存活别名时 fail-closed。
+    """
+    names = {str(item).strip() for item in allowlist if str(item).strip()}
+    if not names:
+        return ""
+    entries = raw.get("peers") if isinstance(raw, dict) else raw
+    if not isinstance(entries, list):
+        return ""
+    matches: dict[str, str] = {}
+    for item in entries:
+        if not isinstance(item, dict) or item.get("retired_at") is not None:
+            continue
+        if item.get("kind") != "group":
+            continue
+        alias = str(item.get("alias") or "").strip()
+        if not alias or alias == "self":
+            continue
+        display = str(item.get("display_name") or "").strip()
+        former = {
+            str(name).strip()
+            for name in (item.get("former_names") or [])
+            if str(name).strip()
+        }
+        hit = ({display} & names) or (former & names)
+        if hit:
+            matches[alias] = display or sorted(hit)[0]
+    if len(matches) > 1:
+        detail = ", ".join(
+            f"wxg:{alias}({display})" for alias, display in sorted(matches.items())
+        )
+        raise SmokeError(
+            "assert_failed",
+            f"peers.json 里目标群有多个存活别名，拒绝猜：{detail}",
+        )
+    if not matches:
+        return ""
+    alias, _display = next(iter(matches.items()))
+    return f"wxg:{alias}"
 
 
 def set_allow_test_inject(text: str, enabled: bool) -> str:
@@ -737,6 +783,25 @@ def _wait_connected(
     )
 
 
+def _wait_peer_chat_id(
+    info: dict[str, Any], deps: Deps, timeout: float
+) -> str:
+    """等桥首轮轮询把 allowlist 群写进 peers.json，再取真实别名。"""
+
+    def probe() -> str | None:
+        try:
+            raw = json.loads(deps.read_text(PEERS_PATH))
+        except (OSError, ValueError):
+            return None
+        return peers_chat_id(raw, info["allowlist"]) or None
+
+    chat_id = _wait_until(
+        "桥为 allowlist 群铸造会话别名", probe, timeout, deps
+    )
+    info["chat_id"] = chat_id
+    return chat_id
+
+
 def _wait_settled(
     client: ControlClient, chat_id: str, deps: Deps, quiet_seconds: float
 ) -> dict[str, Any]:
@@ -1019,6 +1084,19 @@ def _run_f3b(
     baseline_ids = _all_ids(baseline)
     baseline_bot = _bot_ids(baseline)
 
+    prompt = (
+        f"请用第二个微信账号在测试群 @{nickname} 发一条文本；群 chat_id = {chat_id}。"
+    )
+    _step(
+        "06-f3b-ready",
+        evidence_dir,
+        {
+            "chat_id": chat_id,
+            "nickname": nickname,
+            "prompt": prompt,
+            "timeout_seconds": human_timeout,
+        },
+    )
     print(
         "\n=== F3b：需要你做一个发送动作 ===\n"
         f"请用**第二个**微信账号（手机即可）在测试群 @{nickname} 发一条文本，\n"
@@ -1116,6 +1194,17 @@ def run_smoke(args: argparse.Namespace, deps: Deps) -> int:
                 _wait_http_ready(_control_base(info), proc, deps)
                 token = _wait_token(deps)
                 client = ControlClient(_control_base(info), token)
+                if not args.alias:
+                    # 首轮 open_chat + pull_messages(30) 在冷 UIA 上可能十几秒；
+                    # 桥每 poll_seconds 才轮一次，60s 余量太紧，给 180s。
+                    _wait_peer_chat_id(
+                        info, deps, max(180.0, info["poll_seconds"] * 6)
+                    )
+                    _step(
+                        "01-chat-id",
+                        evidence_dir,
+                        {"chat_id": info["chat_id"], "source": "peers.json"},
+                    )
                 _run_f3a(client, info, deps, evidence_dir)
                 _run_f3b(
                     client,

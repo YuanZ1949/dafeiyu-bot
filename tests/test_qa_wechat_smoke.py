@@ -209,8 +209,69 @@ def test_set_allow_test_inject_only_touches_its_line() -> None:
     assert "allow_test_inject: false" in forced
 
 
+def test_set_allow_test_inject_accepts_plain_crlf_line() -> None:
+    # Windows 下 Path.write_text 默认写 CRLF，且 YAML 往往没有行尾注释；
+    # 这种「值后面直接是 \r\n」的形态曾经匹配失败，导致冒烟在启动前就退出。
+    text = "gateway:\r\n  wechat:\r\n    allow_test_inject: true\r\n    enabled: true\r\n"
+    patched = smoke.set_allow_test_inject(text, False)
+    assert "    allow_test_inject: false\r\n" in patched
+    assert patched.count("\r\n") == text.count("\r\n")
+    assert patched.replace("false", "true", 1) == text
+
+
 def test_resolve_chat_id_accepts_alias_or_full_id() -> None:
     assert smoke.resolve_chat_id(["测试群"], None) == "wxg:测试群"
     assert smoke.resolve_chat_id(["测试群"], "别的群") == "wxg:别的群"
     assert smoke.resolve_chat_id([], "wxg:已带前缀") == "wxg:已带前缀"
     assert smoke.resolve_chat_id([], None) == ""
+
+
+def _peers(*items: dict[str, object]) -> dict[str, object]:
+    return {"v": 1, "peers": list(items)}
+
+
+def _peer(
+    alias: str,
+    display: str,
+    *,
+    kind: str = "group",
+    retired_at: object = None,
+    former: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "alias": alias,
+        "display_name": display,
+        "kind": kind,
+        "retired_at": retired_at,
+        "former_names": former or [],
+    }
+
+
+def test_peers_chat_id_resolves_live_group_alias() -> None:
+    raw = _peers(
+        _peer("abc123", "冒烟群"),
+        _peer("friend1", "冒烟群", kind="friend"),
+        _peer("old999", "冒烟群", retired_at=1700000000.0),
+    )
+    assert smoke.peers_chat_id(raw, ["冒烟群"]) == "wxg:abc123"
+
+
+def test_peers_chat_id_matches_former_name() -> None:
+    raw = _peers(_peer("abc123", "新群名", former=["冒烟群"]))
+    assert smoke.peers_chat_id(raw, ["冒烟群"]) == "wxg:abc123"
+
+
+def test_peers_chat_id_returns_empty_before_first_poll() -> None:
+    assert smoke.peers_chat_id(_peers(), ["冒烟群"]) == ""
+    assert smoke.peers_chat_id({"not": "a snapshot"}, ["冒烟群"]) == ""
+
+
+def test_peers_chat_id_fails_closed_on_ambiguous_alias() -> None:
+    raw = _peers(_peer("abc123", "冒烟群"), _peer("def456", "冒烟群"))
+    try:
+        smoke.peers_chat_id(raw, ["冒烟群"])
+    except smoke.SmokeError as exc:
+        assert exc.code == "assert_failed"
+        assert "多个存活别名" in exc.detail
+    else:  # pragma: no cover - 明确失败比静默猜测重要
+        raise AssertionError("同名群有多个存活别名时必须拒绝猜测")
