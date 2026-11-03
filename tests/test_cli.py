@@ -128,7 +128,6 @@ def _doctor_config(**overrides) -> WeChatConfig:
         "bridge_port": 8790,
         "bridge_token": "",
         "account_nickname": "小号",
-        "group_allowlist": frozenset({"群一"}),
     }
     values.update(overrides)
     return WeChatConfig(**values)
@@ -173,9 +172,9 @@ def test_doctor_json_has_eight_wechat_checks(monkeypatch, capsys) -> None:
     assert rc == 0
 
 
-def test_doctor_json_missing_allowlist_fails(monkeypatch, capsys) -> None:
+def test_doctor_json_missing_nickname_fails(monkeypatch, capsys) -> None:
     _patch_doctor_config(
-        monkeypatch, _doctor_config(group_allowlist=frozenset())
+        monkeypatch, _doctor_config(account_nickname="")
     )
     _patch_doctor_probes(monkeypatch)
 
@@ -185,7 +184,7 @@ def test_doctor_json_missing_allowlist_fails(monkeypatch, capsys) -> None:
     assert payload["ok"] is False
     assert rc == 1
     details = " ".join(check["detail"] for check in payload["checks"])
-    assert "group_allowlist" in details
+    assert "account_nickname" in details
 
 
 def test_doctor_json_disabled_all_skip_ok_true(monkeypatch, capsys) -> None:

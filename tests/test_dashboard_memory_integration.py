@@ -313,7 +313,7 @@ async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
 
         config = await (await dash.get("/api/config")).json()
         assert config["brain"]["provider"] == "token"
-        assert config["cooldown"] == {"tool_hint_seconds": 60.0}
+        assert config["cooldown"] == {}
         assert config["behavior"]["chat_intensity"] == "normal"
         assert config["memory"]["retention_days"] == 180
 

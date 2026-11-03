@@ -283,7 +283,6 @@ gateway:
   wechat:
     enabled: true
     account_nickname: 小鲸鱼
-    group_allowlist: ["小鲸鱼测试群", "123456"]
 """
 
 
@@ -294,8 +293,6 @@ def test_wechat_block_defaults(tmp_path: Path) -> None:
     assert cfg.bridge_port == 8790
     assert cfg.bridge_token == ""
     assert cfg.account_nickname == ""
-    assert cfg.group_allowlist == frozenset()
-    assert cfg.max_groups == 3
     assert cfg.poll_seconds == 8.0
     assert cfg.send_min_interval_seconds == 20.0
     assert cfg.send_max_per_hour == 20
@@ -341,58 +338,19 @@ def test_wechat_ready_config_loads(tmp_path: Path) -> None:
     assert settings.gateway.provider == "both"
     assert settings.wechat.enabled is True
     assert settings.wechat.account_nickname == "小鲸鱼"
-    assert settings.wechat.group_allowlist == frozenset(
-        {"小鲸鱼测试群", "123456"}
-    )
 
 
-def test_wechat_allowlist_is_display_names_not_channel_ids(
-    tmp_path: Path,
-) -> None:
-    """允许名单是 `open_chat` 的群显示名：不补 `qq:`、不 casefold。
-
-    别名由桥首次轮询时随机铸造（`uuid4().hex[:12]`），无法预先写进配置；
-    若这里按跨通道 id 解析，桥启动后拿 `qq:123456`/`wxg:abc` 当群名会永远
-    打不开会话。
-    """
+def test_wechat_enabled_without_allowlist_is_ready(tmp_path: Path) -> None:
     settings = load(
         tmp_path,
         "gateway:\n"
+        "  provider: wechat\n"
         "  wechat:\n"
         "    enabled: true\n"
-        "    account_nickname: 小鲸鱼\n"
-        '    group_allowlist: ["123456", "WeChat Group"]\n',
+        "    account_nickname: 小鲸鱼\n",
     )
-    assert settings.wechat.group_allowlist == frozenset({"123456", "WeChat Group"})
-
-
-def test_wechat_allowlist_rejects_empty_entries(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="group_allowlist"):
-        load(
-            tmp_path,
-            "gateway:\n"
-            "  wechat:\n"
-            "    enabled: true\n"
-            '    group_allowlist: ["  "]\n',
-        )
-
-
-def test_wechat_empty_allowlist_only_warns(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    with caplog.at_level("WARNING", logger="dafeiyu.config"):
-        settings = load(
-            tmp_path,
-            "gateway:\n"
-            "  provider: wechat\n"
-            "  wechat:\n"
-            "    enabled: true\n"
-            "    account_nickname: 小鲸鱼\n",
-        )
     assert settings.wechat.enabled is True
-    assert settings.wechat.group_allowlist == frozenset()
     assert settings.gateway.provider == "wechat"
-    assert "group_allowlist 为空" in caplog.text
 
 
 def test_wechat_empty_nickname_only_warns(
@@ -403,8 +361,7 @@ def test_wechat_empty_nickname_only_warns(
             tmp_path,
             "gateway:\n"
             "  wechat:\n"
-            "    enabled: true\n"
-            '    group_allowlist: ["小鲸鱼测试群"]\n',
+            "    enabled: true\n",
         )
     assert settings.wechat.enabled is True
     assert settings.wechat.account_nickname == ""

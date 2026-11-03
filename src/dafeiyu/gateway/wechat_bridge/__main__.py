@@ -2,9 +2,10 @@
 
 用法：`python -m dafeiyu.gateway.wechat_bridge`（见 `run` / `main`）。
 
-启动即 fail-closed：`gateway.wechat.enabled`、非空 `group_allowlist`、
-非空 `account_nickname`、`len(group_allowlist) <= max_groups`，缺一项直接
-`ConfigError` 拒绝启动（消息里只提配置键名）。
+启动即 fail-closed：`gateway.wechat.enabled`、非空 `account_nickname`，以及
+出站后端（hook/auto 需要 `hook_url`，hook 需要本地库）缺一项直接
+`ConfigError` 拒绝启动（消息里只提配置键名）。轮询/发送范围只看面板白名单
+（`data/settings.local.yaml` 的 `groups.whitelist`）。
 
 一切触到 pyweixin 的 import 都在函数体内（`_default_driver_factory` /
 `_default_poller_factory`），保证 `--help` 在没装 pyweixin 的机器上退出 0；
@@ -12,7 +13,7 @@
 
 PART B 接线：
 -   没注入 `frame_source` 时，服务器监听成功后启动 `poller.PollingLoop`
-    的专用 STA/UIA 线程，轮询 allowlist 并把 message/resync/health 帧交给
+    的专用 STA/UIA 线程，按面板白名单轮询并把 message/resync/health 帧交给
     `server.pump_frames`；
 -   `frame_source=` 仍可注入（PART A 测试/离线回放），此时不启动 UIA 线程；
 -   `poller_factory=` 是测试接缝（默认 `PollingLoop(wechat, driver)`）；
@@ -260,9 +261,7 @@ def _validate_send(
     return chat_id.strip(), text, at
 
 
-def _resolve_chat_name(
-    poller: Any, allowlist: Any, chat_id: str
-) -> str:
+def _resolve_chat_name(poller: Any, chat_id: str) -> str:
     """`wxg:<alias>` -> 微信显示名；只读注册表，绝不 resolve 出新别名。"""
     alias = chat_id[4:].strip()
     if not alias or alias == "self":
@@ -274,14 +273,14 @@ def _resolve_chat_name(
     name = str(getattr(peer, "display_name", "") or "").strip()
     if peer is None or not getattr(peer, "live", False) or not name:
         raise _CommandError("chat_name_unresolved")
-    # 面板白名单是唯一操作面：poller 有 `allows_chat` 就交给它判定
-    # （空白名单 = 不限群）；没有面板接缝的旧测试/替身仍按 allowlist 判定。
+    # 白名单只有面板一个来源：poller 有 `allows_chat` 就交给它判定
+    # （空白名单 = 不限群）。没有这个接缝的旧测试替身，注册表已经确认是
+    # 存活群会话，直接放行。
     gate = getattr(poller, "allows_chat", None)
     if callable(gate):
         allowed = bool(gate(chat_id))
     else:
-        allowed_names = {str(group).strip() for group in (allowlist or ())}
-        allowed = getattr(peer, "kind", "group") == "group" and name in allowed_names
+        allowed = getattr(peer, "kind", "group") == "group"
     if not allowed:
         raise _CommandError("chat_not_allowed")
     return name
@@ -428,9 +427,7 @@ async def run(
             if at:
                 # P0 不支持定向 @：明确失败，绝不悄悄丢掉 @ 当普通消息发。
                 return _failed("unsupported_at")
-            name = _resolve_chat_name(
-                poller, getattr(wechat, "group_allowlist", ()), chat_id
-            )
+            name = _resolve_chat_name(poller, chat_id)
             if not sender_holder:
                 raise _CommandError("not_ready")
             sender = sender_holder[0]
@@ -677,19 +674,9 @@ def _startup_checks(wechat: WeChatConfig) -> None:
         raise ConfigError(
             "gateway.wechat.enabled 是 false：微信桥已停用，把 enabled 改为 true 再启动"
         )
-    if not wechat.group_allowlist:
-        raise ConfigError(
-            "gateway.wechat.group_allowlist 为空：微信桥没有可轮询的群"
-        )
     if not wechat.account_nickname:
         raise ConfigError(
             "gateway.wechat.account_nickname 为空：无法判定是否被 @"
-        )
-    if len(wechat.group_allowlist) > wechat.max_groups:
-        raise ConfigError(
-            f"gateway.wechat.group_allowlist 有 {len(wechat.group_allowlist)} 个群，"
-            f"超过 gateway.wechat.max_groups={wechat.max_groups}："
-            "先调大 max_groups 或精简 group_allowlist"
         )
     mode = str(getattr(wechat, "outbound", "uia") or "uia").strip().lower()
     if mode in ("hook", "auto") and not str(

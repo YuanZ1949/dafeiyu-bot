@@ -306,7 +306,7 @@ def _default_probe(wechat: Any) -> Callable[[bool], dict[str, Any]]:
 
 
 class PollingLoop:
-    """按 allowlist 轮询微信群并把事件帧交给调用方（sink / async 迭代器）。
+    """按面板白名单轮询微信群并把事件帧交给调用方（sink / async 迭代器）。
 
     参数都是鸭子类型，测试可以注入：假驱动、假 probe、假 registry、临时
     kill-switch 路径。
@@ -335,8 +335,9 @@ class PollingLoop:
         self.localdb = localdb
         # 面板白名单（可选）：返回 `{"wxg:<alias>", ...}`，None = 读不出来。
         # 面板是用户的唯一操作面：非空只碰列出的群，空 = 不限制（与面板的
-        # `empty_means:"all"` 一致）。None 时退回 `group_allowlist`。
+        # `empty_means:"all"` 一致）。读不出来时 fail-closed：不轮询、不发送。
         self._panel = panel
+        self._panel_none_warned = False
         self.ui = ui if ui is not None else UiThread()
         self._owns_ui = ui is None
         if registry is None:
@@ -363,11 +364,6 @@ class PollingLoop:
         self.full_sweep_seconds = max(0.0, sweep)
         self._last_full_sweep = 0.0
         self._skip_scan_until = 0.0
-        # 稳定顺序 + 绝不截断：allowlist 是什么就轮询什么，不做「只取前 N 个」。
-        self.allowlist: tuple[str, ...] = tuple(
-            sorted(str(group) for group in (getattr(wechat, "group_allowlist", ()) or ()))
-        )
-        self._allowset = frozenset(self.allowlist)
         account_nickname = str(getattr(wechat, "account_nickname", "") or "")
         self._account_nickname = account_nickname
 
@@ -535,14 +531,24 @@ class PollingLoop:
 
     # ------------------------------------------------------- 轮询/发送范围
     def _panel_whitelist(self) -> frozenset[str] | None:
-        """面板白名单；未接面板或读取抛错时返回 None（退回配置 allowlist）。"""
+        """面板白名单；未接面板或读取抛错时返回 None（fail-closed）。"""
         if self._panel is None:
             return None
         try:
-            return self._panel()
+            panel = self._panel()
         except Exception as exc:  # noqa: BLE001 - 面板坏了不能拖垮轮询
-            logger.warning("读取面板白名单失败，本轮按配置 allowlist 处理：%s", exc)
+            logger.warning("读取面板白名单失败，本轮按「无群可轮询」处理：%s", exc)
             return None
+        if panel is None and not self._panel_none_warned:
+            # 面板返回 None = `data/settings.local.yaml` 存在但从没成功解析过。
+            # 这时的「空」不是用户意图，不能当成 empty_means:"all" 放开全部群；
+            # 也没有配置 allowlist 可以退，只能 fail-closed：不轮询、不发送。
+            logger.warning(
+                "面板白名单不可读（settings.local.yaml 从未成功解析）："
+                "本轮不轮询任何群，也不放行任何发送"
+            )
+            self._panel_none_warned = True
+        return panel
 
     def _peer(self, alias: str) -> Any | None:
         lookup = getattr(self.registry, "by_alias", None)
@@ -570,18 +576,18 @@ class PollingLoop:
         return tuple(sorted({str(name).strip() for name in raw if str(name).strip()}))
 
     def _scope(self) -> tuple[str, ...]:
-        """本轮允许轮询的群显示名；面板优先，空白名单 = 不限制。
+        """本轮允许轮询的群显示名；面板是唯一来源。
 
         - 面板白名单非空：只返回其中能解析成存活群会话的那些；
-        - 面板白名单为空：返回本地库枚举到的全部群（本地库不可用时退回配置
-          `group_allowlist`——UIA 没有可靠的会话清单，宁可少开窗）；
-        - 面板读不出来：退回配置 `group_allowlist`（fail-closed）。
+        - 面板白名单为空：返回本地库枚举到的全部群（本地库不能枚举时一个
+          都不轮询——UIA 没有可靠的会话清单，宁可少开窗）；
+        - 面板读不出来（None）：fail-closed，返回空（不轮询任何群）。
         """
         panel = self._panel_whitelist()
         if panel is None:
-            return self.allowlist
+            return ()
         if not panel:
-            return self._localdb_group_names() or self.allowlist
+            return self._localdb_group_names()
         names: set[str] = set()
         for chat_id in panel:
             alias = _alias_of(chat_id)
@@ -598,29 +604,19 @@ class PollingLoop:
         return tuple(sorted(names))
 
     def allows_chat(self, chat_id: str) -> bool:
-        """出站闸门：面板白名单非空时只放行列出的会话，空 = 不限群。"""
+        """出站闸门：面板白名单非空时只放行列出的会话，空 = 不限群。
+
+        面板读不出来（None）时一律拒绝：没有可信的白名单就不发送。
+        """
         if _alias_of(chat_id) is None:
             # 桥只管微信会话：面板放开的只是「哪些群」，不是别的通道。
             return False
         panel = self._panel_whitelist()
         if panel is None:
-            return self._legacy_allows_chat(chat_id)
+            return False
         if panel:
             return str(chat_id or "").strip() in panel
         return True
-
-    def _legacy_allows_chat(self, chat_id: str) -> bool:
-        """没有面板时的旧判定：会话必须解析成存活群，且在配置 allowlist 里。"""
-        alias = _alias_of(chat_id)
-        if alias is None:
-            return False
-        peer = self._peer(alias)
-        if peer is None or not getattr(peer, "live", False):
-            return False
-        if str(getattr(peer, "kind", "group")) != "group":
-            return False
-        name = str(getattr(peer, "display_name", "") or "").strip()
-        return bool(name) and name in self._allowset
 
     async def _poll_round(
         self, groups: Iterable[str] | None = None

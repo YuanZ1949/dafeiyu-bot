@@ -606,19 +606,13 @@ def probe_wechat(config=None) -> list[dict[str, str]]:
                 )
 
     # (8) config readiness
-    allowlist = getattr(cfg, "group_allowlist", None) or ()
     nickname = str(getattr(cfg, "account_nickname", "") or "").strip()
-    missing: list[str] = []
-    if not allowlist:
-        missing.append("group_allowlist")
     if not nickname:
-        missing.append("account_nickname")
-    if missing:
         checks.append(
             _check(
                 "wechat.config_ready",
                 "FAIL",
-                f"gateway.wechat.enabled=true 但缺少：{'、'.join(missing)}",
+                "gateway.wechat.enabled=true 但缺少：account_nickname",
             )
         )
     else:
@@ -626,7 +620,7 @@ def probe_wechat(config=None) -> list[dict[str, str]]:
             _check(
                 "wechat.config_ready",
                 "PASS",
-                f"配置齐备（白名单 {len(allowlist)} 个群，昵称 {nickname}）",
+                f"配置齐备（昵称 {nickname}；群范围以面板白名单 groups.whitelist 为准）",
             )
         )
 
@@ -652,11 +646,6 @@ def format_wechat_config(config) -> str:
     port = getattr(cfg, "bridge_port", 8790)
     token = getattr(cfg, "bridge_token", "") or ""
     nickname = str(getattr(cfg, "account_nickname", "") or "").strip() or "—"
-    allowlist = getattr(cfg, "group_allowlist", None) or ()
-    groups = sorted(str(group) for group in allowlist)
-    allowlist_text = (
-        f"{len(groups)} 个：{'、'.join(groups)}" if groups else "0 个"
-    )
     version_min = str(getattr(cfg, "version_min", "4.1.6") or "4.1.6")
     language = str(getattr(cfg, "language", "zh-CN") or "zh-CN")
     kill_switch_file = str(
@@ -671,7 +660,7 @@ def format_wechat_config(config) -> str:
         f"  bridge_port：{port}",
         f"  bridge_token：{'已配置（不显示）' if token else '未配置'}",
         f"  account_nickname：{nickname}",
-        f"  group_allowlist：{allowlist_text}",
+        "  群范围：面板白名单 groups.whitelist（空 = 不限制）",
         f"  version_min：{version_min}",
         f"  language：{language}",
         f"  kill_switch_file：{kill_switch_file}",

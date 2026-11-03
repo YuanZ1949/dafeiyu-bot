@@ -68,7 +68,6 @@ def make_wx_config(**overrides: object) -> WeChatConfig:
         "bridge_port": 8790,
         "bridge_token": "",
         "account_nickname": "小号",
-        "group_allowlist": frozenset({"g1"}),
         # poll_seconds 要小：陈旧健康判定是 3 × poll_seconds。
         "poll_seconds": 0.2,
         "echo_window_seconds": 120.0,
@@ -113,20 +112,9 @@ def add_msg(
 # ---------------------------------------------------------------------- start()
 
 
-async def test_empty_allowlist_start_raises_config_error_with_key_name() -> None:
-    # 闸门 ③：group_allowlist 为空，start() 必须抛 ConfigError 且消息含键名。
-    adapter = WeChatAdapter(WeChatConfig(account_nickname="小号"))
-
-    with pytest.raises(ConfigError, match="group_allowlist"):
-        await adapter.start()
-
-    # 配置无效就不许留下轮询任务：失败态必须一眼可辨，而不是静默空转。
-    assert adapter._task is None
-
-
 async def test_empty_nickname_start_raises_config_error_with_key_name() -> None:
     # 闸门 ③：account_nickname 为空同样拒绝，且消息里点名这个键。
-    adapter = WeChatAdapter(WeChatConfig(group_allowlist=frozenset({"g1"})))
+    adapter = WeChatAdapter(WeChatConfig())
 
     with pytest.raises(ConfigError, match="account_nickname"):
         await adapter.start()

@@ -36,6 +36,9 @@ MODEL_CAPABILITIES = {"tools": True, "vision": False}
 SUPPORTED_MODES = ("free", "key", "local_model")
 # 相对配置目录的密钥文件引用；自备 Key 档的默认值（也是该档唯一的意义所在）。
 DEFAULT_KEY_REL = "../../../secrets/provider.key"
+# 联网搜索后端：tinyfish 的 API Key 是可选的，没配 key 时走免费额度，
+# 三档都带上，免得免费档只能 webfetch 抓 Bing。
+WEBSEARCH_PROVIDER = "tinyfish"
 
 
 def normalize_base_url(url: str) -> str:
@@ -73,6 +76,7 @@ def _key_config(cfg: BrainConfig, key_rel: str | None) -> dict[str, Any]:
     return {
         "model": f"{KEY_PROVIDER_ID}/{model}",
         "plugins": [],
+        "websearch": {"provider": WEBSEARCH_PROVIDER},
         "providers": {
             KEY_PROVIDER_ID: {
                 "package": PROVIDER_PACKAGE,
@@ -100,6 +104,7 @@ def _local_config(
     return {
         "model": f"{LOCAL_PROVIDER_ID}/{model}",
         "plugins": [],
+        "websearch": {"provider": WEBSEARCH_PROVIDER},
         "providers": {
             LOCAL_PROVIDER_ID: {
                 "package": PROVIDER_PACKAGE,
@@ -143,12 +148,17 @@ def build_config(
       `dafeiyu-local/<local.model>`，可选 apiKey（本地服务需要令牌时）与 lean；
       本地档不继承 key 档的默认引用。
 
+    三档都带 `websearch.provider`（默认 tinyfish：无 key 也能用免费额度）。
     两档 provider 的模型条目都带 `limit.context` / `limit.output` / `capabilities`。
     未知档位直接报错，避免悄悄落回免费形状。
     """
     if mode == "free":
         # 免费档不碰用户密钥与本地端点，key_rel / local 一律忽略。
-        return {"model": FREE_MODEL, "plugins": []}
+        return {
+            "model": FREE_MODEL,
+            "plugins": [],
+            "websearch": {"provider": WEBSEARCH_PROVIDER},
+        }
     if mode == "key":
         resolved = DEFAULT_KEY_REL if key_rel is _UNSET_KEY_REL else key_rel
         return _key_config(cfg, resolved)
@@ -212,10 +222,12 @@ def _agent_permissions(lean: bool) -> list[str]:
             "  - action: webfetch",
             '    resource: "*"',
             "    effect: allow",
+            "  - action: websearch",
+            '    resource: "*"',
+            "    effect: allow",
         ]
     for action in (
         "shell",
-        "websearch",
         "skill",
         "subagent",
         "question",
@@ -264,7 +276,7 @@ def build_agent(
     否则 model/permissions 整段失效、回落到默认值），因此 `AGENT_MARK` 落在
     闭合 `---` 之后的正文首行，再空一行接人设正文。
 
-    lean=True 时去掉 read/edit 与 webfetch 白名单（工作区与联网都不开），
+    lean=True 时去掉 read/edit、webfetch、websearch 白名单（工作区与联网都不开），
     并在正文末尾补一句「本轮没有工具」；deny 通配与密钥 deny 保留。
     """
     cfg = cfg if cfg is not None else BrainConfig(mode=mode)
@@ -274,8 +286,8 @@ def build_agent(
         "---",
         f"description: {AGENT_DESCRIPTION}",
         "mode: primary",
-        "# 4 步给「查网页 → 读结果 → 写笔记 → 出 JSON」留余量；最后一步仍会移除工具。",
-        "steps: 4",
+        "# 6 步给「搜索/抓取 → 翻结果 → 补查 → 写笔记 → 出 JSON」留余量；最后一步仍会移除工具。",
+        "steps: 6",
         "# 钉住模型：全局默认变了也不该静默改变 bot 行为。",
         f"model: {model}",
         *_agent_permissions(lean),
@@ -298,7 +310,7 @@ def _looks_generated(text: str) -> bool:
     另一类生成物每次都被当成手改件、白备份一遍。
 
     标记在正文首行（前置区之后），不再位于文件开头，所以不能只用 startswith。
-    窗口取 120 行而不是 60：permissions 有 14 条 deny/allow（每条 3 行），
+    窗口取 120 行而不是 60：permissions 有 18 条 deny/allow（每条 3 行），
     整个前置区就有 69 行，标记落在第 70 行；窗口太窄会把自家文件当成手改件、
     每次运行都白备份一遍。窗口仍只覆盖前置区，不会把正文里的偶发同名字串
     误判成生成物。

@@ -70,7 +70,6 @@ from .secrets_store import (
     secret_exists,
     write_secret,
 )
-from .service import TOOL_HINT_INTERVAL_SECONDS
 from .settings_local import OverrideError, read_overrides, write_overrides
 from .supervisor.reload_client import reload_opencode
 from .timeutil import SHANGHAI, now_shanghai
@@ -1775,9 +1774,7 @@ class BrainControl:
                 "max_reply_chars_technical": persona.max_reply_chars_technical,
                 "os_probability": persona.os_probability,
             },
-            "cooldown": {
-                "tool_hint_seconds": TOOL_HINT_INTERVAL_SECONDS,
-            },
+            "cooldown": {},
             "behavior": self.behavior_snapshot(),
             "rate_limit": {
                 "threshold": RATE_LIMIT_THRESHOLD,

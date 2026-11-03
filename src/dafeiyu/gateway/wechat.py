@@ -178,10 +178,6 @@ class WeChatAdapter:
 
     def _validate_config(self) -> None:
         """就绪度在加载阶段只告警，真正拒绝发生在这里（doctor 仍能出报告）。"""
-        if not self._config.group_allowlist:
-            raise ConfigError(
-                "缺少 gateway.wechat.group_allowlist：微信通道没有可轮询的群"
-            )
         if not self._config.account_nickname:
             raise ConfigError(
                 "缺少 gateway.wechat.account_nickname：无法判定是否被 @"

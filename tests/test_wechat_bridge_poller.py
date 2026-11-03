@@ -51,13 +51,51 @@ def _wechat(tmp_path: Path, **overrides: Any) -> WeChatConfig:
         "bridge_port": 0,
         "bridge_token": TOKEN,
         "account_nickname": "小助手",
-        "group_allowlist": frozenset(GROUPS),
-        "max_groups": 3,
         "poll_seconds": 0.02,
         "kill_switch_file": str(tmp_path / "wechat.stop"),
     }
     defaults.update(overrides)
     return WeChatConfig(**defaults)
+
+
+ALL_GROUPS = tuple(sorted(GROUPS))
+
+
+class _GroupNamesLocalDb:
+    """只提供群名枚举的本地库：不声明 available，轮询仍走 UIA 开窗。"""
+
+    available = False
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        self._names = names
+
+    def group_names(self) -> tuple[str, ...]:
+        return self._names
+
+
+def _all_groups_panel() -> frozenset[str]:
+    """面板白名单为空 = 不限制；群范围由本地库枚举。"""
+    return frozenset()
+
+
+def _loop(
+    wechat: WeChatConfig,
+    driver: Any,
+    *,
+    groups: tuple[str, ...] = GROUPS,
+    **kwargs: Any,
+) -> PollingLoop:
+    """按「面板空白名单 + 本地库枚举」构造轮询循环（群范围=groups）。"""
+    kwargs.setdefault("poll_seconds", 0.02)
+    return PollingLoop(
+        wechat,
+        driver,
+        probe=_probe,
+        registry=_Registry(),
+        localdb=_GroupNamesLocalDb(groups),
+        panel=_all_groups_panel,
+        **kwargs,
+    )
 
 
 def _probe(connected: bool) -> dict[str, Any]:
@@ -228,13 +266,7 @@ async def test_run_lifecycle_three_messages_then_stop(tmp_path: Path) -> None:
         return server
 
     def poller_factory(config: WeChatConfig, drv: Any) -> PollingLoop:
-        return PollingLoop(
-            config,
-            drv,
-            probe=_probe,
-            registry=_Registry(),
-            poll_seconds=0.02,
-        )
+        return _loop(config, drv)
 
     tasks_before = asyncio.all_tasks()
     threads_before = threading.active_count()
@@ -299,13 +331,7 @@ async def _drive(ws: Any) -> Any:
 async def test_all_driver_calls_run_on_one_non_loop_thread(tmp_path: Path) -> None:
     wechat = _wechat(tmp_path)
     driver = FakeDriver()
-    poller = PollingLoop(
-        wechat,
-        driver,
-        probe=_probe,
-        registry=_Registry(),
-        poll_seconds=0.02,
-    )
+    poller = _loop(wechat, driver)
     loop_thread = threading.get_ident()
     threads_before = threading.active_count()
     frames: list[dict[str, Any]] = []
@@ -326,33 +352,27 @@ async def test_all_driver_calls_run_on_one_non_loop_thread(tmp_path: Path) -> No
     assert threading.active_count() == threads_before
 
 
-# ------------------------------------------------ (c) allowlist 边界
-async def test_only_allowlisted_groups_are_polled_and_list_is_not_truncated(
+# ------------------------------------------------ (c) 群范围边界
+async def test_scope_comes_from_localdb_and_list_is_not_truncated(
     tmp_path: Path,
 ) -> None:
-    wechat = _wechat(tmp_path, group_allowlist=frozenset({"群甲", "群乙"}), max_groups=5)
+    """面板空白名单 = 不限制：群范围 = 本地库枚举，稳定顺序、绝不截断。"""
+    wechat = _wechat(tmp_path)
+    groups = ("群甲", "群乙")
     driver = FakeDriver(
         {"群甲": [[("甲", "开场")]], "群乙": [[("乙", "开场")]], "外部群": [[]]}
     )
-    poller = PollingLoop(
-        wechat,
-        driver,
-        probe=_probe,
-        registry=_Registry(),
-        poll_seconds=0.02,
-    )
-    # 稳定顺序 + 绝不截断：allowlist 是什么就轮询什么，不做「只取前 N 个」。
-    assert poller.allowlist == tuple(sorted(wechat.group_allowlist))
-    assert set(poller.allowlist) == set(wechat.group_allowlist)
-    assert len(poller.allowlist) == len(wechat.group_allowlist)
+    poller = _loop(wechat, driver, groups=groups)
+    assert poller._scope() == tuple(sorted(groups))
+    assert len(poller._scope()) == len(groups)
 
     frames: list[dict[str, Any]] = []
     source = poller.frames()
     try:
         async def _one_round() -> None:
-            # 每群之后都有一帧 health，所以「一轮」= allowlist 长度帧心跳。
+            # 每群之后都有一帧 health，所以「一轮」= 群数帧心跳。
             health_seen = 0
-            while health_seen < len(poller.allowlist):
+            while health_seen < len(groups):
                 frame = await _next_frame(source)
                 frames.append(frame)
                 if frame.get("type") == "health":
@@ -364,8 +384,8 @@ async def test_only_allowlisted_groups_are_polled_and_list_is_not_truncated(
         with contextlib.suppress(BaseException):
             await asyncio.wait_for(source.aclose(), STEP)
 
-    assert set(driver.opened) == {"群甲", "群乙"}
-    assert all(name in wechat.group_allowlist for _, name in driver.calls)
+    assert set(driver.opened) == set(groups)
+    assert all(name in groups for _, name in driver.calls)
     assert not any(name == "外部群" for _, name in driver.calls)
 
 
@@ -377,13 +397,7 @@ async def test_poll_round_emits_health_after_each_group(tmp_path: Path) -> None:
     """
     wechat = _wechat(tmp_path)
     driver = FakeDriver()
-    poller = PollingLoop(
-        wechat,
-        driver,
-        probe=_probe,
-        registry=_Registry(),
-        poll_seconds=0.02,
-    )
+    poller = _loop(wechat, driver)
     await poller.start()
     try:
         async def _collect() -> list[str]:
@@ -400,7 +414,7 @@ async def test_poll_round_emits_health_after_each_group(tmp_path: Path) -> None:
     finally:
         poller.stop()
 
-    assert types.count("health") == len(poller.allowlist)
+    assert types.count("health") == len(GROUPS)
     assert types[-1] == "health", "群循环必须以心跳收尾"
 
 
@@ -410,13 +424,7 @@ async def test_kill_switch_stops_polling_and_deleting_file_does_not_resume(
 ) -> None:
     wechat = _wechat(tmp_path)
     driver = FakeDriver()
-    poller = PollingLoop(
-        wechat,
-        driver,
-        probe=_probe,
-        registry=_Registry(),
-        poll_seconds=0.02,
-    )
+    poller = _loop(wechat, driver)
     threads_before = threading.active_count()
     frames: list[dict[str, Any]] = []
     source = poller.frames()
@@ -458,7 +466,7 @@ async def test_kill_switch_stops_polling_and_deleting_file_does_not_resume(
 
 # ------------------------------------------------ (e) 发送抢占
 async def test_queued_send_runs_before_next_poll_op(tmp_path: Path) -> None:
-    wechat = _wechat(tmp_path, group_allowlist=frozenset({"老友群"}))
+    wechat = _wechat(tmp_path)
     sequence: list[str] = []
     entered = threading.Event()
     release = threading.Event()
@@ -474,13 +482,7 @@ async def test_queued_send_runs_before_next_poll_op(tmp_path: Path) -> None:
             sequence.append("snapshot")
             return {"chat_name": handle.name, "messages": [], "counts": {"total": 0}}
 
-    poller = PollingLoop(
-        wechat,
-        SlowOpenDriver(),
-        probe=_probe,
-        registry=_Registry(),
-        poll_seconds=0.02,
-    )
+    poller = _loop(wechat, SlowOpenDriver())
     frames: list[dict[str, Any]] = []
     source = poller.frames()
 
@@ -517,9 +519,7 @@ async def test_request_stop_shutdown_joins_ui_thread(tmp_path: Path) -> None:
         return server
 
     def poller_factory(config: WeChatConfig, drv: Any) -> PollingLoop:
-        return PollingLoop(
-            config, drv, probe=_probe, registry=_Registry(), poll_seconds=0.02
-        )
+        return _loop(config, drv)
 
     threads_before = threading.active_count()
     non_daemon_before = sum(1 for t in threading.enumerate() if not t.daemon)
@@ -557,13 +557,7 @@ async def test_kill_switch_checked_before_any_driver_call(tmp_path: Path) -> Non
     wechat = _wechat(tmp_path)
     Path(wechat.kill_switch_file).write_text("stop", encoding="utf-8")
     driver = FakeDriver()
-    poller = PollingLoop(
-        wechat,
-        driver,
-        probe=_probe,
-        registry=_Registry(),
-        poll_seconds=0.02,
-    )
+    poller = _loop(wechat, driver)
     source = poller.frames()
     frames: list[dict[str, Any]] = []
     try:
@@ -588,13 +582,7 @@ async def test_poller_never_blocks_event_loop(tmp_path: Path, seconds: float) ->
     """回归：UIA 线程里 sleep 不会让事件循环停摆（每次 await 都有上限）。"""
     wechat = _wechat(tmp_path, poll_seconds=seconds)
     driver = FakeDriver(delay=0.005)
-    poller = PollingLoop(
-        wechat,
-        driver,
-        probe=_probe,
-        registry=_Registry(),
-        poll_seconds=seconds,
-    )
+    poller = _loop(wechat, driver, poll_seconds=seconds)
     ticks = 0
     source = poller.frames()
     try:
@@ -616,13 +604,7 @@ async def test_poller_never_blocks_event_loop(tmp_path: Path, seconds: float) ->
 # ------------------------------------------------ (h) resume 只在删文件后生效
 def test_reset_for_resume_only_after_kill_file_removed(tmp_path: Path) -> None:
     wechat = _wechat(tmp_path)
-    poller = PollingLoop(
-        wechat,
-        FakeDriver(),
-        probe=_probe,
-        registry=_Registry(),
-        poll_seconds=0.02,
-    )
+    poller = _loop(wechat, FakeDriver())
     kill_path = Path(wechat.kill_switch_file)
     kill_path.write_text("stop\n", encoding="utf-8")
 
@@ -638,13 +620,7 @@ def test_reset_for_resume_only_after_kill_file_removed(tmp_path: Path) -> None:
 
 def test_reset_for_resume_resets_sweep_state(tmp_path: Path) -> None:
     """急停期间可能积压消息：恢复后第一轮必须全量，而不是继续吃旧的红点缓存。"""
-    poller = PollingLoop(
-        _wechat(tmp_path),
-        FakeDriver(),
-        probe=_probe,
-        registry=_Registry(),
-        poll_seconds=0.02,
-    )
+    poller = _loop(_wechat(tmp_path), FakeDriver())
     poller._last_full_sweep = 42.0
     poller._skip_scan_until = 99.0
 
@@ -691,14 +667,7 @@ class UnreadDriver(FakeDriver):
 
 @contextlib.asynccontextmanager
 async def _running_poller(wechat: WeChatConfig, driver: Any, clock: Any):
-    poller = PollingLoop(
-        wechat,
-        driver,
-        probe=_probe,
-        registry=_Registry(),
-        poll_seconds=0.02,
-        clock=clock,
-    )
+    poller = _loop(wechat, driver, clock=clock)
     await poller.start()
     try:
         yield poller
@@ -740,7 +709,7 @@ async def test_unread_gate_falls_back_when_probe_fails(tmp_path: Path) -> None:
 
     async with _running_poller(wechat, driver, clock) as poller:
         poller._last_full_sweep = clock.now
-        assert await poller._targets() == poller.allowlist
+        assert await poller._targets() == ALL_GROUPS
 
 
 async def test_unread_gate_falls_back_when_scan_fails(tmp_path: Path) -> None:
@@ -752,7 +721,7 @@ async def test_unread_gate_falls_back_when_scan_fails(tmp_path: Path) -> None:
 
     async with _running_poller(wechat, driver, clock) as poller:
         poller._last_full_sweep = clock.now
-        assert await poller._targets() == poller.allowlist
+        assert await poller._targets() == ALL_GROUPS
 
 
 async def test_unread_outside_allowlist_is_not_rescanned_every_tick(
@@ -775,7 +744,7 @@ async def test_unread_outside_allowlist_is_not_rescanned_every_tick(
 
         # 到点仍要全量兜底：红点可能永久清不掉。
         clock.now += poller.full_sweep_seconds
-        assert await poller._targets() == poller.allowlist
+        assert await poller._targets() == ALL_GROUPS
 
 
 async def test_full_sweep_runs_even_without_unread(tmp_path: Path) -> None:
@@ -787,7 +756,7 @@ async def test_full_sweep_runs_even_without_unread(tmp_path: Path) -> None:
         poller._last_full_sweep = clock.now
         clock.now += poller.full_sweep_seconds
 
-        assert await poller._targets() == poller.allowlist
+        assert await poller._targets() == ALL_GROUPS
     # 全量兜底不需要再看红点。
     assert driver.unread_calls == 0
 
@@ -798,7 +767,7 @@ async def test_unread_gate_disabled_polls_all_groups(tmp_path: Path) -> None:
     wechat = _wechat(tmp_path, unread_gate=False)
 
     async with _running_poller(wechat, driver, clock) as poller:
-        assert await poller._targets() == poller.allowlist
+        assert await poller._targets() == ALL_GROUPS
     assert driver.unread_calls == 0
 
 
@@ -810,7 +779,7 @@ async def test_driver_without_unread_probe_keeps_full_polling(tmp_path: Path) ->
 
     async with _running_poller(wechat, driver, clock) as poller:
         poller._last_full_sweep = clock.now
-        assert await poller._targets() == poller.allowlist
+        assert await poller._targets() == ALL_GROUPS
 
 
 async def test_gated_round_still_emits_health_frames(tmp_path: Path) -> None:
@@ -818,14 +787,7 @@ async def test_gated_round_still_emits_health_frames(tmp_path: Path) -> None:
     clock = _Clock()
     driver = UnreadDriver()
     wechat = _wechat(tmp_path, unread_gate=True, full_sweep_seconds=120.0)
-    poller = PollingLoop(
-        wechat,
-        driver,
-        probe=_probe,
-        registry=_Registry(),
-        poll_seconds=0.01,
-        clock=clock,
-    )
+    poller = _loop(wechat, driver, poll_seconds=0.01, clock=clock)
     poller._last_full_sweep = clock.now
     await poller.start()
     source = poller.frames()

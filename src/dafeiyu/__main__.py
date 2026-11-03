@@ -228,12 +228,11 @@ def log_active_channels(
     if "wechat" in adapters:
         log.info(
             "%s已上线（brain=%s），微信通道适配器就绪：等待桥 "
-            "ws://%s:%s/wechat-bridge（%s 个群）",
+            "ws://%s:%s/wechat-bridge（群范围以面板白名单 groups.whitelist 为准）",
             settings.persona.name,
             brain_provider,
             settings.wechat.bridge_host,
             settings.wechat.bridge_port,
-            len(settings.wechat.group_allowlist),
         )
 
 

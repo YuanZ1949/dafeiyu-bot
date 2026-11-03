@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from dafeiyu.config import WeChatConfig
@@ -13,6 +14,7 @@ from dafeiyu.gateway.wechat_bridge.poller import PollingLoop
 
 STEP = 5.0
 GROUP = "老友群"
+ALIAS = "g1"
 
 
 def _wechat(tmp_path: Path) -> WeChatConfig:
@@ -22,11 +24,14 @@ def _wechat(tmp_path: Path) -> WeChatConfig:
         bridge_port=0,
         bridge_token="t",
         account_nickname="小助手",
-        group_allowlist=frozenset({GROUP}),
-        max_groups=1,
         poll_seconds=0.02,
         kill_switch_file=str(tmp_path / "wechat.stop"),
     )
+
+
+def _panel() -> frozenset[str]:
+    """面板白名单非空：只轮询列出的这一个群。"""
+    return frozenset({f"wxg:{ALIAS}"})
 
 
 def _probe(connected: bool) -> dict[str, Any]:
@@ -46,8 +51,18 @@ def _probe(connected: bool) -> dict[str, Any]:
 
 
 class _Registry:
+    def __init__(self) -> None:
+        self._peers = {
+            ALIAS: SimpleNamespace(
+                alias=ALIAS, display_name=GROUP, live=True, kind="group"
+            )
+        }
+
     def chat_id(self, display_name: str, *, kind: str = "group") -> str:
-        return "wxg:g1"
+        return f"wxg:{ALIAS}"
+
+    def by_alias(self, alias: str) -> Any | None:
+        return self._peers.get(alias)
 
 
 class FakeDriver:
@@ -101,6 +116,7 @@ async def test_health_probe_timeout_degrades_instead_of_killing_frames(
         FakeDriver([[("甲", "开场")]]),
         probe=probe,
         registry=_Registry(),
+        panel=_panel,
         poll_seconds=0.02,
         align_state_path=tmp_path / "align.json",
     )
@@ -132,6 +148,7 @@ async def test_align_window_persists_across_restart(tmp_path: Path) -> None:
         FakeDriver([[("甲", "开场")]]),
         probe=_probe,
         registry=_Registry(),
+        panel=_panel,
         poll_seconds=0.02,
         align_state_path=state,
     )
@@ -152,6 +169,7 @@ async def test_align_window_persists_across_restart(tmp_path: Path) -> None:
         FakeDriver([[("甲", "开场"), ("乙", "停机期间的新消息")]]),
         probe=_probe,
         registry=_Registry(),
+        panel=_panel,
         poll_seconds=0.02,
         align_state_path=state,
     )
@@ -176,6 +194,7 @@ async def test_broken_align_state_falls_back_to_baseline(tmp_path: Path) -> None
         FakeDriver([[("甲", "开场")]]),
         probe=_probe,
         registry=_Registry(),
+        panel=_panel,
         poll_seconds=0.02,
         align_state_path=state,
     )

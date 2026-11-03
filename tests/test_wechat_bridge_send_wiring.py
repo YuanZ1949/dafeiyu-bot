@@ -61,8 +61,6 @@ def _wechat(tmp_path: Path, **overrides: Any) -> WeChatConfig:
         "bridge_port": 0,
         "bridge_token": TOKEN,
         "account_nickname": ACCOUNT,
-        "group_allowlist": frozenset({ALLOWED}),
-        "max_groups": 3,
         "poll_seconds": 1.0,
         # 关闭节流/频率/静默时段，避免测试依赖真实时钟与本地时区。
         "send_min_interval_seconds": 0.0,
@@ -190,6 +188,13 @@ class FakePoller:
 
     async def start(self) -> None:
         self.ui.start()
+
+    def allows_chat(self, chat_id: str) -> bool:
+        """面板白名单替身：只有 ALLOWED 群放行。"""
+        allowed = {
+            f"wxg:{alias}" for alias in self.registry.live_aliases(ALLOWED)
+        }
+        return str(chat_id) in allowed
 
     def abort_sends(self) -> int:
         self.abort_calls += 1
@@ -332,7 +337,7 @@ async def test_startup_health_probe_runs_on_ui_thread_with_injected_driver(
         assert threading.get_ident() not in harness.driver.probe_threads
 
 
-async def test_unknown_alias_and_not_allowlisted_never_touch_driver(
+async def test_unknown_alias_and_out_of_scope_never_touch_driver(
     tmp_path: Path,
 ) -> None:
     async with _bridge(tmp_path, peers=("隔壁群",)) as harness:

@@ -12,9 +12,13 @@ from dafeiyu.models import ChatType, Message
 
 CONTEXT_BUDGET = 2500
 OUTPUT_RESERVE = 300
-# 人设本体（含“当前场景”）的上限。真实人设约 830 token，留足余量；
+# 人设本体（含「当前场景」）的上限。当前人设约 1500 token；印象/摘要另算，
+# 不受这个上限约束。
 # 注意只截断人设本体，绝不截断已拼好的印象/摘要，否则记忆会静默消失。
-SYSTEM_MAX_TOKENS = 1400
+SYSTEM_MAX_TOKENS = 1550
+# 「当前场景」是唯一告诉模型群名/日期/字数上限的段落，人设再长也不能截掉它。
+# 与 `brain.persona.SYSTEM_TEMPLATE` 里的标题保持一致。
+SCENE_HEADER = "## 当前场景"
 
 IMPRESSION_HEADER = "【群友印象】"
 SUMMARY_HEADER = "【昨日摘要】"
@@ -76,6 +80,25 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     return text[:lo]
 
 
+def _truncate_system(system: str, max_tokens: int) -> str:
+    """截断人设本体，但保住末尾的「当前场景」段落。
+
+    人设写得比预算长时，直接从头截会把群名/日期/字数上限一起砍掉，模型就
+    不知道自己今天能说多少字。这里先留出场景段的额度，只截它前面的正文。
+    """
+    if estimate_tokens(system) <= max_tokens:
+        return system
+    idx = system.rfind(f"\n{SCENE_HEADER}")
+    if idx <= 0:
+        return _truncate_to_tokens(system, max_tokens)
+    scene = system[idx:]
+    scene_tokens = estimate_tokens(scene)
+    if scene_tokens >= max_tokens:
+        return _truncate_to_tokens(system, max_tokens)
+    body = _truncate_to_tokens(system[:idx], max_tokens - scene_tokens)
+    return body + scene
+
+
 def _compose_system(base: str, impressions: list[str], summary: str | None) -> str:
     parts = [base]
     if impressions:
@@ -119,7 +142,7 @@ def build_context(
     available = CONTEXT_BUDGET - OUTPUT_RESERVE
 
     # 0) 只对人设本体设上限；印象/摘要属于记忆，不能在这里被截掉。
-    base = _truncate_to_tokens(system, SYSTEM_MAX_TOKENS)
+    base = _truncate_system(system, SYSTEM_MAX_TOKENS)
 
     # 1) 先裁窗口，但永远保留最新的一条（当前消息）
     while total(_compose_system(base, impression_lines, summary), messages) > available and len(messages) > 1:

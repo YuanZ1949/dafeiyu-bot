@@ -1206,7 +1206,7 @@ async def test_config_endpoint_has_thresholds_and_no_secrets(tmp_path: Path) -> 
     assert "api_key" not in raw
     assert payload["brain"]["provider"] == "token"
     assert payload["persona"]["os_probability"] == 0.05
-    assert payload["cooldown"] == {"tool_hint_seconds": 60.0}
+    assert payload["cooldown"] == {}
     assert payload["behavior"]["chat_intensity"] == "normal"
     assert payload["behavior"]["restriction_mode"] == "off"
     assert payload["rate_limit"] == {

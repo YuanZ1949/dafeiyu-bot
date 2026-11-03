@@ -319,7 +319,7 @@ def peers_chat_id(raw: Any, allowlist: list[Any]) -> str:
         }
         hit = ({display} & names) or (former & names)
         if hit:
-            matches[alias] = display or sorted(hit)[0]
+            matches[alias] = display or min(hit)
     if len(matches) > 1:
         detail = ", ".join(
             f"wxg:{alias}({display})" for alias, display in sorted(matches.items())
@@ -374,19 +374,24 @@ def _config_info(
     wechat = _mapping(gateway.get("wechat"))
     supervisor = _mapping(raw_config.get("supervisor"))
     control = _mapping(supervisor.get("control"))
-    allowlist = _as_list(wechat.get("group_allowlist"))
-    chat_id = resolve_chat_id(allowlist, alias_arg)
+    # 面板白名单是唯一范围来源：冒烟直接用它挑目标群（必须是 `wxg:` 会话）。
+    whitelist = [
+        str(item).strip()
+        for item in _as_list(_mapping(raw_config.get("groups")).get("whitelist"))
+        if str(item).strip().startswith("wxg:")
+    ]
+    chat_id = resolve_chat_id(whitelist, alias_arg)
     return {
         "provider": str(gateway.get("provider") or ""),
         "wechat": wechat,
-        "allowlist": allowlist,
+        "allowlist": whitelist,
         "chat_id": chat_id,
         "nickname": str(wechat.get("account_nickname") or "").strip(),
         "control_host": str(control.get("host") or "127.0.0.1").strip(),
         "control_port": _as_int(control.get("port"), 8788),
         "poll_seconds": float(wechat.get("poll_seconds") or 30),
         "kill_switch": _kill_switch_path(wechat),
-        "whitelist": [str(item) for item in _as_list(_mapping(raw_config.get("groups")).get("whitelist"))],
+        "whitelist": whitelist,
         "allow_test_inject": _as_bool(wechat.get("allow_test_inject")),
     }
 
@@ -408,9 +413,13 @@ def analyze_config(
         problems.append(
             Problem("config_missing", "gateway.wechat.enabled 必须为 true")
         )
-    if not info["allowlist"]:
+    if not info["whitelist"]:
         problems.append(
-            Problem("config_missing", "gateway.wechat.group_allowlist 不能为空")
+            Problem(
+                "config_missing",
+                "groups.whitelist 里没有 wxg: 群：冒烟需要明确目标群"
+                "（白名单为空 = 桥不限制，脚本无法确定 chat_id）",
+            )
         )
     if not info["nickname"]:
         problems.append(
@@ -423,16 +432,9 @@ def analyze_config(
                 "gateway.wechat.allow_test_inject 缺失（脚本要临时打开它）",
             )
         )
-    if info["allowlist"] and not info["chat_id"]:
+    if info["whitelist"] and not info["chat_id"]:
         problems.append(
-            Problem("config_missing", "无法从 group_allowlist 解析测试群 chat_id")
-        )
-    if info["whitelist"] and info["chat_id"] not in info["whitelist"]:
-        problems.append(
-            Problem(
-                "config_missing",
-                f"groups.whitelist 非空但不含 {info['chat_id']}，回复会被白名单拦掉",
-            )
+            Problem("config_missing", "无法从 groups.whitelist 解析测试群 chat_id")
         )
     return problems
 
@@ -786,17 +788,29 @@ def _wait_connected(
 def _wait_peer_chat_id(
     info: dict[str, Any], deps: Deps, timeout: float
 ) -> str:
-    """等桥首轮轮询把 allowlist 群写进 peers.json，再取真实别名。"""
+    """等桥首轮轮询把面板白名单里的群写进 peers.json，确认别名可用。"""
+    wanted = {str(item).strip() for item in info["allowlist"] if str(item).strip()}
 
     def probe() -> str | None:
         try:
             raw = json.loads(deps.read_text(PEERS_PATH))
         except (OSError, ValueError):
             return None
-        return peers_chat_id(raw, info["allowlist"]) or None
+        entries = raw.get("peers") if isinstance(raw, dict) else raw
+        if not isinstance(entries, list):
+            return None
+        for item in entries:
+            if not isinstance(item, dict) or item.get("retired_at") is not None:
+                continue
+            if item.get("kind") != "group":
+                continue
+            chat_id = f"wxg:{str(item.get('alias') or '').strip()}"
+            if chat_id in wanted:
+                return chat_id
+        return None
 
     chat_id = _wait_until(
-        "桥为 allowlist 群铸造会话别名", probe, timeout, deps
+        "桥为面板白名单群铸造会话别名", probe, timeout, deps
     )
     info["chat_id"] = chat_id
     return chat_id
@@ -1256,7 +1270,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--env-file", type=Path, default=REPO_ROOT / ".env", help="环境变量文件"
     )
     parser.add_argument(
-        "--alias", default="", help="测试群 alias；默认取 group_allowlist 第一个"
+        "--alias", default="", help="测试群 alias；默认取面板白名单 groups.whitelist 第一个"
     )
     parser.add_argument(
         "--evidence-dir",

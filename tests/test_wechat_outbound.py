@@ -89,7 +89,6 @@ def _wechat(**overrides: Any) -> WeChatConfig:
     values: dict[str, Any] = {
         "enabled": True,
         "account_nickname": "小菜鱼",
-        "group_allowlist": frozenset({GROUP}),
     }
     values.update(overrides)
     return WeChatConfig(**values)

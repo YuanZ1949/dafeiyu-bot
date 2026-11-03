@@ -1,7 +1,7 @@
 """面板白名单（groups.whitelist）接管桥的轮询范围与出站闸门。
 
 面板语义：白名单非空 = 只碰列出的会话；空 = 不限制（本地库枚举到的全部群）。
-读不出来时退回 `gateway.wechat.group_allowlist`，fail-closed。
+读不出来时 fail-closed：不轮询、不发送（群范围只有面板一个来源）。
 
 全部用假注册表 / 假本地库，不碰 UIA、不碰真实微信数据。
 """
@@ -28,7 +28,6 @@ def _wechat(**overrides: Any) -> WeChatConfig:
         "bridge_host": "127.0.0.1",
         "bridge_port": 0,
         "account_nickname": "小菜鱼",
-        "group_allowlist": frozenset({ALLOWED}),
         "poll_seconds": 0.01,
     }
     defaults.update(overrides)
@@ -136,25 +135,25 @@ def test_panel_without_wechat_chats_polls_nothing() -> None:
     assert loop._scope() == ()
 
 
-def test_panel_reader_failure_falls_back_to_config_allowlist() -> None:
+def test_panel_reader_failure_is_fail_closed() -> None:
     def boom() -> frozenset[str] | None:
         raise OSError("disk gone")
 
     loop, _ = _loop(panel=boom, localdb=_LocalDb(["老友群", "垃圾桶"]))
 
-    assert loop._scope() == (ALLOWED,)
+    assert loop._scope() == ()
 
 
-def test_no_panel_keeps_config_allowlist_scope() -> None:
+def test_no_panel_is_fail_closed() -> None:
     loop, _ = _loop(panel=None, localdb=_LocalDb(["老友群", "垃圾桶"]))
 
-    assert loop._scope() == (ALLOWED,)
+    assert loop._scope() == ()
 
 
-def test_panel_without_localdb_falls_back_to_allowlist_when_empty() -> None:
+def test_panel_empty_without_localdb_polls_nothing() -> None:
     loop, _ = _loop(panel=lambda: frozenset(), localdb=None)
 
-    assert loop._scope() == (ALLOWED,)
+    assert loop._scope() == ()
 
 
 def test_panel_skips_retired_or_unknown_aliases() -> None:
@@ -187,13 +186,14 @@ def test_allows_chat_non_empty_panel_is_a_membership_check() -> None:
     assert loop.allows_chat("wxg:a2") is False
 
 
-def test_allows_chat_without_panel_keeps_legacy_allowlist() -> None:
+def test_allows_chat_without_panel_is_denied() -> None:
     peers = _Peers(
         {"a1": (ALLOWED, True, "group"), "a2": ("垃圾桶", True, "group")}
     )
     loop, _ = _loop(panel=None, registry=peers)
 
-    assert loop.allows_chat("wxg:a1") is True
+    # 没有可信白名单就一律拒绝：不退回任何配置清单。
+    assert loop.allows_chat("wxg:a1") is False
     assert loop.allows_chat("wxg:a2") is False
 
 
@@ -202,19 +202,20 @@ def test_resolve_chat_name_obeys_poller_gate() -> None:
     allowed = SimpleNamespace(registry=peers, allows_chat=lambda chat_id: True)
     denied = SimpleNamespace(registry=peers, allows_chat=lambda chat_id: False)
 
-    assert bridge_main._resolve_chat_name(allowed, (), "wxg:a1") == "垃圾桶"
+    assert bridge_main._resolve_chat_name(allowed, "wxg:a1") == "垃圾桶"
     with pytest.raises(bridge_main._CommandError) as excinfo:
-        bridge_main._resolve_chat_name(denied, (), "wxg:a1")
+        bridge_main._resolve_chat_name(denied, "wxg:a1")
     assert excinfo.value.code == "chat_not_allowed"
 
 
-def test_resolve_chat_name_without_gate_falls_back_to_allowlist_argument() -> None:
-    peers = _Peers({"a1": ("垃圾桶", True, "group")})
+def test_resolve_chat_name_without_gate_allows_live_group_peer() -> None:
+    peers = _Peers({"a1": ("垃圾桶", True, "group"), "a2": ("某人", True, "friend")})
     legacy = SimpleNamespace(registry=peers)
 
-    assert bridge_main._resolve_chat_name(legacy, ("垃圾桶",), "wxg:a1") == "垃圾桶"
+    # 没有面板接缝的旧测试替身：注册表已确认是存活群会话，直接放行。
+    assert bridge_main._resolve_chat_name(legacy, "wxg:a1") == "垃圾桶"
     with pytest.raises(bridge_main._CommandError) as excinfo:
-        bridge_main._resolve_chat_name(legacy, (ALLOWED,), "wxg:a1")
+        bridge_main._resolve_chat_name(legacy, "wxg:a2")
     assert excinfo.value.code == "chat_not_allowed"
 
 

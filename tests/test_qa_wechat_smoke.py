@@ -33,7 +33,6 @@ gateway:
   provider: wechat
   wechat:
     enabled: true
-    group_allowlist: ["冒烟群"]
     account_nickname: "小号"
     allow_test_inject: false
 supervisor:
@@ -43,7 +42,7 @@ supervisor:
     host: 127.0.0.1
     port: 18788
 groups:
-  whitelist: []
+  whitelist: ["wxg:冒烟群"]
 """
 
 
@@ -173,7 +172,7 @@ def test_self_check_disabled_wechat_skips_doctor(tmp_path: Path) -> None:
 
 def test_self_check_whitelist_mismatch_is_config_missing(tmp_path: Path) -> None:
     text = CONFIG_TEXT.replace(
-        "  whitelist: []", '  whitelist: ["wxg:别的群"]'
+        '  whitelist: ["wxg:冒烟群"]', '  whitelist: ["qq:别的群"]'
     )
     code, report = _run(tmp_path, _deps(text=text))
     assert code == smoke.EXIT_CONFIG_MISSING

@@ -204,7 +204,6 @@ def _gateway_yaml(provider: str, enabled: bool) -> str:
         "  wechat:\n"
         f"    enabled: {'true' if enabled else 'false'}\n"
         "    bridge_port: 8791\n"
-        '    group_allowlist: ["大肥鱼测试群"]\n'
         "    account_nickname: 大肥鱼\n"
     )
 

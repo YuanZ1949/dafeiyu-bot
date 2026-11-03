@@ -37,8 +37,10 @@ REQUEST_TIMEOUT_SECONDS = 15.0
 WINDOW_TOLERANCE_MS = 1000.0
 # 工具 part 只在活跃状态提示；error 不提示，用户不该等一个已失败的抓取。
 TOOL_ACTIVE_STATES = {"pending", "running", "completed"}
-# 一轮正常对话只会出现这三类消息（spike S3：每轮都有 idle，漏掉它会每轮误判）。
-ALLOWED_MESSAGE_TYPES = {"user", "assistant", "idle"}
+# 一轮正常对话只会出现这几类消息（spike S3：每轮都有 idle，漏掉它会每轮误判）。
+# compaction 是 opencode 自动压缩上下文时产生的消息，不是外来注入：
+# 漏掉它会把整轮 session 当成被污染而重置（13:09 实测踩过）。
+ALLOWED_MESSAGE_TYPES = {"user", "assistant", "idle", "compaction"}
 # 工作区关闭时的会话级兜底：不改 agent 文件重启 opencode 也能收回全部工具。
 DENY_ALL_PERMISSIONS: list[dict[str, Any]] = [
     {"action": "*", "resource": "*", "effect": "deny"}
@@ -122,7 +124,7 @@ class OpenCodeHttpBrain:
     直到拿到本轮完成的 assistant 文本。
     """
 
-    # agent 文件里有 read/edit/webfetch；工作区关掉时 factory 会下推全量 deny。
+    # agent 文件里有 read/edit/webfetch/websearch；工作区关掉时 factory 会下推全量 deny。
     supports_tools = True
 
     def __init__(
@@ -237,7 +239,8 @@ class OpenCodeHttpBrain:
     ) -> list[str]:
         """找出本轮窗口里不该出现的消息（外部注入 / 别的进程写的）。
 
-        正常一轮只有 user/assistant/idle，且本轮只有 bot 发的那一条 user。
+        正常一轮只有 user/assistant/idle（自动压缩时还会多一条 compaction），
+        且本轮只有 bot 发的那一条 user。
         只看窗口内：窗口之前的消息属于之前的轮次，是历史，不是注入——
         把它们当外来消息会让每两轮就重置一次 session，上下文全丢。
         """
@@ -494,17 +497,19 @@ class OpenCodeHttpBrain:
 
     @staticmethod
     def _first_tool(messages: list[dict[str, Any]]) -> str | None:
+        """本轮第一个活跃的联网工具名；同一轮由调用方保证只回调一次。"""
         for message in messages:
             if message.get("type") != "assistant":
                 continue
             for part in message.get("content") or []:
                 if not isinstance(part, dict) or part.get("type") != "tool":
                     continue
-                if part.get("name") != "webfetch":
+                name = part.get("name")
+                if name not in ("webfetch", "websearch"):
                     continue
                 state = part.get("state") or {}
                 if state.get("status") in TOOL_ACTIVE_STATES:
-                    return "webfetch"
+                    return str(name)
         return None
 
     @staticmethod

@@ -5,7 +5,7 @@
 - ``__main__.run()`` 的完整生命周期（假驱动 + 假帧源 + 真 websockets 客户端）；
 - 握手 token（对/错/缺）与客户端 ``wechat.py`` 的 header 形态一致；
 - 未知动作按 §6 规则 5 回 ``bad_action``，且 ``id`` 原样回填；
-- ``_startup_checks`` 的 fail-closed 拒绝（enabled / allowlist / nickname / max_groups）；
+- ``_startup_checks`` 的 fail-closed 拒绝（enabled / nickname / 出站后端）；
 - ``BridgeServer.broadcast`` / ``pump_frames`` 的推帧通路。
 
 反挂死：所有 await 都包在 ``asyncio.wait_for``（<= 5s）里；整个模块远低于 60s。
@@ -59,8 +59,6 @@ def _wechat(**overrides: Any) -> WeChatConfig:
         "bridge_port": 0,
         "bridge_token": TOKEN,
         "account_nickname": "小助手",
-        "group_allowlist": frozenset({"老友群"}),
-        "max_groups": 3,
         "poll_seconds": 1.0,
     }
     defaults.update(overrides)
@@ -349,25 +347,6 @@ async def test_unknown_action_receipt() -> None:
 
 
 # --------------------------------------------------- (e) 启动 fail-closed 拒绝
-def test_startup_refuses_too_many_groups() -> None:
-    wechat = _wechat(
-        max_groups=3,
-        group_allowlist=frozenset({"群一", "群二", "群三", "群四"}),
-    )
-    with pytest.raises(ConfigError) as excinfo:
-        bridge_main._startup_checks(wechat)
-    message = str(excinfo.value)
-    assert "max_groups" in message
-    assert "group_allowlist" in message
-    assert "群一" not in message  # 不回显配置值
-
-
-def test_startup_refuses_empty_allowlist() -> None:
-    with pytest.raises(ConfigError) as excinfo:
-        bridge_main._startup_checks(_wechat(group_allowlist=frozenset()))
-    assert "group_allowlist" in str(excinfo.value)
-
-
 def test_startup_refuses_empty_nickname() -> None:
     with pytest.raises(ConfigError) as excinfo:
         bridge_main._startup_checks(_wechat(account_nickname=""))
@@ -386,7 +365,7 @@ async def test_run_refuses_before_binding() -> None:
     def exploding_driver_factory() -> Any:  # pragma: no cover - 不该被调用
         raise AssertionError("启动检查失败时不得加载驱动")
 
-    wechat = _wechat(group_allowlist=frozenset({"a", "b", "c", "d"}), max_groups=3)
+    wechat = _wechat(account_nickname="")
     with pytest.raises(ConfigError) as excinfo:
         await asyncio.wait_for(
             bridge_main.run(
@@ -395,7 +374,7 @@ async def test_run_refuses_before_binding() -> None:
             ),
             STEP,
         )
-    assert "max_groups" in str(excinfo.value)
+    assert "account_nickname" in str(excinfo.value)
 
 
 # --------------------------------------------- (f) broadcast / pump_frames

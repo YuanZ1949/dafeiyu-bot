@@ -34,8 +34,8 @@ gateway:
   # 面板里每条通道可单独停用）。
   provider: qq
   # 桌面微信小号通道（UIA 桥）。小号专用、封号自担；默认关闭（wechat.enabled=false），
-  # 启用前先跑 `dafeiyu doctor` 的 8 项预检；group_allowlist 为空时拒绝启动
-  # （语义是「拒绝」，不是「放开所有群」）。
+  # 启用前先跑 `dafeiyu doctor` 的 8 项预检；群范围只看面板白名单
+  # （data/settings.local.yaml 的 groups.whitelist，空 = 不限制）。
   wechat:
     # 默认关闭；启用前先跑 `dafeiyu doctor` 的 8 项预检。
     enabled: false
@@ -47,12 +47,6 @@ gateway:
     bridge_token: ""
     # 小号在群里的微信显示昵称（不是会话别名，别名由桥本地铸造）；启用时必填。
     account_nickname: ""
-    # 目标群的**微信显示名**（桥用 `open_chat` 按显示名打开会话）；别名由桥
-    # 本地铸造、首次轮询前不存在，不能写在这里。
-    # 留空 = gateway.wechat.group_allowlist 为空 = 拒绝启动。
-    group_allowlist: []
-    # 最多参与的微信群数上限。
-    max_groups: 3
     # RPA 侧轮询间隔（秒）。
     poll_seconds: 8.0
     # 未读门控：每个 tick 先读一次侧边栏红点（约 20ms），只有存在未读时才打开

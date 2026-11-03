@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from dafeiyu.config import ConfigError
+from dafeiyu.memory import shared_facts
 from dafeiyu.models import ChatType, Impression, Message, Summary, WeeklySummary
 from dafeiyu.timeutil import SHANGHAI, today_shanghai
 
@@ -229,6 +230,23 @@ CREATE TABLE IF NOT EXISTS pending_outbox (
 
 CREATE INDEX IF NOT EXISTS idx_pending_outbox_due
     ON pending_outbox (next_attempt_at, id);
+
+-- 跨群「查证结论」缓存：同一件事在一个群查清后，别的群再问到不必重查。
+-- question_key 是归一化问句（去标点/空白/大小写），写入前已做隐私过滤：
+-- 私聊与疑似个人信息一律不入库，因此这张表可以安全地被所有群读取。
+CREATE TABLE IF NOT EXISTS shared_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    question_key TEXT NOT NULL,
+    question_text TEXT NOT NULL,
+    answer_text TEXT NOT NULL,
+    source_chat_type TEXT NOT NULL,
+    source_chat_id TEXT NOT NULL,
+    source_nickname TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_hit_at TEXT,
+    hits INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (question_key)
+);
 """
 
 # 老库升级：SQLite 的 ALTER TABLE ADD COLUMN 必须带默认值（NOT NULL 也要给）。
@@ -1634,6 +1652,98 @@ class Store:
         ).fetchone()
         return int(row["attempts"]) if row is not None else 0
 
+    # ---- 跨群查证缓存 ---------------------------------------------
+    def add_shared_fact(
+        self,
+        question: str,
+        answer: str,
+        chat_type: ChatType,
+        chat_id: str,
+        nickname: str = "",
+    ) -> int:
+        """写入一条跨群可复用的查证结论；返回行 id（0 = 未写入）。
+
+        隐私闸门在这里再拦一次（调用方也会先过滤）：私聊、疑似个人信息、
+        以及「没查到」这类失败回答都不会落库。
+        """
+        if chat_type is not ChatType.GROUP:
+            return 0
+        pair = shared_facts.extract(question, answer)
+        if pair is None:
+            return 0
+        ask, reply = pair
+        key = shared_facts.normalize(ask)
+        if not key:
+            return 0
+        existing = self._conn.execute(
+            "SELECT id, answer_text FROM shared_facts WHERE question_key = ?",
+            (key,),
+        ).fetchone()
+        if existing is not None:
+            # 同一问题只保留信息量更大的那条答案；短答案不要覆盖长答案。
+            if len(reply) > len(str(existing["answer_text"] or "")):
+                self._conn.execute(
+                    """
+                    UPDATE shared_facts
+                    SET question_text = ?, answer_text = ?, source_chat_type = ?,
+                        source_chat_id = ?, source_nickname = ?,
+                        created_at = datetime('now')
+                    WHERE id = ?
+                    """,
+                    (
+                        ask,
+                        reply,
+                        chat_type.value,
+                        chat_id,
+                        str(nickname or ""),
+                        int(existing["id"]),
+                    ),
+                )
+                self._conn.commit()
+            return int(existing["id"])
+        cur = self._conn.execute(
+            """
+            INSERT INTO shared_facts
+                (question_key, question_text, answer_text, source_chat_type,
+                 source_chat_id, source_nickname)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (key, ask, reply, chat_type.value, chat_id, str(nickname or "")),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def shared_facts(self, limit: int = 400) -> list[dict[str, Any]]:
+        """最近写入的若干条查证结论，供相似度匹配用（表很小，直接扫）。"""
+        rows = self._conn.execute(
+            """
+            SELECT id, question_text, answer_text, source_chat_type, source_chat_id,
+                   source_nickname, created_at, hits
+            FROM shared_facts
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def bump_shared_fact(self, fact_id: int) -> None:
+        """记一次命中：既用于排序，也方便以后判断哪些结论值得保留。"""
+        self._conn.execute(
+            "UPDATE shared_facts SET hits = hits + 1, last_hit_at = datetime('now') WHERE id = ?",
+            (int(fact_id),),
+        )
+        self._conn.commit()
+
+    def purge_shared_facts_for_chat(self, chat_type: ChatType, chat_id: str) -> int:
+        """删掉源自某个会话的全部缓存（forget_chat 时调用）。"""
+        cur = self._conn.execute(
+            "DELETE FROM shared_facts WHERE source_chat_type = ? AND source_chat_id = ?",
+            (chat_type.value, chat_id),
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
+
     @staticmethod
     def _row_to_message(r: sqlite3.Row) -> Message:
         return Message(
@@ -2896,6 +3006,7 @@ class Store:
         self._conn.commit()
 
     def forget_chat(self, chat_type: ChatType, chat_id: str) -> None:
+        self.purge_shared_facts_for_chat(chat_type, chat_id)
         for table in (
             "messages",
             "impressions",
@@ -2915,6 +3026,8 @@ class Store:
         self._conn.commit()
 
     def forget_all(self) -> None:
+        self._conn.execute("DELETE FROM shared_facts")
+        self._conn.commit()
         for table in (
             "messages",
             "impressions",

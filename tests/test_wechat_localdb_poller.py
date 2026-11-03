@@ -29,12 +29,16 @@ def _wechat(tmp_path: Any, **overrides: Any) -> WeChatConfig:
         "bridge_host": "127.0.0.1",
         "bridge_port": 0,
         "account_nickname": "小助手",
-        "group_allowlist": frozenset(GROUPS),
         "poll_seconds": 0.01,
         "kill_switch_file": str(tmp_path / "wechat.stop"),
     }
     defaults.update(overrides)
     return WeChatConfig(**defaults)
+
+
+def _all_groups_panel() -> frozenset[str]:
+    """面板空白名单 = 不限制：群范围由本地库枚举。"""
+    return frozenset()
 
 
 def _probe(connected: bool) -> dict[str, Any]:
@@ -73,6 +77,10 @@ class FakeLocalDb:
         self.calls.append(name)
         return self.snapshots.get(name)
 
+    def group_names(self) -> list[str]:
+        """本地库能枚举到的群：面板空白名单时这就是轮询范围。"""
+        return list(self.snapshots)
+
 
 def _loop(tmp_path: Any, driver: Any, localdb: Any, **overrides: Any) -> PollingLoop:
     return PollingLoop(
@@ -81,6 +89,7 @@ def _loop(tmp_path: Any, driver: Any, localdb: Any, **overrides: Any) -> Polling
         registry=_Registry(),
         probe=_probe,
         localdb=localdb,
+        panel=_all_groups_panel,
         clock=lambda: 1.0,
     )
 
@@ -141,9 +150,9 @@ async def test_localdb_ready_skips_uia_and_emits_new_messages(started: Any) -> N
     assert driver.opened == []
 
 
-async def test_localdb_targets_returns_allowlist_even_with_zero_unread(started: Any) -> None:
+async def test_localdb_targets_ignore_unread_gate(started: Any) -> None:
     driver = FakeDriver()
-    loop = started(driver, FakeLocalDb({}))
+    loop = started(driver, FakeLocalDb(dict.fromkeys(GROUPS)))
 
     targets = await loop._targets()
 
@@ -153,7 +162,7 @@ async def test_localdb_targets_returns_allowlist_even_with_zero_unread(started: 
 
 async def test_localdb_returns_none_falls_back_to_uia(started: Any) -> None:
     driver = FakeDriver()
-    loop = started(driver, FakeLocalDb({}))
+    loop = started(driver, FakeLocalDb(dict.fromkeys(GROUPS)))
     await loop.start()
 
     await _drain_round(loop)
@@ -164,6 +173,9 @@ async def test_localdb_returns_none_falls_back_to_uia(started: Any) -> None:
 async def test_localdb_raises_falls_back_to_uia(started: Any) -> None:
     class Broken:
         available = True
+
+        def group_names(self) -> list[str]:
+            return list(GROUPS)
 
         def snapshot(self, name: str) -> Any:
             raise RuntimeError("镜像坏了")
@@ -207,6 +219,9 @@ async def test_localdb_snapshot_timeout_falls_back(started: Any) -> None:
     class Slow:
         available = True
 
+        def group_names(self) -> list[str]:
+            return ["老友群"]
+
         def snapshot(self, name: str) -> Any:
             import time
 
@@ -214,7 +229,7 @@ async def test_localdb_snapshot_timeout_falls_back(started: Any) -> None:
             return {"messages": []}
 
     driver = FakeDriver()
-    loop = started(driver, Slow(), group_allowlist=frozenset({"老友群"}))
+    loop = started(driver, Slow())
     await loop.start()
 
     await asyncio.wait_for(_drain_round(loop), STEP * 2)

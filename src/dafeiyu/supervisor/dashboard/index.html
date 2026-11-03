@@ -863,7 +863,7 @@
         <textarea id="groups-whitelist" rows="4" placeholder="例如：qq:123456&#10;wxg:46034f826c8b"></textarea>
       </label>
     </div>
-    <div class="kv" style="margin-top:8px">留空 = 所有群都按判定回复；非空 = 只有名单内的群会被主动回复，@ / 引用 / 叫名字仍然必回。这里只决定「回不回」，抓哪些微信群仍看 gateway.wechat.group_allowlist。</div>
+    <div class="kv" style="margin-top:8px">留空 = 所有群都按判定回复；非空 = 只有名单内的群会被主动回复，@ / 引用 / 叫名字仍然必回。这里同时决定「回不回」和「抓哪些微信群」（桥只轮询这里的微信会话）。</div>
     <div class="kv" id="groups-known" style="margin-top:8px">已知群：（暂无）</div>
   </section>
 
@@ -2619,7 +2619,6 @@ async function loadConfig() {
     const rows = [
       ["大脑", providerModel + agent],
       ["人设", `${c.persona.name} · 回复 ${c.persona.max_reply_chars}/${c.persona.max_reply_chars_technical} 字 · OS ${(c.persona.os_probability * 100).toFixed(1)}%`],
-      ["冷却", `工具提示 ${c.cooldown.tool_hint_seconds}s`],
       ["限流", `${c.rate_limit.window_seconds / 60} 分钟内 ${c.rate_limit.threshold} 次 429 → 退避 ${c.rate_limit.backoff_seconds}s · 配额暂停 ${Math.round(c.rate_limit.quota_pause_seconds / 60)} 分钟`],
       ["预算", `每日 ${c.budget.daily_calls} 次 / ${fmtTokens(c.budget.daily_tokens)} token`],
       ["记忆", `窗口 ${c.memory.window_size} 条 · 保留 ${c.memory.retention_days > 0 ? `${c.memory.retention_days} 天` : "永久"}`],

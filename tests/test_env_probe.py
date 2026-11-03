@@ -117,7 +117,6 @@ def _wechat_config(**overrides) -> WeChatConfig:
         "bridge_port": 8790,
         "bridge_token": "",
         "account_nickname": "小号",
-        "group_allowlist": frozenset({"群一"}),
         "version_min": "4.1.6",
         "language": "zh-CN",
     }
@@ -197,16 +196,6 @@ def test_probe_wechat_all_pass(monkeypatch) -> None:
     assert [check["id"] for check in checks] == list(env_probe.WECHAT_CHECK_IDS)
     assert [check["status"] for check in checks] == ["PASS"] * 8
     assert env_probe.wechat_ok(checks) is True
-
-
-def test_probe_wechat_missing_allowlist_fails_config_ready(monkeypatch) -> None:
-    _patch_probes(monkeypatch)
-
-    checks = env_probe.probe_wechat(_wechat_config(group_allowlist=frozenset()))
-
-    config_ready = _by_id(checks)["wechat.config_ready"]
-    assert config_ready["status"] == "FAIL"
-    assert "group_allowlist" in config_ready["detail"]
 
 
 def test_probe_wechat_missing_nickname_fails_config_ready(monkeypatch) -> None:

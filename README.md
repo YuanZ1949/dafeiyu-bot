@@ -338,7 +338,9 @@ powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -Target D:\dafeiyu-r
    - `gateway.provider`: `wechat`（仅微信）或 `both`（QQ + 微信双通道）；
    - `gateway.wechat.enabled: true`；
    - `account_nickname`：小号在目标群里的显示昵称，用于识别 @；
-   - `group_allowlist`：允许的群，填**群在微信里的显示名**（桥按显示名 `open_chat`）；会话别名由桥本地铸造，不能预先写这里。**空白名单 = 拒绝启动**（语义是「拒绝」，不是「放行所有群」）。同名群没法自动区分。
+   - `group_allowlist`：**已删除**。群范围只看面板白名单（`data/settings.local.yaml` 的
+     `groups.whitelist`，条目用桥铸造的 `wxg:<别名>`）；白名单为空 = 不限制，桥按本地库
+     能枚举到的全部群轮询。面板读不出来时 fail-closed（不轮询、不发送）。
 
 4. 预检：`.venv\Scripts\python -m dafeiyu.cli doctor` 有 8 项微信前置检查（进程 / 版本 / 语言 / 完整性 / 桌面 / pyweixin / 端口 / 配置），**全部通过再进入下一步**。
 
@@ -459,7 +461,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 
 - **无真实 message_id**：桥为会话/消息在本地铸造 id，跨重启不保证稳定。
 - 不支持撤回 / 编辑事件。
-- 同名群只能靠显示名 / 人工区分，`group_allowlist` 里的显示名要人工核对。
+- 同名群只能靠显示名 / 人工区分，面板白名单里的群要人工核对（同名群由成员集合区分 alias）。
 - `@` 触发依赖轮询，最坏有约一个 `poll_seconds`（默认 8 秒）的延迟；本地库模式同样受这个轮询间隔限制，但不再有开窗开销。
 - 发送有频率上限：`send_min_interval_seconds`（默认 20 秒）、`send_max_per_hour`（20）、`send_max_per_day`（60）；三者设为 `0` = 不限制。
 - 默认出站（`outbound: uia`）桌面锁屏即发不出去；改用 `hook` / `auto` 可绕开桌面，但依赖外部注入服务。RPA 可能误点，`require_foreground_idle` 默认要求微信窗口前台且空闲才执行操作；开启微信通道时别在那台机器上干重要的事。
@@ -589,8 +591,8 @@ Bot 控制口（8788）与 OneBot 反向 WS（8080）仍只监听本机。**
 - **群白名单**：编辑 `groups.whitelist`（QQ 群号或微信群 alias，即 `qq:<号>` / `wxg:<别名>`），保存到
   `data/settings.local.yaml`，即时生效，重启后保留。默认为空 = 不限制回复对象；非空 =
   只有名单内的群会被主动回复，@ / 引用 / 叫名字仍然必回。QQ 与微信同名群用通道前缀区分
-  （`qq:<号>` / `wxg:<别名>`），不会互相覆盖。注意这里只决定「回不回」，
-  抓哪些微信群仍由 `gateway.wechat.group_allowlist` 决定。
+  （`qq:<号>` / `wxg:<别名>`），不会互相覆盖。注意这里只决定「回不回」；
+  抓哪些微信群同样由这份白名单里的 `wxg:` 条目决定（桥不再有独立的群清单）。
 
 ### 运维 runbook（健康 / 告警 / 备份 / 恢复 / 审计）
 

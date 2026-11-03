@@ -107,9 +107,8 @@ def make_config(port: int, **overrides: object) -> WeChatConfig:
         "bridge_host": "127.0.0.1",
         "bridge_port": port,
         "bridge_token": "",
-        # 合法配置：空 allowlist / 空 nickname 会让 start() 抛 ConfigError。
+        # 合法配置：空 nickname 会让 start() 抛 ConfigError。
         "account_nickname": "小助手",
-        "group_allowlist": frozenset({GROUP_CHAT}),
         "poll_seconds": 0.2,
         "echo_window_seconds": 5.0,
     }
@@ -370,17 +369,9 @@ async def test_stop_sends_stop_action_and_closes_socket() -> None:
 
 
 async def test_start_rejects_incomplete_wechat_config() -> None:
-    for config, key in [
-        (
-            WeChatConfig(enabled=True, account_nickname="小助手"),
-            "group_allowlist",
-        ),
-        (
-            WeChatConfig(
-                enabled=True, group_allowlist=frozenset({GROUP_CHAT})
-            ),
-            "account_nickname",
-        ),
-    ]:
+    cases = [
+        (WeChatConfig(enabled=True), "account_nickname"),
+    ]
+    for config, key in cases:
         with pytest.raises(ConfigError, match=key):
             await WeChatAdapter(config).start()

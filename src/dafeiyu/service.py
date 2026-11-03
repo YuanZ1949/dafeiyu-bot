@@ -7,7 +7,7 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from .behavior import BehaviorSettings
@@ -20,6 +20,7 @@ from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
 from .images import materialize
 from .keepalive import Keepalive
+from .memory import shared_facts
 from .memory.context import build_injection
 from .memory.rotation import apply_rotation, needs_rotation
 from .memory.store import Store
@@ -48,10 +49,6 @@ _IMAGE_PATH_RE = re.compile(r"图存\s+([^\s，)）]+)")
 SHUTUP_MINUTES = 60
 ADMIN_ONLY_REPLY = "这个命令只有管理员能用。"
 FORGET_REPLY = "记忆清空了，本鱼失忆中……🫧"
-TOOL_HINT_REPLY = "本鱼去网上查一下，稍等…"
-FOLLOWUP_REPLY = "没查到什么有用的，本鱼先不瞎说了"
-# 同一会话 60s 内不重复发「去查一下」；每轮最多一次由 brain 侧保证。
-TOOL_HINT_INTERVAL_SECONDS = 60.0
 # 待发队列：通道恢复后补发的轮询间隔 / 重试上限 / 消息保鲜期。
 OUTBOX_RETRY_SECONDS = 15.0
 OUTBOX_MAX_ATTEMPTS = 8
@@ -62,6 +59,23 @@ ROTATION_WINDOW = 40
 # （spec §8.4 原写作 failed，实现统一取 error，避免同一件事两个名字）。
 SKIP_BUDGET = "budget"
 SKIP_ERROR = "error"
+
+# 跨群查证缓存注入段：只当参考，明确告诉模型可能过时、拿不准就重查。
+SHARED_FACT_HEADER = "【别的群问过的同一问题（只作参考，可能过时）】"
+SHARED_FACT_HINT = "这条是别的群查过的结论，别直接当事实复述；拿不准就自己再查一遍。"
+
+
+@dataclass
+class ToolUse:
+    """本轮模型是否调用过工具、调过哪些；只做内部判定，不往群里发任何提示。"""
+
+    used: bool = False
+    names: list[str] = field(default_factory=list)
+
+    async def record(self, name: str) -> None:
+        self.used = True
+        self.names.append(name)
+
 
 _REASON_TEXT = {
     "self": "机器人自己的消息",
@@ -157,7 +171,6 @@ class Service:
         # 已从库里补投过接续语的会话：同一进程内不再重复注入（重启后内存为空，
         # 会再从 session_summaries 捞一次，然后同样只注入一次）。
         self._continuation_used: set[tuple[ChatType, str]] = set()
-        self._hint_at: dict[tuple[ChatType, str], float] = {}
         # 待发队列的补发任务（通道恢复后把没发出去的分片补上）。
         self._outbox_task: asyncio.Task[None] | None = None
         # 面板可改的聊天强度/言论限制：整体替换，避免逐字段同步。
@@ -1138,12 +1151,14 @@ class Service:
         await self._maybe_rotate(chat_type, chat_id)
 
         continuation = self._continuation_for(chat_type, chat_id)
+        fact_hint = self._shared_fact_hint(chat_type, chat_id, batch)
         prompt = self._build_prompt(
             chat_type,
             chat_id,
             batch,
             continuation=continuation,
             omitted=backlog,
+            fact_hint=fact_hint,
         )
 
         log.info(
@@ -1153,10 +1168,10 @@ class Service:
             len(batch),
             addressed,
         )
-        hint = self._tool_hint(chat_type, chat_id)
+        tool_use = ToolUse()
         try:
             reply = await self._call_brain(
-                chat_type, chat_id, batch, prompt, on_tool=hint
+                chat_type, chat_id, batch, prompt, on_tool=tool_use.record
             )
         except BrainError as exc:
             # 失败也占一次调用额度；游标随 mark_skipped 推进，不重投。
@@ -1164,25 +1179,13 @@ class Service:
             self.store.record_usage(chat_type, chat_id, "error", 0, 0)
             self.store.mark_skipped(chat_type, chat_id, ids, SKIP_ERROR)
             log.warning("批次调用失败 %s/%s: %s", chat_id, current_id, exc)
-            if hint.sent:
-                # 已经开口说「去查一下」，不能没有下文；发不出去就排队补发。
-                await self._send_outbox(
-                    chat_type, chat_id, FOLLOWUP_REPLY, origin=current_id
-                )
             self._check_workspace(chat_type, chat_id)
             return
 
         sent = await self._send_batch_reply(batch, reply, chat_type, chat_id)
         if not sent:
-            if hint.sent:
-                # 已经开口说「去查一下」，不能没有下文。正式回复若已进待发
-                # 队列，就等它补发，别再补一句「没查到」（会自相矛盾）。
-                if not self.store.has_outbox(chat_type, chat_id):
-                    await self._send_outbox(
-                        chat_type, chat_id, FOLLOWUP_REPLY, origin=current_id
-                    )
-            else:
-                self.router.note_no_reply(chat_type, chat_id)
+            self.router.note_no_reply(chat_type, chat_id)
+        self._remember_shared_fact(chat_type, chat_id, batch, reply, tool_use)
 
         self.store.record_usage(
             chat_type,
@@ -1203,7 +1206,77 @@ class Service:
         if continuation:
             # 已消费：同一进程内不再从库里重复注入（内存里的到这一步也已弹出）。
             self._continuation_used.add(key)
+        log.debug("本轮工具调用 %s/%s: %s", chat_id, current_id, tool_use.names)
         self._check_workspace(chat_type, chat_id)
+
+    def _shared_fact_hint(
+        self, chat_type: ChatType, chat_id: str, messages: list[Message]
+    ) -> str | None:
+        """命中跨群查证缓存时给 prompt 加一段参考。
+
+        只在群聊里查：私聊的内容本来就不该进共享缓存（写入侧也拦）。
+        """
+        if chat_type is not ChatType.GROUP:
+            return None
+        question = self._shared_fact_question(messages)
+        if question is None:
+            return None
+        fact = shared_facts.pick_best(self.store.shared_facts(), question)
+        if fact is None:
+            return None
+        self.store.bump_shared_fact(fact.id)
+        log.info("命中跨群查证缓存 %s/%s fact=%s", chat_type, chat_id, fact.id)
+        return (
+            f"{SHARED_FACT_HEADER}\n"
+            f"问：{fact.question_text}\n"
+            f"答：{fact.answer_text}\n"
+            f"{SHARED_FACT_HINT}"
+        )
+
+    def _remember_shared_fact(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        messages: list[Message],
+        reply: BrainReply,
+        tool_use: ToolUse,
+    ) -> None:
+        """本轮查证成功（调过工具且有正式回复）时写入跨群缓存。
+
+        只记群聊、只记带提问的消息；隐私过滤在 `shared_facts.extract` 里，
+        存储层还会再拦一次，防止以后别处调用绕过。
+        """
+        if chat_type is not ChatType.GROUP or not tool_use.used or not reply.speak:
+            return
+        question = self._shared_fact_question(messages)
+        if question is None:
+            return
+        nickname = next(
+            (
+                message.nickname
+                for message in reversed(messages)
+                if not message.is_bot and message.content.strip()
+            ),
+            "",
+        )
+        fact_id = self.store.add_shared_fact(
+            question, reply.reply, chat_type, chat_id, nickname
+        )
+        if fact_id:
+            log.info(
+                "写入跨群查证缓存 %s/%s fact=%s", chat_type, chat_id, fact_id
+            )
+
+    @staticmethod
+    def _shared_fact_question(messages: list[Message]) -> str | None:
+        """批次里最后一条「像提问」的人类消息；没有就返回 None。"""
+        for message in reversed(messages):
+            if message.is_bot or message.recalled_at:
+                continue
+            text = message.content.strip()
+            if text and shared_facts.looks_like_question(text):
+                return text
+        return None
 
     async def _send_batch_reply(
         self, batch: list[Message], reply: BrainReply, chat_type: ChatType, chat_id: str
@@ -1244,7 +1317,7 @@ class Service:
             except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
                 log.warning("发送失败 %s/%s: %s", chat_id, batch[-1].message_id, exc)
                 # 失败这条和后面所有分片一起进待发队列：通道恢复后补发，
-                # 不再出现「用户只看到『稍等』」的永久沉默。
+                # 不让这段回复永久丢失。
                 for rest in chunks[index:]:
                     if self.store.enqueue_outbox(
                         chat_type, chat_id, rest, origin_message_id=batch[-1].message_id
@@ -1300,30 +1373,6 @@ class Service:
             self._chat_budget_decision(chat_type, chat_id, addressed=addressed),
             addressed,
         )
-
-    def _tool_hint(self, chat_type: ChatType, chat_id: str):
-        """返回 on_tool 回调：每轮最多一次（brain 侧保证），同 chat 60s 内不重复。
-
-        节流时间戳是进程内状态：多实例部署时各算各的，最坏情况同一分钟内多发
-        一条提示语（提示语只是过渡消息，重复无害），因此不为此建表。
-        """
-        key = (chat_type, chat_id)
-
-        async def hint(tool: str) -> None:
-            now = time.monotonic()
-            last = self._hint_at.get(key)
-            if last is not None and now - last < TOOL_HINT_INTERVAL_SECONDS:
-                return
-            try:
-                await self._adapter_for(chat_id).send(chat_type, chat_id, TOOL_HINT_REPLY)
-            except Exception as exc:  # noqa: BLE001 - 提示语失败不影响主流程
-                log.warning("提示语发送失败 %s/%s: %s", chat_id, tool, exc)
-                return
-            self._hint_at[key] = now
-            hint.sent = True
-
-        hint.sent = False
-        return hint
 
     def _continuation_for(self, chat_type: ChatType, chat_id: str) -> str | None:
         """本轮要注入的接续语：内存优先，重启后回落到库里的 24h 摘要。
@@ -1476,6 +1525,7 @@ class Service:
         *,
         continuation: str | None = None,
         omitted: int = 0,
+        fact_hint: str | None = None,
     ) -> str:
         """三种模式共用的 prompt：长期记忆注入 + 时间线（单条也走这里）。"""
         injection_cfg = self.injection or InjectionConfig()
@@ -1505,6 +1555,11 @@ class Service:
         framing = self.behavior.framing()
         if framing:
             injection = f"{injection}\n\n{framing}" if injection.strip() else framing
+
+        if fact_hint:
+            injection = (
+                f"{injection}\n\n{fact_hint}" if injection.strip() else fact_hint
+            )
 
         # 时机提示只给群聊：私聊无所谓「插不插嘴」。
         if chat_type is ChatType.GROUP and messages:

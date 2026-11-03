@@ -1,7 +1,8 @@
-"""Task 12：`_run_batch` —— 预算分层、purpose、轮换、提示语/补话、容量检查。"""
+"""Task 12：`_run_batch` —— 预算分层、purpose、轮换、工具调用追踪、容量检查。"""
 
 from datetime import date, datetime, timedelta, timezone
 
+from dafeiyu import service as service_module
 from dafeiyu.behavior import BehaviorSettings
 from dafeiyu.brain.client import BrainError, BrainReply
 from dafeiyu.config import (
@@ -18,7 +19,7 @@ from dafeiyu.memory.store import Store
 from dafeiyu.memory.workspace import Workspace
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router
-from dafeiyu.service import FOLLOWUP_REPLY, Service
+from dafeiyu.service import Service, ToolUse
 from dafeiyu.timeutil import today_shanghai
 
 SHANGHAI = timezone(timedelta(hours=8))
@@ -377,17 +378,37 @@ async def test_brain_error_does_not_requeue_and_stays_silent(tmp_path):
     assert store.skip_reason(ChatType.GROUP, CHAT, "m0") == "error"
 
 
-async def test_hint_then_speak_false_sends_followup(tmp_path):
+async def test_tool_use_sends_no_hint_and_keeps_silence(tmp_path):
+    """工具调用只做内部标记：不再先发「去网上查一下，稍等」。"""
     service, _, _, adapter = build(
         tmp_path, brain=FakeBrain(speak=False, text="", fire_tool=True)
     )
 
     await service._run_batch(ChatType.GROUP, CHAT)
 
-    texts = adapter.texts()
-    assert texts[0].startswith("本鱼去网上查一下")
-    assert texts[-1] == FOLLOWUP_REPLY
-    assert FOLLOWUP_REPLY.startswith("没查到")
+    # 模型选择不说：群里一条消息都不该有（既没有过渡语，也没有「没查到」补话）。
+    assert adapter.texts() == []
+
+
+async def test_tool_use_is_recorded_for_internal_use(tmp_path, monkeypatch):
+    """on_tool 被触发时只记录，不发消息；名称留给后续记忆功能。"""
+    recorded: list[ToolUse] = []
+
+    class RecordingToolUse(ToolUse):
+        def __init__(self) -> None:
+            super().__init__()
+            recorded.append(self)
+
+    monkeypatch.setattr(service_module, "ToolUse", RecordingToolUse)
+    service, _, _, adapter = build(tmp_path, brain=FakeBrain(fire_tool=True))
+
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    assert recorded, "本轮应当构造 ToolUse"
+    assert recorded[-1].used is True
+    assert recorded[-1].names == ["webfetch"]
+    # 只发正式回复，不多一条过渡语。
+    assert adapter.texts() == ["在呢"]
 
 
 async def test_rotation_runs_before_model_call(tmp_path):

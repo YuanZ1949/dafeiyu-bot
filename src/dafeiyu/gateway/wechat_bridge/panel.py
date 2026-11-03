@@ -9,7 +9,7 @@
 - 白名单非空：只轮询/只回复列出的会话（``wxg:<alias>`` 形式）；
 - 白名单为空：不限制（桥轮询本地库能枚举到的全部群）。
 
-读不出来时返回 ``None``，调用方退回 `gateway.wechat.group_allowlist`——
+读不出来时返回 ``None``，调用方按 fail-closed 处理（不轮询、不发送）——
 宁可少轮询，也不能因为一次 YAML 解析失败就把「全部群」打开。
 """
 
@@ -35,7 +35,7 @@ class PanelGroups:
         self._broken = False
 
     def whitelist(self) -> frozenset[str] | None:
-        """当前面板白名单；``None`` = 读不出来（调用方按配置 allowlist 处理）。"""
+        """当前面板白名单；``None`` = 读不出来（调用方 fail-closed）。"""
         try:
             stat = self.path.stat()
         except FileNotFoundError:

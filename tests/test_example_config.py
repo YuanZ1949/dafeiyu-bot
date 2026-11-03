@@ -27,7 +27,6 @@ def test_example_config_loads_and_wechat_disabled(tmp_path, monkeypatch):
     assert settings.gateway.provider == "qq"
     assert settings.wechat.enabled is False
     assert settings.wechat.bridge_port == 8790
-    assert settings.wechat.group_allowlist == frozenset()
     assert settings.wechat.version_min == "4.1.6"
     assert settings.wechat.language == "zh-CN"
     assert settings.wechat.kill_switch_file == "data/wechat.stop"
