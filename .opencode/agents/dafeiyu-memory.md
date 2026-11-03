@@ -2,7 +2,7 @@
 description: 记忆旁路专用（摘要/印象），单步、无工具、只输出纯文本或 JSON
 mode: primary
 # 专用配置目录没有全局 model 兜底，这里必须自己钉住（spec §6.2）。
-model: dafeiyu-key/deepseek-flash
+model: opencode/deepseek-v4.1-flash-free
 # 只做一件事：把输入压成摘要或抽成画像。单步防止它自己发起工具调用。
 steps: 1
 permissions:

@@ -174,7 +174,7 @@ def test_budget_ambient_ratio_parsed(tmp_path: Path) -> None:
 def test_agents_permissions_and_persona_sync() -> None:
     text = AGENT_FILE.read_text(encoding="utf-8")
     fm = text.split("---")[1]
-    assert "steps: 4" in fm
+    assert "steps: 6" in fm
     assert "model: opencode/deepseek-v4.1-flash-free" in fm
     assert "glob" not in fm and "grep" not in fm
     assert "data/bot-workspace/**" in fm
