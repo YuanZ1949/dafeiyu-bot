@@ -356,11 +356,59 @@ gateway:
 
 - 原理：用 `OpenProcess(PROCESS_VM_READ)` + `VirtualQueryEx` + `ReadProcessMemory` 只读扫描 `Weixin.exe` 内存，从 WCDB 的 `com.Tencent.WCDB.Config.Cipher` 对象里取出 XOR 混淆的密钥（老版本回退到明文 `X'<hex>'` 字面量），再用 page1 的 HMAC 校验筛选；密钥缓存到 `data/wechat-bridge/localdb/keys.json`（`data/` 已在 `.gitignore` 里）。
 - 消息库按页增量解密到 `data/wechat-bridge/localdb/`（含 WAL 重放），只读句柄查询；**微信原文件一个字节都不写**。
-- 发送仍然走 UIA（输入框键入 + 回车），本模式只影响入站。
+- 默认发送仍走 UIA（输入框键入 + 回车），本模式只影响入站；锁屏也要发见下一节。
 - 任何一步失败（微信没登录 / 提不到密钥 / 库被占用 / 镜像损坏）都只在日志里 warning，并**自动回落 UIA**，60 秒后重试，入站不会停。
 - 首次启用会扫一次进程内存（实测约 3–5 秒，日志 `内存扫描匹配 N/N 个数据库密钥`）。
 
 风险：读进程内存与解密本地库属于非公开接口，可能违反腾讯的软件许可条款；微信升级后密钥格式可能变化导致失效（此时自动回落 UIA）。镜像目录里是**明文**聊天记录，注意机器与备份的访问权限。
+
+### 出站后端：UIA / hook / auto（可选）
+
+默认 `outbound: uia`，行为与之前一致（锁屏不可发）。若已在本机跑了一个能注入微信的 HTTP 服务，可让出站不再依赖桌面：
+
+```yaml
+gateway:
+  wechat:
+    outbound: hook            # uia（默认）/ hook / auto
+    hook_url: ""              # outbound=hook/auto 时必填；http:// 或 https://
+    hook_timeout_seconds: 5.0
+    local_db_enabled: true    # outbound=hook 时必开：群显示名要靠本地库解析成 xxx@chatroom
+    send_verify: true         # 发送后回读本地库，把 typed 升级成 observed（需 local_db_enabled）
+    send_verify_timeout_seconds: 8.0
+    send_verify_interval_seconds: 0.5
+```
+
+- `hook`：桥向 `hook_url` POST `{"action":"send_text","chatroom":"<xxx@chatroom>","chat_name":"<群显示名>","text":"<正文>"}`；群 `chatroom` 由本地库把显示名解析成 `xxx@chatroom`（因此 `outbound: hook` 要求 `local_db_enabled: true`，启动时校验），解析不到就明确回 `chat_name_unresolved`，**绝不猜 id**。响应 `{"ok":true}` 只算 `typed`。
+- `auto`：先 hook，只有**可证明没发出去**（连接被拒 / 后端明确 `sent:false` / 群名解析失败）才回落 UIA。HTTP 超时、5xx、响应损坏属于「结果不明」，**不回落**——否则可能发两次。
+- 回执校验：成功发出后轮询本地库找「自己刚发的那条」，找到升级为 `observed`；窗口内没找到只把回执降级为 `typed` + `receipt_unverified`，**不会返回失败**（失败会让客户端换新 id 重发，协议 §7.6）。
+- `outbound=hook/auto` 时客户端不再要求桌面可交互，锁屏也能下发指令；真正的失败由桥回执里的 `error_code` 表达。
+
+hook 端的具体适配（哪个注入库、支持哪个微信版本）不在本项目内，桥只按上面的请求/响应契约说话。
+
+### 无 hook 的替代：RDP + `tscon` 保控制台解锁（可选）
+
+不想接注入服务，又必须走 UIA 出站时，可以「RDP 连进去，再把会话交回物理控制台」：
+
+1. 从另一台机器用 RDP 登录机器人这台机器（同一个 Windows 账号）；
+2. 管理员身份运行 `.venv\Scripts\python -m dafeiyu.rdp status`，先只读确认会话名、Session ID、协议与计划；
+3. 确认后执行 `handoff`（等价于 `tscon <session> /dest:console`）：会话交回物理控制台，**不会重新锁屏**，UIA 继续可用；**当前 RDP 连接会立即断开**，这是预期行为；
+4. 断开后桌面上就是解锁状态；`python -m dafeiyu.cli doctor` 的 `wechat.desktop_interactive` 应为 PASS（在 RDP 会话里这条会提示先做交接）。
+
+```powershell
+# 只读：会话名 / Session ID / 协议（控制台 / RDP）/ 是否管理员 / 建议动作
+.venv\Scripts\python -m dafeiyu.rdp status
+.venv\Scripts\python -m dafeiyu.rdp plan         # 只打印将要执行的命令，不执行
+.venv\Scripts\python -m dafeiyu.rdp handoff      # 执行交接（需要管理员）
+
+# 等价的包装脚本；-Elevate 会弹 UAC 自动提权
+powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action status
+powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action handoff -Elevate
+```
+
+- 探测优先读 `WTSClientProtocolType`（0=控制台 / 1=ICA / 2=RDP），读不到再回退 `SESSIONNAME` 前缀；两者都读不到一律按「不是 RDP」保守处理，不会乱执行。
+- `tscon` 需要管理员权限；非管理员会明确回 `needs_admin`（CLI 退出码 3），不会静默失败。执行成功但 WTS 仍读不到协议时只提示「未能确认」，不谎报成功。
+- 与 `outbound: hook/auto` 不冲突：有 hook 就用 hook，没有才需要这条路线。
+- 风险：这等于让机器人机器长期保持解锁，**物理安全风险由使用者自担**；不要在别人能物理接触的机器上这么做。
 
 ### 启动
 
@@ -383,7 +431,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 - 同名群只能靠显示名 / 人工区分，`group_allowlist` 里的显示名要人工核对。
 - `@` 触发依赖轮询，最坏有约一个 `poll_seconds`（默认 8 秒）的延迟；本地库模式同样受这个轮询间隔限制，但不再有开窗开销。
 - 发送有频率上限：`send_min_interval_seconds`（默认 20 秒）、`send_max_per_hour`（20）、`send_max_per_day`（60）；三者设为 `0` = 不限制。
-- 桌面锁屏即掉线。RPA 可能误点，`require_foreground_idle` 默认要求微信窗口前台且空闲才执行操作；开启微信通道时别在那台机器上干重要的事。
+- 默认出站（`outbound: uia`）桌面锁屏即发不出去；改用 `hook` / `auto` 可绕开桌面，但依赖外部注入服务。RPA 可能误点，`require_foreground_idle` 默认要求微信窗口前台且空闲才执行操作；开启微信通道时别在那台机器上干重要的事。
 
 ### 急停
 

@@ -283,6 +283,29 @@ def test_probe_wechat_session_zero_fails(monkeypatch) -> None:
     assert "Session 0" in desktop["detail"]
 
 
+def test_probe_wechat_rdp_session_hints_handoff(monkeypatch) -> None:
+    _patch_probes(monkeypatch)
+    monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#7")
+
+    checks = env_probe.probe_wechat(_wechat_config())
+
+    desktop = _by_id(checks)["wechat.desktop_interactive"]
+    assert desktop["status"] == "PASS"
+    assert "RDP" in desktop["detail"]
+    assert "dafeiyu.rdp handoff" in desktop["detail"]
+
+
+def test_probe_wechat_console_session_has_no_rdp_hint(monkeypatch) -> None:
+    _patch_probes(monkeypatch)
+    monkeypatch.setenv("SESSIONNAME", "Console")
+
+    checks = env_probe.probe_wechat(_wechat_config())
+
+    desktop = _by_id(checks)["wechat.desktop_interactive"]
+    assert desktop["status"] == "PASS"
+    assert "dafeiyu.rdp" not in desktop["detail"]
+
+
 def test_probe_wechat_missing_pyweixin(monkeypatch) -> None:
     _patch_probes(monkeypatch, driver=False)
 

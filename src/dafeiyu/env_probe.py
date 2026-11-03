@@ -542,11 +542,19 @@ def probe_wechat(config=None) -> list[dict[str, str]]:
                 )
             else:
                 shown = "未知" if session_id is None else str(session_id)
+                session_name = str(os.environ.get("SESSIONNAME") or "")
+                if session_name.upper().startswith("RDP-"):
+                    detail = (
+                        f"桌面可交互（Session {shown}，RDP 会话）；"
+                        "断开远程桌面后会锁屏，先运行 python -m dafeiyu.rdp handoff"
+                    )
+                else:
+                    detail = f"桌面可交互（Session {shown}）"
                 checks.append(
                     _check(
                         "wechat.desktop_interactive",
                         "PASS",
-                        f"桌面可交互（Session {shown}）",
+                        detail,
                     )
                 )
 
