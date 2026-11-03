@@ -274,8 +274,15 @@ def _resolve_chat_name(
     name = str(getattr(peer, "display_name", "") or "").strip()
     if peer is None or not getattr(peer, "live", False) or not name:
         raise _CommandError("chat_name_unresolved")
-    allowed = {str(group).strip() for group in (allowlist or ())}
-    if getattr(peer, "kind", "group") != "group" or name not in allowed:
+    # 面板白名单是唯一操作面：poller 有 `allows_chat` 就交给它判定
+    # （空白名单 = 不限群）；没有面板接缝的旧测试/替身仍按 allowlist 判定。
+    gate = getattr(poller, "allows_chat", None)
+    if callable(gate):
+        allowed = bool(gate(chat_id))
+    else:
+        allowed_names = {str(group).strip() for group in (allowlist or ())}
+        allowed = getattr(peer, "kind", "group") == "group" and name in allowed_names
+    if not allowed:
         raise _CommandError("chat_not_allowed")
     return name
 
@@ -710,10 +717,14 @@ def _default_driver_factory() -> Any:
 
 def _default_poller_factory(wechat: WeChatConfig, driver: Any) -> Any:
     """默认轮询循环：`PollingLoop` 的 import 也留在函数体内，保持入口轻量。"""
+    from .panel import PanelGroups
     from .poller import PollingLoop
 
     localdb = _build_localdb_source(wechat)
-    return PollingLoop(wechat, driver, localdb=localdb)
+    # 范围以面板白名单为准（热加载，面板改完一个轮询间隔内生效）。
+    return PollingLoop(
+        wechat, driver, localdb=localdb, panel=PanelGroups().whitelist
+    )
 
 
 def _build_localdb_source(wechat: WeChatConfig) -> Any | None:

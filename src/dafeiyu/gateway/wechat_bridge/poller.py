@@ -65,6 +65,15 @@ __all__ = [
     "UiThread",
 ]
 
+
+def _alias_of(chat_id: str) -> str | None:
+    """``wxg:<alias>`` -> ``alias``；其它通道/空值返回 None。"""
+    value = str(chat_id or "").strip()
+    if not value.startswith("wxg:"):
+        return None
+    alias = value[4:].strip()
+    return alias or None
+
 #: 反挂死护栏：本模块的每一个 await 都不超过这个秒数（与 PART A 一致）。
 MAX_AWAIT = 5.0
 
@@ -311,12 +320,17 @@ class PollingLoop:
         poll_seconds: float | None = None,
         kill_switch_path: str | Path | None = None,
         localdb: Any | None = None,
+        panel: Callable[[], frozenset[str] | None] | None = None,
     ) -> None:
         self.wechat = wechat
         self.driver = driver
         # 本地库帧源（可选）：有它且 `available` 时入站直接读解密镜像，
         # `open_chat`/`snapshot` 只作为降级路径；发送永远走 UIA。
         self.localdb = localdb
+        # 面板白名单（可选）：返回 `{"wxg:<alias>", ...}`，None = 读不出来。
+        # 面板是用户的唯一操作面：非空只碰列出的群，空 = 不限制（与面板的
+        # `empty_means:"all"` 一致）。None 时退回 `group_allowlist`。
+        self._panel = panel
         self.ui = ui if ui is not None else UiThread()
         self._owns_ui = ui is None
         if registry is None:
@@ -459,17 +473,18 @@ class PollingLoop:
         漏消息不行。免打扰会话不计入红点，所以 `full_sweep_seconds` 到点必全量。
 
         本地库可用时**不走红点门控**：读 SQLite 本来就不需要开窗，红点反而会
-        漏掉免打扰群，直接返回白名单即可。
+        漏掉免打扰群，直接返回本轮范围即可。
         """
+        scope = self._scope()
         if self._uses_localdb():
-            return self.allowlist
+            return scope
         if not self.unread_gate:
-            return self.allowlist
+            return scope
 
         now = self._clock()
         if now - self._last_full_sweep >= self.full_sweep_seconds:
             self._last_full_sweep = now
-            return self.allowlist
+            return scope
         if now < self._skip_scan_until:
             return ()
 
@@ -477,7 +492,7 @@ class PollingLoop:
         scan = getattr(self.driver, "unread_sessions", None)
         if not callable(probe) or not callable(scan):
             # 替身驱动/旧驱动没有这个能力：保持原来的全量轮询语义。
-            return self.allowlist
+            return scope
 
         try:
             total = await self._ui_call(probe)
@@ -485,7 +500,7 @@ class PollingLoop:
             raise
         except Exception as exc:  # noqa: BLE001 - 探测失败只能退回全量
             logger.warning("未读红点探测失败，退回全量轮询：%s", exc)
-            return self.allowlist
+            return scope
         if not total:
             return ()
 
@@ -495,22 +510,113 @@ class PollingLoop:
             raise
         except Exception as exc:  # noqa: BLE001 - 扫描失败只能退回全量
             logger.warning("未读会话扫描失败，退回全量轮询：%s", exc)
-            return self.allowlist
+            return scope
 
-        targets = tuple(group for group in self.allowlist if group in pending)
+        targets = tuple(group for group in scope if group in pending)
         if not targets:
-            # 未读都在白名单外：别每个 tick 都去翻会话列表，等下一轮全量兜底。
+            # 未读都在范围外：别每个 tick 都去翻会话列表，等下一轮全量兜底。
             self._skip_scan_until = now + self.full_sweep_seconds
         return targets
+
+    # ------------------------------------------------------- 轮询/发送范围
+    def _panel_whitelist(self) -> frozenset[str] | None:
+        """面板白名单；未接面板或读取抛错时返回 None（退回配置 allowlist）。"""
+        if self._panel is None:
+            return None
+        try:
+            return self._panel()
+        except Exception as exc:  # noqa: BLE001 - 面板坏了不能拖垮轮询
+            logger.warning("读取面板白名单失败，本轮按配置 allowlist 处理：%s", exc)
+            return None
+
+    def _peer(self, alias: str) -> Any | None:
+        lookup = getattr(self.registry, "by_alias", None)
+        if not callable(lookup):
+            return None
+        try:
+            return lookup(alias)
+        except Exception as exc:  # noqa: BLE001 - 身份表只影响范围解析
+            logger.debug("解析会话别名 %r 失败：%s", alias, exc)
+            return None
+
+    def _localdb_group_names(self) -> tuple[str, ...]:
+        """本地库能枚举到的全部群显示名；不可用/无能力时返回空元组。"""
+        source = self.localdb
+        getter = getattr(source, "group_names", None)
+        if not callable(getter):
+            return ()
+        try:
+            raw = getter()
+        except Exception as exc:  # noqa: BLE001 - 枚举失败按「不知道」处理
+            logger.warning("枚举本地库群名失败：%s", exc)
+            return ()
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, Iterable):
+            return ()
+        return tuple(sorted({str(name).strip() for name in raw if str(name).strip()}))
+
+    def _scope(self) -> tuple[str, ...]:
+        """本轮允许轮询的群显示名；面板优先，空白名单 = 不限制。
+
+        - 面板白名单非空：只返回其中能解析成存活群会话的那些；
+        - 面板白名单为空：返回本地库枚举到的全部群（本地库不可用时退回配置
+          `group_allowlist`——UIA 没有可靠的会话清单，宁可少开窗）；
+        - 面板读不出来：退回配置 `group_allowlist`（fail-closed）。
+        """
+        panel = self._panel_whitelist()
+        if panel is None:
+            return self.allowlist
+        if not panel:
+            return self._localdb_group_names() or self.allowlist
+        names: set[str] = set()
+        for chat_id in panel:
+            alias = _alias_of(chat_id)
+            if alias is None:
+                continue
+            peer = self._peer(alias)
+            if peer is None or not getattr(peer, "live", False):
+                continue
+            if str(getattr(peer, "kind", "group")) != "group":
+                continue
+            name = str(getattr(peer, "display_name", "") or "").strip()
+            if name:
+                names.add(name)
+        return tuple(sorted(names))
+
+    def allows_chat(self, chat_id: str) -> bool:
+        """出站闸门：面板白名单非空时只放行列出的会话，空 = 不限群。"""
+        if _alias_of(chat_id) is None:
+            # 桥只管微信会话：面板放开的只是「哪些群」，不是别的通道。
+            return False
+        panel = self._panel_whitelist()
+        if panel is None:
+            return self._legacy_allows_chat(chat_id)
+        if panel:
+            return str(chat_id or "").strip() in panel
+        return True
+
+    def _legacy_allows_chat(self, chat_id: str) -> bool:
+        """没有面板时的旧判定：会话必须解析成存活群，且在配置 allowlist 里。"""
+        alias = _alias_of(chat_id)
+        if alias is None:
+            return False
+        peer = self._peer(alias)
+        if peer is None or not getattr(peer, "live", False):
+            return False
+        if str(getattr(peer, "kind", "group")) != "group":
+            return False
+        name = str(getattr(peer, "display_name", "") or "").strip()
+        return bool(name) and name in self._allowset
 
     async def _poll_round(
         self, groups: Iterable[str] | None = None
     ) -> AsyncIterator[dict[str, Any]]:
-        for group in self.allowlist if groups is None else groups:
+        scope = self._scope()
+        allowed = frozenset(scope)
+        for group in scope if groups is None else groups:
             if self._stopped.is_set():
                 return
-            # 双保险：永远不碰 allowlist 之外的会话。
-            if group not in self._allowset:
+            # 双保险：永远不碰本轮范围之外的会话（面板可能刚被改小）。
+            if group not in allowed:
                 continue
             try:
                 frames = await self._poll_group(group)
