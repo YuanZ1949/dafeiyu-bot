@@ -162,7 +162,14 @@ class Supervisor:
         state.proc = proc
         state.started_at = time.monotonic()
         self.logs.write(name, f"已启动 pid={proc.pid}")
-        if state.watcher is not None and not state.watcher.done():
+        # 自动重启时这个 start() 就跑在 _watch 自己里面：此时 watcher 就是当前
+        # 任务，取消它等于把自己打断，状态会永远停在 starting，新进程也没有
+        # 看门狗（后续崩溃再没人拉起）。只有「换掉另一个还活着的看门狗」才取消。
+        if (
+            state.watcher is not None
+            and not state.watcher.done()
+            and state.watcher is not asyncio.current_task()
+        ):
             state.watcher.cancel()
         state.drains = [
             asyncio.create_task(self._drain(name, stream))

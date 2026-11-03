@@ -344,6 +344,44 @@ async def test_restart_replaces_process(tmp_path: Path) -> None:
         await supervisor.stop("sleeper")
 
 
+async def test_auto_restart_keeps_watchdog_and_reaches_ready(tmp_path: Path) -> None:
+    """看门狗自己触发重启时，start() 不能把当前任务取消掉。
+
+    回归：`_watch` → `start()` 里无条件 `state.watcher.cancel()`，取消的正是
+    当前任务；CancelledError 在等待就绪时抛出，状态永远停在 starting，
+    新进程也没有看门狗（下次崩溃再没人拉起）。
+    """
+    marker = tmp_path / "crashed-once"
+    script = (
+        "import os, sys, time\n"
+        f"marker = {str(marker)!r}\n"
+        "if not os.path.exists(marker):\n"
+        "    open(marker, 'w').close()\n"
+        "    time.sleep(0.2)\n"
+        "    sys.exit(3)\n"
+        "print('ready-line', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    specs = {
+        "flaky": ProcSpec(
+            "flaky",
+            [sys.executable, "-u", "-c", script],
+            ready_probe=lambda: True,
+        )
+    }
+    supervisor, hub = make_supervisor(tmp_path, specs)
+    await supervisor.start("flaky")
+    try:
+        await wait_for_log_line(hub, "flaky", "ready-line", timeout=8.0)
+        state = supervisor.states["flaky"]
+        context = f"status={state.status!r} restart_count={state.restart_count}"
+        assert state.status == READY, context
+        assert state.proc is not None and state.proc.returncode is None, context
+        assert state.restart_count == 1, context
+    finally:
+        await supervisor.stop("flaky")
+
+
 async def test_external_instance_turns_stopped_when_pid_dies(tmp_path: Path) -> None:
     specs = {"napcat": ProcSpec("napcat", [sys.executable, "-u", "-c", SLEEPER])}
     supervisor, hub = make_supervisor(tmp_path, specs)
