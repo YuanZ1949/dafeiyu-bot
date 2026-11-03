@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Callable, Hashable
+from collections.abc import Callable, Hashable
+from typing import Any
 
 from dafeiyu.brain.client import BrainError
 from dafeiyu.models import ChatType
@@ -34,7 +35,7 @@ def log_memory_failure(
     label: str,
     exc: BaseException,
     chat_type: ChatType,
-    chat_id: int,
+    chat_id: str,
 ) -> None:
     """记忆类任务失败时的日志分级。
 

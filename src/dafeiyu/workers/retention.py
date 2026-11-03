@@ -36,9 +36,9 @@ async def retention_loop(
             deleted = prune_once(store, retention_days)
             if deleted:
                 logger.info("清理过期消息 %s 条（保留 %s 天）", deleted, retention_days)
-        except Exception:  # noqa: BLE001 - 清理失败不能拖垮主循环
+        except Exception:
             logger.exception("清理过期消息失败")
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass

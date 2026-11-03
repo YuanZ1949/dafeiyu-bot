@@ -61,7 +61,7 @@ def test_pending_summary_days_is_per_chat(tmp_path: Path) -> None:
     assert store.pending_summary_days() == [three_days_ago.date().isoformat()]
     slots = store.pending_summary_slots()
     assert [(slot.chat_id, slot.date, slot.messages) for slot in slots] == [
-        (200, three_days_ago.date().isoformat(), 1)
+        ("200", three_days_ago.date().isoformat(), 1)
     ]
 
 
@@ -99,13 +99,13 @@ async def test_memory_health_endpoint_reports_backlog_and_last_summary(
     assert payload["pending_slots"] == [
         {
             "chat_type": "group",
-            "chat_id": 100,
+            "chat_id": "100",
             "date": two_days_ago.date().isoformat(),
             "messages": 1,
         }
     ]
     assert payload["summary_total"] == 1
-    assert payload["last_summary"]["chat_id"] == 100
+    assert payload["last_summary"]["chat_id"] == "100"
     assert payload["quota"]["paused"] is False
 
 

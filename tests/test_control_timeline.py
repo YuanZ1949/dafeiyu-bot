@@ -53,7 +53,7 @@ async def test_timeline_returns_page_metrics_and_context(tmp_path: Path) -> None
     assert data["anchor_found"] is False
     assert data["chat"] == {
         "chat_type": "group",
-        "chat_id": CHAT_ID,
+        "chat_id": str(CHAT_ID),
         "message_total": 3,
         "summary_total": 1,
         "impression_total": 1,
@@ -107,7 +107,10 @@ async def test_timeline_rejects_bad_parameters(tmp_path: Path) -> None:
 
     async with running(app) as client:
         bad_type = await client.get(f"/api/sessions/room/{CHAT_ID}/timeline")
-        bad_id = await client.get("/api/sessions/group/0/timeline")
+        bad_id = await client.get("/api/sessions/group/%2e%2e%5cetc/timeline")
+        too_long = await client.get(
+            "/api/sessions/group/" + "x" * 129 + "/timeline"
+        )
         bad_limit = await client.get(
             f"/api/sessions/group/{CHAT_ID}/timeline?limit=0"
         )
@@ -123,7 +126,17 @@ async def test_timeline_rejects_bad_parameters(tmp_path: Path) -> None:
 
     assert bad_type.status == 400
     assert bad_id.status == 400
+    assert too_long.status == 400
     assert bad_limit.status == 400
     assert bad_before.status == 400
     assert empty_anchor.status == 400
     assert both.status == 400
+
+
+async def test_timeline_accepts_wechat_string_id(tmp_path: Path) -> None:
+    _, _, app = make_control(tmp_path)
+
+    async with running(app) as client:
+        resp = await client.get("/api/sessions/group/wxg:abc/timeline")
+
+    assert resp.status == 200

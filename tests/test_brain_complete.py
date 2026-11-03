@@ -3,11 +3,11 @@
 from dataclasses import dataclass
 
 import pytest
+from test_opencode_http import FakeServer, make_brain
 
 from dafeiyu.brain.opencode_http import OpenCodeHttpBrain
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType
-from test_opencode_http import FakeServer, make_brain
 
 
 @dataclass

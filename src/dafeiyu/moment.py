@@ -13,8 +13,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from .models import Message
 
@@ -194,9 +194,13 @@ def answers_bot_question(
     """
     if previous is None or not previous.is_bot or current.is_bot:
         return False
-    if max_gap_seconds and current.timestamp and previous.timestamp:
-        if current.timestamp - previous.timestamp > max_gap_seconds:
-            return False
+    if (
+        max_gap_seconds
+        and current.timestamp
+        and previous.timestamp
+        and current.timestamp - previous.timestamp > max_gap_seconds
+    ):
+        return False
     if not is_question(previous.content):
         return False
     body = (current.content or "").strip()

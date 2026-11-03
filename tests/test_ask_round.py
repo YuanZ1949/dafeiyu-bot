@@ -4,12 +4,12 @@ import asyncio
 import time
 
 import httpx
+from test_opencode_http import FakeServer
 
 from dafeiyu.brain import opencode_http
 from dafeiyu.brain.opencode_http import OpenCodeHttpBrain
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType
-from test_opencode_http import FakeServer
 
 # 默认两步：第一步也有文本，只有按 created 取最后一条才会拿到「结论是 X」。
 DEFAULT_STEPS = [("我先查一下", "done"), ("结论是 X", "done")]

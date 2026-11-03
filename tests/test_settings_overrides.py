@@ -191,3 +191,67 @@ def test_invalid_override_types_raise_configerror(tmp_path, monkeypatch, overrid
 
     with pytest.raises(config.ConfigError):
         config.load_settings(config_file=CONFIG_FIXTURE, env_file=ENV_FIXTURE)
+
+
+def _config_with_groups(tmp_path: Path, whitelist: str, blacklist: str = "[]") -> Path:
+    """在临时目录落一份 BASE_YAML 的拷贝，只换 groups 下的两个 id 列表。"""
+    text = BASE_YAML.replace(
+        "groups:\n  whitelist: []\n  blacklist: []\n",
+        f"groups:\n  whitelist: {whitelist}\n  blacklist: {blacklist}\n",
+    )
+    assert text != BASE_YAML, "groups 块替换失败，BASE_YAML 变了？"
+    path = tmp_path / "config-groups.yaml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_overlay_groups_whitelist_overrides_config(tmp_path, monkeypatch):
+    """面板白名单盖掉 config.yaml 里的 whitelist；wxg: 大小写与纯数字都要归一。"""
+    config_file = _config_with_groups(tmp_path, "[123456]")
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides({"groups": {"whitelist": ["wxg:AbC", 77]}}, path)
+
+    s = config.load_settings(config_file=config_file, env_file=ENV_FIXTURE)
+
+    assert s.groups.whitelist == frozenset({"wxg:abc", "qq:77"})
+
+
+def test_overlay_groups_empty_whitelist_clears_config(tmp_path, monkeypatch):
+    """覆盖层给空列表 = 清空（留空 = 不限制回复对象），不是回落到 config 值。"""
+    config_file = _config_with_groups(tmp_path, "[123456]")
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides({"groups": {"whitelist": []}}, path)
+
+    s = config.load_settings(config_file=config_file, env_file=ENV_FIXTURE)
+
+    assert s.groups.whitelist == frozenset()
+
+
+def test_overlay_groups_invalid_id_raises_configerror(tmp_path, monkeypatch):
+    """面板存进来的坏 id 不能拖到启动时才炸：load_settings 直接拒绝。"""
+    config_file = _config_with_groups(tmp_path, "[123456]")
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides({"groups": {"whitelist": ["not-an-id"]}}, path)
+
+    with pytest.raises(config.ConfigError, match="qq:/wxg: 前缀"):
+        config.load_settings(config_file=config_file, env_file=ENV_FIXTURE)
+
+
+def test_overlay_groups_ignores_other_keys(tmp_path, monkeypatch):
+    """覆盖层只认 whitelist：面板无法借 groups 键扩大 blacklist / admins 权限。"""
+    config_file = _config_with_groups(tmp_path, "[123456]", "[qq:88]")
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides(
+        {
+            "groups": {"blacklist": ["qq:99"], "admins": ["qq:1"]},
+            "groups2": {"whitelist": ["wxg:evil"]},
+        },
+        path,
+    )
+
+    s = config.load_settings(config_file=config_file, env_file=ENV_FIXTURE)
+
+    # 覆盖层未带 whitelist 时完全不动它；blacklist / admins 仍按 config.yaml。
+    assert s.groups.whitelist == frozenset({"qq:123456"})
+    assert s.groups.blacklist == frozenset({"qq:88"})
+    assert s.groups.admins == frozenset()

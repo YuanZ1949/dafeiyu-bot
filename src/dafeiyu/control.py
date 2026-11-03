@@ -9,15 +9,17 @@ import os
 import sqlite3
 import tempfile
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from aiohttp import web
 
 from . import __version__
+from .behavior import BehaviorError, as_payload, parse_behavior
 from .brain.factory import (
     build_brain,
     current_provider,
@@ -39,7 +41,15 @@ from .brain.provider_config import (
 )
 from .brain.runtime_config import ensure_isolated_config
 from .budget import BudgetGuard
-from .config import OVERRIDES_PATH, ConfigError, Settings
+from .config import (
+    OVERRIDES_PATH,
+    ConfigError,
+    GroupsConfig,
+    Settings,
+    parse_group_ids,
+)
+from .gateway.base import GatewayError
+from .ids import normalize_chat_id
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
 from .model_probe import (
     FREE_PROBE_TTL,
@@ -50,7 +60,7 @@ from .model_probe import (
     probe_free_model_detail,
     probe_models,
 )
-from .models import ChatType, Message
+from .models import ChatType, Message, channel_of
 from .runtime import RuntimeState, load_runtime, save_runtime
 from .secrets_store import (
     INSTALL_ROOT,
@@ -60,8 +70,6 @@ from .secrets_store import (
     secret_exists,
     write_secret,
 )
-from .behavior import BehaviorError, as_payload, parse_behavior
-from .service import TOOL_HINT_INTERVAL_SECONDS
 from .settings_local import OverrideError, read_overrides, write_overrides
 from .supervisor.reload_client import reload_opencode
 from .timeutil import SHANGHAI, now_shanghai
@@ -180,22 +188,16 @@ async def _read_json_object(
 
 def _chat_target(
     payload: dict[str, Any],
-) -> tuple[ChatType | None, int | None, web.Response | None]:
+) -> tuple[ChatType | None, str | None, web.Response | None]:
     raw_type = str(payload.get("chat_type") or "").strip()
     if raw_type not in ("group", "private"):
         return None, None, web.json_response(
             {"error": "chat_type 必须是 group 或 private"}, status=400
         )
     try:
-        chat_id = int(payload.get("chat_id"))
-    except (TypeError, ValueError):
-        return None, None, web.json_response(
-            {"error": "chat_id 必须是整数"}, status=400
-        )
-    if chat_id <= 0:
-        return None, None, web.json_response(
-            {"error": "chat_id 必须是正整数"}, status=400
-        )
+        chat_id = normalize_chat_id(payload.get("chat_id"))
+    except ValueError as exc:
+        return None, None, web.json_response({"error": str(exc)}, status=400)
     return ChatType(raw_type), chat_id, None
 
 
@@ -438,7 +440,7 @@ def _query_int(request: web.Request, name: str, default: int) -> int:
 
 def _query_scope(
     request: web.Request,
-) -> tuple[ChatType | None, int | None, web.Response | None]:
+) -> tuple[ChatType | None, str | None, web.Response | None]:
     raw_chat_type = (request.query.get("chat_type") or "").strip()
     chat_type: ChatType | None = None
     if raw_chat_type:
@@ -449,19 +451,13 @@ def _query_scope(
                 {"error": "chat_type 必须是 group 或 private"}, status=400
             )
 
-    chat_id: int | None = None
+    chat_id: str | None = None
     raw_chat_id = (request.query.get("chat_id") or "").strip()
     if raw_chat_id:
         try:
-            chat_id = int(raw_chat_id)
-        except ValueError:
-            return None, None, web.json_response(
-                {"error": "chat_id 必须是整数"}, status=400
-            )
-        if chat_id <= 0:
-            return None, None, web.json_response(
-                {"error": "chat_id 必须是正整数"}, status=400
-            )
+            chat_id = normalize_chat_id(raw_chat_id)
+        except ValueError as exc:
+            return None, None, web.json_response({"error": str(exc)}, status=400)
     if chat_id is not None and chat_type is None:
         return None, None, web.json_response(
             {"error": "指定 chat_id 时必须同时指定 chat_type"}, status=400
@@ -471,7 +467,7 @@ def _query_scope(
 
 def _path_target(
     request: web.Request,
-) -> tuple[ChatType | None, int | None, web.Response | None]:
+) -> tuple[ChatType | None, str | None, web.Response | None]:
     raw_type = request.match_info.get("chat_type", "")
     try:
         chat_type = ChatType(raw_type)
@@ -481,38 +477,26 @@ def _path_target(
         )
     raw_id = request.match_info.get("chat_id", "")
     try:
-        chat_id = int(raw_id)
-    except ValueError:
-        return None, None, web.json_response(
-            {"error": "chat_id 必须是整数"}, status=400
-        )
-    if chat_id <= 0:
-        return None, None, web.json_response(
-            {"error": "chat_id 必须是正整数"}, status=400
-        )
+        chat_id = normalize_chat_id(raw_id)
+    except ValueError as exc:
+        return None, None, web.json_response({"error": str(exc)}, status=400)
     return chat_type, chat_id, None
 
 
-def _positive_path_int(
+def _path_id(
     request: web.Request, name: str, label: str
-) -> tuple[int | None, web.Response | None]:
+) -> tuple[str | None, web.Response | None]:
     raw = request.match_info.get(name, "")
     try:
-        value = int(raw)
-    except ValueError:
-        return None, web.json_response(
-            {"error": f"{label} 必须是整数"}, status=400
-        )
-    if value <= 0:
-        return None, web.json_response(
-            {"error": f"{label} 必须是正整数"}, status=400
-        )
+        value = normalize_chat_id(raw, label=label)
+    except ValueError as exc:
+        return None, web.json_response({"error": str(exc)}, status=400)
     return value, None
 
 
 def _user_target(
     request: web.Request,
-) -> tuple[ChatType | None, int | None, int | None, web.Response | None]:
+) -> tuple[ChatType | None, str | None, str | None, web.Response | None]:
     raw_type = request.match_info.get("chat_type", "")
     try:
         chat_type = ChatType(raw_type)
@@ -520,13 +504,26 @@ def _user_target(
         return None, None, None, web.json_response(
             {"error": "chat_type 必须是 group 或 private"}, status=400
         )
-    chat_id, error = _positive_path_int(request, "chat_id", "chat_id")
+    chat_id, error = _path_id(request, "chat_id", "chat_id")
     if error is not None:
         return None, None, None, error
-    user_id, error = _positive_path_int(request, "user_id", "user_id")
+    user_id, error = _path_id(request, "user_id", "user_id")
     if error is not None:
         return None, None, None, error
     return chat_type, chat_id, user_id, None
+
+
+def _wechat_adapter(control: Any) -> Any | None:
+    adapters = getattr(control.service, "adapters", None)
+    if isinstance(adapters, dict):
+        adapter = adapters.get("wechat")
+        if adapter is not None:
+            return adapter
+    return None
+
+
+def _kill_switch_path(control: Any) -> Path:
+    return Path(str(control.settings.wechat.kill_switch_file))
 
 
 def _fmt_ts(timestamp: int | None) -> str:
@@ -578,12 +575,16 @@ class BrainControl:
         service: Any,
         adapter: Any,
         runtime_path: str = "data/runtime.json",
+        chat_titles: Callable[[str], str] | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.service = service
         self.adapter = adapter
         self.runtime_path = runtime_path
+        # 群白名单卡片要显示「wxg:<alias>」对应的微信群名；由启动方注入，
+        # 读不到就退回显示裸 id（不影响保存）。
+        self._chat_titles = chat_titles
         self.runtime: RuntimeState = load_runtime(runtime_path)
         self._lock = asyncio.Lock()
         self._last_notify_at: float | None = None
@@ -704,7 +705,7 @@ class BrainControl:
             return
         try:
             result = await probe_free_model_detail(client)
-        except Exception:  # noqa: BLE001 - 自检永远不允许打断启动
+        except Exception:
             log.warning("免费模型自检异常", exc_info=True)
             result = FreeProbeResult(False, "探测异常")
         available, reason = result.available, result.reason
@@ -875,6 +876,34 @@ class BrainControl:
             budget["cost"] = dict(report.cost)
             budget["warnings"] = [dict(item) for item in report.warnings]
 
+        channels: dict[str, Any] = {}
+        channel_status = getattr(self.service, "channel_status", None)
+        if callable(channel_status):
+            try:
+                raw_channels = channel_status()
+            except Exception as exc:  # noqa: BLE001 - 通道状态失败不能让探活 500
+                log.warning("读取通道状态失败：%s", exc)
+            else:
+                if isinstance(raw_channels, dict):
+                    for name, item in raw_channels.items():
+                        if not isinstance(item, dict):
+                            item = {}
+                        entry: dict[str, Any] = {
+                            "connected": bool(item.get("connected")),
+                            "degraded": bool(item.get("degraded")),
+                            "last_event_at": _iso_ts(item.get("last_event_at")),
+                            "last_disconnect_at": _iso_ts(
+                                item.get("last_disconnect_at")
+                            ),
+                            "last_send_at": _iso_ts(item.get("last_send_at")),
+                        }
+                        # 微信适配器额外暴露登录态与桌面状态；QQ 没有这两个属性，
+                        # 只按状态字典里真实存在的键补，避免凭空造字段。
+                        for extra in ("logged_in", "desktop"):
+                            if extra in item:
+                                entry[extra] = item[extra]
+                        channels[str(name)] = entry
+
         return {
             "ok": ok,
             "generated_at": generated_at,
@@ -887,6 +916,7 @@ class BrainControl:
                     getattr(self.adapter, "last_disconnect_at", None)
                 ),
             },
+            "channels": channels,
             "keepalive": (
                 self.service.keepalive_status()
                 if callable(getattr(self.service, "keepalive_status", None))
@@ -913,7 +943,7 @@ class BrainControl:
             "errors": errors,
         }
 
-    def budget_snapshot(self, chat_type: ChatType, chat_id: int) -> dict[str, Any]:
+    def budget_snapshot(self, chat_type: ChatType, chat_id: str) -> dict[str, Any]:
         """单会话预算报告，字段与健康快照的 budget 一致并附带会话标识。"""
         report = self.budget_guard.report(chat_type, chat_id)
         return {
@@ -1287,7 +1317,7 @@ class BrainControl:
         limit: int = 20,
         offset: int = 0,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
     ) -> dict[str, Any]:
         """dashboard 只读记忆面板的数据源：最近摘要 + 最近印象。"""
         limit = max(1, min(MAX_MEMORY_PAGE, int(limit)))
@@ -1439,7 +1469,7 @@ class BrainControl:
         self,
         query: str,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -1460,7 +1490,7 @@ class BrainControl:
     def timeline_snapshot(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         limit: int = 50,
         before: int | None = None,
         anchor_message_id: str | None = None,
@@ -1509,7 +1539,7 @@ class BrainControl:
         }
 
     def export_snapshot(
-        self, chat_type: ChatType, chat_id: int, limit: int = 1000
+        self, chat_type: ChatType, chat_id: str, limit: int = 1000
     ) -> dict[str, Any]:
         total = self.store.count_messages(chat_type, chat_id)
         messages = self.store.recent_messages(chat_type, chat_id, limit)
@@ -1598,7 +1628,7 @@ class BrainControl:
         }
 
     async def session_action(
-        self, action: str, chat_type: ChatType, chat_id: int
+        self, action: str, chat_type: ChatType, chat_id: str
     ) -> dict[str, Any]:
         if action == "new":
             self.store.reset_chat(chat_type, chat_id)
@@ -1655,6 +1685,79 @@ class BrainControl:
             setter(behavior)
         return as_payload(behavior)
 
+    def _groups(self) -> GroupsConfig:
+        """当前生效的群白名单：优先 Service 的运行时值，兜底启动配置。"""
+        runtime = getattr(self.service, "groups", None)
+        if isinstance(runtime, GroupsConfig):
+            return runtime
+        service_settings = getattr(self.service, "settings", None)
+        groups = getattr(service_settings, "groups", None)
+        if isinstance(groups, GroupsConfig):
+            return groups
+        return self.settings.groups
+
+    def groups_snapshot(self) -> dict[str, Any]:
+        groups = self._groups()
+        known: list[dict[str, Any]] = []
+        for item in self.store.chat_overview():
+            if str(item.get("chat_type") or "") != "group":
+                continue
+            chat_id = str(item.get("chat_id") or "")
+            if not chat_id:
+                continue
+            channel = chat_id.split(":", 1)[0] if ":" in chat_id else "qq"
+            title = ""
+            if self._chat_titles is not None:
+                try:
+                    title = str(self._chat_titles(chat_id) or "").strip()
+                except Exception:  # noqa: BLE001 - 群名只是展示信息，读不到不影响白名单
+                    title = ""
+            known.append(
+                {
+                    "chat_id": chat_id,
+                    "channel": channel,
+                    "title": title,
+                    "message_count": int(item.get("message_count") or 0),
+                    "last_message_at": item.get("last_message_at"),
+                }
+            )
+        return {
+            "whitelist": sorted(groups.whitelist),
+            "blacklist": sorted(groups.blacklist),
+            # 前端据此显示「留空 = 不限制回复对象」，语义与 Service 判定一致。
+            "empty_means": "all",
+            "known": known,
+        }
+
+    def save_groups(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """校验 → 落覆盖层 → 即时应用；任一步失败都不改线上白名单。"""
+        if not isinstance(payload, dict):
+            raise ConfigError("请求体必须是对象")
+        if "whitelist" not in payload:
+            raise ConfigError("缺少 groups.whitelist")
+        whitelist = parse_group_ids(payload["whitelist"], "groups.whitelist")
+        current = self._groups()
+        groups = GroupsConfig(
+            whitelist=whitelist,
+            blacklist=current.blacklist,
+            admins=current.admins,
+        )
+        try:
+            existing = read_overrides(OVERRIDES_PATH)
+        except OverrideError as exc:
+            raise OverrideError(str(exc)) from exc
+        section = existing.get("groups")
+        section = dict(section) if isinstance(section, dict) else {}
+        section["whitelist"] = sorted(whitelist)
+        existing["groups"] = section
+        write_overrides(existing, OVERRIDES_PATH)
+        setter = getattr(self.service, "set_groups", None)
+        if callable(setter):
+            setter(groups)
+        else:
+            self.settings = replace(self.settings, groups=groups)
+        return self.groups_snapshot()
+
     def config_snapshot(self) -> dict[str, Any]:
         state = self.snapshot()
         persona = self.settings.persona
@@ -1671,9 +1774,7 @@ class BrainControl:
                 "max_reply_chars_technical": persona.max_reply_chars_technical,
                 "os_probability": persona.os_probability,
             },
-            "cooldown": {
-                "tool_hint_seconds": TOOL_HINT_INTERVAL_SECONDS,
-            },
+            "cooldown": {},
             "behavior": self.behavior_snapshot(),
             "rate_limit": {
                 "threshold": RATE_LIMIT_THRESHOLD,
@@ -1748,8 +1849,26 @@ def create_app(
         admins = sorted(control.settings.groups.admins)
         if not admins:
             return web.json_response({"error": "未配置管理员"}, status=503)
-        if not bool(getattr(control.adapter, "connected", False)):
-            return web.json_response({"error": "QQ 网关未连接"}, status=503)
+        adapters = getattr(control.service, "adapters", None)
+
+        def _pick_adapter(target: Any) -> tuple[Any, str]:
+            if isinstance(adapters, dict) and adapters:
+                try:
+                    channel = channel_of(str(target))
+                except ValueError:
+                    channel = "qq"
+                found = adapters.get(channel)
+                if found is not None:
+                    return found, channel
+                if len(adapters) == 1:
+                    only = next(iter(adapters.items()))
+                    return only[1], only[0]
+                return None, channel
+            return control.adapter, "qq"
+
+        adapter, channel = _pick_adapter(admins[0])
+        if adapter is None or not bool(getattr(adapter, "connected", False)):
+            return web.json_response({"error": f"{channel} 网关未连接"}, status=503)
         now = time.monotonic()
         last = control._last_notify_at
         if last is not None and now - last < NOTIFY_MIN_INTERVAL_SECONDS:
@@ -1759,12 +1878,59 @@ def create_app(
 
         target = admins[0]
         try:
-            await control.adapter.send(ChatType.PRIVATE, target, text)
+            await adapter.send(ChatType.PRIVATE, target, text)
         except Exception as exc:  # noqa: BLE001 - 发送失败回 503，不打断告警循环
             log.warning("管理员通知发送失败：%s", exc)
             return web.json_response({"error": "管理员通知发送失败"}, status=503)
         control._last_notify_at = now
         return web.json_response({"ok": True, "target": target})
+
+    async def wechat_stop(_: web.Request) -> web.Response:
+        path = _kill_switch_path(control)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("stop\n", encoding="utf-8")
+        log.warning("wechat_stopped: 急停已触发（%s）", path)
+        adapter = _wechat_adapter(control)
+        if adapter is not None:
+            enter = getattr(adapter, "enter_kill_switch", None)
+            if callable(enter):
+                enter()
+        return web.json_response({"ok": True, "event": "wechat_stopped"})
+
+    async def wechat_resume(_: web.Request) -> web.Response:
+        path = _kill_switch_path(control)
+        if path.exists():
+            return web.json_response(
+                {"error": f"急停文件仍存在，请先删除 {path}"}, status=409
+            )
+        adapter = _wechat_adapter(control)
+        if adapter is None:
+            raise web.HTTPNotFound()
+        resume = getattr(adapter, "resume", None)
+        if not callable(resume):
+            raise web.HTTPNotFound()
+        try:
+            await resume()
+        except GatewayError as exc:
+            return web.json_response({"error": str(exc)}, status=503)
+        return web.json_response({"ok": True, "event": "wechat_resumed"})
+
+    async def wechat_inject(request: web.Request) -> web.Response:
+        if not bool(control.settings.wechat.allow_test_inject):
+            raise web.HTTPNotFound()
+        adapter = _wechat_adapter(control)
+        if adapter is None:
+            raise web.HTTPNotFound()
+        path = _kill_switch_path(control)
+        if path.exists() or not bool(getattr(adapter, "connected", False)):
+            return web.json_response(
+                {"error": "微信通道已急停或未连接"}, status=409
+            )
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        await adapter.dispatch_envelope(payload)
+        return web.json_response({"ok": True})
 
     async def status(_: web.Request) -> web.Response:
         return web.json_response(control.snapshot())
@@ -1820,14 +1986,10 @@ def create_app(
             )
 
         raw_user_id = payload.get("user_id")
-        if isinstance(raw_user_id, bool):
-            return web.json_response({"error": "user_id 必须是正整数"}, status=400)
         try:
-            user_id = int(raw_user_id)
-        except (TypeError, ValueError):
-            return web.json_response({"error": "user_id 必须是正整数"}, status=400)
-        if user_id <= 0:
-            return web.json_response({"error": "user_id 必须是正整数"}, status=400)
+            user_id = normalize_chat_id(raw_user_id, label="user_id")
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
 
         raw_nickname = payload.get("nickname", "调试用户")
         if not isinstance(raw_nickname, str):
@@ -1849,11 +2011,12 @@ def create_app(
             flags[field] = value
 
         seed = payload.get("seed")
-        if seed is not None:
-            if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
-                return web.json_response(
-                    {"error": "seed 必须是非负整数"}, status=400
-                )
+        if seed is not None and (
+            isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
+        ):
+            return web.json_response(
+                {"error": "seed 必须是非负整数"}, status=400
+            )
 
         msg = Message(
             chat_type=chat_type,
@@ -1871,7 +2034,8 @@ def create_app(
             return web.json_response(control.explain_trigger(msg, seed=seed))
         except NotImplementedError as exc:
             return web.json_response({"error": str(exc)}, status=503)
-        except Exception as exc:  # 调试器读失败不能把控制口打挂
+        # 调试器读失败不能把控制口打挂
+        except Exception as exc:  # noqa: BLE001
             log.warning("触发调试失败：%s", exc)
             return web.json_response(
                 {"error": f"触发调试失败：{exc.__class__.__name__}"}, status=500
@@ -1928,21 +2092,20 @@ def create_app(
                     {"error": "chat_type 必须是 group 或 private"}, status=400
                 )
 
-        chat_id: int | None = None
+        chat_id: str | None = None
         raw_chat_id = (request.query.get("chat_id") or "").strip()
         if raw_chat_id:
             try:
-                chat_id = int(raw_chat_id)
-            except ValueError:
-                return web.json_response({"error": "chat_id 必须是整数"}, status=400)
-            if chat_id <= 0:
-                return web.json_response({"error": "chat_id 必须是正整数"}, status=400)
+                chat_id = normalize_chat_id(raw_chat_id)
+            except ValueError as exc:
+                return web.json_response({"error": str(exc)}, status=400)
 
         try:
             return web.json_response(
                 control.memory_snapshot(limit, offset, chat_type, chat_id)
             )
-        except Exception as exc:  # 读库失败不能把控制口打挂
+        # 读库失败不能把控制口打挂
+        except Exception as exc:  # noqa: BLE001
             log.warning("读取记忆失败：%s", exc)
             return web.json_response(
                 {"error": f"读取记忆失败：{exc.__class__.__name__}"}, status=500
@@ -1951,7 +2114,8 @@ def create_app(
     async def memory_health(request: web.Request) -> web.Response:
         try:
             return web.json_response(control.memory_health())
-        except Exception as exc:  # 体检读库失败同样不能把控制口打挂
+        # 体检读库失败同样不能把控制口打挂
+        except Exception as exc:  # noqa: BLE001
             log.warning("读取记忆健康失败：%s", exc)
             return web.json_response(
                 {"error": f"读取记忆健康失败：{exc.__class__.__name__}"}, status=500
@@ -2231,8 +2395,8 @@ def create_app(
         os.close(fd)
         try:
             control.store.backup_to(tmp)
-            with open(tmp, "rb") as fh:
-                body = fh.read()
+            # 读临时文件放到线程里：handler 在事件循环上跑，不能用阻塞 open 卡住 loop。
+            body = await asyncio.to_thread(Path(tmp).read_bytes)
         except Exception as exc:  # noqa: BLE001
             log.warning("备份数据库失败：%s", exc)
             return web.json_response(
@@ -2387,9 +2551,45 @@ def create_app(
                 {"error": f"保存聊天行为失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def get_groups(_: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.groups_snapshot())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取群白名单失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取群白名单失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def put_groups(request: web.Request) -> web.Response:
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        try:
+            return web.json_response(control.save_groups(payload))
+        except ConfigError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except OverrideError as exc:
+            return web.json_response(
+                {"error": f"覆盖层读写失败：{exc}"}, status=500
+            )
+        except OSError as exc:
+            return web.json_response(
+                {"error": f"覆盖层写入失败：{exc.__class__.__name__}"}, status=500
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("保存群白名单失败：%s", exc)
+            return web.json_response(
+                {"error": f"保存群白名单失败：{exc.__class__.__name__}"}, status=500
+            )
+
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/health/detail", health_detail)
     app.router.add_post("/api/notify/admin", notify_admin)
+    app.router.add_post("/api/channels/wechat/stop", wechat_stop)
+    app.router.add_post("/api/channels/wechat/resume", wechat_resume)
+    app.router.add_post("/api/channels/wechat/inject", wechat_inject)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/brain", get_brain)
     app.router.add_post("/api/brain", post_brain)
@@ -2423,6 +2623,8 @@ def create_app(
     app.router.add_get("/api/config", config)
     app.router.add_get("/api/behavior", get_behavior)
     app.router.add_put("/api/behavior", put_behavior)
+    app.router.add_get("/api/groups", get_groups)
+    app.router.add_put("/api/groups", put_groups)
     app.router.add_get("/api/backup", backup)
     return app
 
@@ -2434,6 +2636,7 @@ async def start_control_server(
     adapter: Any,
     runtime_path: str = "data/runtime.json",
     memory_actions: MemoryActions | None = None,
+    chat_titles: Callable[[str], str] | None = None,
 ) -> web.AppRunner | None:
     """按环境变量启动控制口；返回 Runner 供退出时 cleanup。"""
     raw_port = os.environ.get("DAFEIYU_CONTROL_PORT", "").strip()
@@ -2448,7 +2651,9 @@ async def start_control_server(
     host = os.environ.get("DAFEIYU_CONTROL_HOST", "127.0.0.1").strip() or "127.0.0.1"
     token = os.environ.get("DAFEIYU_CONTROL_TOKEN", "").strip()
 
-    control = BrainControl(settings, store, service, adapter, runtime_path)
+    control = BrainControl(
+        settings, store, service, adapter, runtime_path, chat_titles=chat_titles
+    )
     # 切档后必须重启 opencode 才真的换模型：配置由本进程写，进程归 supervisor 管。
     control.opencode_reload = partial(
         reload_opencode, settings.supervisor.dashboard.port

@@ -19,7 +19,10 @@ from .brain.persona import load_persona
 from .brain.runtime_config import server_env
 from .config import ConfigError, Settings, load_settings
 from .control import MemoryActions, start_control_server
+from .gateway.base import Adapter
+from .gateway.channels import wechat_enabled_for
 from .gateway.qq import QQAdapter
+from .gateway.wechat import WeChatAdapter
 from .memory.store import Store
 from .memory.workspace import Workspace
 from .models import ChatType
@@ -89,12 +92,12 @@ def build_memory_actions(store: Store, workers: Workers) -> MemoryActions | None
     if workers.impressions is None and workers.scheduler is None:
         return None
 
-    async def summarize(chat_type: ChatType, chat_id: int, date: str):
+    async def summarize(chat_type: ChatType, chat_id: str, date: str):
         if workers.scheduler is None:
             raise RuntimeError("摘要旁路未启用（当前 brain 无 complete_detailed）")
         return await workers.scheduler.summarize_now(chat_type, chat_id, date)
 
-    async def extract(chat_type: ChatType, chat_id: int):
+    async def extract(chat_type: ChatType, chat_id: str):
         if workers.impressions is None:
             raise RuntimeError("印象旁路未启用（当前 brain 无 complete_detailed）")
         if workers.impressions.paused:
@@ -171,6 +174,93 @@ def ensure_manage_server_password(settings: Settings) -> tuple[Settings, str]:
     return settings, password
 
 
+def _build_qq_adapter(settings: Settings) -> QQAdapter:
+    return QQAdapter(
+        host=settings.ws_host,
+        port=settings.ws_port,
+        token=settings.ws_token,
+        bot_qq=settings.bot_qq,
+    )
+
+
+def build_adapters(settings: Settings) -> dict[str, Adapter]:
+    """按 ``gateway.provider`` 构造启用的通道。
+
+    未启用的通道在这里完全不构造：``WeChatAdapter`` 一旦建出来，配置就会被
+    读取、桥端口就有被连接的风险；provider 没选微信时连 ``settings.wechat``
+    都不碰。
+    """
+    provider = settings.gateway.provider
+    if provider == "qq":
+        return {"qq": _build_qq_adapter(settings)}
+    if provider == "both":
+        adapters: dict[str, Adapter] = {"qq": _build_qq_adapter(settings)}
+        if wechat_enabled_for(settings):
+            adapters["wechat"] = WeChatAdapter(settings.wechat)
+        else:
+            log.warning(
+                "gateway.provider=both 但 gateway.wechat.enabled=false，"
+                "微信通道未启用，本次只上线 QQ"
+            )
+        return adapters
+    if wechat_enabled_for(settings):
+        return {"wechat": WeChatAdapter(settings.wechat)}
+    log.warning(
+        "gateway.provider=wechat 但 gateway.wechat.enabled=false，降级为 qq"
+    )
+    return {"qq": _build_qq_adapter(settings)}
+
+
+def log_active_channels(
+    settings: Settings, adapters: dict[str, Adapter], brain_provider: str
+) -> None:
+    """每个启用通道一行启动日志；微信只报适配器和桥端口，不打印 token。"""
+    if "qq" in adapters:
+        log.info(
+            "%s已上线（brain=%s），QQ 通道适配器就绪：等待 NapCat 反向 WS 连接 "
+            "ws://%s:%s（QQ %s）",
+            settings.persona.name,
+            brain_provider,
+            settings.ws_host,
+            settings.ws_port,
+            settings.bot_qq,
+        )
+    if "wechat" in adapters:
+        log.info(
+            "%s已上线（brain=%s），微信通道适配器就绪：等待桥 "
+            "ws://%s:%s/wechat-bridge（群范围以面板白名单 groups.whitelist 为准）",
+            settings.persona.name,
+            brain_provider,
+            settings.wechat.bridge_host,
+            settings.wechat.bridge_port,
+        )
+
+
+def make_chat_titles() -> Callable[[str], str]:
+    """`wxg:<alias>` → 微信群显示名；只用于面板展示，读不到就返回空串。
+
+    QQ 的 `qq:<号>` 本来就是可读的群号，不需要翻译。peers.json 由微信桥
+    维护；它缺失或损坏时白名单功能不受影响，面板只显示裸 id。
+    """
+    registry: Any = None
+
+    def resolve(chat_id: str) -> str:
+        nonlocal registry
+        if not chat_id.startswith("wxg:") or chat_id == "wxg:self":
+            return ""
+        if registry is None:
+            try:
+                from .gateway.wechat_bridge.identity import PeerRegistry
+
+                registry = PeerRegistry()
+            except Exception:  # noqa: BLE001 - 展示信息失败不影响白名单
+                return ""
+        peer = registry.by_alias(chat_id[4:])
+        return str(getattr(peer, "display_name", "") or "").strip()
+
+    return resolve
+
+
 async def main() -> None:
     settings = load_settings()
     setup_logging(settings)
@@ -242,12 +332,7 @@ async def main() -> None:
             server_url=effective_server_url,
         )
 
-        adapter = QQAdapter(
-            host=settings.ws_host,
-            port=settings.ws_port,
-            token=settings.ws_token,
-            bot_qq=settings.bot_qq,
-        )
+        adapters = build_adapters(settings)
         router = Router(settings, store)
         workspace = None
         if settings.workspace.enabled:
@@ -266,9 +351,9 @@ async def main() -> None:
             settings,
             store,
             brain,
-            adapter,
-            router,
-            persona_text,
+            adapters=adapters,
+            router=router,
+            persona_text=persona_text,
             workspace=workspace,
             injection=settings.injection,
             audit=audit,
@@ -301,17 +386,11 @@ async def main() -> None:
             settings,
             store,
             service,
-            adapter,
+            adapters.get("qq"),
             memory_actions=build_memory_actions(store, workers),
+            chat_titles=make_chat_titles(),
         )
-        log.info(
-            "%s已上线（brain=%s），等待 NapCat 反向 WS 连接 ws://%s:%s（QQ %s）",
-            settings.persona.name,
-            provider,
-            settings.ws_host,
-            settings.ws_port,
-            settings.bot_qq,
-        )
+        log_active_channels(settings, adapters, provider)
         try:
             await asyncio.Event().wait()
         except (KeyboardInterrupt, SystemExit):

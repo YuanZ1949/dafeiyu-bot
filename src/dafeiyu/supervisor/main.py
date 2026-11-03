@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import signal
 import subprocess
 import sys
+import urllib.request
 import webbrowser
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 import aiohttp
 
@@ -21,6 +23,7 @@ from ..brain.opencode_auth import PASSWORD_ENV, password_env, resolve_password
 from ..brain.provider_config import ensure_agent_files
 from ..brain.runtime_config import server_env
 from ..config import ConfigError, Settings, load_settings
+from ..gateway.channels import qq_enabled_for, wechat_enabled_for
 from ..timeutil import now_shanghai
 from .alerts import AlertChannel, AlertManager, QQAdminChannel, WebhookChannel
 from .audit import AuditLog
@@ -44,6 +47,13 @@ NAPCAT_DIR = REPO_ROOT / "vendor" / "napcat"
 PID_PATH = REPO_ROOT / "data" / "supervisor.pid"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+# 桥进程只认这个环境变量（config.py 的 `_build_wechat` 同源读取），
+# 绝不能把 token 放进 argv 或 ProcSpec 的 repr。
+WECHAT_BRIDGE_TOKEN_ENV = "DAFEIYU_WECHAT_BRIDGE_TOKEN"
+# 默认 30s 不够：桥要先建 WS 服务，再等 bot 冷启动 + WeChatAdapter 连上，
+# 开机/升级后常见 30-60s。这里显式给 90s，避免误判 FAILED 把桥杀掉。
+WECHAT_BRIDGE_READY_TIMEOUT = 90.0
+
 
 class _HubHandler(logging.Handler):
     """把 supervisor 自己的日志也塞进同一套环形缓冲。"""
@@ -55,7 +65,8 @@ class _HubHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             self.hub.write("supervisor", self.format(record))
-        except Exception:  # 日志系统本身不能把主流程带崩
+        # 日志系统本身不能把主流程带崩
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -135,6 +146,38 @@ def find_napcat_pids(directory: Path = NAPCAT_DIR) -> list[int]:
     return pids
 
 
+def _wechat_bridge_ready_probe(control_port: int, token: str) -> Callable[[], bool]:
+    """微信桥的就绪判据：bot 的 `/api/health/detail` 里微信通道已连接。
+
+    桥自己只跑 WS 服务端、没有 HTTP 端点，因此 `ready_url` 留空，改由这条
+    同步探针问 bot。`/api/health` 只有 `{"ok": true}` 且无 `channels`，不能用；
+    `/api/health/detail` 需要 token，所以控制端口与口令都从 supervisor 传进来。
+    """
+
+    url = f"http://127.0.0.1:{control_port}/api/health/detail"
+
+    def probe() -> bool:
+        headers = {"X-Control-Token": token} if token else {}
+        request = urllib.request.Request(url, headers=headers)
+        # 2s 上限：探针跑在线程池里，超时只影响本次判定，不会卡住事件循环。
+        try:
+            with urllib.request.urlopen(request, timeout=2.0) as response:
+                if getattr(response, "status", 200) != 200:
+                    return False
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 - 401/超时/非 JSON 一律视为未就绪
+            return False
+        if not isinstance(payload, dict):
+            return False
+        channels = payload.get("channels")
+        if not isinstance(channels, dict):
+            return False
+        wechat = channels.get("wechat")
+        return isinstance(wechat, dict) and wechat.get("connected") is True
+
+    return probe
+
+
 def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
     try:
         opencode_bin = resolve_opencode_bin(settings.opencode.bin)
@@ -142,12 +185,6 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
         raise ConfigError(
             f"找不到 OpenCode 可执行文件：{exc}。请先 npm i -g opencode-ai"
         ) from exc
-
-    node = NAPCAT_DIR / "node.exe"
-    if not node.exists():
-        raise ConfigError(
-            f"NapCat 未安装：{node} 不存在。请先运行 scripts/setup-napcat.ps1"
-        )
 
     db_path = Path(settings.opencode.db_path)
     if not db_path.is_absolute():
@@ -202,27 +239,57 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
         ready_url=f"http://127.0.0.1:{control_port}/api/health",
         creationflags=CREATE_NO_WINDOW,
     )
-    # -q <uin> 让 NapCat 用机器人号已有的本地票据自动登录，冷启动不必再扫码。
-    # 必须显式给 uin：本机快速登录列表里还有用户的个人号 504567327，
-    # 不给 -q 会按列表顺序登错号。票据失效时 NapCat 自己回落到二维码，不会卡死。
-    # 配了密码时，快登失败会自动走一次密码回退（napcat.mjs:83224）。
-    napcat_env: dict[str, str] = {}
-    if settings.napcat.quick_password:
-        napcat_env["NAPCAT_QUICK_PASSWORD"] = settings.napcat.quick_password
-    if settings.napcat.quick_password_md5:
-        napcat_env["NAPCAT_QUICK_PASSWORD_MD5"] = settings.napcat.quick_password_md5
-    specs["napcat"] = ProcSpec(
-        name="napcat",
-        command=[str(node), "index.js", "-q", str(settings.bot_qq)],
-        cwd=str(NAPCAT_DIR),
-        env=napcat_env or None,
-        creationflags=CREATE_NO_WINDOW,
-        # 主进程被 NapCat 自己的 kill EPERM 打崩后，worker 会继续占着 QQ 登录态；
-        # 不先清掉，新实例只会报「当前账号已登录，无法重复登录」然后卡住。
-        sweep_pids=lambda: find_napcat_pids(NAPCAT_DIR),
-        # 真出现这句时说明已经有残留占着登录态：清干净再重启一次。
-        recover_patterns=("无法重复登录",),
-    )
+    # 插入顺序即启动顺序（Supervisor.start_all 按 dict 顺序）：桥必须排在 bot
+    # 之后，否则它的 ready_probe（问 bot 的 /api/health/detail）会一直空转。
+    # 只有 provider 真正选中微信时才注册：provider=qq + enabled=true 时
+    # task 20 不会构造 WeChatAdapter，拉起桥只会得到一个永远不就绪的进程。
+    if wechat_enabled_for(settings):
+        specs["wechat_bridge"] = ProcSpec(
+            name="wechat_bridge",
+            command=[sys.executable, "-m", "dafeiyu.gateway.wechat_bridge"],
+            cwd=str(REPO_ROOT),
+            env={
+                WECHAT_BRIDGE_TOKEN_ENV: settings.wechat.bridge_token,
+                # 桥的日志直接由 supervisor 落盘；不强制 UTF-8 时中文会变成 "?"。
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUNBUFFERED": "1",
+            },
+            # 桥是出站 WS 客户端，没有可探的 HTTP 端点。
+            ready_url="",
+            ready_probe=_wechat_bridge_ready_probe(control_port, token),
+            ready_timeout=WECHAT_BRIDGE_READY_TIMEOUT,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    # NapCat 只为 QQ 通道服务：provider=wechat 且微信启用时 bot 不监听 QQ 的 WS
+    # 端口，拉起 NapCat 只会每 5 秒刷一条 `ECONNREFUSED 127.0.0.1:8080`。
+    # 反过来，纯微信部署也不该因为「没装 NapCat」而起不来。
+    if qq_enabled_for(settings):
+        node = NAPCAT_DIR / "node.exe"
+        if not node.exists():
+            raise ConfigError(
+                f"NapCat 未安装：{node} 不存在。请先运行 scripts/setup-napcat.ps1"
+            )
+        # -q <uin> 让 NapCat 用机器人号已有的本地票据自动登录，冷启动不必再扫码。
+        # 必须显式给 uin：本机快速登录列表里还有用户的个人号 504567327，
+        # 不给 -q 会按列表顺序登错号。票据失效时 NapCat 自己回落到二维码，不会卡死。
+        # 配了密码时，快登失败会自动走一次密码回退（napcat.mjs:83224）。
+        napcat_env: dict[str, str] = {}
+        if settings.napcat.quick_password:
+            napcat_env["NAPCAT_QUICK_PASSWORD"] = settings.napcat.quick_password
+        if settings.napcat.quick_password_md5:
+            napcat_env["NAPCAT_QUICK_PASSWORD_MD5"] = settings.napcat.quick_password_md5
+        specs["napcat"] = ProcSpec(
+            name="napcat",
+            command=[str(node), "index.js", "-q", str(settings.bot_qq)],
+            cwd=str(NAPCAT_DIR),
+            env=napcat_env or None,
+            creationflags=CREATE_NO_WINDOW,
+            # 主进程被 NapCat 自己的 kill EPERM 打崩后，worker 会继续占着 QQ 登录态；
+            # 不先清掉，新实例只会报「当前账号已登录，无法重复登录」然后卡住。
+            sweep_pids=lambda: find_napcat_pids(NAPCAT_DIR),
+            # 真出现这句时说明已经有残留占着登录态：清干净再重启一次。
+            recover_patterns=("无法重复登录",),
+        )
     return specs
 
 
@@ -240,12 +307,11 @@ async def _bot_ready(bot_url: str, token: str, timeout: float = 5.0) -> bool:
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=timeout)
-        ) as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status != 200:
-                    return False
-                data = await resp.json(content_type=None)
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        ) as session, session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                return False
+            data = await resp.json(content_type=None)
+    except (TimeoutError, aiohttp.ClientError, ValueError):
         return False
     return isinstance(data, dict) and data.get("ok") is True
 
@@ -337,7 +403,7 @@ def build_ops(
 async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
     try:
         await asyncio.wait_for(stop.wait(), timeout=max(0.0, seconds))
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pass
 
 
@@ -499,10 +565,11 @@ async def run() -> int:
         ready_timeout=float(settings.opencode.startup_timeout_seconds),
     )
 
-    owner = find_napcat_pid()
-    if owner is not None:
-        supervisor.mark_external("napcat", owner)
-        logs.write("supervisor", f"NapCat 已在外运行（pid={owner}），接管为外部实例")
+    if "napcat" in specs:
+        owner = find_napcat_pid()
+        if owner is not None:
+            supervisor.mark_external("napcat", owner)
+            logs.write("supervisor", f"NapCat 已在外运行（pid={owner}），接管为外部实例")
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -592,12 +659,12 @@ async def run() -> int:
         logs.write("supervisor", "正在关闭所有进程…")
         try:
             await asyncio.wait_for(supervisor.shutdown(), timeout=45)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logs.write("supervisor", "停止子进程超时，强制退出")
         logs.write("supervisor", "子进程已停止，关闭 dashboard")
         try:
             await asyncio.wait_for(runner.cleanup(), timeout=15)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logs.write("supervisor", "dashboard 关闭超时，强制退出")
         with contextlib.suppress(Exception):
             await ops.health.close()

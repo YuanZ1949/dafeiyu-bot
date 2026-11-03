@@ -30,8 +30,76 @@ brain:
   #   model: ""
 
 gateway:
-  # 只支持 qq；wechat 会在启动期直接报 ConfigError（协议未实现，不假装能跑）。
+  # 频道选择：qq（仅 NapCat）/ wechat（仅桌面微信小号）/ both（qq+wechat 双通道，
+  # 面板里每条通道可单独停用）。
   provider: qq
+  # 桌面微信小号通道（UIA 桥）。小号专用、封号自担；默认关闭（wechat.enabled=false），
+  # 启用前先跑 `dafeiyu doctor` 的 8 项预检；群范围只看面板白名单
+  # （data/settings.local.yaml 的 groups.whitelist，空 = 不限制）。
+  wechat:
+    # 默认关闭；启用前先跑 `dafeiyu doctor` 的 8 项预检。
+    enabled: false
+    # wechat 的群范围不在本文件配置：以面板白名单 groups.whitelist 为准
+    # （空 = 不限制；读不到面板 = fail-closed，不轮询也不发送）。
+
+    # UIA 桥监听地址；gateway.wechat.bridge_host 绑非回环地址时 bridge_token 必填。
+    bridge_host: 127.0.0.1
+    bridge_port: 8790
+    # 桥鉴权 token（gateway.wechat.bridge_token）：从 env 读 DAFEIYU_WECHAT_BRIDGE_TOKEN
+    # （env 优先于配置文件）。桥绑回环时留空也可以；不要把真 token 写进模板。
+    bridge_token: ""
+    # 小号在群里的微信显示昵称（不是会话别名，别名由桥本地铸造）；启用时必填。
+    account_nickname: ""
+    # RPA 侧轮询间隔（秒）。
+    poll_seconds: 8.0
+    # 未读门控：每个 tick 先读一次侧边栏红点（约 20ms），只有存在未读时才打开
+    # 白名单群；false = 退回每轮全量打开（旧行为）。
+    unread_gate: true
+    # 免打扰会话不计红点，所以每隔这么多秒强制全量扫一遍白名单兜底。
+    full_sweep_seconds: 120.0
+    # 本地消息库入站（实验性）：直接只读解密微信自己的 SQLite（contact.db +
+    # message_N.db）拿消息，不再逐群开窗抓屏；发送仍然走 UIA。
+    # 需要微信正在运行（密钥从进程内存只读提取）；任何一步失败都会自动回落到
+    # UIA 轮询，不会让入站停摆。微信升级后密钥格式可能失效，此时同样回落。
+    local_db_enabled: false
+    # 空 = 自动探测 %USERPROFILE%\Documents\xwechat_files\*\db_storage。
+    local_db_root: ""
+    # 解密镜像的最小同步间隔（秒）；0 = 每轮同步。
+    local_db_refresh_seconds: 1.0
+    # 出站后端：uia（默认，桌面自动化，锁屏不可用）/ hook（HTTP 注入，不依赖桌面，
+    # 但需 hook_url + local_db_enabled，群 username 从本地库解析）/ auto（先 hook，
+    # 只有明确「没发出去」时才回落 UIA；超时这类结果不明的情况不回落，避免重复发送）。
+    outbound: uia
+    # hook 服务地址（POST JSON，请求/响应契约见 wechat_bridge/outbound.py）。
+    hook_url: ""
+    hook_timeout_seconds: 5.0
+    # 发送后回读本地库确认自己刚发的消息（需要 local_db_enabled）；未确认只把回执
+    # 降级为 typed + receipt_unverified，绝不让客户端换 id 重发。
+    send_verify: true
+    send_verify_timeout_seconds: 8.0
+    send_verify_interval_seconds: 0.5
+    # 防封限速：相邻两次发送的最小间隔 / 每小时上限 / 每天上限；
+    # 三者均可设为 0 = 不限制；quiet_hours 起止相同 = 关闭静默时段。
+    send_min_interval_seconds: 20.0
+    send_max_per_hour: 20
+    send_max_per_day: 60
+    # 静默时段 [start, end]，HH:MM，起止相同 = 不静默。
+    quiet_hours: ["23:30", "08:00"]
+    # 模拟打字的延迟区间（秒）。
+    typing_delay_seconds: [0.6, 1.2]
+    # 发送后必须观察到已发出的消息才算成功；超时按失败处理。
+    ack_requires_observed: true
+    # 观察回声消息的时间窗口（秒）。
+    echo_window_seconds: 120.0
+    keepalive: false
+    # 发送前要求微信窗口前台且空闲（防误操作到别的窗口）。
+    require_foreground_idle: true
+    # 急停文件：该文件出现即停发。
+    kill_switch_file: data/wechat.stop
+    # 桌面客户端版本下限，低于则拒绝启动。
+    version_min: "4.1.6"
+    language: zh-CN
+    allow_test_inject: false
 
 opencode:
   # 留空自动找 npm 全局安装的 opencode.exe
@@ -123,7 +191,10 @@ triggers:
   closed_sample_rate: 0.05
 
 groups:
-  # 留空 = 所有群都参与；填了就只在这些群里说话。号之间用逗号分隔。
+  # 接受 `123456`（QQ 群号）或 `wxg:别名`（微信会话 id，由桥本地铸造）。
+  # 留空 = 所有群都参与（不限制回复对象）；填了就只在名单内的群里主动回复。
+  # 面板「群白名单」卡片也可编辑本项，保存到 data/settings.local.yaml，即时生效，留空 = 不限制。
+  # 号之间用逗号分隔。
   whitelist: []
   blacklist: []
   # 群指令（/闭嘴、/醒来）只允许这些 QQ 号执行；留空 = 谁都不能用。
@@ -218,6 +289,7 @@ alerts:
   rules:
     bot_down_seconds: 120
     napcat_down_seconds: 180
+    wechat_down_seconds: 180
     opencode_down_seconds: 120
     quota_pause: true
     disk_free_percent: 10

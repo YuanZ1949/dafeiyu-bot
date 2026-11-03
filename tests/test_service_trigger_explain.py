@@ -27,8 +27,8 @@ def make_msg(
     content: str = "随便聊聊",
     *,
     chat_type: ChatType = ChatType.GROUP,
-    chat_id: int = 1001,
-    user_id: int = 2002,
+    chat_id: str = "qq:1001",
+    user_id: str = "qq:2002",
     at: bool = False,
     reply: bool = False,
 ) -> Message:
@@ -64,7 +64,7 @@ def make_service(
         settings,
         store,
         brain or FakeBrain(),
-        FakeAdapter(),
+        {"qq": FakeAdapter()},
         router,
         "人设",
     )
@@ -83,7 +83,7 @@ def test_explain_trigger_rules_hard_is_model(tmp_path: Path) -> None:
     assert result["hard_source"] == "at"
     assert result["checks"]
     assert service.scheduler is None
-    assert store.count_messages(ChatType.GROUP, 1001) == 0
+    assert store.count_messages(ChatType.GROUP, "qq:1001") == 0
     assert router._states == {}
 
 
@@ -99,7 +99,7 @@ def test_explain_trigger_model_group_enters_batch_without_scheduler(tmp_path: Pa
     assert result["reason"] == "batch"
     assert result["checks"]
     assert service.scheduler is None
-    assert store.count_messages(ChatType.GROUP, 1001) == 0
+    assert store.count_messages(ChatType.GROUP, "qq:1001") == 0
     assert router._states == {}
 
 
@@ -118,7 +118,7 @@ def test_explain_trigger_model_mute_blocks_even_addressed(tmp_path: Path) -> Non
     service, store, router = make_service(
         tmp_path, mode="model", brain=BatchBrain()
     )
-    router.quiet(ChatType.GROUP, 1001, 30)
+    router.quiet(ChatType.GROUP, "qq:1001", 30)
     before = copy.deepcopy(router._states)
 
     result = service.explain_trigger(make_msg("在吗", at=True), now=NOON)
@@ -127,7 +127,7 @@ def test_explain_trigger_model_mute_blocks_even_addressed(tmp_path: Path) -> Non
     assert result["reason"] == "muted"
     assert result["hard_source"] == "at"
     assert router._states == before
-    assert store.count_messages(ChatType.GROUP, 1001) == 0
+    assert store.count_messages(ChatType.GROUP, "qq:1001") == 0
 
 
 def test_explain_trigger_private_budget_blocks(tmp_path: Path) -> None:
@@ -136,10 +136,10 @@ def test_explain_trigger_private_budget_blocks(tmp_path: Path) -> None:
     service.settings = replace(service.settings, budget=budget)
     router.settings = service.settings
     service.budget_guard.config = budget
-    store.record_usage(ChatType.PRIVATE, 2002, "reply", 1, 1)
+    store.record_usage(ChatType.PRIVATE, "qq:2002", "reply", 1, 1)
 
     result = service.explain_trigger(
-        make_msg("你好", chat_type=ChatType.PRIVATE, chat_id=2002),
+        make_msg("你好", chat_type=ChatType.PRIVATE, chat_id="qq:2002"),
     )
 
     assert result["verdict"] == "skip"
@@ -157,7 +157,7 @@ def test_explain_trigger_private_budget_guard_deny(tmp_path: Path, monkeypatch) 
 
     monkeypatch.setattr(service.budget_guard, "evaluate", deny)
     result = service.explain_trigger(
-        make_msg("你好", chat_type=ChatType.PRIVATE, chat_id=2002)
+        make_msg("你好", chat_type=ChatType.PRIVATE, chat_id="qq:2002")
     )
 
     assert result["verdict"] == "skip"
@@ -180,7 +180,7 @@ def test_explain_trigger_private_budget_guard_degrade(tmp_path: Path, monkeypatc
     )
 
     result = service.explain_trigger(
-        make_msg("你好", chat_type=ChatType.PRIVATE, chat_id=2002)
+        make_msg("你好", chat_type=ChatType.PRIVATE, chat_id="qq:2002")
     )
 
     assert result["verdict"] == "model"
@@ -277,7 +277,7 @@ def test_explain_trigger_known_command_is_not_executed(tmp_path: Path) -> None:
     assert result["verdict"] == "command"
     assert result["reason"] == "command"
     assert router._states == {}
-    assert store.count_messages(ChatType.GROUP, 1001) == 0
+    assert store.count_messages(ChatType.GROUP, "qq:1001") == 0
 
 
 def test_explain_trigger_unknown_slash_falls_through_to_rules(tmp_path: Path) -> None:

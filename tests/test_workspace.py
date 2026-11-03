@@ -10,7 +10,7 @@ def test_missing_file_is_empty(tmp_path):
     ws = Workspace(tmp_path)
     ws.ensure()
     # ensure() 会写 MEMORY.md 模板，所以这里用一个确实还没写过的会话笔记。
-    assert ws.read_segment(ws.chat_path(ChatType.GROUP, 1), 100) == ""
+    assert ws.read_segment(ws.chat_path(ChatType.GROUP, "qq:1"), 100) == ""
 
 
 def test_truncation_keeps_tail_and_counts(tmp_path):
@@ -28,12 +28,18 @@ def test_single_giant_line_does_not_explode(tmp_path):
     assert len(out) < 200  # 单行按字符硬切，不整行复制
 
 
-def test_chat_path_is_int_typed(tmp_path):
+def test_chat_path_carries_channel_prefix(tmp_path):
     ws = Workspace(tmp_path)
-    assert ws.chat_path(ChatType.GROUP, 20001).name == "group-20001.md"
-    assert ws.chat_path(ChatType.PRIVATE, 504567327).name == "private-504567327.md"
+    assert ws.chat_path(ChatType.GROUP, "qq:20001").name == "group_qq_20001.md"
+    assert ws.chat_path(ChatType.PRIVATE, "qq:504567327").name == "private_qq_504567327.md"
+    assert ws.chat_path(ChatType.GROUP, "wxg:0d5c1f2a3b4c").name == "group_wxg_0d5c1f2a3b4c.md"
+    assert ws.chat_path(ChatType.GROUP, "qq:20001") != ws.chat_path(
+        ChatType.PRIVATE, "qq:20001"
+    )
     with pytest.raises(TypeError):
-        ws.chat_path(ChatType.GROUP, "..\\..\\x")  # type: ignore[arg-type]
+        ws.chat_path(ChatType.GROUP, 20001)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        ws.chat_path(ChatType.GROUP, "..\\..\\x")
 
 
 def test_enforce_limit_keeps_title_comment_and_tail(tmp_path):

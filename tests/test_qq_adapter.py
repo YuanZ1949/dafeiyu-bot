@@ -56,10 +56,10 @@ async def test_event_reaches_handler_and_send_emits_action() -> None:
             await ws.send(json.dumps(GROUP_EVENT))
             message = await asyncio.wait_for(done, 2)
             assert message.chat_type is ChatType.GROUP
-            assert message.chat_id == 1
+            assert message.chat_id == "qq:1"
             assert message.content == "hi"
 
-            task = asyncio.create_task(adapter.send(ChatType.GROUP, 1, "hi"))
+            task = asyncio.create_task(adapter.send(ChatType.GROUP, "qq:1", "hi"))
             raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
             assert raw["action"] == "send_group_msg"
             assert raw["params"] == {"group_id": 1, "message": "hi"}
@@ -67,7 +67,7 @@ async def test_event_reaches_handler_and_send_emits_action() -> None:
 
             await ws.send(json.dumps({"status": "ok", "retcode": 0, "data": {"message_id": 9}, "echo": raw["echo"]}))
             await asyncio.wait_for(task, 2)
-            assert 9 in adapter.bot_message_ids
+            assert "9" in adapter.bot_message_ids
     finally:
         await adapter.stop()
 
@@ -78,7 +78,7 @@ async def test_private_send_uses_send_private_msg() -> None:
     try:
         uri = f"ws://127.0.0.1:{adapter.port}"
         async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
-            task = asyncio.create_task(adapter.send(ChatType.PRIVATE, 2, "yo"))
+            task = asyncio.create_task(adapter.send(ChatType.PRIVATE, "qq:2", "yo"))
             raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
             assert raw["action"] == "send_private_msg"
             assert raw["params"] == {"user_id": 2, "message": "yo"}
@@ -130,7 +130,7 @@ async def test_send_timeout_raises_gateway_error() -> None:
     try:
         uri = f"ws://127.0.0.1:{adapter.port}"
         async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
-            task = asyncio.create_task(adapter.send(ChatType.GROUP, 1, "slow"))
+            task = asyncio.create_task(adapter.send(ChatType.GROUP, "qq:1", "slow"))
             await asyncio.wait_for(ws.recv(), 2)
             with pytest.raises(GatewayError):
                 await asyncio.wait_for(task, 2)
@@ -141,7 +141,7 @@ async def test_send_timeout_raises_gateway_error() -> None:
 async def test_send_without_connection_raises(caplog) -> None:
     adapter = make_adapter()
     with caplog.at_level("WARNING"), pytest.raises(GatewayError):
-        await adapter.send(ChatType.GROUP, 1, "hi")
+        await adapter.send(ChatType.GROUP, "qq:1", "hi")
     assert "QQ 网关未连接" in caplog.text
     assert "send_group_msg" in caplog.text
 
@@ -154,7 +154,7 @@ async def test_send_logs_delivery_receipt_with_real_message_id(caplog) -> None:
         uri = f"ws://127.0.0.1:{adapter.port}"
         async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
             with caplog.at_level("INFO", logger="dafeiyu.gateway.qq"):
-                task = asyncio.create_task(adapter.send(ChatType.GROUP, 20001, "hi"))
+                task = asyncio.create_task(adapter.send(ChatType.GROUP, "qq:20001", "hi"))
                 raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
                 await ws.send(
                     json.dumps(
@@ -181,7 +181,7 @@ async def test_send_failure_logs_retcode(caplog) -> None:
         uri = f"ws://127.0.0.1:{adapter.port}"
         async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
             with caplog.at_level("WARNING", logger="dafeiyu.gateway.qq"):
-                task = asyncio.create_task(adapter.send(ChatType.GROUP, 1, "hi"))
+                task = asyncio.create_task(adapter.send(ChatType.GROUP, "qq:1", "hi"))
                 raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
                 await ws.send(
                     json.dumps(
@@ -202,7 +202,7 @@ async def test_send_returns_real_message_id() -> None:
     try:
         uri = f"ws://127.0.0.1:{adapter.port}"
         async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
-            task = asyncio.create_task(adapter.send(ChatType.GROUP, 20001, "hi"))
+            task = asyncio.create_task(adapter.send(ChatType.GROUP, "qq:20001", "hi"))
             raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
             await ws.send(
                 json.dumps(
@@ -226,7 +226,7 @@ async def test_send_returns_none_without_message_id() -> None:
     try:
         uri = f"ws://127.0.0.1:{adapter.port}"
         async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
-            task = asyncio.create_task(adapter.send(ChatType.PRIVATE, 2, "yo"))
+            task = asyncio.create_task(adapter.send(ChatType.PRIVATE, "qq:2", "yo"))
             raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
             await ws.send(json.dumps({"status": "ok", "retcode": 0, "data": {}, "echo": raw["echo"]}))
             assert await asyncio.wait_for(task, 2) is None
@@ -236,7 +236,7 @@ async def test_send_returns_none_without_message_id() -> None:
 
 async def test_reply_to_bot_message_sets_flag() -> None:
     adapter = make_adapter()
-    adapter.bot_message_ids.append(9)
+    adapter.bot_message_ids.append("9")
     received = []
     done = asyncio.get_running_loop().create_future()
 

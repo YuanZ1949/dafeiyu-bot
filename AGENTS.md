@@ -41,4 +41,10 @@ codegraph sync
   .venv\Scripts\python -m pip install -e ".[dev]"
   ```
 
+  需要微信适配器的可选依赖时：
+
+  ```powershell
+  .venv\Scripts\python -m pip install -e ".[dev,wechat]"
+  ```
+
 - 运行程序 / 测试统一用 `.venv\Scripts\python -m ...`，避免 PATH 里的其它 Python 干扰。

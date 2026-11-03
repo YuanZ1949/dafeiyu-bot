@@ -10,7 +10,7 @@ from dafeiyu.config import LocalModelConfig
 
 
 def cfg(**overrides) -> LocalModelConfig:
-    base = dict(base_url="http://127.0.0.1:1234/v1", autostart_timeout_seconds=1.0)
+    base = {"base_url": "http://127.0.0.1:1234/v1", "autostart_timeout_seconds": 1.0}
     base.update(overrides)
     return LocalModelConfig(**base)
 

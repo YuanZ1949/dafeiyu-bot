@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
-from dafeiyu.delivery.window import ChatWindow, due_at, note as note_window, on_flushed
+from dafeiyu.delivery.window import ChatWindow, due_at, on_flushed
+from dafeiyu.delivery.window import note as note_window
 from dafeiyu.models import ChatType, Message
 
 ChatKey = tuple[ChatType, int]
@@ -33,7 +34,7 @@ class BatchScheduler:
         # 投递期间又来了消息时，靠这个计数判断窗口是不是被换过。
         self._revisions: dict[ChatKey, int] = {}
 
-    def _window(self, chat_type: ChatType, chat_id: int) -> ChatWindow:
+    def _window(self, chat_type: ChatType, chat_id: str) -> ChatWindow:
         key = (chat_type, chat_id)
         window = self._windows.get(key)
         if window is None:
@@ -69,7 +70,7 @@ class BatchScheduler:
             self._inflight.add(key)
         return sorted(due, key=lambda k: (k[0].value, k[1]))
 
-    def done(self, chat_type: ChatType, chat_id: int) -> None:
+    def done(self, chat_type: ChatType, chat_id: str) -> None:
         self._inflight.discard((chat_type, chat_id))
 
     def resume(self, chats) -> None:
@@ -114,7 +115,7 @@ class BatchScheduler:
                 asyncio.create_task(self._flush(*key))
             await asyncio.sleep(interval)
 
-    async def _flush(self, chat_type: ChatType, chat_id: int) -> None:
+    async def _flush(self, chat_type: ChatType, chat_id: str) -> None:
         key = (chat_type, chat_id)
         window = self._windows.get(key)
         if window is None:

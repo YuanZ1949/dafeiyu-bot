@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,10 @@ from .settings_local import (
 
 # 仪表盘写下的覆盖层；测试与嵌入方可以改写这个模块级路径。
 OVERRIDES_PATH = DEFAULT_PATH
+
+# 配置侧的告警只走日志：doctor 需要能加载一份「不完整」的配置来出报告，
+# 所以加载阶段不允许因为微信就绪度缺失而抛错（拒绝在 Adapter.start()）。
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -66,9 +72,10 @@ class TriggerConfig:
 
 @dataclass(frozen=True)
 class GroupsConfig:
-    whitelist: frozenset[int]
-    blacklist: frozenset[int]
-    admins: frozenset[int] = frozenset()
+    # 跨通道的会话/用户 id 一律带通道前缀（`qq:123456` / `wxg:0d5c...`）。
+    whitelist: frozenset[str]
+    blacklist: frozenset[str]
+    admins: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -169,6 +176,70 @@ class BrainConfig:
 @dataclass(frozen=True)
 class GatewayConfig:
     provider: str = "qq"
+
+
+@dataclass(frozen=True)
+class WeChatConfig:
+    """桌面微信小号通道（UIA 桥）的配置。
+
+    注意这里只有人可读的 `account_nickname`（小号在群里的微信显示昵称），
+    **没有**会话别名：alias 由桥本地铸造（task 14），两者混用会让 `at_bot`
+    退化成「任何 @ 都算」。`bridge_token` 只从 env 读，且不进 repr：配置对象
+    常被打印进日志/异常文本。
+    """
+
+    enabled: bool = False
+    bridge_host: str = "127.0.0.1"
+    bridge_port: int = 8790
+    bridge_token: str = field(default="", repr=False)
+    account_nickname: str = ""
+    poll_seconds: float = 8.0
+    # 未读门控：先用侧边栏红点判断「有没有新消息」，只打开有未读的白名单群。
+    # 免打扰会话不计红点，所以每 full_sweep_seconds 仍做一次全量轮询兜底。
+    unread_gate: bool = True
+    full_sweep_seconds: float = 120.0
+    # 本地消息库（只读解密镜像）：开启后入站直接读微信自己的 SQLite
+    # （contact.db + message_N.db），不再靠 UIA 开窗抓屏；发送仍然走 UIA。
+    # 失败一律 fail-open 回落到 UIA 轮询，不会让入站彻底停摆。
+    local_db_enabled: bool = False
+    # 空 = 自动探测 %USERPROFILE%\Documents\xwechat_files\*\db_storage。
+    local_db_root: str = ""
+    # 镜像同步的最小间隔（秒）；0 = 每轮都同步。
+    local_db_refresh_seconds: float = 1.0
+    # 出站后端：uia = 桌面自动化（现状，锁屏不可用）；hook = HTTP 注入（不依赖桌面，
+    # 需配 hook_url，群 username 从本地库解析）；auto = 先 hook，只有明确「没发出去」
+    # 时才回落 UIA（HTTP 超时这类结果不明的情况不回落，避免重复发送）。
+    outbound: str = "uia"
+    # hook 后端地址（POST JSON）；outbound=hook/auto 时必填，启动时校验。
+    hook_url: str = ""
+    hook_timeout_seconds: float = 5.0
+    # 发送后回读本地库里自己刚发的消息做真实送达确认（需要 local_db_enabled）。
+    # 未确认只把回执降级为 typed + receipt_unverified，绝不诱发客户端重发。
+    send_verify: bool = True
+    send_verify_timeout_seconds: float = 8.0
+    send_verify_interval_seconds: float = 0.5
+    send_min_interval_seconds: float = 20.0
+    send_max_per_hour: int = 20
+    send_max_per_day: int = 60
+    quiet_hours: tuple[str, str] = ("23:30", "08:00")
+    typing_delay_seconds: tuple[float, float] = (0.6, 1.2)
+    ack_requires_observed: bool = True
+    echo_window_seconds: float = 120.0
+    keepalive: bool = False
+    require_foreground_idle: bool = True
+    kill_switch_file: str = "data/wechat.stop"
+    version_min: str = "4.1.6"
+    language: str = "zh-CN"
+    allow_test_inject: bool = False
+
+    @property
+    def outbound_requires_desktop(self) -> bool:
+        """出站是否要求桌面可交互（客户端发送闸门用）。
+
+        ``hook`` / ``auto`` 的后端不依赖 UIA，锁屏时仍应允许下发；实际失败由桥
+        带回 error_code，而不是在客户端被 ``desktop != interactive`` 直接拦掉。
+        """
+        return self.outbound == "uia"
 
 
 @dataclass(frozen=True)
@@ -282,6 +353,7 @@ class SupervisorConfig:
 class AlertRulesConfig:
     bot_down_seconds: int = 120
     napcat_down_seconds: int = 180
+    wechat_down_seconds: int = 180
     opencode_down_seconds: int = 120
     quota_pause: bool = True
     disk_free_percent: int = 10
@@ -346,6 +418,7 @@ class Settings:
     images: ImagesConfig = field(default_factory=ImagesConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
+    wechat: WeChatConfig = field(default_factory=WeChatConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
     local_model: LocalModelConfig = field(default_factory=LocalModelConfig)
     napcat: NapCatConfig = field(default_factory=NapCatConfig)
@@ -525,6 +598,9 @@ def _build_alerts(raw: dict[str, Any]) -> AlertsConfig:
         napcat_down_seconds=_positive_int(
             rules_raw.get("napcat_down_seconds"), "alerts.rules.napcat_down_seconds", 180
         ),
+        wechat_down_seconds=_positive_int(
+            rules_raw.get("wechat_down_seconds"), "alerts.rules.wechat_down_seconds", 180
+        ),
         opencode_down_seconds=_positive_int(
             rules_raw.get("opencode_down_seconds"),
             "alerts.rules.opencode_down_seconds",
@@ -660,12 +736,180 @@ def _bool(value: Any, field: str) -> bool:
     return value
 
 
-def _int_set(value: Any, field: str) -> frozenset[int]:
+_NUMERIC_ID = re.compile(r"^[0-9]+$")
+_ID_PREFIXES = ("qq:", "wxg:")
+_QUIET_HOUR = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
+_HOOK_URL = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def parse_group_ids(value: Any, field: str) -> frozenset[str]:
+    """跨通道 id 集合：纯数字补 `qq:` 前缀，带前缀的原样保留，统一 casefold。
+
+    面板保存群白名单时也走这里：同一套校验，避免 API 放进了启动时会被
+    `load_settings` 拒绝的值。
+    """
     if value is None:
         return frozenset()
     if not isinstance(value, list):
         raise ConfigError(f"{field} 必须是列表")
-    return frozenset(_int(v, field) for v in value)
+    ids: set[str] = set()
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, str)):
+            raise ConfigError(f"{field} 的元素必须是数字或字符串 id")
+        text = str(item).strip()
+        if not text:
+            raise ConfigError(f"{field} 的元素不能为空")
+        if _NUMERIC_ID.match(text):
+            text = f"qq:{text}"
+        lowered = text.casefold()
+        if not lowered.startswith(_ID_PREFIXES):
+            raise ConfigError(
+                f"{field} 的元素必须是纯数字或带 qq:/wxg: 前缀：{str(item)!r}"
+            )
+        prefix, _, rest = lowered.partition(":")
+        if not rest:
+            raise ConfigError(f"{field} 的元素缺少冒号后的 id：{str(item)!r}")
+        ids.add(f"{prefix}:{rest}")
+    return frozenset(ids)
+
+
+def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
+    """解析 `gateway.wechat`；就绪度缺失只告警，不在加载阶段拒绝。"""
+    section: dict[str, Any] = {}
+    if raw is not None:
+        if not isinstance(raw, dict):
+            raise ConfigError("gateway.wechat 必须是映射")
+        section = raw
+
+    token = str(env.get("DAFEIYU_WECHAT_BRIDGE_TOKEN", "") or section.get("bridge_token") or "")
+    host = str(section.get("bridge_host") or "127.0.0.1").strip()
+    port = _int(section.get("bridge_port", 8790), "gateway.wechat.bridge_port")
+    if not 0 < port < 65536:
+        raise ConfigError("gateway.wechat.bridge_port 必须在 1-65535 之间")
+    poll_seconds = _float(section.get("poll_seconds", 8.0), "gateway.wechat.poll_seconds")
+    if poll_seconds <= 0:
+        raise ConfigError("gateway.wechat.poll_seconds 必须大于 0")
+    full_sweep = _float(
+        section.get("full_sweep_seconds", 120.0),
+        "gateway.wechat.full_sweep_seconds",
+    )
+    if full_sweep <= 0:
+        raise ConfigError("gateway.wechat.full_sweep_seconds 必须大于 0")
+    send_interval = _float(
+        section.get("send_min_interval_seconds", 20.0),
+        "gateway.wechat.send_min_interval_seconds",
+    )
+    if send_interval < 0:
+        raise ConfigError("gateway.wechat.send_min_interval_seconds 不能为负")
+    echo_window = _float(
+        section.get("echo_window_seconds", 120.0), "gateway.wechat.echo_window_seconds"
+    )
+    if echo_window < 0:
+        raise ConfigError("gateway.wechat.echo_window_seconds 不能为负")
+    local_db_refresh = _float(
+        section.get("local_db_refresh_seconds", 1.0),
+        "gateway.wechat.local_db_refresh_seconds",
+    )
+    if local_db_refresh < 0:
+        raise ConfigError("gateway.wechat.local_db_refresh_seconds 不能为负")
+    outbound = str(section.get("outbound") or "uia").strip().lower()
+    if outbound not in ("uia", "hook", "auto"):
+        raise ConfigError("gateway.wechat.outbound 只能是 uia / hook / auto")
+    hook_url = str(section.get("hook_url") or "").strip()
+    if hook_url and not _HOOK_URL.match(hook_url):
+        raise ConfigError("gateway.wechat.hook_url 必须是 http:// 或 https:// 地址")
+    hook_timeout = _float(
+        section.get("hook_timeout_seconds", 5.0),
+        "gateway.wechat.hook_timeout_seconds",
+    )
+    if hook_timeout <= 0:
+        raise ConfigError("gateway.wechat.hook_timeout_seconds 必须大于 0")
+    verify_timeout = _float(
+        section.get("send_verify_timeout_seconds", 8.0),
+        "gateway.wechat.send_verify_timeout_seconds",
+    )
+    if verify_timeout < 0:
+        raise ConfigError("gateway.wechat.send_verify_timeout_seconds 不能为负")
+    verify_interval = _float(
+        section.get("send_verify_interval_seconds", 0.5),
+        "gateway.wechat.send_verify_interval_seconds",
+    )
+    if verify_interval <= 0:
+        raise ConfigError("gateway.wechat.send_verify_interval_seconds 必须大于 0")
+
+    quiet_hours = section.get("quiet_hours", ["23:30", "08:00"])
+    if not isinstance(quiet_hours, (list, tuple)) or len(quiet_hours) != 2:
+        raise ConfigError("gateway.wechat.quiet_hours 必须是两个 HH:MM 字符串")
+    quiet: list[str] = []
+    for item in quiet_hours:
+        text = str(item).strip()
+        if not _QUIET_HOUR.match(text):
+            raise ConfigError("gateway.wechat.quiet_hours 必须是 HH:MM（00:00-23:59）")
+        quiet.append(text)
+
+    delays = section.get("typing_delay_seconds", [0.6, 1.2])
+    if not isinstance(delays, (list, tuple)) or len(delays) != 2:
+        raise ConfigError("gateway.wechat.typing_delay_seconds 必须是两个数字")
+    low = _float(delays[0], "gateway.wechat.typing_delay_seconds")
+    high = _float(delays[1], "gateway.wechat.typing_delay_seconds")
+    if low < 0 or high < low:
+        raise ConfigError("gateway.wechat.typing_delay_seconds 必须满足 0 <= 下限 <= 上限")
+
+    kill_switch = str(section.get("kill_switch_file") or "data/wechat.stop").strip()
+    if not kill_switch:
+        raise ConfigError("gateway.wechat.kill_switch_file 不能为空")
+
+    return WeChatConfig(
+        enabled=_bool(section.get("enabled", False), "gateway.wechat.enabled"),
+        bridge_host=host,
+        bridge_port=port,
+        bridge_token=token,
+        account_nickname=str(section.get("account_nickname") or "").strip(),
+        poll_seconds=poll_seconds,
+        unread_gate=_bool(
+            section.get("unread_gate", True), "gateway.wechat.unread_gate"
+        ),
+        full_sweep_seconds=full_sweep,
+        send_min_interval_seconds=send_interval,
+        # 0 = 不限制（发送端 _rate_available 已按 >0 判断）；默认值保持不变。
+        send_max_per_hour=_non_negative_int(
+            section.get("send_max_per_hour"), "gateway.wechat.send_max_per_hour", 20
+        ),
+        send_max_per_day=_non_negative_int(
+            section.get("send_max_per_day"), "gateway.wechat.send_max_per_day", 60
+        ),
+        quiet_hours=(quiet[0], quiet[1]),
+        typing_delay_seconds=(low, high),
+        ack_requires_observed=_bool(
+            section.get("ack_requires_observed", True),
+            "gateway.wechat.ack_requires_observed",
+        ),
+        echo_window_seconds=echo_window,
+        keepalive=_bool(section.get("keepalive", False), "gateway.wechat.keepalive"),
+        require_foreground_idle=_bool(
+            section.get("require_foreground_idle", True),
+            "gateway.wechat.require_foreground_idle",
+        ),
+        local_db_enabled=_bool(
+            section.get("local_db_enabled", False), "gateway.wechat.local_db_enabled"
+        ),
+        local_db_root=str(section.get("local_db_root") or "").strip(),
+        local_db_refresh_seconds=local_db_refresh,
+        outbound=outbound,
+        hook_url=hook_url,
+        hook_timeout_seconds=hook_timeout,
+        send_verify=_bool(
+            section.get("send_verify", True), "gateway.wechat.send_verify"
+        ),
+        send_verify_timeout_seconds=verify_timeout,
+        send_verify_interval_seconds=verify_interval,
+        kill_switch_file=kill_switch,
+        version_min=str(section.get("version_min") or "4.1.6").strip(),
+        language=str(section.get("language") or "zh-CN").strip(),
+        allow_test_inject=_bool(
+            section.get("allow_test_inject", False), "gateway.wechat.allow_test_inject"
+        ),
+    )
 
 
 def _build_persona(raw: dict[str, Any]) -> PersonaConfig:
@@ -834,6 +1078,21 @@ def _apply_behavior_overrides(raw: dict[str, Any], overrides: dict[str, Any]) ->
             target[name] = section[name]
 
 
+def _apply_groups_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """面板保存的群白名单：只认 whitelist，空列表 = 清空（不限制回复对象）。
+
+    其它键（blacklist / admins）仍由 config.yaml 管，避免面板误写扩大权限。
+    """
+    section = overrides.get("groups")
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        raise ConfigError("覆盖层的 groups 必须是映射")
+    if "whitelist" not in section:
+        return
+    _overlay_target(raw, "groups")["whitelist"] = section["whitelist"]
+
+
 def _apply_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> bool:
     """把覆盖层白名单键盖到 raw 上，返回覆盖层是否显式给了 brain.mode。
 
@@ -841,6 +1100,7 @@ def _apply_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> bool:
     覆盖层由面板生成，出现别的键说明版本不一致，静默跳过比报错更稳。
     """
     _apply_behavior_overrides(raw, overrides)
+    _apply_groups_overrides(raw, overrides)
     brain_override = overrides.get("brain")
     if brain_override is None:
         return False
@@ -939,14 +1199,19 @@ def load_settings(
     if not isinstance(gateway_raw, dict):
         raise ConfigError("config.yaml 的 gateway 必须是映射")
     gateway_provider = str(gateway_raw.get("provider") or "qq").strip().casefold()
-    if gateway_provider not in ("qq", "wechat"):
-        raise ConfigError("gateway.provider 只能是 qq 或 wechat")
-    if gateway_provider == "wechat":
-        raise ConfigError(
-            "gateway.provider=wechat 暂不可用：微信接入未实现。可选路径只有三条："
-            "1) WeChatPadPro（付费 iPad 协议，LangBot 内置 wechatpad_api）；"
-            "2) wechatauto-replica / wxauto（Windows 桌面 RPA，依赖微信窗口常驻）；"
-            "3) 继续用 QQ（gateway.provider=qq）。"
+    if gateway_provider not in ("qq", "wechat", "both"):
+        raise ConfigError("gateway.provider 只能是 qq、wechat 或 both")
+    wechat = _build_wechat(gateway_raw.get("wechat"), env)
+    if gateway_provider in ("wechat", "both") and not wechat.enabled:
+        logger.warning(
+            "gateway.provider=%s 但 gateway.wechat.enabled=false，降级为 qq",
+            gateway_provider,
+        )
+        gateway_provider = "qq"
+    if wechat.enabled and not wechat.account_nickname:
+        logger.warning(
+            "gateway.wechat.enabled=true 但 account_nickname 为空：无法判定是否被 @"
+            "（WeChatAdapter.start() 会抛 ConfigError，dafeiyu doctor 第 ⑧ 项会 FAIL）"
         )
 
     local_model_raw = raw.get("local_model") or {}
@@ -1175,9 +1440,15 @@ def load_settings(
         persona=_build_persona(_section(raw, "persona")),
         triggers=_build_triggers(_section(raw, "triggers")),
         groups=GroupsConfig(
-            whitelist=_int_set(_section(raw, "groups").get("whitelist"), "groups.whitelist"),
-            blacklist=_int_set(_section(raw, "groups").get("blacklist"), "groups.blacklist"),
-            admins=_int_set(_section(raw, "groups").get("admins"), "groups.admins"),
+            whitelist=parse_group_ids(
+                _section(raw, "groups").get("whitelist"), "groups.whitelist"
+            ),
+            blacklist=parse_group_ids(
+                _section(raw, "groups").get("blacklist"), "groups.blacklist"
+            ),
+            admins=parse_group_ids(
+                _section(raw, "groups").get("admins"), "groups.admins"
+            ),
         ),
         budget=_build_budget(budget_raw),
         memory=MemoryConfig(
@@ -1212,6 +1483,7 @@ def load_settings(
             mode_from_overrides=mode_from_overrides,
         ),
         gateway=GatewayConfig(provider=gateway_provider),
+        wechat=wechat,
         opencode=OpenCodeConfig(
             bin=str(opencode_raw.get("bin") or "").strip(),
             agent=opencode_agent,

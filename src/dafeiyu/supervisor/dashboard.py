@@ -7,15 +7,17 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
 
 from ..config import Settings
+from ..ids import normalize_chat_id
 from .auth import COOKIE_NAME, DashboardAuth, safe_next_path
 from .backup import REASONS, BackupError
 from .control_token import ControlToken
@@ -215,7 +217,7 @@ def create_app(
                 except ValueError:
                     data = {"error": "bot 返回非 JSON"}
                 return status, data
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return 504, {"error": "bot 响应超时"}
         except aiohttp.ClientError as exc:
             return 502, {"error": f"bot 不可达：{exc.__class__.__name__}"}
@@ -238,7 +240,7 @@ def create_app(
                     if value:
                         headers[name] = value
                 return resp.status, body, headers
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return 504, b'{"error":"bot timeout"}', {
                 "Content-Type": "application/json"
             }
@@ -614,7 +616,7 @@ def create_app(
             while not closing.is_set():
                 try:
                     seq, line = await asyncio.wait_for(queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     idle += 1
                     if idle >= 15:
                         await response.write(b": ping\n\n")
@@ -720,6 +722,24 @@ def create_app(
         code, data = await bot_call("PUT", "/api/behavior", payload)
         return web.json_response(data, status=code)
 
+    async def groups(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/groups")
+
+    async def save_groups(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call("PUT", "/api/groups", payload)
+        return web.json_response(data, status=code)
+
+    async def wechat_stop(_: web.Request) -> web.Response:
+        code, data = await bot_call("POST", "/api/channels/wechat/stop", {})
+        return web.json_response(data, status=code)
+
+    async def wechat_resume(_: web.Request) -> web.Response:
+        code, data = await bot_call("POST", "/api/channels/wechat/resume", {})
+        return web.json_response(data, status=code)
+
     def _session_target(
         request: web.Request,
     ) -> tuple[str, str, web.Response | None]:
@@ -729,9 +749,17 @@ def create_app(
             return "", "", web.json_response(
                 {"error": "chat_type 必须是 group 或 private"}, status=400
             )
-        if not chat_id.isdigit() or int(chat_id) <= 0:
+        try:
+            chat_id = normalize_chat_id(chat_id, label="chat_id")
+        except ValueError as exc:
+            return "", "", web.json_response({"error": str(exc)}, status=400)
+        # 纯数字 QQ id 仍须为正：normalize 允许 '-' 字符，这里补回旧语义。
+        numeric = chat_id.isdecimal() or (
+            chat_id.startswith("-") and chat_id[1:].isdecimal()
+        )
+        if numeric and int(chat_id) <= 0:
             return "", "", web.json_response(
-                {"error": "chat_id 必须是正整数"}, status=400
+                {"error": "chat_id 格式非法：必须是正整数"}, status=400
             )
         return chat_type, chat_id, None
 
@@ -742,9 +770,16 @@ def create_app(
         if error is not None:
             return "", "", "", error
         user_id = request.match_info.get("user_id", "")
-        if not user_id.isdigit() or int(user_id) <= 0:
+        try:
+            user_id = normalize_chat_id(user_id, label="user_id")
+        except ValueError as exc:
+            return "", "", "", web.json_response({"error": str(exc)}, status=400)
+        numeric = user_id.isdecimal() or (
+            user_id.startswith("-") and user_id[1:].isdecimal()
+        )
+        if numeric and int(user_id) <= 0:
             return "", "", "", web.json_response(
-                {"error": "user_id 必须是正整数"}, status=400
+                {"error": "user_id 格式非法：必须是正整数"}, status=400
             )
         return chat_type, chat_id, user_id, None
 
@@ -866,8 +901,8 @@ def create_app(
             detail={
                 "deleted_messages": deleted,
                 "chat_type": chat_type,
-                "chat_id": int(chat_id),
-                "user_id": int(user_id),
+                "chat_id": chat_id,
+                "user_id": user_id,
             },
         )
         return web.json_response(data, status=code)
@@ -893,7 +928,8 @@ def create_app(
                     await supervisor.stop(name)
                 else:
                     await supervisor.restart(name)
-            except Exception as exc:  # 单个失败不影响其它进程
+            # 单个失败不影响其它进程
+            except Exception as exc:  # noqa: BLE001
                 errors.append(f"{name}: {exc}")
         result: dict[str, Any] = {
             "ok": not errors,
@@ -1084,6 +1120,10 @@ def create_app(
     app.router.add_get("/api/config", config)
     app.router.add_get("/api/behavior", behavior)
     app.router.add_put("/api/behavior", save_behavior)
+    app.router.add_get("/api/groups", groups)
+    app.router.add_put("/api/groups", save_groups)
+    app.router.add_post("/api/channels/wechat/stop", wechat_stop)
+    app.router.add_post("/api/channels/wechat/resume", wechat_resume)
     app.router.add_get("/api/backup", backup)
     app.router.add_post("/api/memory/summaries", memory_summary)
     app.router.add_post("/api/memory/impressions", memory_impressions)
@@ -1123,7 +1163,7 @@ def _qr_meta(path: Path) -> dict[str, Any]:
 
 def _sse(line: str, event_id: int | None = None) -> bytes:
     prefix = f"id: {event_id}\n" if event_id is not None else ""
-    return f"{prefix}data: {json.dumps(line, ensure_ascii=False)}\n\n".encode("utf-8")
+    return f"{prefix}data: {json.dumps(line, ensure_ascii=False)}\n\n".encode()
 
 
 async def _json_body(request: web.Request) -> dict | None:

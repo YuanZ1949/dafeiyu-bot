@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime
-from typing import Awaitable, Callable
 
 from dafeiyu.memory.store import SessionStats, Store
 from dafeiyu.models import ChatType, Message
@@ -39,7 +39,7 @@ async def apply_rotation(
     store: Store,
     summarize: Summarizer,
     chat_type: ChatType,
-    chat_id: int,
+    chat_id: str,
     messages: list[Message],
 ) -> str | None:
     """生成接续摘要后换 session；摘要失败则什么都不做，返回 None。"""

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from test_opencode_http import FakeServer
 
 from dafeiyu.brain import factory
 from dafeiyu.config import ConfigError, load_settings
@@ -15,7 +16,6 @@ from dafeiyu.memory.workspace import Workspace
 from dafeiyu.models import ChatType
 from dafeiyu.router import Router
 from dafeiyu.service import Service
-from test_opencode_http import FakeServer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_FILE = REPO_ROOT / ".opencode" / "agents" / "deepseek-qq.md"
@@ -174,7 +174,7 @@ def test_budget_ambient_ratio_parsed(tmp_path: Path) -> None:
 def test_agents_permissions_and_persona_sync() -> None:
     text = AGENT_FILE.read_text(encoding="utf-8")
     fm = text.split("---")[1]
-    assert "steps: 4" in fm
+    assert "steps: 6" in fm
     assert "model: opencode/deepseek-v4.1-flash-free" in fm
     assert "glob" not in fm and "grep" not in fm
     assert "data/bot-workspace/**" in fm
@@ -299,14 +299,14 @@ def test_check_workspace_uses_configured_limit(tmp_path: Path) -> None:
             s,
             store,
             brain=None,
-            adapter=None,
+            adapters={"qq": None},
             router=Router(s, store),
             persona_text="",
             workspace=workspace,
         )
-        target = workspace.chat_path(ChatType.PRIVATE, 1)
+        target = workspace.chat_path(ChatType.PRIVATE, "qq:1")
         target.write_text("# 标题\n" + ("- 很长的条目\n" * 200), encoding="utf-8")
-        service._check_workspace(ChatType.PRIVATE, 1)
+        service._check_workspace(ChatType.PRIVATE, "qq:1")
         assert target.stat().st_size <= 400
         assert "truncated" in target.read_text(encoding="utf-8")
     finally:

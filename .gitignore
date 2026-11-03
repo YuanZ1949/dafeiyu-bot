@@ -22,5 +22,5 @@ config.yaml
 docs/superpowers/spikes/
 .codegraph/
 
-# 计划与证据（本地，不入库）
+# 计划与证据（worktree 本地，不随分支入库）
 .omo/

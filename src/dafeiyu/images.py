@@ -19,15 +19,15 @@ import hashlib
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Awaitable, Callable
 
 import httpx
 
 from .config import Settings
-from .netssl import default_ssl_context
 from .models import Message
+from .netssl import default_ssl_context
 
 log = logging.getLogger(__name__)
 
@@ -35,8 +35,8 @@ _PLACEHOLDER = "[图片]"
 _ANNOTATED = "[图片]（图存 {path}，可用 read 查看）"
 _ANNOTATED_ANIMATED = "[图片]（图存 {path}，动图，可用 read 查看）"
 
-_HTTP_RE = re.compile(r"^https?://", re.I)
-_DATA_URI_RE = re.compile(r"^data:image/[\w.+-]+;base64,", re.I)
+_HTTP_RE = re.compile(r"^https?://", re.IGNORECASE)
+_DATA_URI_RE = re.compile(r"^data:image/[\w.+-]+;base64,", re.IGNORECASE)
 
 # 魔数 → 扩展名（顺序无关，逐前缀匹配）。
 _MAGIC: tuple[tuple[bytes, str], ...] = (
@@ -55,17 +55,16 @@ async def _default_fetch(url: str, timeout: float, max_bytes: int) -> bytes:
     """流式下载，边收边判上限，超限即断。"""
     async with httpx.AsyncClient(
         timeout=timeout, follow_redirects=True, verify=default_ssl_context()
-    ) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in resp.aiter_bytes():
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ValueError(f"图片超过大小上限 {max_bytes} 字节")
-                chunks.append(chunk)
-            return b"".join(chunks)
+    ) as client, client.stream("GET", url) as resp:
+        resp.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"图片超过大小上限 {max_bytes} 字节")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 
 def _sniff_ext(data: bytes) -> str:
@@ -167,7 +166,7 @@ async def materialize(
         return await _materialize(
             msg, settings, fetch=fetch or _default_fetch, annotate=annotate
         )
-    except Exception:  # noqa: BLE001 —— 图片绝不能打断消息入库
+    except Exception:
         log.warning("图片物化失败，回退占位：%s", msg.message_id, exc_info=True)
         return 0
 
@@ -204,7 +203,7 @@ async def _materialize(
             continue
         try:
             data = await _obtain(kind, value, settings=settings, fetch=fetch)
-        except Exception:  # noqa: BLE001 —— 单图失败不影响其余图与入库
+        except Exception:
             log.info(
                 "图片获取失败，保持占位：msg=%s kind=%s", msg.message_id, kind,
                 exc_info=True,

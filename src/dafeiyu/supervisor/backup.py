@@ -8,10 +8,11 @@ import os
 import re
 import sqlite3
 import zipfile
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .. import __version__
 from ..timeutil import now_shanghai
@@ -63,8 +64,18 @@ class BackupManifest:
     workspace_sha256: str = ""
 
 
-def validate_database(path: Path, max_schema_version: int = 1) -> tuple[bool, str]:
-    """校验备份文件能否安全回灌；返回 (ok, reason) 而不是抛异常。"""
+def validate_database(
+    path: Path, max_schema_version: int | None = None
+) -> tuple[bool, str]:
+    """校验备份文件能否安全回灌；返回 (ok, reason) 而不是抛异常。
+
+    ``max_schema_version`` 缺省跟随 ``Store.SCHEMA_VERSION``（单一真源）：
+    schema 升版后仍接受新版库，不再需要调用方手动跟改。
+    """
+    if max_schema_version is None:
+        from dafeiyu.memory.store import Store
+
+        max_schema_version = Store.SCHEMA_VERSION
     path = Path(path)
     try:
         with path.open("rb") as fh:

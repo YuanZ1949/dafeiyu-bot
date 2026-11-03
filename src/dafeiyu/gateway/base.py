@@ -15,7 +15,7 @@ class Adapter(Protocol):
 
     async def stop(self) -> None: ...
 
-    async def send(self, chat_type: ChatType, chat_id: int, text: str) -> str | None:
+    async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str | None:
         """发一条消息，返回网关给出的真实 message_id；拿不到时返回 None。"""
         ...
 

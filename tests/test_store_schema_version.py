@@ -5,6 +5,10 @@ from pathlib import Path
 
 import pytest
 
+# 真 schema-1 夹具：复用 test_store_migration 的 v1 库拼装（INTEGER id 布局 +
+# FTS），替代旧版「把 v2 库重置 user_version=0」的假升级用例。
+from test_store_migration import make_v1_db
+
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 
@@ -29,23 +33,18 @@ def message(content: str = "hi") -> Message:
 
 def test_new_db_sets_schema_version(tmp_path: Path) -> None:
     store = make_store(tmp_path / "t.db")
-    assert store.db_stats()["schema_version"] == 1
+    assert store.db_stats()["schema_version"] == 2
     store.close()
 
 
 def test_old_db_is_upgraded_to_schema_version(tmp_path: Path) -> None:
+    """真 v1 库（INTEGER id + user_version=1）重开后迁移到 v2。"""
     path = tmp_path / "old.db"
-    store = Store(path)
-    store.init_schema()
-    store.close()
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA user_version = 0")
-    conn.commit()
-    conn.close()
+    make_v1_db(path)
 
     store = Store(path)
     store.init_schema()
-    assert store.db_stats()["schema_version"] == 1
+    assert store.db_stats()["schema_version"] == 2
     store.close()
 
 

@@ -109,6 +109,7 @@
     .span-full { grid-column: 1 / -1; }
   }
   .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
   .card {
     background: var(--panel);
     border: 1px solid var(--line);
@@ -142,6 +143,7 @@
     padding: 2px 8px; border-radius: 999px; font-size: var(--fs-sm);
     background: var(--panel-2); border: 1px solid var(--line);
   }
+  .chan-tag { margin-left: 6px; padding: 1px 6px; border-radius: 8px; font-size: 11px; background: rgba(120,120,120,.18); }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
   .st-running .dot { background: var(--ok); }
   .st-starting .dot, .st-restarting .dot { background: var(--warn); }
@@ -499,6 +501,13 @@
     </div>
     <div class="grid-3" id="health-processes"></div>
     <div class="kv cfg-grid" id="health-body"></div>
+    <div class="grid-2" id="health-channels"></div>
+    <div class="row" id="wechat-kill-row">
+      <span class="kv" id="wechat-kill-hint">急停只停微信轮询，QQ 不受影响</span>
+      <span class="spacer"></span>
+      <button class="btn danger" id="btn-wechat-stop" data-channel="wechat">微信急停</button>
+      <button class="btn" id="btn-wechat-resume" data-channel="wechat">恢复轮询</button>
+    </div>
   </section>
 
   <section class="card" id="alerts-card">
@@ -648,7 +657,7 @@
           <option value="group">群聊</option>
           <option value="private">私聊</option>
         </select>
-        <input id="memory-chat-id" type="number" min="1" placeholder="会话 ID" class="w-id" title="手动触发用的会话 ID" aria-label="手动触发用的会话 ID" />
+        <input id="memory-chat-id" placeholder="会话 ID（数字或 wxg:…）" class="w-id" title="手动触发用的会话 ID" aria-label="手动触发用的会话 ID" />
         <button class="btn" id="btn-summarize">按 ID 生成摘要</button>
         <button class="btn" id="btn-extract">按 ID 抽取印象</button>
       </div>
@@ -670,8 +679,8 @@
         <option value="group">群聊</option>
         <option value="private">私聊</option>
       </select>
-      <input id="delete-user-chat-id" type="number" min="1" placeholder="会话 ID" class="w-id" aria-label="要删除的会话 ID" />
-      <input id="delete-user-id" type="number" min="1" placeholder="用户 QQ 号" class="w-user" aria-label="要删除的用户 QQ 号" />
+      <input id="delete-user-chat-id" placeholder="会话 ID（数字或 wxg:…）" class="w-id" aria-label="要删除的会话 ID" />
+      <input id="delete-user-id" placeholder="用户 ID（QQ 号或 wxg:…）" class="w-user" aria-label="要删除的用户 QQ 号" />
       <input id="delete-user-confirm" class="w-confirm" placeholder="输入 DELETE_USER 确认" aria-label="输入 DELETE_USER 确认以启用删除" />
       <button class="btn danger" type="submit" id="btn-delete-user">删除该用户消息</button>
       <span class="kv" id="delete-user-status"></span>
@@ -708,7 +717,7 @@
               <option value="group">群聊</option>
               <option value="private">私聊</option>
             </select>
-            <input id="budget-chat-id" type="number" min="1" value="1" class="w-id" title="会话 ID" aria-label="预算统计的会话 ID" />
+            <input id="budget-chat-id" value="1" class="w-id" title="会话 ID" aria-label="预算统计的会话 ID" />
             <button class="btn" id="btn-budget-refresh">刷新</button>
           </div>
           <div class="budget-chat" id="budget-chat">填写会话 ID 后加载预算</div>
@@ -739,7 +748,7 @@
         <option value="group">只看群聊</option>
         <option value="private">只看私聊</option>
       </select>
-      <input id="search-chat-id" type="number" min="1" placeholder="会话 ID（可选）" class="w-sid" aria-label="限定搜索的会话 ID（可选）" />
+      <input id="search-chat-id" placeholder="会话 ID（可选）" class="w-sid" aria-label="限定搜索的会话 ID（可选）" />
       <button class="btn primary" id="btn-search">搜索</button>
       <button class="btn" id="btn-search-more" disabled>更多</button>
     </div>
@@ -772,10 +781,10 @@
         </select>
       </label>
       <label>会话 ID
-        <input id="debug-chat-id" type="number" min="1" value="1" />
+        <input id="debug-chat-id" value="1" />
       </label>
       <label>用户 ID
-        <input id="debug-user-id" type="number" min="1" value="2" />
+        <input id="debug-user-id" value="2" />
       </label>
       <label>昵称
         <input id="debug-nickname" maxlength="40" value="调试用户" />
@@ -839,6 +848,23 @@
       </label>
     </div>
     <div class="kv" style="margin-top:8px">安静 = 只有 @ / 引用 / 叫名字才进模型；正常 = 当前行为；活跃 = 放开话题收尾与降频闸门。言论限制是关键词级兜底，不是语义审核。</div>
+  </section>
+
+  <section class="card">
+    <div class="row card-head">
+      <h2>群白名单</h2>
+      <span class="kv" id="groups-hint">留空 = 不限制回复对象</span>
+      <span class="spacer"></span>
+      <button class="btn" id="btn-refresh-groups">刷新</button>
+      <button class="btn primary" id="btn-save-groups">保存</button>
+    </div>
+    <div class="debug-form">
+      <label class="debug-wide">回复白名单（一行一个，必须带通道前缀；留空 = 不限制）
+        <textarea id="groups-whitelist" rows="4" placeholder="例如：qq:123456&#10;wxg:46034f826c8b"></textarea>
+      </label>
+    </div>
+    <div class="kv" style="margin-top:8px">留空 = 所有群都按判定回复；非空 = 只有名单内的群会被主动回复，@ / 引用 / 叫名字仍然必回。这里同时决定「回不回」和「抓哪些微信群」（桥只轮询这里的微信会话）。</div>
+    <div class="kv" id="groups-known" style="margin-top:8px">已知群：（暂无）</div>
   </section>
 
   <section class="card span-full">
@@ -1111,10 +1137,16 @@ async function runTriggerDebug() {
     toast("先输入一条模拟消息", true);
     return;
   }
+  const chatId = $("debug-chat-id").value.trim();
+  const userId = $("debug-user-id").value.trim();
+  if (!isValidChatId(chatId) || !isValidChatId(userId)) {
+    toast("会话 ID / 用户 ID 格式非法（允许字母、数字与 _ : . @ -）", true);
+    return;
+  }
   const payload = {
     chat_type: $("debug-chat-type").value,
-    chat_id: Number($("debug-chat-id").value),
-    user_id: Number($("debug-user-id").value),
+    chat_id: chatId,
+    user_id: userId,
     nickname: $("debug-nickname").value.trim() || "调试用户",
     content,
     at_bot: $("debug-at-bot").checked,
@@ -1563,6 +1595,48 @@ function renderHealth(data) {
   const body = $("health-body");
   body.replaceChildren();
   rows.forEach(([label, value]) => body.append(healthKv(label, value)));
+
+  const channels = data.channels || {};
+  const channelBox = $("health-channels");
+  channelBox.replaceChildren();
+  const CHANNEL_TITLE = { qq: "QQ 通道", wechat: "微信通道" };
+  const qqEntry = channels.qq || (data.gateway ? { connected: !!data.gateway.connected, last_event_at: data.gateway.last_event_at, last_disconnect_at: data.gateway.last_disconnect_at } : null);
+  const wechatEntry = channels.wechat || null;
+  const renderChannel = (name, item) => {
+    const card = document.createElement("div");
+    card.className = "card";
+    card.dataset.channel = name;
+    const head = document.createElement("div");
+    head.className = "row";
+    const title = document.createElement("div");
+    title.className = "proc-name";
+    title.textContent = CHANNEL_TITLE[name] || name;
+    const pill = document.createElement("span");
+    const state = !item ? "stopped" : item.connected ? "running" : "stopped";
+    pill.className = `pill st-${state}`;
+    pill.innerHTML = '<span class="dot"></span>';
+    pill.append(!item ? "未启用" : item.connected ? (item.degraded ? "已连接（降级）" : "已连接") : "未连接");
+    head.append(title, pill);
+    card.append(head);
+    if (item) {
+      const body = document.createElement("div");
+      body.className = "kv";
+      body.append(
+        healthKv("最后事件", item.last_event_at || "—"),
+        healthKv("最后断开", item.last_disconnect_at || "—"),
+        healthKv("最后发送", item.last_send_at || "—"),
+      );
+      if (name === "wechat") {
+        body.append(healthKv("登录态", item.logged_in === undefined ? "—" : item.logged_in ? "已登录" : "未登录"));
+        body.append(healthKv("桌面", item.desktop || "—"));
+      }
+      card.append(body);
+    }
+    channelBox.append(card);
+  };
+  renderChannel("qq", qqEntry);
+  renderChannel("wechat", wechatEntry);
+  $("wechat-kill-row").hidden = !wechatEntry;
 }
 
 async function refreshHealth() {
@@ -1826,6 +1900,21 @@ function chatLabel(typeOrItem, id) {
   return `${type === "group" ? "群" : "私聊"} ${id}`;
 }
 
+const CHAT_ID_RE = /^[A-Za-z0-9_:.@-]{1,128}$/;
+
+function isValidChatId(value) {
+  const text = String(value == null ? "" : value).trim();
+  return CHAT_ID_RE.test(text) && !text.includes("..");
+}
+
+function channelOfId(id) {
+  return String(id == null ? "" : id).startsWith("wxg:") ? "wechat" : "qq";
+}
+
+function channelLabelOf(id) {
+  return channelOfId(id) === "wechat" ? "微信" : "QQ";
+}
+
 function memItem(meta, text) {
   const item = document.createElement("div");
   item.className = "mem-item";
@@ -2018,31 +2107,32 @@ function summaryDate() {
 }
 
 function memoryTarget() {
-  const chatId = Number($("memory-chat-id").value);
-  if (!Number.isInteger(chatId) || chatId <= 0) {
-    throw new Error("请先在「高级」里填会话 ID，或直接点会话行的「摘要 / 印象」");
+  const chatId = $("memory-chat-id").value.trim();
+  if (!isValidChatId(chatId)) {
+    throw new Error("请先在「高级」里填会话 ID（数字或 wxg:…），或直接点会话行的「摘要 / 印象」");
   }
   const chatType = $("memory-target-type").value || "group";
   return { chat_type: chatType, chat_id: chatId };
 }
 
 function resolveTarget(chatType, chatId) {
-  if (Number.isInteger(chatId) && chatId > 0 && (chatType === "group" || chatType === "private")) {
-    return { chat_type: chatType, chat_id: chatId };
+  const text = String(chatId == null ? "" : chatId).trim();
+  if ((chatType === "group" || chatType === "private") && isValidChatId(text)) {
+    return { chat_type: chatType, chat_id: text };
   }
   return memoryTarget();
 }
 
 async function deleteUserMessages(event) {
   if (event) event.preventDefault();
-  const chatId = Number($("delete-user-chat-id").value);
-  const userId = Number($("delete-user-id").value);
-  if (!Number.isInteger(chatId) || chatId <= 0) {
-    toast("请先填会话 ID", true);
+  const chatId = $("delete-user-chat-id").value.trim();
+  const userId = $("delete-user-id").value.trim();
+  if (!isValidChatId(chatId)) {
+    toast("请先填会话 ID（数字或 wxg:…）", true);
     return;
   }
-  if (!Number.isInteger(userId) || userId <= 0) {
-    toast("请填用户 QQ 号", true);
+  if (!isValidChatId(userId)) {
+    toast("请填用户 ID（QQ 号或 wxg:…）", true);
     return;
   }
   if ($("delete-user-confirm").value.trim() !== "DELETE_USER") {
@@ -2341,14 +2431,13 @@ function loadBudget() {
 async function loadBudgetData() {
   const chatType = $("budget-chat-type").value;
   const rawId = $("budget-chat-id").value.trim();
-  const chatId = Number(rawId);
-  if (!rawId || !Number.isInteger(chatId) || chatId <= 0) {
-    resetBudget("填写正整数会话 ID 后刷新");
+  if (!isValidChatId(rawId)) {
+    resetBudget("填写会话 ID（数字或 wxg:…）后刷新");
     return;
   }
   try {
     const data = await api(
-      `/api/budget?chat_type=${encodeURIComponent(chatType)}&chat_id=${chatId}`
+      `/api/budget?chat_type=${encodeURIComponent(chatType)}&chat_id=${encodeURIComponent(rawId)}`
     );
     renderBudget(data);
   } catch (err) {
@@ -2416,6 +2505,11 @@ async function loadSessions(append = false) {
       const who = document.createElement("div");
       who.className = "who";
       who.textContent = chatLabel(s.chat_type, s.chat_id);
+      const chan = document.createElement("span");
+      chan.className = "chan-tag";
+      chan.dataset.channel = channelOfId(s.chat_id);
+      chan.textContent = channelLabelOf(s.chat_id);
+      who.append(chan);
       const meta = document.createElement("div");
       meta.className = "meta";
       const parts = [
@@ -2525,7 +2619,6 @@ async function loadConfig() {
     const rows = [
       ["大脑", providerModel + agent],
       ["人设", `${c.persona.name} · 回复 ${c.persona.max_reply_chars}/${c.persona.max_reply_chars_technical} 字 · OS ${(c.persona.os_probability * 100).toFixed(1)}%`],
-      ["冷却", `工具提示 ${c.cooldown.tool_hint_seconds}s`],
       ["限流", `${c.rate_limit.window_seconds / 60} 分钟内 ${c.rate_limit.threshold} 次 429 → 退避 ${c.rate_limit.backoff_seconds}s · 配额暂停 ${Math.round(c.rate_limit.quota_pause_seconds / 60)} 分钟`],
       ["预算", `每日 ${c.budget.daily_calls} 次 / ${fmtTokens(c.budget.daily_tokens)} token`],
       ["记忆", `窗口 ${c.memory.window_size} 条 · 保留 ${c.memory.retention_days > 0 ? `${c.memory.retention_days} 天` : "永久"}`],
@@ -2579,6 +2672,82 @@ async function saveBehavior() {
   }
 }
 
+async function loadGroups() {
+  try {
+    const g = await api("/api/groups");
+    const whitelist = g.whitelist || [];
+    $("groups-whitelist").value = whitelist.join("\n");
+    renderKnownGroups(g.known || []);
+    $("groups-hint").textContent = whitelist.length
+      ? `白名单 ${whitelist.length} 个群`
+      : "留空 = 不限制回复对象";
+  } catch (err) {
+    $("groups-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+function renderKnownGroups(known) {
+  const box = $("groups-known");
+  if (!known.length) {
+    box.textContent = "已知群：（暂无）";
+    return;
+  }
+  const buttons = known.map((item) => {
+    const label = item.title ? `${item.title} · ${item.channel}` : item.chat_id;
+    return `<button class="btn" type="button" data-chat-id="${escapeHtml(item.chat_id)}">${escapeHtml(label)}</button>`;
+  });
+  box.innerHTML = `已知群（点击加入白名单）：${buttons.join(" ")}`;
+}
+
+async function saveGroups() {
+  const whitelist = $("groups-whitelist")
+    .value.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  try {
+    const g = await api("/api/groups", {
+      method: "PUT",
+      body: JSON.stringify({ whitelist }),
+    });
+    const saved = g.whitelist || [];
+    $("groups-whitelist").value = saved.join("\n");
+    renderKnownGroups(g.known || []);
+    $("groups-hint").textContent = saved.length
+      ? `已保存 · ${saved.length} 个群`
+      : "已保存 · 留空 = 不限制回复对象";
+    toast("群白名单已更新");
+  } catch (err) {
+    $("groups-hint").textContent = `保存失败：${err.message}`;
+    toast(`保存失败：${err.message}`, true);
+  }
+}
+
+
+async function wechatStop() {
+  if (!confirm("急停微信通道？会写入急停文件并立即停止微信轮询（QQ 不受影响）。")) return;
+  try {
+    await api("/api/channels/wechat/stop", { method: "POST", body: "{}" });
+    $("wechat-kill-hint").textContent = "微信已急停：删除急停文件后可恢复";
+    toast("微信已急停");
+  } catch (err) {
+    toast(`急停失败：${err.message}`, true);
+  } finally {
+    refreshHealth();
+  }
+}
+
+async function wechatResume() {
+  try {
+    await api("/api/channels/wechat/resume", { method: "POST", body: "{}" });
+    $("wechat-kill-hint").textContent = "微信轮询已恢复";
+    toast("微信轮询已恢复");
+  } catch (err) {
+    $("wechat-kill-hint").textContent = `恢复失败：${err.message}`;
+    toast(`恢复失败：${err.message}`, true);
+  } finally {
+    refreshHealth();
+  }
+}
 
 async function doControl(act, target) {
   const label = { start: "启动", stop: "停止", restart: "重启" }[act] || act;
@@ -3122,6 +3291,8 @@ $("probe-btn").addEventListener("click", (ev) => withBusy(ev.currentTarget, prob
 $("local-context").addEventListener("blur", updateContextGrade);
 $("btn-apply-brain").addEventListener("click", (ev) => withBusy(ev.currentTarget, applyBrain));
 $("btn-refresh-health").addEventListener("click", refreshHealth);
+$("btn-wechat-stop").addEventListener("click", (ev) => withBusy(ev.currentTarget, wechatStop));
+$("btn-wechat-resume").addEventListener("click", (ev) => withBusy(ev.currentTarget, wechatResume));
 $("free-banner-go").addEventListener("click", () => {
   // 只跳到大卡片并把焦点放到「自备 Key」，不替用户做切换。
   $("brain-card").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -3174,6 +3345,21 @@ $("btn-backup").addEventListener("click", downloadBackup);
 $("btn-refresh-config").addEventListener("click", loadConfig);
 $("btn-refresh-behavior").addEventListener("click", loadBehavior);
 $("btn-save-behavior").addEventListener("click", saveBehavior);
+$("btn-refresh-groups").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadGroups));
+$("btn-save-groups").addEventListener("click", (ev) => withBusy(ev.currentTarget, saveGroups));
+$("groups-known").addEventListener("click", (ev) => {
+  const target = ev.target;
+  const button = target instanceof Element ? target.closest("button[data-chat-id]") : null;
+  if (!button) return;
+  const chatId = button.dataset.chatId;
+  const kept = $("groups-whitelist")
+    .value.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!kept.includes(chatId)) kept.push(chatId);
+  $("groups-whitelist").value = kept.join("\n");
+  $("groups-whitelist").focus();
+});
 $("btn-shutdown").addEventListener("click", async () => {
   if (!confirm("将停止 OpenCode / Bot / NapCat 三个进程并退出控制台，确定吗？")) return;
   try {
@@ -3238,6 +3424,7 @@ loadBudget();
 loadSessions();
 loadConfig();
 loadBehavior();
+loadGroups();
 setInterval(refresh, 5000);
 setInterval(() => { if (!document.hidden) refreshHealth(); }, 10000);
 setInterval(() => { if (!document.hidden && !alertsDisabled) refreshAlerts(); }, 10000);
@@ -3253,6 +3440,7 @@ document.addEventListener("visibilitychange", () => {
   refreshBackups();
   loadMemory();
   loadSessions();
+  loadGroups();
 });
 })();
 </script>

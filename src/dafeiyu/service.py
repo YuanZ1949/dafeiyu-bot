@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from .behavior import BehaviorSettings
@@ -14,17 +15,18 @@ from .brain.client import BrainError, BrainReply
 from .brain.persona import build_system_prompt, os_probability_hint
 from .budget import BudgetAction
 from .commands import CommandRegistry, CommandSpec
-from .config import InjectionConfig, Settings
+from .config import GroupsConfig, InjectionConfig, Settings
 from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
 from .images import materialize
 from .keepalive import Keepalive
+from .memory import shared_facts
 from .memory.context import build_injection
 from .memory.rotation import apply_rotation, needs_rotation
 from .memory.store import Store
 from .memory.timeline import TIMELINE_LIMIT, build_batch_prompt
 from .memory.workspace import Workspace
-from .models import ChatType, Message, RecallEvent
+from .models import QQ_PREFIX, ChatType, Message, RecallEvent, channel_of
 from .moment import analyze, answers_bot_question, reopened_by_question
 from .router import Router, now_shanghai
 from .sender import is_technical_question, segment_reply, shape_reply
@@ -47,16 +49,33 @@ _IMAGE_PATH_RE = re.compile(r"图存\s+([^\s，)）]+)")
 SHUTUP_MINUTES = 60
 ADMIN_ONLY_REPLY = "这个命令只有管理员能用。"
 FORGET_REPLY = "记忆清空了，本鱼失忆中……🫧"
-TOOL_HINT_REPLY = "本鱼去网上查一下，稍等…"
-FOLLOWUP_REPLY = "没查到什么有用的，本鱼先不瞎说了"
-# 同一会话 60s 内不重复发「去查一下」；每轮最多一次由 brain 侧保证。
-TOOL_HINT_INTERVAL_SECONDS = 60.0
+# 待发队列：通道恢复后补发的轮询间隔 / 重试上限 / 消息保鲜期。
+OUTBOX_RETRY_SECONDS = 15.0
+OUTBOX_MAX_ATTEMPTS = 8
+OUTBOX_MAX_AGE_SECONDS = 6 * 3600
 # 轮换摘要的输入窗口（spec §9.2：最近 40 条）。
 ROTATION_WINDOW = 40
 # 批次被跳过的原因。error 与 record_usage(purpose="error") 同口径
 # （spec §8.4 原写作 failed，实现统一取 error，避免同一件事两个名字）。
 SKIP_BUDGET = "budget"
 SKIP_ERROR = "error"
+
+# 跨群查证缓存注入段：只当参考，明确告诉模型可能过时、拿不准就重查。
+SHARED_FACT_HEADER = "【别的群问过的同一问题（只作参考，可能过时）】"
+SHARED_FACT_HINT = "这条是别的群查过的结论，别直接当事实复述；拿不准就自己再查一遍。"
+
+
+@dataclass
+class ToolUse:
+    """本轮模型是否调用过工具、调过哪些；只做内部判定，不往群里发任何提示。"""
+
+    used: bool = False
+    names: list[str] = field(default_factory=list)
+
+    async def record(self, name: str) -> None:
+        self.used = True
+        self.names.append(name)
+
 
 _REASON_TEXT = {
     "self": "机器人自己的消息",
@@ -115,7 +134,7 @@ class Service:
         settings: Settings,
         store: Store,
         brain: Any,
-        adapter: Adapter,
+        adapters: dict[str, Adapter],
         router: Router,
         persona_text: str,
         impressions: Any = None,
@@ -127,7 +146,8 @@ class Service:
         self.settings = settings
         self.store = store
         self.brain = brain
-        self.adapter = adapter
+        # 通道名 -> 适配器：发送按消息自带的通道前缀路由，两条通道互不越界。
+        self.adapters: dict[str, Adapter] = dict(adapters)
         self.router = router
         self.budget_guard = router.budget_guard
         self.persona_text = persona_text
@@ -138,33 +158,80 @@ class Service:
         self._sleep = sleep or asyncio.sleep
         self.commands = CommandRegistry()
         self._command_clock: Callable[[], float] = time.monotonic
-        self._command_last: dict[tuple[str, str, int], float] = {}
+        self._command_last: dict[tuple[str, str, str], float] = {}
         self.scheduler: BatchScheduler | None = None
         self._scheduler_task: asyncio.Task | None = None
         self.keepalive: Keepalive | None = None
         self._keepalive_task: asyncio.Task | None = None
-        self._locks: dict[tuple[ChatType, int], asyncio.Lock] = {}
-        self._batch_locks: dict[tuple[ChatType, int], asyncio.Lock] = {}
+        self._locks: dict[tuple[ChatType, str], asyncio.Lock] = {}
+        self._batch_locks: dict[tuple[ChatType, str], asyncio.Lock] = {}
         self._started_at = time.monotonic()
         # 轮换后的接续文本：成功投递才弹出，失败留到下一批重试。
-        self._continuations: dict[tuple[ChatType, int], str] = {}
+        self._continuations: dict[tuple[ChatType, str], str] = {}
         # 已从库里补投过接续语的会话：同一进程内不再重复注入（重启后内存为空，
         # 会再从 session_summaries 捞一次，然后同样只注入一次）。
-        self._continuation_used: set[tuple[ChatType, int]] = set()
-        self._hint_at: dict[tuple[ChatType, int], float] = {}
+        self._continuation_used: set[tuple[ChatType, str]] = set()
+        # 待发队列的补发任务（通道恢复后把没发出去的分片补上）。
+        self._outbox_task: asyncio.Task[None] | None = None
         # 面板可改的聊天强度/言论限制：整体替换，避免逐字段同步。
         self.behavior: BehaviorSettings = settings.behavior
+        # 面板可改的群白名单：Service 与 Router 都读这一份，整体替换。
+        self.groups: GroupsConfig = settings.groups
+
+    def _adapter_for(self, chat_id: str) -> Adapter:
+        """按会话 id 的通道前缀选适配器；单一派生点是 channel_of。"""
+        return self.adapters[channel_of(chat_id)]
+
+    def channel_status(self) -> dict[str, dict[str, Any]]:
+        """每个通道的状态快照；未实现 snapshot 的适配器回落到裸属性。"""
+        status: dict[str, dict[str, Any]] = {}
+        for channel, adapter in self.adapters.items():
+            snapshot = getattr(adapter, "snapshot", None)
+            if callable(snapshot):
+                try:
+                    status[channel] = dict(snapshot())
+                    continue
+                except Exception:
+                    log.warning("通道 %s 状态读取失败", channel, exc_info=True)
+            status[channel] = {
+                "connected": bool(getattr(adapter, "connected", False)),
+                "degraded": bool(getattr(adapter, "degraded", False)),
+                "last_event_at": getattr(adapter, "last_event_at", None),
+                "last_disconnect_at": getattr(adapter, "last_disconnect_at", None),
+                "last_send_at": getattr(adapter, "last_send_at", None),
+            }
+            # 微信形态的适配器额外暴露登录态/桌面状态；QQ 没有这两个属性，
+            # 保持原来的 5 键，避免健康快照凭空多出字段。
+            if hasattr(adapter, "logged_in"):
+                status[channel]["logged_in"] = adapter.logged_in
+            if hasattr(adapter, "desktop"):
+                status[channel]["desktop"] = adapter.desktop
+        return status
 
     async def start(self) -> None:
         self._start_scheduler()
-        self.adapter.on_message(self.handle)
-        on_recall = getattr(self.adapter, "on_recall", None)
-        if callable(on_recall):
-            on_recall(self.handle_recall)
-        await self.adapter.start()
+        for adapter in self.adapters.values():
+            adapter.on_message(self.handle)
+            on_recall = getattr(adapter, "on_recall", None)
+            if callable(on_recall):
+                on_recall(self.handle_recall)
+            # 微信桥重启后 resync 时靠它从 messages 表重建回声；没有该接口的
+            # 假/旧适配器自然跳过，不影响 QQ。
+            seed = getattr(adapter, "set_echo_seed", None)
+            if callable(seed):
+                seed(self._wechat_echo_seed)
+        for adapter in self.adapters.values():
+            await adapter.start()
         self._start_keepalive()
+        self._start_outbox()
 
     async def stop(self) -> None:
+        task = self._outbox_task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            self._outbox_task = None
         task = self._keepalive_task
         if task is not None:
             task.cancel()
@@ -177,7 +244,8 @@ class Service:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
             self._scheduler_task = None
-        await self.adapter.stop()
+        for adapter in self.adapters.values():
+            await adapter.stop()
         closer = getattr(self.brain, "aclose", None)
         if closer is not None:
             await closer()
@@ -209,20 +277,145 @@ class Service:
             self._scheduler_task = asyncio.create_task(scheduler.run())
 
     def _start_keepalive(self) -> None:
-        """启动保活：只在配置了间隔、且适配器知道自己的 QQ 号时启用。"""
+        """启动保活：只对 QQ 通道生效，微信小号不发探针。"""
         seconds = float(self.settings.napcat.keepalive_seconds)
-        bot_qq = int(getattr(self.adapter, "bot_qq", 0) or 0)
-        if seconds <= 0 or bot_qq <= 0:
+        adapter = self.adapters.get("qq")
+        if adapter is None:
+            return
+        # 适配器给的已是带前缀的字符串 id；这里不再做 int() 强转。
+        bot_qq = str(getattr(adapter, "bot_qq", "") or "")
+        if seconds <= 0 or not bot_qq or bot_qq == f"{QQ_PREFIX}0":
             return
         if self._keepalive_task is not None:
             return
-        self.keepalive = Keepalive(self.adapter, bot_qq, seconds)
+        self.keepalive = Keepalive(adapter, bot_qq, seconds)
         self._keepalive_task = asyncio.create_task(self.keepalive.run())
+
+    def _wechat_echo_seed(self) -> list[tuple[str, str, int]]:
+        """回声重建源：echo_window 内的机器人消息（messages 表 is_bot=1）。"""
+        window = int(self.settings.wechat.echo_window_seconds)
+        return self.store.recent_bot_messages(int(time.time()) - window)
 
     def keepalive_status(self) -> dict[str, Any]:
         if self.keepalive is None:
             return {"enabled": False}
         return self.keepalive.status()
+
+    # -------------------------------------------------------------- 待发队列
+    def _start_outbox(self) -> None:
+        if self._outbox_task is not None:
+            return
+        # 旧替身/只读场景没有这些方法：不做补发，行为与以前一致。
+        if not callable(getattr(self.store, "due_outbox", None)):
+            return
+        self._outbox_task = asyncio.create_task(self._outbox_loop(), name="outbox")
+
+    async def _outbox_loop(self) -> None:
+        """通道恢复后把没发出去的分片补发；失败退避，过期/超限就丢。"""
+        while True:
+            await asyncio.sleep(OUTBOX_RETRY_SECONDS)
+            try:
+                await self._flush_outbox()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("待发队列冲刷失败")
+
+    async def _flush_outbox(self) -> int:
+        """补发到期的行；返回成功条数（测试直接调它，不用等定时器）。"""
+        now = time.time()
+        sent = 0
+        for row in self.store.due_outbox(now):
+            try:
+                chat_type = ChatType(row["chat_type"])
+                adapter = self._adapter_for(str(row["chat_id"]))
+            except (ValueError, KeyError) as exc:
+                log.warning("待发队列里有无法路由的行 %r：%s", row.get("chat_id"), exc)
+                self.store.drop_outbox(int(row["id"]))
+                continue
+            chat_id = str(row["chat_id"])
+            row_id = int(row["id"])
+            lock = self._batch_locks.get((chat_type, chat_id))
+            # 正在进行的那一轮回复优先：别让补发的旧分片插进新对话里。
+            if lock is not None and lock.locked():
+                continue
+            age = now - float(row["enqueued_at"] or 0.0)
+            if age > OUTBOX_MAX_AGE_SECONDS:
+                log.warning(
+                    "待发消息超过 %.0f 分钟，丢弃 %s: %s",
+                    age / 60,
+                    chat_id,
+                    str(row["text"])[:40],
+                )
+                self.store.drop_outbox(row_id)
+                continue
+            if not bool(getattr(adapter, "connected", True)):
+                # 通道还没恢复：留在队列里，等下一轮，不算尝试次数。
+                continue
+            try:
+                message_id = await adapter.send(chat_type, chat_id, str(row["text"]))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 失败只退避，不丢队列
+                attempts = self.store.defer_outbox(
+                    row_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                    next_attempt_at=now
+                    + min(OUTBOX_RETRY_SECONDS * (2 ** min(int(row["attempts"]), 6)), 600.0),
+                )
+                log.warning("补发失败（第 %d 次）%s: %s", attempts, chat_id, exc)
+                if attempts >= OUTBOX_MAX_ATTEMPTS:
+                    log.warning("补发超限，丢弃 %s: %s", chat_id, str(row["text"])[:40])
+                    self.store.drop_outbox(row_id)
+                continue
+            self.store.drop_outbox(row_id)
+            self._store_outbox_message(
+                chat_type, chat_id, str(row["text"]), message_id, row_id
+            )
+            log.info("补发成功 %s/%s（入队 %.0fs）", chat_id, row_id, age)
+            sent += 1
+        return sent
+
+    def _store_outbox_message(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        text: str,
+        message_id: str | None,
+        row_id: int,
+    ) -> None:
+        """补发成功后写回历史，保证下一轮上下文连贯。"""
+        self.store.add_message(
+            Message(
+                chat_type=chat_type,
+                chat_id=chat_id,
+                user_id=self._adapter_for(chat_id).bot_id,
+                nickname=self.settings.persona.name,
+                content=text,
+                message_id=message_id or f"outbox:{row_id}",
+                is_bot=True,
+                timestamp=int(now_shanghai().timestamp()),
+            )
+        )
+
+    async def _send_outbox(
+        self, chat_type: ChatType, chat_id: str, text: str, *, origin: str = ""
+    ) -> bool:
+        """尽力立即发送；失败就进待发队列（返回是否已发出）。
+
+        用于「已经给过承诺」的补话：桥断了也不能让用户等到天荒地老。
+        """
+        try:
+            await self._adapter_for(chat_id).send(chat_type, chat_id, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 失败转队列，不打断主流程
+            log.warning("发送失败，转入待发队列 %s/%s: %s", chat_id, origin or "-", exc)
+            self.store.enqueue_outbox(
+                chat_type, chat_id, text, origin_message_id=origin
+            )
+            return False
+        return True
 
     def set_brain(self, brain: Any) -> Any:
         """原子换脑；返回旧实例，由调用方决定何时关闭。
@@ -239,6 +432,12 @@ class Service:
     def set_behavior(self, behavior: BehaviorSettings) -> None:
         """面板保存后即时替换行为快照；下一批消息就按新设置走。"""
         self.behavior = behavior
+
+    def set_groups(self, groups: GroupsConfig) -> None:
+        """面板保存群白名单后即时生效；Service 与 Router 必须同时看到新值。"""
+        self.groups = groups
+        self.settings = replace(self.settings, groups=groups)
+        self.router.settings = replace(self.router.settings, groups=groups)
 
     def _previous_message(self, msg: Message) -> Message | None:
         """紧挨着当前消息的前一条（含 bot）；查不到时返回 None。"""
@@ -263,7 +462,7 @@ class Service:
         """显式点名（@/引用/别名）+ 隐式接话（回答 bot 的上一句提问）。"""
         return self.router.is_addressed(msg) or self._answers_bot_question(msg)
 
-    def _lock(self, chat_type: ChatType, chat_id: int) -> asyncio.Lock:
+    def _lock(self, chat_type: ChatType, chat_id: str) -> asyncio.Lock:
         return self._locks.setdefault((chat_type, chat_id), asyncio.Lock())
 
     async def handle(self, msg: Message) -> None:
@@ -651,7 +850,7 @@ class Service:
         )
 
     def _usage_metrics(
-        self, chat_type: ChatType, chat_id: int, now: Any
+        self, chat_type: ChatType, chat_id: str, now: Any
     ) -> dict[str, Any]:
         budget = self.settings.budget
         metrics: dict[str, Any] = {
@@ -887,7 +1086,7 @@ class Service:
             result["mode_note"] = mode_note
         return result
 
-    async def _run_batch(self, chat_type: ChatType, chat_id: int) -> None:
+    async def _run_batch(self, chat_type: ChatType, chat_id: str) -> None:
         """定时器到点：取批 → 预算 → 轮换 → 注入 prompt → 调模型 → 发送/静默 → 记账。
 
         同一会话串行：调度器的 inflight 已挡住 tick 重复触发，这里的锁再兜一层
@@ -897,7 +1096,7 @@ class Service:
         async with lock:
             await self._run_batch_locked(chat_type, chat_id)
 
-    async def _run_batch_locked(self, chat_type: ChatType, chat_id: int) -> None:
+    async def _run_batch_locked(self, chat_type: ChatType, chat_id: str) -> None:
         latest = self.store.recent_messages(chat_type, chat_id, 1)
         if not latest:
             return
@@ -952,12 +1151,14 @@ class Service:
         await self._maybe_rotate(chat_type, chat_id)
 
         continuation = self._continuation_for(chat_type, chat_id)
+        fact_hint = self._shared_fact_hint(chat_type, chat_id, batch)
         prompt = self._build_prompt(
             chat_type,
             chat_id,
             batch,
             continuation=continuation,
             omitted=backlog,
+            fact_hint=fact_hint,
         )
 
         log.info(
@@ -967,10 +1168,10 @@ class Service:
             len(batch),
             addressed,
         )
-        hint = self._tool_hint(chat_type, chat_id)
+        tool_use = ToolUse()
         try:
             reply = await self._call_brain(
-                chat_type, chat_id, batch, prompt, on_tool=hint
+                chat_type, chat_id, batch, prompt, on_tool=tool_use.record
             )
         except BrainError as exc:
             # 失败也占一次调用额度；游标随 mark_skipped 推进，不重投。
@@ -978,25 +1179,13 @@ class Service:
             self.store.record_usage(chat_type, chat_id, "error", 0, 0)
             self.store.mark_skipped(chat_type, chat_id, ids, SKIP_ERROR)
             log.warning("批次调用失败 %s/%s: %s", chat_id, current_id, exc)
-            if hint.sent:
-                # 已经开口说「去查一下」，不能没有下文。
-                try:
-                    await self.adapter.send(chat_type, chat_id, FOLLOWUP_REPLY)
-                except Exception as send_exc:  # noqa: BLE001 - 补话失败不影响记账
-                    log.warning("补话发送失败 %s/%s: %s", chat_id, current_id, send_exc)
             self._check_workspace(chat_type, chat_id)
             return
 
         sent = await self._send_batch_reply(batch, reply, chat_type, chat_id)
         if not sent:
-            if hint.sent:
-                # 已经开口说「去查一下」，不能没有下文。
-                try:
-                    await self.adapter.send(chat_type, chat_id, FOLLOWUP_REPLY)
-                except Exception as exc:  # noqa: BLE001 - 补话失败不影响记账
-                    log.warning("补话发送失败 %s/%s: %s", chat_id, current_id, exc)
-            else:
-                self.router.note_no_reply(chat_type, chat_id)
+            self.router.note_no_reply(chat_type, chat_id)
+        self._remember_shared_fact(chat_type, chat_id, batch, reply, tool_use)
 
         self.store.record_usage(
             chat_type,
@@ -1017,10 +1206,80 @@ class Service:
         if continuation:
             # 已消费：同一进程内不再从库里重复注入（内存里的到这一步也已弹出）。
             self._continuation_used.add(key)
+        log.debug("本轮工具调用 %s/%s: %s", chat_id, current_id, tool_use.names)
         self._check_workspace(chat_type, chat_id)
 
+    def _shared_fact_hint(
+        self, chat_type: ChatType, chat_id: str, messages: list[Message]
+    ) -> str | None:
+        """命中跨群查证缓存时给 prompt 加一段参考。
+
+        只在群聊里查：私聊的内容本来就不该进共享缓存（写入侧也拦）。
+        """
+        if chat_type is not ChatType.GROUP:
+            return None
+        question = self._shared_fact_question(messages)
+        if question is None:
+            return None
+        fact = shared_facts.pick_best(self.store.shared_facts(), question)
+        if fact is None:
+            return None
+        self.store.bump_shared_fact(fact.id)
+        log.info("命中跨群查证缓存 %s/%s fact=%s", chat_type, chat_id, fact.id)
+        return (
+            f"{SHARED_FACT_HEADER}\n"
+            f"问：{fact.question_text}\n"
+            f"答：{fact.answer_text}\n"
+            f"{SHARED_FACT_HINT}"
+        )
+
+    def _remember_shared_fact(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        messages: list[Message],
+        reply: BrainReply,
+        tool_use: ToolUse,
+    ) -> None:
+        """本轮查证成功（调过工具且有正式回复）时写入跨群缓存。
+
+        只记群聊、只记带提问的消息；隐私过滤在 `shared_facts.extract` 里，
+        存储层还会再拦一次，防止以后别处调用绕过。
+        """
+        if chat_type is not ChatType.GROUP or not tool_use.used or not reply.speak:
+            return
+        question = self._shared_fact_question(messages)
+        if question is None:
+            return
+        nickname = next(
+            (
+                message.nickname
+                for message in reversed(messages)
+                if not message.is_bot and message.content.strip()
+            ),
+            "",
+        )
+        fact_id = self.store.add_shared_fact(
+            question, reply.reply, chat_type, chat_id, nickname
+        )
+        if fact_id:
+            log.info(
+                "写入跨群查证缓存 %s/%s fact=%s", chat_type, chat_id, fact_id
+            )
+
+    @staticmethod
+    def _shared_fact_question(messages: list[Message]) -> str | None:
+        """批次里最后一条「像提问」的人类消息；没有就返回 None。"""
+        for message in reversed(messages):
+            if message.is_bot or message.recalled_at:
+                continue
+            text = message.content.strip()
+            if text and shared_facts.looks_like_question(text):
+                return text
+        return None
+
     async def _send_batch_reply(
-        self, batch: list[Message], reply: BrainReply, chat_type: ChatType, chat_id: int
+        self, batch: list[Message], reply: BrainReply, chat_type: ChatType, chat_id: str
     ) -> list[tuple[str, str | None]]:
         """把批次回复分片发出并入库；返回 (分片文本, 网关真实 id) 列表。"""
         if not reply.speak:
@@ -1046,21 +1305,33 @@ class Service:
         if not chunks:
             return []
         sent: list[tuple[str, str | None]] = []
+        defer = 0
         delay = float(getattr(self.settings.persona, "segment_delay_seconds", 0.0))
-        try:
-            for index, chunk in enumerate(chunks):
-                if index and delay > 0:
-                    await self._sleep(delay)
-                message_id = await self.adapter.send(chat_type, chat_id, chunk)
-                sent.append((chunk, message_id))
-        except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
-            log.warning("发送失败 %s/%s: %s", chat_id, batch[-1].message_id, exc)
+        for index, chunk in enumerate(chunks):
+            if index and delay > 0:
+                await self._sleep(delay)
+            try:
+                message_id = await self._adapter_for(chat_id).send(chat_type, chat_id, chunk)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
+                log.warning("发送失败 %s/%s: %s", chat_id, batch[-1].message_id, exc)
+                # 失败这条和后面所有分片一起进待发队列：通道恢复后补发，
+                # 不让这段回复永久丢失。
+                for rest in chunks[index:]:
+                    if self.store.enqueue_outbox(
+                        chat_type, chat_id, rest, origin_message_id=batch[-1].message_id
+                    ):
+                        defer += 1
+                break
+            sent.append((chunk, message_id))
+        if defer:
+            log.info("发送失败，待发队列 +%d %s/%s", defer, chat_id, batch[-1].message_id)
         else:
             addressed = any(self._is_addressed(m) for m in batch)
             self.router.note_bot_spoke(chat_type, chat_id, ambient=not addressed)
-        finally:
-            # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
-            self._store_bot_chunks(batch[-1], sent)
+        # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
+        self._store_bot_chunks(batch[-1], sent)
         return sent
 
     def _restrictions_allow(self, text: str) -> bool:
@@ -1078,7 +1349,7 @@ class Service:
         return True
 
     def _chat_budget_decision(
-        self, chat_type: ChatType, chat_id: int, *, addressed: bool
+        self, chat_type: ChatType, chat_id: str, *, addressed: bool
     ):
         return self.budget_guard.evaluate(
             chat_type,
@@ -1096,38 +1367,14 @@ class Service:
             decision.action is BudgetAction.DEGRADE and not addressed
         )
 
-    def _budget_for(self, chat_type: ChatType, chat_id: int, *, addressed: bool) -> bool:
+    def _budget_for(self, chat_type: ChatType, chat_id: str, *, addressed: bool) -> bool:
         """80/20 预算分层：非点名只能用 ambient 额度，点名可用剩下的全部。"""
         return self._budget_allows(
             self._chat_budget_decision(chat_type, chat_id, addressed=addressed),
             addressed,
         )
 
-    def _tool_hint(self, chat_type: ChatType, chat_id: int):
-        """返回 on_tool 回调：每轮最多一次（brain 侧保证），同 chat 60s 内不重复。
-
-        节流时间戳是进程内状态：多实例部署时各算各的，最坏情况同一分钟内多发
-        一条提示语（提示语只是过渡消息，重复无害），因此不为此建表。
-        """
-        key = (chat_type, chat_id)
-
-        async def hint(tool: str) -> None:
-            now = time.monotonic()
-            last = self._hint_at.get(key)
-            if last is not None and now - last < TOOL_HINT_INTERVAL_SECONDS:
-                return
-            try:
-                await self.adapter.send(chat_type, chat_id, TOOL_HINT_REPLY)
-            except Exception as exc:  # noqa: BLE001 - 提示语失败不影响主流程
-                log.warning("提示语发送失败 %s/%s: %s", chat_id, tool, exc)
-                return
-            self._hint_at[key] = now
-            hint.sent = True
-
-        hint.sent = False
-        return hint
-
-    def _continuation_for(self, chat_type: ChatType, chat_id: int) -> str | None:
+    def _continuation_for(self, chat_type: ChatType, chat_id: str) -> str | None:
         """本轮要注入的接续语：内存优先，重启后回落到库里的 24h 摘要。
 
         只为拼 prompt 取值，不在这里删除：失败的那一轮必须能原样重投。
@@ -1140,7 +1387,7 @@ class Service:
             return None
         return self.store.recent_session_summary(chat_type, chat_id)
 
-    async def _maybe_rotate(self, chat_type: ChatType, chat_id: int) -> None:
+    async def _maybe_rotate(self, chat_type: ChatType, chat_id: str) -> None:
         """到阈值就换 session；摘要写不出来就继续用旧的，下一批再试。"""
         if not callable(getattr(self.brain, "reset_session", None)):
             return
@@ -1163,7 +1410,7 @@ class Service:
             # 轮换产出了新接续语，旧的「已消费」标记必须失效，否则这条新语不会注入。
             self._continuation_used.discard((chat_type, chat_id))
 
-    def _check_workspace(self, chat_type: ChatType, chat_id: int) -> None:
+    def _check_workspace(self, chat_type: ChatType, chat_id: str) -> None:
         """每轮结束后 stat 一次；超上限保留尾部并留截断注释。"""
         if self.workspace is None:
             return
@@ -1201,7 +1448,7 @@ class Service:
         return reply
 
     def _image_hint(
-        self, chat_type: ChatType, chat_id: int, messages: list[Message]
+        self, chat_type: ChatType, chat_id: str, messages: list[Message]
     ) -> str:
         """本轮或最近提到图时，给模型一段「先 read 再看」的硬提示。
 
@@ -1273,11 +1520,12 @@ class Service:
     def _build_prompt(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         messages: list[Message],
         *,
         continuation: str | None = None,
         omitted: int = 0,
+        fact_hint: str | None = None,
     ) -> str:
         """三种模式共用的 prompt：长期记忆注入 + 时间线（单条也走这里）。"""
         injection_cfg = self.injection or InjectionConfig()
@@ -1307,6 +1555,11 @@ class Service:
         framing = self.behavior.framing()
         if framing:
             injection = f"{injection}\n\n{framing}" if injection.strip() else framing
+
+        if fact_hint:
+            injection = (
+                f"{injection}\n\n{fact_hint}" if injection.strip() else fact_hint
+            )
 
         # 时机提示只给群聊：私聊无所谓「插不插嘴」。
         if chat_type is ChatType.GROUP and messages:
@@ -1343,7 +1596,7 @@ class Service:
     async def _call_brain(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         messages: list[Message],
         prompt: str,
         *,
@@ -1384,7 +1637,7 @@ class Service:
     async def _retry_fresh_session(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         messages: list[Message],
         prompt: str,
         exc: BrainError,
@@ -1421,7 +1674,7 @@ class Service:
         self,
         chat_type: ChatType,
         messages: list[Message],
-        chat_id: int | None = None,
+        chat_id: str | None = None,
     ) -> str:
         chat_title = (
             "本群"
@@ -1456,7 +1709,7 @@ class Service:
         )
 
     def _history_before(
-        self, chat_type: ChatType, chat_id: int, messages: list[Message]
+        self, chat_type: ChatType, chat_id: str, messages: list[Message]
     ) -> list[dict[str, str]]:
         """无状态大脑的历史：本批之前的最近 window_size 条，role 按是否 bot 区分。"""
         window = max(0, int(self.settings.memory.window_size))
@@ -1527,15 +1780,28 @@ class Service:
             return
 
         sent: list[tuple[str, str | None]] = []
+        defer = 0
         delay = float(getattr(self.settings.persona, "segment_delay_seconds", 0.0))
-        try:
-            for index, chunk in enumerate(chunks):
-                if index and delay > 0:
-                    await self._sleep(delay)
-                message_id = await self.adapter.send(msg.chat_type, msg.chat_id, chunk)
-                sent.append((chunk, message_id))
-        except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
-            log.warning("发送失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
+        for index, chunk in enumerate(chunks):
+            if index and delay > 0:
+                await self._sleep(delay)
+            try:
+                message_id = await self._adapter_for(msg.chat_id).send(
+                    msg.chat_type, msg.chat_id, chunk
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
+                log.warning("发送失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
+                for rest in chunks[index:]:
+                    if self.store.enqueue_outbox(
+                        msg.chat_type, msg.chat_id, rest, origin_message_id=msg.message_id
+                    ):
+                        defer += 1
+                break
+            sent.append((chunk, message_id))
+        if defer:
+            log.info("发送失败，待发队列 +%d %s/%s", defer, msg.chat_id, msg.message_id)
         else:
             self.router.note_bot_spoke(
                 msg.chat_type,
@@ -1543,9 +1809,8 @@ class Service:
                 ambient=msg.chat_type is ChatType.GROUP
                 and not self._is_addressed(msg),
             )
-        finally:
-            # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
-            self._store_bot_chunks(msg, sent)
+        # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
+        self._store_bot_chunks(msg, sent)
 
     def _store_bot_chunks(self, msg: Message, chunks: list[tuple[str, str | None]]) -> None:
         """入库 bot 回复：优先用网关返回的真实 message_id，没有才回退合成值。"""
@@ -1555,7 +1820,7 @@ class Service:
                 Message(
                     chat_type=msg.chat_type,
                     chat_id=msg.chat_id,
-                    user_id=self.settings.bot_qq,
+                    user_id=self._adapter_for(msg.chat_id).bot_id,
                     nickname=self.settings.persona.name,
                     content=chunk,
                     message_id=message_id or f"{msg.message_id}:bot:{index}",
@@ -1590,7 +1855,7 @@ class Service:
         )
         return decision.action is not BudgetAction.DENY
 
-    async def forget_chat(self, chat_type: ChatType, chat_id: int) -> None:
+    async def forget_chat(self, chat_type: ChatType, chat_id: str) -> None:
         """硬忘记：先删远端 session（它要读映射），再清本地全部数据。
 
         控制口的 `DELETE /api/sessions/...` 复用这里；不带群聊回复。
@@ -1604,7 +1869,7 @@ class Service:
 
     async def _forget_chat(self, msg: Message) -> None:
         await self.forget_chat(msg.chat_type, msg.chat_id)
-        await self.adapter.send(msg.chat_type, msg.chat_id, FORGET_REPLY)
+        await self._adapter_for(msg.chat_id).send(msg.chat_type, msg.chat_id, FORGET_REPLY)
 
     async def _run_command(self, msg: Message, spec: CommandSpec, args: str) -> bool:
         """权限 → 冷却 → 分发 → 审计；所有分支都返回「命令分支已接管」。"""
@@ -1621,7 +1886,7 @@ class Service:
                     spec.name,
                 )
                 return True
-            await self.adapter.send(msg.chat_type, msg.chat_id, ADMIN_ONLY_REPLY)
+            await self._adapter_for(msg.chat_id).send(msg.chat_type, msg.chat_id, ADMIN_ONLY_REPLY)
             return True
 
         cooldown = self._command_cooldown(spec, msg.chat_type)
@@ -1685,7 +1950,7 @@ class Service:
 
     async def _cmd_help(self, msg: Message, *, is_admin: bool) -> None:
         text = self.commands.help_text(msg.chat_type, is_admin=is_admin)
-        await self.adapter.send(msg.chat_type, msg.chat_id, text)
+        await self._adapter_for(msg.chat_id).send(msg.chat_type, msg.chat_id, text)
 
     async def _cmd_stats(self, msg: Message) -> None:
         today = now_shanghai().date().isoformat()
@@ -1717,10 +1982,12 @@ class Service:
                 f"{self._remaining_text(global_today.tokens, budget.global_daily_tokens)}"
             ),
         ]
-        await self.adapter.send(msg.chat_type, msg.chat_id, "\n".join(lines))
+        await self._adapter_for(msg.chat_id).send(msg.chat_type, msg.chat_id, "\n".join(lines))
 
     async def _cmd_status(self, msg: Message) -> None:
-        connected = bool(getattr(self.adapter, "connected", False))
+        connected = bool(
+            self.channel_status().get(channel_of(msg.chat_id), {}).get("connected", False)
+        )
 
         def count(name: str) -> int:
             scheduler = self.scheduler
@@ -1769,7 +2036,7 @@ class Service:
             f"预算：{decision.action.value}（{action_text}）",
             f"已运行：{uptime} 秒",
         ]
-        await self.adapter.send(msg.chat_type, msg.chat_id, "\n".join(lines))
+        await self._adapter_for(msg.chat_id).send(msg.chat_type, msg.chat_id, "\n".join(lines))
 
     async def _cmd_budget(self, msg: Message) -> None:
         report = self.budget_guard.report(msg.chat_type, msg.chat_id)
@@ -1814,7 +2081,7 @@ class Service:
             f"费用：{cost_text}（估算：{'是' if cost['estimated'] else '否'}）",
             f"预警：{warnings}",
         ]
-        await self.adapter.send(msg.chat_type, msg.chat_id, "\n".join(lines))
+        await self._adapter_for(msg.chat_id).send(msg.chat_type, msg.chat_id, "\n".join(lines))
 
     @staticmethod
     def _remaining_text(used: int, limit: int) -> str:

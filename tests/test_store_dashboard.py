@@ -112,8 +112,8 @@ def test_usage_top_and_recent_errors(store: Store) -> None:
 
     top = store.usage_top("2026-10-24", limit=5)
     assert [(row["chat_type"], row["chat_id"], row["calls"]) for row in top] == [
-        ("group", 1, 2),
-        ("private", 2, 1),
+        ("group", "1", 2),
+        ("private", "2", 1),
     ]
     assert top[0]["tokens"] == 30
     assert store.usage_top("2026-10-25") == []
@@ -121,7 +121,7 @@ def test_usage_top_and_recent_errors(store: Store) -> None:
     errors = store.recent_errors(limit=5)
     assert len(errors) == 1
     assert errors[0]["chat_type"] == "private"
-    assert errors[0]["chat_id"] == 2
+    assert errors[0]["chat_id"] == "2"
     assert re.fullmatch(r"\d\d-\d\d \d\d:\d\d", str(errors[0]["at"]))
 
 
@@ -133,7 +133,7 @@ def test_chat_overview_merges_sources_and_session(store: Store) -> None:
     store.set_brain_session("opencode", ChatType.GROUP, 1, "ses_1")
 
     overview = store.chat_overview()
-    assert [row["chat_id"] for row in overview] == [1, 2]
+    assert [row["chat_id"] for row in overview] == ["1", "2"]
     first, second = overview
     assert first["message_count"] == 2
     assert first["last_message_at"] == 200

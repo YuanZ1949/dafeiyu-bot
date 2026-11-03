@@ -78,7 +78,7 @@ class BudgetGuard:
     def evaluate(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         *,
         addressed: bool,
         purpose: str,
@@ -103,7 +103,8 @@ class BudgetGuard:
             cost = estimate_cost(
                 monthly.prompt_tokens, monthly.completion_tokens, self.config
             )
-        except Exception as exc:  # 读库失败不能拦死点名回复，但也不能放开环境发言。
+        # 读库失败不能拦死点名回复，但也不能放开环境发言。
+        except Exception as exc:  # noqa: BLE001
             log.warning("预算检查读库失败，降级处理: %s", type(exc).__name__)
             return BudgetDecision(
                 BudgetAction.DEGRADE,
@@ -145,7 +146,7 @@ class BudgetGuard:
     def report(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         *,
         now: datetime | None = None,
     ) -> BudgetReport:
@@ -196,7 +197,7 @@ class BudgetGuard:
 
     # ---- 内部实现 -------------------------------------------------
     def _chat_usage(
-        self, chat_type: ChatType, chat_id: int, day: str
+        self, chat_type: ChatType, chat_id: str, day: str
     ) -> UsageTotals:
         return self.store.usage_between(
             day,
@@ -207,7 +208,7 @@ class BudgetGuard:
         )
 
     def _ambient_usage(
-        self, chat_type: ChatType, chat_id: int, day: str
+        self, chat_type: ChatType, chat_id: str, day: str
     ) -> UsageTotals:
         return self.store.usage_between(
             day,
@@ -420,10 +421,7 @@ class BudgetGuard:
         if scope == "global_daily":
             calls = _remaining_count(config.global_daily_calls, global_daily.calls)
             tokens = _remaining_count(config.global_daily_tokens, global_daily.tokens)
-        elif scope == "monthly":
-            calls = _remaining_count(config.monthly_calls, monthly.calls)
-            tokens = _remaining_count(config.monthly_tokens, monthly.tokens)
-        elif scope == "cost":
+        elif scope == "monthly" or scope == "cost":
             calls = _remaining_count(config.monthly_calls, monthly.calls)
             tokens = _remaining_count(config.monthly_tokens, monthly.tokens)
         elif action is BudgetAction.DENY:

@@ -6,9 +6,9 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 from ..memory.store import Store
 from ..models import ChatType
@@ -76,6 +76,7 @@ def resolve_opencode_bin(configured: str = "") -> str:
                 encoding="utf-8",
                 errors="replace",
                 timeout=10,
+                check=False,
             )
             lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
             if lines:
@@ -138,13 +139,13 @@ class OpenCodeBrain:
     async def aclose(self) -> None:
         return None
 
-    async def forget(self, chat_type: ChatType, chat_id: int) -> None:
+    async def forget(self, chat_type: ChatType, chat_id: str) -> None:
         self.store.clear_opencode_session(chat_type, chat_id)
 
     async def reply(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         text: str,
     ) -> BrainReply:
         prompt = text.strip()
@@ -215,7 +216,7 @@ class OpenCodeBrain:
             stdout_b, stderr_b = await asyncio.wait_for(
                 proc.communicate(), timeout=self.timeout
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
             with contextlib.suppress(ProcessLookupError):

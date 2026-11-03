@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import calendar
 import json
+import re
 import sqlite3
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
+from dafeiyu.config import ConfigError
+from dafeiyu.memory import shared_facts
 from dafeiyu.models import ChatType, Impression, Message, Summary, WeeklySummary
 from dafeiyu.timeutil import SHANGHAI, today_shanghai
 
@@ -29,13 +33,15 @@ class MessagePage:
     next_before: int | None
     anchor_found: bool
 
+# v2 布局：chat_id / user_id 系列一律 TEXT（会话 id 带通道前缀，如 qq:123）。
+# 老库升级走 _rebuild_v2_tables：v1 的整数值由 TEXT 亲和性隐式转成十进制字符串。
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
-    user_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
     nickname TEXT NOT NULL,
     content TEXT NOT NULL,
     is_bot INTEGER NOT NULL DEFAULT 0,
@@ -45,7 +51,7 @@ CREATE TABLE IF NOT EXISTS messages (
     reply_to_bot INTEGER NOT NULL DEFAULT 0,
     -- 回复目标：id 用于回查被回复消息的昵称，uid 是消息被清理后的退路。
     reply_to_message_id TEXT,
-    reply_to_user_id INTEGER,
+    reply_to_user_id TEXT,
     -- 非空 = 已被撤回；原文保留但不再进入 prompt。
     recalled_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -60,8 +66,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages (timestamp);
 CREATE TABLE IF NOT EXISTS impressions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
-    subject_user_id INTEGER NOT NULL DEFAULT 0,
+    chat_id TEXT NOT NULL,
+    -- v1 是 INTEGER DEFAULT 0；v2 改 TEXT 后空值哨兵是 ''（0/'0' 都算空）。
+    subject_user_id TEXT NOT NULL DEFAULT '',
     kind TEXT NOT NULL,
     content TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 0.5,
@@ -81,7 +88,7 @@ CREATE INDEX IF NOT EXISTS idx_impressions_chat ON impressions (chat_type, chat_
 -- 避免 _last_count 只存在内存导致每个活跃会话立刻白跑一次。
 CREATE TABLE IF NOT EXISTS impression_cursors (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     last_count INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (chat_type, chat_id)
@@ -91,7 +98,7 @@ CREATE TABLE IF NOT EXISTS impression_cursors (
 -- 避免重启后时区/夏令时转换把窗口算歪。
 CREATE TABLE IF NOT EXISTS chat_state (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     last_bot_spoke REAL,
     last_user_message REAL,
     muted_until REAL,
@@ -108,7 +115,7 @@ CREATE TABLE IF NOT EXISTS chat_state (
 
 CREATE TABLE IF NOT EXISTS summaries (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     date TEXT NOT NULL,
     content TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -119,7 +126,7 @@ CREATE TABLE IF NOT EXISTS summaries (
 -- pending_summary_slots 的按日 LEFT JOIN 误判成那一天的日摘要。
 CREATE TABLE IF NOT EXISTS weekly_summaries (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     week_start TEXT NOT NULL,
     content TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -129,7 +136,7 @@ CREATE TABLE IF NOT EXISTS weekly_summaries (
 CREATE TABLE IF NOT EXISTS usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     date TEXT NOT NULL,
     purpose TEXT NOT NULL,
     prompt_tokens INTEGER NOT NULL DEFAULT 0,
@@ -156,7 +163,7 @@ CREATE TABLE IF NOT EXISTS memory_rate_limit (
 
 CREATE TABLE IF NOT EXISTS opencode_sessions (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (chat_type, chat_id)
@@ -165,7 +172,7 @@ CREATE TABLE IF NOT EXISTS opencode_sessions (
 CREATE TABLE IF NOT EXISTS brain_sessions (
     provider TEXT NOT NULL,
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT,
@@ -178,7 +185,7 @@ CREATE TABLE IF NOT EXISTS brain_sessions (
 CREATE TABLE IF NOT EXISTS session_summaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -191,7 +198,7 @@ CREATE INDEX IF NOT EXISTS idx_session_summaries_chat
 --     下一次投递时自动补上（单靠单调游标会跨过空洞，漏掉更早的缺口）。
 CREATE TABLE IF NOT EXISTS delivered_cursors (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     last_message_id INTEGER NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (chat_type, chat_id)
@@ -199,11 +206,46 @@ CREATE TABLE IF NOT EXISTS delivered_cursors (
 
 CREATE TABLE IF NOT EXISTS delivered_messages (
     chat_type TEXT NOT NULL,
-    chat_id INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
     delivered_at TEXT NOT NULL DEFAULT (datetime('now')),
     skipped_reason TEXT,
     PRIMARY KEY (chat_type, chat_id, message_id)
+);
+
+-- 待发队列：发送瞬间通道/桌面不可用时，把没发出去的分片留在这里，等恢复后
+-- 补发。没有它，「桥崩在发送路上」就等于永久沉默（用户只看到「稍等」）。
+CREATE TABLE IF NOT EXISTS pending_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_type TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    origin_message_id TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    enqueued_at REAL NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_outbox_due
+    ON pending_outbox (next_attempt_at, id);
+
+-- 跨群「查证结论」缓存：同一件事在一个群查清后，别的群再问到不必重查。
+-- question_key 是归一化问句（去标点/空白/大小写），写入前已做隐私过滤：
+-- 私聊与疑似个人信息一律不入库，因此这张表可以安全地被所有群读取。
+CREATE TABLE IF NOT EXISTS shared_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    question_key TEXT NOT NULL,
+    question_text TEXT NOT NULL,
+    answer_text TEXT NOT NULL,
+    source_chat_type TEXT NOT NULL,
+    source_chat_id TEXT NOT NULL,
+    source_nickname TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_hit_at TEXT,
+    hits INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (question_key)
 );
 """
 
@@ -213,7 +255,7 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         "at_bot": "INTEGER NOT NULL DEFAULT 0",
         "reply_to_bot": "INTEGER NOT NULL DEFAULT 0",
         "reply_to_message_id": "TEXT",
-        "reply_to_user_id": "INTEGER",
+        "reply_to_user_id": "TEXT",
         "recalled_at": "TEXT",
     },
     "brain_sessions": {
@@ -341,7 +383,7 @@ class PendingSummary:
     """一个「有消息却没摘要」的槽位：会话 + 日期 + 当天消息数。"""
 
     chat_type: ChatType
-    chat_id: int
+    chat_id: str
     date: str
     messages: int
 
@@ -351,7 +393,7 @@ class PendingWeekly:
     """一个「有日摘要却没周汇总」的槽位：会话 + 周起始 + 该周日摘要条数。"""
 
     chat_type: ChatType
-    chat_id: int
+    chat_id: str
     week_start: str
     days: int
 
@@ -362,7 +404,7 @@ def _parse_day(value: str) -> datetime:
 
 
 def _memory_scope(
-    chat_type: ChatType | None, chat_id: int | None
+    chat_type: ChatType | None, chat_id: str | None
 ) -> tuple[str, list[object]]:
     """只读面板的会话过滤条件；两个参数都可为空。"""
     clauses: list[str] = []
@@ -372,7 +414,7 @@ def _memory_scope(
         params.append(chat_type.value)
     if chat_id is not None:
         clauses.append("chat_id = ?")
-        params.append(int(chat_id))
+        params.append(chat_id)
     return ("WHERE " + " AND ".join(clauses) if clauses else ""), params
 
 
@@ -381,7 +423,7 @@ def _page_bounds(limit: int, offset: int) -> tuple[int, int]:
 
 
 class Store:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
@@ -400,6 +442,11 @@ class Store:
             raise RuntimeError(
                 f"数据库版本 {version} 高于程序支持版本 {self.SCHEMA_VERSION}"
             )
+        # 上一次迁移中途崩溃的库：启动即拒绝，绝不能带残留标记继续跑/自愈。
+        self._refuse_incomplete_migration()
+        if version == 1:
+            self._migrate_v2()
+            version = self.SCHEMA_VERSION
         self._conn.executescript(_SCHEMA)
         self._ensure_columns()
         self._backfill_session_created_at()
@@ -435,6 +482,273 @@ class Store:
         if version < self.SCHEMA_VERSION:
             self._conn.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
         self._conn.commit()
+
+    def _migrate_v2(self) -> None:
+        """v1 → v2 迁移：备份不成功不动库、标记先落库、重建走单事务、版本号最后写。
+
+        顺序本身就是崩溃安全的下限：
+
+        1. 备份失败 → 直接 raise 中止（没有备份就没有回退手段，绝不半迁移）；
+        2. 标记行先于事务单独提交，之后任何一步崩溃，重开库都能凭标记残留
+           拒绝启动（处理手段只有一个：用备份恢复，不是修复半个库）；
+        3. 重建 + 删标记在同一个 ``BEGIN IMMEDIATE`` 事务里，要么整体提交、
+           要么整体回滚；
+        4. ``user_version = 2`` 写在 COMMIT 之后 —— 任何时刻读到的库要么是
+           完整 v1、要么是完整 v2。
+
+        全程用 ``execute`` 显式控制事务，**不得**改用 ``executescript()``：
+        它会在执行脚本前隐式提交，把这里的事务边界打散。
+        """
+        conn = self._conn
+        # 隐式事务陷阱：进入迁移前可能已有未提交的写挂在 legacy sqlite3 的隐式
+        # 事务里（init_schema 之前路径的 UPDATE/ALTER，如 _backfill_session_created_at）。
+        # Python 3.12 legacy 模式下直接 BEGIN IMMEDIATE 会抛
+        # "OperationalError: cannot start a transaction within a transaction"，
+        # 必须先 commit 清掉隐式事务。
+        conn.commit()
+        db = Path(self.path)
+        backup = db.with_name(
+            f"{db.name}.pre-wechat-"
+            f"{datetime.now(SHANGHAI).strftime('%Y%m%dT%H%M%S')}"
+        )
+        self.backup_to(backup)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS migration_marker"
+            " (step TEXT PRIMARY KEY, started_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO migration_marker VALUES ('v2', ?)",
+            (datetime.now(SHANGHAI).isoformat(timespec="seconds"),),
+        )
+        # 标记必须独立提交：重建事务回滚不能把「库是半个」的证据一并抹掉。
+        conn.commit()
+        # WAL 未 checkpoint 就重建表，老数据仍留在 WAL 里；重建前先收敛。
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._rebuild_v2_tables()
+            conn.execute("DELETE FROM migration_marker WHERE step = 'v2'")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
+
+    def _refuse_incomplete_migration(self) -> None:
+        """崩溃恢复：migration_marker 有残留行 → 拒绝启动，指定备份文件。"""
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+            " AND name = 'migration_marker'"
+        ).fetchone()
+        if exists is None:
+            return
+        row = self._conn.execute("SELECT 1 FROM migration_marker").fetchone()
+        if row is None:
+            return
+        db = Path(self.path)
+        # 标记在备份之后、事务之前落库，所以名称最新的备份就是本次迁移的快照。
+        backups = sorted(db.parent.glob(f"{db.name}.pre-wechat-*"))
+        point = str(backups[-1]) if backups else "<备份路径>"
+        raise ConfigError(f"迁移未完成，请用 {point} 恢复")
+
+    # v2 重建的 12 张表（顺序即执行顺序）：chat_id / user_id 系列全部 TEXT 化。
+    # messages/impressions 先重建 —— 两块外部内容 FTS 表靠它们才有可指的内容表。
+    _V2_REBUILD_TABLES: tuple[str, ...] = (
+        "messages",
+        "impressions",
+        "impression_cursors",
+        "chat_state",
+        "summaries",
+        "weekly_summaries",
+        "usage",
+        "opencode_sessions",
+        "brain_sessions",
+        "session_summaries",
+        "delivered_cursors",
+        "delivered_messages",
+    )
+
+    # v2 迁移要补 'qq:' 通道前缀的 channel-scoped id 列（表 → 列清单，逐表对应
+    # 上面的重建表）。v1 里 QQ 是唯一通道，这些列落库的是裸整数，TEXT 化只会变成
+    # '100'/'7' —— 不补前缀，老 QQ 记忆对 recent_messages('qq:100') 等查询全部
+    # 失联，channel_of('100') 还会直接抛错。只列 id 列：message_id/session_id/
+    # content 不带通道语义，绝不加前缀。
+    _V2_QQ_PREFIX_COLUMNS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "messages": ("chat_id", "user_id", "reply_to_user_id"),
+        "impressions": ("chat_id", "subject_user_id"),
+        "impression_cursors": ("chat_id",),
+        "chat_state": ("chat_id",),
+        "summaries": ("chat_id",),
+        "weekly_summaries": ("chat_id",),
+        "usage": ("chat_id",),
+        "opencode_sessions": ("chat_id",),
+        "brain_sessions": ("chat_id",),
+        "session_summaries": ("chat_id",),
+        "delivered_cursors": ("chat_id",),
+        "delivered_messages": ("chat_id",),
+    }
+
+    @staticmethod
+    def _qq_prefix_expr(column: str) -> str:
+        """SELECT 里给 id 列补 'qq:' 前缀的 CASE 表达式；对已带前缀的值幂等。"""
+        if column == "reply_to_user_id":
+            # 可空列：NULL 必须保持 NULL（掉进 ELSE 会拼出 'qq:' 垃圾），
+            # '' 保持 ''，其余补前缀。
+            return (
+                f"CASE WHEN {column} IS NULL THEN NULL"
+                f" WHEN {column} = '' THEN ''"
+                f" WHEN {column} LIKE 'qq:%' THEN {column}"
+                f" ELSE 'qq:' || {column} END"
+            )
+        if column == "subject_user_id":
+            # 空值哨兵：'' 与 empty-TEXT 化的 '0' 都解析成 ''，
+            # 绝不能变 'qq:0' 与真实 subject 撞车。
+            return (
+                f"CASE WHEN {column} IN ('', '0') THEN ''"
+                f" WHEN {column} LIKE 'qq:%' THEN {column}"
+                f" ELSE 'qq:' || {column} END"
+            )
+        return (
+            f"CASE WHEN {column} = '' THEN ''"
+            f" WHEN {column} LIKE 'qq:%' THEN {column}"
+            f" ELSE 'qq:' || {column} END"
+        )
+
+    def _rebuild_v2_tables(self) -> None:
+        """v1 → v2 的表重建：12 张表的 id 列 TEXT 化并补 'qq:' 前缀，FTS5 与触发器还原。
+
+        必须运行在 ``BEGIN IMMEDIATE`` 事务内（调用方保证）：任何一步失败整体
+        回滚，库里要么完整是 v1、要么完整是 v2。固定顺序：
+
+        1. 从 ``sqlite_master`` 把两个 FTS5 表、6 个触发器、这 12 张表上的全部
+           普通索引的 DDL **原样抄下来**（不手写 —— trigram/unicode61 两个
+           tokenizer 必须逐字保留，统一或重写会改变中文子串检索语义）；
+        2. ``DROP TRIGGER`` 拆掉 6 个 FTS 触发器，``DROP TABLE`` 拆掉两个 FTS 表
+           —— 不先拆会在随后 DROP/RENAME 正文表时把它们的 schema 改歪；
+        3. 逐表 ``CREATE <t>_new``（重声明完整 DDL，取自 _SCHEMA 的 v2 版）→
+           ``INSERT ... SELECT`` 显式点名（老库经 _MIGRATIONS 补列的列序与
+           _SCHEMA 不同，``SELECT *`` 会按位置错位）→ ``DROP`` 旧表 →
+           ``RENAME`` 回原名。
+           不用 ``ALTER TABLE ... RENAME`` 直接改名再迁数据：SQLite ≥3.25 会把
+           触发器体/视图里的没改引用重写到临时名上。TEXT 亲和性在 INSERT 时把
+           v1 的整数值隐式转成十进制字符串（例如 100 → ``'100'``）；channel-scoped
+           id 列（_V2_QQ_PREFIX_COLUMNS）再用 CASE 补 ``'qq:'`` 通道前缀 —— 裸
+           '100' 对 ``recent_messages('qq:100')`` 是查不到的。旧表里已经有前缀的
+           值（幂等重跑）与 NULL/空值哨兵原样保留；
+        4. 清掉 impressions 的空值哨兵：v1 的 ``0`` 会变成字符串 ``'0'``，
+           与真实 subject 撞车，统一改成 ``''``（新 DDL 默认值也是 ``''``；
+           步骤 3 的 CASE 已把哨兵解析成 ''，这条 UPDATE 是兜底，一并保留）；
+        5. 按抄录的 DDL 原样重建索引、FTS 表与触发器，再各跑一次
+           ``INSERT INTO <fts>(<fts>) VALUES('rebuild')`` 回填索引；
+        6. ``PRAGMA foreign_key_check`` 必须为空，否则回滚拒迁。
+        """
+        conn = self._conn
+        # 步骤 1：DROP 之前先把要保留的 DDL 从 sqlite_master 原样抄下来。
+        fts_sql: dict[str, str | None] = {}
+        for name in ("messages_fts", "impressions_fts"):
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (name,),
+            ).fetchone()
+            fts_sql[name] = None if row is None else row["sql"]
+        trigger_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger'"
+            " AND tbl_name IN ('messages', 'impressions')"
+        ).fetchall()
+        index_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+            " AND tbl_name IN ('" + "', '".join(self._V2_REBUILD_TABLES) + "')"
+        ).fetchall()
+
+        # 步骤 2：拆触发器与两个 FTS 表。
+        for name in (
+            "messages_ai", "messages_ad", "messages_au",
+            "impressions_ai", "impressions_ad", "impressions_au",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        for name in ("messages_fts", "impressions_fts"):
+            conn.execute(f"DROP TABLE IF EXISTS {name}")
+
+        # 步骤 3：逐表 CREATE _new → INSERT SELECT（显式点名）→ DROP → RENAME。
+        # 重建前先补齐 _MIGRATIONS 声明的列：老库可能缺某一列，显式列清单要求
+        # 新旧两侧列名并集一致。
+        self._ensure_columns()
+        for table in self._V2_REBUILD_TABLES:
+            ddl = self._v2_new_table_ddl(table)
+            conn.execute(ddl)
+            new_cols = [
+                row["name"]
+                for row in conn.execute(f"PRAGMA table_info({table}_new)").fetchall()
+            ]
+            old_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            if old_info:
+                # DROP／RENAME 前先把 _new 里声明、旧表却没有的列找出来：迁移是
+                # 数据不可丢的操作，缺列宁可中止回滚，也不能把值错位塞进去。
+                old_cols = {row["name"] for row in old_info}
+                missing = [name for name in new_cols if name not in old_cols]
+                if missing:
+                    raise RuntimeError(
+                        f"v2 迁移中止：表 {table} 缺列 {missing}，"
+                        "请回滚后核对 _MIGRATIONS 列清单"
+                    )
+                cols = ", ".join(new_cols)
+                # channel-scoped id 列用 CASE 补 'qq:' 前缀（幂等，哨兵不碰），
+                # 其余列原点搬 —— message_id/session_id/content 不带通道语义。
+                prefix_cols = self._V2_QQ_PREFIX_COLUMNS[table]
+                select_items = [
+                    self._qq_prefix_expr(col) if col in prefix_cols else col
+                    for col in new_cols
+                ]
+                conn.execute(
+                    f"INSERT INTO {table}_new ({cols})"
+                    f" SELECT {', '.join(select_items)} FROM {table}"
+                )
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+            conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+
+        # 步骤 4：清空值哨兵（在同一个事务里，和重建一起原子生效）。
+        conn.execute(
+            "UPDATE impressions SET subject_user_id = '' WHERE subject_user_id = '0'"
+        )
+
+        # 步骤 5：按 sqlite_master 抄录的 DDL 原样还原索引、FTS 表与触发器；
+        # 索引先于触发器无要求，但 FTS 表必须先建 —— 触发器体往里写。
+        for row in index_sql:
+            conn.execute(row["sql"])
+        for name in ("messages_fts", "impressions_fts"):
+            if fts_sql[name] is not None:
+                conn.execute(fts_sql[name])
+        for row in trigger_sql:
+            conn.execute(row["sql"])
+        for name in ("messages_fts", "impressions_fts"):
+            if fts_sql[name] is not None:
+                conn.execute(f"INSERT INTO {name}({name}) VALUES('rebuild')")
+
+        # 步骤 6：提交前自检；有违例说明重建歪了，回滚回 v1 拒绝半迁移。
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(
+                f"v2 迁移后 PRAGMA foreign_key_check 有 {len(violations)} 行违例"
+            )
+
+    @staticmethod
+    def _v2_new_table_ddl(table: str) -> str:
+        """从 `_SCHEMA` 抽出该表的 v2 DDL，把表名变成 ``<t>_new``。
+
+        单一来源：迁移目标布局必须与空库直建的 v2 完全一致（plan 的
+        「新装库同构」要求），所以 ``_new`` 的 DDL 直接取自 _SCHEMA 本身而不是
+        再维护一份拷贝；test_fresh_and_migrated_layout_identical 兜底防漂移。
+        """
+        match = re.search(
+            rf"CREATE TABLE IF NOT EXISTS {re.escape(table)} \(.*?^\);",
+            _SCHEMA,
+            re.MULTILINE | re.DOTALL,
+        )
+        if match is None:
+            raise RuntimeError(f"_SCHEMA 里找不到表 {table} 的 DDL")
+        return match.group(0).replace(
+            f"IF NOT EXISTS {table}", f"{table}_new", 1
+        )
 
     def db_stats(self) -> dict[str, Any]:
         """健康快照用的轻量库统计；不读消息正文。"""
@@ -558,7 +872,7 @@ class Store:
         return cur.rowcount > 0
 
     def is_bot_message(
-        self, chat_type: ChatType, chat_id: int, message_id: str
+        self, chat_type: ChatType, chat_id: str, message_id: str
     ) -> bool:
         """这条 message_id 是否是本会话里 bot 自己发的消息。
 
@@ -579,7 +893,7 @@ class Store:
     def recent_messages(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         limit: int,
         upto_message_id: str | None = None,
     ) -> list[Message]:
@@ -615,10 +929,32 @@ class Store:
         ).fetchall()
         return [self._row_to_message(r) for r in reversed(rows)]
 
+    def recent_bot_messages(self, since_ts: int, limit: int = 200) -> list[tuple[str, str, int]]:
+        """回声表重建源：最近的机器人消息（必须带文本）。
+
+        微信桥重启 resync 后，主进程从 `messages WHERE is_bot=1` 取种子；
+        SQL 里 LIMIT 固定 200（与回声表容量一致），窗口在 Python 侧按
+        ``timestamp`` 比较——`timestamp` 是本地 epoch 秒（service 落库时写入），
+        **不是** UTC 字符串 `created_at`。绝不查 `delivered_messages`：它没有
+        文本列，重建不出 ``(chat_id, text)`` 匹配键。返回 newest-first 元组。
+        """
+        limit = max(1, min(int(limit), 200))
+        rows = self._conn.execute(
+            "SELECT chat_id, content, timestamp FROM messages WHERE is_bot=1 ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+        since = int(since_ts)
+        results: list[tuple[str, str, int]] = []
+        for row in rows:
+            ts = int(row["timestamp"])
+            if ts < since:
+                continue
+            results.append((str(row["chat_id"]), str(row["content"]), ts))
+        return results[:limit]
+
     def messages_page(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         limit: int = 50,
         before: int | None = None,
         anchor_message_id: str | None = None,
@@ -673,7 +1009,7 @@ class Store:
         )
 
     def messages_between(
-        self, chat_type: ChatType, chat_id: int, start_ts: int, end_ts: int
+        self, chat_type: ChatType, chat_id: str, start_ts: int, end_ts: int
     ) -> list[Message]:
         rows = self._conn.execute(
             """
@@ -686,7 +1022,7 @@ class Store:
         return [self._row_to_message(r) for r in rows]
 
     def message_nicknames(
-        self, chat_type: ChatType, chat_id: int, message_ids: Sequence[str]
+        self, chat_type: ChatType, chat_id: str, message_ids: Sequence[str]
     ) -> dict[str, str]:
         """按 message_id 批量回查昵称；摘要补「回复 谁」时一次查完，别逐条打库。"""
         ids = [str(mid) for mid in message_ids if mid]
@@ -708,17 +1044,21 @@ class Store:
                 found[str(row["message_id"])] = str(row["nickname"])
         return found
 
-    def active_chats_between(self, start_ts: int, end_ts: int) -> list[tuple[ChatType, int]]:
+    def active_chats_between(self, start_ts: int, end_ts: int) -> list[tuple[ChatType, str]]:
         rows = self._conn.execute(
             """
             SELECT DISTINCT chat_type, chat_id FROM messages
             WHERE timestamp >= ? AND timestamp < ?
+            ORDER BY chat_type,
+                     CASE WHEN chat_id LIKE 'qq:%' THEN 0 ELSE 1 END,
+                     CAST(SUBSTR(chat_id, 4) AS INTEGER),
+                     chat_id
             """,
             (start_ts, end_ts),
         ).fetchall()
-        return [(ChatType(r["chat_type"]), int(r["chat_id"])) for r in rows]
+        return [(ChatType(r["chat_type"]), r["chat_id"]) for r in rows]
 
-    def count_messages(self, chat_type: ChatType, chat_id: int) -> int:
+    def count_messages(self, chat_type: ChatType, chat_id: str) -> int:
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM messages WHERE chat_type = ? AND chat_id = ?",
             (chat_type.value, chat_id),
@@ -753,7 +1093,7 @@ class Store:
         return deleted
 
     def delete_user_messages(
-        self, chat_type: ChatType, chat_id: int, user_id: int
+        self, chat_type: ChatType, chat_id: str, user_id: str
     ) -> int:
         """按用户删除某会话的原始消息，并清理对应投递记录。
 
@@ -770,14 +1110,14 @@ class Store:
                       WHERE chat_type = ? AND chat_id = ? AND user_id = ?
                   )
                 """,
-                (chat_type.value, chat_id, chat_type.value, chat_id, int(user_id)),
+                (chat_type.value, chat_id, chat_type.value, chat_id, user_id),
             )
             cur = self._conn.execute(
                 """
                 DELETE FROM messages
                 WHERE chat_type = ? AND chat_id = ? AND user_id = ?
                 """,
-                (chat_type.value, chat_id, int(user_id)),
+                (chat_type.value, chat_id, user_id),
             )
         return max(cur.rowcount, 0)
 
@@ -785,7 +1125,7 @@ class Store:
         self,
         query: str,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[int, list[Message]]:
@@ -797,7 +1137,7 @@ class Store:
         self,
         query: str,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[int, list[tuple[Message, str]]]:
@@ -819,7 +1159,7 @@ class Store:
                 params.append(chat_type.value)
             if chat_id is not None:
                 clauses.append("m.chat_id = ?")
-                params.append(int(chat_id))
+                params.append(chat_id)
             where = " AND ".join(["messages_fts MATCH ?", *clauses])
             try:
                 total_row = self._conn.execute(
@@ -856,7 +1196,7 @@ class Store:
         self,
         terms: Sequence[str],
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[int, list[tuple[Message, str]]]:
@@ -879,7 +1219,7 @@ class Store:
                 params.append(chat_type.value)
             if chat_id is not None:
                 clauses.append("m.chat_id = ?")
-                params.append(int(chat_id))
+                params.append(chat_id)
             where = " AND ".join(["messages_fts MATCH ?", *clauses])
             try:
                 total_row = self._conn.execute(
@@ -946,7 +1286,7 @@ class Store:
         self,
         query: str,
         chat_type: ChatType | None,
-        chat_id: int | None,
+        chat_id: str | None,
         limit: int,
         offset: int,
     ) -> tuple[int, list[tuple[Message, str]]]:
@@ -989,7 +1329,7 @@ class Store:
         )
 
     # ---- delivery cursors -----------------------------------------
-    def _row_id(self, chat_type: ChatType, chat_id: int, message_id: str) -> int | None:
+    def _row_id(self, chat_type: ChatType, chat_id: str, message_id: str) -> int | None:
         row = self._conn.execute(
             """
             SELECT id FROM messages
@@ -999,7 +1339,7 @@ class Store:
         ).fetchone()
         return None if row is None else int(row["id"])
 
-    def last_delivered_id(self, chat_type: ChatType, chat_id: int) -> int | None:
+    def last_delivered_id(self, chat_type: ChatType, chat_id: str) -> int | None:
         row = self._conn.execute(
             "SELECT last_message_id FROM delivered_cursors WHERE chat_type = ? AND chat_id = ?",
             (chat_type.value, chat_id),
@@ -1007,7 +1347,7 @@ class Store:
         return None if row is None else int(row["last_message_id"])
 
     def pending_messages(
-        self, chat_type: ChatType, chat_id: int, upto_message_id: str, limit: int
+        self, chat_type: ChatType, chat_id: str, upto_message_id: str, limit: int
     ) -> tuple[int, list[Message]]:
         """取「模型还没看过」的人类消息，按时间正序，最多 limit 条。
 
@@ -1053,7 +1393,7 @@ class Store:
             return 0, ([] if row is None else [self._row_to_message(row)])
         return max(0, total - len(messages)), messages
 
-    def mark_delivered(self, chat_type: ChatType, chat_id: int, *message_ids: str) -> None:
+    def mark_delivered(self, chat_type: ChatType, chat_id: str, *message_ids: str) -> None:
         """把一批消息记为「已送达模型」；首次投递同时钉住回溯下限。"""
         rows = [self._row_id(chat_type, chat_id, mid) for mid in message_ids]
         present = [(mid, row) for mid, row in zip(message_ids, rows) if row is not None]
@@ -1080,7 +1420,7 @@ class Store:
     def pending_batch(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         anchor_id: str,
         limit: int = 20,
     ) -> list[Message]:
@@ -1118,7 +1458,7 @@ class Store:
         return [self._row_to_message(r) for r in reversed(rows)]
 
     def count_undelivered_before(
-        self, chat_type: ChatType, chat_id: int, message_id: str
+        self, chat_type: ChatType, chat_id: str, message_id: str
     ) -> int:
         """投递窗口之前还有多少条未投递消息。
 
@@ -1146,7 +1486,7 @@ class Store:
         ).fetchone()
         return int(row["n"]) if row is not None else 0
 
-    def mark_recalled(self, chat_type: ChatType, chat_id: int, message_id: str) -> bool:
+    def mark_recalled(self, chat_type: ChatType, chat_id: str, message_id: str) -> bool:
         """把一条已入库消息标记为撤回；原文保留，只是不再进入 prompt。"""
         cur = self._conn.execute(
             """
@@ -1159,7 +1499,7 @@ class Store:
         self._conn.commit()
         return cur.rowcount > 0
 
-    def is_recalled(self, chat_type: ChatType, chat_id: int, message_id: str) -> bool:
+    def is_recalled(self, chat_type: ChatType, chat_id: str, message_id: str) -> bool:
         row = self._conn.execute(
             """
             SELECT 1 FROM messages
@@ -1170,7 +1510,7 @@ class Store:
         ).fetchone()
         return row is not None
 
-    def chats_with_pending(self, since_ts: int) -> list[tuple[ChatType, int]]:
+    def chats_with_pending(self, since_ts: int) -> list[tuple[ChatType, str]]:
         """哪些会话还有「游标之后、窗口内、未投递」的人类消息（无游标的会话不算）。"""
         rows = self._conn.execute(
             """
@@ -1184,14 +1524,17 @@ class Store:
                   WHERE d.chat_type = m.chat_type AND d.chat_id = m.chat_id
                     AND d.message_id = m.message_id
               )
-            ORDER BY m.chat_type, m.chat_id
+            ORDER BY m.chat_type,
+                     CASE WHEN m.chat_id LIKE 'qq:%' THEN 0 ELSE 1 END,
+                     CAST(SUBSTR(m.chat_id, 4) AS INTEGER),
+                     m.chat_id
             """,
             (since_ts,),
         ).fetchall()
-        return [(ChatType(r["chat_type"]), int(r["chat_id"])) for r in rows]
+        return [(ChatType(r["chat_type"]), r["chat_id"]) for r in rows]
 
     def mark_skipped(
-        self, chat_type: ChatType, chat_id: int, message_ids: Sequence[str], reason: str
+        self, chat_type: ChatType, chat_id: str, message_ids: Sequence[str], reason: str
     ) -> None:
         """把一批消息标成「已处理但不投递」，并记下原因（quiet/budget/error…）。
 
@@ -1225,7 +1568,7 @@ class Store:
         )
         self._conn.commit()
 
-    def skip_reason(self, chat_type: ChatType, chat_id: int, message_id: str) -> str | None:
+    def skip_reason(self, chat_type: ChatType, chat_id: str, message_id: str) -> str | None:
         row = self._conn.execute(
             """
             SELECT skipped_reason FROM delivered_messages
@@ -1234,6 +1577,172 @@ class Store:
             (chat_type.value, chat_id, message_id),
         ).fetchone()
         return None if row is None else row["skipped_reason"]
+
+    # ------------------------------------------------------------ 待发队列
+    def enqueue_outbox(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        text: str,
+        *,
+        origin_message_id: str = "",
+        now: float | None = None,
+    ) -> int:
+        """把没发出去的一条分片排进待发队列；返回行 id（0 = 空文本，未入队）。"""
+        body = str(text or "")
+        if not body.strip():
+            return 0
+        stamp = time.time() if now is None else float(now)
+        cur = self._conn.execute(
+            """
+            INSERT INTO pending_outbox
+                (chat_type, chat_id, text, origin_message_id, enqueued_at, next_attempt_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (chat_type.value, chat_id, body, str(origin_message_id or ""), stamp, stamp),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def due_outbox(self, now: float | None = None, *, limit: int = 20) -> list[dict[str, Any]]:
+        """到点可补发的行，按入队顺序返回（同一会话天然保序）。"""
+        stamp = time.time() if now is None else float(now)
+        rows = self._conn.execute(
+            """
+            SELECT id, chat_type, chat_id, text, origin_message_id, attempts, enqueued_at
+            FROM pending_outbox
+            WHERE next_attempt_at <= ?
+            ORDER BY id
+            LIMIT ?
+            """,
+            (stamp, int(limit)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def has_outbox(self, chat_type: ChatType | None = None, chat_id: str | None = None) -> bool:
+        if chat_type is None:
+            row = self._conn.execute("SELECT 1 FROM pending_outbox LIMIT 1").fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT 1 FROM pending_outbox WHERE chat_type = ? AND chat_id = ? LIMIT 1",
+                (chat_type.value, chat_id),
+            ).fetchone()
+        return row is not None
+
+    def outbox_size(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) FROM pending_outbox").fetchone()[0])
+
+    def drop_outbox(self, row_id: int) -> None:
+        self._conn.execute("DELETE FROM pending_outbox WHERE id = ?", (int(row_id),))
+        self._conn.commit()
+
+    def defer_outbox(self, row_id: int, *, error: str, next_attempt_at: float) -> int:
+        """记一次失败并推迟；返回累计尝试次数。"""
+        self._conn.execute(
+            """
+            UPDATE pending_outbox
+            SET attempts = attempts + 1, last_error = ?, next_attempt_at = ?
+            WHERE id = ?
+            """,
+            (str(error or "")[:300], float(next_attempt_at), int(row_id)),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT attempts FROM pending_outbox WHERE id = ?", (int(row_id),)
+        ).fetchone()
+        return int(row["attempts"]) if row is not None else 0
+
+    # ---- 跨群查证缓存 ---------------------------------------------
+    def add_shared_fact(
+        self,
+        question: str,
+        answer: str,
+        chat_type: ChatType,
+        chat_id: str,
+        nickname: str = "",
+    ) -> int:
+        """写入一条跨群可复用的查证结论；返回行 id（0 = 未写入）。
+
+        隐私闸门在这里再拦一次（调用方也会先过滤）：私聊、疑似个人信息、
+        以及「没查到」这类失败回答都不会落库。
+        """
+        if chat_type is not ChatType.GROUP:
+            return 0
+        pair = shared_facts.extract(question, answer)
+        if pair is None:
+            return 0
+        ask, reply = pair
+        key = shared_facts.normalize(ask)
+        if not key:
+            return 0
+        existing = self._conn.execute(
+            "SELECT id, answer_text FROM shared_facts WHERE question_key = ?",
+            (key,),
+        ).fetchone()
+        if existing is not None:
+            # 同一问题只保留信息量更大的那条答案；短答案不要覆盖长答案。
+            if len(reply) > len(str(existing["answer_text"] or "")):
+                self._conn.execute(
+                    """
+                    UPDATE shared_facts
+                    SET question_text = ?, answer_text = ?, source_chat_type = ?,
+                        source_chat_id = ?, source_nickname = ?,
+                        created_at = datetime('now')
+                    WHERE id = ?
+                    """,
+                    (
+                        ask,
+                        reply,
+                        chat_type.value,
+                        chat_id,
+                        str(nickname or ""),
+                        int(existing["id"]),
+                    ),
+                )
+                self._conn.commit()
+            return int(existing["id"])
+        cur = self._conn.execute(
+            """
+            INSERT INTO shared_facts
+                (question_key, question_text, answer_text, source_chat_type,
+                 source_chat_id, source_nickname)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (key, ask, reply, chat_type.value, chat_id, str(nickname or "")),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def shared_facts(self, limit: int = 400) -> list[dict[str, Any]]:
+        """最近写入的若干条查证结论，供相似度匹配用（表很小，直接扫）。"""
+        rows = self._conn.execute(
+            """
+            SELECT id, question_text, answer_text, source_chat_type, source_chat_id,
+                   source_nickname, created_at, hits
+            FROM shared_facts
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def bump_shared_fact(self, fact_id: int) -> None:
+        """记一次命中：既用于排序，也方便以后判断哪些结论值得保留。"""
+        self._conn.execute(
+            "UPDATE shared_facts SET hits = hits + 1, last_hit_at = datetime('now') WHERE id = ?",
+            (int(fact_id),),
+        )
+        self._conn.commit()
+
+    def purge_shared_facts_for_chat(self, chat_type: ChatType, chat_id: str) -> int:
+        """删掉源自某个会话的全部缓存（forget_chat 时调用）。"""
+        cur = self._conn.execute(
+            "DELETE FROM shared_facts WHERE source_chat_type = ? AND source_chat_id = ?",
+            (chat_type.value, chat_id),
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
 
     @staticmethod
     def _row_to_message(r: sqlite3.Row) -> Message:
@@ -1266,7 +1775,7 @@ class Store:
         return cur.rowcount
 
     def get_brain_session(
-        self, provider: str, chat_type: ChatType, chat_id: int
+        self, provider: str, chat_type: ChatType, chat_id: str
     ) -> str | None:
         row = self._conn.execute(
             """
@@ -1278,7 +1787,7 @@ class Store:
         return None if row is None else str(row["session_id"])
 
     def set_brain_session(
-        self, provider: str, chat_type: ChatType, chat_id: int, session_id: str
+        self, provider: str, chat_type: ChatType, chat_id: str, session_id: str
     ) -> None:
         """写入/更新会话 id；created_at 是这一轮 session 的起点，只落一次。
 
@@ -1300,7 +1809,7 @@ class Store:
         self._conn.commit()
 
     def clear_brain_session(
-        self, provider: str, chat_type: ChatType, chat_id: int
+        self, provider: str, chat_type: ChatType, chat_id: str
     ) -> None:
         self._conn.execute(
             """
@@ -1312,7 +1821,7 @@ class Store:
         self._conn.commit()
 
     # ---- session stats (轮换判据) ----------------------------------
-    def session_stats(self, chat_type: ChatType, chat_id: int) -> SessionStats:
+    def session_stats(self, chat_type: ChatType, chat_id: str) -> SessionStats:
         row = self._conn.execute(
             """
             SELECT delivered_count, token_estimate, created_at FROM brain_sessions
@@ -1329,7 +1838,7 @@ class Store:
         )
 
     def bump_session_stats(
-        self, chat_type: ChatType, chat_id: int, *, messages: int, tokens: int
+        self, chat_type: ChatType, chat_id: str, *, messages: int, tokens: int
     ) -> None:
         """累计本轮投递：无行则建（created_at 只写这一次），有行则累加。"""
         self._conn.execute(
@@ -1354,7 +1863,7 @@ class Store:
         )
         self._conn.commit()
 
-    def reset_session_stats(self, chat_type: ChatType, chat_id: int) -> None:
+    def reset_session_stats(self, chat_type: ChatType, chat_id: str) -> None:
         """轮换后清零；created_at 跟着新 session 重算。"""
         self._conn.execute(
             """
@@ -1366,15 +1875,15 @@ class Store:
         )
         self._conn.commit()
 
-    def get_opencode_session(self, chat_type: ChatType, chat_id: int) -> str | None:
+    def get_opencode_session(self, chat_type: ChatType, chat_id: str) -> str | None:
         return self.get_brain_session("opencode", chat_type, chat_id)
 
     def set_opencode_session(
-        self, chat_type: ChatType, chat_id: int, session_id: str
+        self, chat_type: ChatType, chat_id: str, session_id: str
     ) -> None:
         self.set_brain_session("opencode", chat_type, chat_id, session_id)
 
-    def clear_opencode_session(self, chat_type: ChatType, chat_id: int) -> None:
+    def clear_opencode_session(self, chat_type: ChatType, chat_id: str) -> None:
         self.clear_brain_session("opencode", chat_type, chat_id)
 
     def clear_opencode_sessions(self) -> int:
@@ -1394,8 +1903,8 @@ class Store:
     def upsert_impression(
         self,
         chat_type: ChatType,
-        chat_id: int,
-        subject_user_id: int | None,
+        chat_id: str,
+        subject_user_id: str | None,
         kind: str,
         content: str,
         confidence: float,
@@ -1403,7 +1912,8 @@ class Store:
         source_excerpt: str = "",
         subject_nickname: str = "",
     ) -> None:
-        subject = subject_user_id or 0
+        # 空值哨兵是空串（列默认 ''），不是 0：NULL subject 表示「整群印象」。
+        subject = subject_user_id if subject_user_id is not None else ""
         nickname = subject_nickname.strip()[:40]
         if kind == "nickname":
             # 昵称是「唯一称呼」：同一用户只留最新一条，旧行交给 DELETE 让 FTS 触发器同步。
@@ -1605,7 +2115,7 @@ class Store:
         return cur.rowcount > 0
 
     def search_impressions(
-        self, chat_type: ChatType, chat_id: int, query: str, topk: int
+        self, chat_type: ChatType, chat_id: str, query: str, topk: int
     ) -> list[Impression]:
         rows: list[sqlite3.Row] = []
         if self._fts and query.strip():
@@ -1642,15 +2152,15 @@ class Store:
     def list_impressions(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         topk: int,
-        focus_user_ids: Sequence[int] = (),
+        focus_user_ids: Sequence[str] = (),
     ) -> list[Impression]:
         """按新鲜度/置信度排序；focus_user_ids 里的人优先占名额。
 
         focus 只影响谁先入选，名额内仍按 30 天内见过 > confidence > updated_at 排。
         """
-        focus = list(dict.fromkeys(int(uid) for uid in focus_user_ids))[:32]
+        focus = list(dict.fromkeys(focus_user_ids))[:32]
         if focus:
             marks = ",".join("?" for _ in focus)
             order = f"(subject_user_id IN ({marks})) DESC,"
@@ -1675,7 +2185,7 @@ class Store:
         limit: int = 20,
         offset: int = 0,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
     ) -> list[Impression]:
         """跨会话的最近印象，仅供 dashboard 只读展示；可按会话过滤与分页。"""
         scope, params = _memory_scope(chat_type, chat_id)
@@ -1692,7 +2202,7 @@ class Store:
         return [self._row_to_impression(r) for r in rows]
 
     def count_impressions(
-        self, chat_type: ChatType | None = None, chat_id: int | None = None
+        self, chat_type: ChatType | None = None, chat_id: str | None = None
     ) -> int:
         scope, params = _memory_scope(chat_type, chat_id)
         row = self._conn.execute(
@@ -1701,7 +2211,7 @@ class Store:
         return int(row["total"] or 0)
 
     # ---- 印象抽取游标 ----------------------------------------------
-    def get_impression_cursor(self, chat_type: ChatType, chat_id: int) -> int:
+    def get_impression_cursor(self, chat_type: ChatType, chat_id: str) -> int:
         """已抽取到的消息条数；没有记录时返回 0。"""
         row = self._conn.execute(
             """
@@ -1713,7 +2223,7 @@ class Store:
         return 0 if row is None else int(row["last_count"] or 0)
 
     def set_impression_cursor(
-        self, chat_type: ChatType, chat_id: int, last_count: int
+        self, chat_type: ChatType, chat_id: str, last_count: int
     ) -> None:
         self._conn.execute(
             """
@@ -1729,7 +2239,7 @@ class Store:
 
     # ---- 会话运行状态 ----------------------------------------------
     def load_chat_state(
-        self, chat_type: ChatType, chat_id: int
+        self, chat_type: ChatType, chat_id: str
     ) -> dict[str, object] | None:
         """静音/话题收尾等运行状态；没有记录返回 None。"""
         row = self._conn.execute(
@@ -1761,7 +2271,7 @@ class Store:
     def save_chat_state(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         state: dict[str, object],
     ) -> None:
         self._conn.execute(
@@ -1804,10 +2314,12 @@ class Store:
 
     @staticmethod
     def _row_to_impression(r: sqlite3.Row) -> Impression:
+        # v1 的整数 0 经 TEXT 重建已是字符串 '0'，同样按「无 subject」读回。
+        v = r["subject_user_id"]
         return Impression(
             chat_type=ChatType(r["chat_type"]),
             chat_id=r["chat_id"],
-            subject_user_id=r["subject_user_id"] or None,
+            subject_user_id=None if v in ("", "0") else v,
             kind=r["kind"],
             content=r["content"],
             confidence=r["confidence"],
@@ -1819,7 +2331,7 @@ class Store:
         )
 
     # ---- summaries ------------------------------------------------
-    def all_summaries(self, chat_type: ChatType, chat_id: int) -> list[Summary]:
+    def all_summaries(self, chat_type: ChatType, chat_id: str) -> list[Summary]:
         """导出用：某会话全部按日摘要，时间正序。"""
         rows = self._conn.execute(
             """
@@ -1840,7 +2352,7 @@ class Store:
             for r in rows
         ]
 
-    def upsert_summary(self, chat_type: ChatType, chat_id: int, date: str, content: str) -> None:
+    def upsert_summary(self, chat_type: ChatType, chat_id: str, date: str, content: str) -> None:
         self._conn.execute(
             """
             INSERT INTO summaries (chat_type, chat_id, date, content)
@@ -1852,7 +2364,7 @@ class Store:
         )
         self._conn.commit()
 
-    def get_summary(self, chat_type: ChatType, chat_id: int, date: str) -> str | None:
+    def get_summary(self, chat_type: ChatType, chat_id: str, date: str) -> str | None:
         row = self._conn.execute(
             "SELECT content FROM summaries WHERE chat_type = ? AND chat_id = ? AND date = ?",
             (chat_type.value, chat_id, date),
@@ -1860,7 +2372,7 @@ class Store:
         return None if row is None else str(row["content"])
 
     def count_summaries(
-        self, chat_type: ChatType | None = None, chat_id: int | None = None
+        self, chat_type: ChatType | None = None, chat_id: str | None = None
     ) -> int:
         scope, params = _memory_scope(chat_type, chat_id)
         row = self._conn.execute(
@@ -1895,14 +2407,17 @@ class Store:
              AND s.date = strftime('%Y-%m-%d', m.timestamp, 'unixepoch', '+8 hours')
             WHERE m.timestamp >= ? AND m.timestamp < ? AND s.date IS NULL
             GROUP BY m.chat_type, m.chat_id, day
-            ORDER BY day DESC, m.chat_id ASC
+            ORDER BY day DESC,
+                     CASE WHEN m.chat_id LIKE 'qq:%' THEN 0 ELSE 1 END,
+                     CAST(SUBSTR(m.chat_id, 4) AS INTEGER),
+                     m.chat_id ASC
             """,
             (start_ts, end_ts),
         ).fetchall()
         return [
             PendingSummary(
                 chat_type=ChatType(row["chat_type"]),
-                chat_id=int(row["chat_id"]),
+                chat_id=row["chat_id"],
                 date=str(row["day"]),
                 messages=int(row["n"]),
             )
@@ -1918,7 +2433,7 @@ class Store:
         return sorted({slot.date for slot in self.pending_summary_slots(days, until=until)})
 
     def summaries_between(
-        self, chat_type: ChatType, chat_id: int, start: str, end: str
+        self, chat_type: ChatType, chat_id: str, start: str, end: str
     ) -> list[Summary]:
         """按日期闭区间取日摘要，升序；周汇总的输入就是这 7 天里实际存在的条目。"""
         rows = self._conn.execute(
@@ -1942,7 +2457,7 @@ class Store:
 
     # ---- 周汇总 -----------------------------------------------------
     def upsert_weekly_summary(
-        self, chat_type: ChatType, chat_id: int, week_start: str, content: str
+        self, chat_type: ChatType, chat_id: str, week_start: str, content: str
     ) -> None:
         self._conn.execute(
             """
@@ -1956,7 +2471,7 @@ class Store:
         self._conn.commit()
 
     def get_weekly_summary(
-        self, chat_type: ChatType, chat_id: int, week_start: str
+        self, chat_type: ChatType, chat_id: str, week_start: str
     ) -> str | None:
         row = self._conn.execute(
             """
@@ -1968,7 +2483,7 @@ class Store:
         return None if row is None else str(row["content"])
 
     def latest_weekly_summary(
-        self, chat_type: ChatType, chat_id: int
+        self, chat_type: ChatType, chat_id: str
     ) -> WeeklySummary | None:
         row = self._conn.execute(
             """
@@ -2007,14 +2522,16 @@ class Store:
                         AND w.week_start = ?
                   )
                 GROUP BY s.chat_type, s.chat_id
-                ORDER BY s.chat_id ASC
+                ORDER BY CASE WHEN s.chat_id LIKE 'qq:%' THEN 0 ELSE 1 END,
+                         CAST(SUBSTR(s.chat_id, 4) AS INTEGER),
+                         s.chat_id ASC
                 """,
                 (week_start, end, week_start),
             ).fetchall()
             pending.extend(
                 PendingWeekly(
                     chat_type=ChatType(row["chat_type"]),
-                    chat_id=int(row["chat_id"]),
+                    chat_id=row["chat_id"],
                     week_start=week_start,
                     days=int(row["n"]),
                 )
@@ -2027,7 +2544,7 @@ class Store:
         limit: int = 20,
         offset: int = 0,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
     ) -> list[Summary]:
         """跨会话的最近按日摘要，仅供 dashboard 只读展示；可按会话过滤与分页。"""
         scope, params = _memory_scope(chat_type, chat_id)
@@ -2053,7 +2570,7 @@ class Store:
         ]
 
     # ---- 轮换摘要（一次性接续，与按日 summaries 分开） --------------
-    def add_session_summary(self, chat_type: ChatType, chat_id: int, content: str) -> None:
+    def add_session_summary(self, chat_type: ChatType, chat_id: str, content: str) -> None:
         self._conn.execute(
             """
             INSERT INTO session_summaries (chat_type, chat_id, content)
@@ -2063,7 +2580,7 @@ class Store:
         )
         self._conn.commit()
 
-    def latest_session_summary(self, chat_type: ChatType, chat_id: int) -> str | None:
+    def latest_session_summary(self, chat_type: ChatType, chat_id: str) -> str | None:
         row = self._conn.execute(
             """
             SELECT content FROM session_summaries
@@ -2075,7 +2592,7 @@ class Store:
         return None if row is None else str(row["content"])
 
     def recent_session_summary(
-        self, chat_type: ChatType, chat_id: int, within_hours: float = 24
+        self, chat_type: ChatType, chat_id: str, within_hours: float = 24
     ) -> str | None:
         """`within_hours` 内的最新接续摘要；重启后靠它把轮换接续语捞回来。
 
@@ -2150,7 +2667,7 @@ class Store:
     def record_usage(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         purpose: str,
         prompt_tokens: int,
         completion_tokens: int,
@@ -2174,7 +2691,7 @@ class Store:
         )
         self._conn.commit()
 
-    def usage_today(self, chat_type: ChatType, chat_id: int, today: str) -> tuple[int, int]:
+    def usage_today(self, chat_type: ChatType, chat_id: str, today: str) -> tuple[int, int]:
         row = self._conn.execute(
             """
             SELECT COUNT(*) AS calls,
@@ -2189,7 +2706,7 @@ class Store:
     def usage_today_by_purpose(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         today: str,
         purposes: Sequence[str],
     ) -> tuple[int, int]:
@@ -2229,7 +2746,7 @@ class Store:
         *,
         purposes: Sequence[str] | None = None,
         chat_type: ChatType | None = None,
-        chat_id: int | None = None,
+        chat_id: str | None = None,
     ) -> UsageTotals:
         """日期闭区间内的用量合计；``purposes=None`` 表示所有用途。
 
@@ -2249,7 +2766,7 @@ class Store:
             params.append(chat_type.value)
         if chat_id is not None:
             clauses.append("chat_id = ?")
-            params.append(int(chat_id))
+            params.append(chat_id)
         where = " AND ".join(clauses)
         row = self._conn.execute(
             f"""
@@ -2349,7 +2866,7 @@ class Store:
         return [
             {
                 "chat_type": str(row["chat_type"]),
-                "chat_id": int(row["chat_id"]),
+                "chat_id": row["chat_id"],
                 "calls": int(row["calls"] or 0),
                 "errors": int(row["errors"] or 0),
                 "tokens": int(row["tokens"] or 0),
@@ -2373,7 +2890,7 @@ class Store:
         return [
             {
                 "chat_type": str(row["chat_type"]),
-                "chat_id": int(row["chat_id"]),
+                "chat_id": row["chat_id"],
                 "at": str(row["at"] or ""),
             }
             for row in rows
@@ -2386,15 +2903,15 @@ class Store:
         以消息、摘要、印象、brain_sessions 的并集为会话集合，避免“只剩摘要”的会话消失。
         按最近消息时间倒序，没有消息的排最后。
         """
-        chats: dict[tuple[str, int], dict[str, object]] = {}
+        chats: dict[tuple[str, str], dict[str, object]] = {}
 
-        def bucket(raw_type: str, raw_id: int) -> dict[str, object]:
-            key = (raw_type, int(raw_id))
+        def bucket(raw_type: str, raw_id: str) -> dict[str, object]:
+            key = (raw_type, raw_id)
             return chats.setdefault(
                 key,
                 {
                     "chat_type": raw_type,
-                    "chat_id": int(raw_id),
+                    "chat_id": raw_id,
                     "message_count": 0,
                     "last_message_at": None,
                     "summary_count": 0,
@@ -2430,9 +2947,9 @@ class Store:
             bucket(row["chat_type"], row["chat_id"])["impression_count"] = int(row["n"])
 
         # 同一会话可能有多个 provider 的映射；优先展示 opencode，其次最近更新的。
-        sessions: dict[tuple[str, int], sqlite3.Row] = {}
+        sessions: dict[tuple[str, str], sqlite3.Row] = {}
         for row in self._conn.execute("SELECT * FROM brain_sessions"):
-            key = (row["chat_type"], int(row["chat_id"]))
+            key = (row["chat_type"], row["chat_id"])
             current = sessions.get(key)
             if current is None:
                 sessions[key] = row
@@ -2462,7 +2979,7 @@ class Store:
             reverse=True,
         )
 
-    def forget_messages(self, chat_type: ChatType, chat_id: int) -> None:
+    def forget_messages(self, chat_type: ChatType, chat_id: str) -> None:
         """软忘记：清消息与 session 映射，保留按日摘要、印象和用量。"""
         for table in (
             "messages",
@@ -2470,6 +2987,7 @@ class Store:
             "brain_sessions",
             "delivered_cursors",
             "delivered_messages",
+            "pending_outbox",
             "session_summaries",
         ):
             self._conn.execute(
@@ -2478,7 +2996,7 @@ class Store:
             )
         self._conn.commit()
 
-    def reset_chat(self, chat_type: ChatType, chat_id: int) -> None:
+    def reset_chat(self, chat_type: ChatType, chat_id: str) -> None:
         """只换 session：消息、摘要、印象、用量全部保留。"""
         for table in ("opencode_sessions", "brain_sessions", "session_summaries"):
             self._conn.execute(
@@ -2487,7 +3005,8 @@ class Store:
             )
         self._conn.commit()
 
-    def forget_chat(self, chat_type: ChatType, chat_id: int) -> None:
+    def forget_chat(self, chat_type: ChatType, chat_id: str) -> None:
+        self.purge_shared_facts_for_chat(chat_type, chat_id)
         for table in (
             "messages",
             "impressions",
@@ -2497,6 +3016,7 @@ class Store:
             "brain_sessions",
             "delivered_cursors",
             "delivered_messages",
+            "pending_outbox",
             "session_summaries",
         ):
             self._conn.execute(
@@ -2506,6 +3026,8 @@ class Store:
         self._conn.commit()
 
     def forget_all(self) -> None:
+        self._conn.execute("DELETE FROM shared_facts")
+        self._conn.commit()
         for table in (
             "messages",
             "impressions",
@@ -2515,6 +3037,7 @@ class Store:
             "brain_sessions",
             "delivered_cursors",
             "delivered_messages",
+            "pending_outbox",
             "session_summaries",
         ):
             self._conn.execute(f"DELETE FROM {table}")

@@ -61,8 +61,8 @@ def os_rule(probability: float) -> str:
         return "不要主动冒内心 OS。"
     percent = f"{probability * 100:g}%"
     return (
-        f"小概率（约 {percent}）在回答开头冒一句内心 OS，用斜体加括号，"
-        "例如：*（其实在摸鱼……）*。频率要低，多了就腻。"
+        f"小概率（约 {percent}）在回答开头冒一句内心 OS，用中文括号，"
+        "例如：（其实在摸鱼……）。频率要低，多了就腻。"
     )
 
 

@@ -6,9 +6,10 @@ import logging
 import os
 import socket
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from ..config import RestartConfig
 from .logs import LogHub
@@ -36,8 +37,15 @@ class ProcSpec:
     name: str
     command: list[str]
     cwd: str | None = None
-    env: dict[str, str] | None = None
+    # 子进程环境里可能含口令（opencode/control/wechat bridge token），
+    # repr 一律不展开，避免被日志或异常文本顺带带出去。
+    env: dict[str, str] | None = field(default=None, repr=False)
     ready_url: str = ""
+    # 没有 HTTP 端点的进程（例如微信桥是出站 WS 客户端）用同步探针代替 URL；
+    # 探针由 manager 丢到线程池执行，绝不在事件循环里同步跑。
+    ready_probe: Callable[[], bool] | None = None
+    # 单个进程的就绪窗口覆盖；None 表示沿用 Supervisor.ready_timeout。
+    ready_timeout: float | None = None
     creationflags: int = 0
     # 启动前先清掉同目录的残留进程（NapCat 的 worker 会在主进程崩溃后
     # 继续占着 QQ 登录态，新实例只会报「当前账号已登录，无法重复登录」）。
@@ -119,7 +127,8 @@ class Supervisor:
         try:
             async with self._probe_session.get(url) as resp:
                 return resp.status < 500
-        except Exception:
+        # 就绪探测失败等价于「不可达」，由 start() 负责超时与失败状态。
+        except Exception:  # noqa: BLE001
             return False
 
     # ---- lifecycle -------------------------------------------------
@@ -153,18 +162,25 @@ class Supervisor:
         state.proc = proc
         state.started_at = time.monotonic()
         self.logs.write(name, f"已启动 pid={proc.pid}")
-        if state.watcher is not None and not state.watcher.done():
+        # 自动重启时这个 start() 就跑在 _watch 自己里面：此时 watcher 就是当前
+        # 任务，取消它等于把自己打断，状态会永远停在 starting，新进程也没有
+        # 看门狗（后续崩溃再没人拉起）。只有「换掉另一个还活着的看门狗」才取消。
+        if (
+            state.watcher is not None
+            and not state.watcher.done()
+            and state.watcher is not asyncio.current_task()
+        ):
             state.watcher.cancel()
         state.drains = [
             asyncio.create_task(self._drain(name, stream))
             for stream in (proc.stdout, proc.stderr)
             if stream is not None
         ]
-        if spec.ready_url:
-            if not await self._wait_ready(state):
-                await self._terminate(state)
-                state.status = FAILED
-                raise RuntimeError(f"{name} 未在 {self.ready_timeout:.0f}s 内就绪")
+        if (spec.ready_url or spec.ready_probe) and not await self._wait_ready(state):
+            await self._terminate(state)
+            state.status = FAILED
+            timeout = self._ready_timeout(state)
+            raise RuntimeError(f"{name} 未在 {timeout:.0f}s 内就绪")
         state.status = READY
         state.watcher = asyncio.create_task(self._watch(state))
 
@@ -181,15 +197,27 @@ class Supervisor:
             await _kill_tree(pid)
             self.logs.write(name, f"清理残留进程 pid={pid}（启动前）")
 
+    def _ready_timeout(self, state: ProcState) -> float:
+        override = state.spec.ready_timeout
+        return self.ready_timeout if override is None else override
+
     async def _wait_ready(self, state: ProcState) -> bool:
-        deadline = time.monotonic() + self.ready_timeout
+        deadline = time.monotonic() + self._ready_timeout(state)
         while time.monotonic() < deadline:
             if state.proc is None or state.proc.returncode is not None:
                 return False
             try:
-                if await self._probe(state.spec.ready_url):
+                probe = state.spec.ready_probe
+                if probe is not None:
+                    # 同步探针（HTTP GET）必须离开事件循环：否则连接超时会把
+                    # 整个 supervisor 的调度一起卡住。
+                    ready = await asyncio.to_thread(probe)
+                else:
+                    ready = await self._probe(state.spec.ready_url)
+                if ready:
                     return True
-            except Exception:
+            # 等待就绪期间探测异常按「未就绪」处理，继续重试直到超时。
+            except Exception:  # noqa: BLE001, S110
                 pass
             await asyncio.sleep(0.25)
         return False
@@ -238,7 +266,8 @@ class Supervisor:
             return
         try:
             await self.start(state.name)
-        except Exception as exc:
+        # 自动重启失败标记 FAILED 并写日志，不能让看门狗线程退出。
+        except Exception as exc:  # noqa: BLE001
             state.status = FAILED
             self.logs.write(state.name, f"重启失败：{exc}")
 
@@ -266,7 +295,7 @@ class Supervisor:
         try:
             await asyncio.wait_for(proc.wait(), timeout=STOP_TIMEOUT)
             return
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self.logs.write(
                 state.name,
                 f"{STOP_TIMEOUT:.0f}s 内未退出（pid={pid}），强制结束进程树",
@@ -294,7 +323,8 @@ class Supervisor:
         for name in self.specs:
             try:
                 await self.start(name)
-            except Exception as exc:
+            # start_all 中单个进程失败只记日志，不阻断其余进程。
+            except Exception as exc:  # noqa: BLE001
                 self.logs.write("supervisor", f"{name} 启动失败：{exc}")
 
     async def stop_all(self) -> None:
@@ -436,10 +466,10 @@ async def _http_probe(url: str, timeout: float = 1.0) -> bool:
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=timeout)
-        ) as client:
-            async with client.get(url) as resp:
-                return resp.status < 500
-    except Exception:
+        ) as client, client.get(url) as resp:
+            return resp.status < 500
+    # 无会话就绪探测失败按「不可达」处理。
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -493,8 +523,9 @@ def _find_listener_pid(port: int) -> int | None:
             timeout=5,
             encoding="mbcs",
             errors="replace",
+            check=False,
         ).stdout
-    except Exception:
+    except Exception:  # noqa: BLE001 - 探测失败只表示「查不到」，调用方按无 PID 处理
         return None
     for line in out.splitlines():
         parts = line.split()

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 import logging
 import shutil
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import aiohttp
 
@@ -84,12 +84,16 @@ class HealthMonitor:
             states = self.supervisor.status()
         except Exception as exc:  # noqa: BLE001 - 状态读取失败不打断探活
             log.warning("读取进程状态失败：%s", exc)
-            return {}
-        return {
+            return {"wechat_bridge": {"status": "disabled"}}
+        processes = {
             str(item.get("name")): item
             for item in states
             if isinstance(item, dict) and item.get("name")
         }
+        # 微信桥是可选进程：没有该 spec 时补一个 disabled 占位，
+        # 让告警和面板拿到稳定的键；真实状态存在时原样透传。
+        processes.setdefault("wechat_bridge", {"status": "disabled"})
+        return processes
 
     async def _session_or_create(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -112,7 +116,7 @@ class HealthMonitor:
                 if resp.status >= 400:
                     return {"ok": False, "error": f"HTTP {resp.status}"}
                 data = await resp.json(content_type=None)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return {"ok": False, "error": "探活超时"}
         except Exception as exc:  # noqa: BLE001 - 连接失败只降级
             return {"ok": False, "error": exc.__class__.__name__}
@@ -199,4 +203,4 @@ def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(float(epoch), SHANGHAI).isoformat(timespec="seconds")
 
 
-__all__ = ["HealthMonitor", "BOT_PROBE_TIMEOUT"]
+__all__ = ["BOT_PROBE_TIMEOUT", "HealthMonitor"]

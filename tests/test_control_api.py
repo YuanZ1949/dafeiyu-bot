@@ -18,7 +18,7 @@ from dafeiyu import control as control_module
 from dafeiyu.behavior import BehaviorSettings
 from dafeiyu.brain.client import BrainClient
 from dafeiyu.brain.factory import mode_status
-from dafeiyu.config import load_settings
+from dafeiyu.config import GroupsConfig, load_settings
 from dafeiyu.control import BrainControl, MemoryActions, create_app
 from dafeiyu.memory.store import MAX_MEMORY_PAGE, Store
 from dafeiyu.models import ChatType, Message
@@ -41,6 +41,7 @@ class FakeService:
         self.brain = FakeBrain()
         self.impressions = None
         self.behavior = BehaviorSettings()
+        self.groups = GroupsConfig(frozenset(), frozenset(), frozenset())
 
     def set_brain(self, brain):
         previous = self.brain
@@ -49,6 +50,9 @@ class FakeService:
 
     def set_behavior(self, behavior):
         self.behavior = behavior
+
+    def set_groups(self, groups):
+        self.groups = groups
 
 
 class FakeAdapter:
@@ -443,13 +447,13 @@ async def test_memory_endpoint_returns_store_rows(tmp_path: Path) -> None:
     assert resp.status == 200
     summary = payload["summaries"][0]
     assert summary["chat_type"] == "group"
-    assert summary["chat_id"] == 100
+    assert summary["chat_id"] == "100"
     assert summary["date"] == "2026-10-24"
     assert summary["content"] == "昨天聊了钓鱼"
     impression = payload["impressions"][0]
     assert impression["chat_type"] == "group"
-    assert impression["chat_id"] == 100
-    assert impression["subject_user_id"] == 42
+    assert impression["chat_id"] == "100"
+    assert impression["subject_user_id"] == "42"
     assert impression["kind"] == "preference"
     assert impression["content"] == "喜欢猫"
     assert impression["confidence"] == 0.9
@@ -518,7 +522,7 @@ async def test_memory_endpoint_filters_by_chat_type_and_chat_id(tmp_path: Path) 
 
     assert resp.status == 200
     assert [i["content"] for i in payload["impressions"]] == ["私聊印象"]
-    assert [i["chat_id"] for i in group_payload["impressions"]] == [100]
+    assert [i["chat_id"] for i in group_payload["impressions"]] == ["100"]
 
 
 async def test_memory_endpoint_pages_with_offset(tmp_path: Path) -> None:
@@ -542,8 +546,8 @@ async def test_memory_endpoint_pages_with_offset(tmp_path: Path) -> None:
         "offset=-1",
         "offset=abc",
         "chat_type=bad",
-        "chat_id=0",
-        "chat_id=abc",
+        "chat_id=bad%20id",
+        "chat_id=..%2Fx",
     ],
 )
 async def test_memory_endpoint_rejects_invalid_query(tmp_path: Path, query: str) -> None:
@@ -602,7 +606,7 @@ async def test_post_summary_runs_action_with_target(tmp_path: Path) -> None:
     assert payload == {"ok": True, "date": "2026-10-24", "summary": "昨天聊了钓鱼"}
     assert seen == {
         "chat_type": ChatType.PRIVATE,
-        "chat_id": 200,
+        "chat_id": "200",
         "date": "2026-10-24",
     }
 
@@ -664,8 +668,8 @@ async def test_post_summary_reports_quota_pause(tmp_path: Path) -> None:
     [
         {"chat_type": "channel", "chat_id": 100},
         {"chat_type": "group"},
-        {"chat_type": "group", "chat_id": 0},
-        {"chat_type": "group", "chat_id": "abc"},
+        {"chat_type": "group", "chat_id": "bad id"},
+        {"chat_type": "group", "chat_id": "../etc"},
         {"chat_type": "group", "chat_id": 100, "date": "2026/10/24"},
     ],
 )
@@ -694,7 +698,7 @@ async def test_post_impressions_returns_added_count(tmp_path: Path) -> None:
 
     assert resp.status == 200
     assert payload == {"ok": True, "added": 3}
-    assert seen == {"chat_type": ChatType.GROUP, "chat_id": 100}
+    assert seen == {"chat_type": ChatType.GROUP, "chat_id": "100"}
 
 
 async def test_post_impressions_reports_failure(tmp_path: Path) -> None:
@@ -998,7 +1002,7 @@ async def test_usage_endpoint_fills_empty_days(tmp_path: Path) -> None:
     }
     assert payload["totals"] == {"calls": 2, "errors": 1, "tokens": 24}
     assert payload["top"] == [
-        {"chat_type": "group", "chat_id": 100, "calls": 2, "errors": 1, "tokens": 24}
+        {"chat_type": "group", "chat_id": "100", "calls": 2, "errors": 1, "tokens": 24}
     ]
     assert len(payload["recent_errors"]) == 1
     assert re.fullmatch(r"\d\d-\d\d \d\d:\d\d", payload["recent_errors"][0]["at"])
@@ -1101,7 +1105,7 @@ async def test_export_endpoint_validates_scope_and_format(tmp_path: Path) -> Non
     async with running(app) as client:
         assert (await client.get("/api/memory/export")).status == 400
         assert (
-            await client.get("/api/memory/export?chat_type=group&chat_id=0")
+            await client.get("/api/memory/export?chat_type=group&chat_id=bad%20id")
         ).status == 400
         assert (
             await client.get(
@@ -1144,7 +1148,7 @@ async def test_sessions_endpoint_and_actions(tmp_path: Path) -> None:
 
     async with running(app) as client:
         payload = await (await client.get("/api/sessions")).json()
-        assert [item["chat_id"] for item in payload["items"]] == [100, 200]
+        assert [item["chat_id"] for item in payload["items"]] == ["100", "200"]
         assert payload["items"][0]["session_id"] == "ses_abc"
         assert payload["total"] == 2
 
@@ -1154,7 +1158,7 @@ async def test_sessions_endpoint_and_actions(tmp_path: Path) -> None:
         assert page["total"] == 2
         assert page["limit"] == 1
         assert page["offset"] == 1
-        assert [item["chat_id"] for item in page["items"]] == [200]
+        assert [item["chat_id"] for item in page["items"]] == ["200"]
 
         new = await client.post("/api/sessions/group/100/new")
         assert new.status == 200
@@ -1166,16 +1170,16 @@ async def test_sessions_endpoint_and_actions(tmp_path: Path) -> None:
         assert control.store.count_messages(ChatType.GROUP, 100) == 0
         assert control.store.get_summary(ChatType.GROUP, 200, "2026-10-23") is not None
 
-        calls: list[tuple[ChatType, int]] = []
+        calls: list[tuple[ChatType, str]] = []
 
-        async def forget_chat(chat_type: ChatType, chat_id: int) -> None:
+        async def forget_chat(chat_type: ChatType, chat_id: str) -> None:
             calls.append((chat_type, chat_id))
             control.store.forget_chat(chat_type, chat_id)
 
         service.forget_chat = forget_chat
         deleted = await client.delete("/api/sessions/group/100")
         assert deleted.status == 200
-        assert calls == [(ChatType.GROUP, 100)]
+        assert calls == [(ChatType.GROUP, "100")]
         assert control.store.count_summaries(ChatType.GROUP, 100) == 0
 
 
@@ -1184,7 +1188,7 @@ async def test_session_action_rejects_unknown(tmp_path: Path) -> None:
     async with running(app) as client:
         assert (await client.post("/api/sessions/group/1/rotate")).status == 400
         assert (await client.post("/api/sessions/team/1/new")).status == 400
-        assert (await client.delete("/api/sessions/group/abc")).status == 400
+        assert (await client.delete("/api/sessions/group/bad%20id")).status == 400
         assert (await client.get("/api/sessions?limit=0")).status == 400
         assert (await client.get("/api/sessions?limit=201")).status == 400
         assert (await client.get("/api/sessions?offset=-1")).status == 400
@@ -1202,7 +1206,7 @@ async def test_config_endpoint_has_thresholds_and_no_secrets(tmp_path: Path) -> 
     assert "api_key" not in raw
     assert payload["brain"]["provider"] == "token"
     assert payload["persona"]["os_probability"] == 0.05
-    assert payload["cooldown"] == {"tool_hint_seconds": 60.0}
+    assert payload["cooldown"] == {}
     assert payload["behavior"]["chat_intensity"] == "normal"
     assert payload["behavior"]["restriction_mode"] == "off"
     assert payload["rate_limit"] == {
@@ -1270,6 +1274,129 @@ async def test_behavior_put_rejects_invalid_values(tmp_path: Path, monkeypatch) 
     assert not_object.status == 400
 
 
+def _seed_group_chat(store: Store, chat_id: str, message_id: str) -> None:
+    """直接写一条群消息，让 chat_overview() 能列出这个会话。"""
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id=chat_id,
+            user_id="42",
+            nickname="鱼片",
+            content="hi",
+            message_id=message_id,
+            timestamp=1_700_000_000,
+        )
+    )
+
+
+async def test_groups_get_defaults_to_unrestricted_and_lists_known(
+    tmp_path: Path,
+) -> None:
+    """默认为空白名单：empty_means=all 是前端「留空 = 不限制」文案的来源。"""
+    control, _, app = make_control(tmp_path)
+    _seed_group_chat(control.store, "qq:1001", "g1")
+    control.store.add_message(
+        Message(
+            chat_type=ChatType.PRIVATE,
+            chat_id="qq:1001",
+            user_id="42",
+            nickname="鱼片",
+            content="private",
+            message_id="p1",
+            timestamp=1_700_000_001,
+        )
+    )
+    async with running(app) as client:
+        payload = await (await client.get("/api/groups")).json()
+
+    assert payload["whitelist"] == []
+    assert payload["blacklist"] == []
+    assert payload["empty_means"] == "all"
+    assert [item["chat_id"] for item in payload["known"]] == ["qq:1001"]
+    assert payload["known"][0]["channel"] == "qq"
+    assert payload["known"][0]["title"] == ""
+
+
+async def test_groups_put_persists_and_applies_runtime_whitelist(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """保存后覆盖层落盘、Service 即时看到新值；数字补 qq:、大小写归一。"""
+    overrides = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_module, "OVERRIDES_PATH", overrides)
+    _, service, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.put(
+            "/api/groups", json={"whitelist": [123456, "wxg:AbC"]}
+        )
+        assert resp.status == 200
+        saved = await resp.json()
+
+    assert saved["whitelist"] == ["qq:123456", "wxg:abc"]
+    assert service.groups.whitelist == frozenset({"qq:123456", "wxg:abc"})
+    text = overrides.read_text(encoding="utf-8")
+    assert "qq:123456" in text
+    assert "wxg:abc" in text
+
+
+async def test_groups_put_empty_clears_whitelist(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """空列表必须盖掉已有白名单（留空 = 不限制回复对象）。"""
+    monkeypatch.setattr(
+        control_module, "OVERRIDES_PATH", tmp_path / "settings.local.yaml"
+    )
+    _, service, app = make_control(tmp_path)
+    async with running(app) as client:
+        await client.put("/api/groups", json={"whitelist": ["qq:1"]})
+        resp = await client.put("/api/groups", json={"whitelist": []})
+        saved = await resp.json()
+
+    assert saved["whitelist"] == []
+    assert service.groups.whitelist == frozenset()
+
+
+async def test_groups_put_rejects_invalid_id_without_changing_runtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """校验失败不能改线上白名单，也不能留下半份覆盖层。"""
+    monkeypatch.setattr(
+        control_module, "OVERRIDES_PATH", tmp_path / "settings.local.yaml"
+    )
+    _, service, app = make_control(tmp_path)
+    async with running(app) as client:
+        await client.put("/api/groups", json={"whitelist": ["qq:1"]})
+        bad = await client.put("/api/groups", json={"whitelist": ["not-an-id"]})
+        missing = await client.put("/api/groups", json={})
+        not_object = await client.put("/api/groups", data="[]")
+
+    assert bad.status == 400
+    assert missing.status == 400
+    assert not_object.status == 400
+    assert service.groups.whitelist == frozenset({"qq:1"})
+
+
+async def test_groups_snapshot_resolves_wxg_title_for_panel(tmp_path: Path) -> None:
+    """wxg 别名本身不可读；面板靠注入的 resolver 显示群名。"""
+    settings = make_settings(tmp_path)
+    store = Store(tmp_path / "test.db")
+    store.init_schema()
+    _seed_group_chat(store, "wxg:abc", "g1")
+    service = FakeService()
+    control = BrainControl(
+        settings,
+        store,
+        service,
+        FakeAdapter(),
+        runtime_path=str(tmp_path / "runtime.json"),
+        chat_titles=lambda chat_id: "锦绣壹号9#1101" if chat_id == "wxg:abc" else "",
+    )
+
+    payload = control.groups_snapshot()
+
+    assert payload["known"][0]["channel"] == "wxg"
+    assert payload["known"][0]["title"] == "锦绣壹号9#1101"
+
+
 def test_dashboard_exposes_new_panels() -> None:
     html = (
         Path(__file__).resolve().parents[1]
@@ -1289,6 +1416,10 @@ def test_dashboard_exposes_new_panels() -> None:
         'id="behavior-restriction-mode"',
         'id="behavior-banned-phrases"',
         'id="btn-save-behavior"',
+        'id="groups-whitelist"',
+        'id="groups-known"',
+        'id="btn-save-groups"',
+        'id="btn-refresh-groups"',
     ):
         assert anchor in html, f"面板缺少 {anchor}"
     assert "/api/usage?days=" in html
@@ -1297,6 +1428,7 @@ def test_dashboard_exposes_new_panels() -> None:
     assert "/api/sessions?limit=" in html
     assert "/api/config" in html
     assert "/api/behavior" in html
+    assert "/api/groups" in html
     assert "/api/backup" in html
     assert "loadSessions(true)" in html
     assert "c.memory.retention_days" in html
@@ -1324,7 +1456,7 @@ async def test_budget_endpoint_returns_report(tmp_path: Path) -> None:
 
     assert resp.status == 200
     assert data["chat_type"] == "group"
-    assert data["chat_id"] == 100
+    assert data["chat_id"] == "100"
     assert data["per_chat"]["calls"] == 1
     assert data["per_chat"]["tokens"] == 2000
     assert {
@@ -1344,8 +1476,8 @@ async def test_budget_endpoint_returns_report(tmp_path: Path) -> None:
     "query",
     [
         "chat_type=channel&chat_id=1",
-        "chat_type=group&chat_id=abc",
-        "chat_type=group&chat_id=0",
+        "chat_type=group&chat_id=bad%20id",
+        "chat_type=group&chat_id=..%2Fx",
         "chat_type=group",
         "chat_id=1",
     ],
@@ -1401,7 +1533,7 @@ async def test_delete_user_messages_returns_count_and_is_idempotent(
     assert second_data == {"ok": True, "deleted_messages": 0}
     assert control.store.count_messages(ChatType.GROUP, 100) == 1
     remaining = control.store.recent_messages(ChatType.GROUP, 100, 10)
-    assert [message.user_id for message in remaining] == [8]
+    assert [message.user_id for message in remaining] == ["8"]
 
 
 async def test_delete_user_messages_rejects_invalid_target(tmp_path: Path) -> None:
@@ -1414,10 +1546,10 @@ async def test_delete_user_messages_rejects_invalid_target(tmp_path: Path) -> No
                 "/api/memory/channel/100/user/7", json={"confirm": "DELETE_USER"}
             ),
             await client.delete(
-                "/api/memory/group/0/user/7", json={"confirm": "DELETE_USER"}
+                "/api/memory/group/bad%20id/user/7", json={"confirm": "DELETE_USER"}
             ),
             await client.delete(
-                "/api/memory/group/100/user/0", json={"confirm": "DELETE_USER"}
+                "/api/memory/group/100/user/bad%20id", json={"confirm": "DELETE_USER"}
             ),
         ]
 

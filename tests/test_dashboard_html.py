@@ -194,7 +194,7 @@ def test_html_free_banner_needs_explicit_unavailable_flag() -> None:
     html = read_html()
     assert 'id="free-banner"' in html
     match = re.search(
-        r"function renderFreeBanner\(data\) \{\n(.*?)\n\}", html, re.S
+        r"function renderFreeBanner\(data\) \{\n(.*?)\n\}", html, re.DOTALL
     )
     assert match is not None, "renderFreeBanner 必须仍是一段可直接断言的函数体"
     body = match.group(1)

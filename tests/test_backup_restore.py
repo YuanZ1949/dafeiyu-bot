@@ -202,6 +202,37 @@ def test_validate_rejects_newer_schema(tmp_path: Path) -> None:
     assert "版本" in reason
 
 
+def test_validate_default_tracks_store_schema_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """默认参数必须缺省为 None 再解析 Store.SCHEMA_VERSION，防止重挂硬编码 1。"""
+    import inspect
+
+    default = (
+        inspect.signature(validate_database)
+        .parameters["max_schema_version"]
+        .default
+    )
+    assert default is None
+
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()  # v2 库
+
+    ok, reason = validate_database(db)
+    assert (ok, reason) == (True, "ok")
+
+    # 显式传低版本时仍按调用方的值拒绝，而不是“任意版本都接受”。
+    ok, reason = validate_database(db, max_schema_version=1)
+    assert ok is False
+    assert "版本" in reason
+
+    # 变异防护：把真源改成 1 后，默认调用必须跟着拒绝 v2 库。
+    monkeypatch.setattr(Store, "SCHEMA_VERSION", 1)
+    ok, reason = validate_database(db)
+    assert ok is False
+    assert "版本" in reason
+
+
 # ---- workspace（长期记忆） --------------------------------------------------
 
 

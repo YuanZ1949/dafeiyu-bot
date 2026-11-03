@@ -9,7 +9,6 @@ from dataclasses import dataclass, replace
 import httpx
 
 from ..netssl import default_ssl_context
-
 from .tokens import resolve_usage
 
 log = logging.getLogger(__name__)
@@ -17,7 +16,7 @@ log = logging.getLogger(__name__)
 # UTF-8 解码失败的残渣。丢了原字，但至少别把替换符发到群里。
 _REPLACEMENT_RE = re.compile(r"\ufffd+\??")
 # 抢救用：贪到最后一个引号，能吞掉字符串里插进来的裸引号。
-_REPLY_RE = re.compile(r'"reply"\s*:\s*"(.*)"', re.S)
+_REPLY_RE = re.compile(r'"reply"\s*:\s*"(.*)"', re.DOTALL)
 _SPEAK_FALSE_RE = re.compile(
     r'"speak"\s*:\s*(?:false|"false"|0|"no"|"off")', re.IGNORECASE
 )
@@ -272,7 +271,7 @@ class BrainClient:
     async def reply(
         self,
         chat_type: object,
-        chat_id: int,
+        chat_id: str,
         prompt: str,
         *,
         system: str = "",

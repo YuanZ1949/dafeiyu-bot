@@ -63,8 +63,8 @@ def make_msg(content="[图片]", segs=None, message_id="i1") -> Message:
         segs = [Segment("image", {"url": "http://x/a.png"})]
     return Message(
         chat_type=ChatType.GROUP,
-        chat_id=1001,
-        user_id=2002,
+        chat_id="qq:1001",
+        user_id="qq:2002",
         nickname="阿鱼",
         content=content,
         message_id=message_id,
@@ -343,6 +343,8 @@ def test_build_images_rejects_bad_values(key, value):
 
 
 class _FakeAdapter:
+    bot_id = "qq:999"
+
     def __init__(self):
         self.sent = []
         self.handler = None
@@ -378,7 +380,7 @@ async def test_handle_rewrites_content_before_store(tmp_path):
         2026, 10, 27, 12, 0, tzinfo=timezone(timedelta(hours=8))
     ))
     service = Service(
-        settings, store, _FakeBrain(), _FakeAdapter(), router, "你是溟月",
+        settings, store, _FakeBrain(), {"qq": _FakeAdapter()}, router, "你是溟月",
         workspace=Workspace(tmp_path),
     )
 
@@ -395,7 +397,7 @@ async def test_handle_rewrites_content_before_store(tmp_path):
     finally:
         images_mod._default_fetch = original
 
-    stored = store.recent_messages(ChatType.GROUP, 1001, 10)
+    stored = store.recent_messages(ChatType.GROUP, "qq:1001", 10)
     mine = [m for m in stored if m.message_id == "img-1"]
     assert mine, "消息没有落库"
     content = mine[0].content
@@ -421,7 +423,7 @@ async def test_handle_keeps_placeholder_without_tools(tmp_path):
     )
     brain = _FakeBrain()
     brain.supports_tools = False
-    service = Service(settings, store, brain, _FakeAdapter(), router, "test")
+    service = Service(settings, store, brain, {"qq": _FakeAdapter()}, router, "test")
 
     msg = make_msg(content="[图片]", message_id="img-2")
     fetch, calls = fake_fetch()
@@ -434,7 +436,7 @@ async def test_handle_keeps_placeholder_without_tools(tmp_path):
     finally:
         images_mod._default_fetch = original
 
-    stored = store.recent_messages(ChatType.GROUP, 1001, 10)
+    stored = store.recent_messages(ChatType.GROUP, "qq:1001", 10)
     mine = [m for m in stored if m.message_id == "img-2"]
     assert mine, "消息没有入库"
     assert mine[0].content == "[图片]"

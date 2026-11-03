@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import UTC
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ class RuntimeState:
     # 可用或未探测时为空串。同样只在内存里。
     free_reason: str = ""
 
-    def with_provider(self, provider: str, model: str = "") -> "RuntimeState":
+    def with_provider(self, provider: str, model: str = "") -> RuntimeState:
         if provider == "local_model":
             return RuntimeState(provider=provider, local_model_model=model or self.local_model_model)
         return RuntimeState(provider=provider, local_model_model=self.local_model_model)
@@ -68,6 +69,6 @@ def save_runtime(state: RuntimeState, path: str | Path = DEFAULT_PATH) -> None:
 
 
 def _now_iso() -> str:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    return datetime.now(UTC).isoformat(timespec="milliseconds")

@@ -1,6 +1,6 @@
 from dafeiyu.delivery.window import ChatWindow, due_at, note, on_flushed
 
-PARAMS = dict(batch_seconds=45, debounce=8, max_wait=30, ambient_gap=90)
+PARAMS = {"batch_seconds": 45, "debounce": 8, "max_wait": 30, "ambient_gap": 90}
 
 
 def test_plain_messages_flush_after_45s():

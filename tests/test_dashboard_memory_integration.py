@@ -17,7 +17,8 @@ from aiohttp.test_utils import TestClient, TestServer
 from conftest import TEST_CONFIG_YAML, TEST_DASHBOARD_LOOPBACK_YAML
 
 from dafeiyu.config import load_settings
-from dafeiyu.control import BrainControl, create_app as create_bot_app
+from dafeiyu.control import BrainControl
+from dafeiyu.control import create_app as create_bot_app
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.supervisor.dashboard import create_app as create_dashboard_app
@@ -79,8 +80,8 @@ class FakeSupervisor:
 def seed(store: Store) -> None:
     store.upsert_summary(ChatType.GROUP, GROUP_ID, "2026-10-24", "群里聊了显卡和钓鱼")
     store.upsert_summary(ChatType.PRIVATE, PRIVATE_ID, "2026-10-23", "私聊聊了晚饭")
-    store.upsert_impression(ChatType.GROUP, GROUP_ID, 42, "nickname", "外号叫鱼片", 0.9)
-    store.upsert_impression(ChatType.GROUP, GROUP_ID, 43, "preference", "喜欢猫", 0.8)
+    store.upsert_impression(ChatType.GROUP, GROUP_ID, "qq:42", "nickname", "外号叫鱼片", 0.9)
+    store.upsert_impression(ChatType.GROUP, GROUP_ID, "qq:43", "preference", "喜欢猫", 0.8)
 
 
 async def test_dashboard_memory_reads_seeded_store_end_to_end(tmp_path: Path) -> None:
@@ -211,7 +212,7 @@ async def boot(tmp_path: Path):
 
 
 async def test_dashboard_timeline_proxy_end_to_end(tmp_path: Path) -> None:
-    async with boot(tmp_path) as (dash, store):
+    async with boot(tmp_path) as (dash, _store):
         resp = await dash.get(
             f"/api/sessions/group/{GROUP_ID}/timeline?limit=1"
         )
@@ -272,7 +273,7 @@ async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
         assert usage["series"][-1]["calls"] == 1
         assert usage["series"][-1]["errors"] == 1
         assert usage["series"][-1]["tokens"] == 15
-        assert usage["top"][0]["chat_id"] == GROUP_ID
+        assert usage["top"][0]["chat_id"] == str(GROUP_ID)
 
         found = await (
             await dash.get("/api/memory/search", params={"q": "显卡"})
@@ -303,14 +304,16 @@ async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
         assert len(bundle["summaries"]) == 1
 
         sessions = await (await dash.get("/api/sessions")).json()
-        row = next(item for item in sessions["items"] if item["chat_id"] == GROUP_ID)
+        row = next(
+            item for item in sessions["items"] if item["chat_id"] == str(GROUP_ID)
+        )
         assert row["message_count"] == 2
         assert row["session_id"] == "ses_demo"
         assert row["summary_count"] == 1
 
         config = await (await dash.get("/api/config")).json()
         assert config["brain"]["provider"] == "token"
-        assert config["cooldown"] == {"tool_hint_seconds": 60.0}
+        assert config["cooldown"] == {}
         assert config["behavior"]["chat_intensity"] == "normal"
         assert config["memory"]["retention_days"] == 180
 
@@ -343,14 +346,35 @@ async def test_dashboard_extension_end_to_end(tmp_path: Path) -> None:
         assert store.count_summaries(ChatType.GROUP, GROUP_ID) == 0
 
 
+async def test_dashboard_timeline_proxy_accepts_wechat_id(tmp_path: Path) -> None:
+    async with boot(tmp_path) as (dash, store):
+        store.add_message(
+            Message(
+                chat_type=ChatType.GROUP,
+                chat_id="wxg:abc",
+                user_id="wxg:abc",
+                nickname="鱼片",
+                content="微信消息",
+                message_id="w0",
+                timestamp=1_700_000_100,
+            )
+        )
+        resp = await dash.get("/api/sessions/group/wxg:abc/timeline")
+        data = await resp.json()
+
+    assert resp.status == 200
+    assert data["chat"]["chat_id"] == "wxg:abc"
+    assert [m["content"] for m in data["messages"]] == ["微信消息"]
+
+
 async def test_dashboard_impression_edit_and_merge_proxy(tmp_path: Path) -> None:
     group = ChatType.GROUP
     async with boot(tmp_path) as (dash, store):
-        store.upsert_impression(group, GROUP_ID, 42, "preference", "喜欢狗", 0.5)
+        store.upsert_impression(group, GROUP_ID, "qq:42", "preference", "喜欢狗", 0.5)
         rows = [
             row
             for row in store.list_impressions(group, GROUP_ID, topk=100)
-            if row.subject_user_id == 42
+            if row.subject_user_id == "qq:42"
         ]
         assert len(rows) == 2
         edit_id = rows[0].id
@@ -377,7 +401,7 @@ async def test_dashboard_impression_edit_and_merge_proxy(tmp_path: Path) -> None
             [
                 row
                 for row in store.list_impressions(group, GROUP_ID, topk=100)
-                if row.subject_user_id == 42
+                if row.subject_user_id == "qq:42"
             ]
         ) == 1
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -232,7 +233,7 @@ async def test_control_reports_partial_failure(tmp_path: Path) -> None:
             if name == "bot":
                 raise RuntimeError("端口被占用")
 
-    app, supervisor, _ = make_app(tmp_path, supervisor=Failing())
+    app, _supervisor, _ = make_app(tmp_path, supervisor=Failing())
     async with running(app) as client:
         resp = await client.post("/api/control/start", json={"target": "all"})
         data = await resp.json()
@@ -926,3 +927,99 @@ async def test_index_audit_rows_render_expandable_details(tmp_path: Path) -> Non
     # 审计内容一律走 textContent，避免 detail 里的 HTML 被当标签执行。
     assert "summary.textContent" in text
     assert "pre.textContent" in text
+
+
+async def test_index_has_channel_controls_and_string_ids(tmp_path: Path) -> None:
+    app, _, _ = make_app(tmp_path)
+    async with running(app) as client:
+        resp = await client.get("/")
+        text = await resp.text()
+
+    assert resp.status == 200
+    assert 'id="btn-wechat-stop"' in text
+    assert 'id="btn-wechat-resume"' in text
+    assert 'data-channel="wechat"' in text
+    assert 'id="health-channels"' in text
+    assert 'Number($("debug-chat-id").value)' not in text
+    assert 'Number($("debug-user-id").value)' not in text
+    assert (
+        re.search(
+            r'id="(debug-chat-id|debug-user-id|memory-chat-id|delete-user-chat-id|delete-user-id|budget-chat-id|search-chat-id)"[^>]*type="number"',
+            text,
+        )
+        is None
+    )
+
+
+async def test_channel_stop_resume_proxy(tmp_path: Path) -> None:
+    seen: list[tuple[str, str]] = []
+
+    async def wechat_stop(request: web.Request) -> web.Response:
+        seen.append((request.method, request.path))
+        return web.json_response({"ok": True, "event": "stop"})
+
+    async def wechat_resume(request: web.Request) -> web.Response:
+        seen.append((request.method, request.path))
+        return web.json_response({"error": "急停中，无法恢复"}, status=409)
+
+    bot_app = web.Application()
+    bot_app.router.add_post("/api/channels/wechat/stop", wechat_stop)
+    bot_app.router.add_post("/api/channels/wechat/resume", wechat_resume)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    try:
+        app, _, _ = make_app(tmp_path, bot_url=url)
+        async with running(app) as client:
+            stop_resp = await client.post("/api/channels/wechat/stop", json={})
+            stop_data = await stop_resp.json()
+            resume_resp = await client.post("/api/channels/wechat/resume", json={})
+            resume_data = await resume_resp.json()
+    finally:
+        await bot_client.close()
+
+    assert stop_resp.status == 200
+    assert stop_data == {"ok": True, "event": "stop"}
+    assert resume_resp.status == 409
+    assert resume_data == {"error": "急停中，无法恢复"}
+    assert seen == [
+        ("POST", "/api/channels/wechat/stop"),
+        ("POST", "/api/channels/wechat/resume"),
+    ]
+
+
+async def test_session_timeline_rejects_traversal_without_calling_bot(
+    tmp_path: Path,
+) -> None:
+    seen: list[tuple[str, str]] = []
+
+    async def timeline_endpoint(request: web.Request) -> web.Response:
+        seen.append((request.method, request.path))
+        return web.json_response(
+            {"messages": [], "chat": {"chat_id": request.match_info["chat_id"]}}
+        )
+
+    bot_app = web.Application()
+    bot_app.router.add_get(
+        "/api/sessions/{chat_type}/{chat_id}/timeline", timeline_endpoint
+    )
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    try:
+        app, _, _ = make_app(tmp_path, bot_url=url)
+        async with running(app) as client:
+            bad = await client.get("/api/sessions/group/%2e%2e%5cetc/timeline")
+            invalid = await client.get("/api/sessions/group/bad%20id/timeline")
+            invalid_data = await invalid.json()
+            good = await client.get("/api/sessions/group/wxg:abc/timeline")
+            good_data = await good.json()
+    finally:
+        await bot_client.close()
+
+    assert bad.status == 400
+    assert invalid.status == 400
+    assert "格式非法" in invalid_data["error"]
+    assert good.status == 200
+    assert good_data["chat"]["chat_id"] == "wxg:abc"
+    assert seen == [("GET", "/api/sessions/group/wxg:abc/timeline")]

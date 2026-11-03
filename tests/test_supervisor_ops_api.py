@@ -321,7 +321,7 @@ async def test_restore_with_file_and_confirm(tmp_path: Path) -> None:
 
 
 async def test_audit_endpoint_and_process_control(tmp_path: Path) -> None:
-    app, supervisor, _ops, audit = make_app(tmp_path)
+    app, supervisor, _ops, _audit = make_app(tmp_path)
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
@@ -538,8 +538,8 @@ async def test_user_delete_forwards_confirmation_and_writes_audit(
     assert rows[0]["detail"] == {
         "deleted_messages": 3,
         "chat_type": "group",
-        "chat_id": 100,
-        "user_id": 7,
+        "chat_id": "100",
+        "user_id": "7",
     }
     raw_audit = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
     assert "不能进审计的消息正文" not in raw_audit

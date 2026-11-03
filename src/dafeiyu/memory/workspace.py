@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from dafeiyu.models import ChatType
@@ -8,6 +9,8 @@ from dafeiyu.timeutil import today_shanghai
 MEMORY_TEMPLATE = "# 大肥鱼的长期记忆\n"
 TRUNCATED_TEMPLATE = "<!-- truncated {date} -->"
 TRUNCATION_SUFFIX = "（还有 {n} 行未展开）"
+_CHAT_ID_SAFE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_LEGACY_QQ_ID = re.compile(r"qq:([0-9]+)")
 
 
 class Workspace:
@@ -32,11 +35,35 @@ class Workspace:
     def global_path(self) -> Path:
         return self.root / "MEMORY.md"
 
-    def chat_path(self, chat_type: ChatType, chat_id: int) -> Path:
-        # chat_id 必须来自平台数字 ID；显式拒绝字符串，堵死 ../ 之类的路径注入。
-        if not isinstance(chat_id, int):
-            raise TypeError(f"chat_id must be int, got {type(chat_id).__name__}")
-        return self.root / "chats" / f"{chat_type.value}-{chat_id}.md"
+    def chat_path(self, chat_type: ChatType, chat_id: str) -> Path:
+        # chat_id 必须是带通道前缀的字符串 id；`:`（Windows 非法字符）换成 `_`，
+        # 其余字符过白名单，堵死 ../ 之类的路径注入。
+        if not isinstance(chat_id, str):
+            raise TypeError(f"chat_id must be str, got {type(chat_id).__name__}")
+        safe = chat_id.replace(":", "_")
+        if not _CHAT_ID_SAFE.match(safe) or ".." in safe:
+            raise ValueError(f"chat_id 含非法字符：{chat_id!r}")
+        # 必须保留 chat_type 前缀：同 uin 的群聊与私聊不能共用一个笔记文件。
+        return self.root / "chats" / f"{chat_type.value}_{safe}.md"
+
+    def _legacy_chat_path(self, chat_type: ChatType, chat_id: str) -> Path | None:
+        """v1 的旧文件名 `chats/{chat_type}-{数字}.md`；只有 `qq:<数字>` 才有遗留文件。"""
+        match = _LEGACY_QQ_ID.fullmatch(chat_id) if isinstance(chat_id, str) else None
+        if match is None:
+            return None
+        return self.root / "chats" / f"{chat_type.value}-{match.group(1)}.md"
+
+    def _chat_file(self, chat_type: ChatType, chat_id: str) -> Path:
+        """读笔记用的路径：新文件不存在时把旧文件迁移过来（复制，不删旧文件）。"""
+        path = self.chat_path(chat_type, chat_id)
+        if path.exists():
+            return path
+        legacy = self._legacy_chat_path(chat_type, chat_id)
+        if legacy is None or not legacy.exists():
+            return path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(legacy.read_bytes())
+        return path
 
     # ---- 读取 ---------------------------------------------------------
 
@@ -75,14 +102,14 @@ class Workspace:
     def read_for(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         *,
         global_chars: int,
         chat_chars: int,
     ) -> str:
         parts = [
             self.read_segment(self.global_path(), global_chars),
-            self.read_segment(self.chat_path(chat_type, chat_id), chat_chars),
+            self.read_segment(self._chat_file(chat_type, chat_id), chat_chars),
         ]
         return "\n\n".join(p for p in parts if p)
 
@@ -104,7 +131,7 @@ class Workspace:
         head = f"{title}\n{comment}\n"
         if len(head.encode("utf-8")) > max_bytes:
             # 极端情况下标题本身就超限：先裁标题，保证结果仍不越界。
-            room = max(0, max_bytes - len(f"{comment}\n".encode("utf-8")))
+            room = max(0, max_bytes - len(f"{comment}\n".encode()))
             title = title.encode("utf-8")[:room].decode("utf-8", errors="ignore")
             head = f"{title}\n{comment}\n"
 

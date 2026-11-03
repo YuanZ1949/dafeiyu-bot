@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from conftest import TEST_CONFIG_YAML
 
 from dafeiyu.config import load_settings
 from dafeiyu.supervisor.health import HealthMonitor
 from dafeiyu.supervisor.ops import OpsServices
-from conftest import TEST_CONFIG_YAML
 
 
 class FakeSupervisor:
@@ -166,6 +165,61 @@ async def test_snapshot_reads_bot_health_over_http(tmp_path: Path) -> None:
     assert snap["bot"]["ok"] is True
     assert snap["ok"] is True
     assert snap["processes"]["bot"]["status"] == "running"
+
+
+async def test_snapshot_injects_disabled_wechat_bridge(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    client = TestClient(TestServer(bot_app()))
+    await client.start_server()
+    monitor = HealthMonitor(
+        supervisor=FakeSupervisor(),
+        settings=settings,
+        bot_url=str(client.make_url("")).rstrip("/"),
+        token="t",
+        backups=FakeBackups(),
+    )
+    try:
+        snap = await monitor.snapshot()
+    finally:
+        await monitor.close()
+        await client.close()
+
+    assert snap["processes"]["wechat_bridge"] == {"status": "disabled"}
+    # disabled 不是失败：整体健康仍为 True。
+    assert snap["ok"] is True
+
+
+async def test_snapshot_passes_through_wechat_bridge_status(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    client = TestClient(TestServer(bot_app()))
+    await client.start_server()
+    supervisor = FakeSupervisor(
+        {
+            "bot": "running",
+            "opencode": "running",
+            "napcat": "running",
+            "wechat_bridge": "running",
+        }
+    )
+    monitor = HealthMonitor(
+        supervisor=supervisor,
+        settings=settings,
+        bot_url=str(client.make_url("")).rstrip("/"),
+        token="t",
+        backups=FakeBackups(),
+    )
+    try:
+        snap = await monitor.snapshot()
+    finally:
+        await monitor.close()
+        await client.close()
+
+    assert snap["processes"]["wechat_bridge"] == {
+        "name": "wechat_bridge",
+        "status": "running",
+        "restart_count": 0,
+    }
+    assert snap["ok"] is True
 
 
 async def test_failed_process_makes_overall_unhealthy(tmp_path: Path) -> None:

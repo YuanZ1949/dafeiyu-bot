@@ -111,6 +111,79 @@ def test_health_snapshot_shape_and_no_secrets(tmp_path: Path) -> None:
     assert "sk-test" not in text
 
 
+def test_health_snapshot_reports_per_channel_state(tmp_path: Path) -> None:
+    control, adapter, _store, _app = make_control(tmp_path)
+    adapter.last_event_at = 1_700_000_000
+    adapter.last_disconnect_at = 1_700_000_050
+    adapter.last_send_at = 1_700_000_100
+    control.service.channel_status = lambda: {
+        "qq": {
+            "connected": True,
+            "degraded": False,
+            "last_event_at": 1_700_000_000,
+            "last_disconnect_at": None,
+            "last_send_at": 1_700_000_100,
+        },
+        "wechat": {
+            "connected": False,
+            "degraded": True,
+            "last_event_at": 1_700_000_200,
+            "last_disconnect_at": 1_700_000_300,
+            "last_send_at": 1_700_000_400,
+            "logged_in": False,
+            "desktop": "locked",
+        },
+    }
+
+    snapshot = control.health_snapshot()
+
+    # 顶层 gateway 继续来自 self.adapter，旧面板与旧探针不受影响。
+    assert snapshot["gateway"]["connected"] is True
+    assert snapshot["gateway"]["last_event_at"].startswith("2023-")
+    assert snapshot["gateway"]["last_disconnect_at"].startswith("2023-")
+
+    channels = snapshot["channels"]
+    assert set(channels) == {"qq", "wechat"}
+    required = {
+        "connected",
+        "degraded",
+        "last_event_at",
+        "last_disconnect_at",
+        "last_send_at",
+    }
+    for name in ("qq", "wechat"):
+        assert required <= set(channels[name])
+        assert isinstance(channels[name]["connected"], bool)
+        assert isinstance(channels[name]["degraded"], bool)
+        assert channels[name]["last_event_at"].startswith("2023-")
+        assert channels[name]["last_send_at"].startswith("2023-")
+
+    assert channels["qq"]["last_disconnect_at"] is None
+    assert "logged_in" not in channels["qq"]
+    assert "desktop" not in channels["qq"]
+    assert channels["wechat"]["last_disconnect_at"].startswith("2023-")
+    assert channels["wechat"]["logged_in"] is False
+    assert channels["wechat"]["desktop"] == "locked"
+
+
+def test_health_snapshot_channel_status_failure_keeps_snapshot(
+    tmp_path: Path,
+) -> None:
+    control, adapter, _store, _app = make_control(tmp_path)
+    adapter.last_event_at = 1_700_000_000
+
+    def boom():
+        raise RuntimeError("channel status broken")
+
+    control.service.channel_status = boom
+    snapshot = control.health_snapshot()
+
+    assert snapshot["channels"] == {}
+    assert snapshot["ok"] is True
+    assert snapshot["gateway"]["connected"] is True
+    assert snapshot["gateway"]["last_event_at"].startswith("2023-")
+
+
 def test_health_snapshot_budget_report(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     settings = replace(
@@ -275,7 +348,7 @@ async def test_notify_admin_unavailable_without_admin_or_gateway(
         ).status == 503
 
     (tmp_path / "second").mkdir()
-    control, adapter, _store, app = make_control(
+    _control, adapter, _store, app = make_control(
         tmp_path / "second", admins=frozenset({1}), token="t"
     )
     adapter.connected = False

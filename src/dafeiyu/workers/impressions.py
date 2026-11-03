@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from dafeiyu.brain.tokens import resolve_usage
 from dafeiyu.memory.store import Store
-from dafeiyu.models import ChatType, Message
+from dafeiyu.models import ChatType, Message, channel_of
 
 from .failure import FAILURE_BACKOFF_SECONDS, FailureBackoff, log_memory_failure
 
@@ -18,8 +19,9 @@ EXTRACT_SYSTEM = """\
 抽取值得长期记住的群友信息：外号/称呼（kind=nickname）、偏好与雷点（kind=preference）、
 稳定的事实（kind=fact，如职业、所在城市、养猫）。
 不要抽取一次性情绪、玩笑、隐私敏感信息（身份证、住址门牌、手机号、密码）。
+user_id 必须原样复制输入行里的前缀 id（含 "qq:"/"wxg:" 前缀），不要改写、不要漏掉前缀。
 只输出 JSON 数组，不要解释、不要代码围栏：
-[{"user_id": 123, "kind": "nickname", "content": "外号叫鱼片", "confidence": 0.8}]
+[{"user_id": "qq:123", "kind": "nickname", "content": "外号叫鱼片", "confidence": 0.8}]
 content 不超过 60 字。没有值得记的就输出 []。"""
 
 MAX_SOURCE_MESSAGES = 40
@@ -50,11 +52,16 @@ def _parse_items(raw: str) -> list[dict]:
     return [item for item in data if isinstance(item, dict)]
 
 
-def _valid_item(item: dict) -> tuple[int, str, str, float] | None:
+def _valid_item(item: dict) -> tuple[str, str, str, float] | None:
     user_id = item.get("user_id")
     kind = item.get("kind")
     content = item.get("content")
-    if not isinstance(user_id, int) or isinstance(user_id, bool):
+    # 平台 id 统一带前缀（"qq:123"/"wxg:abc"）：裸 int、空串或丢前缀的值一律丢弃。
+    if not isinstance(user_id, str):
+        return None
+    try:
+        channel_of(user_id)
+    except ValueError:
         return None
     if not isinstance(kind, str) or kind not in VALID_KINDS:
         return None
@@ -104,7 +111,7 @@ class ImpressionWorker:
     def paused(self) -> bool:
         return self._backoff.is_paused()
 
-    async def maybe_extract(self, chat_type: ChatType, chat_id: int) -> int:
+    async def maybe_extract(self, chat_type: ChatType, chat_id: str) -> int:
         """按会话累计消息数触发；同一批消息不会重复抽取。"""
         key = (chat_type, chat_id)
         if self._backoff.is_paused():
@@ -138,7 +145,7 @@ class ImpressionWorker:
     async def extract(
         self,
         chat_type: ChatType,
-        chat_id: int,
+        chat_id: str,
         messages: list[Message] | None = None,
     ) -> int | None:
         """抽取并写入印象；调用失败返回 None，供上层决定是否退避。
@@ -173,7 +180,8 @@ class ImpressionWorker:
                     max_tokens=600,
                 )
                 prompt_tokens = completion_tokens = 0
-        except Exception as exc:
+        # 失败已写日志并进入退避，后台 worker 不能被打挂。
+        except Exception as exc:  # noqa: BLE001
             log_memory_failure(log, "印象抽取", exc, chat_type, chat_id)
             self._backoff.mark_failed((chat_type, chat_id), exc)
             return None

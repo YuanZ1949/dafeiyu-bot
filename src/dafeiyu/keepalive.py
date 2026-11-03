@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 from .gateway.base import Adapter
 from .models import ChatType
@@ -28,14 +29,14 @@ class Keepalive:
     def __init__(
         self,
         adapter: Adapter,
-        bot_qq: int,
+        bot_qq: str,
         interval_seconds: float,
         *,
         text: str = KEEPALIVE_TEXT,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self.adapter = adapter
-        self.bot_qq = int(bot_qq)
+        self.bot_qq = str(bot_qq)
         self.interval_seconds = float(interval_seconds)
         self.text = text
         self._clock = clock or time.time

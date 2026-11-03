@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from dafeiyu.__main__ import build_workers
+from dafeiyu.__main__ import (
+    build_adapters,
+    build_workers,
+    log_active_channels,
+    wechat_enabled_for,
+)
 from dafeiyu.brain import factory
 from dafeiyu.brain.client import BrainClient
-from dafeiyu.config import load_settings
+from dafeiyu.config import GatewayConfig, load_settings
+from dafeiyu.gateway.channels import qq_enabled_for
+from dafeiyu.gateway.wechat import WeChatAdapter
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 
@@ -139,7 +147,7 @@ async def test_memory_workers_follow_brain_switch(tmp_path: Path) -> None:
         )
         old = RecordingBrain()
         new = RecordingBrain(
-            '[{"user_id": 1, "kind": "preference", "content": "喜欢钓鱼", "confidence": 0.9}]'
+            '[{"user_id": "qq:1", "kind": "preference", "content": "喜欢钓鱼", "confidence": 0.9}]'
         )
         current = {"brain": old}
         workers = build_workers(
@@ -184,3 +192,164 @@ def test_worker_wiring_warns_when_skipping(tmp_path: Path, caplog) -> None:
     assert "没有 complete_detailed" in text
     assert "opencode" in text
     assert f"transport={settings.opencode.transport}" in text
+
+
+# ---- Task 20：gateway.provider 通道接线 -------------------------------------
+
+
+def _gateway_yaml(provider: str, enabled: bool) -> str:
+    return (
+        "gateway:\n"
+        f"  provider: {provider}\n"
+        "  wechat:\n"
+        f"    enabled: {'true' if enabled else 'false'}\n"
+        "    bridge_port: 8791\n"
+        "    account_nickname: 大肥鱼\n"
+    )
+
+
+def make_gateway_settings(
+    tmp_path: Path, provider: str, *, enabled: bool
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(BASE + _gateway_yaml(provider, enabled), encoding="utf-8")
+    env = tmp_path / "test.env"
+    env.write_text(
+        "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n"
+        "DAFEIYU_WECHAT_BRIDGE_TOKEN=secret-token\n",
+        encoding="utf-8",
+    )
+    return load_settings(env_file=env, config_file=config)
+
+
+class ForbiddenWeChat:
+    def __init__(self, config) -> None:
+        raise AssertionError("不应构造 WeChatAdapter")
+
+
+def test_provider_qq_constructs_no_wechat_adapter(tmp_path: Path, monkeypatch) -> None:
+    settings = make_gateway_settings(tmp_path, "qq", enabled=True)
+    built: list[object] = []
+
+    class RecordingWeChat:
+        def __init__(self, config) -> None:
+            built.append(config)
+
+    monkeypatch.setattr("dafeiyu.__main__.WeChatAdapter", RecordingWeChat)
+
+    adapters = build_adapters(settings)
+
+    assert set(adapters) == {"qq"}
+    assert built == []
+    assert wechat_enabled_for(settings) is False
+
+
+def test_provider_qq_with_wechat_enabled_has_no_bridge_spec(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = make_gateway_settings(tmp_path, "qq", enabled=True)
+    monkeypatch.setattr("dafeiyu.__main__.WeChatAdapter", ForbiddenWeChat)
+
+    assert set(build_adapters(settings)) == {"qq"}
+
+    import dafeiyu.supervisor.main as supervisor_main
+
+    node_dir = tmp_path / "napcat"
+    node_dir.mkdir()
+    (node_dir / "node.exe").write_bytes(b"")
+    monkeypatch.setattr(supervisor_main, "NAPCAT_DIR", node_dir)
+    monkeypatch.setattr(
+        supervisor_main, "resolve_opencode_bin", lambda _bin: "opencode.exe"
+    )
+
+    specs = supervisor_main.build_specs(settings, "token-abc")
+
+    assert "wechat_bridge" not in specs
+
+
+def test_provider_both_constructs_both_adapters(tmp_path: Path) -> None:
+    settings = make_gateway_settings(tmp_path, "both", enabled=True)
+
+    assert wechat_enabled_for(settings) is True
+    adapters = build_adapters(settings)
+
+    assert set(adapters) == {"qq", "wechat"}
+    assert isinstance(adapters["wechat"], WeChatAdapter)
+
+
+def test_qq_enabled_for_mirrors_adapter_wiring(tmp_path: Path) -> None:
+    """supervisor 用它决定是否拉起 NapCat，必须与 build_adapters 逐条对齐。"""
+    assert qq_enabled_for(make_gateway_settings(tmp_path, "qq", enabled=True)) is True
+    assert qq_enabled_for(make_gateway_settings(tmp_path, "both", enabled=True)) is True
+    assert (
+        qq_enabled_for(make_gateway_settings(tmp_path, "wechat", enabled=True)) is False
+    )
+    # 微信没启用时 build_adapters 会回落 QQ，NapCat 必须照常启动。
+    assert (
+        qq_enabled_for(make_gateway_settings(tmp_path, "wechat", enabled=False)) is True
+    )
+
+
+def test_provider_wechat_without_enabled_degrades_with_warning(
+    tmp_path: Path, caplog
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="dafeiyu.config"):
+        settings = make_gateway_settings(tmp_path, "wechat", enabled=False)
+
+    assert settings.gateway.provider == "qq"
+    assert any(
+        "gateway.provider=wechat" in record.getMessage()
+        and "降级为 qq" in record.getMessage()
+        for record in caplog.records
+    )
+
+    # 配置层已经改写了 provider；接线层对「provider=wechat 且未启用」也必须
+    # 自己兜底，不能把微信适配器建出来。
+    forced = replace(settings, gateway=GatewayConfig(provider="wechat"))
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="dafeiyu.__main__"):
+        adapters = build_adapters(forced)
+
+    assert set(adapters) == {"qq"}
+    assert "降级为 qq" in caplog.text
+
+
+def test_provider_qq_never_reads_bridge_token(tmp_path: Path) -> None:
+    settings = make_gateway_settings(tmp_path, "qq", enabled=True)
+    inner = settings.wechat
+    assert inner.bridge_token == "secret-token"
+    accessed: list[str] = []
+
+    class SpyWeChat:
+        def __getattr__(self, name: str):
+            accessed.append(name)
+            if name == "bridge_token":
+                raise AssertionError(
+                    "provider=qq 不应读取 settings.wechat.bridge_token"
+                )
+            return getattr(inner, name)
+
+    spied = replace(settings, wechat=SpyWeChat())
+    adapters = build_adapters(spied)
+
+    assert set(adapters) == {"qq"}
+    assert "bridge_token" not in accessed
+
+
+def test_startup_logs_one_line_per_active_channel(tmp_path: Path, caplog) -> None:
+    settings = make_gateway_settings(tmp_path, "both", enabled=True)
+    adapters = build_adapters(settings)
+
+    with caplog.at_level(logging.INFO, logger="dafeiyu.__main__"):
+        log_active_channels(settings, adapters, "token")
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "dafeiyu.__main__"
+    ]
+    assert any("QQ 通道" in line for line in lines)
+    assert any(
+        "微信通道" in line and str(settings.wechat.bridge_port) in line
+        for line in lines
+    )

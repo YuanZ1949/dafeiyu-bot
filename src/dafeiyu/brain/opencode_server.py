@@ -11,8 +11,8 @@ from pathlib import Path
 
 import httpx
 
-from .client import BrainError
 from ..netssl import default_ssl_context
+from .client import BrainError
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +170,8 @@ class OpenCodeServer:
             try:
                 if await self._probe():
                     return
-            except Exception as exc:
+            # 探测异常只记录 last_error 并重试，最终统一抛 BrainError；不能把启动流程打挂。
+            except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
             await asyncio.sleep(0.25)
         detail = self.recent_output(20) or last_error
@@ -188,7 +189,7 @@ class OpenCodeServer:
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
                 await proc.wait()
         for task in tasks:
