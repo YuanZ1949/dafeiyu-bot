@@ -27,6 +27,9 @@ from dafeiyu.gateway.wechat_bridge.sender import Sender
 
 WINDOW = 4242
 ACCOUNT = "小助手"
+#: 前台被提权窗口占住时的「路障」窗口 / 微信主窗口（仅测试用假值）。
+ADMIN_WINDOW = 111
+WECHAT_MAIN = 9999
 
 
 class FakeClock:
@@ -91,6 +94,32 @@ class FakeDriver:
         return [call["at"] for call in self.calls if call["action"] == "send_text"]
 
 
+class FlakyOpenDriver(FakeDriver):
+    """前 `failures` 次 `open_chat` 抛错（模拟 UIPI 拦掉点击注入），之后正常。"""
+
+    def __init__(
+        self,
+        clock: FakeClock,
+        *,
+        failures: int = 1,
+        error: Exception | None = None,
+    ) -> None:
+        super().__init__(clock)
+        self.remaining = failures
+        self.error = error or DriverError(
+            "open_chat_failed", "There is no active desktop required for moving mouse cursor!"
+        )
+        self.attempts = 0
+
+    def open_chat(self, name: str) -> ChatHandle:
+        self.attempts += 1
+        if self.remaining > 0:
+            self.remaining -= 1
+            self._record("open_chat", name=name, failed=True)
+            raise self.error
+        return super().open_chat(name)
+
+
 def make_config(tmp_path: Path, **overrides) -> SimpleNamespace:
     values = {
         "kill_switch_file": str(tmp_path / "wechat.stop"),
@@ -108,10 +137,16 @@ def make_config(tmp_path: Path, **overrides) -> SimpleNamespace:
 
 @pytest.fixture(autouse=True)
 def fake_desktop(monkeypatch):
-    """默认桌面可交互、无输入、前台就是 FakeDriver 的窗口。"""
+    """默认桌面可交互、无输入、前台就是 FakeDriver 的窗口。
+
+    `wechat_main_window` / `bump_foreground` 也必须默认打桩：否则兜底路径会
+    真的去枚举、最小化本机微信窗口。
+    """
     monkeypatch.setattr(sender, "get_foreground_window", lambda: WINDOW)
     monkeypatch.setattr(sender, "last_input_age", lambda: 99.0)
     monkeypatch.setattr(sender, "desktop_state", lambda: "interactive")
+    monkeypatch.setattr(sender, "wechat_main_window", lambda: None)
+    monkeypatch.setattr(sender, "bump_foreground", lambda handle: False)
 
 
 @dataclass
@@ -241,6 +276,97 @@ def test_foreground_conflict_opens_chat_first_but_never_sends(
     assert result.delivered == "failed"
     # 顺序证据：先 open_chat，再做前台断言；send_text 一次都没调。
     assert h.driver.actions()[0] == "open_chat"
+    assert "send_text" not in h.driver.actions()
+
+
+def test_open_chat_failure_bumps_wechat_window_and_retries_once(
+    harness, monkeypatch
+) -> None:
+    """UIPI 拦掉点击注入时，顶一次微信主窗口后重试 open_chat。"""
+    driver = FlakyOpenDriver(FakeClock(), failures=1)
+    h = harness(driver=driver)
+    bumped: list[int] = []
+    monkeypatch.setattr(sender, "wechat_main_window", lambda: WECHAT_MAIN)
+    monkeypatch.setattr(
+        sender, "bump_foreground", lambda handle: bumped.append(handle) or True
+    )
+
+    result = h.sender.submit("测试群", "在吗")
+
+    assert result.ok is True
+    assert result.delivered == "observed"
+    assert bumped == [WECHAT_MAIN]
+    assert driver.attempts == 2
+
+
+def test_open_chat_failure_without_recovery_keeps_original_error(
+    harness, monkeypatch
+) -> None:
+    driver = FlakyOpenDriver(
+        FakeClock(),
+        failures=9,
+        error=DriverError("window_unavailable", "微信主窗口不可用"),
+    )
+    h = harness(driver=driver)
+    monkeypatch.setattr(sender, "wechat_main_window", lambda: None)
+    monkeypatch.setattr(sender, "bump_foreground", lambda handle: False)
+
+    result = h.sender.submit("测试群", "在吗")
+
+    assert result.ok is False
+    assert result.error_code == "window_unavailable"
+    assert result.delivered == "failed"
+    assert driver.attempts == 1
+    assert "send_text" not in h.driver.actions()
+
+
+def test_open_chat_retry_is_attempted_only_once(harness, monkeypatch) -> None:
+    driver = FlakyOpenDriver(FakeClock(), failures=9)
+    h = harness(driver=driver)
+    monkeypatch.setattr(sender, "wechat_main_window", lambda: WECHAT_MAIN)
+    monkeypatch.setattr(sender, "bump_foreground", lambda handle: True)
+
+    result = h.sender.submit("测试群", "在吗")
+
+    assert result.error_code == "open_chat_failed"
+    assert driver.attempts == 2
+
+
+def test_foreground_conflict_recovers_by_bumping_target_window(
+    harness, monkeypatch
+) -> None:
+    state = {"fg": ADMIN_WINDOW}
+    bumped: list[int] = []
+
+    def _bump(handle: int) -> bool:
+        bumped.append(handle)
+        state["fg"] = handle
+        return True
+
+    monkeypatch.setattr(sender, "get_foreground_window", lambda: state["fg"])
+    monkeypatch.setattr(sender, "bump_foreground", _bump)
+    monkeypatch.setattr(sender, "wechat_main_window", lambda: WECHAT_MAIN)
+    h = harness()
+
+    result = h.sender.submit("测试群", "在吗")
+
+    assert result.ok is True
+    # 先顶目标会话窗口，不碰主窗口。
+    assert bumped == [WINDOW]
+    assert "send_text" in h.driver.actions()
+
+
+def test_foreground_conflict_fails_closed_when_bump_does_not_help(
+    harness, monkeypatch
+) -> None:
+    monkeypatch.setattr(sender, "get_foreground_window", lambda: ADMIN_WINDOW)
+    monkeypatch.setattr(sender, "bump_foreground", lambda handle: True)
+    monkeypatch.setattr(sender, "wechat_main_window", lambda: WECHAT_MAIN)
+    h = harness()
+
+    result = h.sender.submit("测试群", "在吗")
+
+    assert result.error_code == "foreground_conflict"
     assert "send_text" not in h.driver.actions()
 
 

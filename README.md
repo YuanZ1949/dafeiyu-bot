@@ -390,22 +390,24 @@ hook 端的具体适配（哪个注入库、支持哪个微信版本）不在本
 不想接注入服务，又必须走 UIA 出站时，可以「RDP 连进去，再把会话交回物理控制台」：
 
 1. 从另一台机器用 RDP 登录机器人这台机器（同一个 Windows 账号）；
-2. 管理员身份运行 `.venv\Scripts\python -m dafeiyu.rdp status`，先只读确认会话名、Session ID、协议与计划；
-3. 确认后执行 `handoff`（等价于 `tscon <session> /dest:console`）：会话交回物理控制台，**不会重新锁屏**，UIA 继续可用；**当前 RDP 连接会立即断开**，这是预期行为；
+2. **优先用带 `-Elevate` 的脚本做交接**（它会弹一次 UAC，提权进程跑完 `tscon` 立即退出，不在桌面上留下任何窗口）；
+3. 会话交回物理控制台后，**不会重新锁屏**，UIA 继续可用；**当前 RDP 连接会立即断开**，这是预期行为；
 4. 断开后桌面上就是解锁状态；`python -m dafeiyu.cli doctor` 的 `wechat.desktop_interactive` 应为 PASS（在 RDP 会话里这条会提示先做交接）。
 
 ```powershell
+# 推荐：包装脚本 + -Elevate。-Elevate 起一个「跑完即退」的提权进程，不留前台窗口
+powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action handoff -Elevate
+
 # 只读：会话名 / Session ID / 协议（控制台 / RDP）/ 连接状态 / 是否管理员 / 建议动作
+powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action status
+
+# 等价 CLI（需要在管理员终端里跑；见下面「为什么不要手动开管理员终端」）
 .venv\Scripts\python -m dafeiyu.rdp status
 .venv\Scripts\python -m dafeiyu.rdp plan         # 只打印将要执行的命令，不执行
 .venv\Scripts\python -m dafeiyu.rdp handoff      # 执行交接（需要管理员）
 
 # 从任意管理员会话操作指定 session（默认只操作自己所在会话）
 .venv\Scripts\python -m dafeiyu.rdp status --session 1
-
-# 等价的包装脚本；-Elevate 会弹 UAC 自动提权
-powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action status
-powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action handoff -Elevate
 ```
 
 - 探测优先读 `WTSClientProtocolType`（0=控制台 / 1=ICA / 2=RDP）和 `WTSConnectState`，读不到再回退 `SESSIONNAME` 前缀；两者都读不到一律按「不是 RDP」保守处理，不会乱执行。
@@ -413,6 +415,31 @@ powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action handoff
 - **会话掉线、机器停在登录界面的情况**：如果目标会话是「已断开且没有会话名」，`plan` 会给出 `reconnect_console`，可用 `handoff --reconnect-console`（脚本 `-ReconnectConsole`）把它直接接回控制台。这条路线不先 RDP 也可能生效，但风险更高：物理控制台若被别的会话占用，`tscon` 会报错。不加这个开关时 `handoff` 只会拒绝并提示（CLI 退出码 4），不会动手。
 - 与 `outbound: hook/auto` 不冲突：有 hook 就用 hook，没有才需要这条路线。
 - 风险：这等于让机器人机器长期保持解锁，**物理安全风险由使用者自担**；不要在别人能物理接触的机器上这么做。
+
+#### UIPI：为什么不要手动开一个管理员终端跑 `tscon`
+
+Windows 的 UIPI（User Interface Privilege Isolation）规定：**前台窗口属于更高完整性级别的进程时，中完整性进程既不能注入输入，也不能抢前台**。
+
+桥是普通权限（中完整性），而「以管理员身份运行」的 PowerShell 是高完整性。如果你手动开一个管理员终端跑 `handoff` 并把它留在桌面上，就会出现：
+
+- `SetForegroundWindow(微信)`、`AttachThreadInput` 全部返回 **err=5（拒绝访问）**，`SetCursorPos` 也失败；
+- pywinauto 报 `RuntimeError: There is no active desktop required for moving mouse cursor!`；
+- 桥的发送失败日志是 `open_chat_failed`（桌面其实没锁，`desktop=interactive`，但每次点击注入都被拦掉）；
+- 这个提权窗口桥既关不掉也最小化不了（`ShowWindow` 同样 err=5），只能人工关。
+
+**所以交接一律用 `-Elevate`**：提权进程执行完 `tscon` 就退出，不会留下这个「高完整性路障」。已经留下了的话，重新 RDP 进去手动关掉那个管理员窗口，再交接一次。
+
+桥侧也有兜底：`open_chat` 失败时会找微信主窗口，用「最小化 → 还原」（`SW_MINIMIZE` + `SW_RESTORE`）把它顶回前台后**重试一次**；命中 `foreground_conflict` 时也会先顶目标会话窗口再重查前台。这个动作不绕过 UIPI 去注入，只是把微信恢复成前台窗口，让后续的 UIA 点击能正常注入。顶不动就仍然按原错误码失败，不会重复发送。
+
+#### 为什么不直接把桥「提权」到管理员
+
+不行，而且会让情况更糟：
+
+- 微信以普通权限运行。桥一旦提权，两边完整性级别不一致，健康探测会判 `integrity_mismatch` → `degraded`，`may_send()` 直接返回 False，**所有发送都会被拒**；
+- 每次启动都要过 UAC，计划任务/自启动也得勾「以最高权限运行」，维护成本更高；
+- UIAccess（免 UAC 的高完整性 UI 自动化）需要代码签名并安装到 `Program Files`，不是这个项目的部署方式。
+
+正确做法是**桥与微信保持同一完整性级别**，靠上面「把微信顶回前台」的兜底绕开 UIPI，而不是靠提权硬闯。
 
 ### 启动
 

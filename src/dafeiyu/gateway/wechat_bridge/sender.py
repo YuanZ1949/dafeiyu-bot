@@ -45,9 +45,11 @@ __all__ = [
     "SendResult",
     "Sender",
     "UiaTransport",
+    "bump_foreground",
     "desktop_state",
     "get_foreground_window",
     "last_input_age",
+    "wechat_main_window",
 ]
 
 #: 距最后一次用户输入小于这个秒数就认为用户正在操作，前台不可抢占。
@@ -182,6 +184,106 @@ def desktop_state() -> str:
     except Exception:
         log.debug("OpenInputDesktop 不可用", exc_info=True)
         return "locked"
+
+
+#: 微信主进程可执行名（小写）；4.x 是 `Weixin.exe`，3.x 是 `WeChat.exe`。
+_WECHAT_PROCESS_NAMES = frozenset({"weixin.exe", "wechat.exe"})
+
+#: 微信主窗口被更高完整性窗口压住时，用「最小化 → 还原」把它顶回前台。
+#: 中完整性进程对提权窗口做不了 `SetForegroundWindow`（UIPI 拦截，err=5），
+#: 但对同完整性的微信窗口做 ShowWindow 是允许的。
+_SW_MINIMIZE = 6
+_SW_RESTORE = 9
+_GW_OWNER = 4
+
+
+def wechat_main_window() -> int | None:
+    """找微信的可见主窗口 HWND（同进程名里面积最大的顶层窗口）。
+
+    不按窗口类名/标题硬编码：4.1 的主窗口类名是 `Qt51514QWindowIcon`，
+    3.x 是 `mmui::MainWindow`，标题还可能带未读计数。找不到时返回 None，
+    调用方 fail-closed（不猜窗口，不误顶别的应用）。
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        import psutil
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindow.restype = wintypes.HWND
+
+        names: dict[int, str] = {}
+
+        def _name_of(hwnd: Any) -> str:
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+            pid_value = int(pid.value)
+            if pid_value not in names:
+                try:
+                    names[pid_value] = psutil.Process(pid_value).name().lower()
+                except Exception:  # noqa: BLE001 - 读不到进程名就当不是微信
+                    names[pid_value] = ""
+            return names[pid_value]
+
+        best: list[tuple[int, int]] = []
+
+        def _visit(hwnd: Any, _param: Any) -> bool:
+            if not user32.IsWindowVisible(wintypes.HWND(hwnd)):
+                return True
+            # 过滤工具栏/托盘图标这类被主窗口拥有的弹出窗口。
+            if user32.GetWindow(wintypes.HWND(hwnd), _GW_OWNER):
+                return True
+            if _name_of(hwnd) not in _WECHAT_PROCESS_NAMES:
+                return True
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+                return True
+            area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+            if area <= 0:
+                return True
+            if not best or area > best[0][0]:
+                best[:] = [(area, int(hwnd))]
+            return True
+
+        enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows(enum_proc(_visit), 0)
+    except Exception:
+        log.debug("枚举微信窗口失败", exc_info=True)
+        return None
+    return best[0][1] if best else None
+
+
+def bump_foreground(handle: int) -> bool:
+    """把 `handle` 顶到前台（最小化后还原来突破前台锁），成功返回 True。
+
+    这是 UIPI 场景下中完整性进程唯一还能用的「抢前台」手段：前台是提权
+    窗口时 `SetForegroundWindow` / `AttachThreadInput` 都会 err=5，但对
+    同完整性的微信窗口做 `SW_MINIMIZE` + `SW_RESTORE` 是允许的。
+    """
+    if sys.platform != "win32" or not handle:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        hwnd = wintypes.HWND(int(handle))
+        if not user32.IsWindow(hwnd):
+            return False
+        user32.ShowWindow(hwnd, _SW_MINIMIZE)
+        time.sleep(0.15)
+        user32.ShowWindow(hwnd, _SW_RESTORE)
+        time.sleep(0.25)
+        current = user32.GetForegroundWindow()
+        return bool(current) and int(current) == int(handle)
+    except Exception:
+        log.debug("顶前台失败 hwnd=%s", handle, exc_info=True)
+        return False
 
 
 def _window_handle(window: Any) -> int | None:
@@ -335,25 +437,57 @@ class UiaTransport:
         self._observed_seq = 0
 
     # ------------------------------------------------------------- 准备
+    @staticmethod
+    def _open_chat_failure(chat_name: str, exc: BaseException) -> SendResult:
+        if isinstance(exc, DriverError):
+            return SendResult(
+                False, exc.code, "failed", chat_name=chat_name, detail=str(exc)
+            )
+        log.error("打开会话异常 %s", chat_name, exc_info=exc)
+        return SendResult(
+            False,
+            "open_chat_failed",
+            "failed",
+            chat_name=chat_name,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+
+    @staticmethod
+    def _recover_foreground(chat_name: str, preferred: int | None = None) -> int | None:
+        """把微信窗口顶回前台；返回顶成功的 HWND，失败返回 None。
+
+        先试 `preferred`（已知的目标会话窗口），再退回微信主窗口。只做一次，
+        不循环重试：这一步是兜底，不是重试框架。
+        """
+        candidates: list[int] = []
+        if preferred:
+            candidates.append(int(preferred))
+        main = wechat_main_window()
+        if main and main not in candidates:
+            candidates.append(int(main))
+        for hwnd in candidates:
+            if bump_foreground(hwnd):
+                log.info("已把微信窗口顶回前台 %s（hwnd=%s）", chat_name, hwnd)
+                return hwnd
+        log.info("顶前台未生效 %s：候选窗口=%s", chat_name, candidates)
+        return None
+
     def prepare(self, chat_name: str) -> Prepared | SendResult:
         """开窗并跑完所有「真的可以打字了吗」的闸门。"""
         # (b) 先打开会话，再断言前台窗口就是它。顺序不可反。
         try:
             handle = self._driver.open_chat(chat_name)
-        except DriverError as exc:
-            log.warning("打开会话失败 %s：%s", chat_name, exc)
-            return SendResult(
-                False, exc.code, "failed", chat_name=chat_name, detail=str(exc)
-            )
-        except Exception as exc:
-            log.exception("打开会话异常 %s", chat_name)
-            return SendResult(
-                False,
-                "open_chat_failed",
-                "failed",
-                chat_name=chat_name,
-                detail=f"{type(exc).__name__}: {exc}",
-            )
+        except Exception as exc:  # noqa: BLE001 - 驱动层异常类型不稳定，统一折成错误码
+            # 常见于前台被提权窗口占住（UIPI）：桌面没锁，但点击注入被拦。
+            # 把微信顶回前台后重试一次；错误码语义不变。
+            log.warning("打开会话失败 %s：%s；尝试把微信顶回前台后重试一次", chat_name, exc)
+            if self._recover_foreground(chat_name) is None:
+                return self._open_chat_failure(chat_name, exc)
+            try:
+                handle = self._driver.open_chat(chat_name)
+            except Exception as retry_exc:  # noqa: BLE001 - 同上，重试失败仍折成错误码
+                log.warning("重试打开会话仍失败 %s：%s", chat_name, retry_exc)
+                return self._open_chat_failure(chat_name, retry_exc)
 
         target = _window_handle(getattr(handle, "window", None))
         foreground = get_foreground_window()
@@ -364,13 +498,17 @@ class UiaTransport:
                 target,
                 foreground,
             )
-            return SendResult(
-                False,
-                "foreground_conflict",
-                "failed",
-                chat_name=chat_name,
-                detail=f"target={target} foreground={foreground}",
-            )
+            if target is not None:
+                self._recover_foreground(chat_name, preferred=target)
+                foreground = get_foreground_window()
+            if target is None or foreground is None or target != foreground:
+                return SendResult(
+                    False,
+                    "foreground_conflict",
+                    "failed",
+                    chat_name=chat_name,
+                    detail=f"target={target} foreground={foreground}",
+                )
 
         # (c) 用户刚有输入就不抢前台。注意：pyautogui 的按键同样会刷新系统空闲
         #     计时，轮询刚翻完消息时这里的 age 会是 0.0x 秒——必须先把「自己按的」
