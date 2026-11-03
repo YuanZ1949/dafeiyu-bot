@@ -105,6 +105,17 @@ def test_system_truncated_when_alone_too_big(store: Store) -> None:
     assert bundle.messages[-1]["content"] == "阿伟: 在吗"
 
 
+def test_scene_survives_persona_truncation(store: Store) -> None:
+    """人设超预算时先砍正文，保住「当前场景」（群名/日期/字数上限）。"""
+    add(store, 0, "在吗")
+    persona = "设定" * 8000 + "\n\n## 当前场景\n\n- 群名：测试群\n- 今天：2026-10-24\n"
+    bundle = build_context(store, GROUP, CHAT, 20, 5, persona, "2026-10-24")
+    assert "## 当前场景" in bundle.system
+    assert "群名：测试群" in bundle.system
+    assert bundle.system.endswith("今天：2026-10-24\n")
+    assert estimate_tokens(bundle.system) <= SYSTEM_MAX_TOKENS
+
+
 def test_estimated_tokens_never_reports_under_budget(store: Store) -> None:
     for i in range(20):
         add(store, i, "字" * 100)
