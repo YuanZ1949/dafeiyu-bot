@@ -22,6 +22,8 @@ def _state(**overrides: Any) -> rdp.SessionState:
         "protocol": 2,
         "is_rdp": True,
         "is_admin": True,
+        "connect_state": 0,
+        "is_current": True,
     }
     values.update(overrides)
     return rdp.SessionState(**values)
@@ -60,6 +62,7 @@ class Sleeps:
 def test_detect_uses_wts_protocol_over_session_name(monkeypatch) -> None:
     monkeypatch.setattr(rdp, "current_session_id", lambda: 2)
     monkeypatch.setattr(rdp, "client_protocol_type", lambda sid=None: 2)
+    monkeypatch.setattr(rdp, "session_connect_state", lambda sid=None: 0)
     monkeypatch.setattr(rdp, "is_admin", lambda: True)
 
     state = rdp.detect(env={"SESSIONNAME": "Console"}, platform="win32")
@@ -67,12 +70,15 @@ def test_detect_uses_wts_protocol_over_session_name(monkeypatch) -> None:
     assert state.is_rdp is True
     assert state.session_id == 2
     assert state.protocol == 2
+    assert state.connect_state == 0
+    assert state.is_current is True
     assert state.is_admin is True
 
 
 def test_detect_falls_back_to_session_name(monkeypatch) -> None:
     monkeypatch.setattr(rdp, "current_session_id", lambda: 3)
     monkeypatch.setattr(rdp, "client_protocol_type", lambda sid=None: None)
+    monkeypatch.setattr(rdp, "session_connect_state", lambda sid=None: None)
     monkeypatch.setattr(rdp, "is_admin", lambda: False)
 
     rdp_state = rdp.detect(env={"SESSIONNAME": "RDP-Tcp#7"}, platform="win32")
@@ -81,6 +87,23 @@ def test_detect_falls_back_to_session_name(monkeypatch) -> None:
     assert rdp_state.is_rdp is True
     assert console_state.is_rdp is False
     assert console_state.protocol is None
+    assert console_state.connect_state is None
+
+
+def test_detect_session_override_reads_that_sessions_name(monkeypatch) -> None:
+    monkeypatch.setattr(rdp, "current_session_id", lambda: 1)
+    monkeypatch.setattr(rdp, "client_protocol_type", lambda sid=None: 2)
+    monkeypatch.setattr(rdp, "session_connect_state", lambda sid=None: 1)
+    monkeypatch.setattr(rdp, "session_name_of", lambda sid=None: f"RDP-Tcp#{sid}")
+    monkeypatch.setattr(rdp, "is_admin", lambda: True)
+
+    state = rdp.detect(env={"SESSIONNAME": "Console"}, platform="win32", session_id=7)
+
+    assert state.session_id == 7
+    assert state.session_name == "RDP-Tcp#7"
+    assert state.is_current is False
+    assert rdp.plan_handoff(state).action == "handoff"
+    assert "Session 7" in rdp.plan_handoff(state).reason
 
 
 def test_detect_non_windows_is_unsupported(monkeypatch) -> None:
@@ -132,6 +155,47 @@ def test_plan_unknown_session_and_unsupported() -> None:
     assert "仅 Windows" in unsupported.reason
 
 
+def test_plan_reconnect_console_for_disconnected_session() -> None:
+    plan = rdp.plan_handoff(
+        _state(
+            is_rdp=False,
+            protocol=0,
+            session_name="",
+            session_id=1,
+            connect_state=4,
+            is_current=True,
+        )
+    )
+
+    assert plan.action == "reconnect_console"
+    assert plan.command == ("tscon", "1", "/dest:console")
+    assert "接回控制台" in plan.reason
+
+
+def test_plan_reconnect_console_needs_admin() -> None:
+    plan = rdp.plan_handoff(
+        _state(
+            is_rdp=False,
+            protocol=0,
+            session_name="",
+            session_id=1,
+            connect_state=4,
+            is_admin=False,
+        )
+    )
+
+    assert plan.action == "needs_admin"
+    assert plan.command == ("tscon", "1", "/dest:console")
+
+
+def test_plan_active_console_is_noop_even_without_name() -> None:
+    plan = rdp.plan_handoff(
+        _state(is_rdp=False, protocol=0, session_name="", connect_state=0)
+    )
+
+    assert plan.action == "noop"
+
+
 # ------------------------------------------------------------------ handoff
 def test_handoff_noop_does_not_run_tscon() -> None:
     runner = Runner()
@@ -154,6 +218,45 @@ def test_handoff_needs_admin_does_not_run_tscon() -> None:
     assert result.ok is False
     assert result.error_code == "needs_admin"
     assert runner.calls == []
+
+
+def test_handoff_reconnect_requires_explicit_flag() -> None:
+    runner = Runner()
+
+    result = rdp.handoff(
+        state=_state(
+            is_rdp=False, protocol=0, session_name="", session_id=1, connect_state=4
+        ),
+        runner=runner,
+    )
+
+    assert result.ok is False
+    assert result.error_code == "reconnect_requires_confirmation"
+    assert runner.calls == []
+    assert "--reconnect-console" in result.detail
+
+
+def test_handoff_reconnect_verifies_active_state(monkeypatch) -> None:
+    sleeps = Sleeps()
+    states = iter([4, 0])
+    monkeypatch.setattr(rdp, "client_protocol_type", lambda sid=None: 0)
+    monkeypatch.setattr(rdp, "session_connect_state", lambda sid=None: next(states, 4))
+    runner = Runner(FakeCompleted(0))
+
+    result = rdp.handoff(
+        state=_state(
+            is_rdp=False, protocol=0, session_name="", session_id=1, connect_state=4
+        ),
+        runner=runner,
+        sleep=sleeps,
+        allow_reconnect=True,
+    )
+
+    assert result.ok is True
+    assert result.verified is True
+    assert "接回控制台" in result.detail
+    assert runner.calls[0][0] == ["tscon", "1", "/dest:console"]
+    assert sleeps.calls == [rdp._VERIFY_INTERVAL]
 
 
 def test_handoff_runs_tscon_and_verifies_protocol(monkeypatch) -> None:
@@ -273,3 +376,50 @@ def test_cli_handoff_success_returns_0(monkeypatch, capsys) -> None:
 
     assert rdp.main(["handoff", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_cli_passes_session_and_reconnect_flag(monkeypatch, capsys) -> None:
+    seen: dict[str, Any] = {}
+    target = _state(
+        is_rdp=False, protocol=0, session_name="", session_id=1, connect_state=4
+    )
+
+    def fake_detect(**kwargs):
+        seen["detect"] = kwargs
+        return target
+
+    def fake_handoff(**kwargs):
+        seen["handoff"] = kwargs
+        return rdp.HandoffResult(True, None, "ok", rdp.plan_handoff(target))
+
+    monkeypatch.setattr(rdp, "detect", fake_detect)
+    monkeypatch.setattr(rdp, "handoff", fake_handoff)
+
+    assert rdp.main(["handoff", "--session", "1", "--reconnect-console"]) == 0
+    assert seen["detect"] == {"session_id": 1}
+    assert seen["handoff"]["allow_reconnect"] is True
+
+
+def test_cli_reconnect_without_flag_returns_4(monkeypatch) -> None:
+    monkeypatch.setattr(
+        rdp,
+        "detect",
+        lambda **kwargs: _state(
+            is_rdp=False, protocol=0, session_name="", session_id=1, connect_state=4
+        ),
+    )
+
+    assert rdp.main(["handoff"]) == 4
+
+
+def test_cli_status_json_includes_connect_state_and_target(monkeypatch, capsys) -> None:
+    state = _state(
+        is_rdp=False, protocol=0, session_name="", session_id=1, connect_state=4
+    )
+    monkeypatch.setattr(rdp, "detect", lambda **kwargs: state)
+
+    assert rdp.main(["status", "--json", "--session", "1"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["session"]["connect_state"] == 4
+    assert payload["session"]["is_current"] is True
+    assert payload["plan"]["action"] == "reconnect_console"

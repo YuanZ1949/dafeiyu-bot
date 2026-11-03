@@ -395,18 +395,22 @@ hook 端的具体适配（哪个注入库、支持哪个微信版本）不在本
 4. 断开后桌面上就是解锁状态；`python -m dafeiyu.cli doctor` 的 `wechat.desktop_interactive` 应为 PASS（在 RDP 会话里这条会提示先做交接）。
 
 ```powershell
-# 只读：会话名 / Session ID / 协议（控制台 / RDP）/ 是否管理员 / 建议动作
+# 只读：会话名 / Session ID / 协议（控制台 / RDP）/ 连接状态 / 是否管理员 / 建议动作
 .venv\Scripts\python -m dafeiyu.rdp status
 .venv\Scripts\python -m dafeiyu.rdp plan         # 只打印将要执行的命令，不执行
 .venv\Scripts\python -m dafeiyu.rdp handoff      # 执行交接（需要管理员）
+
+# 从任意管理员会话操作指定 session（默认只操作自己所在会话）
+.venv\Scripts\python -m dafeiyu.rdp status --session 1
 
 # 等价的包装脚本；-Elevate 会弹 UAC 自动提权
 powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action status
 powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action handoff -Elevate
 ```
 
-- 探测优先读 `WTSClientProtocolType`（0=控制台 / 1=ICA / 2=RDP），读不到再回退 `SESSIONNAME` 前缀；两者都读不到一律按「不是 RDP」保守处理，不会乱执行。
-- `tscon` 需要管理员权限；非管理员会明确回 `needs_admin`（CLI 退出码 3），不会静默失败。执行成功但 WTS 仍读不到协议时只提示「未能确认」，不谎报成功。
+- 探测优先读 `WTSClientProtocolType`（0=控制台 / 1=ICA / 2=RDP）和 `WTSConnectState`，读不到再回退 `SESSIONNAME` 前缀；两者都读不到一律按「不是 RDP」保守处理，不会乱执行。
+- `tscon` 需要管理员权限；非管理员会明确回 `needs_admin`（CLI 退出码 3），不会静默失败。执行成功但 WTS 仍读不到状态时只提示「未能确认」，不谎报成功。
+- **会话掉线、机器停在登录界面的情况**：如果目标会话是「已断开且没有会话名」，`plan` 会给出 `reconnect_console`，可用 `handoff --reconnect-console`（脚本 `-ReconnectConsole`）把它直接接回控制台。这条路线不先 RDP 也可能生效，但风险更高：物理控制台若被别的会话占用，`tscon` 会报错。不加这个开关时 `handoff` 只会拒绝并提示（CLI 退出码 4），不会动手。
 - 与 `outbound: hook/auto` 不冲突：有 hook 就用 hook，没有才需要这条路线。
 - 风险：这等于让机器人机器长期保持解锁，**物理安全风险由使用者自担**；不要在别人能物理接触的机器上这么做。
 

@@ -4,10 +4,14 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action plan    # 只打印命令
 #   powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action handoff # 执行交接
 #   powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action handoff -Elevate
+#   powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action status -Session 1
+#   powershell -ExecutionPolicy Bypass -File scripts\rdp-console.ps1 -Action handoff -ReconnectConsole
 # 注意：handoff 需要管理员权限，执行后当前 RDP 连接会立即断开（预期行为）。
 param(
     [ValidateSet("status", "plan", "handoff")]
     [string]$Action = "status",
+    [int]$Session = 0,
+    [switch]$ReconnectConsole,
     [double]$Timeout = 15.0,
     [switch]$Elevate
 )
@@ -23,6 +27,8 @@ if ($Elevate) {
         "-Action", $Action,
         "-Timeout", $Timeout
     )
+    if ($Session -gt 0) { $arguments += @("-Session", $Session) }
+    if ($ReconnectConsole) { $arguments += "-ReconnectConsole" }
     try {
         $proc = Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -Verb RunAs -Wait -PassThru
         exit $proc.ExitCode
@@ -59,9 +65,16 @@ if (Test-Path (Join-Path $src "dafeiyu")) {
     }
 }
 
-& $python -m dafeiyu.rdp $Action --timeout $Timeout
+$pyArgs = @("-m", "dafeiyu.rdp", $Action, "--timeout", $Timeout)
+if ($Session -gt 0) { $pyArgs += @("--session", $Session) }
+if ($ReconnectConsole) { $pyArgs += "--reconnect-console" }
+
+& $python @pyArgs
 $code = $LASTEXITCODE
 if ($code -eq 3) {
     Write-Host "提示：tscon 需要管理员权限，加 -Elevate 重新运行可自动提权。" -ForegroundColor Yellow
+}
+if ($code -eq 4) {
+    Write-Host "提示：目标会话已断开且不在控制台。确认物理控制台没被占用后，加 -ReconnectConsole 再执行。" -ForegroundColor Yellow
 }
 exit $code
