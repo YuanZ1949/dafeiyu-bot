@@ -12,7 +12,6 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from fakes import FakeChannelAdapter
 
 from dafeiyu.behavior import BehaviorSettings
