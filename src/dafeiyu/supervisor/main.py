@@ -248,7 +248,12 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
             name="wechat_bridge",
             command=[sys.executable, "-m", "dafeiyu.gateway.wechat_bridge"],
             cwd=str(REPO_ROOT),
-            env={WECHAT_BRIDGE_TOKEN_ENV: settings.wechat.bridge_token},
+            env={
+                WECHAT_BRIDGE_TOKEN_ENV: settings.wechat.bridge_token,
+                # 桥的日志直接由 supervisor 落盘；不强制 UTF-8 时中文会变成 "?"。
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUNBUFFERED": "1",
+            },
             # 桥是出站 WS 客户端，没有可探的 HTTP 端点。
             ready_url="",
             ready_probe=_wechat_bridge_ready_probe(control_port, token),

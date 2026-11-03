@@ -342,6 +342,26 @@ powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -Target D:\dafeiyu-r
 
 4. 预检：`.venv\Scripts\python -m dafeiyu.cli doctor` 有 8 项微信前置检查（进程 / 版本 / 语言 / 完整性 / 桌面 / pyweixin / 端口 / 配置），**全部通过再进入下一步**。
 
+### 入站加速：直接读本地消息库（可选）
+
+默认入站是 UIA 开窗抓屏，慢且会被锁屏 / 前台占用卡住。打开本地库模式后，入站改为**只读**微信自己的 SQLite：
+
+```yaml
+gateway:
+  wechat:
+    local_db_enabled: true
+    local_db_root: ""          # 空 = 自动探测 %USERPROFILE%\Documents\xwechat_files\*\db_storage
+    local_db_refresh_seconds: 1.0
+```
+
+- 原理：用 `OpenProcess(PROCESS_VM_READ)` + `VirtualQueryEx` + `ReadProcessMemory` 只读扫描 `Weixin.exe` 内存，从 WCDB 的 `com.Tencent.WCDB.Config.Cipher` 对象里取出 XOR 混淆的密钥（老版本回退到明文 `X'<hex>'` 字面量），再用 page1 的 HMAC 校验筛选；密钥缓存到 `data/wechat-bridge/localdb/keys.json`（`data/` 已在 `.gitignore` 里）。
+- 消息库按页增量解密到 `data/wechat-bridge/localdb/`（含 WAL 重放），只读句柄查询；**微信原文件一个字节都不写**。
+- 发送仍然走 UIA（输入框键入 + 回车），本模式只影响入站。
+- 任何一步失败（微信没登录 / 提不到密钥 / 库被占用 / 镜像损坏）都只在日志里 warning，并**自动回落 UIA**，60 秒后重试，入站不会停。
+- 首次启用会扫一次进程内存（实测约 3–5 秒，日志 `内存扫描匹配 N/N 个数据库密钥`）。
+
+风险：读进程内存与解密本地库属于非公开接口，可能违反腾讯的软件许可条款；微信升级后密钥格式可能变化导致失效（此时自动回落 UIA）。镜像目录里是**明文**聊天记录，注意机器与备份的访问权限。
+
 ### 启动
 
 先起桥，再起 bot / supervisor：
@@ -361,7 +381,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 - **无真实 message_id**：桥为会话/消息在本地铸造 id，跨重启不保证稳定。
 - 不支持撤回 / 编辑事件。
 - 同名群只能靠显示名 / 人工区分，`group_allowlist` 里的显示名要人工核对。
-- `@` 触发依赖轮询，最坏有约一个 `poll_seconds`（默认 8 秒）的延迟。
+- `@` 触发依赖轮询，最坏有约一个 `poll_seconds`（默认 8 秒）的延迟；本地库模式同样受这个轮询间隔限制，但不再有开窗开销。
 - 发送有频率上限：`send_min_interval_seconds`（默认 20 秒）、`send_max_per_hour`（20）、`send_max_per_day`（60）；三者设为 `0` = 不限制。
 - 桌面锁屏即掉线。RPA 可能误点，`require_foreground_idle` 默认要求微信窗口前台且空闲才执行操作；开启微信通道时别在那台机器上干重要的事。
 

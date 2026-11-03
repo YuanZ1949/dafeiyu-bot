@@ -200,6 +200,14 @@ class WeChatConfig:
     # 免打扰会话不计红点，所以每 full_sweep_seconds 仍做一次全量轮询兜底。
     unread_gate: bool = True
     full_sweep_seconds: float = 120.0
+    # 本地消息库（只读解密镜像）：开启后入站直接读微信自己的 SQLite
+    # （contact.db + message_N.db），不再靠 UIA 开窗抓屏；发送仍然走 UIA。
+    # 失败一律 fail-open 回落到 UIA 轮询，不会让入站彻底停摆。
+    local_db_enabled: bool = False
+    # 空 = 自动探测 %USERPROFILE%\Documents\xwechat_files\*\db_storage。
+    local_db_root: str = ""
+    # 镜像同步的最小间隔（秒）；0 = 每轮都同步。
+    local_db_refresh_seconds: float = 1.0
     send_min_interval_seconds: float = 20.0
     send_max_per_hour: int = 20
     send_max_per_day: int = 60
@@ -799,6 +807,12 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
     )
     if echo_window < 0:
         raise ConfigError("gateway.wechat.echo_window_seconds 不能为负")
+    local_db_refresh = _float(
+        section.get("local_db_refresh_seconds", 1.0),
+        "gateway.wechat.local_db_refresh_seconds",
+    )
+    if local_db_refresh < 0:
+        raise ConfigError("gateway.wechat.local_db_refresh_seconds 不能为负")
 
     quiet_hours = section.get("quiet_hours", ["23:30", "08:00"])
     if not isinstance(quiet_hours, (list, tuple)) or len(quiet_hours) != 2:
@@ -859,6 +873,11 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
             section.get("require_foreground_idle", True),
             "gateway.wechat.require_foreground_idle",
         ),
+        local_db_enabled=_bool(
+            section.get("local_db_enabled", False), "gateway.wechat.local_db_enabled"
+        ),
+        local_db_root=str(section.get("local_db_root") or "").strip(),
+        local_db_refresh_seconds=local_db_refresh,
         kill_switch_file=kill_switch,
         version_min=str(section.get("version_min") or "4.1.6").strip(),
         language=str(section.get("language") or "zh-CN").strip(),

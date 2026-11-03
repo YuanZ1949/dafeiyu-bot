@@ -60,6 +60,15 @@ gateway:
     unread_gate: true
     # 免打扰会话不计红点，所以每隔这么多秒强制全量扫一遍白名单兜底。
     full_sweep_seconds: 120.0
+    # 本地消息库入站（实验性）：直接只读解密微信自己的 SQLite（contact.db +
+    # message_N.db）拿消息，不再逐群开窗抓屏；发送仍然走 UIA。
+    # 需要微信正在运行（密钥从进程内存只读提取）；任何一步失败都会自动回落到
+    # UIA 轮询，不会让入站停摆。微信升级后密钥格式可能失效，此时同样回落。
+    local_db_enabled: false
+    # 空 = 自动探测 %USERPROFILE%\Documents\xwechat_files\*\db_storage。
+    local_db_root: ""
+    # 解密镜像的最小同步间隔（秒）；0 = 每轮同步。
+    local_db_refresh_seconds: 1.0
     # 防封限速：相邻两次发送的最小间隔 / 每小时上限 / 每天上限；
     # 三者均可设为 0 = 不限制；quiet_hours 起止相同 = 关闭静默时段。
     send_min_interval_seconds: 20.0

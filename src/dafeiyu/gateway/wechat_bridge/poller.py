@@ -310,9 +310,13 @@ class PollingLoop:
         aligner_factory: Callable[..., SessionAligner] = SessionAligner,
         poll_seconds: float | None = None,
         kill_switch_path: str | Path | None = None,
+        localdb: Any | None = None,
     ) -> None:
         self.wechat = wechat
         self.driver = driver
+        # 本地库帧源（可选）：有它且 `available` 时入站直接读解密镜像，
+        # `open_chat`/`snapshot` 只作为降级路径；发送永远走 UIA。
+        self.localdb = localdb
         self.ui = ui if ui is not None else UiThread()
         self._owns_ui = ui is None
         if registry is None:
@@ -453,7 +457,12 @@ class PollingLoop:
         空元组 = 没有任何未读，整轮跳过（只保留一帧 health）。门控关闭、驱动
         没有未读探测能力、或探测/扫描抛错时一律退回全量轮询——省开销可以，
         漏消息不行。免打扰会话不计入红点，所以 `full_sweep_seconds` 到点必全量。
+
+        本地库可用时**不走红点门控**：读 SQLite 本来就不需要开窗，红点反而会
+        漏掉免打扰群，直接返回白名单即可。
         """
+        if self._uses_localdb():
+            return self.allowlist
         if not self.unread_gate:
             return self.allowlist
 
@@ -520,9 +529,11 @@ class PollingLoop:
             yield await self._health_frame(connected=True)
 
     async def _poll_group(self, group: str) -> list[dict[str, Any]]:
-        handle = await self._ui_call(self.driver.open_chat, group)
-        snapshot = await self._ui_call(self.driver.snapshot, handle)
-        entries = snapshot.get("messages") if isinstance(snapshot, dict) else []
+        entries = await self._localdb_entries(group) if self._uses_localdb() else None
+        if entries is None:
+            handle = await self._ui_call(self.driver.open_chat, group)
+            snapshot = await self._ui_call(self.driver.snapshot, handle)
+            entries = snapshot.get("messages") if isinstance(snapshot, dict) else []
         aligner = self._aligner(group)
         if aligner is None:
             return []
@@ -531,6 +542,40 @@ class PollingLoop:
         if result.resync is not None:
             frames.append(result.resync)
         return frames
+
+    def _uses_localdb(self) -> bool:
+        """本地库是否已就绪；就绪才敢跳过开窗，否则一律走 UIA。"""
+        source = self.localdb
+        if source is None:
+            return False
+        try:
+            return bool(getattr(source, "available", False))
+        except Exception as exc:  # noqa: BLE001 - 帧源坏掉只能当没有
+            logger.debug("本地库状态检查失败：%s", exc)
+            return False
+
+    async def _localdb_entries(self, group: str) -> list[Any] | None:
+        """后台线程取本地库快照；None = 本轮不可用，调用方回落 UIA。"""
+        source = self.localdb
+        if source is None:
+            return None
+        try:
+            snapshot = await asyncio.wait_for(
+                asyncio.to_thread(source.snapshot, group), MAX_AWAIT
+            )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            # 首次建库可能在扫进程内存；线程还在跑，下一轮就绪后自动接管。
+            logger.warning("本地库快照超时（%r），本轮回落 UIA", group)
+            return None
+        except Exception as exc:  # noqa: BLE001 - 任何异常都只降级，不打断轮询
+            logger.warning("本地库快照失败（%r），本轮回落 UIA：%s", group, exc)
+            return None
+        if not isinstance(snapshot, dict):
+            return None
+        messages = snapshot.get("messages")
+        return list(messages) if isinstance(messages, list) else None
 
     def _aligner(self, group: str) -> SessionAligner | None:
         cached = self._aligners.get(group)

@@ -60,6 +60,9 @@ _SEND_ACTIONS = ("send_text", "send_at")
 #: 时仍会退出，由 run() 的完成回调请求停机、交给 supervisor 重启。
 _PUMP_STALL_LIMIT = 3
 
+#: 本地库预热任务：只用来阻止被 GC，退出时不强等（扫描线程是 daemon 语义）。
+_WARMUP_TASKS: set[asyncio.Future[Any]] = set()
+
 logger = logging.getLogger(__name__)
 
 #: 可注入的指令处理器：见 `BridgeServer.CommandHandler`。
@@ -432,6 +435,7 @@ async def run(
             poller = (poller_factory or _default_poller_factory)(wechat, driver)
             poller_holder.append(poller)
             await asyncio.wait_for(poller.start(), _AWAIT_TIMEOUT)
+            _warmup_localdb(poller)
             # 默认指令处理器 = 内置发送路径；注入 handler 时由调用方全权接管，
             # 注入 frame_source 时没有轮询循环，也就没有可解析的 alias。
             if command_handler is None:
@@ -648,7 +652,39 @@ def _default_poller_factory(wechat: WeChatConfig, driver: Any) -> Any:
     """默认轮询循环：`PollingLoop` 的 import 也留在函数体内，保持入口轻量。"""
     from .poller import PollingLoop
 
-    return PollingLoop(wechat, driver)
+    localdb = _build_localdb_source(wechat)
+    return PollingLoop(wechat, driver, localdb=localdb)
+
+
+def _build_localdb_source(wechat: WeChatConfig) -> Any | None:
+    """按 `gateway.wechat.local_db_enabled` 建本地库帧源；失败只降级不拒绝启动。"""
+    if not bool(getattr(wechat, "local_db_enabled", False)):
+        return None
+    try:
+        from .localdb.source import LocalDbSource
+    except Exception as exc:  # noqa: BLE001 - 包缺失时退回 UIA 路线
+        logger.warning("本地消息库模块不可用，回落 UIA 入站：%s", exc)
+        return None
+    try:
+        return LocalDbSource(
+            db_root=str(getattr(wechat, "local_db_root", "") or "") or None,
+            self_display_name=str(getattr(wechat, "account_nickname", "") or ""),
+            refresh_seconds=float(getattr(wechat, "local_db_refresh_seconds", 1.0)),
+        )
+    except Exception as exc:  # noqa: BLE001 - 构造失败同样只降级
+        logger.warning("本地消息库初始化参数无效，回落 UIA 入站：%s", exc)
+        return None
+
+
+def _warmup_localdb(poller: Any) -> None:
+    """后台预热：扫进程内存提密钥可能要几十秒，绝不阻塞轮询启动。"""
+    source = getattr(poller, "localdb", None)
+    prepare = getattr(source, "prepare_async", None)
+    if not callable(prepare):
+        return
+    task = asyncio.ensure_future(prepare())
+    _WARMUP_TASKS.add(task)
+    task.add_done_callback(_WARMUP_TASKS.discard)
 
 
 def _default_frame_source(wechat: WeChatConfig) -> Iterable[dict[str, Any]]:

@@ -29,6 +29,9 @@ wechat = [
     "pywinauto>=0.6.9",
     "pyautogui>=0.9.54",
     "psutil>=5.9",
+    # 微信 4.1 本地库（local_db_enabled）的消息正文是 zstd 压缩的 BLOB。
+    # 不装也能跑 UIA 路线；开了本地库但缺这个包时正文会退化成空串。
+    "zstandard>=0.23",
 ]
 
 [project.scripts]
