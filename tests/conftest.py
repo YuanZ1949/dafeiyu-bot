@@ -1,5 +1,22 @@
 """测试共用配置：控制口与 dashboard 的端到端用例必须跑同一份 YAML。"""
 
+from __future__ import annotations
+
+import pytest
+
+
+# 本机覆盖层（data/settings.local.yaml）是**部署状态**，不属于测试输入：
+# 面板一旦写过 groups.whitelist / brain.mode，所有临时配置都会被盖上，
+# 让「同一份 YAML 得到同一结果」的用例随开发机状态漂移。默认指向一个
+# 不存在的路径；需要覆盖层语义的用例自行 monkeypatch 同一个属性。
+@pytest.fixture(autouse=True)
+def _isolate_local_overrides(monkeypatch, tmp_path_factory):
+    from dafeiyu import config as config_module
+
+    missing = tmp_path_factory.mktemp("no-overrides") / "settings.local.yaml"
+    monkeypatch.setattr(config_module, "OVERRIDES_PATH", missing)
+
+
 TEST_CONFIG_YAML = """\
 persona:
   name: 溟月
