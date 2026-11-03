@@ -69,6 +69,18 @@ gateway:
     local_db_root: ""
     # 解密镜像的最小同步间隔（秒）；0 = 每轮同步。
     local_db_refresh_seconds: 1.0
+    # 出站后端：uia（默认，桌面自动化，锁屏不可用）/ hook（HTTP 注入，不依赖桌面，
+    # 但需 hook_url + local_db_enabled，群 username 从本地库解析）/ auto（先 hook，
+    # 只有明确「没发出去」时才回落 UIA；超时这类结果不明的情况不回落，避免重复发送）。
+    outbound: uia
+    # hook 服务地址（POST JSON，请求/响应契约见 wechat_bridge/outbound.py）。
+    hook_url: ""
+    hook_timeout_seconds: 5.0
+    # 发送后回读本地库确认自己刚发的消息（需要 local_db_enabled）；未确认只把回执
+    # 降级为 typed + receipt_unverified，绝不让客户端换 id 重发。
+    send_verify: true
+    send_verify_timeout_seconds: 8.0
+    send_verify_interval_seconds: 0.5
     # 防封限速：相邻两次发送的最小间隔 / 每小时上限 / 每天上限；
     # 三者均可设为 0 = 不限制；quiet_hours 起止相同 = 关闭静默时段。
     send_min_interval_seconds: 20.0

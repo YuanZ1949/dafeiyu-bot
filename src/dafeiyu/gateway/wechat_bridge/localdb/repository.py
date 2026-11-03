@@ -241,6 +241,39 @@ class LocalMessageStore:
                 entries.append(entry)
         return entries
 
+    def find_self_message(
+        self,
+        ref: ChatRef,
+        text: str,
+        *,
+        since: float,
+        limit: int = 50,
+    ) -> dict[str, Any] | None:
+        """回读自己刚发的消息：同群 + 同文本 + ``create_time >= since``。
+
+        只认 ``self_username`` 对应的条目（其昵称由本模块填成
+        ``self_display_name``）。没有配置显示名时无法区分 self 与他人，
+        fail-closed 返回 None——宁可回执停在 ``typed``，也不把别人的话当成
+        自己的送达证据。
+        """
+        body = "" if text is None else str(text)
+        if not body or not self._self_display_name:
+            return None
+        try:
+            threshold = float(since)
+        except (TypeError, ValueError):
+            return None
+        for entry in reversed(self.recent(ref, limit)):
+            ts = entry.get("ts")
+            if not isinstance(ts, int) or isinstance(ts, bool) or ts < threshold:
+                continue
+            if entry.get("text") != body:
+                continue
+            if entry.get("nickname") != self._self_display_name:
+                continue
+            return entry
+        return None
+
     # ------------------------------------------------------------- 行规整
     def _entry_from_row(
         self,

@@ -208,6 +208,18 @@ class WeChatConfig:
     local_db_root: str = ""
     # 镜像同步的最小间隔（秒）；0 = 每轮都同步。
     local_db_refresh_seconds: float = 1.0
+    # 出站后端：uia = 桌面自动化（现状，锁屏不可用）；hook = HTTP 注入（不依赖桌面，
+    # 需配 hook_url，群 username 从本地库解析）；auto = 先 hook，只有明确「没发出去」
+    # 时才回落 UIA（HTTP 超时这类结果不明的情况不回落，避免重复发送）。
+    outbound: str = "uia"
+    # hook 后端地址（POST JSON）；outbound=hook/auto 时必填，启动时校验。
+    hook_url: str = ""
+    hook_timeout_seconds: float = 5.0
+    # 发送后回读本地库里自己刚发的消息做真实送达确认（需要 local_db_enabled）。
+    # 未确认只把回执降级为 typed + receipt_unverified，绝不诱发客户端重发。
+    send_verify: bool = True
+    send_verify_timeout_seconds: float = 8.0
+    send_verify_interval_seconds: float = 0.5
     send_min_interval_seconds: float = 20.0
     send_max_per_hour: int = 20
     send_max_per_day: int = 60
@@ -221,6 +233,15 @@ class WeChatConfig:
     version_min: str = "4.1.6"
     language: str = "zh-CN"
     allow_test_inject: bool = False
+
+    @property
+    def outbound_requires_desktop(self) -> bool:
+        """出站是否要求桌面可交互（客户端发送闸门用）。
+
+        ``hook`` / ``auto`` 的后端不依赖 UIA，锁屏时仍应允许下发；实际失败由桥
+        带回 error_code，而不是在客户端被 ``desktop != interactive`` 直接拦掉。
+        """
+        return self.outbound == "uia"
 
 
 @dataclass(frozen=True)
@@ -720,6 +741,7 @@ def _bool(value: Any, field: str) -> bool:
 _NUMERIC_ID = re.compile(r"^[0-9]+$")
 _ID_PREFIXES = ("qq:", "wxg:")
 _QUIET_HOUR = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
+_HOOK_URL = re.compile(r"^https?://", re.IGNORECASE)
 
 
 def parse_group_ids(value: Any, field: str) -> frozenset[str]:
@@ -813,6 +835,30 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
     )
     if local_db_refresh < 0:
         raise ConfigError("gateway.wechat.local_db_refresh_seconds 不能为负")
+    outbound = str(section.get("outbound") or "uia").strip().lower()
+    if outbound not in ("uia", "hook", "auto"):
+        raise ConfigError("gateway.wechat.outbound 只能是 uia / hook / auto")
+    hook_url = str(section.get("hook_url") or "").strip()
+    if hook_url and not _HOOK_URL.match(hook_url):
+        raise ConfigError("gateway.wechat.hook_url 必须是 http:// 或 https:// 地址")
+    hook_timeout = _float(
+        section.get("hook_timeout_seconds", 5.0),
+        "gateway.wechat.hook_timeout_seconds",
+    )
+    if hook_timeout <= 0:
+        raise ConfigError("gateway.wechat.hook_timeout_seconds 必须大于 0")
+    verify_timeout = _float(
+        section.get("send_verify_timeout_seconds", 8.0),
+        "gateway.wechat.send_verify_timeout_seconds",
+    )
+    if verify_timeout < 0:
+        raise ConfigError("gateway.wechat.send_verify_timeout_seconds 不能为负")
+    verify_interval = _float(
+        section.get("send_verify_interval_seconds", 0.5),
+        "gateway.wechat.send_verify_interval_seconds",
+    )
+    if verify_interval <= 0:
+        raise ConfigError("gateway.wechat.send_verify_interval_seconds 必须大于 0")
 
     quiet_hours = section.get("quiet_hours", ["23:30", "08:00"])
     if not isinstance(quiet_hours, (list, tuple)) or len(quiet_hours) != 2:
@@ -878,6 +924,14 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
         ),
         local_db_root=str(section.get("local_db_root") or "").strip(),
         local_db_refresh_seconds=local_db_refresh,
+        outbound=outbound,
+        hook_url=hook_url,
+        hook_timeout_seconds=hook_timeout,
+        send_verify=_bool(
+            section.get("send_verify", True), "gateway.wechat.send_verify"
+        ),
+        send_verify_timeout_seconds=verify_timeout,
+        send_verify_interval_seconds=verify_interval,
         kill_switch_file=kill_switch,
         version_min=str(section.get("version_min") or "4.1.6").strip(),
         language=str(section.get("language") or "zh-CN").strip(),

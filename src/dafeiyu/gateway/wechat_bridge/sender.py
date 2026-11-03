@@ -41,8 +41,10 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "FOREGROUND_IDLE_SECONDS",
+    "Prepared",
     "SendResult",
     "Sender",
+    "UiaTransport",
     "desktop_state",
     "get_foreground_window",
     "last_input_age",
@@ -68,6 +70,9 @@ class SendResult:
     message_id: str | None = None
     chat_name: str = ""
     detail: str = ""
+    #: 传输层能**证明**这条消息没发出去（连接被拒 / 后端明确 sent:false）。
+    #: `auto` 只在这种情况下回落 UIA；超时等结果不明的情况绝不回落。
+    not_sent: bool = False
 
 
 @dataclass
@@ -147,7 +152,7 @@ def input_was_self_injected(age: float, driver: Any) -> bool:
         return False
     try:
         own = probe()
-    except Exception:  # noqa: BLE001 - 探测失败按用户输入处理
+    except Exception:
         log.debug("last_synthetic_input_age 探测失败", exc_info=True)
         return False
     if own is None:
@@ -286,6 +291,206 @@ def _bubble_present(snapshot: Any, text: str, account_nickname: str) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class Prepared:
+    """一次发送的准备结果：会话显示名 + 传输层需要的句柄/目标 id。
+
+    UIA 传输把 `ChatHandle` 放进 ``handle``；hook 传输把群 username
+    （``xxx@chatroom``）放进 ``target``。Sender 不解释这些字段，只原样交回。
+    """
+
+    chat_name: str
+    handle: Any = None
+    target: str = ""
+
+
+class UiaTransport:
+    """UIA 桌面传输：开窗 -> 前台断言 -> 锁屏/健康闸门 -> 打字 -> 回轮询确认。
+
+    闸门顺序不可交换：前台检查必须在 ``driver.open_chat`` **之后**——驱动自己
+    会打开会话窗口，先要求「前台已经是目标窗」会变成永久拒绝。
+
+    驱动调用必须跑在 STA/UIA 线程上（生产路径由 `_UiThreadDriver` 保证），
+    本类只负责顺序与判定。
+    """
+
+    name = "uia"
+    #: 需要桌面可交互；Sender 据此决定是否做 UIA 准备。
+    requires_desktop = True
+    #: 可能回落到 UIA（auto 传输用），启动时仍需固定 GlobalConfig。
+    may_use_desktop = True
+
+    def __init__(
+        self,
+        config: Any,
+        *,
+        driver: Any = _default_driver,
+        health: Any = None,
+        session_epoch: int | None = None,
+    ) -> None:
+        self._config = config
+        self._driver = driver
+        self._health = health
+        self._epoch = int(session_epoch) if session_epoch is not None else _new_epoch()
+        self._observed_seq = 0
+
+    # ------------------------------------------------------------- 准备
+    def prepare(self, chat_name: str) -> Prepared | SendResult:
+        """开窗并跑完所有「真的可以打字了吗」的闸门。"""
+        # (b) 先打开会话，再断言前台窗口就是它。顺序不可反。
+        try:
+            handle = self._driver.open_chat(chat_name)
+        except DriverError as exc:
+            log.warning("打开会话失败 %s：%s", chat_name, exc)
+            return SendResult(
+                False, exc.code, "failed", chat_name=chat_name, detail=str(exc)
+            )
+        except Exception as exc:
+            log.exception("打开会话异常 %s", chat_name)
+            return SendResult(
+                False,
+                "open_chat_failed",
+                "failed",
+                chat_name=chat_name,
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+
+        target = _window_handle(getattr(handle, "window", None))
+        foreground = get_foreground_window()
+        if target is None or foreground is None or target != foreground:
+            log.warning(
+                "前台冲突 %s：目标窗口=%s 当前前台=%s",
+                chat_name,
+                target,
+                foreground,
+            )
+            return SendResult(
+                False,
+                "foreground_conflict",
+                "failed",
+                chat_name=chat_name,
+                detail=f"target={target} foreground={foreground}",
+            )
+
+        # (c) 用户刚有输入就不抢前台。注意：pyautogui 的按键同样会刷新系统空闲
+        #     计时，轮询刚翻完消息时这里的 age 会是 0.0x 秒——必须先把「自己按的」
+        #     排除掉，否则每条回复都会被自己的轮询拦成 foreground_busy。
+        if bool(_cfg(self._config, "require_foreground_idle", True)):
+            age = last_input_age()
+            if (
+                age is not None
+                and age < FOREGROUND_IDLE_SECONDS
+                and not input_was_self_injected(age, self._driver)
+            ):
+                log.info("用户前台有输入（%.2fs），拒绝发送 %s", age, chat_name)
+                return SendResult(
+                    False,
+                    "foreground_busy",
+                    "failed",
+                    chat_name=chat_name,
+                    detail=f"last input {age:.2f}s ago",
+                )
+
+        # (d) 桌面不可交互（锁屏等）时不排队、不发送。
+        desktop = None
+        if self._health is not None:
+            desktop = getattr(self._health, "desktop", None)
+        if desktop is None:
+            desktop = desktop_state()
+        if desktop != "interactive":
+            log.warning("桌面不可交互（%s），拒绝发送 %s", desktop, chat_name)
+            return SendResult(
+                False,
+                "desktop_unavailable",
+                "failed",
+                chat_name=chat_name,
+                detail=f"desktop={desktop}",
+            )
+
+        # 健康探测（task 17）降级时同样拒绝；`may_send()` 是它对外唯一的结论。
+        if self._health is not None:
+            try:
+                degraded = bool(getattr(self._health, "degraded", False))
+                may_send = getattr(self._health, "may_send", None)
+                ready = bool(may_send()) if callable(may_send) else not degraded
+            except Exception:
+                log.exception("健康探测异常，按降级处理")
+                degraded, ready = True, False
+            if degraded or not ready:
+                log.warning("健康探测降级，拒绝发送 %s", chat_name)
+                return SendResult(
+                    False,
+                    "degraded",
+                    "failed",
+                    chat_name=chat_name,
+                    detail="health provider is degraded",
+                )
+
+        return Prepared(chat_name=chat_name, handle=handle)
+
+    # ------------------------------------------------------------- 发送
+    def send(self, prepared: Prepared, text: str, delay: float) -> SendResult:
+        chat_name = prepared.chat_name
+        try:
+            self._driver.send_text(chat_name, text, delay)
+        except DriverError as exc:
+            log.warning("发送失败 %s：%s", chat_name, exc)
+            return SendResult(
+                False, exc.code, "failed", chat_name=chat_name, detail=str(exc)
+            )
+        except Exception as exc:
+            log.exception("发送异常 %s", chat_name)
+            return SendResult(
+                False,
+                "send_failed",
+                "failed",
+                chat_name=chat_name,
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+
+        # 回轮询确认气泡；没看到就是 failed，绝不自动重试。
+        try:
+            snapshot = self._driver.snapshot(prepared.handle)
+        except DriverError as exc:
+            log.warning("发送后回轮询失败 %s：%s", chat_name, exc)
+            return SendResult(
+                False,
+                "not_observed",
+                "failed",
+                chat_name=chat_name,
+                detail=f"snapshot failed: {exc.code}",
+            )
+        except Exception as exc:
+            log.exception("发送后回轮询异常 %s", chat_name)
+            return SendResult(
+                False,
+                "not_observed",
+                "failed",
+                chat_name=chat_name,
+                detail=f"snapshot failed: {type(exc).__name__}: {exc}",
+            )
+
+        account = str(_cfg(self._config, "account_nickname", "") or "")
+        if not _bubble_present(snapshot, text, account):
+            log.warning("回轮询未看到气泡 %s：%r", chat_name, text[:40])
+            return SendResult(
+                False,
+                "not_observed",
+                "failed",
+                chat_name=chat_name,
+                detail="sent text not found in snapshot",
+            )
+
+        self._observed_seq += 1
+        return SendResult(
+            True,
+            None,
+            "observed",
+            f"{self._epoch}:{self._observed_seq}",
+            chat_name,
+        )
+
+
 class Sender:
     """桥内唯一发送入口。
 
@@ -294,7 +499,10 @@ class Sender:
     - `driver`：驱动模块（默认 `driver.py`），只需 `open_chat/snapshot/send_text`；
     - `clock` / `sleep`：假时钟用来验证节流间隔；
     - `health`：鸭子类型，提供 `desktop`、`degraded`、`may_send()`；
-    - `uniform`：打字延迟分布，默认 `random.uniform`。
+    - `uniform`：打字延迟分布，默认 `random.uniform`；
+    - `transport`：出站传输（默认 `UiaTransport`）；hook/auto 等后端由
+      `outbound.build_transport()` 构造，必须提供 `prepare(chat_name)` /
+      `send(prepared, text, delay)` 与 `requires_desktop`。
     """
 
     def __init__(
@@ -308,6 +516,7 @@ class Sender:
         on_alert: Callable[[str, dict[str, Any]], None] | None = None,
         uniform: Callable[[float, float], float] = random.uniform,
         session_epoch: int | None = None,
+        transport: Any = None,
     ) -> None:
         self._config = config
         self._driver = driver
@@ -317,6 +526,16 @@ class Sender:
         self._on_alert = on_alert
         self._uniform = uniform
         self._epoch = int(session_epoch) if session_epoch is not None else _new_epoch()
+        self._transport = (
+            transport
+            if transport is not None
+            else UiaTransport(
+                config,
+                driver=driver,
+                health=health,
+                session_epoch=self._epoch,
+            )
+        )
 
         self._queue: queue.Queue[_Job | None] = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -329,10 +548,13 @@ class Sender:
         self._day_key: int | None = None
         self._hour_count = 0
         self._day_count = 0
-        self._observed_seq = 0
         self.alerts: list[tuple[str, dict[str, Any]]] = []
 
-        self._force_global_config_at_startup()
+        # hook 后端不需要 UIA：不要为了「固定 GlobalConfig」去 import pyweixin。
+        if getattr(self._transport, "requires_desktop", False) or getattr(
+            self._transport, "may_use_desktop", False
+        ):
+            self._force_global_config_at_startup()
 
     # ------------------------------------------------------------- 生命周期
     def __enter__(self) -> Self:
@@ -535,94 +757,26 @@ class Sender:
             )
         self._connected = True
 
-        # (b) 先打开会话，再断言前台窗口就是它。顺序不可反。
+        # (b) 传输层准备：UIA 在这里开窗/断言前台/检查锁屏与健康；
+        #     hook 在这里解析群 username。失败直接回失败，绝不继续排期。
         try:
-            handle = self._driver.open_chat(chat_name)
+            prepared = self._transport.prepare(chat_name)
         except DriverError as exc:
-            log.warning("打开会话失败 %s：%s", chat_name, exc)
+            log.warning("发送准备失败 %s：%s", chat_name, exc)
             return SendResult(
                 False, exc.code, "failed", chat_name=chat_name, detail=str(exc)
             )
         except Exception as exc:
-            log.exception("打开会话异常 %s", chat_name)
+            log.exception("发送准备异常 %s", chat_name)
             return SendResult(
                 False,
-                "open_chat_failed",
+                "prepare_failed",
                 "failed",
                 chat_name=chat_name,
                 detail=f"{type(exc).__name__}: {exc}",
             )
-
-        target = _window_handle(getattr(handle, "window", None))
-        foreground = get_foreground_window()
-        if target is None or foreground is None or target != foreground:
-            log.warning(
-                "前台冲突 %s：目标窗口=%s 当前前台=%s",
-                chat_name,
-                target,
-                foreground,
-            )
-            return SendResult(
-                False,
-                "foreground_conflict",
-                "failed",
-                chat_name=chat_name,
-                detail=f"target={target} foreground={foreground}",
-            )
-
-        # (c) 用户刚有输入就不抢前台。注意：pyautogui 的按键同样会刷新系统空闲
-        #     计时，轮询刚翻完消息时这里的 age 会是 0.0x 秒——必须先把「自己按的」
-        #     排除掉，否则每条回复都会被自己的轮询拦成 foreground_busy。
-        if bool(_cfg(self._config, "require_foreground_idle", True)):
-            age = last_input_age()
-            if (
-                age is not None
-                and age < FOREGROUND_IDLE_SECONDS
-                and not input_was_self_injected(age, self._driver)
-            ):
-                log.info("用户前台有输入（%.2fs），拒绝发送 %s", age, chat_name)
-                return SendResult(
-                    False,
-                    "foreground_busy",
-                    "failed",
-                    chat_name=chat_name,
-                    detail=f"last input {age:.2f}s ago",
-                )
-
-        # (d) 桌面不可交互（锁屏等）时不排队、不发送。
-        desktop = None
-        if self._health is not None:
-            desktop = getattr(self._health, "desktop", None)
-        if desktop is None:
-            desktop = desktop_state()
-        if desktop != "interactive":
-            log.warning("桌面不可交互（%s），拒绝发送 %s", desktop, chat_name)
-            return SendResult(
-                False,
-                "desktop_unavailable",
-                "failed",
-                chat_name=chat_name,
-                detail=f"desktop={desktop}",
-            )
-
-        # 健康探测（task 17）降级时同样拒绝；`may_send()` 是它对外唯一的结论。
-        if self._health is not None:
-            try:
-                degraded = bool(getattr(self._health, "degraded", False))
-                may_send = getattr(self._health, "may_send", None)
-                ready = bool(may_send()) if callable(may_send) else not degraded
-            except Exception:
-                log.exception("健康探测异常，按降级处理")
-                degraded, ready = True, False
-            if degraded or not ready:
-                log.warning("健康探测降级，拒绝发送 %s", chat_name)
-                return SendResult(
-                    False,
-                    "degraded",
-                    "failed",
-                    chat_name=chat_name,
-                    detail="health provider is degraded",
-                )
+        if isinstance(prepared, SendResult):
+            return prepared
 
         # (e) 节奏：不足最小间隔就等，不丢消息。
         interval = float(_cfg(self._config, "send_min_interval_seconds", 0.0))
@@ -654,73 +808,40 @@ class Sender:
                 detail="inside quiet_hours",
             )
 
-        # 所有闸门通过：打字延迟取配置区间，交给驱动。
+        # 所有闸门通过：打字延迟取配置区间，交给传输层。
         low, high = _typing_range(
             _cfg(self._config, "typing_delay_seconds", (0.0, 0.0))
         )
         delay = float(self._uniform(low, high))
         self._record_send(now)
         try:
-            self._driver.send_text(chat_name, text, delay)
+            result = self._transport.send(prepared, text, delay)
         except DriverError as exc:
-            self._last_send_at = float(self._clock())
             log.warning("发送失败 %s：%s", chat_name, exc)
-            return SendResult(
+            result = SendResult(
                 False, exc.code, "failed", chat_name=chat_name, detail=str(exc)
             )
         except Exception as exc:
-            self._last_send_at = float(self._clock())
             log.exception("发送异常 %s", chat_name)
-            return SendResult(
+            result = SendResult(
                 False,
                 "send_failed",
                 "failed",
                 chat_name=chat_name,
                 detail=f"{type(exc).__name__}: {exc}",
             )
+        # 与旧路径一致：只要真的发起过发送（无论成功/失败），都刷新节流时钟。
         self._last_send_at = float(self._clock())
-
-        # 回轮询确认气泡；没看到就是 failed，绝不自动重试。
-        try:
-            snapshot = self._driver.snapshot(handle)
-        except DriverError as exc:
-            log.warning("发送后回轮询失败 %s：%s", chat_name, exc)
+        if not isinstance(result, SendResult):
+            log.error("传输层返回了非 SendResult：%r", type(result))
             return SendResult(
                 False,
-                "not_observed",
+                "internal_error",
                 "failed",
                 chat_name=chat_name,
-                detail=f"snapshot failed: {exc.code}",
+                detail="transport returned a non-SendResult value",
             )
-        except Exception as exc:
-            log.exception("发送后回轮询异常 %s", chat_name)
-            return SendResult(
-                False,
-                "not_observed",
-                "failed",
-                chat_name=chat_name,
-                detail=f"snapshot failed: {type(exc).__name__}: {exc}",
-            )
-
-        account = str(_cfg(self._config, "account_nickname", "") or "")
-        if not _bubble_present(snapshot, text, account):
-            log.warning("回轮询未看到气泡 %s：%r", chat_name, text[:40])
-            return SendResult(
-                False,
-                "not_observed",
-                "failed",
-                chat_name=chat_name,
-                detail="sent text not found in snapshot",
-            )
-
-        self._observed_seq += 1
-        return SendResult(
-            True,
-            None,
-            "observed",
-            f"{self._epoch}:{self._observed_seq}",
-            chat_name,
-        )
+        return result
 
     # ------------------------------------------------------------- 计数
     def _rate_available(self, now: float) -> bool:

@@ -401,10 +401,18 @@ class WeChatAdapter:
         )
 
     # ----------------------------------------------------------------- 发送
+    def _desktop_required(self) -> bool:
+        """出站是否依赖可交互桌面：只有 uia 后端是。
+
+        `hook` / `auto` 不靠 UIA 打字，锁屏时仍应把指令发给桥；真正的失败由桥
+        回执里的 error_code 表达，而不是在客户端被 desktop 闸门直接拦掉。
+        """
+        return bool(getattr(self._config, "outbound_requires_desktop", True))
+
     async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str | None:
         if not self.connected:
             raise GatewayError("微信桥未连接")
-        if self._desktop != "interactive":
+        if self._desktop != "interactive" and self._desktop_required():
             raise GatewayError(f"微信桌面不可交互：{self._desktop}")
         ws = self._ws
         if ws is None:

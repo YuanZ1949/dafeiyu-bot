@@ -37,6 +37,7 @@ import logging
 import signal
 import sys
 import threading
+import time
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any
@@ -188,10 +189,45 @@ def _default_sender_factory(wechat: WeChatConfig, poller: Any, driver: Any) -> A
 
     不传 `health=`：HealthProbe 会直接调 pyweixin，必须在 UI 线程，P0 先走
     `desktop_state()`/前台检查的实时路径（见计划 P1 项）。
-    """
-    from .sender import Sender
 
-    return Sender(wechat, driver=_UiThreadDriver(poller, raw=driver))
+    `outbound` 决定传输层：`uia`（默认）保持历史行为；`hook` / `auto` 由
+    `outbound.build_transport()` 构造（auto 的 UIA 回落复用同一 STA 代理）。
+    """
+    from .outbound import build_transport
+    from .sender import Sender, UiaTransport
+
+    uia_driver = _UiThreadDriver(poller, raw=driver)
+
+    def uia_factory() -> Any:
+        return UiaTransport(wechat, driver=uia_driver)
+
+    transport = build_transport(
+        wechat,
+        uia_driver=uia_driver,
+        poller=poller,
+        uia_factory=uia_factory,
+    )
+    return Sender(wechat, driver=uia_driver, transport=transport)
+
+
+def _default_receipt_verifier(wechat: WeChatConfig, poller: Any) -> Any | None:
+    """发送后回读本地库确认送达；本地库没接或关闭校验时返回 None。"""
+    if not bool(getattr(wechat, "send_verify", True)):
+        return None
+    source = getattr(poller, "localdb", None)
+    if source is None:
+        return None
+    from .receipt import ReceiptVerifier
+
+    try:
+        return ReceiptVerifier(
+            source,
+            timeout=float(getattr(wechat, "send_verify_timeout_seconds", 8.0)),
+            interval=float(getattr(wechat, "send_verify_interval_seconds", 0.5)),
+        )
+    except (TypeError, ValueError) as exc:
+        logger.warning("回执校验参数无效，跳过本地库确认：%s", exc)
+        return None
 
 
 def _failed(code: str) -> dict[str, Any]:
@@ -316,6 +352,8 @@ async def run(
     # poller 在服务器工厂之后才构造：回调要能引用到它（action:"stop" 先 abort）。
     poller_holder: list[Any] = []
     sender_holder: list[Any] = []
+    #: 回执校验器：本地库可用时把 typed 升级成 observed（run 里按配置构造）。
+    receipt_verifier: Any | None = None
     # 必须早于 server / resume 闭包初始化，否则 resume 可能撞上 UnboundLocalError。
     poller: Any | None = None
     pump_task: asyncio.Task[None] | None = None
@@ -377,7 +415,7 @@ async def run(
     async def _builtin_send(
         action: str, params: dict[str, Any]
     ) -> dict[str, Any]:
-        """生产发送路径：解析 alias -> 提交 Sender -> 映射回执。"""
+        """生产发送路径：解析 alias -> 提交 Sender -> 映射回执 -> 本地库确认。"""
         try:
             chat_id, text, at = _validate_send(action, params)
             if at:
@@ -389,6 +427,7 @@ async def run(
             if not sender_holder:
                 raise _CommandError("not_ready")
             sender = sender_holder[0]
+            started_at = time.time()
             # 只等 future：驱动调用在 Sender worker -> UiThread 上，事件循环
             # 线程绝不直接碰 UIA。
             result = await asyncio.wrap_future(sender.submit_async(name, text))
@@ -399,7 +438,12 @@ async def run(
         except Exception:
             logger.exception("微信桥发送异常 action=%s", action)
             return _failed("internal_error")
-        return _receipt_from_result(result)
+        receipt = _receipt_from_result(result)
+        verifier = receipt_verifier
+        if verifier is not None:
+            # 未确认不回失败：客户端换 id 重发会造成重复消息（协议 §7.6）。
+            receipt = await verifier.apply(name, text, started_at, receipt)
+        return receipt
 
     async def _handle_command(
         action: str, params: dict[str, Any], command_id: str
@@ -443,6 +487,7 @@ async def run(
                     wechat, poller, driver
                 )
                 sender_holder.append(sender)
+                receipt_verifier = _default_receipt_verifier(wechat, poller)
             startup_health = await _startup_health_frame(poller, wechat, driver)
             source = poller.frames()
         else:
@@ -638,6 +683,21 @@ def _startup_checks(wechat: WeChatConfig) -> None:
             f"gateway.wechat.group_allowlist 有 {len(wechat.group_allowlist)} 个群，"
             f"超过 gateway.wechat.max_groups={wechat.max_groups}："
             "先调大 max_groups 或精简 group_allowlist"
+        )
+    mode = str(getattr(wechat, "outbound", "uia") or "uia").strip().lower()
+    if mode in ("hook", "auto") and not str(
+        getattr(wechat, "hook_url", "") or ""
+    ).strip():
+        raise ConfigError(
+            "gateway.wechat.outbound 是 hook/auto 但 hook_url 为空："
+            "先填 hook 服务地址，或把 outbound 改回 uia"
+        )
+    # hook 没有 UIA 兜底：本地库不可用就永远解析不出群 username，所有发送都会
+    # 失败。这种配置应该在启动时拒绝，而不是每条消息都回 chat_name_unresolved。
+    if mode == "hook" and not bool(getattr(wechat, "local_db_enabled", False)):
+        raise ConfigError(
+            "gateway.wechat.outbound 是 hook 但 local_db_enabled 是 false："
+            "hook 需要本地库把群显示名解析成 xxx@chatroom"
         )
 
 

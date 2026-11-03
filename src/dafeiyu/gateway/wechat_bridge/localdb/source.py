@@ -139,6 +139,40 @@ class LocalDbSource:
             log.debug("枚举群名失败：%s", exc)
             return []
 
+    def resolve_username(self, display_name: str) -> str | None:
+        """群显示名 -> ``xxx@chatroom``；不可用/歧义时返回 None（调用方 fail-closed）。"""
+        store = self._ensure()
+        if store is None:
+            return None
+        name = str(display_name or "").strip()
+        if not name:
+            return None
+        try:
+            ref = store.resolve(name)
+        except Exception as exc:  # noqa: BLE001 - 解析失败只是「没解析到」
+            log.debug("本地库解析群 %r 失败：%s", name, exc)
+            return None
+        return str(getattr(ref, "username", "") or "") or None
+
+    def find_self_message(
+        self, display_name: str, text: str, *, since: float
+    ) -> dict[str, Any] | None:
+        """回读自己刚发的消息；本地库不可用/找不到时返回 None。"""
+        store = self._ensure()
+        if store is None:
+            return None
+        name = str(display_name or "").strip()
+        if not name:
+            return None
+        try:
+            ref = store.resolve(name)
+            if ref is None:
+                return None
+            return store.find_self_message(ref, text, since=since)
+        except Exception as exc:  # noqa: BLE001 - 读失败只能「未确认」
+            log.debug("本地库回读自己消息失败（%r）：%s", name, exc)
+            return None
+
     # ------------------------------------------------------------- 内部
     def _ensure(self) -> LocalMessageStore | None:
         if self._store is not None:
