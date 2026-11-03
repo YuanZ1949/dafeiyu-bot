@@ -376,6 +376,111 @@ def test_send_text_skips_zero_delay(fake, monkeypatch) -> None:
     assert fake.Messages.sent[0]["messages"] == ["在吗"]
 
 
+class _FakeChild:
+    def __init__(self, present: bool) -> None:
+        self.present = present
+
+    def exists(self, timeout: float | None = None) -> bool:
+        return self.present
+
+
+class FakeChatWindow:
+    """微信主窗口的「多选」状态替身：多选时输入框消失、工具栏出现。"""
+
+    def __init__(self) -> None:
+        self.multiselect = False
+        self.keys: list[str] = []
+
+    def exists(self, timeout: float | None = None) -> bool:
+        return True
+
+    def class_name(self) -> str:
+        return "mmui::MainWindow"
+
+    def set_focus(self) -> None:  # pragma: no cover - 只是记录调用
+        return None
+
+    def type_keys(self, keys: str) -> None:
+        self.keys.append(keys)
+        if keys == "{ESC}":
+            self.multiselect = False
+
+    def child_window(self, **kwargs):
+        present = not self.multiselect and kwargs.get("auto_id") == "chat_input_field"
+        return _FakeChild(present)
+
+    def descendants(self, **kwargs):
+        if (
+            self.multiselect
+            and kwargs.get("class_name") == driver._MULTISELECT_TOOLBAR_CLASS
+        ):
+            return [object()]
+        return []
+
+
+def test_snapshot_exits_stuck_multiselect(fake, monkeypatch) -> None:
+    """回归：pyweixin 的 ESC 可能被前台窗口抢走，多选留着会让后续发送全失败。"""
+    chat_window = FakeChatWindow()
+    chat_window.multiselect = True
+    fake.Navigator.window = chat_window
+
+    driver.snapshot(ChatHandle(name="测试群", window=None))
+
+    assert chat_window.keys == ["{ESC}"]
+    assert chat_window.multiselect is False
+
+
+def test_send_text_retries_once_after_esc_multiselect(fake, monkeypatch) -> None:
+    """输入框被多选顶掉时 pyweixin 在键入前就抛 NotFriendError：退出多选后可重试。"""
+    chat_window = FakeChatWindow()
+    fake.Navigator.window = chat_window
+    attempts: list[list[str]] = []
+
+    def send_messages_to_friend(
+        friend: str, messages: list[str], close_weixin: bool | None = None
+    ) -> None:
+        attempts.append(list(messages))
+        if len(attempts) == 1:
+            chat_window.multiselect = True
+            raise NotFriendError("非正常好友,无法发送消息")
+        fake.Messages.sent.append(
+            {"friend": friend, "messages": list(messages), "close_weixin": close_weixin}
+        )
+
+    fake.Messages.send_messages_to_friend = send_messages_to_friend
+
+    driver.send_text("测试群", "在吗", 0)
+
+    assert chat_window.keys == ["{ESC}"]
+    assert len(attempts) == 2
+    # 只真正发出一条：第一次在键入前就失败了。
+    assert fake.Messages.sent == [
+        {"friend": "测试群", "messages": ["在吗"], "close_weixin": False}
+    ]
+
+
+def test_send_text_does_not_retry_not_friend_without_multiselect(
+    fake, monkeypatch
+) -> None:
+    chat_window = FakeChatWindow()
+    fake.Navigator.window = chat_window
+    attempts: list[str] = []
+
+    def send_messages_to_friend(friend: str, messages: list[str], **kwargs) -> None:
+        attempts.append(friend)
+        raise NotFriendError("非正常好友,无法发送消息")
+
+    fake.Messages.send_messages_to_friend = send_messages_to_friend
+
+    with pytest.raises(DriverError) as excinfo:
+        driver.send_text("测试群", "在吗", 0)
+
+    assert excinfo.value.code == "not_friend"
+    assert len(attempts) == 1
+    # 不是多选造成的：不要乱按 ESC（正常界面下 ESC 会把微信收进托盘）。
+    assert chat_window.keys == []
+
+
 def test_at_members_dedupes_in_order(fake) -> None:
     assert driver.at_members(ChatHandle(name="测试群", window=None)) == ["阿猫", "阿狗"]
 

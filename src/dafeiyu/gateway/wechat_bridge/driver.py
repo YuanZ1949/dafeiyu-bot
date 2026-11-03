@@ -37,15 +37,18 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+_log = logging.getLogger(__name__)
+
 __all__ = [
+    "PULL_MESSAGES",
     "ChatHandle",
     "DriverError",
-    "PULL_MESSAGES",
     "about",
     "at_members",
     "is_running",
@@ -362,6 +365,15 @@ def list_sessions() -> dict[str, list[dict[str, Any]]]:
 #: 每 8 秒调一遍等于不停把用户的窗口拽回屏幕中央；只在窗口失效时重新解析。
 _main_window_cache: Any | None = None
 
+#: 微信「多选消息」状态的特征：聊天输入框消失、聊天区顶部换成多选工具栏。
+#: pyweixin 的 `utils.traverse_message(select=True)` 靠 `pyautogui.press('esc')`
+#: 退出多选，而 ESC 发给的是**当前前台窗口**；用户或别的进程抢走焦点时微信会
+#: 卡在多选，之后 `send_messages_to_friend` 找不到输入框，在键入任何内容之前就抛
+#: NotFriendError（2026-11-03 F3 实测：回复全部失败，回执却报
+#: `chat_name_unresolved`，因为 `not_friend` 被映射成了它）。
+_CHAT_INPUT_SPEC: dict[str, Any] = {"control_type": "Edit", "auto_id": "chat_input_field"}
+_MULTISELECT_TOOLBAR_CLASS = "mmui::MultiSelectToolIButtonTexttem"
+
 
 def _main_window() -> Any:
     """取微信主窗口（带缓存）：未读探测只需要一个窗口句柄，不做任何激活。"""
@@ -377,8 +389,9 @@ def _main_window() -> Any:
             )
             if alive and is_main:
                 return cached
-        except Exception:  # noqa: BLE001 - 失效判断失败就重新解析
-            pass
+        except Exception as exc:  # noqa: BLE001 - 失效判断失败就重新解析
+            # 句柄状态读不出来：缓存作废，下一行重新开窗。
+            _log.debug("主窗口缓存失效，重新解析：%s", exc)
         _main_window_cache = None
 
     wx = _pyweixin()
@@ -416,6 +429,73 @@ def _no_window_jump(wx: Any) -> Any:
         yield
     finally:
         navigator.open_weixin = original
+
+
+def _chat_input_visible(window: Any) -> bool | None:
+    """聊天输入框在吗；窗口不支持查询时返回 None（不知道，不要动手）。"""
+    try:
+        child = window.child_window(**_CHAT_INPUT_SPEC)
+        return bool(child.exists(timeout=0.1))
+    except Exception as exc:  # noqa: BLE001 - 替身/旧窗口没有 child_window
+        _log.debug("聊天输入框探测失败：%s", exc)
+        return None
+
+
+def _multiselect_stuck(window: Any) -> bool:
+    """输入框不在、多选工具栏在 = 微信卡在「多选消息」。"""
+    if _chat_input_visible(window) is not False:
+        return False
+    try:
+        toolbar = window.descendants(
+            control_type="Button", class_name=_MULTISELECT_TOOLBAR_CLASS
+        )
+    except Exception as exc:  # noqa: BLE001 - 查不到多选工具栏就按正常处理
+        _log.debug("多选工具栏探测失败：%s", exc)
+        return False
+    return bool(toolbar)
+
+
+def _press_escape(window: Any) -> None:
+    """按一次 ESC 退出多选（pyweixin 自己也用这个键）。
+
+    只对**已经确认处于多选**的窗口调用：正常聊天界面下 ESC 是微信「隐藏主窗口」
+    的快捷键（2026-11-03 实测会把窗口收进托盘），绝不能乱按。
+    `type_keys` 走 pywinauto 的 SendInput，和 pyweixin 内部翻消息用的是同一条路。
+    """
+    focus = getattr(window, "set_focus", None)
+    if callable(focus):
+        focus()
+    window.type_keys("{ESC}")
+    time.sleep(0.2)
+
+
+def _exit_multiselect(window: Any, *, attempts: int = 2) -> bool:
+    """微信卡在多选时按 ESC 退出；返回是否真的退出了。
+
+    只在「输入框不在 + 多选工具栏在」时动手，正常聊天界面一次属性读就返回，
+    不会去碰用户正在做的多选以外的状态。
+    """
+    if not _multiselect_stuck(window):
+        return False
+    for attempt in range(max(1, attempts)):
+        try:
+            _press_escape(window)
+        except Exception as exc:  # noqa: BLE001 - 按键失败只影响能否重试发送
+            _log.warning("退出微信多选状态失败（第 %d 次）：%s", attempt + 1, exc)
+            break
+        if _chat_input_visible(window) is not False:
+            _log.info("微信卡在多选消息，已按 ESC 退出")
+            return True
+    return False
+
+
+def _exit_multiselect_now() -> bool:
+    """在当前微信主窗口上尝试退出多选；任何失败都只返回 False。"""
+    try:
+        return _exit_multiselect(_main_window())
+    except Exception as exc:  # noqa: BLE001 - 清理失败不该掩盖真正的发送错误
+        _log.debug("检查微信多选状态失败：%s", exc)
+        return False
 
 
 def unread_total() -> int:
@@ -506,6 +586,12 @@ def snapshot(handle: ChatHandle) -> dict[str, Any]:
                 lambda: wx.Messages.pull_messages(friend=name, number=PULL_MESSAGES),
                 "snapshot_failed",
             )
+            # pyweixin 读完消息会自己按 ESC 退出多选，但那一下发给的是前台窗口；
+            # 焦点被别人抢走时微信会卡在多选，下一条回复就永远发不出去
+            # （输入框消失 -> NotFriendError -> 回执 chat_name_unresolved）。
+            # 这里补一次确定性清理：正常界面只会多一次属性读。
+            with contextlib.suppress(Exception):
+                _exit_multiselect(_main_window())
     finally:
         # `pull_messages` 会按最多 30 次 'up' 翻消息，这些按键会刷新系统空闲计时。
         _mark_synthetic_input()
@@ -534,17 +620,31 @@ def send_text(name: str, text: str, delay: float) -> None:
     _force_global_config(wx)
     if delay > 0:
         time.sleep(delay)
+    # 上一轮快照可能把界面留在多选态：先清掉，别拿一条注定失败的发送去撞。
+    _exit_multiselect_now()
     try:
         with _no_window_jump(wx):
-            _call(
-                lambda: wx.Messages.send_messages_to_friend(
-                    friend=name, messages=[text], close_weixin=False
-                ),
-                "send_failed",
-            )
+            _send_once(wx, name, text)
+    except DriverError as exc:
+        # 卡在多选时 pyweixin 在**键入之前**就抛 NotFriendError（输入框不存在），
+        # 输入框里没有任何内容，退出多选后原样重试一次不会造成重复发送。
+        if exc.code != "not_friend" or not _exit_multiselect_now():
+            raise
+        _log.warning("发送被微信多选状态挡住：%s，已退出多选，重试一次", name)
+        with _no_window_jump(wx):
+            _send_once(wx, name, text)
     finally:
         # 粘贴 + Enter 同样是注入输入；后续的发送判断不该被它自己拦住。
         _mark_synthetic_input()
+
+
+def _send_once(wx: Any, name: str, text: str) -> None:
+    _call(
+        lambda: wx.Messages.send_messages_to_friend(
+            friend=name, messages=[text], close_weixin=False
+        ),
+        "send_failed",
+    )
 
 
 def _force_global_config(wx: Any) -> None:
