@@ -131,6 +131,32 @@ class SessionAligner:
         self._prev = current
         return PollResult(messages, None, self._epoch)
 
+    # --------------------------------------------------------- 重启续跑
+    def seed(self, entries: Iterable[Any]) -> None:
+        """用上一进程留下的窗口当基线，续上停机期间的缺口。
+
+        正常第一轮只建基线（``_prev`` 为空时才这样），否则会把启动前的历史当
+        成新消息回复。桥崩溃重启时，停机窗口里的消息已经不在内存里，只有磁盘
+        上那份窗口能 diff 出来——所以有 seed 就跳过「只建基线」。
+        """
+        seeded = [_entry_from(raw) for raw in entries][-self.window :]
+        if seeded:
+            self._prev = seeded
+
+    def export(self) -> list[dict[str, Any]]:
+        """导出当前窗口，供 :meth:`seed` 在重启后还原（只含对齐需要的字段）。"""
+        return [
+            {
+                "nickname": entry.nickname,
+                "text": entry.text,
+                "kind": entry.kind,
+                "reply_author": entry.reply_author,
+                "reply_text": entry.reply_text,
+                "ts": entry.ts,
+            }
+            for entry in self._prev
+        ]
+
     # ------------------------------------------------------------- 内部
     def _resync(self, current: list[Entry], *, reason: str) -> PollResult:
         """失去连续性：换 epoch、从 0 重编号、只发 resync，不补发历史。"""

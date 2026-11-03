@@ -4,6 +4,7 @@ import calendar
 import json
 import re
 import sqlite3
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -210,6 +211,24 @@ CREATE TABLE IF NOT EXISTS delivered_messages (
     skipped_reason TEXT,
     PRIMARY KEY (chat_type, chat_id, message_id)
 );
+
+-- 待发队列：发送瞬间通道/桌面不可用时，把没发出去的分片留在这里，等恢复后
+-- 补发。没有它，「桥崩在发送路上」就等于永久沉默（用户只看到「稍等」）。
+CREATE TABLE IF NOT EXISTS pending_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_type TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    origin_message_id TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    enqueued_at REAL NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_outbox_due
+    ON pending_outbox (next_attempt_at, id);
 """
 
 # 老库升级：SQLite 的 ALTER TABLE ADD COLUMN 必须带默认值（NOT NULL 也要给）。
@@ -1541,6 +1560,80 @@ class Store:
         ).fetchone()
         return None if row is None else row["skipped_reason"]
 
+    # ------------------------------------------------------------ 待发队列
+    def enqueue_outbox(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        text: str,
+        *,
+        origin_message_id: str = "",
+        now: float | None = None,
+    ) -> int:
+        """把没发出去的一条分片排进待发队列；返回行 id（0 = 空文本，未入队）。"""
+        body = str(text or "")
+        if not body.strip():
+            return 0
+        stamp = time.time() if now is None else float(now)
+        cur = self._conn.execute(
+            """
+            INSERT INTO pending_outbox
+                (chat_type, chat_id, text, origin_message_id, enqueued_at, next_attempt_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (chat_type.value, chat_id, body, str(origin_message_id or ""), stamp, stamp),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def due_outbox(self, now: float | None = None, *, limit: int = 20) -> list[dict[str, Any]]:
+        """到点可补发的行，按入队顺序返回（同一会话天然保序）。"""
+        stamp = time.time() if now is None else float(now)
+        rows = self._conn.execute(
+            """
+            SELECT id, chat_type, chat_id, text, origin_message_id, attempts, enqueued_at
+            FROM pending_outbox
+            WHERE next_attempt_at <= ?
+            ORDER BY id
+            LIMIT ?
+            """,
+            (stamp, int(limit)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def has_outbox(self, chat_type: ChatType | None = None, chat_id: str | None = None) -> bool:
+        if chat_type is None:
+            row = self._conn.execute("SELECT 1 FROM pending_outbox LIMIT 1").fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT 1 FROM pending_outbox WHERE chat_type = ? AND chat_id = ? LIMIT 1",
+                (chat_type.value, chat_id),
+            ).fetchone()
+        return row is not None
+
+    def outbox_size(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) FROM pending_outbox").fetchone()[0])
+
+    def drop_outbox(self, row_id: int) -> None:
+        self._conn.execute("DELETE FROM pending_outbox WHERE id = ?", (int(row_id),))
+        self._conn.commit()
+
+    def defer_outbox(self, row_id: int, *, error: str, next_attempt_at: float) -> int:
+        """记一次失败并推迟；返回累计尝试次数。"""
+        self._conn.execute(
+            """
+            UPDATE pending_outbox
+            SET attempts = attempts + 1, last_error = ?, next_attempt_at = ?
+            WHERE id = ?
+            """,
+            (str(error or "")[:300], float(next_attempt_at), int(row_id)),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT attempts FROM pending_outbox WHERE id = ?", (int(row_id),)
+        ).fetchone()
+        return int(row["attempts"]) if row is not None else 0
+
     @staticmethod
     def _row_to_message(r: sqlite3.Row) -> Message:
         return Message(
@@ -2784,6 +2877,7 @@ class Store:
             "brain_sessions",
             "delivered_cursors",
             "delivered_messages",
+            "pending_outbox",
             "session_summaries",
         ):
             self._conn.execute(
@@ -2811,6 +2905,7 @@ class Store:
             "brain_sessions",
             "delivered_cursors",
             "delivered_messages",
+            "pending_outbox",
             "session_summaries",
         ):
             self._conn.execute(
@@ -2829,6 +2924,7 @@ class Store:
             "brain_sessions",
             "delivered_cursors",
             "delivered_messages",
+            "pending_outbox",
             "session_summaries",
         ):
             self._conn.execute(f"DELETE FROM {table}")

@@ -52,6 +52,10 @@ TOOL_HINT_REPLY = "本鱼去网上查一下，稍等…"
 FOLLOWUP_REPLY = "没查到什么有用的，本鱼先不瞎说了"
 # 同一会话 60s 内不重复发「去查一下」；每轮最多一次由 brain 侧保证。
 TOOL_HINT_INTERVAL_SECONDS = 60.0
+# 待发队列：通道恢复后补发的轮询间隔 / 重试上限 / 消息保鲜期。
+OUTBOX_RETRY_SECONDS = 15.0
+OUTBOX_MAX_ATTEMPTS = 8
+OUTBOX_MAX_AGE_SECONDS = 6 * 3600
 # 轮换摘要的输入窗口（spec §9.2：最近 40 条）。
 ROTATION_WINDOW = 40
 # 批次被跳过的原因。error 与 record_usage(purpose="error") 同口径
@@ -140,20 +144,22 @@ class Service:
         self._sleep = sleep or asyncio.sleep
         self.commands = CommandRegistry()
         self._command_clock: Callable[[], float] = time.monotonic
-        self._command_last: dict[tuple[str, str, int], float] = {}
+        self._command_last: dict[tuple[str, str, str], float] = {}
         self.scheduler: BatchScheduler | None = None
         self._scheduler_task: asyncio.Task | None = None
         self.keepalive: Keepalive | None = None
         self._keepalive_task: asyncio.Task | None = None
-        self._locks: dict[tuple[ChatType, int], asyncio.Lock] = {}
-        self._batch_locks: dict[tuple[ChatType, int], asyncio.Lock] = {}
+        self._locks: dict[tuple[ChatType, str], asyncio.Lock] = {}
+        self._batch_locks: dict[tuple[ChatType, str], asyncio.Lock] = {}
         self._started_at = time.monotonic()
         # 轮换后的接续文本：成功投递才弹出，失败留到下一批重试。
-        self._continuations: dict[tuple[ChatType, int], str] = {}
+        self._continuations: dict[tuple[ChatType, str], str] = {}
         # 已从库里补投过接续语的会话：同一进程内不再重复注入（重启后内存为空，
         # 会再从 session_summaries 捞一次，然后同样只注入一次）。
-        self._continuation_used: set[tuple[ChatType, int]] = set()
-        self._hint_at: dict[tuple[ChatType, int], float] = {}
+        self._continuation_used: set[tuple[ChatType, str]] = set()
+        self._hint_at: dict[tuple[ChatType, str], float] = {}
+        # 待发队列的补发任务（通道恢复后把没发出去的分片补上）。
+        self._outbox_task: asyncio.Task[None] | None = None
         # 面板可改的聊天强度/言论限制：整体替换，避免逐字段同步。
         self.behavior: BehaviorSettings = settings.behavior
         # 面板可改的群白名单：Service 与 Router 都读这一份，整体替换。
@@ -204,8 +210,15 @@ class Service:
         for adapter in self.adapters.values():
             await adapter.start()
         self._start_keepalive()
+        self._start_outbox()
 
     async def stop(self) -> None:
+        task = self._outbox_task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            self._outbox_task = None
         task = self._keepalive_task
         if task is not None:
             task.cancel()
@@ -274,6 +287,122 @@ class Service:
         if self.keepalive is None:
             return {"enabled": False}
         return self.keepalive.status()
+
+    # -------------------------------------------------------------- 待发队列
+    def _start_outbox(self) -> None:
+        if self._outbox_task is not None:
+            return
+        # 旧替身/只读场景没有这些方法：不做补发，行为与以前一致。
+        if not callable(getattr(self.store, "due_outbox", None)):
+            return
+        self._outbox_task = asyncio.create_task(self._outbox_loop(), name="outbox")
+
+    async def _outbox_loop(self) -> None:
+        """通道恢复后把没发出去的分片补发；失败退避，过期/超限就丢。"""
+        while True:
+            await asyncio.sleep(OUTBOX_RETRY_SECONDS)
+            try:
+                await self._flush_outbox()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("待发队列冲刷失败")
+
+    async def _flush_outbox(self) -> int:
+        """补发到期的行；返回成功条数（测试直接调它，不用等定时器）。"""
+        now = time.time()
+        sent = 0
+        for row in self.store.due_outbox(now):
+            try:
+                chat_type = ChatType(row["chat_type"])
+                adapter = self._adapter_for(str(row["chat_id"]))
+            except (ValueError, KeyError) as exc:
+                log.warning("待发队列里有无法路由的行 %r：%s", row.get("chat_id"), exc)
+                self.store.drop_outbox(int(row["id"]))
+                continue
+            chat_id = str(row["chat_id"])
+            row_id = int(row["id"])
+            lock = self._batch_locks.get((chat_type, chat_id))
+            # 正在进行的那一轮回复优先：别让补发的旧分片插进新对话里。
+            if lock is not None and lock.locked():
+                continue
+            age = now - float(row["enqueued_at"] or 0.0)
+            if age > OUTBOX_MAX_AGE_SECONDS:
+                log.warning(
+                    "待发消息超过 %.0f 分钟，丢弃 %s: %s",
+                    age / 60,
+                    chat_id,
+                    str(row["text"])[:40],
+                )
+                self.store.drop_outbox(row_id)
+                continue
+            if not bool(getattr(adapter, "connected", True)):
+                # 通道还没恢复：留在队列里，等下一轮，不算尝试次数。
+                continue
+            try:
+                message_id = await adapter.send(chat_type, chat_id, str(row["text"]))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 失败只退避，不丢队列
+                attempts = self.store.defer_outbox(
+                    row_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                    next_attempt_at=now
+                    + min(OUTBOX_RETRY_SECONDS * (2 ** min(int(row["attempts"]), 6)), 600.0),
+                )
+                log.warning("补发失败（第 %d 次）%s: %s", attempts, chat_id, exc)
+                if attempts >= OUTBOX_MAX_ATTEMPTS:
+                    log.warning("补发超限，丢弃 %s: %s", chat_id, str(row["text"])[:40])
+                    self.store.drop_outbox(row_id)
+                continue
+            self.store.drop_outbox(row_id)
+            self._store_outbox_message(
+                chat_type, chat_id, str(row["text"]), message_id, row_id
+            )
+            log.info("补发成功 %s/%s（入队 %.0fs）", chat_id, row_id, age)
+            sent += 1
+        return sent
+
+    def _store_outbox_message(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        text: str,
+        message_id: str | None,
+        row_id: int,
+    ) -> None:
+        """补发成功后写回历史，保证下一轮上下文连贯。"""
+        self.store.add_message(
+            Message(
+                chat_type=chat_type,
+                chat_id=chat_id,
+                user_id=self._adapter_for(chat_id).bot_id,
+                nickname=self.settings.persona.name,
+                content=text,
+                message_id=message_id or f"outbox:{row_id}",
+                is_bot=True,
+                timestamp=int(now_shanghai().timestamp()),
+            )
+        )
+
+    async def _send_outbox(
+        self, chat_type: ChatType, chat_id: str, text: str, *, origin: str = ""
+    ) -> bool:
+        """尽力立即发送；失败就进待发队列（返回是否已发出）。
+
+        用于「已经给过承诺」的补话：桥断了也不能让用户等到天荒地老。
+        """
+        try:
+            await self._adapter_for(chat_id).send(chat_type, chat_id, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 失败转队列，不打断主流程
+            log.warning("发送失败，转入待发队列 %s/%s: %s", chat_id, origin or "-", exc)
+            self.store.enqueue_outbox(
+                chat_type, chat_id, text, origin_message_id=origin
+            )
+            return False
+        return True
 
     def set_brain(self, brain: Any) -> Any:
         """原子换脑；返回旧实例，由调用方决定何时关闭。
@@ -1036,22 +1165,22 @@ class Service:
             self.store.mark_skipped(chat_type, chat_id, ids, SKIP_ERROR)
             log.warning("批次调用失败 %s/%s: %s", chat_id, current_id, exc)
             if hint.sent:
-                # 已经开口说「去查一下」，不能没有下文。
-                try:
-                    await self._adapter_for(chat_id).send(chat_type, chat_id, FOLLOWUP_REPLY)
-                except Exception as send_exc:  # noqa: BLE001 - 补话失败不影响记账
-                    log.warning("补话发送失败 %s/%s: %s", chat_id, current_id, send_exc)
+                # 已经开口说「去查一下」，不能没有下文；发不出去就排队补发。
+                await self._send_outbox(
+                    chat_type, chat_id, FOLLOWUP_REPLY, origin=current_id
+                )
             self._check_workspace(chat_type, chat_id)
             return
 
         sent = await self._send_batch_reply(batch, reply, chat_type, chat_id)
         if not sent:
             if hint.sent:
-                # 已经开口说「去查一下」，不能没有下文。
-                try:
-                    await self._adapter_for(chat_id).send(chat_type, chat_id, FOLLOWUP_REPLY)
-                except Exception as exc:  # noqa: BLE001 - 补话失败不影响记账
-                    log.warning("补话发送失败 %s/%s: %s", chat_id, current_id, exc)
+                # 已经开口说「去查一下」，不能没有下文。正式回复若已进待发
+                # 队列，就等它补发，别再补一句「没查到」（会自相矛盾）。
+                if not self.store.has_outbox(chat_type, chat_id):
+                    await self._send_outbox(
+                        chat_type, chat_id, FOLLOWUP_REPLY, origin=current_id
+                    )
             else:
                 self.router.note_no_reply(chat_type, chat_id)
 
@@ -1103,21 +1232,33 @@ class Service:
         if not chunks:
             return []
         sent: list[tuple[str, str | None]] = []
+        defer = 0
         delay = float(getattr(self.settings.persona, "segment_delay_seconds", 0.0))
-        try:
-            for index, chunk in enumerate(chunks):
-                if index and delay > 0:
-                    await self._sleep(delay)
+        for index, chunk in enumerate(chunks):
+            if index and delay > 0:
+                await self._sleep(delay)
+            try:
                 message_id = await self._adapter_for(chat_id).send(chat_type, chat_id, chunk)
-                sent.append((chunk, message_id))
-        except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
-            log.warning("发送失败 %s/%s: %s", chat_id, batch[-1].message_id, exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
+                log.warning("发送失败 %s/%s: %s", chat_id, batch[-1].message_id, exc)
+                # 失败这条和后面所有分片一起进待发队列：通道恢复后补发，
+                # 不再出现「用户只看到『稍等』」的永久沉默。
+                for rest in chunks[index:]:
+                    if self.store.enqueue_outbox(
+                        chat_type, chat_id, rest, origin_message_id=batch[-1].message_id
+                    ):
+                        defer += 1
+                break
+            sent.append((chunk, message_id))
+        if defer:
+            log.info("发送失败，待发队列 +%d %s/%s", defer, chat_id, batch[-1].message_id)
         else:
             addressed = any(self._is_addressed(m) for m in batch)
             self.router.note_bot_spoke(chat_type, chat_id, ambient=not addressed)
-        finally:
-            # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
-            self._store_bot_chunks(batch[-1], sent)
+        # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
+        self._store_bot_chunks(batch[-1], sent)
         return sent
 
     def _restrictions_allow(self, text: str) -> bool:
@@ -1584,15 +1725,28 @@ class Service:
             return
 
         sent: list[tuple[str, str | None]] = []
+        defer = 0
         delay = float(getattr(self.settings.persona, "segment_delay_seconds", 0.0))
-        try:
-            for index, chunk in enumerate(chunks):
-                if index and delay > 0:
-                    await self._sleep(delay)
-                message_id = await self._adapter_for(msg.chat_id).send(msg.chat_type, msg.chat_id, chunk)
-                sent.append((chunk, message_id))
-        except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
-            log.warning("发送失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
+        for index, chunk in enumerate(chunks):
+            if index and delay > 0:
+                await self._sleep(delay)
+            try:
+                message_id = await self._adapter_for(msg.chat_id).send(
+                    msg.chat_type, msg.chat_id, chunk
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
+                log.warning("发送失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
+                for rest in chunks[index:]:
+                    if self.store.enqueue_outbox(
+                        msg.chat_type, msg.chat_id, rest, origin_message_id=msg.message_id
+                    ):
+                        defer += 1
+                break
+            sent.append((chunk, message_id))
+        if defer:
+            log.info("发送失败，待发队列 +%d %s/%s", defer, msg.chat_id, msg.message_id)
         else:
             self.router.note_bot_spoke(
                 msg.chat_type,
@@ -1600,9 +1754,8 @@ class Service:
                 ambient=msg.chat_type is ChatType.GROUP
                 and not self._is_addressed(msg),
             )
-        finally:
-            # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
-            self._store_bot_chunks(msg, sent)
+        # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
+        self._store_bot_chunks(msg, sent)
 
     def _store_bot_chunks(self, msg: Message, chunks: list[tuple[str, str | None]]) -> None:
         """入库 bot 回复：优先用网关返回的真实 message_id，没有才回退合成值。"""

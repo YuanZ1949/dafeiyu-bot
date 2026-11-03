@@ -45,7 +45,9 @@ import asyncio
 import concurrent.futures
 import contextlib
 import importlib
+import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -82,6 +84,9 @@ KILL_SWITCH_REASON = "kill_switch"
 
 #: 默认的杀开关相对路径（与 `WeChatConfig.kill_switch_file` 默认值一致）。
 DEFAULT_KILL_SWITCH = "data/wechat.stop"
+
+#: 对齐窗口的落盘点：桥崩溃重启后靠它把停机期间的新消息 diff 出来。
+DEFAULT_ALIGN_STATE = "data/wechat-bridge/align-state.json"
 
 _JOB_POLL = "poll"
 _JOB_SEND = "send"
@@ -321,6 +326,7 @@ class PollingLoop:
         kill_switch_path: str | Path | None = None,
         localdb: Any | None = None,
         panel: Callable[[], frozenset[str] | None] | None = None,
+        align_state_path: str | Path | None = None,
     ) -> None:
         self.wechat = wechat
         self.driver = driver
@@ -373,6 +379,15 @@ class PollingLoop:
         self.kill_switch_path = Path(str(raw_kill or DEFAULT_KILL_SWITCH))
 
         self._aligners: dict[str, SessionAligner] = {}
+        # 对齐窗口落盘：重启后 feed 回 aligner，停机期间的新消息不会丢。
+        self.align_state_path = (
+            Path(str(align_state_path)) if align_state_path else None
+        )
+        self._align_state = self._load_align_state()
+        self._align_dirty = False
+        # 上一次成功的健康帧：探测超时时用它兜底（尤其是 desktop 字段，
+        # bot 侧据此决定能不能发送）。
+        self._last_health: dict[str, Any] | None = None
         self._stopped = asyncio.Event()
         self._started = False
         self._rounds = 0
@@ -612,27 +627,31 @@ class PollingLoop:
     ) -> AsyncIterator[dict[str, Any]]:
         scope = self._scope()
         allowed = frozenset(scope)
-        for group in scope if groups is None else groups:
-            if self._stopped.is_set():
-                return
-            # 双保险：永远不碰本轮范围之外的会话（面板可能刚被改小）。
-            if group not in allowed:
-                continue
-            try:
-                frames = await self._poll_group(group)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - 单群失败不该打断整轮
-                logger.warning("轮询会话 %r 失败，跳过本轮：%s", group, exc)
-            else:
-                for frame in frames:
-                    yield frame
-            if self._stopped.is_set():
-                return
-            # 每群之后补一帧心跳：把最大帧间隔钉在「单群耗时」（开窗+快照约 5s）
-            # 上。3 个群串行一轮 15s+，若只在轮末发心跳，帧泵的空转看门狗就会
-            # 把健康的多群轮询误判成卡死。
-            yield await self._health_frame(connected=True)
+        try:
+            for group in scope if groups is None else groups:
+                if self._stopped.is_set():
+                    return
+                # 双保险：永远不碰本轮范围之外的会话（面板可能刚被改小）。
+                if group not in allowed:
+                    continue
+                try:
+                    frames = await self._poll_group(group)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 单群失败不该打断整轮
+                    logger.warning("轮询会话 %r 失败，跳过本轮：%s", group, exc)
+                else:
+                    for frame in frames:
+                        yield frame
+                if self._stopped.is_set():
+                    return
+                # 每群之后补一帧心跳：把最大帧间隔钉在「单群耗时」（开窗+快照约 5s）
+                # 上。3 个群串行一轮 15s+，若只在轮末发心跳，帧泵的空转看门狗就会
+                # 把健康的多群轮询误判成卡死。
+                yield await self._health_frame(connected=True)
+        finally:
+            # 一轮结束（含被取消/提前 return）统一落盘对齐窗口。
+            self._save_align_state()
 
     async def _poll_group(self, group: str) -> list[dict[str, Any]]:
         entries = await self._localdb_entries(group) if self._uses_localdb() else None
@@ -644,6 +663,7 @@ class PollingLoop:
         if aligner is None:
             return []
         result = aligner.poll(entries or [])
+        self._remember_align_window(group, aligner)
         frames = list(result.messages)
         if result.resync is not None:
             frames.append(result.resync)
@@ -699,13 +719,89 @@ class PollingLoop:
             chat_type="group",
             clock=self._clock,
         )
+        # 旧替身没有 seed：跳过续跑，退回「第一轮只建基线」的语义。
+        seed = getattr(aligner, "seed", None)
+        restored = self._align_state.get(group)
+        if restored and callable(seed):
+            try:
+                seed(restored)
+            except Exception as exc:  # noqa: BLE001 - 坏状态只影响一轮，不阻断轮询
+                logger.warning("会话 %r 的对齐窗口还原失败：%s", group, exc)
         self._aligners[group] = aligner
         return aligner
 
+    def _remember_align_window(self, group: str, aligner: Any) -> None:
+        """把本轮对齐窗口记到内存，等这一轮结束统一落盘。"""
+        export = getattr(aligner, "export", None)
+        if not callable(export):
+            return
+        try:
+            entries = export()
+        except Exception as exc:  # noqa: BLE001 - 落盘失败不能影响帧源
+            logger.debug("导出会话 %r 的对齐窗口失败：%s", group, exc)
+            return
+        if not isinstance(entries, list):
+            return
+        if self._align_state.get(group) != entries:
+            self._align_state[group] = entries
+            self._align_dirty = True
+
+    def _load_align_state(self) -> dict[str, list[dict[str, Any]]]:
+        path = self.align_state_path
+        if path is None or not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - 状态坏了按首次启动处理
+            logger.warning("读取对齐状态失败，按首次启动处理：%s", exc)
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        state: dict[str, list[dict[str, Any]]] = {}
+        for group, entries in raw.items():
+            if isinstance(entries, list):
+                state[str(group)] = [item for item in entries if isinstance(item, dict)]
+        return state
+
+    def _save_align_state(self) -> None:
+        path = self.align_state_path
+        if path is None or not self._align_dirty:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(self._align_state, ensure_ascii=False), "utf-8"
+            )
+            os.replace(tmp, path)
+            self._align_dirty = False
+        except Exception as exc:  # noqa: BLE001 - 磁盘问题只影响续跑，不影响轮询
+            logger.debug("保存对齐状态失败：%s", exc)
+
     # ------------------------------------------------------------- 健康
     async def _health_frame(self, *, connected: bool) -> dict[str, Any]:
-        frame = await self._ui_call(self._probe, connected)
-        out = dict(frame) if isinstance(frame, dict) else {}
+        """健康帧：探测失败只降级，绝不让单次 UIA 超时打死整个帧源。
+
+        发送和探测共用同一个 UIA 线程：一条长发送会让排队的探测超过
+        `MAX_AWAIT`。以前这个 `TimeoutError` 会一路冒到 `frames()`，把桥整个
+        打死；现在沿用上一次成功的字段（`desktop`/`logged_in` 尤其重要，bot
+        据此决定能不能发），只补 `degraded` 和失败原因。
+        """
+        try:
+            frame = await self._ui_call(self._probe, connected)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 探测失败只能降级，不能退出
+            logger.warning("健康探测失败，本帧降级：%s", exc)
+            out = dict(self._last_health or {})
+            # 从没有过成功帧时 fail-closed：宁可这一轮不发，也不在状态不明时操作桌面。
+            out.setdefault("desktop", "locked")
+            out.setdefault("logged_in", False)
+            out["degraded"] = True
+            out["reason"] = f"health_probe_failed:{type(exc).__name__}"
+        else:
+            out = dict(frame) if isinstance(frame, dict) else {}
+            self._last_health = dict(out)
         out.setdefault("v", 1)
         out["type"] = "health"
         out["connected"] = bool(connected)

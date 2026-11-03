@@ -718,12 +718,17 @@ def _default_driver_factory() -> Any:
 def _default_poller_factory(wechat: WeChatConfig, driver: Any) -> Any:
     """默认轮询循环：`PollingLoop` 的 import 也留在函数体内，保持入口轻量。"""
     from .panel import PanelGroups
-    from .poller import PollingLoop
+    from .poller import DEFAULT_ALIGN_STATE, PollingLoop
 
     localdb = _build_localdb_source(wechat)
     # 范围以面板白名单为准（热加载，面板改完一个轮询间隔内生效）。
     return PollingLoop(
-        wechat, driver, localdb=localdb, panel=PanelGroups().whitelist
+        wechat,
+        driver,
+        localdb=localdb,
+        panel=PanelGroups().whitelist,
+        # 对齐窗口落盘：桥崩溃重启后把停机期间的新消息补出来。
+        align_state_path=DEFAULT_ALIGN_STATE,
     )
 
 
