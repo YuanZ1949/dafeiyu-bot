@@ -39,6 +39,9 @@ gateway:
   wechat:
     # 默认关闭；启用前先跑 `dafeiyu doctor` 的 8 项预检。
     enabled: false
+    # wechat 的群范围不在本文件配置：以面板白名单 groups.whitelist 为准
+    # （空 = 不限制；读不到面板 = fail-closed，不轮询也不发送）。
+
     # UIA 桥监听地址；gateway.wechat.bridge_host 绑非回环地址时 bridge_token 必填。
     bridge_host: 127.0.0.1
     bridge_port: 8790
