@@ -78,6 +78,11 @@ gateway:
     outbound: uia
     # hook 服务地址（POST JSON，请求/响应契约见 wechat_bridge/outbound.py）。
     hook_url: ""
+    # 可选：@ / 媒体专用端点。留空时按 hook_url 推导（.../send_text → .../send_at、
+    # .../send_media）；推导不出来就明确回 unsupported_at / unsupported_media。
+    hook_at_url: ""
+    hook_media_url: ""
+    # 原生桥单次发送可能 1–3s；5s 太紧，建议 30。
     hook_timeout_seconds: 5.0
     # 发送后回读本地库确认自己刚发的消息（需要 local_db_enabled）；未确认只把回执
     # 降级为 typed + receipt_unverified，绝不让客户端换 id 重发。

@@ -267,6 +267,10 @@ class WeChatConfig:
     outbound: str = "uia"
     # hook 后端地址（POST JSON）；outbound=hook/auto 时必填，启动时校验。
     hook_url: str = ""
+    # 可选的 @ / 媒体端点；留空时按 hook_url 的末段推导（.../send_text →
+    # .../send_at、.../send_media），推导不出来就明确回 unsupported_at/media。
+    hook_at_url: str = ""
+    hook_media_url: str = ""
     hook_timeout_seconds: float = 5.0
     # 发送后回读本地库里自己刚发的消息做真实送达确认（需要 local_db_enabled）。
     # 未确认只把回执降级为 typed + receipt_unverified，绝不诱发客户端重发。
@@ -945,6 +949,14 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
     hook_url = str(section.get("hook_url") or "").strip()
     if hook_url and not _HOOK_URL.match(hook_url):
         raise ConfigError("gateway.wechat.hook_url 必须是 http:// 或 https:// 地址")
+    hook_at_url = str(section.get("hook_at_url") or "").strip()
+    if hook_at_url and not _HOOK_URL.match(hook_at_url):
+        raise ConfigError("gateway.wechat.hook_at_url 必须是 http:// 或 https:// 地址")
+    hook_media_url = str(section.get("hook_media_url") or "").strip()
+    if hook_media_url and not _HOOK_URL.match(hook_media_url):
+        raise ConfigError(
+            "gateway.wechat.hook_media_url 必须是 http:// 或 https:// 地址"
+        )
     hook_timeout = _float(
         section.get("hook_timeout_seconds", 5.0),
         "gateway.wechat.hook_timeout_seconds",
@@ -1044,6 +1056,8 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
         local_db_refresh_seconds=local_db_refresh,
         outbound=outbound,
         hook_url=hook_url,
+        hook_at_url=hook_at_url,
+        hook_media_url=hook_media_url,
         hook_timeout_seconds=hook_timeout,
         send_verify=_bool(
             section.get("send_verify", True), "gateway.wechat.send_verify"

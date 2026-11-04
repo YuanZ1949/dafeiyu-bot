@@ -31,7 +31,7 @@ import logging
 import socket
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from .sender import Prepared, SendResult
@@ -56,13 +56,15 @@ class HookTransport:
         timeout: float = 5.0,
         opener: Callable[..., Any] | None = None,
         media_url: str = "",
+        at_url: str = "",
     ) -> None:
         self._url = str(url or "").strip()
         self._resolver = resolver
         self._timeout = float(timeout)
         self._opener = opener or urllib.request.urlopen
-        # 可选媒体端点；没配置时 send_media 直接回 unsupported_media。
+        # 可选媒体/@ 端点；没配置时分别回 unsupported_media / unsupported_at。
         self._media_url = str(media_url or "").strip()
+        self._at_url = str(at_url or "").strip()
 
     # ------------------------------------------------------------- 准备
     def prepare(self, chat_name: str) -> Prepared | SendResult:
@@ -115,12 +117,44 @@ class HookTransport:
         }
         return self._post(self._url, payload, chat_name)
 
+    def send_at(
+        self, prepared: Prepared, text: str, at: Sequence[str], delay: float
+    ) -> SendResult:
+        """带 @ 的文本；`at` 是显示名，由后端负责解析成可发送的 id。
+
+        没配 at 端点时明确回 ``unsupported_at`` 且标记 ``not_sent``，调用方
+        可以安全退回普通 ``send_text``（不会重复发送）。
+        """
+        del delay
+        members = tuple(str(item or "").strip() for item in at if str(item or "").strip())
+        if not members:
+            return self.send(prepared, text, 0.0)
+        url = _endpoint(self._url, "send_at", self._at_url)
+        if not url:
+            return SendResult(
+                False,
+                "unsupported_at",
+                "failed",
+                chat_name=prepared.chat_name,
+                detail="未配置 @ hook 端点",
+                not_sent=True,
+            )
+        payload = {
+            "action": "send_at",
+            "chatroom": prepared.target,
+            "chat_name": prepared.chat_name,
+            "text": text,
+            "at": list(members),
+        }
+        return self._post(url, payload, prepared.chat_name)
+
     def send_media(
         self, chat_name: str, kind: str, path: str, name: str = ""
     ) -> SendResult:
         """仅当配置了独立媒体端点时才 POST；否则明确 `unsupported_media`。"""
         display = str(chat_name or "").strip()
-        if not self._url or not self._media_url:
+        url = _endpoint(self._url, "send_media", self._media_url)
+        if not url:
             return SendResult(
                 False,
                 "unsupported_media",
@@ -140,7 +174,7 @@ class HookTransport:
             "path": path,
             "name": name,
         }
-        return self._post(self._media_url, payload, prepared.chat_name)
+        return self._post(url, payload, prepared.chat_name)
 
     def _post(self, url: str, payload: dict[str, Any], chat_name: str) -> SendResult:
         request = urllib.request.Request(
@@ -325,6 +359,15 @@ class AutoTransport:
         )
         return result
 
+    def send_at(
+        self, prepared: Prepared, text: str, at: Sequence[str], delay: float
+    ) -> SendResult:
+        """@ 只走 hook；UIA 不支持定向 @，所以失败就是明确没发（可退回纯文本）。"""
+        hook_prepared = self._hook.prepare(prepared.chat_name)
+        if isinstance(hook_prepared, SendResult):
+            return hook_prepared
+        return self._hook.send_at(hook_prepared, text, at, delay)
+
     def send_media(
         self, chat_name: str, kind: str, path: str, name: str = ""
     ) -> SendResult:
@@ -369,6 +412,7 @@ def build_transport(
         resolver=_localdb_username_resolver(poller),
         timeout=float(getattr(wechat, "hook_timeout_seconds", 5.0) or 5.0),
         media_url=str(getattr(wechat, "hook_media_url", "") or ""),
+        at_url=str(getattr(wechat, "hook_at_url", "") or ""),
     )
     if mode == "hook":
         return hook
@@ -377,6 +421,21 @@ def build_transport(
     # 配置层已校验；这里保底按默认 UIA 处理。
     log.warning("未知 outbound=%r，按 UIA 处理", mode)
     return None
+
+
+def _endpoint(base: str, name: str, explicit: str) -> str:
+    """显式端点优先；否则把 ``.../send_text`` 的末段换成 ``name``。
+
+    只认 ``/send_text`` 结尾的地址，避免把任意 URL 猜成 ``/send_at``。
+    """
+    value = str(explicit or "").strip()
+    if value:
+        return value
+    url = str(base or "").strip().rstrip("/")
+    suffix = "/send_text"
+    if url.endswith(suffix):
+        return f"{url[: -len(suffix)]}/{name}"
+    return ""
 
 
 def _localdb_username_resolver(poller: Any) -> Callable[[str], Any] | None:

@@ -469,17 +469,19 @@ async def run(
             return await _builtin_send_media(params)
         try:
             chat_id, text, at = _validate_send(action, params)
-            if at:
-                # P0 不支持定向 @：明确失败，绝不悄悄丢掉 @ 当普通消息发。
-                return _failed("unsupported_at")
             name = _resolve_chat_name(poller, chat_id)
             if not sender_holder:
                 raise _CommandError("not_ready")
             sender = sender_holder[0]
             started_at = time.time()
             # 只等 future：驱动调用在 Sender worker -> UiThread 上，事件循环
-            # 线程绝不直接碰 UIA。
-            result = await asyncio.wrap_future(sender.submit_async(name, text))
+            # 线程绝不直接碰 UIA。@ 交给传输后端判断（UIA 回 unsupported_at，
+            # hook 后端真正带 @ 发送）。
+            if at:
+                future = sender.submit_async(name, text, at)
+            else:
+                future = sender.submit_async(name, text)
+            result = await asyncio.wrap_future(future)
         except asyncio.CancelledError:
             raise
         except _CommandError as exc:

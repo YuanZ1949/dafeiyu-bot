@@ -786,3 +786,130 @@ def test_uia_send_media_is_unsupported_without_touching_driver() -> None:
     assert result.error_code == "unsupported_media"
     assert result.not_sent is True
     assert driver.calls == []
+
+
+# ------------------------------------------------------------------ @ 定向
+def test_hook_send_at_without_endpoint_is_unsupported_and_not_sent() -> None:
+    transport, opener = _hook()  # HOOK_URL 不以 /send_text 结尾，推导不出 @ 端点
+    prepared = transport.prepare(GROUP)
+
+    result = transport.send_at(prepared, "hi", ["小明"], 0.0)
+
+    assert result.ok is False
+    assert result.error_code == "unsupported_at"
+    assert result.not_sent is True
+    assert opener.requests == []
+
+
+def test_hook_send_at_derives_endpoint_and_posts_members() -> None:
+    opener = FakeOpener(FakeResponse('{"ok": true, "message_id": "h-3"}'))
+    transport = HookTransport(
+        "http://127.0.0.1:9999/send_text",
+        resolver=lambda name: USERNAME,
+        opener=opener,
+    )
+    prepared = transport.prepare(GROUP)
+
+    result = transport.send_at(prepared, "hi", ["小明", "小红"], 0.0)
+
+    assert result.ok is True
+    assert result.message_id == "h-3"
+    assert opener.requests[0].full_url == "http://127.0.0.1:9999/send_at"
+    assert json.loads(opener.requests[0].data.decode("utf-8")) == {
+        "action": "send_at",
+        "chatroom": USERNAME,
+        "chat_name": GROUP,
+        "text": "hi",
+        "at": ["小明", "小红"],
+    }
+
+
+def test_hook_send_at_empty_members_is_plain_send() -> None:
+    transport, opener = _hook(FakeResponse('{"ok": true}'))
+    prepared = transport.prepare(GROUP)
+
+    result = transport.send_at(prepared, "hi", [], 0.0)
+
+    assert result.ok is True
+    assert opener.requests[0].full_url == HOOK_URL
+
+
+def test_auto_send_at_uses_hook_endpoint_without_uia() -> None:
+    opener = FakeOpener(FakeResponse('{"ok": true}'))
+    hook = HookTransport(
+        "http://127.0.0.1:9999/send_text",
+        resolver=lambda name: USERNAME,
+        opener=opener,
+    )
+    auto = AutoTransport(hook, uia_factory=_exploding_uia_factory())
+
+    result = auto.send_at(Prepared(chat_name=GROUP), "hi", ["小明"], 0.0)
+
+    assert result.ok is True
+    assert opener.requests[0].full_url.endswith("/send_at")
+
+
+class _AtTransport:
+    requires_desktop = False
+    may_use_desktop = False
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+
+    def prepare(self, chat_name: str) -> Prepared:
+        return Prepared(chat_name=chat_name, target="t")
+
+    def send(self, prepared: Prepared, text: str, delay: float) -> SendResult:
+        self.calls.append(("send", text))
+        return SendResult(True, None, "typed", "m-1", prepared.chat_name)
+
+    def send_at(
+        self, prepared: Prepared, text: str, at: Any, delay: float
+    ) -> SendResult:
+        self.calls.append(("send_at", text, tuple(at)))
+        return SendResult(True, None, "typed", "m-2", prepared.chat_name)
+
+
+class _NoAtTransport:
+    requires_desktop = False
+    may_use_desktop = False
+
+    def prepare(self, chat_name: str) -> Prepared:
+        return Prepared(chat_name=chat_name, target="t")
+
+    def send(self, prepared: Prepared, text: str, delay: float) -> SendResult:
+        return SendResult(True, None, "typed", "m-1", prepared.chat_name)
+
+
+def test_sender_routes_at_to_transport_send_at() -> None:
+    transport = _AtTransport()
+    sender = Sender(
+        _wechat(outbound="hook", hook_url=HOOK_URL, quiet_hours=("00:00", "00:00")),
+        driver=NoUiaDriver(),
+        transport=transport,
+        sleep=lambda seconds: None,
+    )
+    try:
+        result = sender.submit(GROUP, "hi", ("小明",))
+    finally:
+        sender.close()
+
+    assert result.ok is True
+    assert transport.calls == [("send_at", "hi", ("小明",))]
+
+
+def test_sender_without_at_support_returns_unsupported_at() -> None:
+    sender = Sender(
+        _wechat(outbound="hook", hook_url=HOOK_URL, quiet_hours=("00:00", "00:00")),
+        driver=NoUiaDriver(),
+        transport=_NoAtTransport(),
+        sleep=lambda seconds: None,
+    )
+    try:
+        result = sender.submit(GROUP, "hi", ("小明",))
+    finally:
+        sender.close()
+
+    assert result.ok is False
+    assert result.error_code == "unsupported_at"
+    assert result.not_sent is True

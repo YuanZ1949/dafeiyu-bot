@@ -82,6 +82,8 @@ class _Job:
     chat_name: str
     text: str
     future: Future[SendResult] = field(default_factory=Future)
+    #: 要 @ 的成员显示名；空 = 普通文本。传输层不支持时回 `unsupported_at`。
+    at: tuple[str, ...] = ()
 
 
 def _completed(result: SendResult) -> Future[SendResult]:
@@ -793,15 +795,19 @@ class Sender:
         }
 
     # ------------------------------------------------------------- 提交
-    def submit(self, chat_name: str, text: str) -> SendResult:
+    def submit(
+        self, chat_name: str, text: str, at: tuple[str, ...] = ()
+    ) -> SendResult:
         """入队并等待本条的发送结果。
 
         `submit()` 可以并发调用；返回顺序不必等于完成顺序，但驱动调用严格按入队
         顺序串行执行，不会交叉。
         """
-        return self.submit_async(chat_name, text).result()
+        return self.submit_async(chat_name, text, at).result()
 
-    def submit_async(self, chat_name: str, text: str) -> Future[SendResult]:
+    def submit_async(
+        self, chat_name: str, text: str, at: tuple[str, ...] = ()
+    ) -> Future[SendResult]:
         """入队并立即返回 future；不阻塞调用线程。
 
         生产桥用 ``await asyncio.wrap_future(sender.submit_async(...))``：事件
@@ -823,8 +829,9 @@ class Sender:
             return _completed(
                 SendResult(False, "closed", "failed", detail="发送器已关闭")
             )
+        mentions = tuple(str(item or "").strip() for item in at if str(item or "").strip())
 
-        job = _Job(name, body)
+        job = _Job(name, body, at=mentions)
         with self._worker_lock:
             if self._closed:
                 return _completed(
@@ -849,7 +856,7 @@ class Sender:
                 if not item.future.set_running_or_notify_cancel():
                     continue
                 try:
-                    result = self._execute(item.chat_name, item.text)
+                    result = self._execute(item.chat_name, item.text, item.at)
                 except BaseException as exc:
                     log.exception("发送器内部错误：%s", item.chat_name)
                     result = SendResult(
@@ -892,7 +899,9 @@ class Sender:
         log.warning("driver 缺少 force_global_config 能力，跳过启动固定 GlobalConfig")
 
     # ------------------------------------------------------------- 闸门 + 发送
-    def _execute(self, chat_name: str, text: str) -> SendResult:
+    def _execute(
+        self, chat_name: str, text: str, at: tuple[str, ...] = ()
+    ) -> SendResult:
         # 已 abort/close：worker 可能刚取到 job 还没开始执行，直接回 closed。
         if self._closed:
             return SendResult(
@@ -913,6 +922,18 @@ class Sender:
                 detail=f"kill switch file exists: {kill_switch}",
             )
         self._connected = True
+
+        # (a2) @ 定向：先在传输层准备之前判定能力，UIA 不支持时不要白开一次窗。
+        at_handler = getattr(self._transport, "send_at", None) if at else None
+        if at and not callable(at_handler):
+            return SendResult(
+                False,
+                "unsupported_at",
+                "failed",
+                chat_name=chat_name,
+                detail="当前传输后端不支持定向 @",
+                not_sent=True,
+            )
 
         # (b) 传输层准备：UIA 在这里开窗/断言前台/检查锁屏与健康；
         #     hook 在这里解析群 username。失败直接回失败，绝不继续排期。
@@ -970,9 +991,13 @@ class Sender:
             _cfg(self._config, "typing_delay_seconds", (0.0, 0.0))
         )
         delay = float(self._uniform(low, high))
+
         self._record_send(now)
         try:
-            result = self._transport.send(prepared, text, delay)
+            if callable(at_handler):
+                result = at_handler(prepared, text, at, delay)
+            else:
+                result = self._transport.send(prepared, text, delay)
         except DriverError as exc:
             log.warning("发送失败 %s：%s", chat_name, exc)
             result = SendResult(

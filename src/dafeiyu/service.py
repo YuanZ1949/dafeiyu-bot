@@ -1633,6 +1633,28 @@ class Service:
                     log.warning("附件上传失败（继续发文本）%s: %s", chat_id, exc)
 
         media = tuple(item for item in attachments if item.kind != "file")
+
+        # 没有消息段能力的通道（微信桥）：逐条走自己的媒体接口，再发正文。
+        # 失败只记日志，正文照发——附件是加分项。
+        if media and not callable(getattr(adapter, "send_segments", None)):
+            push_media = cast(
+                Callable[..., Awaitable[Any]] | None,
+                getattr(adapter, "send_media", None),
+            )
+            if callable(push_media):
+                for item in media:
+                    if not item.path:
+                        continue
+                    try:
+                        await push_media(
+                            chat_type, chat_id, item.kind, item.path, item.name
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - 附件是加分项
+                        log.info("媒体发送失败（继续发文本）%s: %s", chat_id, exc)
+                media = ()
+
         if quote_id or at_qq_ids or media:
             sender = cast(
                 Callable[..., Awaitable[str | None]] | None,
