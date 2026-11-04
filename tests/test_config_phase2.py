@@ -297,7 +297,9 @@ def test_wechat_block_defaults(tmp_path: Path) -> None:
     assert cfg.send_min_interval_seconds == 20.0
     assert cfg.send_max_per_hour == 20
     assert cfg.send_max_per_day == 60
-    assert cfg.quiet_hours == ("23:30", "08:00")
+    # 未显式配置时跟随 triggers.quiet_hours（本文件的基线是 01:00-07:00）：
+    # 夜间静默只留一个开关，避免 triggers 放行、发送端默认拦下的分裂行为。
+    assert cfg.quiet_hours == ("01:00", "07:00")
     assert cfg.typing_delay_seconds == (0.6, 1.2)
     assert cfg.ack_requires_observed is True
     assert cfg.echo_window_seconds == 120.0
