@@ -12,6 +12,7 @@ from pathlib import Path
 
 from ..memory.store import Store
 from ..models import ChatType
+from ..winproc import hidden_kwargs
 from .client import BrainError, BrainReply, parse_brain_reply
 
 # 仓库根；发布包里 opencode.exe 放在 vendor/opencode/ 下随包分发。
@@ -77,6 +78,7 @@ def resolve_opencode_bin(configured: str = "") -> str:
                 errors="replace",
                 timeout=10,
                 check=False,
+                **hidden_kwargs(),
             )
             lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
             if lines:
