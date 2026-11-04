@@ -95,6 +95,8 @@ gateway:
     send_max_per_hour: 20
     send_max_per_day: 60
     # 静默时段 [start, end]，HH:MM，起止相同 = 不静默。
+    # 不写这一项 = 继承 triggers.quiet_hours（推荐只在一处配置，
+    # 否则 triggers 放行、这里默认拦下，消息会静默发不出去）。
     quiet_hours: ["23:30", "08:00"]
     # 模拟打字的延迟区间（秒）。
     typing_delay_seconds: [0.6, 1.2]

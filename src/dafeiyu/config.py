@@ -904,8 +904,18 @@ def parse_group_ids(value: Any, field: str) -> frozenset[str]:
     return frozenset(ids)
 
 
-def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
-    """解析 `gateway.wechat`；就绪度缺失只告警，不在加载阶段拒绝。"""
+def _build_wechat(
+    raw: Any,
+    env: dict[str, str],
+    *,
+    default_quiet_hours: tuple[str, str] = ("23:30", "08:00"),
+) -> WeChatConfig:
+    """解析 `gateway.wechat`；就绪度缺失只告警，不在加载阶段拒绝。
+
+    `quiet_hours` 未显式配置时用 `default_quiet_hours`（加载器传
+    `triggers.quiet_hours`）：夜间静默只留一个开关，避免出现
+    「triggers 关了静默、发送端还有一份默认 23:30-08:00」互相打架。
+    """
     section: dict[str, Any] = {}
     if raw is not None:
         if not isinstance(raw, dict):
@@ -976,7 +986,7 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
     if verify_interval <= 0:
         raise ConfigError("gateway.wechat.send_verify_interval_seconds 必须大于 0")
 
-    quiet_hours = section.get("quiet_hours", ["23:30", "08:00"])
+    quiet_hours = section.get("quiet_hours", list(default_quiet_hours))
     if not isinstance(quiet_hours, (list, tuple)) or len(quiet_hours) != 2:
         raise ConfigError("gateway.wechat.quiet_hours 必须是两个 HH:MM 字符串")
     quiet: list[str] = []
@@ -1386,7 +1396,12 @@ def load_settings(
     gateway_provider = str(gateway_raw.get("provider") or "qq").strip().casefold()
     if gateway_provider not in ("qq", "wechat", "both"):
         raise ConfigError("gateway.provider 只能是 qq、wechat 或 both")
-    wechat = _build_wechat(gateway_raw.get("wechat"), env)
+    triggers = _build_triggers(_section(raw, "triggers"))
+    wechat = _build_wechat(
+        gateway_raw.get("wechat"),
+        env,
+        default_quiet_hours=triggers.quiet_hours,
+    )
     if gateway_provider in ("wechat", "both") and not wechat.enabled:
         logger.warning(
             "gateway.provider=%s 但 gateway.wechat.enabled=false，降级为 qq",
@@ -1625,7 +1640,7 @@ def load_settings(
         ws_token=env.get("NAPCAT_WS_TOKEN", ""),
         db_path=env.get("DAFEIYU_DB_PATH", "data/dafeiyu.db"),
         persona=_build_persona(_section(raw, "persona")),
-        triggers=_build_triggers(_section(raw, "triggers")),
+        triggers=triggers,
         groups=GroupsConfig(
             whitelist=parse_group_ids(
                 _section(raw, "groups").get("whitelist"), "groups.whitelist"

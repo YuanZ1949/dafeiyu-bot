@@ -104,3 +104,6 @@ gateway:
   `unsupported_at`。
 - **媒体**：已打通。`Service._send_chunk` 对没有 `send_segments` 的通道逐条调
   `send_media`，失败只记日志、正文照发。支持 image / file / voice / sticker。
+- **静默时段**：`gateway.wechat.quiet_hours` 不写时继承 `triggers.quiet_hours`（起止相同 =
+  不静默）；显式写了就按自己这份拦。两处各写一份且不一致时最容易出现「triggers 放行、
+  发送端仍拦」的静默发不出去。

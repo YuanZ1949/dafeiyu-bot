@@ -384,3 +384,20 @@ def test_wechat_media_max_bytes_must_be_positive(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="gateway.wechat.media.max_bytes"):
         load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+
+def test_wechat_quiet_hours_inherit_triggers(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    settings = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+    assert settings.triggers.quiet_hours == ("01:00", "07:00")
+    # 未配置 gateway.wechat.quiet_hours 时必须跟随 triggers，不能偷偷用
+    # 内置的 23:30-08:00 把夜间回复全拦掉。
+    assert settings.wechat.quiet_hours == settings.triggers.quiet_hours
+
+
+def test_wechat_quiet_hours_explicit_wins(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + 'gateway:\n  wechat:\n    quiet_hours: ["22:00", "06:00"]\n'
+    settings = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+    assert settings.wechat.quiet_hours == ("22:00", "06:00")
+    assert settings.triggers.quiet_hours == ("01:00", "07:00")
