@@ -573,7 +573,20 @@ class PollingLoop:
             return ()
         if isinstance(raw, (str, bytes)) or not isinstance(raw, Iterable):
             return ()
-        return tuple(sorted({str(name).strip() for name in raw if str(name).strip()}))
+        names = tuple(sorted({str(name).strip() for name in raw if str(name).strip()}))
+        # 枚举得到不等于读得到：还没有消息分库的群（例如刚建/只有系统消息的会话）
+        # resolve 会失败，此时 UIA 兜底只会多一次开窗超时，什么也读不到。
+        resolver = getattr(source, "resolve_username", None)
+        if not callable(resolver):
+            return names
+        kept: list[str] = []
+        for name in names:
+            try:
+                if resolver(name):
+                    kept.append(name)
+            except Exception as exc:  # noqa: BLE001 - 解析失败按「读不到」处理
+                logger.debug("解析本地库群 %r 失败：%s", name, exc)
+        return tuple(kept)
 
     def _scope(self) -> tuple[str, ...]:
         """本轮允许轮询的群显示名；面板是唯一来源。

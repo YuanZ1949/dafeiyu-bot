@@ -235,3 +235,20 @@ async def test_localdb_snapshot_timeout_falls_back(started: Any) -> None:
     await asyncio.wait_for(_drain_round(loop), STEP * 2)
 
     assert driver.opened == ["老友群"]
+
+
+async def test_localdb_targets_skip_groups_without_resolvable_username(
+    started: Any,
+) -> None:
+    """枚举到但解析不出 @chatroom 的群不开窗：UIA 兜底只会白等一次超时。"""
+
+    class _Partial(FakeLocalDb):
+        def resolve_username(self, name: str) -> str | None:
+            return None if name == "垃圾桶" else f"{name}@chatroom"
+
+    driver = FakeDriver()
+    localdb = _Partial({"垃圾桶": {"messages": []}, "老友群": {"messages": []}})
+    loop = started(driver, localdb)
+
+    assert await loop._targets() == ("老友群",)
+    assert driver.opened == []
