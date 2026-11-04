@@ -19,6 +19,7 @@ from pathlib import Path
 import aiohttp
 
 from ..config import load_settings
+from ..winproc import hidden_kwargs
 from .auth import COOKIE_NAME
 from .lan_access import ensure_dashboard_password
 from .manager import port_owner
@@ -136,6 +137,7 @@ def _process_command_line(pid: int) -> str | None:
             errors="replace",
             timeout=5,
             check=False,
+            **hidden_kwargs(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -238,6 +240,7 @@ def _force_kill(pid: int) -> None:
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
                 check=False,
+                **hidden_kwargs(),
             )
         return
     with contextlib.suppress(ProcessLookupError, PermissionError):

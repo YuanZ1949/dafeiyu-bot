@@ -131,6 +131,7 @@ def find_napcat_pids(directory: Path = NAPCAT_DIR) -> list[int]:
             text=True,
             timeout=20,
             check=False,
+            creationflags=CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
         return []

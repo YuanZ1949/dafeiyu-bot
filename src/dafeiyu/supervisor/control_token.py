@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from ..winproc import hidden_kwargs
+
 log = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -53,6 +55,7 @@ def harden_token_file(path: Path) -> None:
                 text=True,
                 timeout=10,
                 check=False,
+                **hidden_kwargs(),
             )
             if result.returncode != 0:
                 log.warning(

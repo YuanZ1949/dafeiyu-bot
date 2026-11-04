@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any
 
 from ..config import RestartConfig
+from ..winproc import hidden_kwargs
 from .logs import LogHub
 
 log = logging.getLogger(__name__)
@@ -524,6 +525,7 @@ def _find_listener_pid(port: int) -> int | None:
             encoding="mbcs",
             errors="replace",
             check=False,
+            **hidden_kwargs(),
         ).stdout
     except Exception:  # noqa: BLE001 - 探测失败只表示「查不到」，调用方按无 PID 处理
         return None
