@@ -487,3 +487,39 @@ def test_process_names_lists_snapshot_names(monkeypatch) -> None:
     )
 
     assert health._process_names() == ["explorer.exe", "Weixin.exe"]
+
+
+# ------------------------------------------------------------------ hook 出站（非 UIA）
+def test_hook_outbound_skips_uia_probe_while_locked(healthy, monkeypatch) -> None:
+    def boom(*args: object, **kwargs: object):
+        raise AssertionError("outbound=hook 不允许探测 UIA")
+
+    monkeypatch.setattr(health.driver, "about", boom)
+    monkeypatch.setattr(health.driver, "language", boom)
+    monkeypatch.setattr(health, "_detect_desktop", lambda: health.DESKTOP_LOCKED)
+
+    frame = health.probe(make_config(outbound="hook"))
+
+    assert frame["logged_in"] is True
+    assert frame["desktop"] == health.DESKTOP_LOCKED
+    assert frame["degraded"] is False
+    assert frame["reason"] is None
+    assert frame["integrity"] == health.INTEGRITY_UNKNOWN
+
+
+def test_hook_outbound_may_send_while_locked(healthy, monkeypatch) -> None:
+    monkeypatch.setattr(health, "_detect_desktop", lambda: health.DESKTOP_LOCKED)
+    probe = health.HealthProbe(make_config(outbound="hook"))
+
+    assert probe.may_send() == (True, None)
+
+
+def test_hook_outbound_still_fails_when_wechat_not_running(healthy, monkeypatch) -> None:
+    monkeypatch.setattr(health.driver, "is_running", lambda: False)
+
+    frame = health.probe(make_config(outbound="hook"))
+
+    assert frame["logged_in"] is False
+    assert frame["desktop"] == "no_wechat"
+    assert frame["degraded"] is True
+    assert frame["reason"] == "no_wechat"

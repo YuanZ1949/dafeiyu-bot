@@ -42,6 +42,31 @@ try {
     Write-Host "读取配置失败，使用默认端口 8787" -ForegroundColor DarkYellow
 }
 
+# 微信出站走 hook/auto 时，先把本地 hook 服务拉起来（脚本自身幂等）。
+# 放在 supervisor 之前：bot 一连上桥就能发消息，不用等第一次发送才失败。
+$wechatHook = $false
+try {
+    $hookFlag = & $python -c "from dafeiyu.config import load_settings; w = load_settings().wechat; print('1' if (w.enabled and w.outbound in ('hook', 'auto')) else '0')" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $hookFlag) {
+        $wechatHook = (($hookFlag | Select-Object -Last 1).Trim() -eq "1")
+    }
+} catch {
+    Write-Host "读取微信出站配置失败，跳过 hook 服务启动" -ForegroundColor DarkYellow
+}
+
+if ($wechatHook) {
+    $hookScript = Join-Path $root "scripts\start-wechat-hook.ps1"
+    if (Test-Path -LiteralPath $hookScript) {
+        Write-Host "启动微信 hook 服务（非 UIA 出站）..." -ForegroundColor Cyan
+        & powershell -ExecutionPolicy Bypass -File $hookScript
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "hook 服务未就绪：微信出站会失败，其余通道照常启动" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "找不到 $hookScript，跳过微信 hook 服务" -ForegroundColor DarkYellow
+    }
+}
+
 $pidFile = Join-Path $root "data\supervisor.pid"
 $alreadyRunning = $false
 if (Test-Path -LiteralPath $pidFile) {

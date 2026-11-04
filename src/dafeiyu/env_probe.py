@@ -355,6 +355,9 @@ def probe_wechat(config=None) -> list[dict[str, str]]:
         getattr(cfg, "language", "zh-CN") or "zh-CN"
     )
     checks: list[dict[str, str]] = []
+    # 出站走 hook/auto 时不碰 UIA：完整性级别与桌面解锁都不再是前置条件。
+    outbound = str(getattr(cfg, "outbound", "uia") or "uia").strip().lower()
+    uia_needed = outbound == "uia"
 
     # (1) process
     pids: list[int] = []
@@ -482,6 +485,14 @@ def probe_wechat(config=None) -> list[dict[str, str]]:
         checks.append(
             _check("wechat.integrity_match", "SKIP", "微信进程未运行，跳过完整性检查")
         )
+    elif not uia_needed:
+        checks.append(
+            _check(
+                "wechat.integrity_match",
+                "SKIP",
+                f"outbound={outbound}，出站不依赖 UIA 完整性级别",
+            )
+        )
     else:
         try:
             integrity = _wechat_integrity_state(True)
@@ -516,6 +527,14 @@ def probe_wechat(config=None) -> list[dict[str, str]]:
     if not running:
         checks.append(
             _check("wechat.desktop_interactive", "SKIP", "微信进程未运行，跳过桌面检查")
+        )
+    elif not uia_needed:
+        checks.append(
+            _check(
+                "wechat.desktop_interactive",
+                "SKIP",
+                f"outbound={outbound}，锁屏/后台也能发送",
+            )
         )
     else:
         try:

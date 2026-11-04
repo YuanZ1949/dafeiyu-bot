@@ -16,5 +16,11 @@ if (-not (Test-Path $python)) {
 
 $env:PYTHONIOENCODING = "utf-8"
 
+# 微信 hook 服务是独立进程，supervisor 不管它，这里先单独收掉。
+$hookScript = Join-Path $root "scripts\start-wechat-hook.ps1"
+if (Test-Path -LiteralPath $hookScript) {
+    & powershell -ExecutionPolicy Bypass -File $hookScript -Stop
+}
+
 & $python -m dafeiyu.supervisor.stop
 exit $LASTEXITCODE

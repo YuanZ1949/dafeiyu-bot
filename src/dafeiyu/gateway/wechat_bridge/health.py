@@ -586,6 +586,11 @@ def probe(
     integrity = INTEGRITY_UNKNOWN
     logged_in = False
 
+    # 出站走 hook/auto 时不碰 UIA：锁屏、完整性、版本/语言都不再是降级理由。
+    # 否则锁屏时 `drv.about()` 每次都要白等一次超时，还会把健康帧打成 degraded。
+    outbound = str(_cfg(config, "outbound", "uia") or "uia").strip().lower()
+    uia_needed = outbound == "uia"
+
     if not running:
         desktop = DESKTOP_NO_WECHAT
         reasons.append("no_wechat")
@@ -594,50 +599,57 @@ def probe(
             desktop = _detect_desktop()
         except Exception:  # noqa: BLE001 - 探测失败按锁屏处理（fail-closed）
             desktop = DESKTOP_LOCKED
-            reasons.append("desktop_probe_failed")
+            if uia_needed:
+                reasons.append("desktop_probe_failed")
 
-        try:
-            info = drv.about()
-        except Exception:  # noqa: BLE001 - 读不到就降级，不吞掉
-            info = None
-            reasons.append("about_failed")
-        if isinstance(info, dict):
-            raw_version = info.get("version")
-            if raw_version:
-                wechat_version = str(raw_version)
-            # about() 能读到信息即说明微信已登录并可被驱动访问。
+        if not uia_needed:
+            # 微信进程在跑就认为通道可用：真正能不能发由 hook 回执决定。
             logged_in = True
-
-        try:
-            language = drv.language()
-        except Exception:  # noqa: BLE001
-            language = None
-            reasons.append("language_unknown")
-
-        try:
-            integrity = _integrity_state(True)
-        except Exception:  # noqa: BLE001 - 读不到完整性时按 unknown 降级
-            integrity = INTEGRITY_UNKNOWN
-
-        if desktop != DESKTOP_INTERACTIVE:
-            reasons.append("desktop_locked")
-
-        if wechat_version is None:
-            reasons.append("version_unknown")
+            if desktop == DESKTOP_NO_WECHAT:
+                desktop = DESKTOP_LOCKED
         else:
-            comparison = _compare_versions(wechat_version, version_min)
-            if comparison is None:
-                reasons.append("version_unparsable")
-            elif comparison < 0:
-                reasons.append("version_too_old")
+            try:
+                info = drv.about()
+            except Exception:  # noqa: BLE001 - 读不到就降级，不吞掉
+                info = None
+                reasons.append("about_failed")
+            if isinstance(info, dict):
+                raw_version = info.get("version")
+                if raw_version:
+                    wechat_version = str(raw_version)
+                # about() 能读到信息即说明微信已登录并可被驱动访问。
+                logged_in = True
 
-        if language is not None and _normalize_language(language) != expected_language:
-            reasons.append("language_mismatch")
+            try:
+                language = drv.language()
+            except Exception:  # noqa: BLE001
+                language = None
+                reasons.append("language_unknown")
 
-        if integrity == INTEGRITY_MISMATCHED:
-            reasons.append("integrity_mismatch")
-        elif integrity == INTEGRITY_UNKNOWN:
-            reasons.append("integrity_unknown")
+            try:
+                integrity = _integrity_state(True)
+            except Exception:  # noqa: BLE001 - 读不到完整性时按 unknown 降级
+                integrity = INTEGRITY_UNKNOWN
+
+            if desktop != DESKTOP_INTERACTIVE:
+                reasons.append("desktop_locked")
+
+            if wechat_version is None:
+                reasons.append("version_unknown")
+            else:
+                comparison = _compare_versions(wechat_version, version_min)
+                if comparison is None:
+                    reasons.append("version_unparsable")
+                elif comparison < 0:
+                    reasons.append("version_too_old")
+
+            if language is not None and _normalize_language(language) != expected_language:
+                reasons.append("language_mismatch")
+
+            if integrity == INTEGRITY_MISMATCHED:
+                reasons.append("integrity_mismatch")
+            elif integrity == INTEGRITY_UNKNOWN:
+                reasons.append("integrity_unknown")
 
     seen: set[str] = set()
     unique_reasons = [r for r in reasons if not (r in seen or seen.add(r))]
