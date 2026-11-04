@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from dafeiyu.brain.provider_config import (
@@ -77,10 +78,13 @@ def test_memory_agent_path_matches_constant(tmp_path: Path) -> None:
 
 def test_repo_memory_agent_is_up_to_date() -> None:
     """仓库里那份必须等于生成结果，否则改模板的人会忘了重新生成。"""
+    text = REPO_MEMORY_AGENT.read_text(encoding="utf-8")
+    if "model: opencode/" not in text:
+        pytest.skip("本地仓库当前非 free 档：agent 文件是运行时生成物")
     generated = build_memory_agent(
         "free", template=AGENT_TEMPLATE.read_text(encoding="utf-8")
     )
-    assert REPO_MEMORY_AGENT.read_text(encoding="utf-8") == generated
+    assert text == generated
 
 
 def test_write_generated_backs_up_hand_written_memory_agent(tmp_path: Path) -> None:

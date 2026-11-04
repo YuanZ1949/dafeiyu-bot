@@ -191,10 +191,12 @@ def test_prompt_puts_scene_before_timeline(tmp_path) -> None:
 
 
 # --------------------------------------------------------------- 预算/强度
-def test_budget_denied_marks_model_call_blocked(tmp_path) -> None:
+def test_budget_denied_marks_model_call_blocked(tmp_path, monkeypatch) -> None:
     service, store, _adapter, _brain = build(
         tmp_path, budget=BudgetConfig(1, 300000)
     )
+    # 用量按 store 自己的「今天」入账；钉到 NOW 那天，别让它只在写用例当天通过。
+    monkeypatch.setattr(store, "today", lambda: NOW.strftime("%Y-%m-%d"))
     store.record_usage(ChatType.GROUP, CHAT, "reply", 10, 5)
     seed_batch(store)
 

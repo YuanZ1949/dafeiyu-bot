@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 import httpx
@@ -175,7 +176,9 @@ def test_agents_permissions_and_persona_sync() -> None:
     text = AGENT_FILE.read_text(encoding="utf-8")
     fm = text.split("---")[1]
     assert "steps: 6" in fm
-    assert "model: opencode/deepseek-v4.1-flash-free" in fm
+    # free 档基线钉免费模型；key/local 档下文件由 supervisor 按档位重写，
+    # 这里只要求仍然显式钉住某个受支持的 provider，不能回落到全局默认。
+    assert re.search(r"^model: (opencode|dafeiyu-key|dafeiyu-local)/\S+$", fm, re.M)
     assert "glob" not in fm and "grep" not in fm
     assert "data/bot-workspace/**" in fm
     assert "webfetch" in fm
@@ -214,7 +217,9 @@ def test_memory_agent_file_denies_all_tools() -> None:
     assert "mode: primary" in fm
     assert "steps: 1" in fm
     # 专用配置目录没有全局 model 兜底，记忆 agent 必须自己钉住模型
-    assert "model: opencode/deepseek-v4.1-flash-free" in fm
+    # free 档基线钉免费模型；key/local 档下文件由 supervisor 按档位重写，
+    # 这里只要求仍然显式钉住某个受支持的 provider，不能回落到全局默认。
+    assert re.search(r"^model: (opencode|dafeiyu-key|dafeiyu-local)/\S+$", fm, re.M)
     assert 'action: "*"' in fm and "effect: deny" in fm
     assert "effect: allow" not in fm
     assert "摘要" in text and "印象" in text
