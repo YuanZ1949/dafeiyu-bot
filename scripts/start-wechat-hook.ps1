@@ -14,13 +14,20 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $python = Join-Path $HelperRoot ".venv\Scripts\python.exe"
+# 后台启动优先用 pythonw：python.exe 是 console 子系统，新建进程会多出一个黑框。
+# -Foreground 仍然用 python.exe（日志直接打在终端上）。
+$pythonw = Join-Path $HelperRoot ".venv\Scripts\pythonw.exe"
 $script = Join-Path $root "scripts\wechat_hook_server.py"
 $logDir = Join-Path $root "logs"
 $logFile = Join-Path $logDir "wechat-hook.log"
 
 function Get-HookProcess {
-    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-        Where-Object { $_.CommandLine -like "*wechat_hook_server.py*" }
+    # 兼容历史实例：早先是 python.exe，现在是 pythonw.exe。
+    Get-CimInstance Win32_Process |
+        Where-Object {
+            ($_.Name -eq "python.exe" -or $_.Name -eq "pythonw.exe") -and
+            $_.CommandLine -like "*wechat_hook_server.py*"
+        }
 }
 
 if ($Stop) {
@@ -45,7 +52,9 @@ if ($existing) {
                  "--log-file", "`"$logFile`"")
     if ($Account) { $cliArgs += @("--account", "`"$Account`"") }
     if ($Token) { $cliArgs += @("--token", "`"$Token`"") }
-    $commandLine = "`"$python`" " + ($cliArgs -join " ")
+    $launcher = $python
+    if (-not $Foreground -and (Test-Path $pythonw)) { $launcher = $pythonw }
+    $commandLine = "`"$launcher`" " + ($cliArgs -join " ")
 
     if ($Foreground) {
         & $python $script --helper-root $HelperRoot --port $Port --log-file $logFile
