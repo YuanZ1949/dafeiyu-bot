@@ -26,7 +26,7 @@ from pathlib import Path
 import httpx
 
 from .config import Settings
-from .models import Message
+from .models import Attachment, Message
 from .netssl import default_ssl_context
 
 log = logging.getLogger(__name__)
@@ -230,6 +230,22 @@ async def _materialize(
             msg.content = msg.content.replace(
                 _PLACEHOLDER, template.format(path=rel), 1
             )
+            # 附件只是内存元数据：path 用 workspace 相对路径（images/xxx），
+            # 与 dashboard 的 /api/workspace/file?path=images/... 对齐；
+            # 注记被跳过（content 里没有占位）时不追加，保持两者同步。
+            try:
+                msg.attachments.append(
+                    Attachment(
+                        kind="image",
+                        source=value,
+                        path=f"images/{target.name}",
+                        name=target.name,
+                        size=len(data),
+                    )
+                )
+            # 追加附件失败不得影响图片物化本身。
+            except Exception:
+                log.debug("图片附件记录失败：msg=%s", msg.message_id, exc_info=True)
         done += 1
     if done:
         log.debug("图片物化完成：%s → %d 张", msg.message_id, done)

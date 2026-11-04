@@ -275,6 +275,9 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `behavior.restriction_mode` | `off` | 言论限制：`off` 关闭、`soft` 只注入提示、`strict` 命中关键词的整条回复丢弃、`regenerate` 先让模型改写（每批最多 2 次），仍命中则删掉含禁句的整句 |
 | `behavior.banned_phrases` | `[]` | 禁词（关键词级子串匹配，非语义审核） |
 | `behavior.banned_topics` | `[]` | 禁话题（注入提示；strict 模式也做关键词拦截） |
+| `gateway.wechat.media.enabled` | `false` | 微信入站图片落盘总开关；关闭时只保留 `[图片]` 占位，不读任何本地文件 |
+| `gateway.wechat.media.max_bytes` | `10485760` | 微信入站图片解密后的单张大小上限（10 MiB）；超限保留占位 |
+| `gateway.wechat.media.storage_root` | `""` | 微信本地媒体根目录；空 = 自动探测 `xwechat_files`，只接受该目录内的文件 |
 
 预算分四层：每群每日、全局每日、自然月、月度费用。所有 `0` 都表示「未启用/不限制」。
 `degrade` 会保留 @/引用/叫名字的回复，只停普通插话；`stop` 连点名也不回；`notify`
@@ -284,6 +287,14 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 由 supervisor 做 24 小时去重，告警 detail 只包含计数与限额，不包含消息正文。
 当前会话的 per-chat 额度在 `/budget` 和面板预算卡显示；单群预警不进入 supervisor
 告警通道。`alerts.rules.budget_warning` 可单独关闭预算预警。
+
+Observer（`mind.observer_enabled`）默认关闭，打开它需要同时满足 `mind.enabled: true`、
+`mind.episodes_enabled: true`，且当前大脑提供 `complete_detailed`（面板的 `effective`
+字段把这三个条件一起算进去）。成本按「`mind.observer_daily_calls` × 白名单群数」粗估；
+白名单为空时面板显示「群白名单为空，暂不估算」，不会把 0 当成免费。
+
+各通道支持哪些消息类型、失败时怎么降级，以及附件的路径/大小/后缀边界，见
+[docs/message-types.md](docs/message-types.md)。
 
 ## 3. 启动与停止
 

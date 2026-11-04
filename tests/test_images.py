@@ -442,3 +442,56 @@ async def test_handle_keeps_placeholder_without_tools(tmp_path):
     assert mine[0].content == "[图片]"
     assert calls == []
     assert not images_dir(tmp_path).exists()
+
+
+# ---------------------------------------------------------------- 附件
+
+
+async def test_materialize_appends_image_attachment(tmp_path):
+    settings = make_settings(tmp_path)
+    msg = make_msg()
+    fetch, _calls = fake_fetch()
+    got = await materialize(msg, settings, fetch=fetch)
+    assert got == 1
+    assert len(msg.attachments) == 1
+    att = msg.attachments[0]
+    assert att.kind == "image"
+    assert att.source == "http://x/a.png"
+    assert att.size == len(PNG)
+    # workspace 相对 posix 路径：绝不带盘符/绝对前缀
+    assert att.path == f"images/{att.name}"
+    assert not Path(att.path).is_absolute()
+    stored = Path(settings.workspace.dir) / att.path
+    assert stored.is_file()
+    assert stored.read_bytes() == PNG
+    # content 仍是原来的路径注记，附件只是旁边的结构化副本
+    assert att.name in msg.content
+    assert "（图存 " in msg.content
+
+
+async def test_annotate_false_adds_no_attachment(tmp_path):
+    msg = make_msg()
+    fetch, _calls = fake_fetch()
+    got = await materialize(msg, make_settings(tmp_path), fetch=fetch, annotate=False)
+    assert got == 0
+    assert msg.attachments == []
+
+
+async def test_fetch_failure_adds_no_attachment(tmp_path):
+    msg = make_msg()
+    fetch, _calls = fake_fetch(fail=True)
+    got = await materialize(msg, make_settings(tmp_path), fetch=fetch)
+    assert got == 0
+    assert msg.content == "[图片]"
+    assert msg.attachments == []
+
+
+async def test_content_without_placeholder_adds_no_attachment(tmp_path):
+    # 注记被跳过时附件也不追加：content 与 attachments 必须同步。
+    msg = make_msg(content="已经处理过")
+    fetch, _calls = fake_fetch()
+    got = await materialize(msg, make_settings(tmp_path), fetch=fetch)
+    assert got == 1
+    assert msg.content == "已经处理过"
+    assert msg.attachments == []
+

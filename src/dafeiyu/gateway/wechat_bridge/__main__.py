@@ -56,7 +56,10 @@ DEFAULT_ENV_FILE = ".env"
 _AWAIT_TIMEOUT = 5.0
 # 发送指令单独放宽：Sender 默认 20s 节奏，5s 会在消息仍要发出时先回 timeout，
 # 客户端按 §7.6 换新 id 重试就会重复发送。客户端 _SEND_TIMEOUT 必须更大。
-_SEND_ACTIONS = ("send_text", "send_at")
+_SEND_ACTIONS = ("send_text", "send_at", "send_media")
+
+#: 媒体 kind 白名单：与 reply_media / media.py 的 Attachment.kind 对齐。
+_MEDIA_KINDS = frozenset({"image", "file", "voice", "video"})
 #: 帧泵连续空转多少次才停泵。1 次 = 单次慢轮询就自杀，正是之前「帧源超时即
 #: return」导致假活的根源；3 次（≈ 6 × poll_seconds）给慢轮询留足余量，真卡死
 #: 时仍会退出，由 run() 的完成回调请求停机、交给 supervisor 重启。
@@ -261,6 +264,23 @@ def _validate_send(
     return chat_id.strip(), text, at
 
 
+def _validate_media(params: dict[str, Any]) -> tuple[str, str, str, str]:
+    """校验 send_media 入参，返回 ``(chat_id, kind, path, name)``。"""
+    chat_id = params.get("chat_id")
+    if not isinstance(chat_id, str) or not chat_id.strip().startswith("wxg:"):
+        raise _CommandError("bad_params")
+    kind = params.get("kind")
+    if kind not in _MEDIA_KINDS:
+        raise _CommandError("bad_params")
+    path = params.get("path")
+    if not isinstance(path, str) or not path.strip():
+        raise _CommandError("bad_params")
+    name = params.get("name", "")
+    if not isinstance(name, str) or len(name) > 60:
+        raise _CommandError("bad_params")
+    return chat_id.strip(), str(kind), path.strip(), name
+
+
 def _resolve_chat_name(poller: Any, chat_id: str) -> str:
     """`wxg:<alias>` -> 微信显示名；只读注册表，绝不 resolve 出新别名。"""
     alias = chat_id[4:].strip()
@@ -418,10 +438,35 @@ async def run(
         logger.info("微信桥收到 resume 指令，轮询已恢复")
         return {"ok": True}
 
+    async def _builtin_send_media(params: dict[str, Any]) -> dict[str, Any]:
+        """媒体发送：传输后端有 `send_media` 才调用，否则明确不支持。"""
+        try:
+            chat_id, kind, path, filename = _validate_media(params)
+            name = _resolve_chat_name(poller, chat_id)
+            if not sender_holder:
+                raise _CommandError("not_ready")
+            sender = sender_holder[0]
+            transport = getattr(sender, "transport", None)
+            handler = getattr(transport, "send_media", None)
+            if not callable(handler):
+                return _failed("unsupported_media")
+            # 传输可能做阻塞 HTTP / UIA 检查：放到线程里，绝不卡事件循环。
+            result = await asyncio.to_thread(handler, name, kind, path, filename)
+        except asyncio.CancelledError:
+            raise
+        except _CommandError as exc:
+            return _failed(exc.code)
+        except Exception:
+            logger.exception("微信桥媒体发送异常")
+            return _failed("internal_error")
+        return _receipt_from_result(result)
+
     async def _builtin_send(
         action: str, params: dict[str, Any]
     ) -> dict[str, Any]:
         """生产发送路径：解析 alias -> 提交 Sender -> 映射回执 -> 本地库确认。"""
+        if action == "send_media":
+            return await _builtin_send_media(params)
         try:
             chat_id, text, at = _validate_send(action, params)
             if at:
@@ -729,10 +774,16 @@ def _build_localdb_source(wechat: WeChatConfig) -> Any | None:
         logger.warning("本地消息库模块不可用，回落 UIA 入站：%s", exc)
         return None
     try:
+        media = getattr(wechat, "media", None)
         return LocalDbSource(
             db_root=str(getattr(wechat, "local_db_root", "") or "") or None,
             self_display_name=str(getattr(wechat, "account_nickname", "") or ""),
             refresh_seconds=float(getattr(wechat, "local_db_refresh_seconds", 1.0)),
+            media_enabled=bool(getattr(media, "enabled", False)),
+            media_max_bytes=int(
+                getattr(media, "max_bytes", 10 * 1024 * 1024) or 10 * 1024 * 1024
+            ),
+            media_storage_root=str(getattr(media, "storage_root", "") or ""),
         )
     except Exception as exc:  # noqa: BLE001 - 构造失败同样只降级
         logger.warning("本地消息库初始化参数无效，回落 UIA 入站：%s", exc)

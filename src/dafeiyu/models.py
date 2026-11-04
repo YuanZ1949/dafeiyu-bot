@@ -33,6 +33,21 @@ class Segment:
     data: dict
 
 
+@dataclass(frozen=True)
+class Attachment:
+    """消息附件（图片/语音/视频/文件等）。
+
+    仅存在于内存中，用于提示词与出站发送；永不写入 messages 表或任何持久化存储。
+    """
+
+    kind: str
+    source: str = ""
+    path: str = ""
+    name: str = ""
+    size: int = 0
+    duration: int = 0
+
+
 @dataclass
 class Message:
     chat_type: ChatType
@@ -53,9 +68,16 @@ class Message:
     recalled_at: str | None = None
     # 微信引用块的原文摘要（协议可选字段）：只进提示词，不入库。
     reply_to_text: str | None = None
+    # 消息类型与附件：同样只在内存中流转，不持久化（content 仍是唯一持久载体）。
+    kind: str = "text"
+    attachments: list[Attachment] = field(default_factory=list)
 
     def to_prompt_line(self) -> str:
         return f"{self.nickname}: {self.content}"
+
+    def attachment_paths(self) -> tuple[str, ...]:
+        """返回非空 path 的附件路径，保持原顺序。"""
+        return tuple(a.path for a in self.attachments if a.path)
 
     @property
     def channel(self) -> str:

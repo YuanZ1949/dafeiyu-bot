@@ -375,3 +375,182 @@ async def test_start_rejects_incomplete_wechat_config() -> None:
     for config, key in cases:
         with pytest.raises(ConfigError, match=key):
             await WeChatAdapter(config).start()
+
+
+# ------------------------------------------------------ 消息类型 v2（todo 3）
+async def test_message_kind_image_builds_placeholder_attachment() -> None:
+    envelope = message_envelope(text="[图片]", kind="image")
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.kind == "image"
+    assert message.content == "[图片]"
+    assert len(message.attachments) == 1
+    assert message.attachments[0].kind == "image"
+    assert message.attachments[0].name == "[图片]"
+
+
+async def test_message_kind_voice_maps_attachment_name() -> None:
+    envelope = message_envelope(text="[语音]", kind="voice")
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.kind == "voice"
+    assert len(message.attachments) == 1
+    assert message.attachments[0].name == "[语音]"
+
+
+async def test_message_unknown_kind_falls_back_to_text() -> None:
+    envelope = message_envelope(kind="999")
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.kind == "text"
+    assert message.attachments == []
+
+
+async def test_message_without_kind_key_matches_legacy_behaviour() -> None:
+    envelope = message_envelope()
+    assert "kind" not in envelope
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.kind == "text"
+    assert message.attachments == []
+
+
+async def test_message_non_text_kind_with_empty_text_has_no_placeholder() -> None:
+    envelope = message_envelope(text="", kind="image")
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.kind == "image"
+    assert message.attachments == []
+
+
+@pytest.mark.parametrize("raw_kind", [None, [], "  ", 7])
+async def test_message_kind_normalizes_without_raising(raw_kind: object) -> None:
+    envelope = message_envelope(kind=raw_kind)
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.kind == "text"
+
+
+async def test_message_kind_uppercase_and_spaces_normalize_to_known_kind() -> None:
+    envelope = message_envelope(text="[图片]", kind=" Image ")
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.kind == "image"
+    assert len(message.attachments) == 1
+    assert message.attachments[0].kind == "image"
+
+
+# ---- todo 8：send_at / send_media -------------------------------------------
+
+
+async def test_send_at_sends_one_frame_and_records_echo() -> None:
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        message_id = await adapter.send_at(
+            ChatType.GROUP, GROUP_CHAT, "你好", ["阿强", "小明"]
+        )
+
+        assert message_id == "3:99"
+        assert len(bridge.commands) == 1
+        frame = bridge.commands[0]
+        assert frame["action"] == "send_at"
+        assert frame["params"] == {
+            "chat_id": GROUP_CHAT,
+            "text": "你好",
+            "at": ["阿强", "小明"],
+        }
+        assert list(adapter._sent_echo)[-1][:2] == (GROUP_CHAT, "你好")
+
+
+async def test_send_at_empty_at_degrades_to_send_text() -> None:
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        await adapter.send_at(ChatType.GROUP, GROUP_CHAT, "你好", [])
+
+        assert len(bridge.commands) == 1
+        assert bridge.commands[0]["action"] == "send_text"
+        assert bridge.commands[0]["params"] == {"chat_id": GROUP_CHAT, "text": "你好"}
+
+
+async def test_send_media_unsupported_returns_false_without_echo() -> None:
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        bridge.receipt = {
+            "ok": False,
+            "error_code": "unsupported_media",
+            "delivered": "failed",
+        }
+
+        ok = await adapter.send_media(
+            ChatType.GROUP, GROUP_CHAT, "image", "C:/tmp/a.png"
+        )
+
+        assert ok is False
+        assert len(bridge.commands) == 1
+        assert bridge.commands[0]["action"] == "send_media"
+        assert len(adapter._sent_echo) == 0
+        assert adapter.last_send_at is None
+
+
+async def test_send_media_other_failure_raises() -> None:
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        bridge.receipt = {
+            "ok": False,
+            "error_code": "internal_error",
+            "delivered": "failed",
+        }
+
+        with pytest.raises(GatewayError):
+            await adapter.send_media(
+                ChatType.GROUP, GROUP_CHAT, "image", "C:/tmp/a.png"
+            )
+
+
+# ---- todo 12: 本地库媒体 -> Attachment.path --------------------------------
+async def test_message_media_dict_becomes_attachment_with_path() -> None:
+    envelope = message_envelope(
+        text="[图片]",
+        kind="image",
+        media={
+            "kind": "image",
+            "path": "C:/wx/media/a.dat",
+            "name": "a.png",
+            "size": 123,
+            "duration": 0,
+        },
+    )
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.kind == "image"
+    assert len(message.attachments) == 1
+    attachment = message.attachments[0]
+    assert attachment.kind == "image"
+    assert attachment.path == "C:/wx/media/a.dat"
+    assert attachment.name == "a.png"
+    assert attachment.size == 123
+    assert attachment.duration == 0
+
+
+async def test_message_media_without_path_keeps_placeholder_attachment() -> None:
+    envelope = message_envelope(text="[图片]", kind="image", media={"name": "a.png"})
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert len(message.attachments) == 1
+    assert message.attachments[0].path == ""
+    assert message.attachments[0].name == "[图片]"
+
+
+async def test_message_media_non_dict_is_ignored() -> None:
+    envelope = message_envelope(text="[图片]", kind="image", media="oops")
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert len(message.attachments) == 1
+    assert message.attachments[0].path == ""
+    assert message.attachments[0].name == "[图片]"

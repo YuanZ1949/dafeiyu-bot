@@ -5,9 +5,11 @@ import json
 import logging
 import re
 from dataclasses import dataclass, replace
+from typing import cast
 
 import httpx
 
+from ..models import Attachment
 from ..netssl import default_ssl_context
 from .tokens import resolve_usage
 
@@ -24,7 +26,8 @@ _SPEAK_FALSE_RE = re.compile(
 OUTPUT_INSTRUCTION = """\
 只输出一个 JSON 对象，不要输出解释、前后缀或代码围栏。格式：
 {"read": "这轮大家在聊什么、情绪如何（≤40 字）", "think": "你打算怎么接、为什么（≤40 字）", "speak": true 或 false, "reply": "要对群里说的话", "reason": "一句话理由"}
-speak=false 时 reply 留空。read/think 写给自己看，不会发到群里；旧格式只有 speak/reply/reason 也认。"""
+speak=false 时 reply 留空。read/think 写给自己看，不会发到群里；旧格式只有 speak/reply/reason 也认。
+可选字段："at": ["昵称"] 表示这条回复要 @ 谁；"attachments": [{"type": "image"|"file"|"voice"|"video", "path": "replies/xxx.png", "name": "可选"}] 只在确实产出文件时填写，path 必须相对 workspace，拿不准就省略；想发表情时用 {"type": "sticker", "name": "表情 id 或表情名"}，name 填纯数字表示 QQ 内置表情。"""
 
 FALLBACK_REPLY = "本鱼刚刚游神了…你再说一遍？🐋"
 
@@ -59,6 +62,9 @@ class BrainReply:
     # 追加在末尾，避免打乱既有按位置构造的位置参数。
     read: str = ""
     think: str = ""
+    # 协议 v2 的可选字段：同样追加在末尾，旧的位置参数构造保持可用。
+    attachments: tuple[Attachment, ...] = ()
+    at: tuple[str, ...] = ()
 
 
 def _strip_fence(text: str) -> str:
@@ -85,6 +91,84 @@ def _short_field(value: object, limit: int = READ_THINK_LIMIT) -> str:
     if len(text) > limit:
         text = text[:limit].rstrip()
     return text
+
+
+MAX_REPLY_ATTACHMENTS = 2
+MAX_REPLY_AT = 3
+MAX_ATTACHMENT_PATH = 200
+MAX_ATTACHMENT_NAME = 60
+REPLY_ATTACHMENT_KINDS = frozenset({"image", "file", "voice", "video", "sticker"})
+
+
+def _int_field(value: object) -> int:
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str | float):
+        return 0
+    try:
+        return int(value)
+    except (ValueError, OverflowError):
+        return 0
+
+
+def parse_reply_attachments(raw: object) -> tuple[Attachment, ...]:
+    """解析模型给的 attachments 字段。
+
+    模型输出不可信：只做结构上的过滤与限长，不读文件、不校验路径存在
+    （真正的白名单校验在发送前由 reply_media 负责）。非法项静默丢弃。
+    """
+    if not isinstance(raw, list):
+        return ()
+    parsed: list[Attachment] = []
+    for item in cast(list[object], raw):
+        if len(parsed) >= MAX_REPLY_ATTACHMENTS:
+            break
+        if not isinstance(item, dict):
+            continue
+        entry = cast(dict[str, object], item)
+        kind = str(entry.get("type") or "").strip()
+        if kind not in REPLY_ATTACHMENT_KINDS:
+            continue
+        name = str(entry.get("name") or "").strip()
+        if kind == "sticker":
+            # 表情不读文件：name 是 face id 或 mface 摘要，path 直接忽略。
+            if not name:
+                continue
+            parsed.append(Attachment(kind="sticker", name=name[:MAX_ATTACHMENT_NAME]))
+            continue
+        path = entry.get("path")
+        if not isinstance(path, str):
+            continue
+        path = path.strip()
+        if not path or len(path) > MAX_ATTACHMENT_PATH:
+            continue
+        parsed.append(
+            Attachment(
+                kind=kind,
+                path=path,
+                name=name[:MAX_ATTACHMENT_NAME],
+                size=_int_field(entry.get("size")),
+                duration=_int_field(entry.get("duration")),
+            )
+        )
+    return tuple(parsed)
+
+
+def parse_at(raw: object) -> tuple[str, ...]:
+    """解析 @ 昵称列表：只认字符串，去空、去重、限 3 个。"""
+    if not isinstance(raw, list):
+        return ()
+    names: list[str] = []
+    for item in cast(list[object], raw):
+        if not isinstance(item, str):
+            continue
+        name = item.strip()
+        if not name or name in names:
+            continue
+        names.append(name)
+        if len(names) >= MAX_REPLY_AT:
+            break
+    return tuple(names)
 
 
 def _reply_from_dict(data: dict) -> tuple[bool, str] | None:
@@ -224,6 +308,8 @@ def parse_brain_reply(
         completion_tokens=completion_tokens,
         read=_short_field(data.get("read")),
         think=_short_field(data.get("think")),
+        attachments=parse_reply_attachments(data.get("attachments")),
+        at=parse_at(data.get("at")),
     )
 
 

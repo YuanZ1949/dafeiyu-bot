@@ -567,6 +567,20 @@ class UiaTransport:
         return Prepared(chat_name=chat_name, handle=handle)
 
     # ------------------------------------------------------------- 发送
+    def send_media(
+        self, chat_name: str, kind: str, path: str, name: str = ""
+    ) -> SendResult:
+        """UIA 通道明确不支持媒体发送：返回 `unsupported_media`，不碰桌面。"""
+        del kind, path, name
+        return SendResult(
+            False,
+            "unsupported_media",
+            "failed",
+            chat_name=str(chat_name or ""),
+            detail="UIA 通道不支持媒体发送",
+            not_sent=True,
+        )
+
     def send(self, prepared: Prepared, text: str, delay: float) -> SendResult:
         chat_name = prepared.chat_name
         try:
@@ -759,6 +773,11 @@ class Sender:
     @property
     def connected(self) -> bool:
         return self._connected
+
+    @property
+    def transport(self) -> Any:
+        """当前传输后端（UIA / hook / auto），供桥做能力探测。"""
+        return self._transport
 
     def queue_depth(self) -> int:
         return self._queue.qsize()

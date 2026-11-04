@@ -224,6 +224,16 @@ class GatewayConfig:
 
 
 @dataclass(frozen=True)
+class WeChatMediaConfig:
+    """微信入站媒体落盘（todo 11/12）。默认关闭，关闭时本地库行完全不变。"""
+
+    enabled: bool = False
+    max_bytes: int = 10 * 1024 * 1024
+    #: 空 = 自动探测（本地库镜像的 db_root）；配置后只接受该根目录内的文件。
+    storage_root: str = ""
+
+
+@dataclass(frozen=True)
 class WeChatConfig:
     """桌面微信小号通道（UIA 桥）的配置。
 
@@ -276,6 +286,8 @@ class WeChatConfig:
     version_min: str = "4.1.6"
     language: str = "zh-CN"
     allow_test_inject: bool = False
+    # 追加在最后：位置参数构造与旧测试保持不变。
+    media: WeChatMediaConfig = field(default_factory=WeChatMediaConfig)
 
     @property
     def outbound_requires_desktop(self) -> bool:
@@ -974,6 +986,26 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
     if not kill_switch:
         raise ConfigError("gateway.wechat.kill_switch_file 不能为空")
 
+    media_raw = section.get("media")
+    if media_raw is None:
+        media = WeChatMediaConfig()
+    elif not isinstance(media_raw, dict):
+        raise ConfigError("gateway.wechat.media 必须是映射")
+    else:
+        media_max = _int(
+            media_raw.get("max_bytes", 10 * 1024 * 1024),
+            "gateway.wechat.media.max_bytes",
+        )
+        if media_max <= 0:
+            raise ConfigError("gateway.wechat.media.max_bytes 必须大于 0")
+        media = WeChatMediaConfig(
+            enabled=_bool(
+                media_raw.get("enabled", False), "gateway.wechat.media.enabled"
+            ),
+            max_bytes=media_max,
+            storage_root=str(media_raw.get("storage_root") or "").strip(),
+        )
+
     return WeChatConfig(
         enabled=_bool(section.get("enabled", False), "gateway.wechat.enabled"),
         bridge_host=host,
@@ -1024,6 +1056,7 @@ def _build_wechat(raw: Any, env: dict[str, str]) -> WeChatConfig:
         allow_test_inject=_bool(
             section.get("allow_test_inject", False), "gateway.wechat.allow_test_inject"
         ),
+        media=media,
     )
 
 
@@ -1213,6 +1246,23 @@ def _apply_groups_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> N
     _overlay_target(raw, "groups")["whitelist"] = section["whitelist"]
 
 
+def _apply_mind_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """面板保存的观察者开关：只认两个白名单键，其余静默忽略。
+
+    Observer 的其它参数（provider / 间隔 / 最少消息数）仍由 config.yaml 管，
+    避免旧版本面板写进来的未知键改变启动行为。
+    """
+    section = overrides.get("mind")
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        raise ConfigError("覆盖层的 mind 必须是映射")
+    target = _overlay_target(raw, "mind")
+    for name in ("observer_enabled", "observer_daily_calls"):
+        if name in section:
+            target[name] = section[name]
+
+
 def _apply_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> bool:
     """把覆盖层白名单键盖到 raw 上，返回覆盖层是否显式给了 brain.mode。
 
@@ -1221,6 +1271,7 @@ def _apply_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> bool:
     """
     _apply_behavior_overrides(raw, overrides)
     _apply_groups_overrides(raw, overrides)
+    _apply_mind_overrides(raw, overrides)
     brain_override = overrides.get("brain")
     if brain_override is None:
         return False

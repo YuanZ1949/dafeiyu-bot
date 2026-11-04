@@ -5,7 +5,9 @@ import contextlib
 import inspect
 import json
 import logging
+import mimetypes
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -13,7 +15,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from stat import S_ISREG
 from typing import Any, cast
 
 from aiohttp import web
@@ -45,6 +48,7 @@ from .config import (
     OVERRIDES_PATH,
     ConfigError,
     GroupsConfig,
+    MindConfig,
     Settings,
     parse_group_ids,
 )
@@ -108,6 +112,27 @@ _TRUE_QUERY_VALUES = {"1", "true", "yes", "on"}
 
 def _truthy(raw: str | None) -> bool:
     return str(raw or "").strip().casefold() in _TRUE_QUERY_VALUES
+
+
+# 工作区只读文件端点：只放行这两个子目录、这些扩展名，单文件不超过 20 MiB。
+WORKSPACE_FILE_DIRS = ("images", "replies")
+WORKSPACE_FILE_SUFFIXES = frozenset(
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".mp3",
+        ".wav",
+        ".mp4",
+        ".pdf",
+        ".txt",
+        ".zip",
+    }
+)
+MAX_WORKSPACE_FILE_BYTES = 20 * 1024 * 1024
+_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
 # 人设正文的唯一来源：provider_config 只替换前置区，正文原样搬运。
 AGENT_TEMPLATE_PATH = Path(__file__).resolve().parent / "brain" / "agent_template.md"
 # 记忆旁路 agent 的正文；与聊天 agent 分开，模型随档位一起生成。
@@ -1769,6 +1794,77 @@ class BrainControl:
             self.settings = replace(self.settings, groups=groups)
         return self.groups_snapshot()
 
+    def _brain_supports_observer(self) -> bool:
+        brain = getattr(self.service, "brain", None)
+        return callable(getattr(brain, "complete_detailed", None))
+
+    def mind_snapshot(self) -> dict[str, Any]:
+        mind: MindConfig = self.settings.mind
+        group_count = len(self._groups().whitelist)
+        supports = self._brain_supports_observer()
+        return {
+            "enabled": bool(mind.enabled),
+            "observer_enabled": bool(mind.observer_enabled),
+            "observer_provider": mind.observer_provider,
+            "observer_interval_seconds": int(mind.observer_interval_seconds),
+            "observer_min_messages": int(mind.observer_min_messages),
+            "observer_daily_calls": int(mind.observer_daily_calls),
+            "group_count": group_count,
+            # 白名单为空时没有观察对象，估算是 0 而不是「按 1 个群」硬凑。
+            "estimated_daily_calls": int(mind.observer_daily_calls) * group_count,
+            "brain_supports_observer": supports,
+            # 与 ObserverWorker._enabled 一致：总闸 + 观察开关 + episode 开关，
+            # 再叠加 brain 是否具备 complete_detailed（没有就永远调不动模型）。
+            "effective": bool(
+                mind.enabled
+                and mind.observer_enabled
+                and mind.episodes_enabled
+                and supports
+            ),
+        }
+
+    def save_mind(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """校验 → 落覆盖层 → 更新内存快照；不改运行中的 Observer。"""
+        if not isinstance(payload, dict):
+            raise ConfigError("请求体必须是对象")
+        allowed = {"observer_enabled", "observer_daily_calls"}
+        unknown = sorted(set(payload) - allowed)
+        if unknown:
+            raise ConfigError(f"未知字段：{unknown[0]}")
+        if not payload:
+            raise ConfigError("至少提供 observer_enabled 或 observer_daily_calls")
+
+        updates: dict[str, Any] = {}
+        if "observer_enabled" in payload:
+            value = payload["observer_enabled"]
+            if not isinstance(value, bool):
+                raise ConfigError("observer_enabled 必须是布尔值")
+            updates["observer_enabled"] = value
+        if "observer_daily_calls" in payload:
+            value = payload["observer_daily_calls"]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConfigError("observer_daily_calls 必须是整数")
+            if not 1 <= value <= 1000:
+                raise ConfigError("observer_daily_calls 必须在 1-1000 之间")
+            updates["observer_daily_calls"] = value
+
+        try:
+            existing = read_overrides(OVERRIDES_PATH)
+        except OverrideError as exc:
+            raise OverrideError(str(exc)) from exc
+        raw = existing.get("mind")
+        section = dict(raw) if isinstance(raw, dict) else {}
+        section.update(updates)
+        existing["mind"] = section
+        write_overrides(existing, OVERRIDES_PATH)
+
+        self.settings = replace(
+            self.settings, mind=replace(self.settings.mind, **updates)
+        )
+        result = self.mind_snapshot()
+        result["restart_required"] = True
+        return result
+
     def config_snapshot(self) -> dict[str, Any]:
         state = self.snapshot()
         persona = self.settings.persona
@@ -2615,8 +2711,91 @@ def create_app(
                 {"error": f"保存群白名单失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def get_mind(_: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.mind_snapshot())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取心智配置失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取心智配置失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def put_mind(request: web.Request) -> web.Response:
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        try:
+            return web.json_response(control.save_mind(payload))
+        except ConfigError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except OverrideError as exc:
+            return web.json_response(
+                {"error": f"配置文件读写失败：{exc}"}, status=500
+            )
+        except OSError as exc:
+            return web.json_response(
+                {"error": f"配置文件写入失败：{exc.__class__.__name__}"}, status=500
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("保存心智配置失败：%s", exc)
+            return web.json_response(
+                {"error": f"保存心智配置失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def workspace_file(request: web.Request) -> web.StreamResponse:
+        """只读回放工作区附件；任何可疑输入都按 404 处理，不暴露真实路径。"""
+
+        def missing() -> web.Response:
+            return web.json_response({"error": "not found"}, status=404)
+
+        workspace = control.settings.workspace
+        if not workspace.enabled:
+            return missing()
+        raw = request.query.get("path", "").strip()
+        if not raw or "\x00" in raw or _DRIVE_PREFIX_RE.match(raw):
+            return missing()
+        # 先做语法层拒绝（绝对路径/UNC/..），再进文件系统解析。
+        posix = raw.replace("\\", "/")
+        if posix.startswith("/"):
+            return missing()
+        parts = [part for part in posix.split("/") if part not in ("", ".")]
+        if len(parts) < 2 or parts[0] not in WORKSPACE_FILE_DIRS:
+            return missing()
+        if any(part == ".." for part in parts):
+            return missing()
+        if PurePosixPath(posix).suffix.casefold() not in WORKSPACE_FILE_SUFFIXES:
+            return missing()
+        # base 与 target 都 resolve：软链接逃逸后 is_relative_to 会失败。
+        try:
+            base = (Path(workspace.dir) / parts[0]).resolve()
+            target = base.joinpath(*parts[1:]).resolve()
+        except (OSError, ValueError):
+            return missing()
+        if not target.is_relative_to(base):
+            return missing()
+        try:
+            info = await asyncio.to_thread(target.stat)
+        except OSError:
+            return missing()
+        # 目录、超限文件都先挡掉：绝不把 20 MiB 以上的内容读进内存。
+        if not S_ISREG(info.st_mode) or info.st_size > MAX_WORKSPACE_FILE_BYTES:
+            return missing()
+        content_type = (
+            mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        )
+        return web.FileResponse(
+            target,
+            headers={
+                "Content-Type": content_type,
+                "Cache-Control": "private, max-age=60",
+            },
+        )
+
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/health/detail", health_detail)
+    app.router.add_get("/api/workspace/file", workspace_file)
     app.router.add_post("/api/notify/admin", notify_admin)
     app.router.add_post("/api/channels/wechat/stop", wechat_stop)
     app.router.add_post("/api/channels/wechat/resume", wechat_resume)
@@ -2657,6 +2836,8 @@ def create_app(
     app.router.add_put("/api/behavior", put_behavior)
     app.router.add_get("/api/groups", get_groups)
     app.router.add_put("/api/groups", put_groups)
+    app.router.add_get("/api/mind", get_mind)
+    app.router.add_put("/api/mind", put_mind)
     app.router.add_get("/api/backup", backup)
     return app
 

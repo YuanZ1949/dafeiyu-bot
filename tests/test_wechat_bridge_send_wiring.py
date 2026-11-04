@@ -533,3 +533,48 @@ def test_ui_thread_driver_rejects_when_bridge_is_stopped() -> None:
         assert driver.calls == []
     finally:
         ui.stop(timeout=STEP)
+
+
+async def test_send_media_on_uia_transport_is_unsupported_without_driver(
+    tmp_path: Path,
+) -> None:
+    async with _bridge(tmp_path) as harness:
+        alias = harness.poller.registry.live_aliases(ALLOWED)[0]
+
+        receipt = await _command(
+            harness,
+            "send_media",
+            {
+                "chat_id": f"wxg:{alias}",
+                "kind": "image",
+                "path": "C:/tmp/a.png",
+                "name": "a.png",
+            },
+            "m1",
+        )
+
+        assert receipt["ok"] is False
+        assert receipt["error_code"] == "unsupported_media"
+        assert receipt["delivered"] == "failed"
+        assert receipt["message_id"] is None
+        # UIA 分支绝不碰桌面。
+        assert harness.driver.calls == []
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"chat_id": "wxg:a", "kind": "exe", "path": "C:/a"},
+        {"chat_id": "wxg:a", "kind": "image", "path": "   "},
+        {"chat_id": "nope", "kind": "image", "path": "C:/a"},
+    ],
+)
+async def test_send_media_bad_params_rejected_before_transport(
+    tmp_path: Path, params: dict[str, Any]
+) -> None:
+    async with _bridge(tmp_path) as harness:
+        receipt = await _command(harness, "send_media", params, "m2")
+
+        assert receipt["ok"] is False
+        assert receipt["error_code"] == "bad_params"
+        assert harness.driver.calls == []

@@ -40,3 +40,29 @@ def test_example_config_wechat_block_matches_defaults():
     assert set(wechat_raw) == field_names
     assert wechat_raw["enabled"] is False
     assert wechat_raw["bridge_token"] == ""
+
+
+def test_example_config_media_and_observer_default_off(tmp_path, monkeypatch):
+    """新增的媒体/观察者开关在模板里必须显式关闭（软回滚前提）。"""
+    settings = _load_example(tmp_path, monkeypatch)
+
+    assert settings.wechat.media.enabled is False
+    assert settings.wechat.media.max_bytes == 10 * 1024 * 1024
+    assert settings.wechat.media.storage_root == ""
+    assert settings.mind.observer_enabled is False
+
+
+def test_example_config_media_block_optional(tmp_path, monkeypatch):
+    """删掉 gateway.wechat.media 段后仍按代码默认值加载（老配置不炸）。"""
+    monkeypatch.chdir(tmp_path)
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["gateway"]["wechat"].pop("media")
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text("BOT_QQ=10001\n", encoding="utf-8")
+
+    settings = load_settings(env_file=env_file, config_file=config)
+
+    assert settings.wechat.media.enabled is False
+    assert settings.wechat.media.max_bytes == 10 * 1024 * 1024

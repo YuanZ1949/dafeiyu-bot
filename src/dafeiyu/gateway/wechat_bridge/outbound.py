@@ -55,11 +55,14 @@ class HookTransport:
         resolver: Callable[[str], Any] | None = None,
         timeout: float = 5.0,
         opener: Callable[..., Any] | None = None,
+        media_url: str = "",
     ) -> None:
         self._url = str(url or "").strip()
         self._resolver = resolver
         self._timeout = float(timeout)
         self._opener = opener or urllib.request.urlopen
+        # 可选媒体端点；没配置时 send_media 直接回 unsupported_media。
+        self._media_url = str(media_url or "").strip()
 
     # ------------------------------------------------------------- 准备
     def prepare(self, chat_name: str) -> Prepared | SendResult:
@@ -110,8 +113,38 @@ class HookTransport:
             "chat_name": chat_name,
             "text": text,
         }
+        return self._post(self._url, payload, chat_name)
+
+    def send_media(
+        self, chat_name: str, kind: str, path: str, name: str = ""
+    ) -> SendResult:
+        """仅当配置了独立媒体端点时才 POST；否则明确 `unsupported_media`。"""
+        display = str(chat_name or "").strip()
+        if not self._url or not self._media_url:
+            return SendResult(
+                False,
+                "unsupported_media",
+                "failed",
+                chat_name=display,
+                detail="未配置媒体 hook 端点",
+                not_sent=True,
+            )
+        prepared = self.prepare(display)
+        if isinstance(prepared, SendResult):
+            return prepared
+        payload = {
+            "action": "send_media",
+            "chatroom": prepared.target,
+            "chat_name": prepared.chat_name,
+            "kind": kind,
+            "path": path,
+            "name": name,
+        }
+        return self._post(self._media_url, payload, prepared.chat_name)
+
+    def _post(self, url: str, payload: dict[str, Any], chat_name: str) -> SendResult:
         request = urllib.request.Request(
-            self._url,
+            url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json; charset=utf-8"},
             method="POST",
@@ -292,6 +325,12 @@ class AutoTransport:
         )
         return result
 
+    def send_media(
+        self, chat_name: str, kind: str, path: str, name: str = ""
+    ) -> SendResult:
+        """媒体只走 hook；UIA 明确不支持，因此不存在「回落」候选。"""
+        return self._hook.send_media(chat_name, kind, path, name)
+
     def _fallback(self, prepared: Prepared, text: str, delay: float) -> SendResult:
         uia = self._uia
         if uia is None:
@@ -329,6 +368,7 @@ def build_transport(
         str(getattr(wechat, "hook_url", "") or ""),
         resolver=_localdb_username_resolver(poller),
         timeout=float(getattr(wechat, "hook_timeout_seconds", 5.0) or 5.0),
+        media_url=str(getattr(wechat, "hook_media_url", "") or ""),
     )
     if mode == "hook":
         return hook

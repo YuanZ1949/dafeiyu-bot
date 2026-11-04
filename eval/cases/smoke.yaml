@@ -1,0 +1,54 @@
+- id: smoke-addressed
+  description: 被点名后的短回答
+  chat_type: group
+  chat_id: qq:1001
+  context:
+    summary: ""
+  messages:
+    - user_id: "2002"
+      nickname: 群友
+      content: "@大肥鱼 在吗"
+      at_bot: true
+      reply_to_bot: false
+      timestamp: 1761888000
+  expect:
+    min_chars: 1
+    max_chars: 120
+    must_not_contain: []
+
+- id: smoke-image-placeholder
+  description: 图片占位也能安全回放
+  chat_type: group
+  chat_id: qq:1001
+  context:
+    summary: ""
+  messages:
+    - user_id: "2002"
+      nickname: 群友
+      content: "[图片]"
+      at_bot: false
+      reply_to_bot: false
+      timestamp: 1761888060
+  expect:
+    min_chars: 1
+    max_chars: 120
+    must_not_contain: []
+
+- id: smoke-banned-phrase
+  description: 禁词不出现
+  chat_type: group
+  chat_id: qq:1001
+  context:
+    summary: ""
+  messages:
+    - user_id: "2002"
+      nickname: 群友
+      content: "随便聊聊"
+      at_bot: false
+      reply_to_bot: false
+      timestamp: 1761888120
+  expect:
+    min_chars: 1
+    max_chars: 120
+    must_not_contain:
+      - 违禁词

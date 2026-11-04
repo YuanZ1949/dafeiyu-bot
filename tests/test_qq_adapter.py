@@ -1,5 +1,6 @@
 import asyncio
 import json
+from typing import Any
 
 import pytest
 import websockets
@@ -329,3 +330,169 @@ async def test_call_action_without_connection_raises() -> None:
     with pytest.raises(GatewayError):
         await adapter.call_action("get_group_info", {"group_id": 1})
 
+
+
+# ---- todo 7：文件上传与合并转发 ---------------------------------------------
+
+
+class _Recorder:
+    def __init__(self, *, fail_actions: set[str] | None = None) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._fail = fail_actions or set()
+
+    async def __call__(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((action, params))
+        if action in self._fail:
+            raise GatewayError(f"{action} 失败：retcode=1")
+        return {"message_id": 88}
+
+
+async def test_upload_file_group_defaults_name(monkeypatch) -> None:
+    adapter = make_adapter()
+    recorder = _Recorder()
+
+    async def fake_request(action, params):
+        return await recorder(action, params)
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+
+    await adapter.upload_file(ChatType.GROUP, "qq:123", "C:/tmp/a.pdf")
+
+    assert recorder.calls == [
+        (
+            "upload_group_file",
+            {"group_id": 123, "file": "C:/tmp/a.pdf", "name": "a.pdf"},
+        )
+    ]
+
+
+async def test_upload_file_private_and_explicit_name(monkeypatch) -> None:
+    adapter = make_adapter()
+    recorder = _Recorder()
+
+    async def fake_request(action, params):
+        return await recorder(action, params)
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+
+    await adapter.upload_file(
+        ChatType.PRIVATE, "qq:9", "C:/tmp/data.zip", name="报告.zip"
+    )
+
+    assert recorder.calls == [
+        (
+            "upload_private_file",
+            {"user_id": 9, "file": "C:/tmp/data.zip", "name": "报告.zip"},
+        )
+    ]
+
+
+async def test_upload_file_propagates_gateway_error(monkeypatch) -> None:
+    adapter = make_adapter()
+    recorder = _Recorder(fail_actions={"upload_group_file"})
+
+    async def fake_request(action, params):
+        return await recorder(action, params)
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+
+    with pytest.raises(GatewayError):
+        await adapter.upload_file(ChatType.GROUP, "qq:123", "C:/tmp/a.pdf")
+
+
+async def test_send_forward_group_records_message_id(monkeypatch) -> None:
+    adapter = make_adapter()
+    recorder = _Recorder()
+    nodes = [
+        {
+            "type": "node",
+            "data": {
+                "name": "n",
+                "uin": "1",
+                "content": [{"type": "text", "data": {"text": "hi"}}],
+            },
+        }
+    ]
+
+    async def fake_request(action, params):
+        return await recorder(action, params)
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+
+    message_id = await adapter.send_forward(ChatType.GROUP, "qq:123", nodes)
+
+    assert message_id == "88"
+    assert "88" in adapter.bot_message_ids
+    assert recorder.calls == [
+        ("send_group_forward_msg", {"group_id": 123, "messages": nodes})
+    ]
+
+
+async def test_send_forward_private_without_message_id(monkeypatch) -> None:
+    adapter = make_adapter()
+
+    async def fake_request(action, params):
+        return {}
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+
+    message_id = await adapter.send_forward(ChatType.PRIVATE, "qq:9", [])
+
+    assert message_id is None
+    assert "88" not in adapter.bot_message_ids
+
+
+async def test_service_uploads_file_before_text(monkeypatch) -> None:
+    from dafeiyu.models import Attachment
+    from dafeiyu.service import Service
+
+    adapter = make_adapter()
+    recorder = _Recorder()
+
+    async def fake_request(action, params):
+        return await recorder(action, params)
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+    service = object.__new__(Service)
+    service.adapters = {"qq": adapter}
+
+    await service._send_chunk(
+        ChatType.GROUP,
+        "qq:123",
+        "文件在这",
+        attachments=(Attachment(kind="file", path="C:/tmp/a.pdf"),),
+    )
+
+    assert [action for action, _ in recorder.calls] == [
+        "upload_group_file",
+        "send_group_msg",
+    ]
+    assert recorder.calls[1][1]["message"] == "文件在这"
+
+
+async def test_service_survives_upload_failure(monkeypatch) -> None:
+    from dafeiyu.models import Attachment
+    from dafeiyu.service import Service
+
+    adapter = make_adapter()
+    recorder = _Recorder(fail_actions={"upload_group_file"})
+
+    async def fake_request(action, params):
+        return await recorder(action, params)
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+    service = object.__new__(Service)
+    service.adapters = {"qq": adapter}
+
+    message_id = await service._send_chunk(
+        ChatType.GROUP,
+        "qq:123",
+        "文件在这",
+        attachments=(Attachment(kind="file", path="C:/tmp/a.pdf"),),
+    )
+
+    assert message_id == "88"
+    assert [action for action, _ in recorder.calls] == [
+        "upload_group_file",
+        "send_group_msg",
+    ]

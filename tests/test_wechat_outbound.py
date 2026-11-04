@@ -25,8 +25,10 @@ from dafeiyu.config import ConfigError, WeChatConfig, load_settings
 from dafeiyu.gateway.wechat import WeChatAdapter
 from dafeiyu.gateway.wechat_bridge import sender as sender_module
 from dafeiyu.gateway.wechat_bridge.__main__ import (
+    _CommandError,
     _default_receipt_verifier,
     _startup_checks,
+    _validate_media,
 )
 from dafeiyu.gateway.wechat_bridge.outbound import (
     AutoTransport,
@@ -34,7 +36,12 @@ from dafeiyu.gateway.wechat_bridge.outbound import (
     build_transport,
 )
 from dafeiyu.gateway.wechat_bridge.receipt import ReceiptVerifier
-from dafeiyu.gateway.wechat_bridge.sender import Prepared, Sender, SendResult
+from dafeiyu.gateway.wechat_bridge.sender import (
+    Prepared,
+    Sender,
+    SendResult,
+    UiaTransport,
+)
 from dafeiyu.models import ChatType
 
 GROUP = "锦绣壹号9#1101"
@@ -637,3 +644,145 @@ async def test_client_still_blocks_locked_desktop_for_uia() -> None:
     with pytest.raises(Exception, match="桌面不可交互"):
         await adapter.send(ChatType.GROUP, "wxg:abc", "不该发出")
     assert ws.sent == []
+
+
+# ---------------------------------------------------------- todo 8: send_media
+def test_validate_media_accepts_valid_params() -> None:
+    assert _validate_media(
+        {"chat_id": "wxg:a", "kind": "image", "path": "C:/a.png", "name": "a.png"}
+    ) == ("wxg:a", "image", "C:/a.png", "a.png")
+    # 缺省 name 是空串；两端空白被剥掉。
+    assert _validate_media(
+        {"chat_id": " wxg:a ", "kind": "file", "path": " C:/a.pdf "}
+    ) == ("wxg:a", "file", "C:/a.pdf", "")
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},
+        {"chat_id": "abc", "kind": "image", "path": "p"},
+        {"chat_id": 1, "kind": "image", "path": "p"},
+        {"chat_id": "wxg:a", "kind": "audio", "path": "p"},
+        {"chat_id": "wxg:a", "kind": None, "path": "p"},
+        {"chat_id": "wxg:a", "kind": "image", "path": "   "},
+        {"chat_id": "wxg:a", "kind": "image", "path": 5},
+        {"chat_id": "wxg:a", "kind": "image", "path": "p", "name": 5},
+        {"chat_id": "wxg:a", "kind": "image", "path": "p", "name": "x" * 61},
+    ],
+)
+def test_validate_media_rejects_bad_params(params: dict[str, Any]) -> None:
+    with pytest.raises(_CommandError) as excinfo:
+        _validate_media(params)
+
+    assert excinfo.value.code == "bad_params"
+
+
+def test_hook_send_media_without_media_url_is_unsupported() -> None:
+    transport, opener = _hook()
+
+    result = transport.send_media(GROUP, "image", "C:/a.png", "a.png")
+
+    assert result.ok is False
+    assert result.error_code == "unsupported_media"
+    assert result.not_sent is True
+    assert opener.requests == []
+
+
+def test_hook_send_media_unresolved_chat_name_not_sent() -> None:
+    transport = HookTransport(
+        HOOK_URL, resolver=None, media_url="http://127.0.0.1:9999/media"
+    )
+
+    result = transport.send_media(GROUP, "image", "C:/a.png")
+
+    assert result.error_code == "chat_name_unresolved"
+    assert result.not_sent is True
+
+
+def test_hook_send_media_posts_exactly_once_to_media_endpoint() -> None:
+    opener = FakeOpener(FakeResponse('{"ok": true, "message_id": "h-9"}'))
+    transport = HookTransport(
+        HOOK_URL,
+        resolver=lambda name: USERNAME,
+        timeout=1.0,
+        opener=opener,
+        media_url="http://127.0.0.1:9999/media",
+    )
+
+    result = transport.send_media(GROUP, "file", "C:/a.pdf", "报告.pdf")
+
+    assert result.ok is True
+    assert result.delivered == "typed"
+    assert result.message_id == "h-9"
+    assert len(opener.requests) == 1
+    request = opener.requests[0]
+    assert request.full_url == "http://127.0.0.1:9999/media"
+    assert json.loads(request.data.decode("utf-8")) == {
+        "action": "send_media",
+        "chatroom": USERNAME,
+        "chat_name": GROUP,
+        "kind": "file",
+        "path": "C:/a.pdf",
+        "name": "报告.pdf",
+    }
+    assert request.get_method() == "POST"
+
+
+def _exploding_uia_factory() -> Any:
+    def factory() -> Any:
+        raise AssertionError("媒体发送不允许创建 UIA 传输")
+
+    return factory
+
+
+def test_auto_send_media_delegates_to_hook_without_uia() -> None:
+    hook, opener = _hook()
+    auto = AutoTransport(hook, uia_factory=_exploding_uia_factory())
+
+    result = auto.send_media(GROUP, "image", "C:/a.png")
+
+    assert result.error_code == "unsupported_media"
+    assert opener.requests == []
+
+
+def test_auto_send_media_posts_via_hook_media_endpoint() -> None:
+    opener = FakeOpener(FakeResponse('{"ok": true, "message_id": "h-1"}'))
+    hook = HookTransport(
+        HOOK_URL,
+        resolver=lambda name: USERNAME,
+        opener=opener,
+        media_url="http://127.0.0.1:9999/media",
+    )
+    auto = AutoTransport(hook, uia_factory=_exploding_uia_factory())
+
+    result = auto.send_media(GROUP, "image", "C:/a.png", "a.png")
+
+    assert result.ok is True
+    assert len(opener.requests) == 1
+
+
+class _UntouchableDriver:
+    """任何属性访问都记一笔；UIA 媒体分支不该碰驱动。"""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        def record(*_args: Any, **_kwargs: Any) -> Any:
+            self.calls.append(name)
+            raise AssertionError(f"UIA 驱动不应被调用：{name}")
+
+        return record
+
+
+def test_uia_send_media_is_unsupported_without_touching_driver() -> None:
+    driver = _UntouchableDriver()
+    transport = UiaTransport(SimpleNamespace(), driver=driver)
+
+    result = transport.send_media(GROUP, "image", "C:/a.png", "a.png")
+
+    assert result.ok is False
+    assert result.error_code == "unsupported_media"
+    assert result.not_sent is True
+    assert driver.calls == []

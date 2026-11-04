@@ -8,13 +8,21 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Collection
 from http import HTTPStatus
 from itertools import count
+from pathlib import Path
 from typing import Any
 
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 from dafeiyu.gateway.base import GatewayError
-from dafeiyu.models import QQ_PREFIX, ChatType, Message, RecallEvent, Segment
+from dafeiyu.models import (
+    QQ_PREFIX,
+    Attachment,
+    ChatType,
+    Message,
+    RecallEvent,
+    Segment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +50,7 @@ _FORWARD_FALLBACK = "[合并转发]"
 _FORWARD_MAX_DEPTH = 2
 _FORWARD_MAX_NODES = 10
 _FORWARD_NODE_CLIP = 60
+_ATTACHMENT_NAME_CLIP = 60
 
 
 def _as_int(value: Any) -> int:
@@ -194,7 +203,7 @@ def _render_forward(
             if isinstance(message, str):
                 body = message.strip()
             elif isinstance(message, list):
-                body, _segs, _rid, _rqq = _render_segments(
+                body, _segs, _rid, _rqq, _atts = _render_segments(
                     message, depth + 1, bot_qq=bot_qq
                 )
             else:
@@ -208,12 +217,78 @@ def _render_forward(
         return _FORWARD_FALLBACK
 
 
+def _pick_media_source(
+    data: dict[str, Any], keys: tuple[str, ...] = ("url", "file", "base64")
+) -> str:
+    """按给定优先级挑第一个非空字符串来源；没有可用来源返回空串。
+
+    与 ``images._source`` 同思路，但不 import images（避免网关 ↔ 物化的循环依赖）。
+    """
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _attachment_from_segment(seg_type: str, data: dict[str, Any]) -> Attachment | None:
+    """单个段 → 附件；无可记录信息时返回 None。"""
+    if seg_type == "image":
+        source = _pick_media_source(data)
+        return Attachment(kind="image", source=source) if source else None
+    if seg_type in ("record", "video"):
+        source = _pick_media_source(data, ("url", "file"))
+        duration = _as_int(data.get("duration"))
+        if not source and not duration:
+            return None
+        return Attachment(kind=seg_type, source=source, duration=duration)
+    if seg_type == "file":
+        name = _clip_first(
+            data.get("name") or data.get("file"), _ATTACHMENT_NAME_CLIP
+        )
+        if not name:
+            return None
+        return Attachment(
+            kind="file", name=name, size=_as_int(data.get("size"))
+        )
+    if seg_type == "face":
+        name = _clip_first(data.get("id"), _ATTACHMENT_NAME_CLIP)
+        return Attachment(kind="sticker", name=name) if name else None
+    if seg_type == "mface":
+        name = _clip_first(data.get("summary"), _ATTACHMENT_NAME_CLIP)
+        return Attachment(kind="sticker", name=name) if name else None
+    if seg_type == "node":
+        # 摘要已经由 content 里的 [合并转发] 占位承载，这里只留类型标记。
+        return Attachment(kind="forward")
+    return None
+
+
+def _attachments_from_segments(raw_segments: list[Any]) -> list[Attachment]:
+    """把可识别的媒体段归一化成附件；未知/畸形段静默跳过，永不抛异常。"""
+    attachments: list[Attachment] = []
+    for item in raw_segments:
+        if not isinstance(item, dict):
+            continue
+        seg_type = str(item.get("type", ""))
+        data = item.get("data")
+        if not isinstance(data, dict):
+            continue
+        try:
+            attachment = _attachment_from_segment(seg_type, data)
+        # 单个畸形段不得影响整条消息的解析。
+        except Exception:  # noqa: BLE001
+            attachment = None
+        if attachment is not None:
+            attachments.append(attachment)
+    return attachments
+
+
 def _render_segments(
     raw_segments: list[Any],
     depth: int = 0,
     *,
     bot_qq: int = 0,
-) -> tuple[str, list[Segment], str | None, int | None]:
+) -> tuple[str, list[Segment], str | None, int | None, list[Attachment]]:
     parts: list[str] = []
     segments: list[Segment] = []
     reply_id: str | None = None
@@ -258,7 +333,13 @@ def _render_segments(
             parts.append(_render_rich_segment(seg_type, data))
         # 其余未知段类型一律忽略，不抛异常
 
-    return "".join(parts).strip(), segments, reply_id, reply_qq
+    return (
+        "".join(parts).strip(),
+        segments,
+        reply_id,
+        reply_qq,
+        _attachments_from_segments(raw_segments),
+    )
 
 
 def _parse_recall(event: dict[str, Any]) -> RecallEvent | None:
@@ -317,12 +398,13 @@ def parse_event(
     reply_id: str | None = None
     reply_qq: int | None = None
     segments: list[Segment] = []
+    attachments: list[Attachment] = []
 
     if isinstance(raw_message, str):
         content = raw_message.strip()
         at_bot = False
     elif isinstance(raw_message, list):
-        content, segments, reply_id, reply_qq = _render_segments(
+        content, segments, reply_id, reply_qq, attachments = _render_segments(
             raw_message, bot_qq=bot_qq
         )
         at_bot = any(
@@ -351,6 +433,7 @@ def parse_event(
         reply_to_message_id=reply_id or None,
         reply_to_user_id=_qq_id(reply_qq) if reply_qq else None,
         timestamp=_as_int(event.get("time")),
+        attachments=attachments,
     )
 
 
@@ -449,6 +532,63 @@ class QQAdapter:
             if isinstance(segment, dict)
         )
         return await self._send_message(chat_type, chat_id, segments, chars=chars)
+
+    async def upload_file(
+        self, chat_type: ChatType, chat_id: str, path: str, name: str = ""
+    ) -> None:
+        """把本地文件上传到群/私聊；失败抛 `GatewayError`，绝不吞掉。
+
+        `name` 是对方看到的文件名，空则取路径 basename。日志只记文件名与
+        会话，不把完整本地路径写到 INFO 以上。
+        """
+        bare_id = _bare_id(chat_id)
+        filename = name or Path(path).name
+        if chat_type is ChatType.GROUP:
+            action = "upload_group_file"
+            params: dict[str, Any] = {
+                "group_id": bare_id,
+                "file": path,
+                "name": filename,
+            }
+        else:
+            action = "upload_private_file"
+            params = {"user_id": bare_id, "file": path, "name": filename}
+
+        target = f"{chat_type.value}/{bare_id}"
+        try:
+            await self._request(action, params)
+        except GatewayError as exc:
+            logger.warning("文件上传失败 %s %s name=%s：%s", action, target, filename, exc)
+            raise
+        logger.info("文件已上传 %s %s name=%s", action, target, filename)
+
+    async def send_forward(
+        self, chat_type: ChatType, chat_id: str, nodes: list[dict[str, Any]]
+    ) -> str | None:
+        """发合并转发；节点由调用方构造，这里只负责协议动作与 id 记账。"""
+        bare_id = _bare_id(chat_id)
+        if chat_type is ChatType.GROUP:
+            action = "send_group_forward_msg"
+            params: dict[str, Any] = {"group_id": bare_id, "messages": nodes}
+        else:
+            action = "send_private_forward_msg"
+            params = {"user_id": bare_id, "messages": nodes}
+
+        target = f"{chat_type.value}/{bare_id}"
+        try:
+            data = await self._request(action, params)
+        except GatewayError as exc:
+            logger.warning("合并转发失败 %s %s：%s", action, target, exc)
+            raise
+
+        self.last_send_at = time.time()
+        message_id = data.get("message_id")
+        if message_id is None:
+            return None
+        value = str(message_id)
+        self.bot_message_ids.append(value)
+        logger.info("合并转发已发送 %s %s msg_id=%s", action, target, value)
+        return value
 
     async def call_action(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         """通用 OneBot 动作调用；只读查询（如 `get_group_info`）也走这里。"""

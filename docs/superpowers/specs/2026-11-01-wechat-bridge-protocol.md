@@ -2,6 +2,7 @@
 
 - 日期：2026-11-01
 - 状态：已冻结（v1），作为 todo 10 / 11 / 13 的实现依据
+- v2 增量：见 §10（当前实现；向后兼容，线协议 `v` 仍为 `1`，未做版本协商）
 - 范围：桌面微信桥的**信封定义**——事件（event）、指令（command）、回执（receipt）、健康（health）四类消息的字段、必填性、缺字段的下游后果，以及 `v` 版本与向后兼容规则
 - 相关文件：`docs/superpowers/specs/2026-11-01-wechat-bridge-protocol.md`（本文件）；下游 `src/dafeiyu/wxg/`（桥接服务器，todo 11）、`src/dafeiyu/gateway/wechat.py`（adapter 侧客户端，todo 10，命名待实现时定）、驱动门面（todo 13）；参照 `src/dafeiyu/gateway/qq.py`（OneBot v11 echo 关联先例，`qq.py:426`、`qq.py:507-510`、`qq.py:267-334`）
 
@@ -221,3 +222,81 @@
 - **todo 10（adapter 客户端，主进程侧）**：在 `src/dafeiyu/gateway/` 下新建微信 adapter，把本协议的四张表转成 `Adapter`（`src/dafeiyu/gateway/base.py:13-22` 的进程内 Protocol）能吃的东西；回声关联照抄 `gateway/qq.py` 的 echo/pending 模式（`qq.py:426`、`qq.py:507-510`），只是 `echo` 换成本协议的 `id`。事件解析入口对应 `qq.py:267-334` 的骨架。
 - **todo 11（桥服务器）**：按本协议实现桌面侧常驻进程，事件流按 §2 吐 JSON 行，接收指令按 §3 执行、receipt 按 §4 回填 `id`，健康快照按 §5 周期上报；显示名寻址与 resync 按 §2.2 落地。
 - **todo 13（驱动门面）**：把 adapter 以上的一层（发送接口、健康轮询、会话生命周期）封装成 dafeiyu 内部可调用的门面。凡本文件与三个下游实现的冲突，以本文件为准；歧义在实现 PR 里提回本文件改版，不许代码各改各的。
+
+## 10. v2 增量（当前实现）
+
+本节记录消息类型扩展后**已经落地**的字段与动作。线协议版本号仍写 `"v": 1`：
+
+- `kind` / `media` 是新增的 optional 字段，旧对端按 §6 规则 3 忽略即可，协议仍是 v1；
+- `send_at` / `send_media` 是新增的 action 值。旧桥遇到未知 action 会按 §6 规则 5 回 `ok:false, error_code:"bad_action"`，不会崩主循环；客户端应把这种情况当作「该桥不支持」并回落，而不是换 id 重试。
+
+因此这里把它称为 **v2 增量**，但**没有把 `v` 改成 2，也没有做版本协商**。§3.1 的 action 枚举由本节扩充。
+
+### 10.1 message 事件新增字段
+
+| 字段 | 类型 | 必填 | 含义 |
+| --- | --- | --- | --- |
+| `kind` | string | 否（缺省 `"text"`） | 消息类型；缺省或未知值一律按 `"text"` 处理 |
+| `media` | object \| 缺省 | 否 | 本地库发现的媒体**元数据**；绝不携带文件字节 |
+
+`kind` 白名单（客户端 `WeChatAdapter._MESSAGE_KINDS`）：
+
+```text
+text, image, voice, video, file, sticker, card, location, call, link, quote, record, forward
+```
+
+桥的本地库映射（`localdb/repository.py::_PLACEHOLDER_BY_TYPE`）：
+
+```text
+1 -> text        3 -> image       34 -> voice      42 -> card
+43 -> video      47 -> sticker    48 -> location   50 -> call
+49 (appmsg) -> quote（引用消息）或 link（其余卡片）
+```
+
+`media` 只在 `gateway.wechat.media.enabled: true`、本地索引库能证明文件存在、且文件大小在 `(0, max_bytes]` 时出现：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `kind` | string | `image` / `voice` / `video`；由 `_MEDIA_KIND_BY_TYPE` 单独派生（3/47 → image，34 → voice，43 → video），可能与消息级 `kind` 不同（例如消息 `kind=sticker`、`media.kind=image`） |
+| `path` | string | 本地库发现的**绝对路径**；必须 `resolve()` 到 `storage_root`（或镜像 db_root）内，越界直接丢弃 |
+| `name` | string | 文件名 / 显示名 |
+| `size` | int | 字节数（> 0 且 ≤ `max_bytes`） |
+| `duration` | int | 语音/视频时长（秒）；未知为 0 |
+
+客户端只把 `media` 映射成内存里的 `Attachment`，**不入库**；正文里的 `[图片]` 等占位仍是唯一持久载体。是否复制/解密到 workspace、是否把路径写进正文，由主进程 `media.py` 决定；开关关闭或任何一步失败都保留占位。
+
+### 10.2 command 新增动作
+
+| action | params | 当前状态 |
+| --- | --- | --- |
+| `send_at` | `{chat_id, text, at: string[]}` | action 门禁已启用（`_SEND_ACTIONS` / `_KNOWN_ACTIONS`）。`at` 为空时等价 `send_text`；**非空 `at` 在默认内置发送路径里返回 `ok:false, error_code:"unsupported_at"`**（UIA 定向 @ 未实现）。客户端会抛 `GatewayError`，service 随后回落到普通 `send_text`，不会静默丢掉 @ 意图 |
+| `send_media` | `{chat_id, kind, path, name}` | 协议、桥与客户端 adapter 均已实现；实际传输能力见 §10.3 |
+
+`send_media` 参数约束（桥 `_validate_media`）：
+
+- `chat_id`：`"wxg:<alias>"`，且必须解析到存活、在白名单内的群；
+- `kind`：`image` / `file` / `voice` / `video` 之一；
+- `path`：非空字符串（本地路径；桥不负责下载）；
+- `name`：字符串，长度 ≤ 60，可为空。
+
+回执：
+
+- 传输层支持且成功：正常 `ok:true` + `delivered`；
+- 传输层明确不支持：`ok:false, error_code:"unsupported_media", delivered:"failed"`；
+- 参数错误：`bad_params`；会话解析失败：`chat_name_unresolved` / `chat_not_allowed`。
+
+`unsupported_media` 的**精确语义**：
+
+- 客户端 `WeChatAdapter.send_media` 收到该错误码时返回 `False`，**不重试、不回落、不记回声表**；调用方继续发文本。其他错误码仍抛 `GatewayError`。
+- UIA 传输**永远**返回 `unsupported_media`（`UiaTransport.send_media` 不碰桌面）。
+- hook 传输只有配置了独立媒体端点才会真正 POST；端点来自构造参数 `media_url`，`build_transport` 用 `wechat.hook_media_url` 读取，当前配置对象没有该字段，缺省为空。为空时同样返回 `unsupported_media`。
+- `auto` 的媒体只走 hook，不回落 UIA（UIA 反正不支持）。
+
+### 10.3 当前接线范围与计划中项
+
+- `send_media` 已在**桥 + `WeChatAdapter`** 落地，但 `Service._send_chunk` 尚未调用它：模型给的微信出站附件目前仍只发文本（QQ 走 `send_segments`）。接到自定义 hook 媒体端点的调用方可以显式调用 `WeChatAdapter.send_media`。
+- 微信 UIA 通道的图片/文件发送：**未实现**，恒 `unsupported_media`；不做剪贴板发图。
+- 微信 `send_at` 的定向 @：action 已接受，`at` 非空时明确 `unsupported_at`；不静默丢 @。
+- 微信语音转写、视频转码：**不做**。
+- QQ `send_forward`：adapter 有协议动作封装，但模型输出协议没有对应字段，service 也未接线——**未启用**。
+

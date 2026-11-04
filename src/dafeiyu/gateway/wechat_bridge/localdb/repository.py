@@ -97,6 +97,33 @@ _REQUIRED_COLUMNS = frozenset(
     }
 )
 
+#: 媒体落盘只处理这几类；47（表情）按图片处理。
+_MEDIA_KIND_BY_TYPE: dict[int, str] = {3: "image", 34: "voice", 43: "video", 47: "image"}
+
+#: 已知的微信媒体索引库（仓库里没有可验证的 schema，按「存在才读」适配）。
+_MEDIA_REL = "message/message_resource.db"
+
+#: 表名优先级；实际列名在运行时从 schema 读，绝不按固定 DDL 假设。
+_MEDIA_TABLE_PRIORITY = (
+    "message_resource",
+    "MessageResourceInfo",
+    "message_resource_info",
+    "hardlink",
+    "HardLinkInfo",
+    "media",
+)
+_MEDIA_ID_COLUMNS = (
+    "message_local_id",
+    "local_id",
+    "msg_local_id",
+    "message_id",
+    "msg_id",
+)
+_MEDIA_PATH_COLUMNS = ("local_path", "file_path", "media_path", "path")
+_MEDIA_NAME_COLUMNS = ("file_name", "name")
+_MEDIA_SIZE_COLUMNS = ("file_size", "size", "filesize")
+_MEDIA_DURATION_COLUMNS = ("duration", "play_length", "voice_length")
+
 
 @dataclass(frozen=True)
 class ChatRef:
@@ -123,6 +150,9 @@ class LocalMessageStore:
         self_display_name: str,
         contact_rel: str = "contact/contact.db",
         message_rels: Sequence[str] | None = None,
+        media_enabled: bool = False,
+        media_max_bytes: int = 10 * 1024 * 1024,
+        media_storage_root: str = "",
     ) -> None:
         if not callable(getattr(mirrors, "path_for", None)):
             raise StoreError("mirrors 必须提供 path_for(rel) -> Path")
@@ -132,6 +162,10 @@ class LocalMessageStore:
             raise StoreError("self_display_name 必须是 str")
         if not isinstance(contact_rel, str) or not contact_rel.strip():
             raise StoreError("contact_rel 不能为空")
+        if not isinstance(media_enabled, bool):
+            raise StoreError("media_enabled 必须是 bool")
+        if int(media_max_bytes) <= 0:
+            raise StoreError("media_max_bytes 必须大于 0")
 
         explicit: tuple[str, ...] | None = None
         if message_rels is not None:
@@ -152,6 +186,9 @@ class LocalMessageStore:
         self._contact_rel = contact_rel.replace("\\", "/")
         self._explicit_rels = explicit
         self._warned_no_zstd = False
+        self._media_enabled = media_enabled
+        self._media_max_bytes = int(media_max_bytes)
+        self._media_storage_root = str(media_storage_root or "").strip()
 
     # ------------------------------------------------------------- 公共 API
     def group_names(self) -> list[str]:
@@ -232,11 +269,17 @@ class LocalMessageStore:
             except sqlite3.Error as exc:
                 log.debug("读取 %s.%s 失败：%s", shard, table, exc)
                 return []
+            media_raw = (
+                self._media_rows(con, [_safe_int(row[0]) for row in rows])
+                if self._media_enabled
+                else {}
+            )
 
         entries: list[dict[str, Any]] = []
         # SQL 取的是最新 N 条（DESC），这里翻成时间正序（旧 -> 新）。
         for row in reversed(rows):
-            entry = self._entry_from_row(row, senders, contacts, strangers)
+            raw = media_raw.get(_safe_int(row[0]))
+            entry = self._entry_from_row(row, senders, contacts, strangers, raw)
             if entry is not None:
                 entries.append(entry)
         return entries
@@ -281,6 +324,7 @@ class LocalMessageStore:
         senders: dict[int, str],
         contacts: dict[str, str],
         strangers: dict[str, str],
+        media_raw: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         local_type = _base_type(row[1])
         if local_type not in _SUPPORTED_TYPES:
@@ -318,7 +362,11 @@ class LocalMessageStore:
             "reply_to": reply_to,
             "reply_author": reply_author,
             "ts": _safe_int(row[3]),
-        }
+        } | (
+            {"media": media}
+            if (media := self._media_meta(local_type, media_raw)) is not None
+            else {}
+        )
 
     def _decode_content(self, value: Any, content_type: int) -> str:
         """按 ``WCDB_CT_message_content`` 解正文；任何失败都退化成空串。"""
@@ -436,6 +484,123 @@ class LocalMessageStore:
             if name:
                 out.append((name, _display_name(remark, nick_name)))
         return out
+
+    # ------------------------------------------------------------- 媒体元数据
+    def _media_rows(
+        self, con: sqlite3.Connection, local_ids: Sequence[int]
+    ) -> dict[int, dict[str, Any]]:
+        """``local_id -> {path,name,size,duration}``；任何失败都返回空。
+
+        schema 不可验证（仓库里没有真实媒体库）：只在**确实存在**的表里按列名
+        适配，读不到就当没有媒体，绝不猜路径。
+        """
+        wanted = {_safe_int(value) for value in local_ids}
+        wanted.discard(0)
+        if not wanted:
+            return {}
+        found = self._query_media_tables(con, wanted)
+        resource = self._mirror_path(_MEDIA_REL)
+        if resource is not None:
+            try:
+                with closing(_connect(resource)) as resource_con:
+                    found.update(self._query_media_tables(resource_con, wanted))
+            except (sqlite3.Error, OSError) as exc:
+                log.debug("打开媒体索引库失败：%s", exc)
+        return found
+
+    def _query_media_tables(
+        self, con: sqlite3.Connection, ids: set[int]
+    ) -> dict[int, dict[str, Any]]:
+        columns_by_table = _table_columns(con)
+        placeholders = ",".join("?" for _ in ids)
+        parameters = tuple(sorted(ids))
+        for table, layout in _media_tables(columns_by_table):
+            id_column = layout["id"]
+            select = [id_column, layout["path"]]
+            for key in ("name", "size", "duration"):
+                if layout.get(key):
+                    select.append(layout[key])
+            quoted = ", ".join(f'"{_quote_ident(col)}"' for col in select)
+            sql = (
+                f'SELECT {quoted} FROM "{_quote_ident(table)}" '
+                f'WHERE "{_quote_ident(id_column)}" IN ({placeholders})'
+            )
+            try:
+                rows = con.execute(sql, parameters).fetchall()
+            except sqlite3.Error as exc:
+                log.debug("读取媒体表 %s 失败：%s", table, exc)
+                continue
+            found: dict[int, dict[str, Any]] = {}
+            for row in rows:
+                values = dict(zip(select, row, strict=False))
+                key = _safe_int(values.get(id_column))
+                if key:
+                    found[key] = {
+                        "path": values.get(layout["path"]),
+                        "name": values.get(layout["name"]) if layout.get("name") else "",
+                        "size": values.get(layout["size"]) if layout.get("size") else 0,
+                        "duration": (
+                            values.get(layout["duration"])
+                            if layout.get("duration")
+                            else 0
+                        ),
+                    }
+            if found:
+                return found
+        return {}
+
+    def _media_meta(
+        self, local_type: int, raw: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """把索引行落成文档化的 media dict；证明不了文件存在就返回 None。"""
+        kind = _MEDIA_KIND_BY_TYPE.get(local_type)
+        if kind is None or not isinstance(raw, dict):
+            return None
+        text = str(raw.get("path") or "").strip()
+        if not text:
+            return None
+        root = self._media_root()
+        if root is None:
+            log.debug("媒体根目录未知，跳过媒体发现")
+            return None
+        try:
+            root_resolved = root.resolve()
+            candidate = Path(text)
+            if not candidate.is_absolute():
+                candidate = root_resolved / candidate
+            candidate = candidate.resolve()
+            if not candidate.is_relative_to(root_resolved):
+                log.debug("媒体路径越界，忽略：%s", candidate.name)
+                return None
+            if not candidate.is_file():
+                log.debug("媒体文件缺失，保留占位：%s", candidate.name)
+                return None
+            size = candidate.stat().st_size
+        except (OSError, ValueError) as exc:
+            log.debug("媒体路径不可用：%s", exc)
+            return None
+        if size <= 0 or size > self._media_max_bytes:
+            log.debug("媒体文件大小不可接受（%s）：%d 字节", candidate.name, size)
+            return None
+        name = str(raw.get("name") or "").strip() or candidate.name
+        return {
+            "kind": kind,
+            "path": str(candidate),
+            "name": name,
+            "size": int(size),
+            "duration": _safe_int(raw.get("duration")),
+        }
+
+    def _media_root(self) -> Path | None:
+        if self._media_storage_root:
+            return Path(self._media_storage_root)
+        root = getattr(self._mirrors, "db_root", None)
+        if root is None:
+            return None
+        try:
+            return Path(root)
+        except TypeError:
+            return None
 
 
 # ----------------------------------------------------------------- 工具函数
@@ -573,6 +738,70 @@ def _has_columns(con: sqlite3.Connection, table: str) -> bool:
     if not info:
         return False
     return _REQUIRED_COLUMNS.issubset({str(row[1]) for row in info})
+
+
+def _table_columns(con: sqlite3.Connection) -> dict[str, set[str]]:
+    """``表名 -> 列名集合``；读不到 schema 的表直接不出现在结果里。"""
+    try:
+        names = [
+            str(row[0])
+            for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        ]
+    except sqlite3.Error as exc:
+        log.debug("枚举媒体库表失败：%s", exc)
+        return {}
+    out: dict[str, set[str]] = {}
+    for name in names:
+        try:
+            info = con.execute(f'PRAGMA table_info("{_quote_ident(name)}")').fetchall()
+        except sqlite3.Error:
+            continue
+        columns = {str(row[1]) for row in info if len(row) > 1}
+        if columns:
+            out[name] = columns
+    return out
+
+
+def _media_tables(
+    columns_by_table: dict[str, set[str]],
+) -> list[tuple[str, dict[str, str]]]:
+    """按已知优先级挑出「有 id 列 + 有路径列」的表，列名运行时适配。"""
+
+    def rank(name: str) -> tuple[int, str]:
+        try:
+            return (_MEDIA_TABLE_PRIORITY.index(name), name)
+        except ValueError:
+            return (len(_MEDIA_TABLE_PRIORITY), name)
+
+    chosen: list[tuple[str, dict[str, str]]] = []
+    for name in sorted(columns_by_table, key=rank):
+        columns = columns_by_table[name]
+        id_column = _first_present(columns, _MEDIA_ID_COLUMNS)
+        path_column = _first_present(columns, _MEDIA_PATH_COLUMNS)
+        if id_column is None or path_column is None:
+            continue
+        layout = {"id": id_column, "path": path_column}
+        for key, candidates in (
+            ("name", _MEDIA_NAME_COLUMNS),
+            ("size", _MEDIA_SIZE_COLUMNS),
+            ("duration", _MEDIA_DURATION_COLUMNS),
+        ):
+            match = _first_present(columns, candidates)
+            if match is not None:
+                layout[key] = match
+        chosen.append((name, layout))
+    return chosen
+
+
+def _first_present(columns: set[str], candidates: Sequence[str]) -> str | None:
+    lowered = {column.lower(): column for column in columns}
+    for candidate in candidates:
+        found = lowered.get(candidate.lower())
+        if found is not None:
+            return found
+    return None
 
 
 def _name2id(con: sqlite3.Connection) -> dict[int, str]:

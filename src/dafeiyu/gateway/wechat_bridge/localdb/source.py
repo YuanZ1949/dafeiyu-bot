@@ -58,6 +58,9 @@ class LocalDbSource:
         retry_seconds: float = DEFAULT_RETRY_SECONDS,
         cache_path: str | Path | None = None,
         clock: Callable[[], float] = time.monotonic,
+        media_enabled: bool = False,
+        media_max_bytes: int = 10 * 1024 * 1024,
+        media_storage_root: str = "",
     ) -> None:
         self._db_root = Path(db_root) if db_root else None
         self._self_display_name = str(self_display_name or "")
@@ -66,6 +69,9 @@ class LocalDbSource:
         self._retry_seconds = max(0.0, float(retry_seconds))
         self._cache_path = Path(cache_path) if cache_path else self._mirror_dir / "keys.json"
         self._clock = clock
+        self._media_enabled = bool(media_enabled)
+        self._media_max_bytes = int(media_max_bytes)
+        self._media_storage_root = str(media_storage_root or "").strip()
 
         self._store: LocalMessageStore | None = None
         self._self_username = ""
@@ -228,6 +234,9 @@ class LocalDbSource:
             mirrors,
             self_username=self._self_username,
             self_display_name=self._self_display_name,
+            media_enabled=self._media_enabled,
+            media_max_bytes=self._media_max_bytes,
+            media_storage_root=self._media_storage_root,
         )
 
     def _record_failure(self, message: str) -> None:

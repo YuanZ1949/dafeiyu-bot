@@ -14,8 +14,8 @@ from fixtures.onebot_events import (
     xml_card,
 )
 
-from dafeiyu.gateway.qq import parse_event
-from dafeiyu.models import ChatType
+from dafeiyu.gateway.qq import _attachments_from_segments, parse_event
+from dafeiyu.models import ChatType, Message
 
 BOT_QQ = 10001
 
@@ -302,3 +302,87 @@ def test_markdown_segment_is_readable() -> None:
     )
     assert m is not None
     assert m.content == "[Markdown] **重点**"
+
+
+# --- 结构化附件（content 必须逐字节不变） ---
+
+
+def test_media_segments_become_attachments() -> None:
+    event = group_event(
+        segments=[
+            text("看图 "),
+            {"type": "image", "data": {"url": "https://x/a.png"}},
+            {"type": "record", "data": {"file": "x.amr", "duration": "3"}},
+            {"type": "file", "data": {"name": "a.pdf", "size": "12"}},
+        ]
+    )
+    m = parse_event(event, bot_qq=BOT_QQ)
+    assert isinstance(m, Message)
+    # 附件不改变任何渲染结果
+    assert m.content == "看图 [图片][语音][文件] a.pdf"
+    assert [a.kind for a in m.attachments] == ["image", "record", "file"]
+    image_att, record_att, file_att = m.attachments
+    assert image_att.source == "https://x/a.png"
+    assert record_att.source == "x.amr"
+    assert record_att.duration == 3
+    assert file_att.name == "a.pdf"
+    assert file_att.size == 12
+    # 入站附件只带 source，绝不带文件系统路径
+    assert all(a.path == "" for a in m.attachments)
+
+
+def test_unknown_and_malformed_segments_have_no_attachments() -> None:
+    m = parse_event(
+        group_event(
+            segments=[{"type": "mystery", "data": {}}, {"type": "image", "data": None}]
+        ),
+        bot_qq=BOT_QQ,
+    )
+    assert isinstance(m, Message)
+    assert m.attachments == []
+
+    assert (
+        _attachments_from_segments(
+            [
+                None,
+                42,
+                {"type": "image", "data": None},
+                {"type": "file", "data": {}},
+                {"type": "record", "data": {}},
+                {"type": "face", "data": {}},
+                {"type": "mface", "data": {}},
+                "not-a-dict",
+            ]
+        )
+        == []
+    )
+
+
+def test_node_segment_becomes_forward_attachment() -> None:
+    node = {"type": "node", "data": {"content": [forward_node("张三", [text("转来的")])]}}
+    m = parse_event(group_event(segments=[node]), bot_qq=BOT_QQ)
+    assert isinstance(m, Message)
+    assert m.content == "[合并转发]"
+    assert len(m.attachments) == 1
+    assert m.attachments[0].kind == "forward"
+
+
+def test_face_mface_and_video_mappings() -> None:
+    m = parse_event(
+        group_event(
+            segments=[
+                face(),
+                {"type": "mface", "data": {"summary": "猫猫表情"}},
+                {"type": "video", "data": {"file": "v.mp4", "duration": "7"}},
+            ]
+        ),
+        bot_qq=BOT_QQ,
+    )
+    assert isinstance(m, Message)
+    assert m.content == "[表情][表情][视频]"
+    assert [(a.kind, a.name, a.duration) for a in m.attachments] == [
+        ("sticker", "1", 0),
+        ("sticker", "猫猫表情", 0),
+        ("video", "", 7),
+    ]
+

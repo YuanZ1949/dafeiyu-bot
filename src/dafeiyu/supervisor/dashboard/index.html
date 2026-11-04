@@ -443,6 +443,16 @@
   }
   .timeline-msg-head b { color: var(--text); font-weight: 600; }
   .timeline-msg-text { white-space: pre-wrap; word-break: break-word; }
+  .attachment-previews { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .attachment-previews img {
+    max-width: 180px; max-height: 140px; object-fit: contain;
+    border: 1px solid var(--line); border-radius: 6px;
+  }
+  .attachment-previews audio { max-width: 260px; }
+  .attachment-previews a {
+    color: var(--accent); font-size: var(--fs-sm); word-break: break-all;
+  }
+  .batch-msg .attachment-previews { flex-basis: 100%; }
   .timeline-flags { color: var(--warn); font-size: var(--fs-xs); margin-top: 4px; }
   .timeline-context {
     border-top: 1px solid var(--line); padding: 12px 20px 16px;
@@ -900,6 +910,27 @@
 
   <section class="card">
     <div class="row card-head">
+      <h2>心智</h2>
+      <span class="kv" id="mind-hint">保存后重启生效</span>
+      <span class="spacer"></span>
+      <button class="btn" id="btn-refresh-mind">刷新</button>
+      <button class="btn primary" id="btn-save-mind">保存</button>
+    </div>
+    <div class="debug-form">
+      <label>观察者
+        <input type="checkbox" id="mind-observer-enabled" />
+      </label>
+      <label>每日调用上限
+        <input type="number" id="mind-daily-calls" min="1" max="1000" step="1" />
+      </label>
+    </div>
+    <div class="kv" id="mind-prerequisites" style="margin-top:8px"></div>
+    <div class="kv" id="mind-cost" style="margin-top:8px"></div>
+    <div class="kv" style="margin-top:8px">观察者只观察群聊；需要心智总闸打开且当前大脑支持 complete_detailed。改动写入 config.yaml，重启后生效。</div>
+  </section>
+
+  <section class="card">
+    <div class="row card-head">
       <h2>群白名单</h2>
       <span class="kv" id="groups-hint">留空 = 不限制回复对象</span>
       <span class="spacer"></span>
@@ -1307,6 +1338,66 @@ async function runBatchPreview() {
   }
 }
 
+// content 里的附件注记（后端写入的纯文本，前端只识别，绝不拼 HTML）：
+//   [图片]（图存 images/a.png，可用 read 查看）   ← images.py 的模板（含「动图」变体）
+//   [图片] images/a.png                          ← service 给 bot 消息补的短注记
+//   [文件] name (replies/a.pdf)                  ← media.py 的文件注记
+// 只接受白名单扩展名；含 ".." 的路径客户端也直接忽略。
+const ATTACHMENT_EXTENSIONS = new Set([
+  "png", "jpg", "jpeg", "gif", "webp", "mp3", "wav", "mp4", "pdf", "txt", "zip",
+]);
+const ATTACHMENT_IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
+const ATTACHMENT_AUDIO_EXTENSIONS = new Set(["mp3", "wav"]);
+const ATTACHMENT_MAX_PREVIEWS = 6;
+const ATTACHMENT_ANNOTATION_RE =
+  /\[(?:图片|文件)\](?:（图存\s+([^，）\s]+)[^）]*）|\s+([^\s（(，。；、）]+)(?:[（(]([^）)]+)[）)])?)/g;
+
+function attachmentPreviewUrl(path) {
+  return "/api/workspace/file?path=" + encodeURIComponent(path);
+}
+
+function attachmentPreviews(content) {
+  const text = String(content || "");
+  if (!text || (!text.includes("[图片]") && !text.includes("[文件]"))) return null;
+  const nodes = [];
+  for (const match of text.matchAll(ATTACHMENT_ANNOTATION_RE)) {
+    if (nodes.length >= ATTACHMENT_MAX_PREVIEWS) break;
+    const path = (match[3] || match[1] || match[2] || "").trim();
+    if (!path || path.includes("..")) continue;
+    const name = path.split(/[\\/]/).pop() || "";
+    const dot = name.lastIndexOf(".");
+    if (dot <= 0) continue;
+    const ext = name.slice(dot + 1).toLowerCase();
+    if (!ATTACHMENT_EXTENSIONS.has(ext)) continue;
+    const url = attachmentPreviewUrl(path);
+    if (ATTACHMENT_IMAGE_EXTENSIONS.has(ext)) {
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.alt = "图片";
+      img.src = url;
+      nodes.push(img);
+    } else if (ATTACHMENT_AUDIO_EXTENSIONS.has(ext)) {
+      const audio = document.createElement("audio");
+      audio.controls = true;
+      audio.preload = "none";
+      audio.src = url;
+      nodes.push(audio);
+    } else {
+      const link = document.createElement("a");
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.href = url;
+      link.textContent = name;
+      nodes.push(link);
+    }
+  }
+  if (!nodes.length) return null;
+  const wrap = document.createElement("div");
+  wrap.className = "attachment-previews";
+  wrap.append(...nodes);
+  return wrap;
+}
+
 function renderBatchPreview(data) {
   $("batch-result").hidden = false;
   const budget = $("batch-budget");
@@ -1378,6 +1469,8 @@ function renderBatchPreview(data) {
       mark.textContent = "当前";
       row.append(mark);
     }
+    const previews = attachmentPreviews(msg.content);
+    if (previews) row.append(previews);
     list.append(row);
   });
 
@@ -2619,6 +2712,8 @@ async function searchMessages(append) {
         `${chatLabel(m.chat_type, m.chat_id)} · ${m.at || "—"} · ${m.is_bot ? "大肥鱼" : m.nickname}`,
         m.snippet || m.content
       );
+      const previews = attachmentPreviews(m.content);
+      if (previews) item.appendChild(previews);
       const actions = document.createElement("div");
       actions.className = "mem-actions";
       const locate = document.createElement("button");
@@ -2822,6 +2917,46 @@ async function saveBehavior() {
     toast("聊天行为已更新");
   } catch (err) {
     $("behavior-hint").textContent = `保存失败：${err.message}`;
+    toast(`保存失败：${err.message}`, true);
+  }
+}
+
+async function loadMind() {
+  try {
+    const m = await api("/api/mind");
+    $("mind-observer-enabled").checked = Boolean(m.observer_enabled);
+    $("mind-daily-calls").value = String(m.observer_daily_calls);
+    renderMind(m);
+    $("mind-hint").textContent = "保存后重启生效";
+  } catch (err) {
+    $("mind-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+function renderMind(m) {
+  const gate = m.enabled ? "已开启" : "未开启";
+  const brain = m.brain_supports_observer ? "可用" : "不可用";
+  const cost = m.group_count > 0
+    ? `预估每日模型调用 ${m.estimated_daily_calls} 次（上限 ${m.observer_daily_calls} × ${m.group_count} 个群）`
+    : "群白名单为空，暂不估算";
+  $("mind-prerequisites").textContent =
+    `前置条件：mind.enabled ${gate} · brain.complete_detailed ${brain} · 当前${m.effective ? "已生效" : "未生效"}`;
+  $("mind-cost").textContent =
+    `群白名单 ${m.group_count} 个 · 观察者 ${m.observer_provider} · 每 ${m.observer_interval_seconds}s / 至少 ${m.observer_min_messages} 条新消息 · ${cost}`;
+}
+
+async function saveMind() {
+  const payload = {
+    observer_enabled: $("mind-observer-enabled").checked,
+    observer_daily_calls: Number($("mind-daily-calls").value),
+  };
+  try {
+    const m = await api("/api/mind", { method: "PUT", body: JSON.stringify(payload) });
+    renderMind(m);
+    $("mind-hint").textContent = m.restart_required ? "已保存 · 重启后生效" : "已保存";
+    toast("心智配置已保存，重启后生效");
+  } catch (err) {
+    $("mind-hint").textContent = `保存失败：${err.message}`;
     toast(`保存失败：${err.message}`, true);
   }
 }
@@ -3128,6 +3263,8 @@ function renderTimelineMessages(messages) {
     text.className = "timeline-msg-text";
     text.textContent = m.content || "";
     item.append(head, text);
+    const previews = attachmentPreviews(m.content);
+    if (previews) item.append(previews);
     const flags = [];
     if (m.at_bot) flags.push("点名");
     if (m.reply_to_bot) flags.push("回复大肥鱼");
@@ -3509,6 +3646,8 @@ $("btn-refresh-behavior").addEventListener("click", loadBehavior);
 $("btn-save-behavior").addEventListener("click", saveBehavior);
 $("btn-refresh-groups").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadGroups));
 $("btn-save-groups").addEventListener("click", (ev) => withBusy(ev.currentTarget, saveGroups));
+$("btn-refresh-mind").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadMind));
+$("btn-save-mind").addEventListener("click", (ev) => withBusy(ev.currentTarget, saveMind));
 $("groups-known").addEventListener("click", (ev) => {
   const target = ev.target;
   const button = target instanceof Element ? target.closest("button[data-chat-id]") : null;
@@ -3586,6 +3725,7 @@ loadBudget();
 loadSessions();
 loadConfig();
 loadBehavior();
+loadMind();
 loadGroups();
 setInterval(refresh, 5000);
 setInterval(() => { if (!document.hidden) refreshHealth(); }, 10000);

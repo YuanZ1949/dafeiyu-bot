@@ -23,7 +23,7 @@ import os
 import time
 import uuid
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -54,6 +54,8 @@ class Entry:
     reply_author: str = ""
     reply_text: str = ""
     ts: int = 0
+    #: 媒体元数据（本地库发现的可信路径）；只透传，不解析、不读字节。
+    media: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -153,6 +155,7 @@ class SessionAligner:
                 "reply_author": entry.reply_author,
                 "reply_text": entry.reply_text,
                 "ts": entry.ts,
+                "media": dict(entry.media),
             }
             for entry in self._prev
         ]
@@ -200,6 +203,7 @@ class SessionAligner:
             "user_id": self._user_id(entry.nickname),
             "nickname": entry.nickname or "未知成员",
             "text": entry.text,
+            "kind": entry.kind,
             "at_bot": at_bot,
             "at_all": at_all,
             "reply_to_bot": reply_to_bot,
@@ -210,6 +214,7 @@ class SessionAligner:
             # 才不会有「重启后先自我回复一次」的窗口。
             "is_bot": self._is_bot(entry),
             "session_epoch": self._epoch,
+            "media": dict(entry.media),
         }
 
     def _is_bot(self, entry: Entry) -> bool:
@@ -295,6 +300,7 @@ def _entry_from(raw: Any) -> Entry:
             reply_author=str(raw.get("reply_author") or reply_author),
             reply_text=reply_text,
             ts=_int(raw.get("ts")),
+            media=(dict(raw["media"]) if isinstance(raw.get("media"), dict) else {}),
         )
     if isinstance(raw, (tuple, list)):
         items = list(raw) + ["", ""]

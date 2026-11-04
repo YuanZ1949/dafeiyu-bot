@@ -46,7 +46,7 @@ __all__ = [
 # 与 wechat.py 客户端逐字一致的三件套。
 BRIDGE_PATH = "/wechat-bridge"
 PROTOCOL_VERSION = 1
-_KNOWN_ACTIONS = ("send_text", "send_at", "probe", "stop", "resume")
+_KNOWN_ACTIONS = ("send_text", "send_at", "send_media", "probe", "stop", "resume")
 _MAX_FRAME = 1 << 20
 
 # 反挂死护栏：服务器内的每一个 await 都有显式超时（发送除外，见下）。
@@ -54,7 +54,7 @@ _AWAIT_TIMEOUT = 5.0
 # 发送指令单独放宽：Sender 默认 20s 节奏，5s 会在消息仍要发出时先回 timeout，
 # 客户端按 §7.6 换新 id 重试就会重复发送。客户端 _SEND_TIMEOUT 必须更大。
 _SEND_AWAIT_TIMEOUT = 120.0
-_SEND_ACTIONS = ("send_text", "send_at")
+_SEND_ACTIONS = ("send_text", "send_at", "send_media")
 _CLOSE_CODE_VERSION_MISMATCH = 1002
 _CLOSE_CODE_GOING_AWAY = 1001
 

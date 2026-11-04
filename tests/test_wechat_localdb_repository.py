@@ -691,3 +691,166 @@ def _store_with_single_message(
     ref = store.resolve(GROUP_NAME)
     assert ref is not None
     return store, ref
+
+
+# ---------------------------------------------------------- todo 11: 媒体发现
+MEDIA_DDL = """
+CREATE TABLE message_resource(
+    message_local_id INTEGER, local_path TEXT, file_name TEXT,
+    file_size INTEGER, duration INTEGER
+)
+"""
+
+
+def make_media_db(
+    path: Path,
+    *,
+    local_id: int,
+    local_path: str,
+    name: str = "",
+    size: int = 0,
+    duration: int = 0,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as con:
+        con.execute(MEDIA_DDL)
+        con.execute(
+            "INSERT INTO message_resource VALUES (?, ?, ?, ?, ?)",
+            (local_id, local_path, name, size, duration),
+        )
+
+
+def build_image_store(
+    tmp_path: Path,
+    *,
+    local_path: str,
+    size_limit: int = 1024 * 1024,
+    make_resource_db: bool = True,
+):
+    root = tmp_path / "mirror"
+    make_contact_db(
+        root / "contact/contact.db",
+        contacts=[(GROUP, "", GROUP_NAME)],
+    )
+    make_message_db(
+        root / "message/message_0.db",
+        name2id={1: GROUP, 2: SELF},
+        tables={GROUP: [(3, 2, 1000, "", 0)]},
+    )
+    if make_resource_db:
+        make_media_db(
+            root / "message/message_resource.db",
+            local_id=1,
+            local_path=local_path,
+            name="a.png",
+            size=123,
+            duration=0,
+        )
+    store = LocalMessageStore(
+        PathOnlyMirrors(root),
+        self_username=SELF,
+        self_display_name=SELF_NAME,
+        message_rels=["message/message_0.db"],
+        media_enabled=True,
+        media_max_bytes=size_limit,
+        media_storage_root=str(root),
+    )
+    return store, root
+
+
+def test_media_disabled_row_has_no_media_key(tmp_path: Path) -> None:
+    root = tmp_path / "mirror"
+    make_contact_db(
+        root / "contact/contact.db", contacts=[(GROUP, "", GROUP_NAME)]
+    )
+    make_message_db(
+        root / "message/message_0.db",
+        name2id={1: GROUP, 2: SELF},
+        tables={GROUP: [(3, 2, 1000, "", 0)]},
+    )
+    (root / "media").mkdir(parents=True)
+    (root / "media/a.png").write_bytes(b"\x89PNG\r\n\x1a\nxx")
+    make_media_db(
+        root / "message/message_resource.db",
+        local_id=1,
+        local_path="media/a.png",
+        name="a.png",
+        size=16,
+    )
+
+    store = make_store(root)
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+    rows = store.recent(ref, 1)
+
+    assert rows[0]["text"] == "[图片]"
+    assert "media" not in rows[0]
+
+
+def test_media_enabled_adds_documented_dict(tmp_path: Path) -> None:
+    root = tmp_path / "mirror"
+    (root / "media").mkdir(parents=True)
+    png = root / "media/a.png"
+    payload = b"\x89PNG\r\n\x1a\n" + b"x" * 16
+    png.write_bytes(payload)
+
+    store, _ = build_image_store(tmp_path, local_path="media/a.png")
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+    row = store.recent(ref, 1)[0]
+
+    assert row["text"] == "[图片]"
+    assert row["media"] == {
+        "kind": "image",
+        "path": str(png.resolve()),
+        "name": "a.png",
+        "size": len(payload),
+        "duration": 0,
+    }
+
+
+def test_media_missing_file_keeps_placeholder(tmp_path: Path) -> None:
+    store, _ = build_image_store(tmp_path, local_path="media/missing.png")
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+    row = store.recent(ref, 1)[0]
+
+    assert row["text"] == "[图片]"
+    assert "media" not in row
+
+
+def test_media_path_outside_root_is_rejected(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"\x89PNG\r\n\x1a\nxx")
+
+    store, _ = build_image_store(tmp_path, local_path=str(outside))
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+    row = store.recent(ref, 1)[0]
+
+    assert "media" not in row
+
+
+def test_media_over_max_bytes_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "mirror"
+    (root / "media").mkdir(parents=True)
+    (root / "media/a.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 64)
+
+    store, _ = build_image_store(tmp_path, local_path="media/a.png", size_limit=10)
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+    row = store.recent(ref, 1)[0]
+
+    assert "media" not in row
+
+
+def test_media_absent_index_db_is_fail_open(tmp_path: Path) -> None:
+    store, _ = build_image_store(
+        tmp_path, local_path="media/a.png", make_resource_db=False
+    )
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+    row = store.recent(ref, 1)[0]
+
+    assert row["text"] == "[图片]"
+    assert "media" not in row

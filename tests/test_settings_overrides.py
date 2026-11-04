@@ -255,3 +255,34 @@ def test_overlay_groups_ignores_other_keys(tmp_path, monkeypatch):
     assert s.groups.whitelist == frozenset({"qq:123456"})
     assert s.groups.blacklist == frozenset({"qq:88"})
     assert s.groups.admins == frozenset()
+
+
+def test_overlay_mind_observer_settings_are_applied(tmp_path, monkeypatch):
+    """面板只写两个 mind 键；其余键即使出现在覆盖层也不参与合并。"""
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides(
+        {
+            "mind": {
+                "observer_enabled": True,
+                "observer_daily_calls": 12,
+                "observer_provider": "main",
+                "unknown": {"x": 1},
+            }
+        },
+        path,
+    )
+
+    s = config.load_settings(config_file=CONFIG_FIXTURE, env_file=ENV_FIXTURE)
+
+    assert s.mind.observer_enabled is True
+    assert s.mind.observer_daily_calls == 12
+    assert s.mind.observer_provider == "local"
+    assert not hasattr(s.mind, "unknown")
+
+
+def test_overlay_mind_must_be_mapping(tmp_path, monkeypatch):
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides({"mind": ["not", "a", "map"]}, path)
+
+    with pytest.raises(config.ConfigError, match="mind"):
+        config.load_settings(config_file=CONFIG_FIXTURE, env_file=ENV_FIXTURE)

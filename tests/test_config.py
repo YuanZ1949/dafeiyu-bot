@@ -345,3 +345,42 @@ def test_opencode_startup_timeout_must_be_positive(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="startup_timeout_seconds"):
         load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+
+# ---------------------------------------------------------- todo 11: wechat media
+def test_wechat_media_defaults_off(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    settings = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+
+    assert settings.wechat.media.enabled is False
+    assert settings.wechat.media.max_bytes == 10 * 1024 * 1024
+    assert settings.wechat.media.storage_root == ""
+
+
+def test_wechat_media_section_parsed(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + (
+        "gateway:\n  wechat:\n    media:\n      enabled: true\n"
+        "      max_bytes: 2048\n      storage_root: D:/wx\n"
+    )
+    settings = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+    assert settings.wechat.media.enabled is True
+    assert settings.wechat.media.max_bytes == 2048
+    assert settings.wechat.media.storage_root == "D:/wx"
+
+
+def test_wechat_media_non_mapping_rejected(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + "gateway:\n  wechat:\n    media: []\n"
+
+    with pytest.raises(ConfigError, match="gateway.wechat.media"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+
+def test_wechat_media_max_bytes_must_be_positive(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + "gateway:\n  wechat:\n    media:\n      max_bytes: 0\n"
+
+    with pytest.raises(ConfigError, match="gateway.wechat.media.max_bytes"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))

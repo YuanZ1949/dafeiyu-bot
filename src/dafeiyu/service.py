@@ -6,9 +6,10 @@ import inspect
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 from .behavior import BehaviorSettings
 from .brain.client import BrainError, BrainReply
@@ -29,14 +30,16 @@ from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
 from .images import materialize
 from .keepalive import Keepalive
+from .media import materialize_attachments
 from .memory import shared_facts
 from .memory.context import build_injection
 from .memory.rotation import apply_rotation, needs_rotation
 from .memory.store import Store
 from .memory.timeline import TIMELINE_LIMIT, build_batch_prompt, time_label
 from .memory.workspace import Workspace
-from .models import QQ_PREFIX, ChatType, Message, RecallEvent, channel_of
+from .models import QQ_PREFIX, Attachment, ChatType, Message, RecallEvent, channel_of
 from .moment import analyze, answers_bot_question, reopened_by_question
+from .reply_media import build_onebot_segments, resolve_at_names, resolve_attachments
 from .router import Router, now_shanghai
 from .sender import is_technical_question, segment_reply, shape_reply
 from .workers.failure import (
@@ -54,6 +57,16 @@ log = logging.getLogger(__name__)
 
 # images.materialize 写进 content 的路径注记；这里反过来抽取路径做「图片」提示。
 _IMAGE_PATH_RE = re.compile(r"图存\s+([^\s，)）]+)")
+
+# bot 出站附件的纯文本注记：content 是唯一持久载体，面板靠它做预览。
+# 路径写成 workspace 相对 posix 形式（replies/a.png），与 /api/workspace/file 对齐。
+_ATTACHMENT_NOTE_BY_KIND = {
+    "image": "\n[图片] {path}",
+    "voice": "\n[语音] {path}",
+    "record": "\n[语音] {path}",
+    "video": "\n[视频] {path}",
+    "file": "\n[文件] {name} ({path})",
+}
 
 SHUTUP_MINUTES = 60
 ADMIN_ONLY_REPLY = "这个命令只有管理员能用。"
@@ -621,10 +634,22 @@ class Service:
             self.store.note_bot_mood("被夸了一句，有点飘")
 
     async def handle(self, msg: Message) -> None:
+        annotate = self._tools_enabled()
         # 图片物化必须在入库前：content 字符串是图片路径到达大脑的唯一载体。
         # materialize 内部永不抛异常，失败保持 [图片] 占位。
         # 没有 read 工具的大脑看不到图，路径字符串只是噪音：直接跳过物化。
-        await materialize(msg, self.settings, annotate=self._tools_enabled())
+        await materialize(msg, self.settings, annotate=annotate)
+        if annotate:
+            # 微信本地库附件同理：只有能被 read 看到时才值得落盘。
+            decode = None
+            if self.settings.wechat.media.enabled:
+                try:
+                    from .gateway.wechat_bridge.media.dat import decode_dat
+
+                    decode = decode_dat
+                except Exception:
+                    log.debug("微信 .dat 解码模块不可用，按原字节复制", exc_info=True)
+            await materialize_attachments(msg, self.settings, decode=decode)
         # 机器人自己的消息也要先落库（作为 assistant 轮次），但不触发任何回复。
         if not self.store.add_message(msg):
             return
@@ -1579,30 +1604,132 @@ class Service:
         chunk: str,
         *,
         quote_id: str | None = None,
+        attachments: tuple[Attachment, ...] = (),
+        at_qq_ids: tuple[str, ...] = (),
+        at_names: tuple[str, ...] = (),
     ) -> str | None:
-        """发一片回复；有被点名/被回复的消息时带上引用，失败退回纯文本。
+        """发一片回复；有附件/@/引用时升级为消息段，失败退回纯文本。
 
-        引用只影响「这一条挂在谁说之下」，不能让回复本身发不出去：适配器没有
-        消息段能力（微信桥）或 NapCat 拒收（老版本/消息已撤回）时一律降级。
+        引用、@、附件都只影响「这一条怎么发」，不能让回复本身发不出去：
+        适配器没有对应能力（微信桥没有消息段）、NapCat 拒收（老版本/消息已
+        撤回）或本地文件上传失败时一律降级为纯文本，且不重试。
         """
         adapter = self._adapter_for(chat_id)
-        if quote_id:
-            sender = getattr(adapter, "send_segments", None)
+
+        # 文件类附件走独立上传接口；上传失败只记日志，文本照发。
+        uploader = cast(
+            Callable[..., Awaitable[None]] | None,
+            getattr(adapter, "upload_file", None),
+        )
+        if callable(uploader):
+            for item in attachments:
+                if item.kind != "file" or not item.path:
+                    continue
+                try:
+                    await uploader(chat_type, chat_id, item.path, name=item.name)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 附件是加分项
+                    log.warning("附件上传失败（继续发文本）%s: %s", chat_id, exc)
+
+        media = tuple(item for item in attachments if item.kind != "file")
+        if quote_id or at_qq_ids or media:
+            sender = cast(
+                Callable[..., Awaitable[str | None]] | None,
+                getattr(adapter, "send_segments", None),
+            )
             if callable(sender):
                 try:
                     return await sender(
                         chat_type,
                         chat_id,
-                        [
-                            {"type": "reply", "data": {"id": quote_id}},
-                            {"type": "text", "data": {"text": chunk}},
-                        ],
+                        build_onebot_segments(
+                            chunk,
+                            quote_id=quote_id,
+                            at_qq_ids=at_qq_ids,
+                            attachments=media,
+                        ),
                     )
                 except asyncio.CancelledError:
                     raise
-                except Exception as exc:  # noqa: BLE001 - 引用是加分项，不是前提
-                    log.info("引用回复失败，退回纯文本 %s: %s", chat_id, exc)
+                except Exception as exc:  # noqa: BLE001 - 消息段是加分项
+                    log.info("消息段发送失败，退回纯文本 %s: %s", chat_id, exc)
+
+        if at_names:
+            at_sender = cast(
+                Callable[..., Awaitable[str | None]] | None,
+                getattr(adapter, "send_at", None),
+            )
+            if callable(at_sender):
+                try:
+                    return await at_sender(chat_type, chat_id, chunk, list(at_names))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - @ 是加分项
+                    log.info("带 @ 发送失败，退回纯文本 %s: %s", chat_id, exc)
+
         return await adapter.send(chat_type, chat_id, chunk)
+
+    def _safe_reply_attachments(
+        self, reply: BrainReply, chat_id: str
+    ) -> tuple[Attachment, ...]:
+        """解析模型附件；解析器自身出错也只丢附件，不影响文本。"""
+        try:
+            return tuple(resolve_attachments(reply, self.settings))
+        except Exception as exc:  # noqa: BLE001 - 文本优先
+            log.warning("附件解析失败，本条只发文本 %s: %s", chat_id, exc)
+            return ()
+
+    @staticmethod
+    def _at_qq_ids(
+        names: tuple[str, ...], participants: list[Message]
+    ) -> tuple[str, ...]:
+        """名字 → 本批次第一个同昵称成员的 user_id；去重、封顶 3、跳过 bot。"""
+        ids: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            for message in participants:
+                if message.is_bot:
+                    continue
+                if (message.nickname or "").strip() != name:
+                    continue
+                user_id = str(message.user_id or "").strip()
+                # OneBot 的 at 段要裸号；仓库内部 id 带 "qq:" 前缀。
+                user_id = user_id.removeprefix(QQ_PREFIX)
+                if user_id and user_id not in seen:
+                    seen.add(user_id)
+                    ids.append(user_id)
+                break
+            if len(ids) >= 3:
+                break
+        return tuple(ids)
+
+    def _attachment_note(self, item: Attachment) -> str:
+        """单个附件的 content 注记；路径转成 workspace 相对形式供面板预览。"""
+        path = str(item.path or "").strip()
+        template = _ATTACHMENT_NOTE_BY_KIND.get((item.kind or "").strip().lower())
+        if not path or template is None:
+            return ""
+        display = path
+        if self.settings.workspace.enabled and self.settings.workspace.dir:
+            try:
+                root = Path(self.settings.workspace.dir).resolve()
+                display = (
+                    Path(path).resolve(strict=False).relative_to(root).as_posix()
+                )
+            except (OSError, ValueError):
+                display = path
+        name = (item.name or Path(path).name).strip() or Path(path).name
+        return template.format(path=display, name=name)
+
+    def _annotate_attachments(
+        self, chunk: str, attachments: tuple[Attachment, ...]
+    ) -> str:
+        """把出站附件写成纯文本注记；附件永不进 pending_outbox。"""
+        if not attachments:
+            return chunk
+        notes = [note for item in attachments if (note := self._attachment_note(item))]
+        return chunk + "".join(notes)
 
     def _guard_chunks(
         self, chat_type: ChatType, chat_id: str, chunks: list[str]
@@ -1727,6 +1854,11 @@ class Service:
         chunks = self._guard_chunks(chat_type, chat_id, chunks)
         if not chunks:
             return []
+        # 附件与 @ 只在守卫确认有内容要发之后才解析/上传：文本被整体丢弃时
+        # 一个字节都不许发出去。
+        attachments = self._safe_reply_attachments(reply, chat_id)
+        at_names = tuple(resolve_at_names(reply.at, batch))
+        at_qq_ids = self._at_qq_ids(at_names, batch)
         sent: list[tuple[str, str | None]] = []
         defer = 0
         delay = float(getattr(self.settings.persona, "segment_delay_seconds", 0.0))
@@ -1746,6 +1878,9 @@ class Service:
                     chat_id,
                     chunk,
                     quote_id=quote_id if index == 0 else None,
+                    attachments=attachments if index == 0 else (),
+                    at_qq_ids=at_qq_ids if index == 0 else (),
+                    at_names=at_names if index == 0 else (),
                 )
             except asyncio.CancelledError:
                 raise
@@ -1765,7 +1900,7 @@ class Service:
         else:
             self.router.note_bot_spoke(chat_type, chat_id, ambient=not addressed)
         # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
-        self._store_bot_chunks(batch[-1], sent)
+        self._store_bot_chunks(batch[-1], sent, attachments=attachments)
         return sent
 
     async def _apply_restrictions(
@@ -2426,6 +2561,10 @@ class Service:
         if not chunks:
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
+        # 与批次路径同序：先确认有内容，再解析附件/@。
+        attachments = self._safe_reply_attachments(reply, msg.chat_id)
+        at_names = tuple(resolve_at_names(reply.at, [msg]))
+        at_qq_ids = self._at_qq_ids(at_names, [msg])
 
         sent: list[tuple[str, str | None]] = []
         defer = 0
@@ -2444,6 +2583,9 @@ class Service:
                     msg.chat_id,
                     chunk,
                     quote_id=quote_id if index == 0 else None,
+                    attachments=attachments if index == 0 else (),
+                    at_qq_ids=at_qq_ids if index == 0 else (),
+                    at_names=at_names if index == 0 else (),
                 )
             except asyncio.CancelledError:
                 raise
@@ -2466,19 +2608,30 @@ class Service:
                 and not self._is_addressed(msg),
             )
         # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
-        self._store_bot_chunks(msg, sent)
+        self._store_bot_chunks(msg, sent, attachments=attachments)
 
-    def _store_bot_chunks(self, msg: Message, chunks: list[tuple[str, str | None]]) -> None:
-        """入库 bot 回复：优先用网关返回的真实 message_id，没有才回退合成值。"""
+    def _store_bot_chunks(
+        self,
+        msg: Message,
+        chunks: list[tuple[str, str | None]],
+        *,
+        attachments: tuple[Attachment, ...] = (),
+    ) -> None:
+        """入库 bot 回复：优先用网关返回的真实 message_id，没有才回退合成值。
+
+        附件只以纯文本注记的形式挂在第一片 content 末尾（面板据此预览），
+        不新增字段、不写 pending_outbox。
+        """
         now_ts = int(now_shanghai().timestamp())
         for index, (chunk, message_id) in enumerate(chunks):
+            content = self._annotate_attachments(chunk, attachments) if index == 0 else chunk
             self.store.add_message(
                 Message(
                     chat_type=msg.chat_type,
                     chat_id=msg.chat_id,
                     user_id=self._adapter_for(msg.chat_id).bot_id,
                     nickname=self.settings.persona.name,
-                    content=chunk,
+                    content=content,
                     message_id=message_id or f"{msg.message_id}:bot:{index}",
                     is_bot=True,
                     timestamp=now_ts,

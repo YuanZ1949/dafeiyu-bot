@@ -36,7 +36,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
 from ..config import ConfigError, WeChatConfig
-from ..models import ChatType, Message, RecallEvent
+from ..models import Attachment, ChatType, Message, RecallEvent
 from .base import GatewayError
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,24 @@ _STOP_TIMEOUT = 1.0
 _MAX_FRAME = 1 << 20
 _RECONNECT_DELAYS = (1, 2, 4, 8, 16, 30)
 _CHAT_TYPES = {"group": ChatType.GROUP, "private": ChatType.PRIVATE}
+#: 信封 kind 白名单：只认这些；缺省/未知一律按 text 处理。
+_MESSAGE_KINDS = frozenset(
+    {
+        "text",
+        "image",
+        "voice",
+        "video",
+        "file",
+        "sticker",
+        "card",
+        "location",
+        "call",
+        "link",
+        "quote",
+        "record",
+        "forward",
+    }
+)
 _DESKTOPS = ("interactive", "locked", "no_wechat")
 _SENT_ECHO_MAX = 200
 
@@ -305,6 +323,30 @@ class WeChatAdapter:
             return
         logger.warning("未知微信桥信封 type=%r", kind)
 
+    def _attachments(
+        self, envelope: dict[str, Any], kind: str, content: str
+    ) -> list[Attachment]:
+        """本地库发现的媒体优先；没有 media 时保持旧的占位附件形状。"""
+        media = envelope.get("media")
+        if isinstance(media, dict):
+            path = str(media.get("path") or "").strip()
+            if path:
+                name = str(media.get("name") or "").strip()
+                if not name:
+                    name = content[:60] or path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                return [
+                    Attachment(
+                        kind=kind,
+                        path=path,
+                        name=name,
+                        size=_int(media.get("size")),
+                        duration=_int(media.get("duration")),
+                    )
+                ]
+        if kind != "text" and content:
+            return [Attachment(kind=kind, name=content[:60])]
+        return []
+
     def _parse_message(self, envelope: dict[str, Any]) -> Message | None:
         # 第一层回声过滤：桥自己标记的 bot 消息直接丢弃。
         if bool(envelope.get("is_bot", False)):
@@ -321,12 +363,16 @@ class WeChatAdapter:
         if chat_type is None:
             logger.warning("微信消息 chat_type 未知：%r", envelope.get("chat_type"))
             return None
+        raw_kind = str(envelope.get("kind") or "text").strip().lower()
+        kind = raw_kind if raw_kind in _MESSAGE_KINDS else "text"
+        content = str(envelope.get("text") or "")
+        attachments = self._attachments(envelope, kind, content)
         return Message(
             chat_type=chat_type,
             chat_id=chat_id,
             user_id=str(envelope.get("user_id") or ""),
             nickname=str(envelope.get("nickname") or ""),
-            content=str(envelope.get("text") or ""),
+            content=content,
             message_id=message_id,
             at_bot=bool(envelope.get("at_bot", False)),
             reply_to_bot=bool(envelope.get("reply_to_bot", False)),
@@ -336,6 +382,8 @@ class WeChatAdapter:
                 else None
             ),
             timestamp=_int(envelope.get("ts")),
+            kind=kind,
+            attachments=attachments,
         )
 
     def _parse_recall(self, envelope: dict[str, Any]) -> RecallEvent | None:
@@ -406,6 +454,44 @@ class WeChatAdapter:
         return bool(getattr(self._config, "outbound_requires_desktop", True))
 
     async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str | None:
+        _ok, value = await self._send_action(
+            "send_text", {"chat_id": chat_id, "text": text}, echo_text=text
+        )
+        return value
+
+    async def send_at(
+        self, chat_type: ChatType, chat_id: str, text: str, at: list[str]
+    ) -> str | None:
+        """带 @ 的文本；`at` 为空时完全等价普通 send（不发空数组帧）。"""
+        if not at:
+            return await self.send(chat_type, chat_id, text)
+        _ok, value = await self._send_action(
+            "send_at",
+            {"chat_id": chat_id, "text": text, "at": list(at)},
+            echo_text=text,
+        )
+        return value
+
+    async def send_media(
+        self, chat_type: ChatType, chat_id: str, kind: str, path: str, name: str = ""
+    ) -> bool:
+        """发媒体；桥明确回 `unsupported_media` 时返回 False，不抛错也不重试。"""
+        ok, _value = await self._send_action(
+            "send_media",
+            {"chat_id": chat_id, "kind": kind, "path": path, "name": name},
+            unsupported_media=True,
+        )
+        return ok
+
+    async def _send_action(
+        self,
+        action: str,
+        params: dict[str, Any],
+        *,
+        echo_text: str | None = None,
+        unsupported_media: bool = False,
+    ) -> tuple[bool, str | None]:
+        """所有出站动作的唯一实现：连接/桌面闸门/回执/回声表只此一份。"""
         if not self.connected:
             raise GatewayError("微信桥未连接")
         if self._desktop != "interactive" and self._desktop_required():
@@ -422,8 +508,8 @@ class WeChatAdapter:
         envelope = {
             "v": _PROTOCOL_VERSION,
             "id": command_id,
-            "action": "send_text",
-            "params": {"chat_id": chat_id, "text": text},
+            "action": action,
+            "params": params,
         }
         try:
             await ws.send(json.dumps(envelope, ensure_ascii=False))
@@ -439,20 +525,35 @@ class WeChatAdapter:
         delivered = str(receipt.get("delivered") or "failed")
         error_code = str(receipt.get("error_code") or "")
         if not ok or delivered == "failed":
+            if unsupported_media and error_code == "unsupported_media":
+                # 明确不支持：不重试、不回落、不记回声，调用方继续发文本。
+                logger.info(
+                    "微信桥不支持媒体发送 %s kind=%s",
+                    params.get("chat_id"),
+                    params.get("kind"),
+                )
+                return False, None
             raise GatewayError(f"微信发送失败：{error_code or delivered}")
 
         message_id = receipt.get("message_id")
         value = str(message_id) if message_id is not None else None
-        # 成功（typed/observed）才记回声表与发送时间。
         self.last_send_at = time.time()
-        self._sent_echo.append((chat_id, text, time.monotonic()))
-        if delivered == "observed":
-            logger.info("微信消息已送达 %s msg_id=%s", chat_id, value)
-        else:
-            logger.warning(
-                "微信回执仅 typed（未确认气泡）%s msg_id=%s", chat_id, value
+        if echo_text is not None:
+            # 成功（typed/observed）才记回声表；媒体没有可匹配文本，不记。
+            self._sent_echo.append(
+                (str(params["chat_id"]), echo_text, time.monotonic())
             )
-        return value
+            if delivered == "observed":
+                logger.info("微信消息已送达 %s msg_id=%s", params["chat_id"], value)
+            else:
+                logger.warning(
+                    "微信回执仅 typed（未确认气泡）%s msg_id=%s",
+                    params["chat_id"],
+                    value,
+                )
+        else:
+            logger.info("微信媒体已发送 %s kind=%s", params.get("chat_id"), params.get("kind"))
+        return True, value
 
     async def _send_stop(self) -> None:
         ws = self._ws
