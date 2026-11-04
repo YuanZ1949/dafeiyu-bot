@@ -105,6 +105,7 @@ class MomentSignals:
     followed_up: bool
     addressed: bool
     score: float
+    pending_loop: str = ""
 
     def hint(self) -> str:
         """注入给模型的一段「时机」说明；没有信号时返回空串。"""
@@ -117,6 +118,8 @@ class MomentSignals:
             return "【时机】有人提问，但群里正聊得热；先判断有没有把握答准，没把握就别插。"
         if self.question:
             return "【时机】群里有人提问；如果你有明确答案可以接，答不上来就别说。"
+        if self.pending_loop:
+            return f"【时机】这个群还有件事没下文：{self.pending_loop}。接得上就自然问一句，接不上别硬提。"
         if self.short_only:
             return "【时机】这批没什么可接的内容，倾向不说。"
         if self.hot:
@@ -137,6 +140,7 @@ def analyze(
     now_ts: int,
     addressed: bool = False,
     followed_up: bool = False,
+    pending_loop: str = "",
 ) -> MomentSignals:
     """从一批消息里提取时机信号；纯函数，方便单测和回放。"""
     humans = [m for m in messages if not m.is_bot and m.content.strip()]
@@ -176,6 +180,7 @@ def analyze(
         followed_up=followed_up,
         addressed=addressed,
         score=round(score, 3),
+        pending_loop=pending_loop,
     )
 
 

@@ -3,12 +3,21 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime
+from typing import Any
 
 from dafeiyu.delivery.window import ChatWindow, due_at, on_flushed
 from dafeiyu.delivery.window import note as note_window
 from dafeiyu.models import ChatType, Message
+from dafeiyu.timeutil import SHANGHAI
 
-ChatKey = tuple[ChatType, int]
+ChatKey = tuple[ChatType, str]
+
+
+def _iso(epoch: float | None) -> str | None:
+    if epoch is None:
+        return None
+    return datetime.fromtimestamp(epoch, SHANGHAI).isoformat(timespec="seconds")
 
 
 class BatchScheduler:
@@ -22,7 +31,7 @@ class BatchScheduler:
         self,
         store,
         cfg,
-        on_flush: Callable[[ChatType, int], Awaitable[None]],
+        on_flush: Callable[[ChatType, str], Awaitable[None]],
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.store = store
@@ -95,6 +104,31 @@ class BatchScheduler:
     def pending_count(self) -> int:
         """排队中的会话数（健康快照用；语义与 pending_chats 一致）。"""
         return len(self.pending_chats())
+
+    def window_snapshot(
+        self, chat_type: ChatType, chat_id: str
+    ) -> dict[str, Any]:
+        """只读返回当前窗口（调试器用）；不创建窗口、不改任何内部状态。
+
+        时间统一给「上海本地 ISO 字符串 + epoch 秒」两份：面板直接显示前者，
+        脚本要算差值用后者。
+        """
+        key = (chat_type, chat_id)
+        window = self._windows.get(key)
+        if window is None or window.first_queued_at is None:
+            return {"queued": False}
+        at = due_at(window, **self._params())
+        return {
+            "queued": True,
+            "inflight": key in self._inflight,
+            "first_queued_at": _iso(window.first_queued_at),
+            "addressed_first_at": _iso(window.addressed_first_at),
+            "addressed_last_at": _iso(window.addressed_last_at),
+            "last_ambient_at": _iso(window.last_ambient_at),
+            "due_at": _iso(at),
+            "first_queued_ts": window.first_queued_at,
+            "due_ts": at,
+        }
 
     def inflight_count(self) -> int:
         """正在投递的会话数。"""

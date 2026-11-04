@@ -258,3 +258,74 @@ async def test_reply_to_bot_message_sets_flag() -> None:
             assert message.content == "在吗"
     finally:
         await adapter.stop()
+
+
+async def test_send_segments_posts_message_array() -> None:
+    """引用回复把 message 换成段数组；纯文本 send 的 params 结构不变。"""
+    adapter = make_adapter()
+    await adapter.start()
+    try:
+        uri = f"ws://127.0.0.1:{adapter.port}"
+        async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
+            segments = [
+                {"type": "reply", "data": {"id": "42"}},
+                {"type": "text", "data": {"text": "在的"}},
+            ]
+            task = asyncio.create_task(
+                adapter.send_segments(ChatType.GROUP, "qq:1", segments)
+            )
+            raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
+            assert raw["action"] == "send_group_msg"
+            assert raw["params"] == {"group_id": 1, "message": segments}
+            await ws.send(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "retcode": 0,
+                        "data": {"message_id": 77},
+                        "echo": raw["echo"],
+                    }
+                )
+            )
+            assert await asyncio.wait_for(task, 2) == "77"
+            assert "77" in adapter.bot_message_ids
+    finally:
+        await adapter.stop()
+
+
+async def test_call_action_returns_data() -> None:
+    """通用动作调用走同一条 echo 回执通路，只读查询也能用。"""
+    adapter = make_adapter()
+    await adapter.start()
+    try:
+        uri = f"ws://127.0.0.1:{adapter.port}"
+        async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
+            task = asyncio.create_task(
+                adapter.call_action("get_group_info", {"group_id": 1})
+            )
+            raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
+            assert raw["action"] == "get_group_info"
+            assert raw["params"] == {"group_id": 1}
+            await ws.send(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "retcode": 0,
+                        "data": {"group_name": "我们一起测试吖"},
+                        "echo": raw["echo"],
+                    }
+                )
+            )
+            data = await asyncio.wait_for(task, 2)
+            assert data["group_name"] == "我们一起测试吖"
+            # 查询不算发送：健康快照里的 last_send_at 不该被它推进。
+            assert adapter.last_send_at is None
+    finally:
+        await adapter.stop()
+
+
+async def test_call_action_without_connection_raises() -> None:
+    adapter = make_adapter()
+    with pytest.raises(GatewayError):
+        await adapter.call_action("get_group_info", {"group_id": 1})
+

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 from dafeiyu.models import ChatType
@@ -112,6 +113,42 @@ class Workspace:
             self.read_segment(self._chat_file(chat_type, chat_id), chat_chars),
         ]
         return "\n\n".join(p for p in parts if p)
+
+    # ---- 写入 ---------------------------------------------------------
+
+    def append_note(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        lines: Sequence[str],
+        *,
+        max_bytes: int = 65536,
+    ) -> None:
+        """把若干行追加到 chats/<chat_type>_<safe_id>.md；目录不存在就建，写完 enforce_limit。"""
+        self._append_lines(self.chat_path(chat_type, chat_id), lines, max_bytes)
+
+    def append_global(
+        self, lines: Sequence[str], *, max_bytes: int = 65536
+    ) -> None:
+        """把若干行追加到 MEMORY.md，写完 enforce_limit。"""
+        self._append_lines(self.global_path(), lines, max_bytes)
+
+    def _append_lines(
+        self, path: Path, lines: Sequence[str], max_bytes: int
+    ) -> None:
+        """过滤空行后逐行追加；空列表直接返回，不建目录也不建文件。"""
+        prepared = [
+            f"{line.rstrip(chr(10)).rstrip(chr(13))}\n"
+            for line in lines
+            if line and line.strip()
+        ]
+        if not prepared:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # newline="" 让 \n 原样落盘：Windows 默认会翻成 \r\n，撑大字节预算。
+        with path.open("a", encoding="utf-8", newline="") as handle:
+            handle.writelines(prepared)
+        self.enforce_limit(path, max_bytes)
 
     # ---- 容量 ---------------------------------------------------------
 

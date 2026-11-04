@@ -354,11 +354,14 @@ async def test_opencode_brain_receives_speaker_and_chat(tmp_path):
     service, _, _, adapter, _ = build(tmp_path, brain=brain)
     await service.handle(make_msg())
     # 单条消息也走批次构建器：带时间线表头，行内仍标出说话人与 @。
-    assert brain.calls == [
-        (ChatType.GROUP, "qq:1001", "—— 以下是自你上次开口以来的新消息 ——\n阿鱼：@溟月 在吗（@了你）")
-    ]
+    # 「此刻」在时间线之前，内容是时钟相关的，只断言位置不断言具体时间。
+    prompt = brain.calls[0][2]
+    assert prompt.startswith("【此刻】")
+    assert prompt.endswith(
+        "—— 以下是自你上次开口以来的新消息 ——\n阿鱼：@溟月 在吗（@了你）"
+    )
     assert adapter.sent == [(ChatType.GROUP, "qq:1001", "在呢")]
-    assert "[人设覆盖]" not in brain.calls[0][2]
+    assert "[人设覆盖]" not in prompt
 
 
 async def test_opencode_prompt_gets_os_override_when_configured(tmp_path):

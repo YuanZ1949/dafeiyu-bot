@@ -8,6 +8,7 @@ import pytest
 from dafeiyu.brain.client import (
     FALLBACK_REPLY,
     BrainError,
+    BrainReply,
     parse_brain_reply,
     salvage_reply,
 )
@@ -472,6 +473,42 @@ def test_parse_clean_json_does_not_warn(caplog: pytest.LogCaptureFixture) -> Non
 
     assert reply.reply == "好"
     assert not caplog.records
+
+
+def test_parse_reads_read_and_think_fields() -> None:
+    content = (
+        '{"read": "大家在聊新模型，有点犹豫", "think": "补一句使用感受", '
+        '"speak": true, "reply": "本鱼试过，写短活还行", "reason": "有人问到"}'
+    )
+    reply = parse_brain_reply(content)
+
+    assert reply.read == "大家在聊新模型，有点犹豫"
+    assert reply.think == "补一句使用感受"
+    assert reply.speak is True
+    assert reply.reply == "本鱼试过，写短活还行"
+
+
+def test_parse_legacy_format_leaves_read_think_empty() -> None:
+    reply = parse_brain_reply('{"speak": false, "reply": "", "reason": "没必要接"}')
+
+    assert reply.speak is False
+    assert reply.read == ""
+    assert reply.think == ""
+
+
+def test_parse_read_think_truncated_and_flattened() -> None:
+    long = "很长的读" * 30
+    reply = parse_brain_reply(f'{{"read": "{long}", "think": "第一行\\n第二行", "reply": "好"}}')
+
+    assert len(reply.read) == 40
+    assert "\n" not in reply.think
+    assert reply.think == "第一行 第二行"
+
+
+def test_brain_reply_positional_construction_still_works() -> None:
+    reply = BrainReply(True, "好", "理由", 1, 2, True)
+
+    assert reply.read == "" and reply.think == ""
 
 
 def test_check_response_keeps_http_status() -> None:

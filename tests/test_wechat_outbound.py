@@ -530,7 +530,7 @@ def test_sender_hook_backend_sends_while_desktop_locked(monkeypatch) -> None:
     driver = NoUiaDriver()
     transport, opener = _hook(FakeResponse('{"ok": true, "message_id": "h-2"}'))
     sender = Sender(
-        _wechat(outbound="hook", hook_url=HOOK_URL),
+        _wechat(outbound="hook", hook_url=HOOK_URL, quiet_hours=("00:00", "00:00")),
         driver=driver,
         transport=transport,
         sleep=lambda seconds: None,

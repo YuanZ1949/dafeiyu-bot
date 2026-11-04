@@ -220,6 +220,9 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `persona.max_reply_chars` | `120` | 闲聊回复上限（字） |
 | `persona.max_reply_chars_technical` | `300` | 技术问题回复上限（字） |
 | `persona.os_probability` | `0.05` | 出现「内心 OS」的概率，`0` 关闭；三种 provider 模式都生效（opencode 模式按轮注入覆盖指令） |
+| `persona.repeat_guard` | `true` | 重复守卫：同一句话在最近 50 条自己的发言里出现过，就先去重复开头，再换一句中性短句，仍重复则这一片不发；不重调模型 |
+| `persona.opportunity_guard` | `true` | 机会检测（规则版）：纯热聊/纯表情批次不送模型，消息攒在待投队列，等点名或问句时一起进 prompt；待投接近 20 条时照旧送审 |
+| `persona.quote_reply` | `true` | 引用回复：被点名/被引用时把首片回复挂在原消息下；`false` 时完全走纯文本发送 |
 | `persona.prompt_file` | `""` | 自定义人设文件路径；留空使用内置 `brain/persona.md`。改完重启生效 |
 | `triggers.cooldown_seconds` | `60` | 同一群两次**非提问**发言的最小间隔（明确提问、@/引用/叫名字不受限） |
 | `triggers.sample_rate` | `0.05` | 普通消息被纳入模型判断的采样率 |
@@ -250,8 +253,26 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `memory.recall_enabled` | `false` | 回复前按当前批次检索同会话旧消息，注入「相关旧记忆」；代码默认关，`config.yaml` 示例已显式开启 |
 | `memory.recall_topk` | `3` | 相关旧记忆最多注入几条 |
 | `memory.recall_chars` | `300` | 相关旧记忆段落的字符预算 |
+| `memory.scene_injection` | `true` | 注入「此刻」：现在几点、本群叫什么、距上次开口多久、刚才是谁在说；关掉后 prompt 里不再有这行 |
+| `memory.inject_episodes` | `false` | 注入「正在聊的事」（`episodes` 最新一条 open 的一句话摘要）；数据由 Observer 写，默认关 |
+| `memory.inject_open_loops` | `false` | 注入「没有下文的事」（谁问了没人接、谁答应了没做）；默认关 |
+| `memory.open_loop_topk` | `3` | 「没有下文的事」最多注入几条 |
+| `memory.open_loop_chars` | `200` | 「没有下文的事」段落的字符预算 |
+| `memory.episode_chars` | `220` | 「正在聊的事」段落的字符预算 |
+| `memory.mind_chars` | `600` | 「正在聊的事 + 没有下文的事 + 你和他 + 本鱼的近况 + 群友印象」合计预算；超了按印象→未了事→关系卡→近况丢弃，最后截断正在聊的事 |
+| `memory.state_chars` | `100` | 「本鱼的近况」段落的字符预算 |
+| `memory.relation_chars` | `160` | 「你和他」关系卡段落的字符预算 |
+| `mind.enabled` | `false` | 心智层总闸；关闭即回到旧行为（Observer/自省/关系卡/状态注入全部不启用） |
+| `mind.state_enabled` | `true` | 总闸打开时是否注入 `bot_state`（在意的事 + 心情） |
+| `mind.episodes_enabled` | `true` | 总闸打开时是否启用 episode/open_loop 的观察与写入 |
+| `mind.observer_enabled` | `false` | 是否启用 Observer 旁路（需要能调模型） |
+| `mind.observer_provider` | `local` | Observer/Reflector 用哪个端点：`local` 只用本地模型，`main` 跟随当前大脑 |
+| `mind.observer_interval_seconds` | `600` | Observer 扫描间隔 |
+| `mind.observer_min_messages` | `8` | 单群至少累积多少条新消息才观察一次 |
+| `mind.observer_daily_calls` | `24` | 单群每天「观察 + 自省」总调用上限，与回复预算分开 |
+| `mind.reflection_hour` | `5` | 每天几点之后跑夜间自省（0-23，上海时区） |
 | `behavior.chat_intensity` | `normal` | 聊天强度：`quiet` 只回点名、`normal` 当前行为、`active` 放开话题收尾/降频闸门 |
-| `behavior.restriction_mode` | `off` | 言论限制：`off` 关闭、`soft` 只注入提示、`strict` 命中关键词的整条回复丢弃 |
+| `behavior.restriction_mode` | `off` | 言论限制：`off` 关闭、`soft` 只注入提示、`strict` 命中关键词的整条回复丢弃、`regenerate` 先让模型改写（每批最多 2 次），仍命中则删掉含禁句的整句 |
 | `behavior.banned_phrases` | `[]` | 禁词（关键词级子串匹配，非语义审核） |
 | `behavior.banned_topics` | `[]` | 禁话题（注入提示；strict 模式也做关键词拦截） |
 
@@ -575,6 +596,8 @@ Bot 控制口（8788）与 OneBot 反向 WS（8080）仍只监听本机。**
   - **导出 MD / JSON**：导出单会话记忆。
 - **触发规则调试器**：输入一条模拟消息，只读展示 rules / 批次模式下的判定路径、硬触发来源、
   预算 / 静默 / 冷却 / 采样指标和最终是否会进入模型。不会写消息、调模型、消耗预算或改调度器。
+- **批次预览**：输入会话类型与会话 ID，只读预览下一次投递：待投消息、预算判定、完整 prompt
+  （含「此刻」与记忆注入）以及 token / 费用估算。不写库、不调模型、不发消息、不动调度器。
 - **日志**：按 supervisor / opencode / bot / napcat 分来源实时查看，支持级别与关键字筛选、
   暂停/继续、加载行数切换、清屏和下载当前日志文件。清屏只影响页面视图，不删除磁盘日志。
 - **健康 / 告警 / 备份**：聚合 bot、OpenCode、NapCat、网关、磁盘与备份状态；查看告警事件并发送

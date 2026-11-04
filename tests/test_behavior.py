@@ -99,6 +99,31 @@ def test_yaml_bool_off_is_tolerated():
     assert parse_behavior({"restriction_mode": False}).restriction_mode == "off"
 
 
+def test_regenerate_mode_parses_and_frames():
+    b = parse_behavior(
+        {
+            "restriction_mode": "regenerate",
+            "banned_phrases": ["作为一个AI"],
+        }
+    )
+    assert b.restriction_mode == "regenerate"
+    framing = b.framing()
+    # 照常注入禁句列表，但不要出现 strict 的整条丢弃文案。
+    assert "作为一个AI" in framing
+    assert "先尝试改写" in framing
+    assert "整条回复会被丢弃" not in framing
+
+
+def test_regenerate_payload_label():
+    b = parse_behavior({"restriction_mode": "regenerate"})
+    assert as_payload(b)["restriction_label"] == "先改写（最多 2 次）"
+
+
+def test_restriction_mode_bogus_rejected_with_field_name():
+    with pytest.raises(BehaviorError, match="restriction_mode"):
+        parse_behavior({"restriction_mode": "bogus"})
+
+
 def test_match_is_casefold_substring_and_first_hit_wins():
     b = BehaviorSettings(
         restriction_mode="strict",

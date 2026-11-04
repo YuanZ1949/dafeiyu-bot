@@ -23,8 +23,8 @@ _SPEAK_FALSE_RE = re.compile(
 
 OUTPUT_INSTRUCTION = """\
 只输出一个 JSON 对象，不要输出解释、前后缀或代码围栏。格式：
-{"speak": true 或 false, "reply": "要对群里说的话", "reason": "一句话理由"}
-speak=false 时 reply 留空。"""
+{"read": "这轮大家在聊什么、情绪如何（≤40 字）", "think": "你打算怎么接、为什么（≤40 字）", "speak": true 或 false, "reply": "要对群里说的话", "reason": "一句话理由"}
+speak=false 时 reply 留空。read/think 写给自己看，不会发到群里；旧格式只有 speak/reply/reason 也认。"""
 
 FALLBACK_REPLY = "本鱼刚刚游神了…你再说一遍？🐋"
 
@@ -55,6 +55,10 @@ class BrainReply:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     estimated: bool = False
+    # 新版输出协议的「读」和「想」：只进日志，不进群，也不落库。
+    # 追加在末尾，避免打乱既有按位置构造的位置参数。
+    read: str = ""
+    think: str = ""
 
 
 def _strip_fence(text: str) -> str:
@@ -70,6 +74,17 @@ def _strip_fence(text: str) -> str:
 
 def _clean_replacements(text: str) -> str:
     return _REPLACEMENT_RE.sub("", text)
+
+
+READ_THINK_LIMIT = 40
+
+
+def _short_field(value: object, limit: int = READ_THINK_LIMIT) -> str:
+    """read/think 只用来记日志：单行、限长，超出直接截断。"""
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    if len(text) > limit:
+        text = text[:limit].rstrip()
+    return text
 
 
 def _reply_from_dict(data: dict) -> tuple[bool, str] | None:
@@ -207,6 +222,8 @@ def parse_brain_reply(
         reason=str(data.get("reason") or ""),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        read=_short_field(data.get("read")),
+        think=_short_field(data.get("think")),
     )
 
 

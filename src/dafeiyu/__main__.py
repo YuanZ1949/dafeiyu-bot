@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .brain.client import BrainError
+from .brain.client import BrainClient, BrainError
 from .brain.factory import build_brain, current_provider, local_model_name
 from .brain.lmstudio import ensure_server
 from .brain.opencode import resolve_opencode_bin
@@ -32,6 +32,9 @@ from .service import Service
 from .supervisor.audit import AuditLog
 from .workers.failure import FailureBackoff, MemoryPaused
 from .workers.impressions import ImpressionWorker
+from .workers.observer import ObserverWorker, observer_loop
+from .workers.outcome import OutcomeWorker, outcome_loop
+from .workers.reflector import ReflectorWorker, reflector_loop
 from .workers.retention import retention_loop
 from .workers.summary import SummaryScheduler, summary_loop
 
@@ -43,10 +46,13 @@ CHECKPOINT_INTERVAL_SECONDS = 6 * 3600
 
 @dataclass(frozen=True)
 class Workers:
-    """摘要/印象两条旁路；不支持的脑类型给 None。"""
+    """摘要/印象两条记忆旁路，以及心智层三条旁路；不支持的脑类型给 None。"""
 
     impressions: ImpressionWorker | None = None
     scheduler: SummaryScheduler | None = None
+    observer: ObserverWorker | None = None
+    reflector: ReflectorWorker | None = None
+    outcome: OutcomeWorker | None = None
 
 
 def build_workers(
@@ -56,13 +62,29 @@ def build_workers(
     provider: str,
     *,
     brain_getter: Callable[[], Any] | None = None,
+    workspace: Workspace | None = None,
 ) -> Workers:
     """判据是脑有没有 ``complete_detailed``，不是 provider 名字。
 
     opencode 的 CLI 传输没有这个方法，按 provider 判断会建出一个
     运行时才炸的 worker；HTTP 传输有，所以 opencode 也能跑旁路。
     """
-    if not hasattr(brain, "complete_detailed"):
+    backoff = FailureBackoff(persistence=store)
+    impressions: ImpressionWorker | None = None
+    scheduler: SummaryScheduler | None = None
+    if hasattr(brain, "complete_detailed"):
+        # 两条旁路共用一份退避：配额熔断必须一次管住摘要与印象，且写入库跨重启存活。
+        impressions = ImpressionWorker(
+            store,
+            brain,
+            every=settings.memory.extract_every,
+            brain_getter=brain_getter,
+            backoff=backoff,
+        )
+        scheduler = SummaryScheduler(
+            store, brain, brain_getter=brain_getter, backoff=backoff
+        )
+    else:
         # 静默跳过会让用户以为「记忆坏了」：把模式和缺失的方法说清楚。
         log.warning(
             "brain=%s（transport=%s）没有 complete_detailed，"
@@ -70,20 +92,61 @@ def build_workers(
             provider,
             getattr(settings.opencode, "transport", "-"),
         )
-        return Workers()
-    # 两条旁路共用一份退避：配额熔断必须一次管住摘要与印象，且写入库跨重启存活。
-    backoff = FailureBackoff(persistence=store)
+
+    observer: ObserverWorker | None = None
+    reflector: ReflectorWorker | None = None
+    outcome: OutcomeWorker | None = None
+    mind = settings.mind
+    if mind.enabled:
+        # spec §6.3：Observer 默认只用本地模型，别和主链路抢同一份免费额度。
+        mind_brain = brain
+        mind_getter = brain_getter
+        if mind.observer_provider == "local":
+            local = settings.local_model
+            if local.base_url and local.model:
+                mind_brain = BrainClient(
+                    api_key=local.api_key or "local",
+                    base_url=local.base_url,
+                    model=local.model,
+                    trust_env=False,
+                    max_tokens=local.max_tokens,
+                    timeout=local.timeout_seconds,
+                    reasoning_effort=local.reasoning_effort or None,
+                )
+                mind_getter = None
+            else:
+                log.warning(
+                    "mind.observer_provider=local 但 local_model 未配置，"
+                    "Observer/Reflector 已跳过"
+                )
+                mind_brain = None
+        if mind_brain is not None and hasattr(mind_brain, "complete_detailed"):
+            if mind.observer_enabled:
+                # 独立退避：Observer 撞配额不能把主链路一起熔断。
+                observer = ObserverWorker(
+                    store,
+                    mind_brain,
+                    mind,
+                    backoff=FailureBackoff(persistence=store),
+                    brain_getter=mind_getter,
+                )
+            reflector = ReflectorWorker(
+                store,
+                mind_brain,
+                mind,
+                workspace,
+                backoff=FailureBackoff(persistence=store),
+                brain_getter=mind_getter,
+            )
+        # 结果打标是纯 SQL，与脑无关；心智层打开就算，重启也能继续对账。
+        outcome = OutcomeWorker(store)
+
     return Workers(
-        impressions=ImpressionWorker(
-            store,
-            brain,
-            every=settings.memory.extract_every,
-            brain_getter=brain_getter,
-            backoff=backoff,
-        ),
-        scheduler=SummaryScheduler(
-            store, brain, brain_getter=brain_getter, backoff=backoff
-        ),
+        impressions=impressions,
+        scheduler=scheduler,
+        observer=observer,
+        reflector=reflector,
+        outcome=outcome,
     )
 
 
@@ -285,9 +348,10 @@ async def main() -> None:
     service: Service | None = None
     control_runner = None
     service_started = False
-    summary_task: asyncio.Task | None = None
-    retention_task: asyncio.Task | None = None
-    checkpoint_task: asyncio.Task | None = None
+    summary_task: asyncio.Task[None] | None = None
+    retention_task: asyncio.Task[None] | None = None
+    checkpoint_task: asyncio.Task[None] | None = None
+    mind_tasks: list[asyncio.Task[None]] = []
 
     try:
         runtime = load_runtime()
@@ -361,7 +425,12 @@ async def main() -> None:
 
         # 旁路要在 service 建好之后接，brain_getter 才能在 dashboard 换脑时跟上。
         workers = build_workers(
-            settings, store, brain, provider, brain_getter=lambda: service.brain
+            settings,
+            store,
+            brain,
+            provider,
+            brain_getter=lambda: service.brain,
+            workspace=workspace,
         )
         service.impressions = workers.impressions
         scheduler = workers.scheduler
@@ -370,6 +439,24 @@ async def main() -> None:
             if scheduler is not None
             else None
         )
+        # 心智层三条旁路：全部独立任务，任一失败只记日志，不阻塞主链路。
+        if workers.observer is not None:
+            mind_tasks.append(
+                asyncio.create_task(
+                    observer_loop(
+                        workers.observer,
+                        interval_seconds=settings.mind.observer_interval_seconds,
+                    )
+                )
+            )
+        if workers.reflector is not None:
+            mind_tasks.append(
+                asyncio.create_task(reflector_loop(workers.reflector, interval=600))
+            )
+        if workers.outcome is not None:
+            mind_tasks.append(
+                asyncio.create_task(outcome_loop(workers.outcome, interval=600))
+            )
         retention_task = (
             asyncio.create_task(
                 retention_loop(store, settings.memory.retention_days)
@@ -408,6 +495,10 @@ async def main() -> None:
             checkpoint_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await checkpoint_task
+        for task in mind_tasks:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         if control_runner is not None:
             await control_runner.cleanup()
         if service_started and service is not None:

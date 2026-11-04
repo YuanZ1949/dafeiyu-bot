@@ -42,6 +42,12 @@ class PersonaConfig:
     prompt_file: str = ""
     # 拆成多条短消息时，每条之间的停顿（秒）。
     segment_delay_seconds: float = 0.8
+    # 重复守卫：同一句话最近说过就改写/换中性短句/不说。
+    repeat_guard: bool = True
+    # 机会检测（规则版）：纯热聊/纯表情批次先攒着不投，等点名或问句再一起送。
+    opportunity_guard: bool = True
+    # 引用回复：被点名/被回复时把回复挂在原消息下；关掉后发送参数与无引用时一致。
+    quote_reply: bool = True
 
 
 @dataclass(frozen=True)
@@ -115,6 +121,27 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True)
+class MindConfig:
+    """心智层总闸（spec §10）：默认全关，灰度打开即软回滚。
+
+    ``mind:`` 段是可选的：老配置没有这一段也要能启动，所以用
+    ``raw.get("mind") or {}`` 读取，不能走 ``_section``。
+    """
+
+    enabled: bool = False
+    state_enabled: bool = True
+    episodes_enabled: bool = True
+    # Observer 需要能调模型；默认只允许本地模型（不挤主链路免费额度）。
+    observer_enabled: bool = False
+    observer_provider: str = "local"
+    observer_interval_seconds: int = 600
+    observer_min_messages: int = 8
+    # 单群每天观察/自省总调用上限，与 reply 预算分开。
+    observer_daily_calls: int = 24
+    reflection_hour: int = 5
+
+
+@dataclass(frozen=True)
 class InjectionConfig:
     """opencode 分支的注入预算，单位是字符数（不是 token）。"""
 
@@ -123,10 +150,28 @@ class InjectionConfig:
     impression_chars: int = 150
     inject_summaries: bool = True
     inject_impressions: bool = True
+    # 「此刻」：时间感 + 群名 + 距上次开口 + 上一句是谁在说。默认开。
+    scene_enabled: bool = True
     # 默认关闭：相关旧记忆会改变 prompt，升级后要显式打开。
     recall_enabled: bool = False
     recall_topk: int = 3
     recall_chars: int = 300
+    # 「没有下文的事」/「正在聊的事」：数据由 Observer 写，注入默认关，
+    # 等 Observer 真跑起来再开，免得空表也占一段 prompt。
+    inject_open_loops: bool = False
+    inject_episodes: bool = False
+    open_loop_topk: int = 3
+    open_loop_chars: int = 200
+    episode_chars: int = 220
+    # 「正在聊的事 + 没有下文的事 + 群友印象」三段合计的字符预算；超了先砍
+    # 群友印象，再砍没有下文的事，最后截断正在聊的事（spec §5.5）。
+    mind_chars: int = 600
+    # 「本鱼的近况」（bot_state）与「你和他」（关系卡）：只有 mind.enabled
+    # 打开后才由 _build_injection 置 true，直接构造 InjectionConfig 时默认关。
+    inject_state: bool = False
+    state_chars: int = 100
+    inject_relations: bool = False
+    relation_chars: int = 160
 
 
 @dataclass(frozen=True)
@@ -428,6 +473,8 @@ class Settings:
     audit: AuditConfig = field(default_factory=AuditConfig)
     # 面板可改的运行时行为；默认值等价于当前线上行为。
     behavior: BehaviorSettings = field(default_factory=BehaviorSettings)
+    # 心智层（Observer/Reflector/状态/关系卡）总闸；默认全关，老配置无感。
+    mind: MindConfig = field(default_factory=MindConfig)
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -700,10 +747,48 @@ def _build_images(raw: dict[str, Any]) -> ImagesConfig:
     )
 
 
+def _build_mind(raw: dict[str, Any]) -> MindConfig:
+    """解析可选的 ``mind:`` 段；缺段 = 全默认（enabled=false），老配置不受影响。"""
+    if not isinstance(raw, dict):
+        raise ConfigError("config.yaml 的 mind 必须是映射")
+    provider = str(raw.get("observer_provider", "local")).strip().lower()
+    if provider not in ("local", "main"):
+        raise ConfigError("mind.observer_provider 只能是 local 或 main")
+    hour = _int(raw.get("reflection_hour", 5), "mind.reflection_hour")
+    if not 0 <= hour <= 23:
+        raise ConfigError("mind.reflection_hour 必须在 0-23 之间")
+    return MindConfig(
+        enabled=_bool(raw.get("enabled", False), "mind.enabled"),
+        state_enabled=_bool(raw.get("state_enabled", True), "mind.state_enabled"),
+        episodes_enabled=_bool(
+            raw.get("episodes_enabled", True), "mind.episodes_enabled"
+        ),
+        observer_enabled=_bool(
+            raw.get("observer_enabled", False), "mind.observer_enabled"
+        ),
+        observer_provider=provider,
+        observer_interval_seconds=_positive_int(
+            raw.get("observer_interval_seconds"),
+            "mind.observer_interval_seconds",
+            600,
+        ),
+        observer_min_messages=_positive_int(
+            raw.get("observer_min_messages"), "mind.observer_min_messages", 8
+        ),
+        observer_daily_calls=_non_negative_int(
+            raw.get("observer_daily_calls"), "mind.observer_daily_calls", 24
+        ),
+        reflection_hour=hour,
+    )
+
+
 def _build_injection(
-    workspace_raw: dict[str, Any], memory_raw: dict[str, Any]
+    workspace_raw: dict[str, Any],
+    memory_raw: dict[str, Any],
+    mind: MindConfig | None = None,
 ) -> InjectionConfig:
     """字符预算在 workspace 段（spec §12），开关在 memory 段。"""
+    mind = mind or MindConfig()
     return InjectionConfig(
         memory_chars=_positive_int(
             workspace_raw.get("memory_chars"), "workspace.memory_chars", 500
@@ -718,6 +803,9 @@ def _build_injection(
         inject_impressions=_bool(
             memory_raw.get("inject_impressions", True), "memory.inject_impressions"
         ),
+        scene_enabled=_bool(
+            memory_raw.get("scene_injection", True), "memory.scene_injection"
+        ),
         recall_enabled=_bool(
             memory_raw.get("recall_enabled", False), "memory.recall_enabled"
         ),
@@ -726,6 +814,33 @@ def _build_injection(
         ),
         recall_chars=_positive_int(
             memory_raw.get("recall_chars"), "memory.recall_chars", 300
+        ),
+        inject_open_loops=_bool(
+            memory_raw.get("inject_open_loops", False), "memory.inject_open_loops"
+        ),
+        inject_episodes=_bool(
+            memory_raw.get("inject_episodes", False), "memory.inject_episodes"
+        ),
+        open_loop_topk=_positive_int(
+            memory_raw.get("open_loop_topk"), "memory.open_loop_topk", 3
+        ),
+        open_loop_chars=_positive_int(
+            memory_raw.get("open_loop_chars"), "memory.open_loop_chars", 200
+        ),
+        episode_chars=_positive_int(
+            memory_raw.get("episode_chars"), "memory.episode_chars", 220
+        ),
+        mind_chars=_positive_int(
+            memory_raw.get("mind_chars", 600), "memory.mind_chars", 600
+        ),
+        # 心智段只在总闸打开时生效：老配置/直接构造 InjectionConfig 都不改变行为。
+        inject_state=mind.enabled and mind.state_enabled,
+        state_chars=_positive_int(
+            memory_raw.get("state_chars"), "memory.state_chars", 100
+        ),
+        inject_relations=mind.enabled,
+        relation_chars=_positive_int(
+            memory_raw.get("relation_chars"), "memory.relation_chars", 160
         ),
     )
 
@@ -933,6 +1048,11 @@ def _build_persona(raw: dict[str, Any]) -> PersonaConfig:
         os_probability=_float(raw.get("os_probability", 0.05), "persona.os_probability"),
         prompt_file=str(raw.get("prompt_file") or "").strip(),
         segment_delay_seconds=segment_delay,
+        repeat_guard=_bool(raw.get("repeat_guard", True), "persona.repeat_guard"),
+        opportunity_guard=_bool(
+            raw.get("opportunity_guard", True), "persona.opportunity_guard"
+        ),
+        quote_reply=_bool(raw.get("quote_reply", True), "persona.quote_reply"),
     )
 
 
@@ -1427,6 +1547,8 @@ def load_settings(
     except BehaviorError as exc:
         raise ConfigError(str(exc)) from exc
 
+    mind = _build_mind(raw.get("mind") or {})
+
     return Settings(
         api_key=api_key,
         base_url=env.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
@@ -1468,7 +1590,7 @@ def load_settings(
                 memory_raw.get("rotation_tokens"), "memory.rotation_tokens", 40000
             ),
         ),
-        injection=_build_injection(workspace_raw, memory_raw),
+        injection=_build_injection(workspace_raw, memory_raw, mind),
         workspace=_build_workspace(workspace_raw),
         images=_build_images(raw.get("images") or {}),
         logging=LoggingConfig(
@@ -1525,4 +1647,5 @@ def load_settings(
         backup=_build_backup(raw.get("backup") or {}),
         audit=_build_audit(raw.get("audit") or {}),
         behavior=behavior,
+        mind=mind,
     )

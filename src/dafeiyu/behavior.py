@@ -20,13 +20,18 @@ from dataclasses import dataclass
 from typing import Any
 
 INTENSITIES: tuple[str, ...] = ("quiet", "normal", "active")
-RESTRICTION_MODES: tuple[str, ...] = ("off", "soft", "strict")
+RESTRICTION_MODES: tuple[str, ...] = ("off", "soft", "strict", "regenerate")
 
 MAX_ITEMS = 100
 MAX_ITEM_CHARS = 50
 
 INTENSITY_LABELS = {"quiet": "安静", "normal": "正常", "active": "活跃"}
-RESTRICTION_LABELS = {"off": "关闭", "soft": "提示模型", "strict": "严格拦截"}
+RESTRICTION_LABELS = {
+    "off": "关闭",
+    "soft": "提示模型",
+    "strict": "严格拦截",
+    "regenerate": "先改写（最多 2 次）",
+}
 
 
 class BehaviorError(ValueError):
@@ -76,6 +81,9 @@ class BehaviorSettings:
                     else ""
                 )
                 lines.append("以上是硬性限制，宁可不说也不要触碰。" + suffix)
+            # regenerate 沿用禁句注入（不是 off 行为），只补一段兜底动作说明。
+            if self.restriction_mode == "regenerate" and self.banned_phrases:
+                lines.append("【言论限制】命中后先尝试改写，仍命中则删句。")
         return "\n".join(lines)
 
     def match(self, text: str) -> str | None:

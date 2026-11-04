@@ -368,6 +368,22 @@
   .debug-metric { border: 1px solid var(--line); border-radius: 6px; padding: 8px; background: var(--panel-2); font-size: var(--fs-sm); }
   .debug-metric .label { color: var(--muted); }
   .debug-metric .value { font-weight: 600; margin-top: 4px; }
+  .batch-msg {
+    display: flex; gap: 8px; flex-wrap: wrap; padding: 6px 8px;
+    border-left: 2px solid var(--line); border-radius: 4px;
+    background: var(--panel-2); font-size: var(--fs-sm);
+  }
+  .batch-msg.current { border-left-color: var(--accent); }
+  .batch-msg .who { font-weight: 600; }
+  .batch-msg .when { color: var(--muted); }
+  .batch-msg .mark { color: var(--warn); }
+  .batch-prompt {
+    margin-top: 12px; padding: 8px; border-radius: 8px;
+    background: var(--panel-2); border: 1px solid var(--line);
+    white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto;
+    font-size: var(--fs-sm);
+  }
+  .batch-prompt[hidden] { display: none; }
   body.timeline-open { overflow: hidden; }
   .drawer-backdrop {
     position: fixed; inset: 0; z-index: 15;
@@ -806,6 +822,37 @@
     </div>
   </section>
 
+  <section class="card span-full" id="batch-preview">
+    <div class="row card-head">
+      <h2>批次预览</h2>
+      <span class="kv" id="batch-hint">只读预览 · 不会调用模型</span>
+      <span class="spacer"></span>
+      <button class="btn primary" id="btn-batch-preview">预览</button>
+    </div>
+    <div class="debug-form">
+      <label>会话类型
+        <select id="batch-chat-type">
+          <option value="group">群聊</option>
+          <option value="private">私聊</option>
+        </select>
+      </label>
+      <label>会话 ID
+        <input id="batch-chat-id" value="1" />
+      </label>
+    </div>
+    <div class="kv debug-note">取当前待投批次、预算判定与最终 prompt；不写库、不发消息、不动调度器</div>
+    <div id="batch-result" hidden aria-live="polite">
+      <div class="debug-verdict" id="batch-budget"></div>
+      <div class="debug-metrics" id="batch-stats"></div>
+      <div class="debug-checks" id="batch-messages"></div>
+      <div class="row mt-2">
+        <button class="btn" id="btn-batch-toggle-prompt">显示最终 prompt</button>
+        <span class="kv" id="batch-prompt-hint"></span>
+      </div>
+      <pre class="batch-prompt" id="batch-prompt" hidden></pre>
+    </div>
+  </section>
+
   <section class="card">
     <div class="row card-head">
       <h2>运行配置</h2>
@@ -838,6 +885,7 @@
           <option value="off">关闭</option>
           <option value="soft">提示模型（仍可能说出）</option>
           <option value="strict">严格（命中关键词整条不发）</option>
+          <option value="regenerate">先改写（最多 2 次）</option>
         </select>
       </label>
       <label class="debug-wide">禁词（一行一个，子串匹配）
@@ -1232,6 +1280,112 @@ function renderTriggerDebug(data) {
     item.append(label, value);
     metrics.append(item);
   });
+}
+
+async function runBatchPreview() {
+  const chatId = $("batch-chat-id").value.trim();
+  if (!isValidChatId(chatId)) {
+    toast("会话 ID 格式非法（允许字母、数字与 _ : . @ -）", true);
+    return;
+  }
+  const payload = {
+    chat_type: $("batch-chat-type").value,
+    chat_id: chatId,
+  };
+  const button = $("btn-batch-preview");
+  button.disabled = true;
+  try {
+    const data = await api("/api/debug/batch", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    renderBatchPreview(data);
+  } catch (err) {
+    toast(`预览失败：${err.message}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderBatchPreview(data) {
+  $("batch-result").hidden = false;
+  const budget = $("batch-budget");
+  const action = (data.budget && data.budget.action) || "unknown";
+  budget.className = `debug-verdict ${action === "allow" ? "batch" : action === "deny" ? "skip" : ""}`;
+  budget.textContent = data.would_call_model
+    ? "会调用模型"
+    : "不会调用模型（预算/强度/无待投消息）";
+  const scopeText = (data.budget && data.budget.scope) || "none";
+  const reasonText = (data.budget && data.budget.reason) || "";
+  $("batch-hint").textContent =
+    `预算 ${action}${scopeText !== "none" ? ` · ${scopeText}` : ""}` +
+    (reasonText ? ` · ${reasonText}` : "") +
+    (data.addressed ? " · 被点名" : "");
+
+  const stats = $("batch-stats");
+  stats.replaceChildren();
+  const window = data.window || {};
+  const items = [
+    ["批次消息", `${(data.messages || []).length} 条`],
+    ["预计 token", data.token_estimate ?? 0],
+    ["预计费用", `${data.cost_estimate ?? 0} ${(data.budget_report || {}).cost?.currency || ""}`.trim()],
+    ["下一条发送", window.queued ? (data.next_send_at || "已到期") : "无排队窗口"],
+    ["当前条", data.current_message_id || "—"],
+  ];
+  items.forEach(([labelText, valueText]) => {
+    const item = document.createElement("div");
+    item.className = "debug-metric";
+    const label = document.createElement("div");
+    label.className = "label";
+    label.textContent = labelText;
+    const value = document.createElement("div");
+    value.className = "value";
+    value.textContent = valueText;
+    item.append(label, value);
+    stats.append(item);
+  });
+
+  const list = $("batch-messages");
+  list.replaceChildren();
+  const messages = data.messages || [];
+  if (!messages.length) {
+    const empty = document.createElement("div");
+    empty.className = "kv";
+    empty.textContent = "当前没有待投消息。";
+    list.append(empty);
+  }
+  messages.forEach((msg) => {
+    const row = document.createElement("div");
+    row.className = `batch-msg${msg.is_current ? " current" : ""}`;
+    const when = document.createElement("span");
+    when.className = "when";
+    when.textContent = msg.time_label || "";
+    const who = document.createElement("span");
+    who.className = "who";
+    who.textContent = msg.nickname || msg.user_id || "";
+    const body = document.createElement("span");
+    body.textContent = msg.recalled ? "[已撤回]" : (msg.content || "（无文字内容）");
+    row.append(when, who, body);
+    if (msg.at_bot || msg.reply_to_bot) {
+      const mark = document.createElement("span");
+      mark.className = "mark";
+      mark.textContent = msg.reply_to_bot ? "引用你" : "@你";
+      row.append(mark);
+    }
+    if (msg.is_current) {
+      const mark = document.createElement("span");
+      mark.className = "mark";
+      mark.textContent = "当前";
+      row.append(mark);
+    }
+    list.append(row);
+  });
+
+  const prompt = $("batch-prompt");
+  prompt.textContent = data.prompt || "（本轮没有 prompt）";
+  $("batch-prompt-hint").textContent = data.prompt_truncated
+    ? "已截断"
+    : `${(data.prompt || "").length} 字`;
 }
 
 function fmtUptime(seconds) {
@@ -2634,7 +2788,7 @@ async function loadConfig() {
 }
 
 const INTENSITY_LABELS = { quiet: "安静", normal: "正常", active: "活跃" };
-const RESTRICTION_LABELS = { off: "关闭", soft: "提示模型", strict: "严格拦截" };
+const RESTRICTION_LABELS = { off: "关闭", soft: "提示模型", strict: "严格拦截", regenerate: "先改写（最多 2 次）" };
 
 async function loadBehavior() {
   try {
@@ -3335,6 +3489,14 @@ $("btn-search-more").addEventListener("click", (ev) => withBusy(ev.currentTarget
 $("btn-sessions-more").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadSessions(true)));
 $("btn-refresh-sessions").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadSessions()));
 $("btn-debug-trigger").addEventListener("click", runTriggerDebug);
+$("btn-batch-preview").addEventListener("click", runBatchPreview);
+$("btn-batch-toggle-prompt").addEventListener("click", () => {
+  const box = $("batch-prompt");
+  box.hidden = !box.hidden;
+  $("btn-batch-toggle-prompt").textContent = box.hidden
+    ? "显示最终 prompt"
+    : "收起最终 prompt";
+});
 $("debug-content").addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
     event.preventDefault();

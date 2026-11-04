@@ -12,6 +12,12 @@ persona:
   max_reply_chars: 120
   max_reply_chars_technical: 300
   os_probability: 0.05
+  # 重复守卫：同一句话最近 50 条里说过，就改写/换中性短句/这一片不说。
+  repeat_guard: true
+  # 机会检测（规则版）：纯热聊/纯表情批次先攒着不投，等点名或问句再一起送。
+  opportunity_guard: true
+  # 引用回复：被点名/被引用时把回复挂在原消息下；关掉后发纯文本。
+  quote_reply: true
   # 留空使用内置人设 brain/persona.md；也可填自己的 md 路径（绝对或相对仓库根目录）
   prompt_file: ""
 
@@ -251,9 +257,42 @@ memory:
   rotation_tokens: 40000
   inject_summaries: true
   inject_impressions: true
+  # 「此刻」注入：现在几点、本群叫什么、距上次开口多久、刚才是谁在说。
+  # 关掉后 prompt 里不再有【此刻】那行，其余记忆注入不受影响。
+  scene_injection: true
   recall_enabled: true
   recall_topk: 3
   recall_chars: 300
+  # 记忆层（P1）：episodes / open_loops 由 Observer 写入，注入默认关。
+  # 「正在聊的事」= 当前这段对话的一句话摘要，只注最新一条 open；
+  # 「没有下文的事」= 谁问了没人接、谁答应了没做，取最近 1–3 条。
+  inject_episodes: false
+  inject_open_loops: false
+  open_loop_topk: 3
+  open_loop_chars: 200
+  episode_chars: 220
+  # 「正在聊的事 + 没有下文的事 + 你和他 + 本鱼的近况 + 群友印象」的合计
+  # 字符预算；超了按「印象 → 未了事 → 关系卡 → 近况」丢弃，最后截断正在聊的事。
+  mind_chars: 600
+  state_chars: 100
+  relation_chars: 160
+
+# 心智层（P1）：默认全关，灰度打开；关掉即回到当前行为（软回滚）。
+# 缺这一段也能启动——所有字段都有默认值。
+mind:
+  enabled: false
+  state_enabled: true
+  episodes_enabled: true
+  # Observer 需要调模型；默认只允许本地模型，不挤主链路免费额度。
+  observer_enabled: false
+  # local：只用 local_model 段配置的端点；main：跟随当前大脑。
+  observer_provider: local
+  observer_interval_seconds: 600
+  observer_min_messages: 8
+  # 单群每天「观察 + 夜间自省」的总调用上限，与回复预算分开计。
+  observer_daily_calls: 24
+  # 每天几点之后跑自省（0-23，上海时区）。
+  reflection_hour: 5
 
 # 面板「聊天行为」卡片可实时改；这里的值只是默认值，面板改动写
 # data/settings.local.yaml，重启后仍然保留。
@@ -261,7 +300,8 @@ behavior:
   # quiet：只回点名（@/引用/叫名字）；normal：当前行为；
   # active：放开「话题收尾」和「连续空转降频」两个软闸门。
   chat_intensity: normal
-  # off：不限制；soft：只把限制注入提示；strict：命中关键词的整条回复丢弃。
+  # off：不限制；soft：只把限制注入提示；strict：命中关键词的整条回复丢弃；
+  # regenerate：命中后先让模型改写（每批最多 2 次），仍命中则删掉含禁句的整句。
   # 注意：YAML 里裸 off 会被解析成布尔值，想手改请像下面这样加引号。
   restriction_mode: "off"
   # 关键词级子串匹配（不是语义审核）；面板一行一个。

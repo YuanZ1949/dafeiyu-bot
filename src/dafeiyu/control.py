@@ -14,7 +14,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from aiohttp import web
 
@@ -962,7 +962,18 @@ class BrainControl:
         explain = getattr(self.service, "explain_trigger", None)
         if not callable(explain):
             raise NotImplementedError("当前服务不支持触发调试")
-        return explain(msg, seed=seed)
+        return cast(dict[str, Any], explain(msg, seed=seed))
+
+    def preview_batch(self, chat_type: ChatType, chat_id: str) -> dict[str, Any]:
+        """只读预演下一次批次；服务不支持时抛 NotImplementedError（路由转 503）。"""
+        preview = getattr(self.service, "preview_batch", None)
+        if not callable(preview):
+            raise NotImplementedError("当前服务不支持批次预览")
+        result = preview(chat_type, chat_id)
+        as_dict = getattr(result, "as_dict", None)
+        if not callable(as_dict):
+            raise NotImplementedError("当前服务不支持批次预览")
+        return cast(dict[str, Any], as_dict())
 
     async def switch(self, provider: str, model: str = "") -> dict[str, Any]:
         target = normalize_provider(provider)
@@ -1773,6 +1784,8 @@ class BrainControl:
                 "max_reply_chars": persona.max_reply_chars,
                 "max_reply_chars_technical": persona.max_reply_chars_technical,
                 "os_probability": persona.os_probability,
+                "repeat_guard": persona.repeat_guard,
+                "opportunity_guard": persona.opportunity_guard,
             },
             "cooldown": {},
             "behavior": self.behavior_snapshot(),
@@ -2039,6 +2052,24 @@ def create_app(
             log.warning("触发调试失败：%s", exc)
             return web.json_response(
                 {"error": f"触发调试失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def debug_batch(request: web.Request) -> web.Response:
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        chat_type, chat_id, error = _chat_target(payload or {})
+        if error is not None:
+            return error
+        try:
+            return web.json_response(control.preview_batch(chat_type, chat_id))
+        except NotImplementedError as exc:
+            return web.json_response({"error": str(exc)}, status=503)
+        # 预览读失败不能把控制口打挂
+        except Exception as exc:  # noqa: BLE001
+            log.warning("批次预览失败：%s", exc)
+            return web.json_response(
+                {"error": f"批次预览失败：{exc.__class__.__name__}"}, status=500
             )
 
     async def models(request: web.Request) -> web.Response:
@@ -2595,6 +2626,7 @@ def create_app(
     app.router.add_post("/api/brain", post_brain)
     app.router.add_get("/api/brain/models", models)
     app.router.add_post("/api/debug/trigger", debug_trigger)
+    app.router.add_post("/api/debug/batch", debug_batch)
     app.router.add_get("/api/memory", memory)
     app.router.add_get("/api/memory/health", memory_health)
     app.router.add_post("/api/memory/summaries", post_summary)

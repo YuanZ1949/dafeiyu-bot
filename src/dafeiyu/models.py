@@ -89,6 +89,86 @@ class Impression:
     id: int | None = None
 
 
+@dataclass(frozen=True)
+class Participant:
+    """episode 的参与者：只留 id 和当时的群昵称，够注入时叫人就行。"""
+
+    user_id: str
+    nickname: str = ""
+
+
+@dataclass
+class Episode:
+    """一段有起止的对话（「正在聊什么」）。
+
+    Observer 每 10 分钟或每 8–20 条消息重算一次，落库时带 ``id`` 更新同一行；
+    ``status`` 只有 open 的会进注入。``started_at`` 用 epoch 秒，和
+    ``messages.timestamp`` 同一口径（不要写 TEXT）。
+    """
+
+    chat_type: ChatType
+    chat_id: str
+    start_message_id: str
+    last_message_id: str
+    topic: str
+    summary: str
+    participants: tuple[Participant, ...] = ()
+    # opening|discussion|climax|winding|closed；未知值落库前归一成 discussion。
+    phase: str = "discussion"
+    mood: str = ""
+    importance: float = 0.5
+    # open|closed|stale
+    status: str = "open"
+    started_at: int = 0
+    updated_at: str = ""
+    id: int | None = None
+
+
+@dataclass
+class OpenLoop:
+    """没有下文的事：谁问了没接、谁答应了没做、群里在等什么。"""
+
+    chat_type: ChatType
+    chat_id: str
+    kind: str
+    content: str
+    subject_user_id: str | None = None
+    source_message_id: str = ""
+    # open|done|dropped
+    status: str = "open"
+    created_at: str = ""
+    closed_at: str | None = None
+    id: int | None = None
+
+
+@dataclass
+class BotState:
+    """角色的当前状态（单行、跨群共享）：只留「在意什么」和「一句心情」。
+
+    刻意不做数值情绪与随机波动：宁可少，不要飘。``focus`` 由每晚 Reflector
+    覆盖，``mood_note`` 由规则在「被夸/被怼/被冷落」时改写。
+    """
+
+    focus: str = ""
+    mood_note: str = ""
+    updated_at: str = ""
+
+
+@dataclass
+class RelationshipCard:
+    """关系卡：聚合出来的「这个人是谁、聊过多少、上次怎么回的」。
+
+    不落表，每次按当前批次发言人现算（impressions + messages 聚合）。
+    """
+
+    user_id: str
+    nickname: str = ""
+    facts: tuple[str, ...] = ()
+    message_count: int = 0
+    last_seen_ts: int = 0
+    last_bot_reply: str = ""
+
+
 @dataclass
 class Summary:
     chat_type: ChatType

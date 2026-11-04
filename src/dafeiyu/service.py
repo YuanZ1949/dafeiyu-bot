@@ -12,8 +12,17 @@ from typing import TYPE_CHECKING, Any
 
 from .behavior import BehaviorSettings
 from .brain.client import BrainError, BrainReply
+from .brain.guard import (
+    REPEAT_WINDOW,
+    has_leading_os,
+    opening_fragments,
+    polish_chunk,
+    strip_banned_sentences,
+    strip_leading_os,
+)
 from .brain.persona import build_system_prompt, os_probability_hint
-from .budget import BudgetAction
+from .brain.tokens import estimate_tokens, resolve_usage
+from .budget import BudgetAction, BudgetDecision, BudgetReport, estimate_cost
 from .commands import CommandRegistry, CommandSpec
 from .config import GroupsConfig, InjectionConfig, Settings
 from .delivery.scheduler import BatchScheduler
@@ -24,7 +33,7 @@ from .memory import shared_facts
 from .memory.context import build_injection
 from .memory.rotation import apply_rotation, needs_rotation
 from .memory.store import Store
-from .memory.timeline import TIMELINE_LIMIT, build_batch_prompt
+from .memory.timeline import TIMELINE_LIMIT, build_batch_prompt, time_label
 from .memory.workspace import Workspace
 from .models import QQ_PREFIX, ChatType, Message, RecallEvent, channel_of
 from .moment import analyze, answers_bot_question, reopened_by_question
@@ -55,10 +64,53 @@ OUTBOX_MAX_ATTEMPTS = 8
 OUTBOX_MAX_AGE_SECONDS = 6 * 3600
 # 轮换摘要的输入窗口（spec §9.2：最近 40 条）。
 ROTATION_WINDOW = 40
+# 「此刻」注入用的常量：群名缓存一小时，查不到就省略那半句。
+GROUP_NAME_TTL_SECONDS = 3600.0
+GROUP_NAME_TIMEOUT_SECONDS = 2.0
+_WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def _period_of_day(hour: int) -> str:
+    """把 24 小时切成模型能直接用的「时段」词，而不是让它自己算。"""
+    if hour < 5:
+        return "凌晨"
+    if hour < 8:
+        return "清晨"
+    if hour < 11:
+        return "上午"
+    if hour < 13:
+        return "中午"
+    if hour < 17:
+        return "下午"
+    if hour < 19:
+        return "傍晚"
+    if hour < 23:
+        return "晚上"
+    return "深夜"
+
+
+def _duration_text(seconds: int) -> str:
+    if seconds < 3600:
+        return f"{max(1, seconds // 60)} 分钟"
+    if seconds < 86400:
+        return f"{seconds // 3600} 小时"
+    return f"{seconds // 86400} 天"
+
+
 # 批次被跳过的原因。error 与 record_usage(purpose="error") 同口径
 # （spec §8.4 原写作 failed，实现统一取 error，避免同一件事两个名字）。
 SKIP_BUDGET = "budget"
 SKIP_ERROR = "error"
+
+# 机会检测（规则版）的阈值：命中纯热聊负分信号时先攒着不投。
+# 「纯热聊」= 60 秒内 ≥5 条、没有问句、也没有求助词；单条短句不在此列。
+OPPORTUNITY_HOLD_SCORE = 0.2
+# 待投队列超过 pending_batch 的 20 条上限时不再攒，照旧截断送审，避免热聊撑爆队列。
+PENDING_BATCH_LIMIT = 20
+# 禁句 regenerate：每批最多改写这么多次，之后一律走确定性删句。
+REGENERATE_ATTEMPTS = 2
+# 改写走一次性补全，必须封顶等待时间，不能拖住发送链路。
+REGENERATE_TIMEOUT_SECONDS = 20.0
 
 # 跨群查证缓存注入段：只当参考，明确告诉模型可能过时、拿不准就重查。
 SHARED_FACT_HEADER = "【别的群问过的同一问题（只作参考，可能过时）】"
@@ -75,6 +127,87 @@ class ToolUse:
     async def record(self, name: str) -> None:
         self.used = True
         self.names.append(name)
+
+
+# 调试器预览一次最多回 20000 字 prompt：够看清注入与时间线，又不会把面板撑爆。
+PREVIEW_PROMPT_MAX_CHARS = 20000
+PREVIEW_TRUNCATED_MARK = "\n…（已截断）"
+
+
+@dataclass(frozen=True)
+class BatchPreview:
+    """一次「如果现在投递，会发生什么」的只读快照。
+
+    字段与 `_run_batch_locked` 一一对应：批次组成、预算判定、最终 prompt、
+    token/费用估算、下一次发送时间。预览不写库、不调模型、不动调度器。
+    """
+
+    chat_type: ChatType
+    chat_id: str
+    generated_at: str
+    messages: tuple[Message, ...]
+    addressed: bool
+    addressed_message_ids: tuple[str, ...]
+    current_message_id: str | None
+    budget: BudgetDecision
+    budget_report: BudgetReport
+    would_call_model: bool
+    prompt: str
+    prompt_truncated: bool
+    token_estimate: int
+    cost_estimate: float
+    next_send_at: str | None
+    window: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        decision = self.budget
+        report = self.budget_report
+        return {
+            "chat_type": self.chat_type.value,
+            "chat_id": self.chat_id,
+            "generated_at": self.generated_at,
+            "messages": [
+                {
+                    "message_id": msg.message_id,
+                    "nickname": msg.nickname,
+                    "user_id": msg.user_id,
+                    "content": msg.content,
+                    "timestamp": msg.timestamp,
+                    "time_label": time_label(msg.timestamp),
+                    "at_bot": msg.at_bot,
+                    "reply_to_bot": msg.reply_to_bot,
+                    "recalled": bool(msg.recalled_at),
+                    "is_current": msg.message_id == self.current_message_id,
+                }
+                for msg in self.messages
+            ],
+            "addressed": self.addressed,
+            "addressed_message_ids": list(self.addressed_message_ids),
+            "current_message_id": self.current_message_id,
+            "budget": {
+                "action": decision.action.value,
+                "reason": decision.reason,
+                "scope": decision.scope,
+                "warnings": list(decision.warnings),
+                "remaining_calls": decision.remaining_calls,
+                "remaining_tokens": decision.remaining_tokens,
+                "remaining_cost": decision.remaining_cost,
+            },
+            "budget_report": {
+                "per_chat": report.per_chat,
+                "global_daily": report.global_daily,
+                "monthly": report.monthly,
+                "cost": report.cost,
+                "warnings": [dict(item) for item in report.warnings],
+            },
+            "would_call_model": self.would_call_model,
+            "prompt": self.prompt,
+            "prompt_truncated": self.prompt_truncated,
+            "token_estimate": self.token_estimate,
+            "cost_estimate": self.cost_estimate,
+            "next_send_at": self.next_send_at,
+            "window": self.window,
+        }
 
 
 _REASON_TEXT = {
@@ -177,6 +310,10 @@ class Service:
         self.behavior: BehaviorSettings = settings.behavior
         # 面板可改的群白名单：Service 与 Router 都读这一份，整体替换。
         self.groups: GroupsConfig = settings.groups
+        # 「此刻」用的群名缓存：chat_id -> (群名, 抓取时刻)。查不到就不写。
+        self._group_names: dict[str, tuple[str, float]] = {}
+        # 群名刷新是后台任务：网关慢/断线不能拖住消息处理。
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
 
     def _adapter_for(self, chat_id: str) -> Adapter:
         """按会话 id 的通道前缀选适配器；单一派生点是 channel_of。"""
@@ -465,6 +602,24 @@ class Service:
     def _lock(self, chat_type: ChatType, chat_id: str) -> asyncio.Lock:
         return self._locks.setdefault((chat_type, chat_id), asyncio.Lock())
 
+    # 心情规则：只认「在跟它说话」的消息，避免群里聊别人也改写它的状态。
+    _MOOD_JAB = ("笨", "蠢", "傻", "垃圾", "闭嘴", "没用", "讨厌", "烦死")
+    _MOOD_PRAISE = ("厉害", "牛", "聪明", "可爱", "谢谢", "喜欢你", "爱你", "靠谱", "棒")
+
+    def _note_mood(self, msg: Message) -> None:
+        """被夸/被怼时改一句心情；同一句连续命中会被 store 抑制。"""
+        if not self.settings.mind.enabled:
+            return
+        text = (msg.content or "").strip()
+        if not text:
+            return
+        if not self._is_addressed(msg):
+            return
+        if any(word in text for word in self._MOOD_JAB):
+            self.store.note_bot_mood("被怼了，不太高兴")
+        elif any(word in text for word in self._MOOD_PRAISE):
+            self.store.note_bot_mood("被夸了一句，有点飘")
+
     async def handle(self, msg: Message) -> None:
         # 图片物化必须在入库前：content 字符串是图片路径到达大脑的唯一载体。
         # materialize 内部永不抛异常，失败保持 [图片] 占位。
@@ -475,6 +630,7 @@ class Service:
             return
         if msg.is_bot:
             return
+        self._note_mood(msg)
 
         # 重启后网关内存里的 bot_message_ids 是空的；引用老消息时回库确认
         # 「被引用的是不是我」，否则会漏掉一次点名。
@@ -491,6 +647,9 @@ class Service:
         # 印象抽取按消息条数触发，与是否回复无关，必须在早退分支之前调度；
         # 只对群聊抽印象（私聊内容不进 impressions，也不花抽取配额）。
         self._schedule_impressions(msg)
+        # 群名是「此刻」注入的一半内容：后台刷新，过期才查，查不到就省略。
+        if msg.chat_type is ChatType.GROUP:
+            self._schedule_group_name(msg.chat_id)
 
         async with self._lock(msg.chat_type, msg.chat_id):
             # 先记用户消息：被点名会重开已收尾的话题，普通消息只刷新时间。
@@ -1096,6 +1255,121 @@ class Service:
         async with lock:
             await self._run_batch_locked(chat_type, chat_id)
 
+    def preview_batch(
+        self, chat_type: ChatType, chat_id: str, *, now: Any = None
+    ) -> BatchPreview:
+        """只读预演下一次批次：不写库、不调模型、不发消息、不动调度器。
+
+        取批与判定顺序照抄 `_run_batch_locked`，两边的差异只能是「副作用」，
+        不能是「看到的东西不一样」。
+        """
+        moment = now or now_shanghai()
+        latest = self.store.recent_messages(chat_type, chat_id, 1)
+        batch = (
+            self.store.pending_batch(chat_type, chat_id, latest[0].message_id)
+            if latest
+            else []
+        )
+
+        addressed_ids = tuple(m.message_id for m in batch if self._is_addressed(m))
+        addressed = bool(addressed_ids)
+        if addressed_ids:
+            current_id: str | None = addressed_ids[-1]
+        elif batch:
+            current_id = batch[-1].message_id
+        else:
+            current_id = None
+
+        decision = self.budget_guard.evaluate(
+            chat_type,
+            chat_id,
+            addressed=addressed,
+            purpose="reply" if addressed else "ambient",
+            now=moment,
+        )
+        report = self.budget_guard.report(chat_type, chat_id, now=moment)
+        quiet_blocked = not addressed and self.behavior.chat_intensity == "quiet"
+        prompt = ""
+        truncated = False
+        opportunity_hold = False
+        if batch:
+            ids = [m.message_id for m in batch]
+            omitted = self.store.count_undelivered_before(chat_type, chat_id, ids[0])
+            opportunity_hold = self._opportunity_hold(
+                batch,
+                addressed=addressed,
+                now_ts=int(moment.timestamp()),
+                backlog=omitted,
+            )
+            prompt = self._build_prompt(
+                chat_type,
+                chat_id,
+                batch,
+                continuation=self._continuation_for(chat_type, chat_id),
+                omitted=omitted,
+                # 预览不能推进跨群查证缓存的使用计数。
+                fact_hint=self._shared_fact_hint(
+                    chat_type, chat_id, batch, bump=False
+                ),
+                # 预览必须和真实批次看到同一刻，否则「此刻」「时机」会漂。
+                now=moment,
+            )
+            if len(prompt) > PREVIEW_PROMPT_MAX_CHARS:
+                prompt = prompt[:PREVIEW_PROMPT_MAX_CHARS] + PREVIEW_TRUNCATED_MARK
+                truncated = True
+
+        would_call = (
+            bool(batch)
+            and self._budget_allows(decision, addressed)
+            and not quiet_blocked
+            and not opportunity_hold
+        )
+        tokens = estimate_tokens(prompt)
+        window: dict[str, Any] = (
+            self.scheduler.window_snapshot(chat_type, chat_id)
+            if self.scheduler is not None
+            else {"queued": False}
+        )
+        return BatchPreview(
+            chat_type=chat_type,
+            chat_id=chat_id,
+            generated_at=moment.isoformat(timespec="seconds"),
+            messages=tuple(batch),
+            addressed=addressed,
+            addressed_message_ids=addressed_ids,
+            current_message_id=current_id,
+            budget=decision,
+            budget_report=report,
+            would_call_model=would_call,
+            prompt=prompt,
+            prompt_truncated=truncated,
+            token_estimate=tokens,
+            cost_estimate=estimate_cost(tokens, 0, self.settings.budget),
+            next_send_at=window.get("due_at"),
+            window=window,
+        )
+
+    def _opportunity_hold(
+        self, batch: list[Message], *, addressed: bool, now_ts: int, backlog: int
+    ) -> bool:
+        """机会检测（规则版）：纯热聊/纯斗图没有钩子时先攒着不投。
+
+        只认 P0 的负分信号 `hot`（60 秒内 ≥5 条且无问句）；单条短句仍照旧送审，
+        避免把「帮我看看」这类短请求误吞。待投队列快到 `pending_batch` 的 20 条
+        上限时也不再攒，否则热聊会把队列越撑越大。
+        """
+        if not self.settings.persona.opportunity_guard:
+            return False
+        if len(batch) + backlog >= PENDING_BATCH_LIMIT:
+            return False
+        signals = analyze(batch, now_ts=now_ts, addressed=addressed)
+        return (
+            signals.hot
+            and not signals.question
+            and not signals.help
+            and signals.score <= OPPORTUNITY_HOLD_SCORE
+        )
+
     async def _run_batch_locked(self, chat_type: ChatType, chat_id: str) -> None:
         latest = self.store.recent_messages(chat_type, chat_id, 1)
         if not latest:
@@ -1134,6 +1408,19 @@ class Service:
         # 消息留在待投队列里，等下一次点名再一起看。
         if not addressed and self.behavior.chat_intensity == "quiet":
             log.debug("批次跳过（安静强度）%s/%s", chat_id, current_id)
+            return
+
+        # 机会检测（规则版）：纯热聊/纯斗图先攒着不投。
+        # 关键是不 mark_skipped：游标不动，下次被点名或有问句时连这批一起进 prompt。
+        if self._opportunity_hold(
+            batch,
+            addressed=addressed,
+            now_ts=int(now_shanghai().timestamp()),
+            backlog=backlog,
+        ):
+            log.debug(
+                "批次攒着不投（纯热聊）%s/%s ids=%d", chat_id, current_id, len(batch)
+            )
             return
 
         budget = self._chat_budget_decision(chat_type, chat_id, addressed=addressed)
@@ -1210,11 +1497,17 @@ class Service:
         self._check_workspace(chat_type, chat_id)
 
     def _shared_fact_hint(
-        self, chat_type: ChatType, chat_id: str, messages: list[Message]
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        messages: list[Message],
+        *,
+        bump: bool = True,
     ) -> str | None:
         """命中跨群查证缓存时给 prompt 加一段参考。
 
         只在群聊里查：私聊的内容本来就不该进共享缓存（写入侧也拦）。
+        `bump=False` 供调试器预览：只读，不推进使用计数。
         """
         if chat_type is not ChatType.GROUP:
             return None
@@ -1224,8 +1517,9 @@ class Service:
         fact = shared_facts.pick_best(self.store.shared_facts(), question)
         if fact is None:
             return None
-        self.store.bump_shared_fact(fact.id)
-        log.info("命中跨群查证缓存 %s/%s fact=%s", chat_type, chat_id, fact.id)
+        if bump:
+            self.store.bump_shared_fact(fact.id)
+            log.info("命中跨群查证缓存 %s/%s fact=%s", chat_type, chat_id, fact.id)
         return (
             f"{SHARED_FACT_HEADER}\n"
             f"问：{fact.question_text}\n"
@@ -1278,10 +1572,132 @@ class Service:
                 return text
         return None
 
+    async def _send_chunk(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        chunk: str,
+        *,
+        quote_id: str | None = None,
+    ) -> str | None:
+        """发一片回复；有被点名/被回复的消息时带上引用，失败退回纯文本。
+
+        引用只影响「这一条挂在谁说之下」，不能让回复本身发不出去：适配器没有
+        消息段能力（微信桥）或 NapCat 拒收（老版本/消息已撤回）时一律降级。
+        """
+        adapter = self._adapter_for(chat_id)
+        if quote_id:
+            sender = getattr(adapter, "send_segments", None)
+            if callable(sender):
+                try:
+                    return await sender(
+                        chat_type,
+                        chat_id,
+                        [
+                            {"type": "reply", "data": {"id": quote_id}},
+                            {"type": "text", "data": {"text": chunk}},
+                        ],
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 引用是加分项，不是前提
+                    log.info("引用回复失败，退回纯文本 %s: %s", chat_id, exc)
+        return await adapter.send(chat_type, chat_id, chunk)
+
+    def _guard_chunks(
+        self, chat_type: ChatType, chat_id: str, chunks: list[str]
+    ) -> list[str]:
+        """重复守卫 + 内心 OS 抑制：读不到历史就原样放行。"""
+        if not chunks:
+            return chunks
+        try:
+            recent = [
+                message.content
+                for message in self.store.recent_bot_messages_in(
+                    chat_type, chat_id, REPEAT_WINDOW
+                )
+            ]
+        except Exception as exc:  # noqa: BLE001 - 守卫是加分项，不能挡正常发送
+            log.debug(
+                "重复守卫读取历史失败 %s/%s：%s", chat_id, chat_type.value, exc
+            )
+            return chunks
+
+        # 内心 OS 频率抑制：最近 10 条自己真冒过 OS，才剥这轮的行首 OS。
+        # 与 repeat_guard 独立：关掉重复守卫不该把 OS 抑制一起关掉。
+        if any(has_leading_os(text) for text in recent[:10]):
+            stripped: list[str] = []
+            for chunk in chunks:
+                cleaned = strip_leading_os(chunk)
+                if not cleaned:
+                    log.info(
+                        "OS 抑制：丢弃纯 OS 分片 %s/%s %r",
+                        chat_id,
+                        chat_type.value,
+                        chunk[:40],
+                    )
+                    continue
+                if cleaned != chunk:
+                    log.info(
+                        "OS 抑制：剥离行首 OS %s/%s %r -> %r",
+                        chat_id,
+                        chat_type.value,
+                        chunk[:40],
+                        cleaned[:40],
+                    )
+                stripped.append(cleaned)
+            chunks = stripped
+            if not chunks:
+                return chunks
+
+        if not getattr(self.settings.persona, "repeat_guard", True):
+            return chunks
+        kept: list[str] = []
+        for chunk in chunks:
+            guarded = polish_chunk(chunk, recent)
+            if guarded is None:
+                log.info(
+                    "重复守卫：丢弃分片 %s/%s %r", chat_id, chat_type.value, chunk[:40]
+                )
+                continue
+            if guarded != chunk:
+                log.info(
+                    "重复守卫：改写分片 %s/%s %r -> %r",
+                    chat_id,
+                    chat_type.value,
+                    chunk[:40],
+                    guarded[:40],
+                )
+            # 中性短句本身也可能被运营者设成禁句；strict/regenerate 下命中就整片不发。
+            # soft 只提示不拦截，保持既有「仍发送」语义。
+            if (
+                self.behavior.restriction_mode in ("strict", "regenerate")
+                and self.behavior.match(guarded) is not None
+            ):
+                log.warning(
+                    "重复守卫改写后仍命中言论限制，丢弃分片 %s/%s %r",
+                    chat_id,
+                    chat_type.value,
+                    guarded[:40],
+                )
+                continue
+            kept.append(guarded)
+            # 同一轮后续分片也不能和刚定下的前一片重复。
+            recent.append(guarded)
+        return kept
+
     async def _send_batch_reply(
         self, batch: list[Message], reply: BrainReply, chat_type: ChatType, chat_id: str
     ) -> list[tuple[str, str | None]]:
         """把批次回复分片发出并入库；返回 (分片文本, 网关真实 id) 列表。"""
+        if reply.read or reply.think:
+            log.debug(
+                "模型读/想 %s/%s read=%s think=%s",
+                chat_type.value,
+                chat_id,
+                reply.read or "-",
+                reply.think or "-",
+            )
         if not reply.speak:
             log.info(
                 "模型选择不说 %s/%s ids=%d reason=%s",
@@ -1291,10 +1707,14 @@ class Service:
                 (reply.reason or "-").strip()[:120],
             )
             return []
-        if not self._restrictions_allow(reply.reply):
+        addressed = any(self._is_addressed(m) for m in batch)
+        reply_text = await self._apply_restrictions(
+            chat_type, chat_id, reply.reply, addressed=addressed
+        )
+        if reply_text is None:
             return []
         chunks = shape_reply(
-            reply.reply,
+            reply_text,
             self.settings.persona.max_reply_chars,
             self.settings.persona.max_reply_chars_technical,
             is_technical=is_technical_question(batch[-1].content),
@@ -1304,14 +1724,29 @@ class Service:
             chunks = segment_reply(chunks[0])
         if not chunks:
             return []
+        chunks = self._guard_chunks(chat_type, chat_id, chunks)
+        if not chunks:
+            return []
         sent: list[tuple[str, str | None]] = []
         defer = 0
         delay = float(getattr(self.settings.persona, "segment_delay_seconds", 0.0))
+        # 只引用被点名/被回复的那条，且只挂在第一片上（后面几片是同一轮接话）。
+        addressed_ids = [m.message_id for m in batch if self._is_addressed(m)]
+        quote_id = (
+            addressed_ids[-1]
+            if addressed_ids and self.settings.persona.quote_reply
+            else None
+        )
         for index, chunk in enumerate(chunks):
             if index and delay > 0:
                 await self._sleep(delay)
             try:
-                message_id = await self._adapter_for(chat_id).send(chat_type, chat_id, chunk)
+                message_id = await self._send_chunk(
+                    chat_type,
+                    chat_id,
+                    chunk,
+                    quote_id=quote_id if index == 0 else None,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
@@ -1328,25 +1763,92 @@ class Service:
         if defer:
             log.info("发送失败，待发队列 +%d %s/%s", defer, chat_id, batch[-1].message_id)
         else:
-            addressed = any(self._is_addressed(m) for m in batch)
             self.router.note_bot_spoke(chat_type, chat_id, ambient=not addressed)
         # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
         self._store_bot_chunks(batch[-1], sent)
         return sent
 
-    def _restrictions_allow(self, text: str) -> bool:
-        """言论限制的最后一道网：strict 命中就整条不发；soft 只记警告。
+    async def _apply_restrictions(
+        self, chat_type: ChatType, chat_id: str, text: str, *, addressed: bool
+    ) -> str | None:
+        """言论限制的最后一道网：按模式决定放行、改写还是丢弃。
 
         关键词级匹配是兜底，不保证语义审核；真正的约束在注入的提示里。
+        regenerate 先让模型改写（每批最多 REGENERATE_ATTEMPTS 次），仍命中
+        则删掉含禁句的整句；删不出干净内容就不发。
         """
         violation = self.behavior.match(text)
         if violation is None:
-            return True
-        if self.behavior.restriction_mode == "strict":
+            return text
+        mode = self.behavior.restriction_mode
+        if mode == "strict":
             log.warning("回复命中言论限制，整条丢弃：%s", violation)
-            return False
-        log.warning("回复触及言论限制（提示模式，仍发送）：%s", violation)
-        return True
+            return None
+        if mode != "regenerate":
+            log.warning("回复触及言论限制（提示模式，仍发送）：%s", violation)
+            return text
+        for attempt in range(REGENERATE_ATTEMPTS):
+            rewritten = await self._regenerate_reply(
+                chat_type, chat_id, text, addressed=addressed
+            )
+            if not rewritten:
+                break
+            if self.behavior.match(rewritten) is None:
+                log.info(
+                    "禁句改写成功（第 %d 次）%s/%s", attempt + 1, chat_id, chat_type.value
+                )
+                return rewritten
+        cleaned = strip_banned_sentences(text, self.behavior.banned_phrases)
+        if cleaned and self.behavior.match(cleaned) is None:
+            log.info("禁句删句后发送 %s/%s：%r", chat_id, chat_type.value, cleaned[:40])
+            return cleaned
+        log.warning("禁句改写与删句都失败，本次不发：%s", violation)
+        return None
+
+    async def _regenerate_reply(
+        self, chat_type: ChatType, chat_id: str, text: str, *, addressed: bool
+    ) -> str:
+        """让模型把命中禁句的回复改写一版；能力缺失或失败时返回空串。
+
+        走 ``complete_detailed`` 的一次性补全（临时 session），不污染聊天上下文。
+        用量记进 reply/ambient，和主回复同口径，避免预算与面板对不上。
+        """
+        detailed = getattr(self.brain, "complete_detailed", None)
+        if not callable(detailed):
+            return ""
+        # callable() 会把 Any 收窄成「返回 object 的函数」，这里再放宽一次，
+        # 否则 wait_for 的参数类型会被误判。
+        rewrite: Any = detailed
+        system = self._system_prompt(chat_type, [], chat_id)
+        banned = "、".join(
+            item for item in (*self.behavior.banned_phrases, *self.behavior.banned_topics) if item
+        )
+        prompt = (
+            "把下面这条回复改写一遍，保留原意和语气，但不要出现这些内容："
+            f"{banned}。只输出改写后的回复正文，不要解释。\n\n{text}"
+        )
+        try:
+            raw, prompt_tokens, completion_tokens = await asyncio.wait_for(
+                rewrite(system, [{"role": "user", "content": prompt}]),
+                timeout=REGENERATE_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 改写失败就退回确定性删句
+            log.warning("禁句改写调用失败 %s/%s：%s", chat_id, chat_type.value, exc)
+            return ""
+        prompt_tokens, completion_tokens, estimated = resolve_usage(
+            f"{system}\n{prompt}", raw or "", prompt_tokens, completion_tokens
+        )
+        self.store.record_usage(
+            chat_type,
+            chat_id,
+            "reply" if addressed else "ambient",
+            prompt_tokens,
+            completion_tokens,
+            estimated,
+        )
+        return (raw or "").strip()
 
     def _chat_budget_decision(
         self, chat_type: ChatType, chat_id: str, *, addressed: bool
@@ -1517,6 +2019,86 @@ class Service:
             )
         return "".join(parts)
 
+    def _schedule_group_name(self, chat_id: str) -> None:
+        """群名缓存过期才起一个后台刷新任务；查不到就一直省着那半句。"""
+        cached = self._group_names.get(chat_id)
+        if cached and time.monotonic() - cached[1] < GROUP_NAME_TTL_SECONDS:
+            return
+        task = asyncio.ensure_future(self._refresh_group_name(chat_id))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _refresh_group_name(self, chat_id: str) -> None:
+        """向网关要群名；适配器不支持（微信桥）或失败都静默跳过。
+
+        失败也写空名占位：同一条 TTL 内不再重试，否则网关抽风时每条消息都会
+        多打一次 `get_group_info`。
+        """
+        name = await self._fetch_group_name(chat_id)
+        self._group_names[chat_id] = (name, time.monotonic())
+
+    async def _fetch_group_name(self, chat_id: str) -> str:
+        try:
+            adapter = self._adapter_for(chat_id)
+        except KeyError:
+            return ""
+        call = getattr(adapter, "call_action", None)
+        if not callable(call):
+            return ""
+        bare = chat_id.removeprefix(QQ_PREFIX)
+        if not bare.isdigit():
+            return ""
+        try:
+            data = await asyncio.wait_for(
+                call("get_group_info", {"group_id": int(bare)}),
+                GROUP_NAME_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 群名只是锦上添花
+            log.debug("群名获取失败 %s: %s", chat_id, exc)
+            return ""
+        return str(data.get("group_name") or "").strip() if isinstance(data, dict) else ""
+
+    def _scene_hint(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        messages: list[Message],
+        *,
+        now: Any = None,
+    ) -> str:
+        """「此刻」：现在几点、这是哪个群、你多久没开口、刚才是谁在说。
+
+        同一句「在吗」，凌晨和下午该有的反应完全不同。缺哪项就省哪项，
+        绝不编造；整段控制在一行内，不抢记忆注入的注意力。
+        """
+        now = now or now_shanghai()
+        parts = [
+            (
+                f"现在是 {now:%m-%d} {_WEEKDAYS[now.weekday()]} {now:%H:%M}"
+                f"（{_period_of_day(now.hour)}）"
+            )
+        ]
+        if chat_type is ChatType.GROUP:
+            name = self._group_names.get(chat_id, ("", 0.0))[0]
+            if name:
+                parts.append(f"本群：{name}")
+        try:
+            state = self.store.load_chat_state(chat_type, chat_id) or {}
+        except Exception:  # noqa: BLE001 - 状态读不到就不提这半句
+            state = {}
+        last_spoke = state.get("last_bot_spoke")
+        if isinstance(last_spoke, (int, float)) and last_spoke > 0:
+            delta = int(now.timestamp() - float(last_spoke))
+            if delta >= 60:
+                parts.append(f"距你上次开口 {_duration_text(delta)}")
+            elif delta >= 0:
+                parts.append("你刚刚才说过话")
+        if messages and not messages[-1].is_bot:
+            parts.append(f"刚才是 {messages[-1].nickname} 在说")
+        return "【此刻】" + "；".join(parts) + "。"
+
     def _build_prompt(
         self,
         chat_type: ChatType,
@@ -1526,8 +2108,10 @@ class Service:
         continuation: str | None = None,
         omitted: int = 0,
         fact_hint: str | None = None,
+        now: Any = None,
     ) -> str:
         """三种模式共用的 prompt：长期记忆注入 + 时间线（单条也走这里）。"""
+        moment = now or now_shanghai()
         injection_cfg = self.injection or InjectionConfig()
         recall_queries = [
             message.content
@@ -1548,10 +2132,15 @@ class Service:
             chat_type,
             chat_id,
             injection_cfg,
-            today=now_shanghai().date().isoformat(),
+            today=moment.date().isoformat(),
             recall_queries=recall_queries,
             exclude_ids=exclude_ids,
         )
+        if injection_cfg.scene_enabled:
+            scene = self._scene_hint(chat_type, chat_id, messages, now=moment)
+            if scene:
+                injection = f"{scene}\n\n{injection}" if injection.strip() else scene
+
         framing = self.behavior.framing()
         if framing:
             injection = f"{injection}\n\n{framing}" if injection.strip() else framing
@@ -1563,15 +2152,32 @@ class Service:
 
         # 时机提示只给群聊：私聊无所谓「插不插嘴」。
         if chat_type is ChatType.GROUP and messages:
+            # 心智层关闭时不查 open_loops、不注入开场负例：默认行为必须与今天一致。
+            pending_loop = (
+                self._pending_loop_hint(chat_type, chat_id)
+                if self.settings.mind.enabled
+                else ""
+            )
             signals = analyze(
                 messages,
-                now_ts=int(now_shanghai().timestamp()),
+                now_ts=int(moment.timestamp()),
                 addressed=any(self._is_addressed(m) for m in messages),
                 followed_up=any(self._answers_bot_question(m) for m in messages),
+                pending_loop=pending_loop,
             )
             hint = signals.hint()
             if hint:
                 injection = f"{injection}\n\n{hint}" if injection.strip() else hint
+
+            if self.settings.mind.enabled:
+                openings = self._opening_negatives(chat_type, chat_id)
+                if openings:
+                    negatives = "【别再用这些开头】" + "、".join(openings)
+                    injection = (
+                        f"{injection}\n\n{negatives}"
+                        if injection.strip()
+                        else negatives
+                    )
 
         image_hint = self._image_hint(chat_type, chat_id, messages)
         if image_hint:
@@ -1592,6 +2198,29 @@ class Service:
             omitted=omitted,
             reply_names=reply_names,
         )
+
+    def _pending_loop_hint(self, chat_type: ChatType, chat_id: str) -> str:
+        """最近一件「没下文的事」，只截 40 字给提示层用。
+
+        查库失败一律 fail-open：提示是锦上添花，不能因为 read 出错挡住回复。
+        """
+        try:
+            loop = self.store.latest_open_loop(chat_type, chat_id)
+        except Exception as exc:  # noqa: BLE001 - 提示层失败不影响主链路
+            log.debug("读取未了事失败，跳过提示：%s", exc)
+            return ""
+        if loop is None:
+            return ""
+        return loop.content.strip()[:40]
+
+    def _opening_negatives(self, chat_type: ChatType, chat_id: str) -> list[str]:
+        """本群最近用过的开场，作为「别再用这些开头」的负例。"""
+        try:
+            recent = self.store.recent_bot_messages_in(chat_type, chat_id, 10)
+        except Exception as exc:  # noqa: BLE001 - 提示层失败不影响主链路
+            log.debug("读取最近发言失败，跳过开场负例：%s", exc)
+            return []
+        return opening_fragments([message.content for message in recent])
 
     async def _call_brain(
         self,
@@ -1752,6 +2381,15 @@ class Service:
             reply.estimated,
         )
 
+        if reply.read or reply.think:
+            log.debug(
+                "模型读/想 %s/%s read=%s think=%s",
+                msg.chat_type.value,
+                msg.chat_id,
+                reply.read or "-",
+                reply.think or "-",
+            )
+
         if not reply.speak:
             log.info(
                 "模型选择不说 %s/%s id=%s reason=%s",
@@ -1763,12 +2401,18 @@ class Service:
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
 
-        if not self._restrictions_allow(reply.reply):
+        reply_text = await self._apply_restrictions(
+            msg.chat_type,
+            msg.chat_id,
+            reply.reply,
+            addressed=self._is_addressed(msg),
+        )
+        if reply_text is None:
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
 
         chunks = shape_reply(
-            reply.reply,
+            reply_text,
             self.settings.persona.max_reply_chars,
             self.settings.persona.max_reply_chars_technical,
             is_technical=is_technical_question(msg.content),
@@ -1778,16 +2422,28 @@ class Service:
         if not chunks:
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
+        chunks = self._guard_chunks(msg.chat_type, msg.chat_id, chunks)
+        if not chunks:
+            self.router.note_no_reply(msg.chat_type, msg.chat_id)
+            return
 
         sent: list[tuple[str, str | None]] = []
         defer = 0
         delay = float(getattr(self.settings.persona, "segment_delay_seconds", 0.0))
+        quote_id = (
+            msg.message_id
+            if self._is_addressed(msg) and self.settings.persona.quote_reply
+            else None
+        )
         for index, chunk in enumerate(chunks):
             if index and delay > 0:
                 await self._sleep(delay)
             try:
-                message_id = await self._adapter_for(msg.chat_id).send(
-                    msg.chat_type, msg.chat_id, chunk
+                message_id = await self._send_chunk(
+                    msg.chat_type,
+                    msg.chat_id,
+                    chunk,
+                    quote_id=quote_id if index == 0 else None,
                 )
             except asyncio.CancelledError:
                 raise
