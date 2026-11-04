@@ -161,9 +161,9 @@ def build_onebot_segments(
     """按固定顺序拼 OneBot 消息段：reply -> at -> text -> 媒体。
 
     ``image`` 出 image 段，``record``/``voice`` 出 record 段，
-    ``sticker`` 出 face（纯数字 name）或 mface（文本 name）段；
-    file/forward/video 没有路径形态（file/forward 归 todo 7），静默跳过；
-    空文本不出段。
+    ``video`` 出 video 段，``sticker`` 出 face（纯数字 name）或 mface
+    （文本 name）段；``file`` 走独立上传接口、``forward`` 需要节点结构，
+    两者不在这里出段（静默跳过）；空文本不出段。
     """
     segments: list[dict[str, Any]] = []
     if quote_id:
@@ -188,6 +188,8 @@ def build_onebot_segments(
             segments.append({"type": "image", "data": {"file": path}})
         elif kind in ("record", "voice"):
             segments.append({"type": "record", "data": {"file": path}})
+        elif kind == "video":
+            segments.append({"type": "video", "data": {"file": path}})
     return segments
 
 

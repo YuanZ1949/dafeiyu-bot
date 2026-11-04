@@ -445,6 +445,27 @@ async def test_batch_reply_resolves_attachment_and_mention(tmp_path) -> None:
     assert adapter.sent == []
 
 
+async def test_batch_reply_video_becomes_video_segment(tmp_path) -> None:
+    ws = tmp_path / "ws"
+    (ws / "replies").mkdir(parents=True)
+    (ws / "replies" / "a.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp4")
+    adapter = _RichAdapter()
+    service = _rich_service(tmp_path, adapter)
+    reply = BrainReply(
+        True, "看", attachments=(Attachment(kind="video", path="replies/a.mp4"),)
+    )
+
+    await service._send_batch_reply([_plain_msg()], reply, ChatType.GROUP, GROUP)
+
+    assert len(adapter.segments) == 1
+    segments = adapter.segments[0][2]
+    assert [seg["type"] for seg in segments] == ["text", "video"]
+    assert segments[-1]["data"] == {
+        "file": (ws / "replies" / "a.mp4").resolve().as_posix()
+    }
+    assert adapter.sent == []
+
+
 async def test_batch_reply_sticker_becomes_face_segment(tmp_path) -> None:
     adapter = _RichAdapter()
     service = _rich_service(tmp_path, adapter)

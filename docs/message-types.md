@@ -16,7 +16,7 @@
 | 文本 | 支持 | 支持 | 支持 | 支持（`send_text`） |
 | 图片 | 支持（`images.enabled` 时落盘并把路径写进正文；失败保留 `[图片]`） | 支持（`gateway.wechat.media.enabled` 时解密落盘给路径；否则占位） | 支持（`send_segments` 的 image 段） | 不支持（UIA 恒 `unsupported_media`；协议与 adapter 已就绪，回复链路未接线） |
 | 语音 | 占位（正文 `[语音]`；只记录来源/时长元数据，不转写） | 占位（正文 `[语音]`；不转写） | 支持（`send_segments` 的 record 段，kind 为 `record`/`voice`） | 不支持（UIA 恒 `unsupported_media`） |
-| 视频 | 占位（正文 `[视频]`；只记录来源/时长元数据，不转码） | 占位（正文 `[视频]`；不转码） | 不支持（`build_onebot_segments` 跳过 video，只发文本） | 不支持（UIA 恒 `unsupported_media`） |
+| 视频 | 占位（正文 `[视频]`；只记录来源/时长元数据，不转码） | 占位（正文 `[视频]`；不转码） | 支持（`send_segments` 的 video 段，路径同样受 `replies/` 与后缀白名单约束） | 不支持（UIA 恒 `unsupported_media`） |
 | 文件 | 只记录元数据（正文 `[文件] 名字`，记录名字/大小，不下载） | 占位（按 link/占位处理，不下载） | 支持（`upload_file`，模型附件 `kind=file`） | 不支持（协议 kind 允许，UIA 不支持；回复链路未接线） |
 | 表情 / 贴纸 | 占位（`[表情]`；记录 sticker 名字/id） | 占位（`[表情]`；记录 sticker 名字） | 支持（模型附件 `type=sticker`：纯数字 `name` 出 `face` 段，其它文本出 `mface` 摘要段） | 不支持 |
 | @ | 支持（正文保留 `@名字`，并标记 `at_bot`） | 支持（正文保留原文，并标记 `at_bot`） | 支持（at 段；名字必须在本批次在场成员里，最多 3 个） | 不支持（`send_at` 动作可收，但非空 `at` 返回 `unsupported_at`，回落纯文本） |
@@ -41,7 +41,7 @@
 - 文件必须非空且不超过 **10 MiB**；
 - 工作区关闭、目标缺失、解析失败一律跳过并留 warning，绝不抛错，也不读取/发送模型给的任意路径。
 
-QQ 侧：图片/语音走 OneBot 消息段，文件走 `upload_file`。表情用 `{"type": "sticker", "name": "..."}`：`name` 为 1–6 位非 0 数字时出 `face` 段，其它文本出 `mface` 摘要段；只校验名字非空，不读文件、不受 `replies/` 白名单限制。微信侧：UIA 传输对任何媒体都返回 `unsupported_media`，客户端不重试、不回落，调用方继续发文本；不做剪贴板发图。
+QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。表情用 `{"type": "sticker", "name": "..."}`：`name` 为 1–6 位非 0 数字时出 `face` 段，其它文本出 `mface` 摘要段；只校验名字非空，不读文件、不受 `replies/` 白名单限制。微信侧：UIA 传输对任何媒体都返回 `unsupported_media`，客户端不重试、不回落，调用方继续发文本；不做剪贴板发图。
 
 ### 入站媒体（群 → 本机）
 

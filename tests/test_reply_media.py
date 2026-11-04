@@ -279,13 +279,20 @@ def test_voice_maps_to_record_segment() -> None:
     assert segments == [{"type": "record", "data": {"file": "C:/ws/replies/a.mp3"}}]
 
 
-def test_video_forward_skipped_silently() -> None:
+def test_video_maps_to_video_segment() -> None:
     segments = build_onebot_segments(
-        "看",
-        attachments=(
-            Attachment(kind="video", path="C:/ws/replies/a.mp4"),
-            Attachment(kind="forward", path="C:/ws/replies/a.txt"),
-        ),
+        "看", attachments=(Attachment(kind="video", path="C:/ws/replies/a.mp4"),)
+    )
+
+    assert segments == [
+        {"type": "text", "data": {"text": "看"}},
+        {"type": "video", "data": {"file": "C:/ws/replies/a.mp4"}},
+    ]
+
+
+def test_forward_without_nodes_skipped_silently() -> None:
+    segments = build_onebot_segments(
+        "看", attachments=(Attachment(kind="forward", path="C:/ws/replies/a.txt"),)
     )
 
     assert segments == [{"type": "text", "data": {"text": "看"}}]
