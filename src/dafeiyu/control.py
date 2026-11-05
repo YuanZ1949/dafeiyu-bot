@@ -51,8 +51,10 @@ from .config import (
     MindConfig,
     Settings,
     parse_group_ids,
+    parse_wechat_peer_ids,
 )
 from .gateway.base import GatewayError
+from .hotconfig import WeChatRuntime, WeChatRuntimeView
 from .ids import normalize_chat_id
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
 from .model_probe import (
@@ -930,6 +932,26 @@ class BrainControl:
                         for extra in ("logged_in", "desktop"):
                             if extra in item:
                                 entry[extra] = item[extra]
+                        # 发送回执只保留计数与时间戳，消息正文不进健康快照。
+                        raw_receipts = item.get("receipts")
+                        if isinstance(raw_receipts, dict):
+                            receipt_fields = (
+                                "observed",
+                                "typed",
+                                "unverified",
+                                "failed",
+                                "total",
+                                "unverified_rate",
+                            )
+                            entry["receipts"] = {
+                                key: raw_receipts[key]
+                                for key in receipt_fields
+                                if key in raw_receipts
+                            }
+                            if "last_at" in raw_receipts:
+                                entry["receipts"]["last_at"] = _iso_ts(
+                                    raw_receipts["last_at"]
+                                )
                         channels[str(name)] = entry
 
         return {
@@ -1844,6 +1866,91 @@ class BrainControl:
             "chats": chats,
             "note": "仅列出已产生消息的微信好友私聊",
         }
+
+    def _wechat_private_runtime(self) -> WeChatRuntime:
+        """当前生效的微信私聊开关：覆盖层可解析时以它为准，否则回落启动配置。
+
+        合并且语义直接复用 hotconfig 的 ``WeChatRuntimeView``，与桥/bot 运行期
+        热读同一份实现：只认四个键，类型不符的键静默忽略。
+        """
+        wechat = self.settings.wechat
+        defaults = WeChatRuntime(
+            private_enabled=bool(wechat.private_enabled),
+            private_reply=bool(wechat.private_reply),
+            private_allow=frozenset(wechat.private_allow),
+            private_deny=frozenset(wechat.private_deny),
+        )
+        return WeChatRuntimeView(defaults, Path(OVERRIDES_PATH)).current()
+
+    def private_settings_snapshot(self) -> dict[str, Any]:
+        """微信私聊开关 + 好友列表；``chats`` 复用只读列表，不重复查询。"""
+        runtime = self._wechat_private_runtime()
+        return {
+            "settings": {
+                "private_enabled": runtime.private_enabled,
+                "private_reply": runtime.private_reply,
+                "private_allow": sorted(runtime.private_allow),
+                "private_deny": sorted(runtime.private_deny),
+            },
+            "chats": self.private_chats_snapshot()["chats"],
+            "note": "开关与名单保存后一个轮询周期内热生效（重启不丢）",
+            "hot_reload": True,
+        }
+
+    def save_private_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """校验 → 落覆盖层 → 更新内存快照；桥/bot 下一轮询周期热读，无需重启。"""
+        if not isinstance(payload, dict):
+            raise ConfigError("请求体必须是对象")
+        allowed = {
+            "private_enabled",
+            "private_reply",
+            "private_allow",
+            "private_deny",
+        }
+        unknown = sorted(set(payload) - allowed)
+        if unknown:
+            raise ConfigError(f"未知字段：{unknown[0]}")
+        if not payload:
+            raise ConfigError(
+                "至少提供 private_enabled / private_reply / "
+                "private_allow / private_deny 中的一项"
+            )
+
+        updates: dict[str, Any] = {}
+        for name in ("private_enabled", "private_reply"):
+            if name not in payload:
+                continue
+            value = payload[name]
+            if not isinstance(value, bool):
+                raise ConfigError(f"{name} 必须是布尔值")
+            updates[name] = value
+        for name in ("private_allow", "private_deny"):
+            if name in payload:
+                updates[name] = parse_wechat_peer_ids(
+                    payload[name], f"wechat.{name}"
+                )
+
+        try:
+            existing = read_overrides(OVERRIDES_PATH)
+        except OverrideError as exc:
+            raise OverrideError(str(exc)) from exc
+        raw = existing.get("wechat")
+        section = dict(raw) if isinstance(raw, dict) else {}
+        for name in ("private_enabled", "private_reply"):
+            if name in updates:
+                section[name] = updates[name]
+        for name in ("private_allow", "private_deny"):
+            if name in updates:
+                section[name] = sorted(updates[name])
+        existing["wechat"] = section
+        write_overrides(existing, OVERRIDES_PATH)
+
+        self.settings = replace(
+            self.settings, wechat=replace(self.settings.wechat, **updates)
+        )
+        result = self.private_settings_snapshot()
+        result["restart_required"] = False
+        return result
 
     def _brain_supports_observer(self) -> bool:
         brain = getattr(self.service, "brain", None)
@@ -2823,6 +2930,33 @@ def create_app(
                 status=500,
             )
 
+    async def get_private_settings(_: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.private_settings_snapshot())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取微信私聊设置失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取微信私聊设置失败：{exc.__class__.__name__}"},
+                status=500,
+            )
+
+    async def put_private_settings(request: web.Request) -> web.Response:
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        try:
+            return web.json_response(control.save_private_settings(payload))
+        except (ConfigError, OverrideError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("保存微信私聊设置失败：%s", exc)
+            return web.json_response(
+                {"error": f"保存微信私聊设置失败：{exc.__class__.__name__}"},
+                status=500,
+            )
+
     async def get_mind(_: web.Request) -> web.Response:
         try:
             return web.json_response(control.mind_snapshot())
@@ -2951,6 +3085,8 @@ def create_app(
     app.router.add_get("/api/groups", get_groups)
     app.router.add_put("/api/groups", put_groups)
     app.router.add_get("/api/private/chats", get_private_chats)
+    app.router.add_get("/api/private/settings", get_private_settings)
+    app.router.add_put("/api/private/settings", put_private_settings)
     app.router.add_get("/api/mind", get_mind)
     app.router.add_put("/api/mind", put_mind)
     app.router.add_get("/api/backup", backup)

@@ -20,9 +20,11 @@ from dafeiyu.brain.client import BrainClient
 from dafeiyu.brain.factory import mode_status
 from dafeiyu.config import GroupsConfig, load_settings
 from dafeiyu.control import BrainControl, MemoryActions, create_app
+from dafeiyu.hotconfig import WeChatRuntime, WeChatRuntimeView
 from dafeiyu.memory.store import MAX_MEMORY_PAGE, Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.runtime import RuntimeState
+from dafeiyu.settings_local import read_overrides, write_overrides
 from dafeiyu.workers.failure import QUOTA_KEY, MemoryPaused
 
 YAML = TEST_CONFIG_YAML
@@ -1486,6 +1488,127 @@ async def test_private_chats_title_failure_falls_back_to_chat_id(
     assert payload["chats"][0]["title"] == "wxg:abc"
 
 
+async def test_private_settings_get_defaults_and_reuses_chats(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """默认关闭；chats 与 /api/private/chats 同源，不重复查询。"""
+    monkeypatch.setattr(
+        control_module, "OVERRIDES_PATH", tmp_path / "settings.local.yaml"
+    )
+    control, _, app = make_control(tmp_path)
+    _seed_private_chat(control.store, "wxg:abc", "a1", nickname="苑长", timestamp=300)
+
+    async with running(app) as client:
+        resp = await client.get("/api/private/settings")
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload["settings"] == {
+        "private_enabled": False,
+        "private_reply": False,
+        "private_allow": [],
+        "private_deny": [],
+    }
+    assert payload["hot_reload"] is True
+    assert [chat["chat_id"] for chat in payload["chats"]] == ["wxg:abc"]
+    assert payload["note"] == "开关与名单保存后一个轮询周期内热生效（重启不丢）"
+
+
+async def test_private_settings_put_persists_and_hot_reads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """保存后写覆盖层；桥/bot 用同一份 View 热读到的值必须一致。"""
+    overrides = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_module, "OVERRIDES_PATH", overrides)
+    control, _, app = make_control(tmp_path)
+
+    async with running(app) as client:
+        resp = await client.put(
+            "/api/private/settings",
+            json={
+                "private_enabled": True,
+                "private_reply": True,
+                "private_allow": ["wxg:AbC", "wxg:abc"],
+                "private_deny": ["WXG:Spam"],
+            },
+        )
+        saved = await resp.json()
+
+    assert resp.status == 200
+    assert saved["settings"] == {
+        "private_enabled": True,
+        "private_reply": True,
+        "private_allow": ["wxg:abc"],
+        "private_deny": ["wxg:spam"],
+    }
+    assert saved["restart_required"] is False
+    assert control.settings.wechat.private_enabled is True
+    assert control.settings.wechat.private_allow == frozenset({"wxg:abc"})
+
+    runtime = WeChatRuntimeView(WeChatRuntime(), overrides).current()
+    assert runtime.private_enabled is True
+    assert runtime.private_reply is True
+    assert runtime.private_allow == frozenset({"wxg:abc"})
+    assert runtime.private_deny == frozenset({"wxg:spam"})
+
+
+async def test_private_settings_put_preserves_other_override_sections(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """只改 wechat 段命中的键，brain 等其它段原样保留。"""
+    overrides = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_module, "OVERRIDES_PATH", overrides)
+    write_overrides(
+        {"brain": {"mode": "free"}, "wechat": {"private_enabled": True}}, overrides
+    )
+    _, _, app = make_control(tmp_path)
+
+    async with running(app) as client:
+        resp = await client.put("/api/private/settings", json={"private_reply": True})
+        assert resp.status == 200
+
+    data = read_overrides(overrides)
+    assert data["brain"] == {"mode": "free"}
+    assert data["wechat"] == {"private_enabled": True, "private_reply": True}
+
+
+async def test_private_settings_put_rejects_invalid_without_touching_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """非法布尔/QQ 前缀/未知键/空 payload 都是 400，且覆盖层一个字节都不变。"""
+    overrides = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_module, "OVERRIDES_PATH", overrides)
+    control, _, app = make_control(tmp_path)
+
+    async with running(app) as client:
+        ok = await client.put(
+            "/api/private/settings", json={"private_allow": ["wxg:abc"]}
+        )
+        assert ok.status == 200
+        before = overrides.read_text(encoding="utf-8")
+
+        bad_bool = await client.put(
+            "/api/private/settings", json={"private_enabled": "true"}
+        )
+        qq_prefix = await client.put(
+            "/api/private/settings", json={"private_allow": ["qq:123456"]}
+        )
+        unknown = await client.put(
+            "/api/private/settings", json={"unknown": True}
+        )
+        empty = await client.put("/api/private/settings", json={})
+        not_object = await client.put("/api/private/settings", data="[]")
+
+    assert bad_bool.status == 400
+    assert qq_prefix.status == 400
+    assert unknown.status == 400
+    assert empty.status == 400
+    assert not_object.status == 400
+    assert overrides.read_text(encoding="utf-8") == before
+    assert control.settings.wechat.private_enabled is False
+    assert control.settings.wechat.private_allow == frozenset({"wxg:abc"})
+
+
 def test_dashboard_exposes_new_panels() -> None:
     html = (
         Path(__file__).resolve().parents[1]
@@ -1512,6 +1635,11 @@ def test_dashboard_exposes_new_panels() -> None:
         'id="private-chats-state"',
         'id="private-chats-body"',
         'id="btn-refresh-private-chats"',
+        'id="private-enabled"',
+        'id="private-reply"',
+        'id="private-allow"',
+        'id="private-deny"',
+        'id="btn-save-private-settings"',
     ):
         assert anchor in html, f"面板缺少 {anchor}"
     assert "/api/usage?days=" in html
@@ -1522,11 +1650,16 @@ def test_dashboard_exposes_new_panels() -> None:
     assert "/api/behavior" in html
     assert "/api/groups" in html
     assert "/api/private/chats" in html
+    assert "/api/private/settings" in html
     assert "/api/backup" in html
     assert "loadSessions(true)" in html
     assert "c.memory.retention_days" in html
     assert "URL.createObjectURL" in html
     assert "confirm(" in html
+    assert "item.receipts" in html
+    assert "receipts.unverified_rate" in html
+    assert "证实" in html
+    assert "建议检查本地库回读" in html
 
 
 def test_dashboard_usage_bars_scale_by_max() -> None:

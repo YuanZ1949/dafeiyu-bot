@@ -166,6 +166,46 @@ def test_health_snapshot_reports_per_channel_state(tmp_path: Path) -> None:
     assert channels["wechat"]["desktop"] == "locked"
 
 
+def test_health_snapshot_passes_wechat_receipt_counts(tmp_path: Path) -> None:
+    control, _adapter, _store, _app = make_control(tmp_path)
+    receipts = {
+        "observed": 7,
+        "typed": 3,
+        "unverified": 2,
+        "failed": 1,
+        "total": 13,
+        "unverified_rate": 0.167,
+        "last_at": 1_700_000_500,
+        "body": "不该出现在健康快照里的正文",
+    }
+    control.service.channel_status = lambda: {
+        "wechat": {"connected": True, "receipts": dict(receipts)}
+    }
+
+    snapshot = control.health_snapshot()
+
+    got = snapshot["channels"]["wechat"]["receipts"]
+    assert got["observed"] == 7
+    assert got["typed"] == 3
+    assert got["unverified"] == 2
+    assert got["failed"] == 1
+    assert got["total"] == 13
+    assert got["unverified_rate"] == 0.167
+    assert isinstance(got["last_at"], str)
+    assert got["last_at"].startswith("2023-")
+    assert "body" not in got
+    assert "不该出现在健康快照里的正文" not in json.dumps(snapshot, ensure_ascii=False)
+
+
+def test_health_snapshot_omits_receipts_when_absent(tmp_path: Path) -> None:
+    control, _adapter, _store, _app = make_control(tmp_path)
+    control.service.channel_status = lambda: {"wechat": {"connected": True}}
+
+    snapshot = control.health_snapshot()
+
+    assert "receipts" not in snapshot["channels"]["wechat"]
+
+
 def test_health_snapshot_channel_status_failure_keeps_snapshot(
     tmp_path: Path,
 ) -> None:

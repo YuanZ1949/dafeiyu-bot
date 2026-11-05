@@ -344,6 +344,11 @@
     font-family: Consolas, "Cascadia Mono", monospace;
     font-size: var(--fs-xs); color: var(--muted); white-space: nowrap;
   }
+  .private-chats .private-actions { white-space: nowrap; }
+  .private-chats .private-actions .btn {
+    padding: 2px 6px; font-size: var(--fs-xs);
+  }
+  .private-chats .private-actions .btn + .btn { margin-left: 4px; }
   .decision-stats { justify-content: flex-start; gap: 6px; margin-bottom: 8px; }
   .decision-stats .pill { color: var(--muted); }
   .decision-stats .pill b { color: var(--text); font-weight: 600; }
@@ -1020,16 +1025,27 @@
   <section class="card">
     <div class="row card-head">
       <h2>微信私聊</h2>
-      <span class="kv" id="private-chats-hint">只读</span>
+      <span class="kv" id="private-chats-hint">加载中…</span>
       <span class="spacer"></span>
       <button class="btn" id="btn-refresh-private-chats">刷新</button>
+      <button class="btn primary" id="btn-save-private-settings">保存</button>
     </div>
-    <div class="kv" style="margin-top:8px">只展示已产生消息的微信好友私聊；本卡片只读，不提供开关或黑白名单编辑。</div>
+    <div class="kv" style="margin-top:8px">开关与名单保存后一个轮询周期内热生效（重启不丢）。</div>
+    <div class="debug-form">
+      <label><input type="checkbox" id="private-enabled" /> 接入私聊</label>
+      <label><input type="checkbox" id="private-reply" /> 自动回复（需先接入私聊）</label>
+      <label class="debug-wide">允许名单（一行一个 wxg:...；允许为空 = 不限制，拒绝优先）
+        <textarea id="private-allow" rows="3" placeholder="例如：wxg:46034f826c8b"></textarea>
+      </label>
+      <label class="debug-wide">拒绝名单（一行一个 wxg:...；拒绝优先于允许）
+        <textarea id="private-deny" rows="3" placeholder="例如：wxg:46034f826c8b"></textarea>
+      </label>
+    </div>
     <div class="kv" id="private-chats-state" style="margin-top:8px">加载中…</div>
     <div class="private-chats-scroll" id="private-chats-wrap" hidden>
       <table class="private-chats">
         <thead>
-          <tr><th>标题</th><th>会话 id</th><th>消息数</th><th>最近活跃</th><th>已投递数</th></tr>
+          <tr><th>标题</th><th>会话 id</th><th>消息数</th><th>最近活跃</th><th>已投递数</th><th>名单</th></tr>
         </thead>
         <tbody id="private-chats-body"></tbody>
       </table>
@@ -1960,6 +1976,26 @@ function renderHealth(data) {
       if (name === "wechat") {
         body.append(healthKv("登录态", item.logged_in === undefined ? "—" : item.logged_in ? "已登录" : "未登录"));
         body.append(healthKv("桌面", item.desktop || "—"));
+        const receipts = item.receipts;
+        if (receipts && typeof receipts === "object" && !Array.isArray(receipts)) {
+          const total = Number(receipts.total) || 0;
+          body.append(healthKv(
+            "回执",
+            total === 0
+              ? "—"
+              : `证实 ${receipts.observed ?? 0} · 键入 ${receipts.typed ?? 0} · 未证实 ${receipts.unverified ?? 0} · 失败 ${receipts.failed ?? 0}`,
+          ));
+          const rate = Number(receipts.unverified_rate) || 0;
+          const unverified = Number(receipts.unverified) || 0;
+          if (rate >= 0.2 && unverified >= 5) {
+            const warn = document.createElement("div");
+            warn.className = "kv";
+            warn.style.color = "var(--warn)";
+            warn.style.fontWeight = "600";
+            warn.textContent = `未证实比例 ${(rate * 100).toFixed(0)}%（建议检查本地库回读）`;
+            body.append(warn);
+          }
+        }
       }
       card.append(body);
     }
@@ -3252,47 +3288,130 @@ async function saveGroups() {
 }
 
 
+// 只读列表接口 /api/private/chats 仍保留；本卡改用 /api/private/settings 一次取回开关与好友列表。
 async function loadPrivateChats() {
   const state = $("private-chats-state");
-  const wrap = $("private-chats-wrap");
-  const body = $("private-chats-body");
   state.textContent = "加载中…";
-  wrap.hidden = true;
+  $("private-chats-wrap").hidden = true;
   try {
-    const data = await api("/api/private/chats");
+    const data = await api("/api/private/settings");
+    renderPrivateSettings(data.settings || {});
     const chats = data.chats || [];
-    body.replaceChildren();
-    if (!chats.length) {
-      state.textContent = "还没有好友私聊记录";
-      $("private-chats-hint").textContent = "只读";
-      return;
-    }
-    chats.forEach((chat) => {
-      const row = document.createElement("tr");
-      const title = document.createElement("td");
-      title.textContent = chat.title || chat.chat_id;
-      const id = document.createElement("td");
-      id.className = "chat-id";
-      id.textContent = chat.chat_id;
-      const count = document.createElement("td");
-      count.textContent = String(chat.message_count ?? 0);
-      const active = document.createElement("td");
-      active.textContent = privateChatTime(chat.last_message_at);
-      if (chat.last_message_at) {
-        active.title = new Date(Number(chat.last_message_at) * 1000)
-          .toLocaleString("zh-CN", { hour12: false });
-      }
-      const delivered = document.createElement("td");
-      delivered.textContent = String(chat.delivered_count ?? 0);
-      row.append(title, id, count, active, delivered);
-      body.appendChild(row);
-    });
-    $("private-chats-hint").textContent = `共 ${chats.length} 个好友私聊 · 只读`;
-    state.textContent = data.note || "仅列出已产生消息的微信好友私聊";
-    wrap.hidden = false;
+    renderPrivateChatRows(chats);
+    state.textContent = data.note || "开关与名单保存后一个轮询周期内热生效（重启不丢）";
+    $("private-chats-hint").textContent = chats.length
+      ? `共 ${chats.length} 个好友私聊`
+      : "已加载 · 暂无好友私聊";
   } catch (err) {
     state.textContent = `读取失败：${err.message}`;
-    $("private-chats-hint").textContent = "只读";
+    $("private-chats-hint").textContent = "读取失败";
+  }
+}
+
+function renderPrivateSettings(settings) {
+  $("private-enabled").checked = Boolean(settings.private_enabled);
+  $("private-reply").checked = Boolean(settings.private_reply);
+  $("private-allow").value = (settings.private_allow || []).join("\n");
+  $("private-deny").value = (settings.private_deny || []).join("\n");
+}
+
+function renderPrivateChatRows(chats) {
+  const body = $("private-chats-body");
+  body.replaceChildren();
+  chats.forEach((chat) => {
+    const row = document.createElement("tr");
+    const title = document.createElement("td");
+    title.textContent = chat.title || chat.chat_id;
+    const id = document.createElement("td");
+    id.className = "chat-id";
+    id.textContent = chat.chat_id;
+    const count = document.createElement("td");
+    count.textContent = String(chat.message_count ?? 0);
+    const active = document.createElement("td");
+    active.textContent = privateChatTime(chat.last_message_at);
+    if (chat.last_message_at) {
+      active.title = new Date(Number(chat.last_message_at) * 1000)
+        .toLocaleString("zh-CN", { hour12: false });
+    }
+    const delivered = document.createElement("td");
+    delivered.textContent = String(chat.delivered_count ?? 0);
+    row.append(title, id, count, active, delivered, privateRowActions(chat.chat_id));
+    body.appendChild(row);
+  });
+  $("private-chats-wrap").hidden = !chats.length;
+}
+
+function privateRowActions(chatId) {
+  const cell = document.createElement("td");
+  cell.className = "private-actions";
+  [
+    ["allow", "允许"],
+    ["deny", "拒绝"],
+    ["remove", "移除"],
+  ].forEach(([action, label]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn";
+    button.textContent = label;
+    button.dataset.chatId = chatId;
+    button.dataset.privateAction = action;
+    cell.appendChild(button);
+  });
+  return cell;
+}
+
+function privateTextareaList(id) {
+  return $(id)
+    .value.split(/\r?\n/)
+    .map((line) => line.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function setPrivateTextareaList(id, items) {
+  $(id).value = Array.from(new Set(items)).sort().join("\n");
+}
+
+function editPrivatePeer(chatId, action) {
+  const id = String(chatId || "").trim().toLowerCase();
+  if (!id) return;
+  let allow = privateTextareaList("private-allow");
+  let deny = privateTextareaList("private-deny");
+  if (action === "allow") {
+    allow.push(id);
+    deny = deny.filter((item) => item !== id);
+  } else if (action === "deny") {
+    deny.push(id);
+    allow = allow.filter((item) => item !== id);
+  } else {
+    allow = allow.filter((item) => item !== id);
+    deny = deny.filter((item) => item !== id);
+  }
+  setPrivateTextareaList("private-allow", allow);
+  setPrivateTextareaList("private-deny", deny);
+  $("private-chats-hint").textContent = "名单已修改，点「保存」后生效";
+}
+
+async function savePrivateSettings() {
+  const payload = {
+    private_enabled: $("private-enabled").checked,
+    private_reply: $("private-reply").checked,
+    private_allow: privateTextareaList("private-allow"),
+    private_deny: privateTextareaList("private-deny"),
+  };
+  try {
+    const data = await api("/api/private/settings", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    renderPrivateSettings(data.settings || {});
+    renderPrivateChatRows(data.chats || []);
+    $("private-chats-state").textContent =
+      data.note || "开关与名单保存后一个轮询周期内热生效（重启不丢）";
+    $("private-chats-hint").textContent = "已保存 · 一个轮询周期内热生效";
+    toast("微信私聊设置已更新");
+  } catch (err) {
+    $("private-chats-hint").textContent = `保存失败：${err.message}`;
+    toast(`保存失败：${err.message}`, true);
   }
 }
 
@@ -3958,6 +4077,15 @@ $("btn-refresh-behavior").addEventListener("click", loadBehavior);
 $("btn-save-behavior").addEventListener("click", saveBehavior);
 $("btn-refresh-groups").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadGroups));
 $("btn-refresh-private-chats").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadPrivateChats));
+$("btn-save-private-settings").addEventListener("click", (ev) => withBusy(ev.currentTarget, savePrivateSettings));
+$("private-chats-body").addEventListener("click", (ev) => {
+  const target = ev.target;
+  const button = target instanceof Element
+    ? target.closest("button[data-private-action]")
+    : null;
+  if (!button) return;
+  editPrivatePeer(button.dataset.chatId, button.dataset.privateAction);
+});
 $("btn-save-groups").addEventListener("click", (ev) => withBusy(ev.currentTarget, saveGroups));
 $("btn-refresh-mind").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadMind));
 $("btn-save-mind").addEventListener("click", (ev) => withBusy(ev.currentTarget, saveMind));
