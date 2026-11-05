@@ -3,5 +3,12 @@
 from __future__ import annotations
 
 from .dat import decode_dat
+from .keygen import DEFAULT_KEY_CACHE, MediaKey, MediaKeyResolver, derive_aes_key
 
-__all__ = ["decode_dat"]
+__all__ = [
+    "DEFAULT_KEY_CACHE",
+    "MediaKey",
+    "MediaKeyResolver",
+    "decode_dat",
+    "derive_aes_key",
+]
