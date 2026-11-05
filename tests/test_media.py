@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -25,6 +27,7 @@ def make_settings(
     workspace: bool = True,
     media: bool = True,
     max_bytes: int = 1024 * 1024,
+    retention_days: int = 0,
 ) -> Settings:
     return cast(
         Settings,
@@ -37,6 +40,8 @@ def make_settings(
                 wechat=SimpleNamespace(
                     media=SimpleNamespace(enabled=media, max_bytes=max_bytes)
                 ),
+                # workspace/images 与 QQ 侧共用，保留期沿用 images.retention_days。
+                images=SimpleNamespace(retention_days=retention_days),
             ),
         ),
     )
@@ -247,3 +252,60 @@ async def test_second_call_is_idempotent(tmp_path: Path) -> None:
     assert second == 0
     assert message.content == content
     assert message.content.count("（图存") == 1
+
+
+async def test_sticker_placeholder_is_annotated_and_idempotent(tmp_path: Path) -> None:
+    source = write_dat(tmp_path)
+    settings = make_settings(tmp_path)
+    message = make_message(str(source), content="[表情:745c9c20]")
+
+    first = await materialize_attachments(message, settings, decode=decode_dat)
+    content = message.content
+    second = await materialize_attachments(message, settings, decode=decode_dat)
+
+    assert first == 1
+    assert "[表情:745c9c20]（图存 images/" in content
+    assert content.count("（图存") == 1
+    assert second == 0
+    assert message.content == content
+
+
+async def test_materialize_cleans_expired_images(tmp_path: Path) -> None:
+    images_dir = tmp_path / "ws" / "images"
+    images_dir.mkdir(parents=True)
+    old = images_dir / "old.png"
+    old.write_bytes(PNG)
+    fresh = images_dir / "fresh.png"
+    fresh.write_bytes(PNG)
+    eight_days_ago = time.time() - 8 * 86400
+    os.utime(old, (eight_days_ago, eight_days_ago))
+
+    source = tmp_path / "a.png"
+    source.write_bytes(PNG)
+    settings = make_settings(tmp_path, retention_days=7)
+    message = make_message(str(source))
+
+    count = await materialize_attachments(message, settings)
+
+    assert count == 1
+    assert not old.exists()
+    assert fresh.is_file()
+
+
+async def test_retention_zero_keeps_expired_images(tmp_path: Path) -> None:
+    images_dir = tmp_path / "ws" / "images"
+    images_dir.mkdir(parents=True)
+    old = images_dir / "old.png"
+    old.write_bytes(PNG)
+    eight_days_ago = time.time() - 8 * 86400
+    os.utime(old, (eight_days_ago, eight_days_ago))
+
+    source = tmp_path / "a.png"
+    source.write_bytes(PNG)
+    settings = make_settings(tmp_path, retention_days=0)
+    message = make_message(str(source))
+
+    count = await materialize_attachments(message, settings)
+
+    assert count == 1
+    assert old.is_file()

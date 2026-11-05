@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +31,9 @@ _PLACEHOLDER = "[图片]"
 _ANNOTATED = "[图片]（图存 {path}，可用 read 查看）"
 _ANNOTATION_MARK = "（图存"
 _FILE_PREFIX = "[文件]"
+
+#: 可被注记的图片/表情占位；表情可带名称或 md5 前缀。
+_PLACEHOLDER_RE = re.compile(r"\[(?:图片|表情(?::[^\]\r\n]*)?)\]")
 
 #: 与 ``images.py`` 相同的魔数表。这里刻意复制一份：本模块只依赖 models，
 #: 不调用另一个模块的私有函数（那会让两边的生命周期互相绑定）。
@@ -60,16 +65,18 @@ def _target(directory: Path, source: str, data: bytes, suffix: str) -> Path:
 
 
 def _annotate_first(content: str, annotation: str) -> str:
-    """替换第一个**未**带注记的 ``[图片]``，避免重复注解已物化的占位。"""
-    start = 0
-    while True:
-        index = content.find(_PLACEHOLDER, start)
-        if index < 0:
-            return content
-        tail = content[index + len(_PLACEHOLDER) :]
+    """替换第一个**未**带注记的 ``[图片]``/``[表情...]``，避免重复注解已物化的占位。"""
+    # 注记模板固定以 ``[图片]`` 开头；表情占位只换前缀，复用同一段后缀。
+    suffix = (
+        annotation[len(_PLACEHOLDER) :]
+        if annotation.startswith(_PLACEHOLDER)
+        else annotation
+    )
+    for match in _PLACEHOLDER_RE.finditer(content):
+        tail = content[match.end() :]
         if not tail.startswith(_ANNOTATION_MARK):
-            return content[:index] + annotation + tail
-        start = index + len(_PLACEHOLDER)
+            return content[: match.start()] + match.group(0) + suffix + tail
+    return content
 
 
 def _materialized_relative(path: Path, root: Path) -> str | None:
@@ -78,6 +85,23 @@ def _materialized_relative(path: Path, root: Path) -> str | None:
         return path.resolve().relative_to(root.resolve()).as_posix()
     except (OSError, ValueError):
         return None
+
+
+def _cleanup(directory: Path, retention_days: int) -> None:
+    """惰性清理：retention_days>0 时删掉过期文件。0 = 不清理。"""
+    if retention_days <= 0:
+        return
+    cutoff = time.time() - retention_days * 86400
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_file() and entry.stat().st_mtime < cutoff:
+                entry.unlink()
+        except OSError:  # 并发删除/权限问题：清理失败不致命
+            log.debug("清理过期图片失败：%s", entry, exc_info=True)
 
 
 def _file_note(attachment: Attachment) -> str:
@@ -177,7 +201,13 @@ async def materialize_attachments(
                 continue
 
             if not prepared:
+                # 目录与清理只在第一张真要落盘时才动，避免无图消息碰文件系统。
                 directory.mkdir(parents=True, exist_ok=True)
+                # workspace/images 与 images.py 共用，沿用同一保留期配置。
+                retention_days = getattr(
+                    getattr(settings, "images", None), "retention_days", 0
+                )
+                _cleanup(directory, retention_days)
                 prepared = True
             target = _target(directory, source, data, source_path.suffix)
             try:
