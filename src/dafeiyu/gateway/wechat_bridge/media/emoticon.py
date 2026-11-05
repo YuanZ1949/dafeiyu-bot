@@ -5,6 +5,8 @@
 - 文件名就是 32 位十六进制 md5（与消息 XML 的 ``<emoji md5="...">`` 一致）；
 - 算法是 AES-128-CBC，``IV == key``，整文件单流，尾部 PKCS7；
 - 明文是 ``wxgf`` 容器：``wxgf`` 魔数 + 元数据头，之后才是裸 HEVC Annex B。
+  头的长度随版本不同（v0x12 为 22 字节，v0x13/v0x14 会内嵌数百字节），因此
+  这里按「第一个参数集 NAL（VPS/SPS/PPS）」定位真正的码流起点。
 
 ``cfgDword`` 与图片 ``.dat`` 同源（见 :mod:`keygen`），但密钥派生多了
 ``EMOTICON`` 后缀且取 raw digest。模块只做「解密 + 转码」，不猜路径、
@@ -40,12 +42,20 @@ _EMOTICON_NAME_RE = re.compile(r"[0-9a-fA-F]{32}")
 
 _WXGF_MAGIC = b"wxgf"
 
-#: HEVC Annex B 起始码；``wxgf`` 头只有 22 字节，但留足余量再搜。
+#: HEVC Annex B 起始码。
 _START_CODE = b"\x00\x00\x00\x01"
-_START_CODE_SEARCH = 64
 
-#: 单次转码的墙钟上限：贴纸很小，超时说明 ffmpeg 卡住了。
-_DEFAULT_TIMEOUT = 20.0
+#: ``wxgf`` 头长度随版本增长：v0x12 是 22 字节，v0x13/v0x14 会多出
+#: 一段几百字节到 1 KB 以上的内嵌数据（静态缩略图/附加参数）。实测真实
+#: 贴纸的 VPS 出现在 22、894、961、1303 字节处，因此扫描上限取 64 KiB。
+_MAX_HEADER_SCAN = 64 * 1024
+
+#: HEVC NAL 类型：VPS=32、SPS=33、PPS=34。``nal_unit_type = (byte >> 1) & 0x3F``。
+_PARAM_SET_TYPES = frozenset({32, 33, 34})
+
+#: 单次转码的墙钟上限：贴纸很小，超时说明 ffmpeg 卡住了。本机最重的
+#: 96 帧贴纸暖机约 3s，但首次冷启动被杀软扫描时实测到 19.98s，因此留到 30s。
+_DEFAULT_TIMEOUT = 30.0
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _GIF_MAGIC = (b"GIF87a", b"GIF89a")
@@ -98,11 +108,30 @@ def decrypt_emoticon(
     return plain
 
 
+def _find_parameter_set(payload: bytes, limit: int) -> int:
+    """找到第一个参数集（VPS/SPS/PPS）NAL 的起始码位置；没有返回 -1。
+
+    不能只认「第一个起始码」：v0x13/v0x14 的内嵌数据里会出现形如
+    ``00 00 00 01`` 的字节（实测 4d2c… 在 795 处就有一个，但 NAL 类型是
+    保留值），从那里截断会让 ffmpeg 解不出帧。参数集才是可解码起点。
+    """
+    position = payload.find(_START_CODE, len(_WXGF_MAGIC), limit)
+    while position >= 0:
+        header = position + len(_START_CODE)
+        if header < len(payload):
+            nal_type = (payload[header] >> 1) & 0x3F
+            if nal_type in _PARAM_SET_TYPES:
+                return position
+        position = payload.find(_START_CODE, header, limit)
+    return -1
+
+
 def wxgf_hevc(payload: bytes) -> bytes | None:
     """从 ``wxgf`` 明文里取出裸 HEVC 流；格式不符返回 ``None``。"""
     if not payload.startswith(_WXGF_MAGIC):
         return None
-    position = payload.find(_START_CODE, len(_WXGF_MAGIC), _START_CODE_SEARCH)
+    limit = min(len(payload), _MAX_HEADER_SCAN)
+    position = _find_parameter_set(payload, limit)
     if position < 0:
         return None
     stream = payload[position:]

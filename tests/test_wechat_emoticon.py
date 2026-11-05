@@ -116,6 +116,21 @@ def test_wxgf_hevc_requires_start_code() -> None:
     assert wxgf_hevc(b"wxgf" + b"\x00" * 40) is None
 
 
+def test_wxgf_hevc_finds_parameter_set_after_long_header() -> None:
+    """v0x13/v0x14 的头可能超过 64 字节，且中间夹着假起始码。"""
+    fake = b"\x00\x00\x00\x01\x2c" + b"\x00" * 200  # NAL 类型 22，不是参数集
+    header = b"wxgf" + b"\x14" + b"\x00" * 300
+    payload = header + fake + b"\x00" * 200 + STREAM
+
+    assert wxgf_hevc(payload) == STREAM
+
+
+def test_wxgf_hevc_ignores_non_parameter_set_start_code() -> None:
+    payload = b"wxgf" + b"\x14" + b"\x00" * 40 + b"\x00\x00\x00\x01\x2c" + b"\x00" * 40
+
+    assert wxgf_hevc(payload) is None
+
+
 # ---------------------------------------------------------------- 转码
 def _patch_ffmpeg(monkeypatch: pytest.MonkeyPatch, result: bytes, *, frames: int):
     captured: dict[str, object] = {}
