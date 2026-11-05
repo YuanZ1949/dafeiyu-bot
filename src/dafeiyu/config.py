@@ -139,6 +139,10 @@ class MindConfig:
     # 单群每天观察/自省总调用上限，与 reply 预算分开。
     observer_daily_calls: int = 24
     reflection_hour: int = 5
+    # QQ 表情回应：默认关闭；打开后仅在发送成功后尝试调用，失败只记日志。
+    # emoji id 的具体取值需按 NapCat/QQ 版本验证，先留成配置项。
+    emoji_reactions: bool = False
+    emoji_reaction_id: str = "128"
 
 
 @dataclass(frozen=True)
@@ -795,6 +799,10 @@ def _build_mind(raw: dict[str, Any]) -> MindConfig:
             raw.get("observer_daily_calls"), "mind.observer_daily_calls", 24
         ),
         reflection_hour=hour,
+        emoji_reactions=_bool(
+            raw.get("emoji_reactions", False), "mind.emoji_reactions"
+        ),
+        emoji_reaction_id=str(raw.get("emoji_reaction_id") or "128").strip() or "128",
     )
 
 

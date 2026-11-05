@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import websockets
@@ -496,3 +496,140 @@ async def test_service_survives_upload_failure(monkeypatch) -> None:
         "upload_group_file",
         "send_group_msg",
     ]
+
+
+async def test_set_msg_emoji_like_sends_bare_message_id(monkeypatch) -> None:
+    adapter = make_adapter()
+    recorder = _Recorder()
+
+    async def fake_request(action, params):
+        return await recorder(action, params)
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+
+    ok = await adapter.set_msg_emoji_like(ChatType.GROUP, "qq:123", "qq:88", "128")
+
+    assert ok is True
+    assert recorder.calls == [
+        ("set_msg_emoji_like", {"message_id": 88, "emoji_id": "128"})
+    ]
+
+
+async def test_set_msg_emoji_like_failure_is_swallowed(monkeypatch) -> None:
+    adapter = make_adapter()
+    recorder = _Recorder(fail_actions={"set_msg_emoji_like"})
+
+    async def fake_request(action, params):
+        return await recorder(action, params)
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+
+    assert await adapter.set_msg_emoji_like(ChatType.GROUP, "qq:123", "88", "128") is False
+
+
+async def test_set_msg_emoji_like_skips_empty_ids() -> None:
+    adapter = make_adapter()
+
+    assert await adapter.set_msg_emoji_like(ChatType.GROUP, "qq:123", "", "128") is False
+    assert await adapter.set_msg_emoji_like(ChatType.GROUP, "qq:123", "88", "") is False
+
+
+async def test_service_sends_forward_and_skips_empty_text(monkeypatch) -> None:
+    from dafeiyu.models import Attachment
+    from dafeiyu.service import Service
+
+    adapter = make_adapter()
+    recorder = _Recorder()
+    texts: list[str] = []
+
+    async def fake_request(action, params):
+        return await recorder(action, params)
+
+    async def fake_send(chat_type, chat_id, text):
+        texts.append(text)
+        return "99"
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+    monkeypatch.setattr(adapter, "send", fake_send)
+    service = object.__new__(Service)
+    service.adapters = {"qq": adapter}
+    item = Attachment(kind="forward", nodes=({"name": "阿明", "content": "原话"},))
+
+    message_id = await service._send_chunk(
+        ChatType.GROUP, "qq:123", "", attachments=(item,)
+    )
+
+    assert message_id == "88"
+    assert recorder.calls[0][0] == "send_group_forward_msg"
+    assert recorder.calls[0][1]["group_id"] == 123
+    assert recorder.calls[0][1]["messages"] == [
+        {
+            "type": "node",
+            "data": {
+                "name": "阿明",
+                "content": [{"type": "text", "data": {"text": "原话"}}],
+            },
+        }
+    ]
+    # 只有转发时不再补一条空文本。
+    assert texts == []
+
+
+async def test_service_degrades_forward_failure_to_text(monkeypatch) -> None:
+    from dafeiyu.models import Attachment
+    from dafeiyu.service import Service
+
+    adapter = make_adapter()
+    recorder = _Recorder(fail_actions={"send_group_forward_msg"})
+
+    async def fake_request(action, params):
+        return await recorder(action, params)
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+    service = object.__new__(Service)
+    service.adapters = {"qq": adapter}
+    item = Attachment(kind="forward", nodes=({"name": "阿明", "content": "原话"},))
+
+    await service._send_chunk(ChatType.GROUP, "qq:123", "", attachments=(item,))
+
+    # 转发失败后退化成一行占位文本，仍然走普通发送。
+    assert [action for action, _ in recorder.calls] == [
+        "send_group_forward_msg",
+        "send_group_msg",
+    ]
+    assert "合并转发 1 条" in recorder.calls[1][1]["message"]
+
+
+async def test_maybe_emoji_reaction_respects_config(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from dafeiyu.service import Service
+
+    adapter = make_adapter()
+    calls: list[tuple[object, ...]] = []
+
+    async def fake_react(chat_type, chat_id, message_id, emoji_id):
+        calls.append((chat_type, chat_id, message_id, emoji_id))
+        return True
+
+    monkeypatch.setattr(adapter, "set_msg_emoji_like", fake_react)
+    service = object.__new__(Service)
+    service.adapters = {"qq": adapter}
+    service.settings = cast(
+        Any,
+        SimpleNamespace(
+            mind=SimpleNamespace(emoji_reactions=True, emoji_reaction_id="128")
+        ),
+    )
+
+    await service._maybe_emoji_reaction(ChatType.GROUP, "qq:123", "88")
+    assert calls == [(ChatType.GROUP, "qq:123", "88", "128")]
+
+    service.settings = cast(
+        Any,
+        SimpleNamespace(
+            mind=SimpleNamespace(emoji_reactions=False, emoji_reaction_id="128")
+        ),
+    )
+    await service._maybe_emoji_reaction(ChatType.GROUP, "qq:123", "88")
+    assert calls == [(ChatType.GROUP, "qq:123", "88", "128")]

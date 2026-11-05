@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 
 class ChatType(str, Enum):
@@ -46,6 +47,9 @@ class Attachment:
     name: str = ""
     size: int = 0
     duration: int = 0
+    #: 合并转发节点（仅出站协议使用），元素形如 ``{"name": "...", "content": "..."}``。
+    #: 追加在末尾，旧的位置参数构造保持可用。
+    nodes: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass
@@ -93,6 +97,24 @@ class RecallEvent:
     chat_id: str
     message_id: str
     operator_id: str = ""
+
+
+@dataclass(frozen=True)
+class NoticeEvent:
+    """OneBot notice 里的非撤回事件（戳一戳/进退群/禁言）。
+
+    ``kind`` 统一成 ``group_poke`` / ``friend_poke`` / ``group_increase`` /
+    ``group_decrease`` / ``group_ban``；``user_id`` 是事件主体（被戳者、进/退群者、
+    被禁言者），``operator_id`` 是操作者或发起者。仅用于日志与后续接入，不触发模型。
+    """
+
+    kind: str
+    chat_type: ChatType
+    chat_id: str
+    user_id: str = ""
+    operator_id: str = ""
+    sub_type: str = ""
+    duration: int = 0
 
 
 @dataclass

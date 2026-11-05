@@ -311,6 +311,10 @@ mind:
   observer_daily_calls: 24
   # 每天几点之后跑自省（0-23，上海时区）。
   reflection_hour: 5
+  # QQ 表情回应：默认关闭；开启后机器人发出消息会尝试贴一个表情（失败只记日志）。
+  # emoji id 与 NapCat/QQ 版本相关，上线前先用真实环境验证。
+  emoji_reactions: false
+  emoji_reaction_id: "128"
 
 # 面板「聊天行为」卡片可实时改；这里的值只是默认值，面板改动写
 # data/settings.local.yaml，重启后仍然保留。

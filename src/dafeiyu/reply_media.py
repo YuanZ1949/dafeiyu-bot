@@ -27,6 +27,9 @@ ALLOWED_SUFFIXES = frozenset(
     {".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mp3", ".wav", ".pdf", ".txt", ".zip"}
 )
 REPLIES_DIRNAME = "replies"
+#: 合并转发节点的上限与单节点正文长度（与 brain.client 的解析上限一致）。
+MAX_FORWARD_NODES = 5
+MAX_FORWARD_TEXT = 200
 
 # 名字截断与 @ 封顶：模型编造超长名字/点名过多时收敛到安全规模。
 _MAX_NAME_CHARS = 60
@@ -89,6 +92,26 @@ def _resolve_one(candidate: Any, raw: str, base: Path, root: Path) -> Attachment
     return None
 
 
+def _forward_attachment(candidate: Any) -> Attachment | None:
+    """合并转发：只保留非空正文的节点并限长；没有有效节点返回 None。"""
+    nodes: list[dict[str, Any]] = []
+    for node in getattr(candidate, "nodes", ()) or ():
+        if len(nodes) >= MAX_FORWARD_NODES:
+            break
+        if not isinstance(node, dict):
+            continue
+        name = str(node.get("name") or "").strip()
+        content = str(node.get("content") or "").strip()
+        if not content:
+            continue
+        nodes.append(
+            {"name": name[:_MAX_NAME_CHARS], "content": content[:MAX_FORWARD_TEXT]}
+        )
+    if not nodes:
+        return None
+    return Attachment(kind="forward", nodes=tuple(nodes))
+
+
 def resolve_attachments(reply: BrainReply, settings: Settings) -> list[Attachment]:
     """把 BrainReply.attachments 的候选解析成安全附件，拒绝项跳过。
 
@@ -111,6 +134,13 @@ def resolve_attachments(reply: BrainReply, settings: Settings) -> list[Attachmen
                 log.info("忽略空 name 的表情附件")
                 continue
             resolved.append(Attachment(kind="sticker", name=name[:_MAX_NAME_CHARS]))
+            continue
+        if kind == "forward":
+            forward = _forward_attachment(candidate)
+            if forward is None:
+                log.info("忽略没有有效节点的合并转发附件")
+                continue
+            resolved.append(forward)
             continue
         raw = str(getattr(candidate, "path", "") or "")
         if not raw.strip():

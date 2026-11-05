@@ -68,6 +68,23 @@ _ATTACHMENT_NOTE_BY_KIND = {
     "file": "\n[文件] {name} ({path})",
 }
 
+
+def _forward_message_nodes(item: Attachment) -> list[dict[str, Any]]:
+    """把模型友好的 ``{name, content}`` 节点包成 OneBot ``node`` 段。"""
+    return [
+        {
+            "type": "node",
+            "data": {
+                "name": str(node.get("name") or ""),
+                "content": [
+                    {"type": "text", "data": {"text": str(node.get("content") or "")}}
+                ],
+            },
+        }
+        for node in item.nodes
+        if str(node.get("content") or "").strip()
+    ]
+
 SHUTUP_MINUTES = 60
 ADMIN_ONLY_REPLY = "这个命令只有管理员能用。"
 FORGET_REPLY = "记忆清空了，本鱼失忆中……🫧"
@@ -1597,6 +1614,36 @@ class Service:
                 return text
         return None
 
+    async def _maybe_emoji_reaction(
+        self, chat_type: ChatType, chat_id: str, message_id: str | None
+    ) -> None:
+        """mind.emoji_reactions 开启时，给刚发出的 QQ 消息贴一个表情回应。
+
+        只有适配器真的实现 ``set_msg_emoji_like`` 时才尝试；任何失败只记
+        debug，不影响已经完成的发送。
+        """
+        if not message_id:
+            return
+        if not bool(getattr(self.settings.mind, "emoji_reactions", False)):
+            return
+        adapter = self._adapter_for(chat_id)
+        react = cast(
+            Callable[..., Awaitable[bool]] | None,
+            getattr(adapter, "set_msg_emoji_like", None),
+        )
+        if not callable(react):
+            return
+        emoji = str(getattr(self.settings.mind, "emoji_reaction_id", "128") or "128")
+        try:
+            ok = await react(chat_type, chat_id, str(message_id), emoji)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 表情回应是加法项
+            log.debug("表情回应异常 %s/%s: %s", chat_id, message_id, exc)
+            return
+        if not ok:
+            log.debug("表情回应未生效 %s/%s", chat_id, message_id)
+
     async def _send_chunk(
         self,
         chat_type: ChatType,
@@ -1615,6 +1662,38 @@ class Service:
         撤回）或本地文件上传失败时一律降级为纯文本，且不重试。
         """
         adapter = self._adapter_for(chat_id)
+
+        # 合并转发：OneBot 独立接口；适配器不支持/调用失败时降级成一行文本提示，
+        # 不把异常抛回上层（转发始终是加法项）。
+        forward_id: str | None = None
+        forwards = [
+            item
+            for item in attachments
+            if str(item.kind or "").strip().lower() == "forward" and item.nodes
+        ]
+        if forwards:
+            forwarder = cast(
+                Callable[..., Awaitable[str | None]] | None,
+                getattr(adapter, "send_forward", None),
+            )
+            for item in forwards:
+                if not callable(forwarder):
+                    chunk += f"\n[合并转发 {len(item.nodes)} 条]"
+                    continue
+                try:
+                    forward_id = await forwarder(
+                        chat_type, chat_id, _forward_message_nodes(item)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 转发是加法项
+                    log.warning("合并转发失败，降级为文本 %s: %s", chat_id, exc)
+                    chunk += f"\n[合并转发 {len(item.nodes)} 条]"
+            attachments = tuple(
+                item
+                for item in attachments
+                if str(item.kind or "").strip().lower() != "forward"
+            )
 
         # 文件类附件走独立上传接口；上传失败只记日志，文本照发。
         uploader = cast(
@@ -1690,6 +1769,9 @@ class Service:
                 except Exception as exc:  # noqa: BLE001 - @ 是加分项
                     log.info("带 @ 发送失败，退回纯文本 %s: %s", chat_id, exc)
 
+        # 只有转发、没有正文/附件时，直接返回转发消息 id，避免再发一条空文本。
+        if not chunk and not at_names and not attachments and not quote_id:
+            return forward_id
         return await adapter.send(chat_type, chat_id, chunk)
 
     def _safe_reply_attachments(
@@ -1917,6 +1999,7 @@ class Service:
                         defer += 1
                 break
             sent.append((chunk, message_id))
+            await self._maybe_emoji_reaction(chat_type, chat_id, message_id)
         if defer:
             log.info("发送失败，待发队列 +%d %s/%s", defer, chat_id, batch[-1].message_id)
         else:
@@ -2620,6 +2703,7 @@ class Service:
                         defer += 1
                 break
             sent.append((chunk, message_id))
+            await self._maybe_emoji_reaction(msg.chat_type, msg.chat_id, message_id)
         if defer:
             log.info("发送失败，待发队列 +%d %s/%s", defer, msg.chat_id, msg.message_id)
         else:

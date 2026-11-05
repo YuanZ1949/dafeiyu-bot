@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import Any, cast
 
 import httpx
 
@@ -27,7 +27,7 @@ OUTPUT_INSTRUCTION = """\
 只输出一个 JSON 对象，不要输出解释、前后缀或代码围栏。格式：
 {"read": "这轮大家在聊什么、情绪如何（≤40 字）", "think": "你打算怎么接、为什么（≤40 字）", "speak": true 或 false, "reply": "要对群里说的话", "reason": "一句话理由"}
 speak=false 时 reply 留空。read/think 写给自己看，不会发到群里；旧格式只有 speak/reply/reason 也认。
-可选字段："at": ["昵称"] 表示这条回复要 @ 谁；"attachments": [{"type": "image"|"file"|"voice"|"video", "path": "replies/xxx.png", "name": "可选"}] 只在确实产出文件时填写，path 必须相对 workspace，拿不准就省略；想发表情时用 {"type": "sticker", "name": "表情 id 或表情名"}，name 填纯数字表示 QQ 内置表情。"""
+可选字段："at": ["昵称"] 表示这条回复要 @ 谁；"attachments": [{"type": "image"|"file"|"voice"|"video", "path": "replies/xxx.png", "name": "可选"}] 只在确实产出文件时填写，path 必须相对 workspace，拿不准就省略；想发表情时用 {"type": "sticker", "name": "表情 id 或表情名"}，name 填纯数字表示 QQ 内置表情。；需要转发聊天记录时用 {"type": "forward", "nodes": [{"name": "谁", "content": "一句原话"}]}（最多 5 条）"""
 
 FALLBACK_REPLY = "本鱼刚刚游神了…你再说一遍？🐋"
 
@@ -97,7 +97,12 @@ MAX_REPLY_ATTACHMENTS = 2
 MAX_REPLY_AT = 3
 MAX_ATTACHMENT_PATH = 200
 MAX_ATTACHMENT_NAME = 60
-REPLY_ATTACHMENT_KINDS = frozenset({"image", "file", "voice", "video", "sticker"})
+REPLY_ATTACHMENT_KINDS = frozenset(
+    {"image", "file", "voice", "video", "sticker", "forward"}
+)
+#: 合并转发的节点上限与单节点正文长度：模型输出不可信，先在这里收口。
+MAX_FORWARD_NODES = 5
+MAX_FORWARD_TEXT = 200
 
 
 def _int_field(value: object) -> int:
@@ -109,6 +114,33 @@ def _int_field(value: object) -> int:
         return int(value)
     except (ValueError, OverflowError):
         return 0
+
+
+def _parse_forward_nodes(raw: object) -> tuple[dict[str, Any], ...]:
+    """解析合并转发节点：只保留 name/content 两个字符串字段并限长。
+
+    模型可能给出任意结构；空正文的节点直接丢弃，整体最多 ``MAX_FORWARD_NODES``。
+    """
+    if not isinstance(raw, list):
+        return ()
+    nodes: list[dict[str, Any]] = []
+    for item in cast(list[object], raw):
+        if len(nodes) >= MAX_FORWARD_NODES:
+            break
+        if not isinstance(item, dict):
+            continue
+        entry = cast(dict[str, object], item)
+        name = str(entry.get("name") or "").strip()
+        content = str(entry.get("content") or "").strip()
+        if not content:
+            continue
+        nodes.append(
+            {
+                "name": name[:MAX_ATTACHMENT_NAME],
+                "content": content[:MAX_FORWARD_TEXT],
+            }
+        )
+    return tuple(nodes)
 
 
 def parse_reply_attachments(raw: object) -> tuple[Attachment, ...]:
@@ -135,6 +167,12 @@ def parse_reply_attachments(raw: object) -> tuple[Attachment, ...]:
             if not name:
                 continue
             parsed.append(Attachment(kind="sticker", name=name[:MAX_ATTACHMENT_NAME]))
+            continue
+        if kind == "forward":
+            nodes = _parse_forward_nodes(entry.get("nodes"))
+            if not nodes:
+                continue
+            parsed.append(Attachment(kind="forward", nodes=nodes))
             continue
         path = entry.get("path")
         if not isinstance(path, str):

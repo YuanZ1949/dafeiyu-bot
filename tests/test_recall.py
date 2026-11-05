@@ -10,7 +10,7 @@ import pytest
 from dafeiyu.gateway.qq import parse_event
 from dafeiyu.memory.store import Store
 from dafeiyu.memory.timeline import format_message_line
-from dafeiyu.models import ChatType, Message, RecallEvent
+from dafeiyu.models import ChatType, Message, NoticeEvent, RecallEvent
 
 # 会话 id 一律带通道前缀：裸 int 只存在于 v1 时代。
 CHAT = "qq:1"
@@ -73,10 +73,22 @@ def test_parse_friend_recall_event() -> None:
     assert event.message_id == "p9"
 
 
-def test_parse_ignores_other_notices() -> None:
+def test_parse_other_notices_as_notice_event() -> None:
+    """非撤回 notice 现在产出 NoticeEvent（只记录，不触发回复）。"""
+    event = parse_event(
+        {"post_type": "notice", "notice_type": "group_increase", "group_id": 1},
+        bot_qq=999,
+    )
+
+    assert isinstance(event, NoticeEvent)
+    assert event.kind == "group_increase"
+    assert event.chat_id == "qq:1"
+
+
+def test_parse_ignores_unknown_notices() -> None:
     assert (
         parse_event(
-            {"post_type": "notice", "notice_type": "group_increase", "group_id": 1},
+            {"post_type": "notice", "notice_type": "group_card", "group_id": 1},
             bot_qq=999,
         )
         is None

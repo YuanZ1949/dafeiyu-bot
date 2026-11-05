@@ -182,3 +182,57 @@ def test_output_instruction_keeps_required_format_and_adds_optional_fields() -> 
     assert '"speak": true 或 false' in OUTPUT_INSTRUCTION
     assert '"at":' in OUTPUT_INSTRUCTION
     assert '"attachments":' in OUTPUT_INSTRUCTION
+    assert '"forward"' in OUTPUT_INSTRUCTION
+
+
+def test_forward_nodes_parsed_and_trimmed() -> None:
+    parsed = parse_reply_attachments(
+        [
+            {
+                "type": "forward",
+                "nodes": [
+                    {"name": " 阿明 ", "content": " 原话 "},
+                    {"name": "没有正文", "content": "   "},
+                    "not-a-dict",
+                    {"name": "阿强", "content": "第二句"},
+                ],
+            }
+        ]
+    )
+
+    assert [a.kind for a in parsed] == ["forward"]
+    assert parsed[0].path == ""
+    assert parsed[0].nodes == (
+        {"name": "阿明", "content": "原话"},
+        {"name": "阿强", "content": "第二句"},
+    )
+
+
+def test_forward_nodes_capped_and_text_clipped() -> None:
+    parsed = parse_reply_attachments(
+        [
+            {
+                "type": "forward",
+                "nodes": [
+                    {"name": f"n{i}", "content": "x" * 300} for i in range(9)
+                ],
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert len(parsed[0].nodes) == 5
+    assert all(len(node["content"]) == 200 for node in parsed[0].nodes)
+
+
+def test_forward_without_valid_nodes_dropped() -> None:
+    parsed = parse_reply_attachments(
+        [
+            {"type": "forward"},
+            {"type": "forward", "nodes": []},
+            {"type": "forward", "nodes": [{"name": "空", "content": ""}]},
+            {"type": "forward", "nodes": "oops"},
+        ]
+    )
+
+    assert parsed == ()

@@ -20,6 +20,7 @@ from dafeiyu.models import (
     Attachment,
     ChatType,
     Message,
+    NoticeEvent,
     RecallEvent,
     Segment,
 )
@@ -364,15 +365,67 @@ def _parse_recall(event: dict[str, Any]) -> RecallEvent | None:
     )
 
 
+def _parse_notice(event: dict[str, Any]) -> NoticeEvent | None:
+    """解析非撤回 notice（戳一戳/进退群/禁言）；未知类型返回 None。
+
+    只产出结构化事件供上层记日志，不触发模型回复。``poke`` 在 OneBot 里
+    有两种写法（``notice_type=notify`` + ``sub_type=poke``，或直接
+    ``group_poke``/``friend_poke``），两种都收。
+    """
+    notice_type = str(event.get("notice_type") or "")
+    sub_type = str(event.get("sub_type") or "")
+    if notice_type == "notify" and sub_type == "poke":
+        kind = "group_poke" if event.get("group_id") else "friend_poke"
+    elif notice_type in ("group_poke", "friend_poke"):
+        kind = notice_type
+    elif notice_type in ("group_increase", "group_decrease", "group_ban"):
+        kind = notice_type
+    else:
+        return None
+
+    group_id = _qq_id(event.get("group_id"))
+    user_id = _qq_id(event.get("user_id"))
+    # poke 事件里 user_id 是发起者、target_id 是被戳者；其余事件 user_id 是主体。
+    if kind.endswith("_poke"):
+        subject = _qq_id(event.get("target_id") or event.get("user_id"))
+        operator = user_id
+    else:
+        subject = user_id
+        operator = _qq_id(event.get("operator_id"))
+
+    if kind == "group_poke":
+        chat_type, chat_id = ChatType.GROUP, group_id
+    elif kind == "friend_poke":
+        chat_type, chat_id = ChatType.PRIVATE, operator or subject
+    else:
+        chat_type, chat_id = ChatType.GROUP, group_id
+    if not chat_id:
+        return None
+
+    try:
+        duration = int(event.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    return NoticeEvent(
+        kind=kind,
+        chat_type=chat_type,
+        chat_id=chat_id,
+        user_id=subject,
+        operator_id=operator,
+        sub_type=sub_type,
+        duration=max(0, duration),
+    )
+
+
 def parse_event(
     event: dict[str, Any],
     bot_qq: int,
     bot_message_ids: Collection[str] = (),
-) -> Message | RecallEvent | None:
+) -> Message | RecallEvent | NoticeEvent | None:
     if not isinstance(event, dict):
         return None
     if event.get("post_type") == "notice":
-        return _parse_recall(event)
+        return _parse_recall(event) or _parse_notice(event)
     if event.get("post_type") != "message":
         return None
 
@@ -590,6 +643,35 @@ class QQAdapter:
         logger.info("合并转发已发送 %s %s msg_id=%s", action, target, value)
         return value
 
+    async def set_msg_emoji_like(
+        self, chat_type: ChatType, chat_id: str, message_id: str, emoji_id: str
+    ) -> bool:
+        """给已发出的消息贴表情回应；任何失败都返回 False，不抛给调用方。
+
+        ``chat_type``/``chat_id`` 只用于日志定位：OneBot 的 ``set_msg_emoji_like``
+        按 ``message_id`` 找消息。真实 NapCat 的 emoji id 取值需上线前验证。
+        """
+        if not message_id or not emoji_id:
+            return False
+        try:
+            await self._request(
+                "set_msg_emoji_like",
+                {"message_id": _bare_id(message_id), "emoji_id": str(emoji_id)},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 表情回应是加法项
+            logger.warning(
+                "表情回应失败 %s %s msg_id=%s emoji=%s：%s",
+                chat_type.value,
+                chat_id,
+                message_id,
+                emoji_id,
+                exc,
+            )
+            return False
+        return True
+
     async def call_action(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         """通用 OneBot 动作调用；只读查询（如 `get_group_info`）也走这里。"""
         return await self._request(action, params)
@@ -683,6 +765,19 @@ class QQAdapter:
         if "post_type" in data:
             event = parse_event(data, self._bot_qq, self.bot_message_ids)
             if event is None:
+                return
+            if isinstance(event, NoticeEvent):
+                # 安全默认：只记录，不触发模型回复（后续要接再接）。
+                logger.info(
+                    "QQ notice %s %s/%s user=%s operator=%s sub=%s duration=%s",
+                    event.kind,
+                    event.chat_type.value,
+                    event.chat_id,
+                    event.user_id,
+                    event.operator_id,
+                    event.sub_type,
+                    event.duration,
+                )
                 return
             self.last_event_at = time.time()
             if isinstance(event, RecallEvent):

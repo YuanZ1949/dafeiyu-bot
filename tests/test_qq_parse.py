@@ -15,7 +15,7 @@ from fixtures.onebot_events import (
 )
 
 from dafeiyu.gateway.qq import _attachments_from_segments, parse_event
-from dafeiyu.models import ChatType, Message
+from dafeiyu.models import ChatType, Message, NoticeEvent
 
 BOT_QQ = 10001
 
@@ -95,7 +95,141 @@ def test_private_message() -> None:
 
 
 def test_non_message_event_returns_none() -> None:
+    # 缺 group_id 的 notice 没有会话可归属，仍按未知事件丢弃。
     assert parse_event({"post_type": "notice", "notice_type": "group_increase"}, bot_qq=BOT_QQ) is None
+
+
+def test_group_poke_notify_shape_is_parsed() -> None:
+    event = {
+        "post_type": "notice",
+        "notice_type": "notify",
+        "sub_type": "poke",
+        "group_id": 30003,
+        "user_id": 20002,
+        "target_id": BOT_QQ,
+    }
+    notice = parse_event(event, bot_qq=BOT_QQ)
+
+    assert isinstance(notice, NoticeEvent)
+    assert notice.kind == "group_poke"
+    assert notice.chat_type is ChatType.GROUP
+    assert notice.chat_id == "qq:30003"
+    assert notice.user_id == "qq:10001"  # 被戳者
+    assert notice.operator_id == "qq:20002"  # 发起者
+    assert notice.sub_type == "poke"
+
+
+def test_friend_poke_uses_private_chat() -> None:
+    event = {
+        "post_type": "notice",
+        "notice_type": "notify",
+        "sub_type": "poke",
+        "user_id": 20002,
+        "target_id": BOT_QQ,
+    }
+    notice = parse_event(event, bot_qq=BOT_QQ)
+
+    assert isinstance(notice, NoticeEvent)
+    assert notice.kind == "friend_poke"
+    assert notice.chat_type is ChatType.PRIVATE
+    assert notice.chat_id == "qq:20002"
+
+
+def test_direct_poke_notice_types_are_parsed() -> None:
+    group = parse_event(
+        {
+            "post_type": "notice",
+            "notice_type": "group_poke",
+            "group_id": 30003,
+            "user_id": 20002,
+            "target_id": BOT_QQ,
+        },
+        bot_qq=BOT_QQ,
+    )
+    friend = parse_event(
+        {
+            "post_type": "notice",
+            "notice_type": "friend_poke",
+            "user_id": 20002,
+            "target_id": BOT_QQ,
+        },
+        bot_qq=BOT_QQ,
+    )
+
+    assert isinstance(group, NoticeEvent) and group.kind == "group_poke"
+    assert isinstance(friend, NoticeEvent) and friend.kind == "friend_poke"
+
+
+def test_group_increase_decrease_ban_notices() -> None:
+    increase = parse_event(
+        {
+            "post_type": "notice",
+            "notice_type": "group_increase",
+            "sub_type": "invite",
+            "group_id": 30003,
+            "user_id": 20002,
+            "operator_id": 20003,
+        },
+        bot_qq=BOT_QQ,
+    )
+    decrease = parse_event(
+        {
+            "post_type": "notice",
+            "notice_type": "group_decrease",
+            "sub_type": "kick",
+            "group_id": 30003,
+            "user_id": 20002,
+            "operator_id": 20003,
+        },
+        bot_qq=BOT_QQ,
+    )
+    ban = parse_event(
+        {
+            "post_type": "notice",
+            "notice_type": "group_ban",
+            "sub_type": "ban",
+            "group_id": 30003,
+            "user_id": 20002,
+            "operator_id": 20003,
+            "duration": "600",
+        },
+        bot_qq=BOT_QQ,
+    )
+
+    assert isinstance(increase, NoticeEvent)
+    assert (increase.kind, increase.user_id, increase.operator_id) == (
+        "group_increase",
+        "qq:20002",
+        "qq:20003",
+    )
+    assert isinstance(decrease, NoticeEvent) and decrease.kind == "group_decrease"
+    assert isinstance(ban, NoticeEvent)
+    assert (ban.kind, ban.duration, ban.sub_type) == ("group_ban", 600, "ban")
+
+
+def test_recall_still_wins_over_notice_parser() -> None:
+    from dafeiyu.models import RecallEvent
+
+    event = {
+        "post_type": "notice",
+        "notice_type": "group_recall",
+        "group_id": 30003,
+        "user_id": 20002,
+        "message_id": 40004,
+    }
+    parsed = parse_event(event, bot_qq=BOT_QQ)
+
+    assert isinstance(parsed, RecallEvent)
+
+
+def test_unknown_notice_type_still_returns_none() -> None:
+    event = {
+        "post_type": "notice",
+        "notice_type": "group_card",
+        "group_id": 30003,
+        "user_id": 20002,
+    }
+    assert parse_event(event, bot_qq=BOT_QQ) is None
 
 
 def test_mixed_segments_render_placeholders() -> None:

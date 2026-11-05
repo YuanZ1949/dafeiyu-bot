@@ -357,6 +357,35 @@ def test_sticker_without_name_dropped(tmp_path: Path) -> None:
     assert resolved == []
 
 
+def test_forward_resolves_without_workspace_and_keeps_nodes(tmp_path: Path) -> None:
+    settings = replace(make_settings(tmp_path), workspace=WorkspaceConfig(dir=""))
+    resolved = resolve_attachments(
+        make_reply(
+            Attachment(
+                kind="forward",
+                nodes=(
+                    {"name": "阿明", "content": "原话"},
+                    {"name": "", "content": "   "},
+                ),
+            )
+        ),
+        settings,
+    )
+
+    assert [(item.kind, item.nodes) for item in resolved] == [
+        ("forward", ({"name": "阿明", "content": "原话"},))
+    ]
+
+
+def test_forward_without_nodes_dropped(tmp_path: Path) -> None:
+    resolved = resolve_attachments(
+        make_reply(Attachment(kind="forward", path="replies/a.txt")),
+        make_settings(tmp_path),
+    )
+
+    assert resolved == []
+
+
 def test_empty_text_with_attachments_omits_text_segment() -> None:
     segments = build_onebot_segments(
         "", attachments=(Attachment(kind="image", path="C:/ws/replies/a.png"),)
