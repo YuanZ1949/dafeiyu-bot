@@ -222,12 +222,14 @@ class SessionAligner:
 
     def _user_id(self, nickname: str) -> str:
         name = nickname.strip()
-        if not name:
-            return f"wxg:{self._anonymous_alias}"
+        # 回调优先于空昵称兜底：私聊的稳定别名对任意昵称（含空昵称）都成立；
+        # 群聊不传回调，这里仍走匿名槽位 / 按昵称缓存的 uuid 逻辑。
         if self._user_alias is not None:
             alias = str(self._user_alias(name) or "").strip()
             if alias:
                 return alias if alias.startswith("wxg:") else f"wxg:{alias}"
+        if not name:
+            return f"wxg:{self._anonymous_alias}"
         cached = self._user_aliases.get(name)
         if cached is None:
             cached = uuid.uuid4().hex[:12]

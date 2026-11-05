@@ -306,3 +306,70 @@ async def test_private_disabled_never_polls_friends(started: Any) -> None:
 
     assert await loop._targets() == ()
     assert driver.opened == []
+
+
+# ------------------------------------- 好友私聊：source -> aligner 信封透传
+def test_private_source_snapshot_feeds_aligner(tmp_path: Any) -> None:
+    """LocalDbSource(好友) 的 entries 喂给 private aligner：kind 与 media 原样进信封。
+
+    群/好友两类的 localdb 快照解析必须一致：好友同样走 resolve_any ->
+    recent(...,50)，媒体元数据只透传 dict，不读字节。
+    """
+    from dafeiyu.gateway.wechat_bridge.align import SessionAligner
+    from dafeiyu.gateway.wechat_bridge.localdb.source import LocalDbSource
+    from tests.test_wechat_localdb_repository import (
+        FILE_TITLE,
+        IMG_PAYLOAD,
+        QUOTED_ORIGINAL,
+        QUOTE_REPLY,
+        FRIEND_NAME,
+        build_friend_media_store,
+    )
+
+    store, _root = build_friend_media_store(tmp_path)
+    source = LocalDbSource(mirror_dir=tmp_path / "mirror")
+    source._store = store
+
+    snapshot = source.snapshot(FRIEND_NAME)
+
+    assert snapshot is not None
+    assert snapshot["chat_name"] == FRIEND_NAME
+    assert [m["kind"] for m in snapshot["messages"]] == [
+        "text", "image", "voice", "link", "quote",
+    ]
+    assert snapshot["messages"][0]["nickname"] == FRIEND_NAME
+    assert snapshot["messages"][1]["media"]["kind"] == "image"
+    assert snapshot["messages"][1]["media"]["size"] == len(IMG_PAYLOAD)
+
+    aligner = SessionAligner(
+        "wxg:friend1",
+        FRIEND_NAME,
+        account_nickname="小菜鱼",
+        chat_type="private",
+        clock=lambda: 1.0,
+    )
+    # 上一轮窗口只有第一条文字：这样本帧里 4 种非文本消息都是「新」的。
+    aligner.seed([(FRIEND_NAME, QUOTED_ORIGINAL)])
+
+    result = aligner.poll(snapshot["messages"])
+
+    messages = result.messages
+    assert [(m["kind"], m["text"]) for m in messages] == [
+        ("image", "[图片]"),
+        ("voice", "[语音]"),
+        ("link", FILE_TITLE),
+        ("quote", QUOTE_REPLY),
+    ]
+    assert all(m["nickname"] == FRIEND_NAME for m in messages)
+    assert all(
+        m["chat_type"] == "private" and m["chat_id"] == "wxg:friend1" for m in messages
+    )
+    assert messages[0]["media"]["kind"] == "image"
+    assert messages[0]["media"]["size"] == len(IMG_PAYLOAD)
+    assert messages[1]["media"]["kind"] == "voice"
+    # 文件消息没有媒体元数据（现有实现的 appmsg/link 映射）；
+    # 信封恒有 media 键：无媒体时是空 dict（不是 repository 层的直接省略）。
+    assert messages[2]["media"] == {}
+    # 引用 bot 的消息：作者 == account_nickname 才算回复机器人。
+    assert messages[3]["reply_to_bot"] is True
+    assert messages[3]["reply_to_text"] == QUOTED_ORIGINAL

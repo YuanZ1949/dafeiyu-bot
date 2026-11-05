@@ -302,6 +302,66 @@ def test_user_alias_hook_is_used() -> None:
     assert result.messages[-1]["user_id"] == "wxg:u2"
 
 
+# ------------------------------------------------------- private：user_id 钉会话
+def _private_aligner() -> SessionAligner:
+    return SessionAligner(
+        "wxg:friend1",
+        "好友甲",
+        account_nickname=ACCOUNT,
+        chat_type="private",
+        user_alias=lambda _name: "wxg:friend1",
+    )
+
+
+def test_private_user_alias_pins_all_nicknames_to_chat_id() -> None:
+    """私聊 user_id = 会话稳定 chat_id：任意昵称、空昵称都一样。"""
+    aligner = _private_aligner()
+    window: list[dict] = [msg("老名字", "开场")]
+    aligner.poll(window)
+
+    window += [msg("老名字", "一"), msg("", "空昵称"), msg("改了名", "二")]
+    result = aligner.poll(window)
+
+    assert [e["user_id"] for e in result.messages] == ["wxg:friend1"] * 3
+    assert all(e["chat_type"] == "private" and e["chat_id"] == "wxg:friend1" for e in result.messages)
+
+
+def test_private_user_id_stays_stable_across_polls_and_nickname_changes() -> None:
+    aligner = _private_aligner()
+    window = [msg("甲", "开场")]
+    aligner.poll(window)  # 第一轮只建基线
+
+    window.append(msg("甲", "一"))
+    first = aligner.poll(window)
+
+    window.append(msg("乙（改名后）", "二"))
+    second = aligner.poll(window)
+
+    assert [e["user_id"] for e in first.messages] == ["wxg:friend1"]
+    assert [e["user_id"] for e in second.messages] == ["wxg:friend1"]
+
+
+def test_group_without_alias_keeps_reinvented_ids_per_session() -> None:
+    """群聊回归：同昵称会话内稳定、不同昵称不同 id；新实例（重启语义）重新随机。"""
+    aligner = make_aligner()
+    window = [msg("阿猫", "开场")]
+    aligner.poll(window)
+    window += [msg("阿猫", "一"), msg("阿狗", "二")]
+    result = aligner.poll(window)
+
+    cat, dog = (e["user_id"] for e in result.messages)
+    assert cat != dog
+    assert cat.startswith("wxg:") and dog.startswith("wxg:")
+
+    restarted = make_aligner()  # 对齐器是新实例：同昵称拿到不同随机 alias
+    window2 = [msg("阿猫", "开场")]
+    restarted.poll(window2)
+    window2.append(msg("阿猫", "一"))
+    after = restarted.poll(window2)
+
+    assert after.messages[0]["user_id"] != cat
+
+
 def test_timestamp_falls_back_to_clock() -> None:
     aligner = make_aligner()
 

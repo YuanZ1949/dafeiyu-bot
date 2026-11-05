@@ -957,3 +957,114 @@ def test_source_forwards_friend_names_and_peer_kind(tmp_path: Path) -> None:
     assert source.peer_kind(GROUP_NAME) == "group"
     assert source.resolve_username(FRIEND_NAME) == FRIEND
     assert source.resolve_username(GROUP_NAME) == GROUP
+
+
+# --------------------------------- 好友私聊媒体/引用入站回归（fixture 级）
+IMG_PAYLOAD = b"\x89PNG\r\n\x1a\ngoodfileimg"
+VOICE_PAYLOAD = b"RIFFvoicepayload"
+VOICE_NAME = "voice.amr"
+FILE_TITLE = "报告.pdf"
+QUOTE_REPLY = "收到"
+QUOTED_ORIGINAL = "早"
+
+FILE_XML = f'<msg><appmsg><title>{FILE_TITLE}</title><type>6</type></appmsg></msg>'
+QUOTE_XML = (
+    f"<msg><appmsg><title>{QUOTE_REPLY}</title><type>57</type>"
+    f'<refermsg><displayname>{SELF_NAME}</displayname>'
+    f"<content>{QUOTED_ORIGINAL}</content><type>1</type></refermsg>"
+    "</appmsg></msg>"
+)
+
+
+def add_media_rows(
+    path: Path, rows: list[tuple[int, str, str, int, int]]
+) -> None:
+    """往 make_media_db 建好的 message_resource 表追加行（同一 schema）。"""
+    with sqlite3.connect(path) as con:
+        con.executemany("INSERT INTO message_resource VALUES (?, ?, ?, ?, ?)", rows)
+
+
+def build_friend_media_store(tmp_path: Path) -> tuple[LocalMessageStore, Path]:
+    """好友会话 5 类入站：text / image / voice / file(appmsg) / quote。
+
+    media 已启用且图片/语音文件真实存在； voice 语音时长 3000。
+    """
+    root = tmp_path / "mirror"
+    (root / "media").mkdir(parents=True)
+    (root / "media/img.png").write_bytes(IMG_PAYLOAD)
+    (root / "media" / VOICE_NAME).write_bytes(VOICE_PAYLOAD)
+    make_contact_db(root / "contact/contact.db", contacts=[(FRIEND, "", FRIEND_NAME)])
+    make_message_db(
+        root / "message/message_0.db",
+        name2id={1: FRIEND, 2: SELF},
+        tables={
+            FRIEND: [
+                text_row(1, QUOTED_ORIGINAL, created=1001),
+                text_row(1, "", created=1002, local_type=3),
+                text_row(1, "", created=1003, local_type=34),
+                text_row(1, FILE_XML, created=1004, local_type=49),
+                text_row(1, QUOTE_XML, created=1005, local_type=49),
+            ]
+        },
+    )
+    make_media_db(
+        root / "message/message_resource.db",
+        local_id=2,
+        local_path="media/img.png",
+        name="img.png",
+        size=len(IMG_PAYLOAD),
+        duration=0,
+    )
+    add_media_rows(
+        root / "message/message_resource.db",
+        [(3, "media/voice.amr", VOICE_NAME, len(VOICE_PAYLOAD), 3000)],
+    )
+    store = LocalMessageStore(
+        PathOnlyMirrors(root),
+        self_username=SELF,
+        self_display_name=SELF_NAME,
+        message_rels=["message/message_0.db"],
+        media_enabled=True,
+        media_storage_root=str(root),
+    )
+    return store, root
+
+
+def test_friend_recent_media_and_quote_end_to_end(tmp_path: Path) -> None:
+    store, root = build_friend_media_store(tmp_path)
+    ref = store.resolve_any(FRIEND_NAME)
+    assert ref is not None
+    assert ref.kind == "friend"
+
+    entries = store.recent(ref)
+
+    assert [entry["kind"] for entry in entries] == [
+        "text", "image", "voice", "link", "quote",
+    ]
+    assert [entry["text"] for entry in entries] == [
+        QUOTED_ORIGINAL, "[图片]", "[语音]", FILE_TITLE, QUOTE_REPLY,
+    ]
+    # 好友已联系入 contact：所有条目的昵称都是好友显示名。
+    assert all(entry["nickname"] == FRIEND_NAME for entry in entries)
+    assert [entry["ts"] for entry in entries] == [1001, 1002, 1003, 1004, 1005]
+
+    image = entries[1]
+    assert image["media"] == {
+        "kind": "image",
+        "path": str((root / "media/img.png").resolve()),
+        "name": "img.png",
+        "size": len(IMG_PAYLOAD),
+        "duration": 0,
+    }
+    voice = entries[2]
+    assert voice["media"]["kind"] == "voice"
+    assert voice["media"]["name"] == VOICE_NAME
+    assert voice["media"]["size"] == len(VOICE_PAYLOAD)
+    assert voice["media"]["duration"] == 3000
+    # 文件消息走 appmsg/link 映射（现有实现没有独立 file kind），且无媒体元数据。
+    assert "media" not in entries[3]
+    # quote：同群场景只多出 reply 字段，不进媒体管线。
+    quote = entries[4]
+    assert quote["reply_to"] == QUOTED_ORIGINAL
+    assert quote["reply_author"] == SELF_NAME
+    assert "media" not in quote

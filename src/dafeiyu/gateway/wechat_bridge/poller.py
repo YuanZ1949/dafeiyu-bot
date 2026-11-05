@@ -45,6 +45,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -75,6 +76,19 @@ def _alias_of(chat_id: str) -> str | None:
         return None
     alias = value[4:].strip()
     return alias or None
+
+
+def _accepts_user_alias(factory: Callable[..., Any]) -> bool:
+    """工厂签名是否接 ``user_alias``：旧测试替身没有这个参数，不能硬塞。"""
+    try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or parameter.name == "user_alias"
+        for parameter in signature.parameters.values()
+    )
 
 #: 反挂死护栏：本模块的每一个 await 都不超过这个秒数（与 PART A 一致）。
 MAX_AWAIT = 5.0
@@ -800,13 +814,20 @@ class PollingLoop:
         except Exception as exc:  # noqa: BLE001 - 身份歧义时 fail-closed，不猜
             logger.warning("会话 %r 无法解析稳定 alias，跳过：%s", group, exc)
             return None
-        aligner = self._aligner_factory(
-            chat_id,
-            group,
-            account_nickname=self._account_nickname,
-            chat_type=chat_type,
-            clock=self._clock,
-        )
+        aligner_kwargs: dict[str, Any] = {
+            "account_nickname": self._account_nickname,
+            "chat_type": chat_type,
+            "clock": self._clock,
+        }
+        # 好友私聊：user_id 用 registry 解析出的稳定 chat_id；群聊不传回调，
+        # 成员仍按昵称生成会话内随机 alias（重启语义不变）。
+        if chat_type == "private" and _accepts_user_alias(self._aligner_factory):
+
+            def stable_alias(_name: str) -> str:
+                return chat_id
+
+            aligner_kwargs["user_alias"] = stable_alias
+        aligner = self._aligner_factory(chat_id, group, **aligner_kwargs)
         # 旧替身没有 seed：跳过续跑，退回「第一轮只建基线」的语义。
         seed = getattr(aligner, "seed", None)
         restored = self._align_state.get(group)

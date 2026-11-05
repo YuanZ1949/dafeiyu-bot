@@ -802,3 +802,108 @@ async def test_gated_round_still_emits_health_frames(tmp_path: Path) -> None:
 
     assert [f.get("type") for f in frames] == ["health", "health", "health"]
     assert driver.opened == []
+
+
+# ------------------------------------------------ (j) 私聊 user_id 钉在稳定 chat_id
+class _FriendRegistry:
+    """假身份表：好友解析成固定的稳定 alias，群走显示名直译。"""
+
+    def chat_id(self, display_name: str, *, kind: str = "group") -> str:
+        if kind == "friend":
+            return "wxg:friend1"
+        return f"wxg:{display_name}"
+
+
+def _friend_loop(tmp_path: Path, driver: Any, registry: Any, **kwargs: Any) -> PollingLoop:
+    """最小注入的轮询循环：只为直接调用 `_aligner`，不启动 UIA 线程。"""
+    return PollingLoop(
+        _wechat(tmp_path),
+        driver,
+        probe=_probe,
+        registry=registry,
+        **kwargs,
+    )
+
+
+def test_friend_inbound_user_id_equals_stable_chat_id(tmp_path: Path) -> None:
+    poller = _friend_loop(
+        tmp_path,
+        FakeDriver({"好友甲": [[("阿猫", "开场")]]}),
+        _FriendRegistry(),
+    )
+
+    aligner = poller._aligner("好友甲", kind="friend")
+    assert aligner is not None and aligner.chat_type == "private"
+    aligner.poll([("阿猫", "开场")])
+    frames = list(aligner.poll([("阿猫", "开场"), ("阿猫", "新一"), ("阿猫", "新二")]).messages)
+
+    assert len(frames) == 2
+    assert frames[0]["chat_id"] == "wxg:friend1"
+    assert frames[0]["user_id"] == "wxg:friend1"
+    # 同一次（连续）poll 的新消息 user_id 不变。
+    assert frames[1]["user_id"] == "wxg:friend1"
+
+
+def test_friend_inbound_user_id_stable_on_repeated_polls(tmp_path: Path) -> None:
+    poller = _friend_loop(
+        tmp_path,
+        FakeDriver({"好友甲": [[("甲", "开场")]]}),
+        _FriendRegistry(),
+    )
+    aligner = poller._aligner("好友甲", kind="friend")
+    assert aligner is not None
+
+    window: list[tuple[str, str]] = [("甲", "开场"), ("甲", "一")]
+    first = aligner.poll(list(window))
+
+    window.append(("乙（改名后）", "二"))
+    second = aligner.poll(list(window))
+
+    for frame in (*first.messages, *second.messages):
+        assert frame["user_id"] == frame["chat_id"] == "wxg:friend1"
+
+
+def test_group_aligner_does_not_receive_user_alias(tmp_path: Path) -> None:
+    """群聊分支不许传回调：成员 user_id 仍是会话内随机 alias，不等于 chat_id。"""
+
+    class _GroupRegistry:
+        def chat_id(self, display_name: str, *, kind: str = "group") -> str:
+            return "wxg:g1"
+
+    poller = _friend_loop(tmp_path, FakeDriver(), _GroupRegistry())
+    aligner = poller._aligner("老友群", kind="group")
+    assert aligner is not None and aligner.chat_type == "group"
+    aligner.poll([("甲", "开场")])
+    frame = aligner.poll([("甲", "开场"), ("甲", "新")]).messages[0]
+
+    assert frame["chat_id"] == "wxg:g1"
+    assert frame["user_id"] != "wxg:g1"
+
+
+def test_aligner_factory_without_user_alias_kwarg_still_works(tmp_path: Path) -> None:
+    """旧测试替身工厂没有 ``user_alias`` 参数：friend 分支不能硬塞、也不能吞 TypeError。"""
+
+    class _Double:
+        def __init__(
+            self,
+            chat_id: str,
+            chat_name: str,
+            *,
+            account_nickname: str,
+            chat_type: str,
+            clock: Any,
+        ) -> None:
+            self.chat_id = chat_id
+            self.chat_type = chat_type
+
+    poller = _friend_loop(
+        tmp_path,
+        FakeDriver(),
+        _FriendRegistry(),
+        aligner_factory=_Double,
+    )
+    aligner = poller._aligner("好友甲", kind="friend")
+
+    assert isinstance(aligner, _Double)
+    assert aligner.chat_id == "wxg:friend1"
+    assert aligner.chat_type == "private"
