@@ -368,6 +368,12 @@ class Service:
         self._group_names: dict[str, tuple[str, float]] = {}
         # 群名刷新是后台任务：网关慢/断线不能拖住消息处理。
         self._bg_tasks: set[asyncio.Task[Any]] = set()
+        # 微信 4.x 图片 .dat 的 AES key（cfgDword 派生）：懒解析、进程内缓存；
+        # 扫描进程内存必须离开事件环，这里只保留一次性的后台任务状态。
+        self._media_resolver: Any = None
+        self._media_resolver_ready = False
+        self._media_resolver_lock = threading.Lock()
+        self._media_scan_lock = threading.Lock()
 
     def _adapter_for(self, chat_id: str) -> Adapter:
         """按会话 id 的通道前缀选适配器；单一派生点是 channel_of。"""
@@ -414,6 +420,7 @@ class Service:
 
     async def start(self) -> None:
         self._start_scheduler()
+        self._start_media_key_prewarm()
         for adapter in self.adapters.values():
             adapter.on_message(self.handle)
             on_recall = getattr(adapter, "on_recall", None)
@@ -715,6 +722,101 @@ class Service:
         elif any(word in text for word in self._MOOD_PRAISE):
             self.store.note_bot_mood("被夸了一句，有点飘")
 
+    def _wechat_media_enabled(self) -> bool:
+        media = getattr(getattr(self.settings, "wechat", None), "media", None)
+        return bool(getattr(media, "enabled", False))
+
+    def _media_key_resolver(self) -> Any:
+        """懒建微信图片密钥解析器；未启用 / 导入失败时返回 ``None``。
+
+        解析器本身不做 I/O；真正读缓存与扫内存都发生在 ``resolve`` /
+        ``cached`` 里。导入失败只降级为「图片按占位处理」，不影响入站。
+        """
+        if self._media_resolver_ready:
+            return self._media_resolver
+        with self._media_resolver_lock:
+            if self._media_resolver_ready:
+                return self._media_resolver
+            self._media_resolver_ready = True
+            if not self._wechat_media_enabled():
+                return None
+            try:
+                from .gateway.wechat_bridge.media.keygen import MediaKeyResolver
+
+                wechat = getattr(self.settings, "wechat", None)
+                media = getattr(wechat, "media", None)
+                self._media_resolver = MediaKeyResolver(
+                    db_root=str(getattr(wechat, "local_db_root", "") or "") or None,
+                    storage_root=str(getattr(media, "storage_root", "") or ""),
+                )
+            except Exception:  # noqa: BLE001 - 密钥发现失败只影响图片
+                log.debug("微信图片密钥解析器不可用，图片按占位处理", exc_info=True)
+                self._media_resolver = None
+        return self._media_resolver
+
+    def _start_media_key_prewarm(self) -> None:
+        """启动时后台预热：提前从缓存或进程内存拿到 AES key。"""
+        resolver = self._media_key_resolver()
+        if resolver is None:
+            return
+
+        def run() -> None:
+            try:
+                if resolver.prewarm():
+                    log.info("微信图片密钥已就绪")
+            except Exception:  # noqa: BLE001 - 预热失败不影响启动
+                log.debug("微信图片密钥预热失败", exc_info=True)
+
+        try:
+            threading.Thread(
+                target=run, name="wechat-media-key-prewarm", daemon=True
+            ).start()
+        except RuntimeError:
+            log.debug("微信图片密钥预热线程无法启动")
+
+    def _decode_wechat_dat(self, data: bytes) -> bytes | None:
+        """``materialize_attachments`` 用的 ``decode``：只解已能证明是图片的。
+
+        V2 需要 AES key。命中本进程缓存就同步解；没命中先按旧格式尝试（V2
+        会保持占位），同时把扫描丢到后台线程——事件环上不能做内存扫描。
+        """
+        try:
+            from .gateway.wechat_bridge.media.dat import decode_dat
+        except Exception:  # noqa: BLE001 - 模块缺失按原字节语义处理
+            return None
+        resolver = self._media_key_resolver()
+        if resolver is None:
+            return decode_dat(data)
+        key = resolver.cached(data)
+        if key is not None:
+            return decode_dat(data, aes_key=key.aes_key, xor_key=key.xor_key)
+        self._kick_media_key_scan(data)
+        return decode_dat(data)
+
+    def _kick_media_key_scan(self, sample: bytes) -> None:
+        """同一时刻最多一个后台扫描；失败由 resolver 自己的冷却兜住。"""
+        resolver = self._media_resolver
+        if resolver is None:
+            return
+        if not self._media_scan_lock.acquire(blocking=False):
+            return
+
+        def run() -> None:
+            try:
+                resolver.resolve(sample)
+            except Exception:  # noqa: BLE001 - 后台任务不能把进程带崩
+                log.debug("微信图片密钥后台扫描失败", exc_info=True)
+            finally:
+                self._media_scan_lock.release()
+
+        try:
+            threading.Thread(
+                target=run, name="wechat-media-key", daemon=True
+            ).start()
+        except RuntimeError:
+            self._media_scan_lock.release()
+            log.debug("微信图片密钥扫描线程无法启动")
+
     async def handle(self, msg: Message) -> None:
         annotate = self._tools_enabled()
         # 图片物化必须在入库前：content 字符串是图片路径到达大脑的唯一载体。
@@ -723,14 +825,9 @@ class Service:
         await materialize(msg, self.settings, annotate=annotate)
         if annotate:
             # 微信本地库附件同理：只有能被 read 看到时才值得落盘。
-            decode = None
-            if self.settings.wechat.media.enabled:
-                try:
-                    from .gateway.wechat_bridge.media.dat import decode_dat
-
-                    decode = decode_dat
-                except Exception:
-                    log.debug("微信 .dat 解码模块不可用，按原字节复制", exc_info=True)
+            decode = (
+                self._decode_wechat_dat if self._wechat_media_enabled() else None
+            )
             await materialize_attachments(msg, self.settings, decode=decode)
         # 机器人自己的消息也要先落库（作为 assistant 轮次），但不触发任何回复。
         if not self.store.add_message(msg):
