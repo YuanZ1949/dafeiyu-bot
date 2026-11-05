@@ -47,7 +47,7 @@ from urllib.request import urlopen
 
 from dafeiyu.config import ConfigError, Settings, WeChatConfig, load_settings
 
-from .server import BridgeServer, pump_frames
+from .server import DEFAULT_INBOUND_STATE, BridgeServer, pump_frames
 
 __all__ = ["main", "run"]
 
@@ -415,6 +415,7 @@ async def run(
     frame_source: FrameSource | None = None,
     poller_factory: PollerFactory | None = None,
     sender_factory: SenderFactory | None = None,
+    state_path: str | Path | None = None,
 ) -> int:
     """加载配置、fail-closed 检查、起服务器、轮询、等待停机。
 
@@ -580,6 +581,9 @@ async def run(
         bridge_token=wechat.bridge_token,
         command_handler=_handle_command,
         on_stop_requested=_signal_stop,
+        # 入站水位落盘只由调用方显式开启：生产 `main()` 传默认路径；
+        # 测试/替身不传 = 纯内存，绝不碰 data/wechat-bridge/inbound_state.json。
+        state_path=state_path,
     )
     bound_port = await asyncio.wait_for(server.start(), _AWAIT_TIMEOUT)
     logger.info("微信桥已监听 %s:%s", wechat.bridge_host, bound_port)
@@ -920,7 +924,13 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     try:
-        return asyncio.run(run(sys.argv[1:] if argv is None else list(argv)))
+        return asyncio.run(
+            run(
+                sys.argv[1:] if argv is None else list(argv),
+                # 只有真实进程入口开启入站水位持久化（硬化重投）。
+                state_path=DEFAULT_INBOUND_STATE,
+            )
+        )
     except KeyboardInterrupt:
         # SIGINT hook 没接住时 asyncio.run 的兜底：按用户主动停机处理。
         return 0

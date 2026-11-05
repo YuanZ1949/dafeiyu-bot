@@ -67,7 +67,8 @@ _MAX_FRAME = 1 << 20
 UNACKED_MAX = 200
 #: 入站水位默认落盘路径：与 `DEFAULT_KILL_SWITCH` / 对齐状态同一 `data/` 约定。
 DEFAULT_INBOUND_STATE = "data/wechat-bridge/inbound_state.json"
-#: 入站 seq 每推进这么多帧落一次盘（ack 每次即时落盘，不逐帧 fsync）。
+#: 旧版水位落盘节流常量（每 N 帧一次）。保留名字供旧调用方/测试引用，
+#: 现在未确认帧每帧都落盘（缓冲上限 200 条），不再依赖它。
 _INBOUND_SAVE_EVERY = 50
 #: 每个连接记录的已发 seq 历史上限：广播重试与 hello 重投按它对同一连接去重。
 _CONN_SEQ_MAX = 2048
@@ -184,10 +185,10 @@ class BridgeServer:
         self._broadcast_timeout: float = (
             _AWAIT_TIMEOUT if broadcast_timeout is None else float(broadcast_timeout)
         )
-        # 入站水位文件：默认 data/wechat-bridge/inbound_state.json（测试传 tmp_path）。
-        self.state_path = (
-            Path(str(state_path)) if state_path else Path(DEFAULT_INBOUND_STATE)
-        )
+        # 入站水位文件：显式传入才落盘（生产入口传 DEFAULT_INBOUND_STATE，
+        # 测试传 tmp_path）。None = 纯内存水位，绝不写生产文件——否则没传参的
+        # 测试会把伪造帧写进 data/wechat-bridge/inbound_state.json。
+        self.state_path = Path(str(state_path)) if state_path else None
         self._server: Any | None = None
         self._stop: asyncio.Future[None] | None = None
         self._closed: bool = False
@@ -371,14 +372,15 @@ class BridgeServer:
         frame["seq"] = self._inbound_seq
         envelope["seq"] = self._inbound_seq
         self._unacked.append((self._inbound_seq, envelope))
-        if self._inbound_seq % _INBOUND_SAVE_EVERY == 0:
-            self._save_inbound_state()
+        # 未确认帧随水位一起落盘：硬杀进程后仍能靠 hello 重投把它补出去。
+        # 缓冲上限 200 条，文件很小；失败只记 debug，不影响发帧。
+        self._save_inbound_state()
 
     # ------------------------------------------------------- 入站水位（P3-11）
     def _load_inbound_state(self) -> None:
-        """启动时恢复水位；缺文件/损坏一律从 0 开始并告警，绝不因此崩溃。"""
+        """启动时恢复水位与未确认帧；缺文件/损坏一律从 0 开始并告警，绝不崩溃。"""
         path = self.state_path
-        if not path.exists():
+        if path is None or not path.exists():
             return
         try:
             raw = json.loads(path.read_text("utf-8"))
@@ -388,23 +390,84 @@ class BridgeServer:
                 if seq >= 0 and 0 <= acked <= seq:
                     self._inbound_seq = seq
                     self._inbound_acked = acked
+                    self._restore_unacked(raw.get("frames"), seq, acked)
                     return
         except Exception as exc:  # noqa: BLE001 - 水位只影响重投，不许影响启动
             logger.warning("微信桥入站水位文件损坏，按 0 处理：%s", exc)
             return
         logger.warning("微信桥入站水位文件内容非法，按 0 处理：%s", path)
 
+    def _restore_unacked(self, frames: Any, seq: int, acked: int) -> None:
+        """校验并恢复 `frames` 里的未确认帧：非法条目跳过、重复 seq 只留第一条。
+
+        旧格式（无 `frames`）按空缓冲处理，不告警。恢复结果按 seq 升序，
+        最多 `UNACKED_MAX` 条（与运行期 deque 一样保留最新的窗口）。
+        """
+        if frames is None:
+            return
+        if not isinstance(frames, list):
+            logger.warning("微信桥入站帧缓冲格式非法，按空处理：%s", self.state_path)
+            return
+        valid: dict[int, dict[str, Any]] = {}
+        skipped = 0
+        for item in frames:
+            if not isinstance(item, dict):
+                skipped += 1
+                continue
+            frame_seq = item.get("seq")
+            frame = item.get("frame")
+            if not isinstance(frame, dict):
+                skipped += 1
+                continue
+            # bool 是 int 的子类，这里只认真正的正整数 seq。
+            if type(frame_seq) is not int or frame_seq <= 0:
+                skipped += 1
+                continue
+            if frame_seq <= acked or frame_seq > seq:
+                skipped += 1
+                continue
+            inner = frame.get("seq")
+            if inner is None:
+                # 旧数据可能只在顶层记了 seq：回填进帧内，重投时与协议一致。
+                frame["seq"] = frame_seq
+            elif type(inner) is not int or inner != frame_seq:
+                skipped += 1
+                continue
+            if frame_seq in valid:
+                skipped += 1
+                continue
+            valid[frame_seq] = frame
+        if skipped:
+            # 一次汇总告警，避免坏文件把启动日志刷屏。
+            logger.warning(
+                "微信桥入站帧缓冲有 %d 条非法条目，已跳过：%s",
+                skipped,
+                self.state_path,
+            )
+        self._unacked.extend(sorted(valid.items())[-UNACKED_MAX:])
+
     def _save_inbound_state(self) -> None:
-        """水位落盘：临时文件 + ``os.replace`` 原子替换；失败只记 debug。"""
+        """水位 + 未确认帧落盘：临时文件 + ``os.replace`` 原子替换；失败只记 debug。
+
+        `state_path` 为 None（未显式开启持久化）时什么都不写。
+        """
         path = self.state_path
+        if path is None:
+            return
         try:
+            payload = {
+                "seq": self._inbound_seq,
+                "acked": self._inbound_acked,
+                # 已 ack 的帧不在缓冲里，这里只写窗口内的未确认帧（升序）。
+                "frames": [
+                    {"seq": seq, "frame": envelope}
+                    for seq, envelope in self._unacked
+                ],
+            }
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(path.name + ".tmp")
             tmp.write_text(
-                json.dumps(
-                    {"seq": self._inbound_seq, "acked": self._inbound_acked},
-                    ensure_ascii=False,
-                ),
+                json.dumps(payload, ensure_ascii=False),
                 "utf-8",
             )
             os.replace(tmp, path)

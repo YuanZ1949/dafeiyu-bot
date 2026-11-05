@@ -1419,7 +1419,7 @@ async def test_ack_trims_unacked_and_persists(tmp_path: Path) -> None:
             assert server._inbound_seq == 2
 
             state = json.loads((tmp_path / "state.json").read_text("utf-8"))
-            assert state == {"seq": 2, "acked": 2}
+            assert state == {"seq": 2, "acked": 2, "frames": []}
     finally:
         await asyncio.wait_for(server.stop(), STEP)
 
@@ -1586,7 +1586,7 @@ async def test_inbound_state_never_regresses_across_restart(tmp_path: Path) -> N
     finally:
         await asyncio.wait_for(server.stop(), STEP)
 
-    assert json.loads(path.read_text("utf-8")) == {"seq": 2, "acked": 2}
+    assert json.loads(path.read_text("utf-8")) == {"seq": 2, "acked": 2, "frames": []}
 
     server2 = BridgeServer(state_path=path)
     assert server2._inbound_seq == 2
@@ -1599,9 +1599,11 @@ async def test_inbound_state_never_regresses_across_restart(tmp_path: Path) -> N
             assert third["seq"] == 3, "重启后 seq 必须接着水位继续，而不是回到 1"
     finally:
         await asyncio.wait_for(server2.stop(), STEP)
-    # seq=3 不属于任何落盘点（ack 与每 50 帧才落）：文件不被回退覆盖，
-    # 仍保留上次 ack 时的水位。
-    assert json.loads(path.read_text("utf-8")) == {"seq": 2, "acked": 2}
+    # 未确认帧现在随水位每帧落盘：seq=3 的帧在重启回放窗口内，不会被回退覆盖。
+    state = json.loads(path.read_text("utf-8"))
+    assert state["seq"] == 3
+    assert state["acked"] == 2
+    assert [item["seq"] for item in state["frames"]] == [3]
 
 
 async def test_corrupt_state_file_treated_as_zero_without_crash(
@@ -1622,3 +1624,225 @@ async def test_corrupt_state_file_treated_as_zero_without_crash(
         assert "水位" in caplog.text or "watermark" in caplog.text
     finally:
         await asyncio.wait_for(server.stop(), STEP)
+
+
+# ------------------------------------- 未确认帧持久化 / 硬杀重放（P3-11）
+async def test_unacked_frames_survive_hard_kill_and_replay_on_hello(
+    tmp_path: Path,
+) -> None:
+    """不调用 stop 直接换实例：未确认帧从状态文件恢复，hello(0) 原样重投。"""
+    path = tmp_path / "state.json"
+    server = BridgeServer(state_path=path)
+    port = await asyncio.wait_for(server.start(), STEP)
+    originals: dict[str, dict[str, Any]] = {}
+    ws = await connect(_uri(port))
+    try:
+        for text in ("m1", "m2"):
+            frame = _bridge_msg(text)
+            originals[text] = frame
+            await asyncio.wait_for(server.broadcast(frame), STEP)
+            await _recv_until(
+                ws, lambda f, t=text: f.get("type") == "message" and f.get("text") == t
+            )
+    finally:
+        await ws.close()
+
+    # 模拟进程被硬杀：server 既不 stop 也不额外落盘；文件在 broadcast 时已写好。
+    state = json.loads(path.read_text("utf-8"))
+    assert [item["seq"] for item in state["frames"]] == [1, 2]
+    # 状态文件是本地数据文件，允许包含帧正文（用于重投）。
+    assert [item["frame"]["text"] for item in state["frames"]] == ["m1", "m2"]
+
+    server2 = BridgeServer(state_path=path)
+    assert [seq for seq, _ in server2._unacked] == [1, 2]
+    port2 = await asyncio.wait_for(server2.start(), STEP)
+    try:
+        async with connect(_uri(port2)) as ws2:
+            await asyncio.wait_for(
+                ws2.send(
+                    json.dumps(
+                        {"v": 1, "id": "h1", "action": "hello", "params": {"last_seq": 0}}
+                    )
+                ),
+                STEP,
+            )
+            first = await _recv_json(ws2)
+            assert first["type"] == "message"
+            assert first["text"] == "m1"
+            assert first["seq"] == originals["m1"]["seq"] == 1
+            second = await _recv_json(ws2)
+            assert second["type"] == "message"
+            assert second["text"] == "m2"
+            assert second["seq"] == originals["m2"]["seq"] == 2
+            receipt = await _recv_json(ws2)
+            assert receipt["id"] == "h1" and receipt["ok"] is True
+    finally:
+        await _stopped(server2)
+        await _stopped(server)
+
+
+async def test_acked_frames_not_replayed_after_restart(tmp_path: Path) -> None:
+    """ack(1) 后重建：只剩 seq=2 在文件里，hello(0) 只重投它。"""
+    path = tmp_path / "state.json"
+    server = BridgeServer(state_path=path)
+    port = await asyncio.wait_for(server.start(), STEP)
+    ws = await connect(_uri(port))
+    try:
+        for text in ("m1", "m2"):
+            await asyncio.wait_for(server.broadcast(_bridge_msg(text)), STEP)
+            await _recv_until(
+                ws, lambda f, t=text: f.get("type") == "message" and f.get("text") == t
+            )
+        await asyncio.wait_for(
+            ws.send(json.dumps({"v": 1, "id": "a1", "action": "ack", "params": {"seq": 1}})),
+            STEP,
+        )
+        assert (await _recv_until(ws, lambda f: f.get("id") == "a1"))["ok"] is True
+    finally:
+        await ws.close()
+
+    state = json.loads(path.read_text("utf-8"))
+    assert state["acked"] == 1
+    assert [item["seq"] for item in state["frames"]] == [2]
+
+    server2 = BridgeServer(state_path=path)
+    assert [seq for seq, _ in server2._unacked] == [2]
+    port2 = await asyncio.wait_for(server2.start(), STEP)
+    try:
+        async with connect(_uri(port2)) as ws2:
+            await asyncio.wait_for(
+                ws2.send(
+                    json.dumps(
+                        {"v": 1, "id": "h1", "action": "hello", "params": {"last_seq": 0}}
+                    )
+                ),
+                STEP,
+            )
+            only = await _recv_json(ws2)
+            assert only["type"] == "message" and only["seq"] == 2
+            assert only["text"] == "m2"
+            receipt = await _recv_json(ws2)
+            assert receipt["id"] == "h1" and receipt["ok"] is True
+    finally:
+        await _stopped(server2)
+        await _stopped(server)
+
+
+async def test_legacy_state_without_frames_starts_empty(tmp_path: Path) -> None:
+    """旧格式只有 seq/acked：启动不崩、缓冲为空，后续从水位 +1 继续发号。"""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"seq": 3, "acked": 0}), encoding="utf-8")
+
+    server = BridgeServer(state_path=path)
+    assert server._inbound_seq == 3
+    assert server._inbound_acked == 0
+    assert len(server._unacked) == 0
+    try:
+        assert await asyncio.wait_for(server.broadcast(_bridge_msg("m4")), STEP) == 0
+        assert server._inbound_seq == 4
+    finally:
+        await _stopped(server)
+    assert json.loads(path.read_text("utf-8"))["seq"] == 4
+
+
+async def test_restore_skips_bad_frame_entries(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """坏条目（非 int/0 seq、非 dict frame、越界、跨帧 seq 不符、重复）逐条跳过。"""
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "seq": 5,
+                "acked": 0,
+                "frames": [
+                    # 先放 seq=5 再放 seq=1：恢复后必须按 seq 升序。
+                    {"seq": 5, "frame": {"v": 1, "type": "message", "text": "backfill"}},
+                    {"seq": 1, "frame": {"v": 1, "type": "message", "text": "keep-1", "seq": 1}},
+                    {"seq": "x", "frame": {"v": 1, "type": "message", "seq": 1}},
+                    {"seq": 0, "frame": {"v": 1, "type": "message", "seq": 0}},
+                    {"seq": 4, "frame": "not-a-dict"},
+                    {"seq": 2, "frame": {"v": 1, "type": "message", "seq": 9}},
+                    {"seq": 6, "frame": {"v": 1, "type": "message", "seq": 6}},
+                    {"seq": 1, "frame": {"v": 1, "type": "message", "text": "dup", "seq": 1}},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING", logger="dafeiyu.gateway.wechat_bridge.server"):
+        server = BridgeServer(state_path=path)
+    assert [seq for seq, _ in server._unacked] == [1, 5]
+    first_seq, first_frame = server._unacked[0]
+    assert first_frame["text"] == "keep-1", "重复 seq 只保留第一条"
+    _, last_frame = server._unacked[1]
+    assert last_frame["seq"] == 5, "缺 seq 的帧回填顶层 seq"
+    assert caplog.text.count("非法条目") == 1, "坏条目只汇总告警一次，不刷屏"
+    await _stopped(server)
+
+
+async def test_no_state_path_means_no_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """不传 state_path = 纯内存水位：进程帧绝不写进默认生产文件（测试污染回归）。"""
+    monkeypatch.chdir(tmp_path)
+    server = BridgeServer()
+    assert server.state_path is None
+    port = await asyncio.wait_for(server.start(), STEP)
+    try:
+        async with connect(_uri(port)) as ws:
+            await asyncio.wait_for(server.broadcast(_bridge_msg("m1")), STEP)
+            await _recv_until(ws, lambda f: f.get("type") == "message")
+            await asyncio.wait_for(
+                ws.send(
+                    json.dumps({"v": 1, "id": "a1", "action": "ack", "params": {"seq": 1}})
+                ),
+                STEP,
+            )
+            receipt = await _recv_until(ws, lambda f: f.get("id") == "a1")
+            assert receipt["ok"] is True
+    finally:
+        await _stopped(server)
+    assert not (tmp_path / bridge_server.DEFAULT_INBOUND_STATE).exists()
+
+
+def test_main_entry_enables_state_persistence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """只有真实进程入口开启水位持久化：main() -> run(state_path=默认路径)。"""
+    captured: dict[str, Any] = {}
+
+    async def fake_run(
+        argv: list[str] | None = None,
+        *,
+        state_path: str | Path | None = None,
+        **kwargs: Any,
+    ) -> int:
+        captured["state_path"] = state_path
+        return 0
+
+    monkeypatch.setattr(bridge_main, "run", fake_run)
+    assert bridge_main.main([]) == 0
+    assert captured["state_path"] == bridge_server.DEFAULT_INBOUND_STATE
+    assert bridge_main.DEFAULT_INBOUND_STATE == bridge_server.DEFAULT_INBOUND_STATE
+
+
+async def test_run_forwards_state_path_to_server_factory() -> None:
+    """run() 把显式 state_path 原样交给 BridgeServer（默认 None 不落盘）。"""
+    recorded: dict[str, Any] = {}
+
+    class _Stop(Exception):
+        pass
+
+    def server_factory(*args: Any, **kwargs: Any) -> Any:
+        recorded.update(kwargs)
+        raise _Stop()
+
+    with pytest.raises(_Stop):
+        await bridge_main.run(
+            settings=SimpleNamespace(wechat=_wechat()),
+            driver_factory=type("FakeDriver", (), {}),
+            server_factory=server_factory,
+            frame_source=[],
+            state_path="data/custom-state.json",
+        )
+    assert recorded["state_path"] == "data/custom-state.json"
