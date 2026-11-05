@@ -47,6 +47,7 @@ __all__ = [
     "MediaKey",
     "MediaKeyResolver",
     "derive_aes_key",
+    "derive_emoticon_key",
     "guess_xor_key",
 ]
 
@@ -98,6 +99,17 @@ def derive_aes_key(dword: int, wxid: str) -> bytes:
     """按微信规则派生 AES-128 密钥（16 个 ASCII 十六进制字符）。"""
     digest = hashlib.md5(f"{dword}{wxid}".encode("utf-8")).hexdigest()
     return digest[:16].encode("ascii")
+
+
+def derive_emoticon_key(dword: int, wxid: str) -> bytes:
+    """派生表情缓存（``cache/*/Emoticon/...``）的 AES-128-CBC 密钥。
+
+    与图片 ``.dat`` 的差别有两处，容易混：
+
+    - 派生串多一个 ``EMOTICON`` 后缀；
+    - 取 **raw digest 的前 16 字节**，而不是它的 ASCII 十六进制前 16 个字符。
+    """
+    return hashlib.md5(f"{dword}{wxid}EMOTICON".encode("utf-8")).digest()[:16]
 
 
 def guess_xor_key(sample: bytes) -> int | None:
@@ -196,6 +208,7 @@ class MediaKeyResolver:
         self._retry_after = 0.0
         self._resolved = False
         self._cache_loaded = False
+        self._cache_values: tuple[int, int] | None = None
 
     # ------------------------------------------------------------- 公共接口
     def resolve(self, sample: bytes | bytearray | memoryview) -> MediaKey | None:
@@ -267,6 +280,31 @@ class MediaKeyResolver:
     def key(self) -> MediaKey | None:
         return self._key
 
+    @property
+    def dword(self) -> int:
+        """已解析的 ``cfgDword``；还没拿到时为 0。"""
+        return self._dword
+
+    def emoticon_key(self) -> bytes | None:
+        """表情缓存用的 AES-128-CBC 密钥（``IV == key``）；拿不到返回 ``None``。
+
+        只读已解析结果或落盘缓存，**绝不扫描内存**，可在事件环上调用。
+        表情没有 V2 头可供校验，因此这里只要求缓存里的 wxid 与当前账号一致；
+        真正的正确性由调用方「解密后必须出现 ``wxgf``」来证明。
+        """
+        with self._lock:
+            dword = self._dword
+            if not dword:
+                values = self._cache_values_from_disk()
+                if values is None:
+                    return None
+                dword = values[0]
+                self._dword = dword
+            wxid = self._resolve_wxid()
+            if not wxid:
+                return None
+            return derive_emoticon_key(dword, wxid)
+
     def _drop_key(self) -> None:
         """丢弃内存里的 key，允许下一次 ``resolve`` 重新扫描。"""
         self._key = None
@@ -275,6 +313,7 @@ class MediaKeyResolver:
         self._retry_after = 0.0
         # 落盘缓存可能也过期了，别在同一进程里反复读同一个坏文件。
         self._cache_loaded = True
+        self._cache_values = None
 
     @staticmethod
     def _matches(key: MediaKey, sample: bytes) -> bool:
@@ -290,25 +329,12 @@ class MediaKeyResolver:
 
     # ------------------------------------------------------------- 缓存
     def _load_cache(self, sample: bytes) -> None:
-        if self._cache_loaded:
+        values = self._cache_values_from_disk()
+        if values is None:
             return
-        self._cache_loaded = True
-        if self._cache_path is None:
-            return
-        try:
-            payload = json.loads(self._cache_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return
-        if not isinstance(payload, dict):
-            return
-        dword = payload.get("dword")
-        xor_key = payload.get("xor_key")
-        if not isinstance(dword, int) or isinstance(dword, bool):
-            return
-        if not isinstance(xor_key, int) or not 0 <= xor_key <= 0xFF:
-            return
+        dword, xor_key = values
         wxid = self._resolve_wxid()
-        if not wxid or payload.get("wxid") != wxid:
+        if not wxid:
             return
         key = MediaKey(derive_aes_key(dword, wxid), xor_key)
         if not self._validates(key, sample):
@@ -317,6 +343,35 @@ class MediaKeyResolver:
         self._key = key
         self._dword = dword
         log.info("使用缓存的微信图片密钥：cfgDword=%s", dword)
+
+    def _cache_values_from_disk(self) -> tuple[int, int] | None:
+        """读取并校验落盘缓存，返回 ``(dword, xor_key)``。
+
+        只校验结构与 wxid，不用样本验证 AES key：表情密钥只需要 ``dword``，
+        而表情缓存启动时不一定有 V2 图片样本可用。
+        """
+        if self._cache_loaded:
+            return self._cache_values
+        self._cache_loaded = True
+        if self._cache_path is None:
+            return None
+        try:
+            payload = json.loads(self._cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        dword = payload.get("dword")
+        xor_key = payload.get("xor_key")
+        if not isinstance(dword, int) or isinstance(dword, bool):
+            return None
+        if not isinstance(xor_key, int) or not 0 <= xor_key <= 0xFF:
+            return None
+        wxid = self._resolve_wxid()
+        if not wxid or payload.get("wxid") != wxid:
+            return None
+        self._cache_values = (dword, xor_key)
+        return self._cache_values
 
     def _save_cache(self) -> None:
         if self._cache_path is None or self._key is None or not self._dword:

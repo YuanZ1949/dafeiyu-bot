@@ -18,6 +18,7 @@ from dafeiyu.gateway.wechat_bridge.media.keygen import (
     MediaKey,
     MediaKeyResolver,
     derive_aes_key,
+    derive_emoticon_key,
     guess_xor_key,
 )
 
@@ -295,6 +296,50 @@ def test_without_wxid_returns_none(tmp_path: Path) -> None:
     )
 
     assert resolver.resolve(SAMPLE) is None
+
+
+# ---------------------------------------------------------------- 表情密钥
+def test_emoticon_key_reads_dword_from_cache_without_sample(tmp_path: Path) -> None:
+    (tmp_path / "media_key.json").write_text(
+        json.dumps({"dword": DWORD, "xor_key": XOR_KEY, "wxid": WXID}),
+        encoding="utf-8",
+    )
+    resolver = MediaKeyResolver(
+        wxid=WXID,
+        cache_path=tmp_path / "media_key.json",
+        pids=lambda: [],
+        memory_factory=lambda _pid: FakeMemory(),
+    )
+
+    assert resolver.emoticon_key() == derive_emoticon_key(DWORD, WXID)
+    assert resolver.dword == DWORD
+
+
+def test_emoticon_key_none_without_cache(tmp_path: Path) -> None:
+    resolver = MediaKeyResolver(
+        wxid=WXID,
+        cache_path=tmp_path / "missing.json",
+        pids=lambda: [],
+        memory_factory=lambda _pid: FakeMemory(),
+    )
+
+    assert resolver.emoticon_key() is None
+    assert resolver.dword == 0
+
+
+def test_emoticon_key_ignores_cache_for_other_wxid(tmp_path: Path) -> None:
+    (tmp_path / "media_key.json").write_text(
+        json.dumps({"dword": DWORD, "xor_key": XOR_KEY, "wxid": "wxid_other"}),
+        encoding="utf-8",
+    )
+    resolver = MediaKeyResolver(
+        wxid=WXID,
+        cache_path=tmp_path / "media_key.json",
+        pids=lambda: [],
+        memory_factory=lambda _pid: FakeMemory(),
+    )
+
+    assert resolver.emoticon_key() is None
 
 
 def test_prewarm_picks_attach_sample_and_resolves(tmp_path: Path) -> None:
