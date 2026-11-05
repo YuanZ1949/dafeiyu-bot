@@ -186,10 +186,13 @@ class MemoryActions:
         summarize: Callable[..., Any],
         extract: Callable[..., Any],
         delete_impression: Callable[[int], bool],
+        unblock: Callable[[], None] | None = None,
     ) -> None:
         self.summarize = summarize
         self.extract = extract
         self.delete_impression = delete_impression
+        # 可选：把同进程内各 worker 的内存退避一起清掉；未注入时只清库。
+        self.unblock = unblock
 
 
 def _json_ok(payload: Any) -> str | None:
@@ -2248,6 +2251,23 @@ def create_app(
                 {"error": f"读取记忆健康失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def memory_unblock(_: web.Request) -> web.Response:
+        """手动解除配额熔断：清掉库里的退避记录。
+
+        面板只在 ``quota.paused`` 时显示入口；清空后下一次健康快照会转为
+        正常，后台 worker 也会重新尝试（退避只在失败时重新写入）。
+        """
+        try:
+            cleared = control.store.clear_backoff()
+            if memory_actions is not None and memory_actions.unblock is not None:
+                memory_actions.unblock()
+        except Exception as exc:  # noqa: BLE001 - 清库失败按 500 回给面板
+            log.warning("解除配额熔断失败：%s", exc)
+            return web.json_response(
+                {"error": f"解除熔断失败：{exc.__class__.__name__}"}, status=500
+            )
+        return web.json_response({"ok": True, "cleared": cleared})
+
     async def post_summary(request: web.Request) -> web.Response:
         if memory_actions is None:
             return web.json_response({"error": "记忆操作未启用"}, status=503)
@@ -2808,6 +2828,7 @@ def create_app(
     app.router.add_post("/api/debug/batch", debug_batch)
     app.router.add_get("/api/memory", memory)
     app.router.add_get("/api/memory/health", memory_health)
+    app.router.add_post("/api/memory/unblock", memory_unblock)
     app.router.add_post("/api/memory/summaries", post_summary)
     app.router.add_post("/api/memory/impressions", post_impressions)
     app.router.add_patch(

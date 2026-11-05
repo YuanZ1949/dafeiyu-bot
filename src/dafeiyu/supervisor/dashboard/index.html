@@ -689,6 +689,10 @@
       </div>
     </details>
     <div class="kv" id="memory-health" role="status" aria-live="polite"></div>
+    <div class="row" id="memory-unblock-row" hidden>
+      <span class="kv">配额熔断会暂停摘要与印象的自动生成，到期会自行恢复。</span>
+      <button class="btn" id="btn-memory-unblock">解除熔断</button>
+    </div>
     <div class="mem-grid">
       <div class="mem-col">
         <h3>按日摘要</h3>
@@ -2299,6 +2303,8 @@ async function loadMemoryHealth() {
   const box = $("memory-health");
   try {
     const h = await api("/api/memory/health");
+    const paused = Boolean(h.quota && h.quota.paused);
+    $("memory-unblock-row").hidden = !paused;
     const parts = [];
     if (h.quota && h.quota.paused) {
       const until = Number(h.quota.until);
@@ -2335,6 +2341,18 @@ async function loadMemoryHealth() {
     box.style.color = "var(--warn)";
   }
   if (state) renderGlobalBanner(state);
+}
+
+// 手动解除配额熔断：清空后立刻重读体检，按钮会随 paused=false 自动隐藏。
+async function unblockMemoryQuota() {
+  try {
+    await api("/api/memory/unblock", { method: "POST", body: "{}" });
+    toast("已解除配额熔断");
+    await loadMemoryHealth();
+    loadMemory();
+  } catch (err) {
+    toast(`解除失败：${err.message}`, true);
+  }
 }
 
 function isoDateLocal(d) {
@@ -3597,6 +3615,7 @@ $("btn-backup-now").addEventListener("click", createBackup);
 $("btn-backup-restore").addEventListener("click", restoreBackup);
 $("btn-rotate-token").addEventListener("click", rotateControlToken);
 $("btn-refresh-memory").addEventListener("click", loadMemory);
+$("btn-memory-unblock").addEventListener("click", (ev) => withBusy(ev.currentTarget, unblockMemoryQuota));
 $("delete-user-form").addEventListener("submit", deleteUserMessages);
 $("btn-summarize").addEventListener("click", (ev) => withBusy(ev.currentTarget, triggerSummary));
 $("btn-extract").addEventListener("click", (ev) => withBusy(ev.currentTarget, triggerExtract));

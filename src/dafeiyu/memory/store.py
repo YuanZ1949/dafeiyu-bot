@@ -3405,9 +3405,20 @@ class Store:
         )
         self._conn.commit()
 
-    def clear_backoff(self, key: str) -> None:
-        self._conn.execute("DELETE FROM memory_backoff WHERE key = ?", (key,))
+    def clear_backoff(self, key: str | None = None) -> int:
+        """删除退避记录，返回删除的行数。
+
+        ``key`` 为 None 时清空整张表（面板「解除熔断」用）；给定时只删对应
+        的退避键，保持 ``FailureBackoff`` 成功/过期时的按 key 清除语义。
+        """
+        if key is None:
+            cursor = self._conn.execute("DELETE FROM memory_backoff")
+        else:
+            cursor = self._conn.execute(
+                "DELETE FROM memory_backoff WHERE key = ?", (key,)
+            )
         self._conn.commit()
+        return int(cursor.rowcount)
 
     def load_rate_limits(self) -> list[float]:
         """429 事件的墙钟时间戳（窗口裁剪由调用方做，库里只负责存）。"""

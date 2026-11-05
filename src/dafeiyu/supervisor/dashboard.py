@@ -36,6 +36,8 @@ BOT_SWITCH_TIMEOUT = 20.0
 # 删远端 session 要等 OpenCode 收尾，换脑/导出/整库备份更慢，不能沿用 2 秒。
 BOT_DELETE_TIMEOUT = 20.0
 BOT_BACKUP_TIMEOUT = 30.0
+# 附件流式转发每次读 64 KiB，兼顾吞吐和面板进程的内存峰值。
+BOT_STREAM_CHUNK = 64 * 1024
 MAX_AUDIT_LIMIT = 200
 DEFAULT_MAX_UPLOAD_MB = 512
 DASHBOARD_DIR = Path(__file__).with_name("dashboard")
@@ -699,6 +701,13 @@ def create_app(
     async def memory_health(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/memory/health")
 
+    async def memory_unblock(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call("POST", "/api/memory/unblock", payload)
+        return web.json_response(data, status=code)
+
     async def sessions(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/sessions")
 
@@ -746,6 +755,60 @@ def create_app(
     async def wechat_resume(_: web.Request) -> web.Response:
         code, data = await bot_call("POST", "/api/channels/wechat/resume", {})
         return web.json_response(data, status=code)
+
+    async def wechat_inject(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call("POST", "/api/channels/wechat/inject", payload)
+        return web.json_response(data, status=code)
+
+    async def get_mind(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/mind")
+
+    async def save_mind(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call("PUT", "/api/mind", payload)
+        return web.json_response(data, status=code)
+
+    async def workspace_file(request: web.Request) -> web.StreamResponse:
+        """附件回放：原样透传 Content-Type，边读边写，别把整个文件读进内存。"""
+        path = "/api/workspace/file"
+        # raw_query_string 保留前端 encodeURIComponent 后的编码，避免二次解码。
+        if request.rel_url.raw_query_string:
+            path = f"{path}?{request.rel_url.raw_query_string}"
+        # 复用会话默认的 2 秒总超时会把大文件拦腰截断，流式转发只限制连接阶段。
+        timeout = aiohttp.ClientTimeout(
+            total=None, sock_connect=BOT_TIMEOUT, sock_read=BOT_BACKUP_TIMEOUT
+        )
+        try:
+            async with bot_session().request(
+                "GET", path, headers=control_headers(), timeout=timeout
+            ) as resp:
+                headers: dict[str, str] = {}
+                for name in ("Content-Type", "Content-Disposition", "Cache-Control"):
+                    value = resp.headers.get(name)
+                    if value:
+                        headers[name] = value
+                response = web.StreamResponse(status=resp.status, headers=headers)
+                await response.prepare(request)
+                try:
+                    async for chunk in resp.content.iter_chunked(BOT_STREAM_CHUNK):
+                        if chunk:
+                            await response.write(chunk)
+                except (aiohttp.ClientError, TimeoutError):
+                    # 响应头已经发出，无法再改状态码，直接收尾让浏览器自行处理。
+                    pass
+                await response.write_eof()
+                return response
+        except TimeoutError:
+            return web.json_response({"error": "bot 响应超时"}, status=504)
+        except aiohttp.ClientError as exc:
+            return web.json_response(
+                {"error": f"bot 不可达：{exc.__class__.__name__}"}, status=502
+            )
 
     def _session_target(
         request: web.Request,
@@ -1116,6 +1179,7 @@ def create_app(
     app.router.add_get("/api/budget", budget)
     app.router.add_get("/api/memory/search", memory_search)
     app.router.add_get("/api/memory/health", memory_health)
+    app.router.add_post("/api/memory/unblock", memory_unblock)
     app.router.add_get("/api/memory/export", memory_export)
     app.router.add_get("/api/sessions", sessions)
     app.router.add_post("/api/debug/trigger", debug_trigger)
@@ -1130,8 +1194,12 @@ def create_app(
     app.router.add_put("/api/behavior", save_behavior)
     app.router.add_get("/api/groups", groups)
     app.router.add_put("/api/groups", save_groups)
+    app.router.add_get("/api/mind", get_mind)
+    app.router.add_put("/api/mind", save_mind)
+    app.router.add_get("/api/workspace/file", workspace_file)
     app.router.add_post("/api/channels/wechat/stop", wechat_stop)
     app.router.add_post("/api/channels/wechat/resume", wechat_resume)
+    app.router.add_post("/api/channels/wechat/inject", wechat_inject)
     app.router.add_get("/api/backup", backup)
     app.router.add_post("/api/memory/summaries", memory_summary)
     app.router.add_post("/api/memory/impressions", memory_impressions)

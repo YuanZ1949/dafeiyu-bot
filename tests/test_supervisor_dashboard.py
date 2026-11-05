@@ -69,7 +69,7 @@ async def read_sse_event(response) -> list[str]:
         lines.append(text)
 
 
-def make_app(tmp_path: Path, supervisor=None, qr: Path | None = None, on_shutdown=None, bot_url: str = BOT_URL):
+def make_app(tmp_path: Path, supervisor=None, qr: Path | None = None, on_shutdown=None, bot_url: str = BOT_URL, token="", auth=None):
     supervisor = supervisor or FakeSupervisor()
     hub = LogHub(tmp_path / "logs")
     app = create_app(
@@ -78,8 +78,9 @@ def make_app(tmp_path: Path, supervisor=None, qr: Path | None = None, on_shutdow
         logs=hub,
         qr_path=qr or tmp_path / "qrcode.png",
         bot_url=bot_url,
-        token="",
+        token=token,
         on_shutdown=on_shutdown,
+        auth=auth,
     )
     return app, supervisor, hub
 
@@ -1023,3 +1024,91 @@ async def test_session_timeline_rejects_traversal_without_calling_bot(
     assert good.status == 200
     assert good_data["chat"]["chat_id"] == "wxg:abc"
     assert seen == [("GET", "/api/sessions/group/wxg:abc/timeline")]
+
+
+async def test_mind_workspace_inject_and_unblock_proxies(tmp_path: Path) -> None:
+    """面板侧缺失的四个控制口端点要代理到 8788，并带上共享 token。"""
+    seen: list[tuple[str, str, str]] = []
+
+    async def mind(request: web.Request) -> web.Response:
+        seen.append((request.method, request.path, request.headers.get("X-Control-Token", "")))
+        if request.method == "PUT":
+            return web.json_response(await request.json())
+        return web.json_response({"observer_enabled": True, "observer_daily_calls": 3})
+
+    async def workspace(request: web.Request) -> web.Response:
+        seen.append((request.method, request.path, request.headers.get("X-Control-Token", "")))
+        assert request.query["path"] == "images/a.png"
+        return web.Response(
+            body=b"\x89PNG\r\n\x1a\n", headers={"Content-Type": "image/png"}
+        )
+
+    async def inject(request: web.Request) -> web.Response:
+        seen.append((request.method, request.path, request.headers.get("X-Control-Token", "")))
+        return web.json_response({"ok": True, "payload": await request.json()})
+
+    async def unblock(request: web.Request) -> web.Response:
+        seen.append((request.method, request.path, request.headers.get("X-Control-Token", "")))
+        return web.json_response({"ok": True, "cleared": 2})
+
+    bot_app = web.Application()
+    bot_app.router.add_get("/api/mind", mind)
+    bot_app.router.add_put("/api/mind", mind)
+    bot_app.router.add_get("/api/workspace/file", workspace)
+    bot_app.router.add_post("/api/channels/wechat/inject", inject)
+    bot_app.router.add_post("/api/memory/unblock", unblock)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    try:
+        app, _, _ = make_app(tmp_path, bot_url=url, token="secret")
+        async with running(app) as client:
+            got = await client.get("/api/mind")
+            got_data = await got.json()
+            saved = await client.put(
+                "/api/mind",
+                json={"observer_enabled": False, "observer_daily_calls": 9},
+            )
+            saved_data = await saved.json()
+            image = await client.get("/api/workspace/file?path=images%2Fa.png")
+            image_body = await image.read()
+            injected = await client.post(
+                "/api/channels/wechat/inject", json={"type": "message"}
+            )
+            injected_data = await injected.json()
+            cleared = await client.post("/api/memory/unblock", json={})
+            cleared_data = await cleared.json()
+    finally:
+        await bot_client.close()
+
+    assert got.status == 200
+    assert got_data["observer_daily_calls"] == 3
+    assert saved.status == 200
+    assert saved_data == {"observer_enabled": False, "observer_daily_calls": 9}
+    assert image.status == 200
+    assert image.headers["Content-Type"].startswith("image/png")
+    assert image_body == b"\x89PNG\r\n\x1a\n"
+    assert injected_data == {"ok": True, "payload": {"type": "message"}}
+    assert cleared.status == 200
+    assert cleared_data == {"ok": True, "cleared": 2}
+    assert seen == [
+        ("GET", "/api/mind", "secret"),
+        ("PUT", "/api/mind", "secret"),
+        ("GET", "/api/workspace/file", "secret"),
+        ("POST", "/api/channels/wechat/inject", "secret"),
+        ("POST", "/api/memory/unblock", "secret"),
+    ]
+
+
+async def test_index_has_mind_and_unblock_controls(tmp_path: Path) -> None:
+    app, _, _ = make_app(tmp_path)
+    async with running(app) as client:
+        text = await (await client.get("/")).text()
+
+    assert 'id="memory-unblock-row"' in text
+    assert 'id="btn-memory-unblock"' in text
+    assert "/api/memory/unblock" in text
+    assert "unblockMemoryQuota" in text
+    assert "/api/mind" in text
+    assert "/api/workspace/file" in text
+

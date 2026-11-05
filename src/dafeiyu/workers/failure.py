@@ -209,6 +209,15 @@ class FailureBackoff:
         if self._until.pop(key, None) is not None and self._persistence is not None:
             self._persistence.clear_backoff(_encode_key(key))
 
+    def reset(self) -> None:
+        """丢弃内存里的全部退避（面板手动解除熔断用）。
+
+        只清内存，不动持久化：库里的记录由控制口统一清理，避免同一个动作
+        在两个地方重复写。配额暂停期间 worker 不会回查数据库，所以不清
+        内存的话，熔断要等自然到期才真正恢复。
+        """
+        self._until.clear()
+
     def should_skip(self, key: Hashable) -> bool:
         key = _normalize_key(key)
         if key != QUOTA_KEY and self._active(QUOTA_KEY):
