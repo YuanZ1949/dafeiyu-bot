@@ -722,3 +722,231 @@ Get-Content logs\supervisor\wechat_bridge.log -Tail 10
   极端慢发送的残余窗口）。
 - 桥进程被硬杀（非正常停机）时，内存中未投递的 pending/队列帧仍会丢；
   正常停机与重连不会。
+
+---
+
+## 19. 私聊去重、稳定性与停止审计（2026-11-05 第六轮）
+
+对应提交（**仅本地，未 push**）：
+
+- `77d746b` 私聊 `user_id` 锚定稳定 `chat_id`，补好友媒体/引用入站回归
+- `a8677e3` 发送 `dedupe_key` 去重，堵回执丢失导致的重复补发
+- `55aac1a` supervisor 统一记录停止来源审计
+
+### 19.1 私聊 `user_id` 稳定化（修 §18.5 第一条边界）
+
+- `SessionAligner._user_id` 改为「`user_alias` 回调优先」：回调存在时先调用
+  （允许收到空昵称），返回非空即规范成 `wxg:<alias>`；只有回调缺失或返回空
+  才走原来的匿名槽位 / 昵称 uuid 缓存。
+- `PollingLoop._aligner` 只在 `kind == "friend"` 时传
+  `user_alias=lambda _name: chat_id`，群聊调用参数保持原样。
+- 结果：好友私聊帧的 `user_id` == 稳定 `chat_id`（如 `wxg:16588ff14d86`），
+  桥重启不变；群成员仍是会话内昵称别名。
+
+### 19.2 发送 `dedupe_key`（修 §18.5 第二条边界）
+
+- 协议：`send_text` 的 `params` 可带 `dedupe_key`（可选，无 key 时线协议与
+  回执形状完全不变）。
+- 服务侧只对声明 `supports_dedupe_key = True` 的 adapter 传该 kwarg，QQ 与
+  所有三参测试替身不受影响。
+- key 由 service 按分片生成：`reply:{chat_id}:{batch_anchor_message_id}:{index}`，
+  **首发与 outbox 补发复用同一个 key**（`pending_outbox.dedupe_key` 落库，
+  老库由 `_MIGRATIONS` 补列）。
+- 桥侧按 `(action, chat_id, dedupe_key)` 维护进程内表：TTL 3600s、上限 1024；
+  命中已完成结局直接重放（回执 `id` 用当前请求的），命中在途请求用
+  `asyncio.shield` 合流到同一次执行；超时/异常不缓存，后续同 key 可重新执行。
+- 残余窗口：桥重启丢内存缓存；跨重启的重复仍可能发生（见 §18.5）。
+
+### 19.3 好友私聊媒体/引用入站回归（P2-7）
+
+- 新增 fixture：好友会话 5 类入站（text / image / voice / file(appmsg) /
+  quote），媒体文件真实存在、`media_enabled=True`。
+- 断言链路 `LocalMessageStore.recent → LocalDbSource.snapshot →
+  SessionAligner.poll`：`kind`、`media`（path/name/size/duration）、
+  `reply_to` / `reply_to_bot` 全程透传；文件消息按现有 appmsg/link 映射，
+  无媒体元数据。
+- 未发现缺陷，只新增测试。
+
+### 19.4 supervisor 停止来源审计（P3-12）
+
+- 新增进程内 `StopOrigin` + `record_supervisor_stop` / `signal_stop`：
+  SIGINT/SIGTERM（actor=system，detail.signal）、dashboard
+  `/api/shutdown`（actor=`dashboard:<user>@<ip>`，reason=dashboard）、异常
+  收摊（clean=false）统一登记。
+- 审计事件：`supervisor.stop`（触发时）+ `supervisor.exit`（收摊完成，
+  含 reason / actor / uptime_seconds / clean）。原 HTTP 级 `shutdown`
+  记录保留。
+- `_install_signal_handlers` 增加可注入 `on_signal(name)` 回调，测试不真发信号。
+
+### 19.5 验收
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+# 2026-11-05 第六轮：2680 passed, 20 skipped（新增 29 个测试）
+```
+
+LSP（basedpyright）：本轮改动的 `align.py` / `poller.py` / `wechat.py` /
+`server.py` 无诊断；`store.py` / `service.py` / `dashboard.py` / `main.py`
+剩余报错均为改动前既有问题（行号不在本轮改动范围内）。
+
+---
+
+## 20. 私聊热开关、入站 seq/ack 与面板好友视图（2026-11-05 第七轮）
+
+对应提交（**仅本地，未 push**）：
+
+- `a8226cd` 私聊开关与好友黑白名单支持覆盖层热加载（P1-5 / P1-6 读路径）
+- `5649d02` 入站帧 `seq`/`ack` 与桥未确认重投，水位落盘防回退（P3-10 / P3-11）
+- `f4e45dd` 面板微信私聊只读视图与代理接口（P2-8）
+
+### 20.1 私聊运行时热开关（P1-5 / P1-6）
+
+- 新增 `src/dafeiyu/hotconfig.py`：`WeChatRuntime`（四个字段的不可变快照）
+  与 `WeChatRuntimeView`（按 `(st_mtime_ns, st_size)` 缓存的线程安全只读视图）。
+  容错契约：文件不存在 = 默认值；解析/读取失败 = 上次成功值 + 只告警一次；
+  坏值/未知键忽略。消费方热路径上**永不抛异常**。
+- 覆盖层只认四个键：`wechat.private_enabled` / `private_reply` /
+  `private_allow` / `private_deny`；其余 `gateway.wechat.*` 仍由 `config.yaml`
+  管理（`_apply_wechat_overrides` 只合并这四个键）。
+- 名单元素必须是 `wxg:<alias>`（`parse_wechat_peer_ids`，统一 casefold；
+  纯数字 / `qq:` 前缀直接报错）。语义：deny 优先，allow 为空 = 不限制，
+  两个都空 = 放行全部好友；**群聊完全不受名单影响**。
+- 桥侧：`PollingLoop` 增加 `runtime` 注入（`_default_poller_factory` 传
+  `PanelRuntime().wechat`），`_scope()` / `allows_chat()` / 好友枚举每轮热读；
+  解析好友稳定 id 失败时 fail-closed 跳过该好友。
+- bot 侧：`Service._wechat_private_readonly` 改读同一份热视图；读失败回落
+  `settings.wechat.private_reply`。`private_reply=false` 时私聊写
+  `silent/private_readonly` 决策后直接返回，命令仍可用。
+
+### 20.2 入站 seq/ack 与未确认重投（P3-10）
+
+- 协议：message/recall 帧由桥分配单调 `seq`；health/startup 永不带 seq。
+- 客户端（`gateway/wechat.py`）：连上即发 `hello{last_seq}`；handler 成功
+  消化后回 `ack{seq}`；坏帧/回声帧/无 handler 也 ack（永不进 handler 的帧
+  不该占缓冲）。handler 抛异常时不 ack，帧留在桥侧等待重投。
+- 桥（`server.py`）：`UNACKED_MAX=200` 有界未确认缓冲；`ack` 单调裁剪；
+  `hello` 首帧按客户端 `last_seq` 升序重投更高的未确认帧。
+- **本轮修掉的回归**：重投原先被「该连接已发历史」挡住——历史只证明
+  「发过」不证明「处理过」，同一 socket 缓冲丢失时 hello 是唯一补救。
+  现在重投以客户端 `last_seq` 为准；已发历史仅用于让随后的帧泵 pending
+  重试跳过同一帧，保证「同一帧对同一连接不出两遍」。
+- health 帧新增 `inbound_seq` / `inbound_acked` / `unacked_count`，
+  丢帧窗口 = `inbound_seq - inbound_acked`。
+
+### 20.3 桥水位落盘（P3-11 第一阶段）
+
+- `data/wechat-bridge/inbound_state.json`：`{"seq": n, "acked": n}`，
+  临时文件 + `os.replace` 原子替换；缺文件/损坏/越界一律按 0 处理并告警。
+- 目的：崩溃/重启后 `seq` 不回退，避免新旧帧 seq 冲突。
+- **已知边界**：此阶段只落水位，未确认帧本身仍在内存；硬杀仍会丢帧。
+  帧级持久化见下一轮（§21）。
+
+### 20.4 面板微信私聊视图（P2-8，只读）
+
+- `GET /api/private/chats`：只列 `chat_type=private` 且 `chat_id` 以
+  `wxg:` 开头的会话，按最近活跃倒序；标题取最近一条非 bot 消息昵称，
+  失败只回落 `chat_id`（单会话失败不影响整表）。字段：`title` /
+  `message_count` / `last_message_at` / `delivered_count` / `session_id`。
+- 面板新增「微信私聊」卡：只读表格 + 刷新；不重复显示已有列。
+- 写路径（开关 / 黑白名单编辑）见 §21。
+
+### 20.5 验收
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+# 2026-11-05 第七轮：2723 passed, 20 skipped（修复配置示例缺字段后 4 passed）
+```
+
+- 新增测试：`tests/test_hotconfig.py`；`test_settings_overrides` / `test_config`
+  覆盖层四键；`test_wechat_bridge_poller` 热读与名单闸门；
+  `test_service_decisions` 只读热切换；`test_wechat_bridge_main` hello 重投、
+  ack 单调、水位恢复；`test_control_api` 私聊列表；`test_wechat_adapter`
+  客户端 hello/ack。
+- `config.example.yaml` 增补 `private_allow: []` / `private_deny: []`
+  （`test_example_config` 要求字段集合与 `WeChatConfig` 完全一致）。
+
+---
+
+## 21. 私聊开关写路径、帧级重放与回执口径（2026-11-05 第八轮）
+
+本轮改动与 §20 同批提交（本地，未 push）。
+
+### 21.1 面板可编辑私聊开关（P1-5 / P1-6 写路径）
+
+- `BrainControl.private_settings_snapshot()`：返回
+  `{settings, chats, note, hot_reload}`；`chats` 直接复用
+  `private_chats_snapshot()`，不重复查询。`settings` 以覆盖层
+  `wechat:` 段为准（复用 `hotconfig.WeChatRuntimeView` 的合并语义），
+  解析失败时回落启动配置。
+- `BrainControl.save_private_settings(payload)`：只接受四个键；未知键 /
+  空 body / 非严格布尔 / 非 `wxg:` 名单在**写文件前**报错；只改 payload
+  命中的键，保留其它覆盖段；`write_overrides` 原子写；随后同步
+  `self.settings.wechat` 并返回快照 + `restart_required=false`。
+- 接口：`GET /api/private/settings`、`PUT /api/private/settings`
+  （bot 控制口 8788；面板 8787 代理同名路由，PUT 原样转发 body 并透传
+  状态码/错误 JSON）。
+- 面板「微信私聊」卡改为可编辑（未新增重复卡片）：
+  - 复选框「接入私聊」/「自动回复（需先接入私聊）」；
+  - 「允许名单」/「拒绝名单」textarea，一行一个 `wxg:...`；
+  - 好友表每行「允许 / 拒绝 / 移除」：仅编辑前端内存（两名单互斥、
+    去重、casefold），点「保存」才提交；
+  - 保存成功提示「已保存 · 一个轮询周期内热生效」。
+- 跨字段不强制：`private_reply=true` 与 `private_enabled=false` 可同时
+  保存（与配置语义一致），UI 文案已标注依赖关系。
+
+### 21.2 帧级持久化与硬杀重放（P3-11 完整）
+
+- `data/wechat-bridge/inbound_state.json` 扩展为
+  `{"seq": n, "acked": n, "frames": [{"seq": n, "frame": {...}}, ...]}`：
+  只含未确认 message/recall 帧，升序，最多 `UNACKED_MAX=200` 条。
+- 每分配一个新 seq 即落盘（不再等 50 帧），ack 裁剪后立即落盘；仍是
+  临时文件 + `os.replace` 原子替换，失败只 debug。
+- 启动恢复 `_restore_unacked()`：逐条校验 `seq` 为正整数、`frame` 为
+  dict、内外 seq 一致、`acked < seq <= 文件 seq`；重复 seq 只留第一条；
+  非法条目汇总为一次 warning；结果取最新 200 条窗口。
+- 旧格式（无 `frames`）按空缓冲处理；文件损坏仍从 0 开始，不影响启动。
+- 硬杀后：新桥实例 + 客户端 `hello{last_seq}` → 按原 seq 升序重放未确认
+  帧；ack 后才裁剪。已知边界：超过 200 帧窗口的旧帧不可重放（由
+  health 的 `unacked_count` 体现）。
+
+### 21.3 发送回执口径统一（P2-9）
+
+- `WeChatAdapter.receipts` 四类计数，唯一计数入口是 `_send_action()`：
+  - `observed`：回执 `delivered=="observed"`；
+  - `unverified`：`ok=true` 但 `error_code=="receipt_unverified"`；
+  - `typed`：其它成功（含无错误码的 `typed`）；
+  - `failed`：`ok=false` / `delivered=="failed"` / 等待回执超时 / 断线 /
+    `_fail_pending` 注入的失败；
+  - `unsupported_media` 的能力不支持提前返回**不计数**（不是投递尝试）。
+- `receipt_stats()`：`{observed, typed, unverified, failed, total,
+  unverified_rate, last_at}`；`unverified_rate` 分母为
+  `observed+typed+unverified`（失败不进分母），无回执时为 0.0；
+  返回副本，读取出错返回全零快照并 warning，不抛异常。
+- `Service.channel_status()` 仅对**没有 `snapshot()`** 的适配器注入
+  `receipts`；调用异常只 warning、不加键，其它通道不受影响。
+- 健康快照透传 `channels.wechat.receipts`（`last_at` 转 ISO），面板
+  「微信通道」卡显示「证实 A · 键入 B · 未证实 C · 失败 D」；
+  `unverified_rate >= 0.2` 且 `unverified >= 5` 时追加提示。
+- 计数是进程内内存值，重启归零；桥侧在收到 WS 指令前的失败不计入。
+
+### 21.4 落盘显式开启与测试隔离
+
+- 入站水位持久化只在**显式传入** `state_path` 时开启：
+  - 生产入口 `main()` 传 `state_path=DEFAULT_INBOUND_STATE`（`run()` 透传）；
+  - `BridgeServer()` / `run()` 默认 `state_path=None`，`_load_inbound_state` /
+    `_save_inbound_state` 直接返回，纯内存、零副作用。
+- 修复过程：不带 `state_path` 的既有测试曾把伪造帧写进
+  `data/wechat-bridge/inbound_state.json`（seq/acked 与测试帧混杂）。现在
+  新增回归：`test_no_state_path_means_no_persistence`、
+  `test_run_forwards_state_path_to_server_factory`、
+  `test_main_entry_enables_state_persistence`。已删除被污染的生产状态文件。
+- 验证：`tests/test_wechat_bridge_main.py` 50 passed；全量
+  `pytest -q` = **2746 passed, 20 skipped**（5:00）；改动文件 basedpyright
+  无新增 error（既有 warning 未处理）。
+- 运行态复核（重启整栈后）：8080/8787/8788/8790/24310/30012 均监听；
+  hook `/health` = `ready:true`、`wechat_version:4.2.0.11`；
+  `GET /api/private/settings` = `private_enabled/private_reply=true` 且
+  `hot_reload:true`；`GET /api/health/detail` 的
+  `channels.wechat.receipts` 六项齐全；重启后尚无入站事件，故
+  `inbound_state.json` 未生成（符合「有帧才落盘」）。
+
