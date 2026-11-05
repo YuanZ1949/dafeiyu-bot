@@ -93,6 +93,10 @@ _PLACEHOLDER_BY_TYPE: dict[int, tuple[str, str]] = {
 #: 表情 XML 里可作为可读名的属性，按优先级排列（实测大多为空）。
 _EMOJI_NAME_ATTRS = ("desc", "attachedtext")
 
+#: 表情 XML 的 md5 属性（缓存文件名与它一致）；XML 解析失败时用正则兜底。
+_EMOJI_MD5_RE = re.compile(r'<emoji[^>]*\bmd5="([0-9a-fA-F]{32})"')
+_HEX32_RE = re.compile(r"[0-9a-f]{32}")
+
 #: appmsg 的引用回复类型。
 _APPMSG_QUOTE = 57
 
@@ -438,6 +442,10 @@ class LocalMessageStore:
         )
 
         kind, text, reply_to, reply_author = _render_body(local_type, body)
+
+        if local_type == 47 and media_raw is None and self._media_enabled:
+            # 贴纸的 md5 在消息 XML 里，比媒体索引可靠；缓存目录按 md5 分片。
+            media_raw = self._emoticon_media(body)
 
         if sender_username == self._self_username:
             nickname = self._self_display_name
@@ -807,6 +815,23 @@ class LocalMessageStore:
             "duration": _safe_int(raw.get("duration")),
         }
 
+    def _emoticon_media(self, body: str) -> dict[str, Any] | None:
+        """从表情 XML 的 md5 找到 ``cache/<YYYY-MM>/Emoticon/...`` 缓存文件。
+
+        只返回候选路径；文件存在性/大小/越界校验仍交给 :meth:`_media_meta`。
+        """
+        digest = _emoji_md5(body)
+        if not digest:
+            return None
+        root = self._media_root()
+        if root is None:
+            return None
+        path = _emoticon_file(root, digest)
+        if path is None:
+            log.debug("表情缓存文件缺失：%s", digest)
+            return None
+        return {"path": str(path), "name": path.name, "size": 0, "duration": 0}
+
     def _media_root(self) -> Path | None:
         if self._media_storage_root:
             return Path(self._media_storage_root)
@@ -1073,6 +1098,37 @@ def _blob_md5(value: Any) -> str:
         return ""
     match = _MD5_IN_BLOB_RE.search(data)
     return match.group(0).decode("ascii").lower() if match is not None else ""
+
+
+def _emoji_md5(body: str) -> str:
+    """从表情 XML 取 ``<emoji md5="...">``；拿不到 32 位 hex 返回空串。"""
+    root = _parse_xml(body)
+    if root is not None:
+        node = root.find(".//emoji")
+        if node is not None:
+            value = str(node.get("md5") or "").strip().lower()
+            if _HEX32_RE.fullmatch(value):
+                return value
+    match = _EMOJI_MD5_RE.search(body or "")
+    return match.group(1).lower() if match is not None else ""
+
+
+def _emoticon_file(root: Path, digest: str) -> Path | None:
+    """在 ``<root>/cache/<YYYY-MM>/Emoticon/<md5[:2]>/<md5>`` 下找表情缓存。"""
+    if not _HEX32_RE.fullmatch(digest):
+        return None
+    try:
+        matches = sorted((root / "cache").glob(f"*/Emoticon/{digest[:2]}/{digest}"))
+    except OSError as exc:
+        log.debug("枚举表情缓存目录失败：%s", exc)
+        return None
+    for match in matches:
+        try:
+            if match.is_file():
+                return match
+        except OSError as exc:
+            log.debug("检查表情缓存文件失败：%s", exc)
+    return None
 
 
 def _attach_file(base: Path, digest: str) -> Path | None:

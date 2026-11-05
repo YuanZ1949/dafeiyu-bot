@@ -1113,6 +1113,97 @@ def test_resource_absent_db_is_fail_open(tmp_path: Path) -> None:
     assert "media" not in rows["[图片]"]
     assert "media" not in rows["[表情]"]
 
+
+# ------------------------------------------------- 3b. 表情缓存（type 47）
+EMOTICON_MD5 = "745c9c20f715400b40f5d679bd12ebdb"
+
+
+def build_emoticon_store(
+    tmp_path: Path,
+    *,
+    md5: str = EMOTICON_MD5,
+    with_file: bool = True,
+    content: str | None = None,
+) -> tuple[LocalMessageStore, Path]:
+    root = tmp_path / "mirror"
+    make_contact_db(
+        root / "contact/contact.db",
+        contacts=[(GROUP, "", GROUP_NAME)],
+    )
+    body = content if content is not None else f'<msg><emoji md5="{md5}" type="2" /></msg>'
+    make_message_db(
+        root / "message/message_0.db",
+        name2id={1: GROUP, 2: SELF},
+        tables={GROUP: [(47, 2, 1000, body, 0)]},
+    )
+    cache = tmp_path / "cache" / "2026-11" / "Emoticon" / md5[:2] / md5
+    if with_file:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_bytes(b"cipher")
+    store = LocalMessageStore(
+        DbRootMirrors(root),
+        self_username=SELF,
+        self_display_name=SELF_NAME,
+        message_rels=["message/message_0.db"],
+        media_enabled=True,
+        media_max_bytes=1024 * 1024,
+    )
+    return store, cache
+
+
+def test_emoticon_cache_is_found_from_message_xml(tmp_path: Path) -> None:
+    store, cache = build_emoticon_store(tmp_path)
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+
+    row = store.recent(ref, 5)[0]
+
+    assert row["kind"] == "sticker"
+    assert row["media"]["kind"] == "image"
+    assert Path(row["media"]["path"]) == cache.resolve()
+    assert row["media"]["name"] == EMOTICON_MD5
+    assert row["media"]["size"] == len(b"cipher")
+
+
+def test_emoticon_cache_missing_file_keeps_placeholder(tmp_path: Path) -> None:
+    store, _ = build_emoticon_store(tmp_path, with_file=False)
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+
+    row = store.recent(ref, 5)[0]
+
+    assert "media" not in row
+
+
+def test_emoticon_without_md5_keeps_placeholder(tmp_path: Path) -> None:
+    store, _ = build_emoticon_store(tmp_path, content="<msg><emoji type='2' /></msg>")
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+
+    row = store.recent(ref, 5)[0]
+
+    assert "media" not in row
+
+
+def test_emoticon_is_ignored_when_media_disabled(tmp_path: Path) -> None:
+    store, _ = build_emoticon_store(tmp_path)
+    disabled = LocalMessageStore(
+        DbRootMirrors(tmp_path / "mirror"),
+        self_username=SELF,
+        self_display_name=SELF_NAME,
+        message_rels=["message/message_0.db"],
+        media_enabled=False,
+    )
+    ref = disabled.resolve(GROUP_NAME)
+    assert ref is not None
+
+    row = disabled.recent(ref, 5)[0]
+
+    assert "media" not in row
+    # 同一份库在开关打开时确实能找到媒体，证明上面不是数据本身缺失。
+    assert store.recent(ref, 5)[0]["media"]["kind"] == "image"
+
+
 # ------------------------------------------------- 4. 好友私聊（wxid_*）
 FRIEND = "wxid_friend"
 FRIEND_NAME = "苑长"
