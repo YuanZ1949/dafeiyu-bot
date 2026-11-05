@@ -14,7 +14,13 @@ wechat_bridge.media.dat`。
 
 from __future__ import annotations
 
-__all__ = ["CipherError", "aes_ecb_decrypt", "aes_ecb_encrypt"]
+__all__ = [
+    "CipherError",
+    "aes_cbc_decrypt",
+    "aes_cbc_encrypt",
+    "aes_ecb_decrypt",
+    "aes_ecb_encrypt",
+]
 
 #: 允许的 AES 密钥长度：AES-128 / AES-192 / AES-256。
 _KEY_SIZES = (16, 24, 32)
@@ -274,3 +280,59 @@ def aes_ecb_decrypt(
 ) -> bytes:
     """AES-ECB 解密（无填充，``data`` 长度必须是 16 的整数倍）。"""
     return _ecb_crypt(_check_key(key), _check_data(data), encrypt=False)
+
+
+def _check_iv(iv: bytes | bytearray | memoryview) -> bytes:
+    if not isinstance(iv, (bytes, bytearray, memoryview)):
+        raise TypeError("iv 必须是 bytes")
+    value = bytes(iv)
+    if len(value) != _BLOCK_SIZE:
+        raise ValueError(f"IV 必须是 16 字节，收到 {len(value)} 字节")
+    return value
+
+
+def aes_cbc_decrypt(
+    key: bytes | bytearray | memoryview,
+    iv: bytes | bytearray | memoryview,
+    data: bytes | bytearray | memoryview,
+) -> bytes:
+    """AES-CBC 解密（无填充，``data`` 长度必须是 16 的整数倍）。
+
+    微信表情缓存用的就是 AES-128-CBC、``IV == key``；这里只做密码学原语，
+    填充与格式识别由调用方负责。
+    """
+    raw = _check_data(data)
+    previous = _check_iv(iv)
+    scheduler = _Scheduler(_check_key(key))
+    out = bytearray(len(raw))
+    for offset in range(0, len(raw), _BLOCK_SIZE):
+        block = raw[offset : offset + _BLOCK_SIZE]
+        plain = _decrypt_block(scheduler.round_keys, block)
+        out[offset : offset + _BLOCK_SIZE] = bytes(
+            value ^ mask for value, mask in zip(plain, previous, strict=True)
+        )
+        previous = block
+    return bytes(out)
+
+
+def aes_cbc_encrypt(
+    key: bytes | bytearray | memoryview,
+    iv: bytes | bytearray | memoryview,
+    data: bytes | bytearray | memoryview,
+) -> bytes:
+    """AES-CBC 加密（无填充）；主要供测试构造样本。"""
+    raw = _check_data(data)
+    previous = _check_iv(iv)
+    scheduler = _Scheduler(_check_key(key))
+    out = bytearray(len(raw))
+    for offset in range(0, len(raw), _BLOCK_SIZE):
+        block = bytes(
+            value ^ mask
+            for value, mask in zip(
+                raw[offset : offset + _BLOCK_SIZE], previous, strict=True
+            )
+        )
+        cipher = _encrypt_block(scheduler.round_keys, block)
+        out[offset : offset + _BLOCK_SIZE] = cipher
+        previous = cipher
+    return bytes(out)
