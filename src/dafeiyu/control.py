@@ -2462,6 +2462,40 @@ def create_app(
                 {"error": f"读取预算失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def decisions(request: web.Request) -> web.Response:
+        """决策流水：最近 N 条 + 窗口统计。"""
+        chat_type, chat_id, error = _query_scope(request)
+        if error is not None:
+            return error
+        try:
+            limit = _query_int(request, "limit", 50)
+            days = _query_int(request, "days", 1)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        limit = max(1, min(200, limit))
+        days = max(1, min(30, days))
+        outcome = (request.query.get("outcome") or "").strip() or None
+        try:
+            return web.json_response(
+                {
+                    "items": control.store.list_decisions(
+                        limit=limit,
+                        chat_type=chat_type,
+                        chat_id=chat_id,
+                        outcome=outcome,
+                    ),
+                    "stats": control.store.decision_stats(
+                        days=days, now_ts=time.time()
+                    ),
+                    "generated_at": now_shanghai().isoformat(),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - 读库失败不能把控制口打挂
+            log.warning("读取决策流水失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取决策流水失败：{exc.__class__.__name__}"}, status=500
+            )
+
     async def search_messages(request: web.Request) -> web.Response:
         query = (request.query.get("q") or "").strip()
         if not query:
@@ -2844,6 +2878,7 @@ def create_app(
     )
     app.router.add_get("/api/usage", usage)
     app.router.add_get("/api/budget", budget)
+    app.router.add_get("/api/decisions", decisions)
     app.router.add_get("/api/memory/search", search_messages)
     app.router.add_get("/api/memory/export", export_memory)
     app.router.add_get("/api/sessions", sessions)

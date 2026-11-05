@@ -695,6 +695,9 @@ def create_app(
     async def budget(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/budget")
 
+    async def decisions(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/decisions")
+
     async def memory_search(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/memory/search")
 
@@ -1177,6 +1180,7 @@ def create_app(
     app.router.add_get("/api/memory", memory)
     app.router.add_get("/api/usage", usage)
     app.router.add_get("/api/budget", budget)
+    app.router.add_get("/api/decisions", decisions)
     app.router.add_get("/api/memory/search", memory_search)
     app.router.add_get("/api/memory/health", memory_health)
     app.router.add_post("/api/memory/unblock", memory_unblock)

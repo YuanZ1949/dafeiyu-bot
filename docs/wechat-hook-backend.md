@@ -9,7 +9,7 @@
 dafeiyu wechat_bridge (outbound=hook)
         │  POST /send_text  {"action","chatroom","chat_name","text"}
         ▼
-scripts/wechat_hook_server.py         ← 本仓库，HTTP 契约层（:30011）
+scripts/wechat_hook_server.py         ← 本仓库，HTTP 契约层（:30012，端口跟随 hook_url）
         │  进程内调用
         ▼
 helper/native/text_bridge.dll         ← Prometheus-first/helper，注入 Weixin.exe
@@ -47,6 +47,11 @@ powershell -ExecutionPolicy Bypass -File scripts\start-wechat-hook.ps1 -Stop
 脚本会脱离 SSH/终端会话启动（`Win32_Process.Create`），否则 SSH 断开就把进程带走了。
 日志：`logs/wechat-hook.log`。
 
+端口以 `gateway.wechat.hook_url` 为准：`start-all.ps1` 解析出端口后传给
+`start-wechat-hook.ps1 -Port`。若端口已被占用、但占用者的命令行读不到（通常是
+更高权限启动的旧实例），脚本会直接报错并要求你换端口或用管理员结束它，
+**不会**再起一个收不到请求、却让 `/health` 读到旧状态的重复实例。
+
 手动前台调试：
 
 ```powershell
@@ -56,11 +61,11 @@ C:\MyFile\AICoding\helper\.venv\Scripts\python.exe scripts\wechat_hook_server.py
 ## 自检
 
 ```powershell
-curl http://127.0.0.1:30011/health
+curl http://127.0.0.1:30012/health
 # {"ok":true,"ready":true,"self_wxid":"wxid_...","wechat_version":"4.2.0.11"}
 
 # 真发一条到文件传输助手
-curl -X POST http://127.0.0.1:30011/send_text -H "Content-Type: application/json" `
+curl -X POST http://127.0.0.1:30012/send_text -H "Content-Type: application/json" `
   -d '{"chatroom":"filehelper","chat_name":"文件传输助手","text":"hook self-test"}'
 ```
 
@@ -85,7 +90,7 @@ gateway:
   wechat:
     enabled: true
     outbound: hook
-    hook_url: http://127.0.0.1:30011/send_text
+    hook_url: http://127.0.0.1:30012/send_text
     hook_timeout_seconds: 30     # 原生桥单次发送可能 1–3s，5s 太紧
     local_db_enabled: true       # 入站（非 UIA）+ 群名 -> xxx@chatroom 解析
 ```

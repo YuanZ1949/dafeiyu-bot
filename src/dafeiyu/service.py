@@ -539,6 +539,13 @@ class Service:
             self._store_outbox_message(
                 chat_type, chat_id, str(row["text"]), message_id, row_id
             )
+            self._mark_decision_retried(
+                chat_type,
+                chat_id,
+                origin_message_id=str(row["origin_message_id"] or ""),
+                retry_after_seconds=int(max(0.0, age)),
+                outbox_id=row_id,
+            )
             log.info("补发成功 %s/%s（入队 %.0fs）", chat_id, row_id, age)
             sent += 1
         return sent
@@ -734,7 +741,7 @@ class Service:
             if not decision.call_model:
                 log.debug("skip %s/%s: %s", msg.chat_id, msg.message_id, decision.reason)
                 return
-        elif not self._private_budget_ok(msg):
+        elif self._wechat_private_readonly(msg) or not self._private_budget_ok(msg):
             return
 
         await self._reply(msg)
@@ -744,8 +751,8 @@ class Service:
         scheduler = self._ensure_scheduler()
 
         if msg.chat_type is ChatType.PRIVATE:
-            # 私聊延迟敏感，不进批次窗口，但仍受双闸预算约束。
-            if not self._private_budget_ok(msg):
+            # 私聊延迟敏感，不进批次窗口，但仍受「只读/预算」两道约束。
+            if self._wechat_private_readonly(msg) or not self._private_budget_ok(msg):
                 return
             await self._reply(msg)
             return
@@ -1425,6 +1432,14 @@ class Service:
             self.store.mark_delivered(
                 chat_type, chat_id, *[m.message_id for m in batch]
             )
+            self._record_decision(
+                chat_type,
+                chat_id,
+                outcome="blocked",
+                checkpoint="recalled",
+                message_ids=[m.message_id for m in batch],
+                message_count=len(batch),
+            )
             log.info("批次取消（末条已撤回）%s/%s", chat_id, batch[-1].message_id)
             return
 
@@ -1449,6 +1464,15 @@ class Service:
         # 切到安静强度前已经排队的批次：非点名也不送模型。不 mark_skipped，
         # 消息留在待投队列里，等下一次点名再一起看。
         if not addressed and self.behavior.chat_intensity == "quiet":
+            self._record_decision(
+                chat_type,
+                chat_id,
+                outcome="held",
+                checkpoint="intensity_quiet",
+                message_ids=ids,
+                addressed=addressed,
+                message_count=len(batch),
+            )
             log.debug("批次跳过（安静强度）%s/%s", chat_id, current_id)
             return
 
@@ -1460,6 +1484,15 @@ class Service:
             now_ts=int(now_shanghai().timestamp()),
             backlog=backlog,
         ):
+            self._record_decision(
+                chat_type,
+                chat_id,
+                outcome="held",
+                checkpoint="opportunity_hold",
+                message_ids=ids,
+                addressed=addressed,
+                message_count=len(batch),
+            )
             log.debug(
                 "批次攒着不投（纯热聊）%s/%s ids=%d", chat_id, current_id, len(batch)
             )
@@ -1468,6 +1501,16 @@ class Service:
         budget = self._chat_budget_decision(chat_type, chat_id, addressed=addressed)
         if not self._budget_allows(budget, addressed):
             self.store.mark_skipped(chat_type, chat_id, ids, SKIP_BUDGET)
+            self._record_decision(
+                chat_type,
+                chat_id,
+                outcome="blocked",
+                checkpoint="budget",
+                message_ids=ids,
+                addressed=addressed,
+                message_count=len(batch),
+                detail={"scope": budget.scope, "reason": budget.reason},
+            )
             log.debug(
                 "批次跳过（预算）%s/%s scope=%s reason=%s",
                 chat_id,
@@ -1498,6 +1541,7 @@ class Service:
             addressed,
         )
         tool_use = ToolUse()
+        started = time.monotonic()
         try:
             reply = await self._call_brain(
                 chat_type, chat_id, batch, prompt, on_tool=tool_use.record
@@ -1507,11 +1551,28 @@ class Service:
             # 不再往群里发「断线了」这类失败提示：用户明确不要，失败只留日志。
             self.store.record_usage(chat_type, chat_id, "error", 0, 0)
             self.store.mark_skipped(chat_type, chat_id, ids, SKIP_ERROR)
+            self._record_decision(
+                chat_type,
+                chat_id,
+                outcome="error",
+                checkpoint="brain_error",
+                message_ids=ids,
+                addressed=addressed,
+                message_count=len(batch),
+                latency_ms=int((time.monotonic() - started) * 1000),
+                detail={"error": type(exc).__name__},
+            )
             log.warning("批次调用失败 %s/%s: %s", chat_id, current_id, exc)
             self._check_workspace(chat_type, chat_id)
             return
 
-        sent = await self._send_batch_reply(batch, reply, chat_type, chat_id)
+        sent = await self._send_batch_reply(
+            batch,
+            reply,
+            chat_type,
+            chat_id,
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
         if not sent:
             self.router.note_no_reply(chat_type, chat_id)
         self._remember_shared_fact(chat_type, chat_id, batch, reply, tool_use)
@@ -1917,10 +1978,76 @@ class Service:
             recent.append(guarded)
         return kept
 
+    def _record_decision(self, chat_type: ChatType, chat_id: str, **fields: Any) -> None:
+        """决策流水写入：任何异常都不能影响回复链路。"""
+        try:
+            self.store.record_decision(chat_type, chat_id, **fields)
+        except Exception:  # noqa: BLE001
+            log.debug(
+                "决策流水写入失败 %s/%s", chat_type.value, chat_id, exc_info=True
+            )
+
+    def _mark_decision_retried(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        *,
+        origin_message_id: str,
+        retry_after_seconds: int,
+        outbox_id: int,
+    ) -> None:
+        """补发成功后把原失败决策原地改成 ``replied``。
+
+        和 `_record_decision` 一样吞异常：统计口径出错可以事后补，发送失败
+        不能因为写库再坏一次。老版本 store 没有这个方法时静默跳过。
+        """
+        marker = getattr(self.store, "mark_decision_retried", None)
+        if marker is None:
+            return
+        try:
+            marker(
+                chat_type,
+                chat_id,
+                origin_message_id,
+                retry_after_seconds=retry_after_seconds,
+                outbox_id=outbox_id,
+            )
+        except Exception:  # noqa: BLE001
+            log.debug(
+                "补发决策更新失败 %s/%s", chat_type.value, chat_id, exc_info=True
+            )
+
     async def _send_batch_reply(
-        self, batch: list[Message], reply: BrainReply, chat_type: ChatType, chat_id: str
+        self,
+        batch: list[Message],
+        reply: BrainReply,
+        chat_type: ChatType,
+        chat_id: str,
+        *,
+        latency_ms: int = 0,
     ) -> list[tuple[str, str | None]]:
         """把批次回复分片发出并入库；返回 (分片文本, 网关真实 id) 列表。"""
+
+        def record(
+            outcome: str, checkpoint: str = "", reply_preview: str = ""
+        ) -> None:
+            self._record_decision(
+                chat_type,
+                chat_id,
+                outcome=outcome,
+                checkpoint=checkpoint,
+                message_ids=[m.message_id for m in batch],
+                addressed=any(self._is_addressed(m) for m in batch),
+                message_count=len(batch),
+                read=reply.read,
+                think=reply.think,
+                reason=reply.reason,
+                reply_preview=reply_preview,
+                prompt_tokens=reply.prompt_tokens,
+                completion_tokens=reply.completion_tokens,
+                latency_ms=latency_ms,
+            )
+
         if reply.read or reply.think:
             log.debug(
                 "模型读/想 %s/%s read=%s think=%s",
@@ -1937,12 +2064,14 @@ class Service:
                 len(batch),
                 (reply.reason or "-").strip()[:120],
             )
+            record("silent")
             return []
         addressed = any(self._is_addressed(m) for m in batch)
         reply_text = await self._apply_restrictions(
             chat_type, chat_id, reply.reply, addressed=addressed
         )
         if reply_text is None:
+            record("silent", "restricted")
             return []
         chunks = shape_reply(
             reply_text,
@@ -1954,9 +2083,11 @@ class Service:
         if len(chunks) == 1:
             chunks = segment_reply(chunks[0])
         if not chunks:
+            record("silent", "guard_dropped")
             return []
         chunks = self._guard_chunks(chat_type, chat_id, chunks)
         if not chunks:
+            record("silent", "guard_dropped")
             return []
         # 附件与 @ 只在守卫确认有内容要发之后才解析/上传：文本被整体丢弃时
         # 一个字节都不许发出去。
@@ -2006,6 +2137,13 @@ class Service:
             self.router.note_bot_spoke(chat_type, chat_id, ambient=not addressed)
         # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
         self._store_bot_chunks(batch[-1], sent, attachments=attachments)
+        preview = "".join(chunks)
+        # 一个分片都没发出去才算失败：入队也失败时 defer 为 0，不能因为
+        # 「没有待发」就误记成已回复。
+        if not sent:
+            record("error", "send_failed", reply_preview=preview)
+        else:
+            record("replied", reply_preview=preview)
         return sent
 
     async def _apply_restrictions(
@@ -2604,13 +2742,49 @@ class Service:
         return history[-window:]
 
     async def _reply(self, msg: Message) -> None:
+        started = time.monotonic()
         try:
             reply = await self._ask_brain(msg)
         except BrainError as exc:
             # 失败也占一次调用额度，避免异常时无限重试烧钱；静默失败，不发提示。
             self.store.record_usage(msg.chat_type, msg.chat_id, "error", 0, 0)
+            self._record_decision(
+                msg.chat_type,
+                msg.chat_id,
+                outcome="error",
+                trigger="private",
+                checkpoint="brain_error",
+                message_ids=[msg.message_id],
+                message_count=1,
+                addressed=self._is_addressed(msg),
+                latency_ms=int((time.monotonic() - started) * 1000),
+                detail={"error": type(exc).__name__},
+            )
             log.warning("模型调用失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
             return
+
+        latency_ms = int((time.monotonic() - started) * 1000)
+
+        def record(
+            outcome: str, checkpoint: str = "", reply_preview: str = ""
+        ) -> None:
+            self._record_decision(
+                msg.chat_type,
+                msg.chat_id,
+                outcome=outcome,
+                trigger="private",
+                checkpoint=checkpoint,
+                message_ids=[msg.message_id],
+                message_count=1,
+                addressed=self._is_addressed(msg),
+                read=reply.read,
+                think=reply.think,
+                reason=reply.reason,
+                reply_preview=reply_preview,
+                prompt_tokens=reply.prompt_tokens,
+                completion_tokens=reply.completion_tokens,
+                latency_ms=latency_ms,
+            )
 
         self.store.record_usage(
             msg.chat_type,
@@ -2638,6 +2812,7 @@ class Service:
                 msg.message_id,
                 (reply.reason or "-").strip()[:120],
             )
+            record("silent")
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
 
@@ -2648,6 +2823,7 @@ class Service:
             addressed=self._is_addressed(msg),
         )
         if reply_text is None:
+            record("silent", "restricted")
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
 
@@ -2660,10 +2836,12 @@ class Service:
         if len(chunks) == 1:
             chunks = segment_reply(chunks[0])
         if not chunks:
+            record("silent", "guard_dropped")
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
         chunks = self._guard_chunks(msg.chat_type, msg.chat_id, chunks)
         if not chunks:
+            record("silent", "guard_dropped")
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
         # 与批次路径同序：先确认有内容，再解析附件/@。
@@ -2715,6 +2893,12 @@ class Service:
             )
         # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
         self._store_bot_chunks(msg, sent, attachments=attachments)
+        preview = "".join(chunks)
+        # 与批次路径同语义：没有任何分片真正发出，就是发送失败。
+        if not sent:
+            record("error", "send_failed", reply_preview=preview)
+        else:
+            record("replied", reply_preview=preview)
 
     def _store_bot_chunks(
         self,
@@ -2758,6 +2942,34 @@ class Service:
                 log.exception("印象抽取失败 %s/%s", msg.chat_type, msg.chat_id)
 
         asyncio.create_task(run())
+
+    def _wechat_private_readonly(self, msg: Message) -> bool:
+        """微信私聊只读：`gateway.wechat.private_reply=false` 时只落库不回复。
+
+        入站开关（`private_enabled`）由桥负责；这里只管「能不能回」。命令分支
+        在 `handle()` 里先于本函数执行，所以只读模式下 `/status` 等命令仍可用。
+        只认 ``wxg:`` 会话：QQ 私聊不受微信开关影响。
+        """
+        if msg.chat_type is not ChatType.PRIVATE:
+            return False
+        if not str(msg.chat_id or "").startswith("wxg:"):
+            return False
+        wechat = getattr(self.settings, "wechat", None)
+        if bool(getattr(wechat, "private_reply", False)):
+            return False
+        self._record_decision(
+            msg.chat_type,
+            msg.chat_id,
+            outcome="silent",
+            trigger="private",
+            checkpoint="private_readonly",
+            message_ids=[msg.message_id],
+            message_count=1,
+            addressed=True,
+            detail={"private_reply": False},
+        )
+        log.debug("skip %s/%s: private_readonly", msg.chat_id, msg.message_id)
+        return True
 
     def _private_budget_ok(self, msg: Message) -> bool:
         # 私聊视为点名：存储读失败时只降级不拦死。

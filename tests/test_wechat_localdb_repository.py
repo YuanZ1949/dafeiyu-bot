@@ -854,3 +854,106 @@ def test_media_absent_index_db_is_fail_open(tmp_path: Path) -> None:
 
     assert row["text"] == "[图片]"
     assert "media" not in row
+
+# ------------------------------------------------- 4. 好友私聊（wxid_*）
+FRIEND = "wxid_friend"
+FRIEND_NAME = "苑长"
+
+
+def build_friend_store(tmp_path: Path) -> LocalMessageStore:
+    root = tmp_path / "mirror"
+    make_contact_db(
+        root / "contact/contact.db",
+        contacts=[
+            (GROUP, "", GROUP_NAME),
+            (FRIEND, "", FRIEND_NAME),
+            (SELF, "", SELF_NAME),
+            ("filehelper", "", "文件传输助手"),
+            ("gh_official", "", "微信支付"),
+            ("123@openim", "", "外部联系人"),
+        ],
+    )
+    make_message_db(
+        root / "message/message_0.db",
+        name2id={1: GROUP, 2: SELF, 3: FRIEND},
+        tables={GROUP: [], FRIEND: [text_row(3, "在么")]},
+    )
+    return make_store(root)
+
+
+def test_friend_names_only_wxid_and_excludes_self_and_system(tmp_path: Path) -> None:
+    store = build_friend_store(tmp_path)
+
+    # 自己、系统号、公众号、@openim、群都不算好友。
+    assert store.friend_names() == [FRIEND_NAME]
+
+
+def test_resolve_friend_and_kind_of(tmp_path: Path) -> None:
+    store = build_friend_store(tmp_path)
+
+    ref = store.resolve(FRIEND_NAME, kind="friend")
+
+    assert ref == ChatRef(
+        display_name=FRIEND_NAME,
+        username=FRIEND,
+        shard="message/message_0.db",
+        table=message_table_name(FRIEND),
+        kind="friend",
+    )
+    # 默认按群解析不能命中好友，避免出站把私聊名当群名。
+    assert store.resolve(FRIEND_NAME) is None
+    assert store.resolve_any(FRIEND_NAME) == ref
+    assert store.kind_of(FRIEND_NAME) == "friend"
+    assert store.kind_of(GROUP_NAME) == "group"
+
+
+def test_resolve_any_fails_closed_on_group_friend_name_clash(tmp_path: Path) -> None:
+    root = tmp_path / "mirror"
+    make_contact_db(
+        root / "contact/contact.db",
+        contacts=[
+            (GROUP, "", "同名"),
+            (FRIEND, "", "同名"),
+        ],
+    )
+    make_message_db(
+        root / "message/message_0.db",
+        name2id={1: GROUP, 2: FRIEND},
+        tables={GROUP: [], FRIEND: []},
+    )
+    store = make_store(root)
+
+    assert store.resolve("同名", kind="group") is not None
+    assert store.resolve("同名", kind="friend") is not None
+    # 同名群/好友无法判定意图：解析与类型都 fail-closed。
+    assert store.resolve_any("同名") is None
+    assert store.kind_of("同名") is None
+
+
+def test_duplicate_friend_display_name_fails_closed(tmp_path: Path) -> None:
+    root = tmp_path / "mirror"
+    make_contact_db(
+        root / "contact/contact.db",
+        contacts=[
+            ("wxid_a", "", "同名好友"),
+            ("wxid_b", "", "同名好友"),
+        ],
+    )
+    store = make_store(root)
+
+    assert store.friend_names() == ["同名好友"]
+    assert store.resolve("同名好友", kind="friend") is None
+
+
+def test_source_forwards_friend_names_and_peer_kind(tmp_path: Path) -> None:
+    from dafeiyu.gateway.wechat_bridge.localdb.source import LocalDbSource
+
+    store = build_friend_store(tmp_path)
+    source = LocalDbSource(mirror_dir=tmp_path / "mirror")
+    source._store = store
+
+    assert source.friend_names() == [FRIEND_NAME]
+    assert source.peer_kind(FRIEND_NAME) == "friend"
+    assert source.peer_kind(GROUP_NAME) == "group"
+    assert source.resolve_username(FRIEND_NAME) == FRIEND
+    assert source.resolve_username(GROUP_NAME) == GROUP

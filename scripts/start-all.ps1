@@ -56,9 +56,22 @@ try {
 
 if ($wechatHook) {
     $hookScript = Join-Path $root "scripts\start-wechat-hook.ps1"
+    # 端口以 config.yaml 的 gateway.wechat.hook_url 为准，脚本不再写死 30011。
+    $hookPort = 30011
+    try {
+        $hookPortText = & $python -c "from urllib.parse import urlsplit; from dafeiyu.config import load_settings; print(urlsplit(load_settings().wechat.hook_url).port or 30011)" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $hookPortText) {
+            $parsedPort = 0
+            if ([int]::TryParse((($hookPortText | Select-Object -Last 1).Trim()), [ref]$parsedPort)) {
+                $hookPort = $parsedPort
+            }
+        }
+    } catch {
+        Write-Host "读取 hook 端口失败，回退 30011" -ForegroundColor DarkYellow
+    }
     if (Test-Path -LiteralPath $hookScript) {
-        Write-Host "启动微信 hook 服务（非 UIA 出站）..." -ForegroundColor Cyan
-        & powershell -ExecutionPolicy Bypass -File $hookScript
+        Write-Host "启动微信 hook 服务（非 UIA 出站，端口 $hookPort）..." -ForegroundColor Cyan
+        & powershell -ExecutionPolicy Bypass -File $hookScript -Port $hookPort
         if ($LASTEXITCODE -ne 0) {
             Write-Host "hook 服务未就绪：微信出站会失败，其余通道照常启动" -ForegroundColor Yellow
         }

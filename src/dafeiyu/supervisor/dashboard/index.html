@@ -44,6 +44,7 @@
     --list-h-xl: 340px;
     --list-h-mem: 300px;
     --list-h-sessions: 360px;
+    --list-h-decisions: 360px;
     /* 固定宽度 token */
     --w-id: 110px;
     --w-sid: 130px;
@@ -331,6 +332,43 @@
   .session-row .meta { color: var(--muted); font-size: var(--fs-sm); flex: 1; min-width: 180px; }
   .session-row .acts { display: flex; gap: 6px; flex-wrap: wrap; }
   .session-row .btn { padding: 4px 8px; font-size: var(--fs-sm); }
+  .decision-stats { justify-content: flex-start; gap: 6px; margin-bottom: 8px; }
+  .decision-stats .pill { color: var(--muted); }
+  .decision-stats .pill b { color: var(--text); font-weight: 600; }
+  .decision-list { display: grid; gap: 6px; max-height: var(--list-h-decisions); overflow: auto; }
+  .decision-item { border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); }
+  .decision-item:hover, .decision-item.open { border-color: var(--accent); }
+  .decision-head {
+    display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+    cursor: pointer; font-size: var(--fs-sm);
+  }
+  .decision-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .decision-time { color: var(--muted); font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+  .decision-chat {
+    color: var(--muted); flex: 0 1 auto; max-width: 150px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .decision-badge {
+    flex: 0 0 auto; padding: 1px 8px; border-radius: 999px;
+    border: 1px solid var(--line); font-size: var(--fs-xs);
+  }
+  .decision-badge.out-replied { color: var(--ok); border-color: var(--ok); }
+  .decision-badge.out-silent { color: var(--muted); }
+  .decision-badge.out-blocked { color: var(--warn); border-color: var(--warn); }
+  .decision-badge.out-held { color: var(--accent); border-color: var(--accent); }
+  .decision-badge.out-error { color: var(--bad); border-color: var(--bad); }
+  .decision-checkpoint { flex: 0 0 auto; color: var(--warn); font-size: var(--fs-xs); }
+  .decision-summary {
+    flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .decision-detail {
+    border-top: 1px dashed var(--line); padding: 8px 10px;
+    display: grid; gap: 4px; font-size: var(--fs-sm);
+  }
+  .decision-line { white-space: pre-wrap; word-break: break-word; }
+  .decision-line b { color: var(--muted); font-weight: 600; margin-right: 6px; }
+  .decision-attribution { color: var(--warn); }
   .debug-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
   .debug-form label { display: grid; gap: 4px; color: var(--muted); font-size: var(--fs-sm); }
   .debug-form input, .debug-form select, .debug-form textarea { width: 100%; }
@@ -525,7 +563,6 @@
       <span class="spacer"></span>
       <button class="btn" id="btn-refresh-health">刷新</button>
     </div>
-    <div class="grid-3" id="health-processes"></div>
     <div class="kv cfg-grid" id="health-body"></div>
     <div class="grid-2" id="health-channels"></div>
     <div class="row" id="wechat-kill-row">
@@ -534,6 +571,25 @@
       <button class="btn danger" id="btn-wechat-stop" data-channel="wechat">微信急停</button>
       <button class="btn" id="btn-wechat-resume" data-channel="wechat">恢复轮询</button>
     </div>
+  </section>
+
+  <section class="card span-full" id="decisions-card">
+    <div class="row card-head">
+      <h2>决策流</h2>
+      <span class="kv" id="decisions-hint"></span>
+      <span class="spacer"></span>
+      <span class="kv" id="decisions-updated"></span>
+    </div>
+    <div class="row decision-stats" id="decisions-stats"></div>
+    <div class="row card-toolbar" id="decision-filters" role="group" aria-label="按决策结果筛选">
+      <button type="button" class="tab active" data-filter="" aria-pressed="true">全部</button>
+      <button type="button" class="tab" data-filter="replied" aria-pressed="false">回复</button>
+      <button type="button" class="tab" data-filter="silent" aria-pressed="false">沉默</button>
+      <button type="button" class="tab" data-filter="blocked" aria-pressed="false">拦截</button>
+      <button type="button" class="tab" data-filter="held" aria-pressed="false">攒着</button>
+      <button type="button" class="tab" data-filter="error" aria-pressed="false">错误</button>
+    </div>
+    <div class="decision-list" id="decisions-list"></div>
   </section>
 
   <section class="card" id="alerts-card">
@@ -690,7 +746,6 @@
     </details>
     <div class="kv" id="memory-health" role="status" aria-live="polite"></div>
     <div class="row" id="memory-unblock-row" hidden>
-      <span class="kv">配额熔断会暂停摘要与印象的自动生成，到期会自行恢复。</span>
       <button class="btn" id="btn-memory-unblock">解除熔断</button>
     </div>
     <div class="mem-grid">
@@ -1024,6 +1079,23 @@ const MODE_ORDER = ["free", "key", "local_model"];
 const MODE_LABEL = { free: "免费额度", key: "自备 Key", local_model: "本地模型" };
 // 与 model_probe.CONTEXT_P90 保持一致：静态页不能 import Python 常量，测试钉住两边相同。
 const CONTEXT_P90 = 21062;
+const DECISION_OUTCOME = {
+  replied: { label: "回复", cls: "replied" },
+  silent: { label: "沉默", cls: "silent" },
+  blocked: { label: "拦截", cls: "blocked" },
+  held: { label: "攒着", cls: "held" },
+  error: { label: "失败", cls: "error" },
+};
+const DECISION_CHECKPOINT = {
+  intensity_quiet: "安静强度",
+  opportunity_hold: "纯热聊攒着",
+  budget: "预算",
+  recalled: "已撤回",
+  restricted: "言论限制",
+  guard_dropped: "重复守卫",
+  brain_error: "模型失败",
+  send_failed: "发送失败",
+};
 
 let state = null;
 let selectedMode = "free";
@@ -1059,6 +1131,13 @@ let searchTotal = 0;
 const SESSIONS_PAGE = 50;
 let sessionsOffset = 0;
 let sessionsTotal = 0;
+
+// 决策流：50 条 / 1 天；筛选在前端做，不重新请求。
+const DECISION_LIMIT = 50;
+const DECISION_DAYS = 1;
+let decisionFilter = "";
+let decisionItems = [];
+const decisionExpanded = new Set();
 
 let usageDays = 7;
 let healthQuotaPaused = false;
@@ -1626,8 +1705,7 @@ function renderBrain() {
   const mode = inferBrainMode(brain);
   $("brain-hint").textContent =
     `当前：${MODE_LABEL[mode] || mode}` +
-    (brain.model ? ` · ${brain.model}` : "") +
-    ` · OneBot ${brain.gateway_connected ? "已连接" : "未连接"}`;
+    (brain.model ? ` · ${brain.model}` : "");
 }
 
 function applyStatus(data) {
@@ -1796,52 +1874,23 @@ function renderHealth(data) {
   $("health-hint").textContent =
     `${data.generated_at || "—"} · 运行 ${fmtUptime(data.uptime_seconds)} · v${data.version || "—"}`;
 
-  const procBox = $("health-processes");
-  procBox.replaceChildren();
-  Object.entries(data.processes || {}).forEach(([name, proc]) => {
-    const card = document.createElement("div");
-    card.className = "card";
-    const title = document.createElement("div");
-    title.className = "proc-name";
-    title.textContent = PROC_TITLE[name] || name;
-    const st = (proc && proc.status) || "stopped";
-    const pill = document.createElement("span");
-    pill.className = `pill st-${st}`;
-    pill.innerHTML = '<span class="dot"></span>';
-    pill.append(STATUS_TEXT[st] || st);
-    card.append(title, pill);
-    procBox.append(card);
-  });
-
-  const gateway = data.gateway || {};
   const traffic = data.traffic || {};
   const scheduler = data.scheduler || {};
   const quota = data.quota || {};
   healthQuotaPaused = Boolean(quota.paused);
   const memory = data.memory || {};
   const disk = data.disk || {};
-  const backups = data.backups || {};
-  const alerts = data.alerts || {};
   const rows = [
-    ["QQ 网关", gateway.connected ? "已连接" : "未连接"],
     ["最后消息", traffic.last_message_at || "—"],
     ["最后回复", traffic.last_reply_at || "—"],
     ["待投批次", `${scheduler.pending_chats ?? 0} 排队 / ${scheduler.inflight_chats ?? 0} 投递中`],
-    ["配额", quota.paused_until ? "暂停中" : "正常"],
     [
       "磁盘",
       disk.free_percent === null || disk.free_percent === undefined
         ? "不可用"
         : `剩余 ${disk.free_percent}%（${fmtBytes(disk.free_bytes)} 可用）`,
     ],
-    [
-      "备份",
-      backups.last_error_at
-        ? `失败于 ${backups.last_error_at}`
-        : `${backups.count ?? 0} 份 · 上次成功 ${backups.last_success_at || "—"}`,
-    ],
     ["消息库", `${memory.message_count ?? 0} 条 · ${fmtBytes(memory.db_bytes)}`],
-    ["告警", `活动 ${alerts.firing ?? 0} · 24h 恢复 ${alerts.resolved_24h ?? 0}`],
   ];
   const body = $("health-body");
   body.replaceChildren();
@@ -1901,6 +1950,160 @@ async function refreshHealth() {
     $("health-hint").textContent = `读取失败：${err.message}`;
   }
   if (state) renderGlobalBanner(state);
+}
+
+function decisionOutcome(outcome) {
+  return DECISION_OUTCOME[outcome] || { label: outcome || "未知", cls: "silent" };
+}
+
+function decisionCheckpointLabel(checkpoint) {
+  return checkpoint ? (DECISION_CHECKPOINT[checkpoint] || checkpoint) : "";
+}
+
+function decisionClock(at, withSeconds = false) {
+  const date = new Date(at);
+  if (Number.isNaN(date.getTime())) return "--:--";
+  return date.toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    ...(withSeconds ? { second: "2-digit" } : {}),
+    hour12: false,
+  });
+}
+
+// chat_id 可能很长（qq:… / wxg:…），列表里只留尾部，完整值靠 title 显示。
+function shortChatId(id) {
+  const text = String(id == null ? "" : id);
+  return text.length > 18 ? `…${text.slice(-16)}` : text;
+}
+
+function decisionSummary(item) {
+  return item.reason || item.think || item.read || "—";
+}
+
+// 沉默/拦截的归因：没有 checkpoint 就是模型自决，否则标明卡在哪一步。
+function decisionAttribution(item) {
+  if (!["silent", "blocked", "held", "error"].includes(item.outcome)) return "";
+  if (item.checkpoint) return `卡在：${decisionCheckpointLabel(item.checkpoint)}`;
+  return {
+    silent: "模型自决",
+    blocked: "规则拦截",
+    held: "刻意攒着",
+    error: "调用失败",
+  }[item.outcome] || "";
+}
+
+function fmtLatency(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value <= 0) return "—";
+  return value < 1000 ? `${Math.round(value)}ms` : `${(value / 1000).toFixed(1)}s`;
+}
+
+function decisionLine(label, text) {
+  if (!text) return "";
+  return `<div class="decision-line"><b>${label}</b>${escapeHtml(text)}</div>`;
+}
+
+function decisionDetailHtml(item) {
+  const parts = [
+    decisionLine("读", item.read),
+    decisionLine("想", item.think),
+    decisionLine("理由", item.reason),
+    item.outcome === "replied" ? decisionLine("回复", item.reply_preview) : "",
+  ];
+  const meta = [
+    `消息 ${Number(item.message_count) || 0}`,
+    item.addressed ? "点名" : "未点名",
+    `${Number(item.prompt_tokens) || 0} + ${Number(item.completion_tokens) || 0} token`,
+    `延迟 ${fmtLatency(item.latency_ms)}`,
+  ];
+  parts.push(`<div class="kv decision-meta">${meta.join(" · ")}</div>`);
+  const attribution = decisionAttribution(item);
+  if (attribution) parts.push(`<div class="kv decision-attribution">${escapeHtml(attribution)}</div>`);
+  return parts.join("");
+}
+
+function renderDecisionStats(stats) {
+  const s = stats || {};
+  const by = s.by_outcome || {};
+  const days = Number(s.window_days) || DECISION_DAYS;
+  const silence = Number(s.silence_rate);
+  const silenceText = Number.isFinite(silence) ? `${Math.round(silence * 100)}%` : "—";
+  const chips = [
+    `${days === 1 ? "今日" : `近 ${days} 天`} <b>${Number(s.total) || 0}</b> 次`,
+    `回复 <b>${Number(by.replied) || 0}</b>`,
+    `沉默 <b>${Number(by.silent) || 0}</b>`,
+    `拦截 <b>${Number(by.blocked) || 0}</b>`,
+    `模型沉默率 <b>${silenceText}</b>`,
+    `平均 <b>${fmtLatency(s.avg_latency_ms)}</b>`,
+  ];
+  $("decisions-stats").innerHTML = chips
+    .map((text) => `<span class="pill">${text}</span>`)
+    .join("");
+}
+
+function renderDecisions() {
+  const box = $("decisions-list");
+  const items = decisionItems.filter((item) => !decisionFilter || item.outcome === decisionFilter);
+  if (!items.length) {
+    box.replaceChildren(emptyState(decisionItems.length ? "当前筛选没有决策记录" : "暂无决策记录"));
+    return;
+  }
+  box.innerHTML = items.map((item) => {
+    const key = String(item.id ?? "");
+    const open = decisionExpanded.has(key);
+    const out = decisionOutcome(item.outcome);
+    const checkpoint = decisionCheckpointLabel(item.checkpoint);
+    return `<div class="decision-item${open ? " open" : ""}" data-decision-id="${escapeHtml(key)}">
+      <div class="decision-head" role="button" tabindex="0" aria-expanded="${open ? "true" : "false"}">
+        <span class="decision-time" title="${escapeHtml(item.at || "")}">${escapeHtml(decisionClock(item.at))}</span>
+        <span class="decision-chat" title="${escapeHtml(String(item.chat_id ?? ""))}">${escapeHtml(shortChatId(item.chat_id))}</span>
+        <span class="decision-badge out-${escapeHtml(out.cls)}">${escapeHtml(out.label)}</span>
+        ${checkpoint ? `<span class="decision-checkpoint">${escapeHtml(checkpoint)}</span>` : ""}
+        <span class="decision-summary" title="${escapeHtml(decisionSummary(item))}">${escapeHtml(decisionSummary(item))}</span>
+      </div>
+      <div class="decision-detail"${open ? "" : " hidden"}>${decisionDetailHtml(item)}</div>
+    </div>`;
+  }).join("");
+}
+
+function toggleDecision(key, head) {
+  const item = head.closest("[data-decision-id]");
+  const detail = item && item.querySelector(".decision-detail");
+  if (!detail) return;
+  const open = !decisionExpanded.has(key);
+  if (open) decisionExpanded.add(key);
+  else decisionExpanded.delete(key);
+  item.classList.toggle("open", open);
+  head.setAttribute("aria-expanded", open ? "true" : "false");
+  detail.hidden = !open;
+}
+
+function setDecisionFilter(value) {
+  decisionFilter = value;
+  document.querySelectorAll("#decision-filters .tab").forEach((el) => {
+    const active = el.dataset.filter === value;
+    el.classList.toggle("active", active);
+    el.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  renderDecisions();
+}
+
+async function loadDecisions() {
+  if (document.hidden) return; // 后台标签不刷新，回到前台由 visibilitychange 触发
+  try {
+    const data = await api(`/api/decisions?limit=${DECISION_LIMIT}&days=${DECISION_DAYS}`);
+    decisionItems = Array.isArray(data.items) ? data.items : [];
+    renderDecisionStats(data.stats);
+    $("decisions-hint").textContent = "";
+    $("decisions-updated").textContent = data.generated_at
+      ? `更新 ${decisionClock(data.generated_at, true)}`
+      : "";
+    renderDecisions();
+  } catch (err) {
+    $("decisions-hint").textContent = `读取失败：${err.message}`;
+    if (!decisionItems.length) renderDecisions();
+  }
 }
 
 // alerts 未启用：新后端回 200 + enabled:false（老后端 503）。
@@ -2241,18 +2444,6 @@ function renderMemory(data) {
   let hint = totalShown
     ? `摘要 ${summaries.length}/${summaryTotal} · 印象 ${impressions.length}/${impressionTotal}`
     : `摘要 ${summaries.length} 条 · 印象 ${impressions.length} 条`;
-  // 配额熔断时记忆任务全停，面板只说「没有摘要」会被当成故障。
-  const quota = (data && data.quota) || {};
-  const quotaUntil = Number(quota.until);
-  if (quota.paused && Number.isFinite(quotaUntil)) {
-    const at = new Date(quotaUntil * 1000);
-    const clock = at.toLocaleTimeString("zh-CN", {
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
-    hint += ` · 配额暂停中，${clock} 后恢复`;
-  }
   $("memory-hint").textContent = hint;
   // 分页上限以服务端 limit_max 为准；字段缺失（旧服务端）才用下面的兜底常量。
   const limitMax = Number(data && data.limit_max);
@@ -2884,10 +3075,10 @@ async function loadConfig() {
     const providerModel = c.brain.model ? `${c.brain.provider} · ${c.brain.model}` : c.brain.provider;
     const agent = c.brain.provider === "opencode" ? ` · agent ${c.brain.agent}` : "";
     const rows = [
-      ["大脑", providerModel + agent],
+      ["配置·大脑", providerModel + agent],
       ["人设", `${c.persona.name} · 回复 ${c.persona.max_reply_chars}/${c.persona.max_reply_chars_technical} 字 · OS ${(c.persona.os_probability * 100).toFixed(1)}%`],
       ["限流", `${c.rate_limit.window_seconds / 60} 分钟内 ${c.rate_limit.threshold} 次 429 → 退避 ${c.rate_limit.backoff_seconds}s · 配额暂停 ${Math.round(c.rate_limit.quota_pause_seconds / 60)} 分钟`],
-      ["预算", `每日 ${c.budget.daily_calls} 次 / ${fmtTokens(c.budget.daily_tokens)} token`],
+      ["配置·预算", `每日 ${c.budget.daily_calls} 次 / ${fmtTokens(c.budget.daily_tokens)} token`],
       ["记忆", `窗口 ${c.memory.window_size} 条 · 保留 ${c.memory.retention_days > 0 ? `${c.memory.retention_days} 天` : "永久"}`],
       ["网关", c.gateway.provider],
     ];
@@ -3600,6 +3791,24 @@ $("probe-btn").addEventListener("click", (ev) => withBusy(ev.currentTarget, prob
 $("local-context").addEventListener("blur", updateContextGrade);
 $("btn-apply-brain").addEventListener("click", (ev) => withBusy(ev.currentTarget, applyBrain));
 $("btn-refresh-health").addEventListener("click", refreshHealth);
+$("decision-filters").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-filter]");
+  if (btn) setDecisionFilter(btn.dataset.filter || "");
+});
+$("decisions-list").addEventListener("click", (ev) => {
+  const head = ev.target.closest(".decision-head");
+  if (!head) return;
+  const item = head.closest("[data-decision-id]");
+  if (item) toggleDecision(item.dataset.decisionId, head);
+});
+$("decisions-list").addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter" && ev.key !== " ") return;
+  const head = ev.target.closest(".decision-head");
+  if (!head) return;
+  ev.preventDefault();
+  const item = head.closest("[data-decision-id]");
+  if (item) toggleDecision(item.dataset.decisionId, head);
+});
 $("btn-wechat-stop").addEventListener("click", (ev) => withBusy(ev.currentTarget, wechatStop));
 $("btn-wechat-resume").addEventListener("click", (ev) => withBusy(ev.currentTarget, wechatResume));
 $("free-banner-go").addEventListener("click", () => {
@@ -3733,9 +3942,11 @@ initTabs();
 $("summary-date").value = yesterdayIso();
 loadAuthSession();
 // 面板刚打开：强制重探一次免费档，别让上一次会话留下的旧黄条继续挂着。
+// 只为触发后端重探；响应丢弃也没关系，状态由下一轮 /api/status 带回。
 api("/api/brain?probe=1").catch(() => {});
 refresh();
 refreshHealth();
+loadDecisions();
 refreshAlerts();
 refreshBackups();
 loadMemory();
@@ -3754,9 +3965,11 @@ setInterval(loadMemory, 30000);
 setInterval(loadUsage, 30000);
 setInterval(loadBudget, 30000);
 setInterval(loadSessions, 15000);
+setInterval(() => { if (!document.hidden) loadDecisions(); }, 15000);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   refreshHealth();
+  loadDecisions();
   if (!alertsDisabled) refreshAlerts();
   refreshBackups();
   loadMemory();

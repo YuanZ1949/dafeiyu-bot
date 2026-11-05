@@ -50,6 +50,26 @@ __all__ = ["ChatRef", "LocalMessageStore", "StoreError"]
 #: 群 username 的固定后缀。
 CHATROOM_SUFFIX = "@chatroom"
 
+#: 系统/官方会话：即使不是 ``@chatroom`` 也不能当好友私聊对象。
+_SYSTEM_USERNAMES = frozenset(
+    {
+        "filehelper",
+        "notifymessage",
+        "weixin",
+        "fmessage",
+        "medianote",
+        "floatbottle",
+        "qqmail",
+        "qmessage",
+        "tmessage",
+        "weixinreminder",
+        "officialaccounts",
+        "mphelper",
+        "brandsessionholder",
+        "snshelper",
+    }
+)
+
 #: `local_type` 低 32 位是类型，高位是标志位。
 _TYPE_MASK = 0xFFFFFFFF
 
@@ -127,12 +147,14 @@ _MEDIA_DURATION_COLUMNS = ("duration", "play_length", "voice_length")
 
 @dataclass(frozen=True)
 class ChatRef:
-    """一个已定位的群：显示名 + username + 分库相对路径 + 消息表名。"""
+    """一个已定位的会话：显示名 + username + 分库相对路径 + 消息表名。"""
 
     display_name: str
     username: str
     shard: str
     table: str
+    #: "group" / "friend"；旧调用方按 4 个位置参数构造时默认按群处理。
+    kind: str = "group"
 
 
 class StoreError(RuntimeError):
@@ -200,24 +222,43 @@ class LocalMessageStore:
         }
         return sorted(names)
 
-    def resolve(self, display_name: str) -> ChatRef | None:
-        """按群显示名解析 ``(username, shard, table)``；歧义/缺失返回 None。"""
+    def friend_names(self) -> list[str]:
+        """所有好友（``wxid_*`` 私聊对象）的显示名（去重、排序）。
+
+        只认 ``contact`` 表里的 wxid：官方号（``gh_``）、系统会话
+        （filehelper / weixin / notifymessage …）和 ``@openim`` 都不算好友，
+        避免把系统通知当成「有人私聊 bot」。
+        """
+        names = {
+            display
+            for username, display in self._contact_rows()
+            if self._is_friend_username(username) and display
+        }
+        return sorted(names)
+
+    def resolve(self, display_name: str, kind: str = "group") -> ChatRef | None:
+        """按显示名解析 ``(username, shard, table)``；歧义/缺失返回 None。"""
         name = str(display_name or "").strip()
-        if not name:
+        if not name or kind not in ("group", "friend"):
             return None
 
         matched = [
             username
             for username, display in self._contact_rows()
-            if _is_chatroom(username) and display == name
+            if self._match_username(username, kind) and display == name
         ]
         if not matched:
-            log.debug("群显示名 %r 在 contact 里没有对应的 @chatroom", name)
+            log.debug(
+                "%s显示名 %r 在 contact 里没有对应的 username",
+                "群" if kind == "group" else "好友",
+                name,
+            )
             return None
         if len(set(matched)) > 1:
-            # 同名群 fail closed：猜错群会把 A 群的消息发进 B 群。
+            # 同名 fail closed：猜错会话会把 A 的消息发进 B。
             log.warning(
-                "群显示名 %r 命中 %d 个 @chatroom，拒绝猜测：%s",
+                "%s显示名 %r 命中 %d 个 username，拒绝猜测：%s",
+                "群" if kind == "group" else "好友",
                 name,
                 len(set(matched)),
                 sorted(set(matched)),
@@ -228,9 +269,50 @@ class LocalMessageStore:
         table = message_table_name(username)
         shard = self._find_shard(table)
         if shard is None:
-            log.debug("群 %r（%s）的消息表 %s 不在任何分库里", name, username, table)
+            log.debug("会话 %r（%s）的消息表 %s 不在任何分库里", name, username, table)
             return None
-        return ChatRef(display_name=name, username=username, shard=shard, table=table)
+        return ChatRef(
+            display_name=name, username=username, shard=shard, table=table, kind=kind
+        )
+
+    def resolve_any(self, display_name: str) -> ChatRef | None:
+        """群或好友任一命中；同名的群和好友同时存在时返回 None（不猜）。"""
+        group = self.resolve(display_name, kind="group")
+        friend = self.resolve(display_name, kind="friend")
+        if group is not None and friend is not None:
+            log.warning(
+                "显示名 %r 同时命中群 %s 和好友 %s，拒绝猜测",
+                display_name,
+                group.username,
+                friend.username,
+            )
+            return None
+        return group or friend
+
+    def kind_of(self, display_name: str) -> str | None:
+        """显示名唯一对应的会话类型；不存在或群/好友重名时返回 None。"""
+        name = str(display_name or "").strip()
+        if not name:
+            return None
+        kinds = [kind for kind in ("group", "friend") if self.resolve(name, kind)]
+        return kinds[0] if len(kinds) == 1 else None
+
+    def _match_username(self, username: str, kind: str) -> bool:
+        if kind == "group":
+            return _is_chatroom(username)
+        if kind == "friend":
+            return self._is_friend_username(username)
+        return False
+
+    def _is_friend_username(self, username: str) -> bool:
+        """微信 4.x 的私聊对象：``wxid_*``，排除自己和系统/官方号。"""
+        value = str(username or "").strip()
+        return (
+            bool(value)
+            and value.startswith("wxid_")
+            and value != self._self_username
+            and value not in _SYSTEM_USERNAMES
+        )
 
     def recent(self, ref: ChatRef, limit: int = 50) -> list[dict[str, Any]]:
         """读 ``ref`` 最近的 ``limit`` 条消息，时间正序（旧 -> 新）。"""

@@ -54,7 +54,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .align import SessionAligner
 
@@ -327,6 +327,7 @@ class PollingLoop:
         localdb: Any | None = None,
         panel: Callable[[], frozenset[str] | None] | None = None,
         align_state_path: str | Path | None = None,
+        private_enabled: bool | None = None,
     ) -> None:
         self.wechat = wechat
         self.driver = driver
@@ -338,6 +339,12 @@ class PollingLoop:
         # `empty_means:"all"` 一致）。读不出来时 fail-closed：不轮询、不发送。
         self._panel = panel
         self._panel_none_warned = False
+        # 微信私聊：默认关闭。关闭时不枚举好友、面板里列了也不轮询，
+        # `allows_chat` 也不放行好友出站；开启后才把好友纳入范围。
+        raw_private = private_enabled
+        if raw_private is None:
+            raw_private = bool(getattr(wechat, "private_enabled", False))
+        self.private_enabled = bool(raw_private)
         self.ui = ui if ui is not None else UiThread()
         self._owns_ui = ui is None
         if registry is None:
@@ -374,7 +381,7 @@ class PollingLoop:
         )
         self.kill_switch_path = Path(str(raw_kill or DEFAULT_KILL_SWITCH))
 
-        self._aligners: dict[str, SessionAligner] = {}
+        self._aligners: dict[tuple[str, str], SessionAligner] = {}
         # 对齐窗口落盘：重启后 feed 回 aligner，停机期间的新消息不会丢。
         self.align_state_path = (
             Path(str(align_state_path)) if align_state_path else None
@@ -562,45 +569,101 @@ class PollingLoop:
 
     def _localdb_group_names(self) -> tuple[str, ...]:
         """本地库能枚举到的全部群显示名；不可用/无能力时返回空元组。"""
+        return self._localdb_names("group")
+
+    def _localdb_friend_names(self) -> tuple[str, ...]:
+        """本地库能枚举到的好友显示名；私聊关闭/无能力时返回空元组。"""
+        if not self.private_enabled:
+            return ()
+        return self._localdb_names("friend")
+
+    def _localdb_names(self, kind: str) -> tuple[str, ...]:
         source = self.localdb
-        getter = getattr(source, "group_names", None)
+        getter = getattr(source, "group_names" if kind == "group" else "friend_names", None)
         if not callable(getter):
             return ()
         try:
             raw = getter()
         except Exception as exc:  # noqa: BLE001 - 枚举失败按「不知道」处理
-            logger.warning("枚举本地库群名失败：%s", exc)
+            logger.warning("枚举本地库%s名失败：%s", "群" if kind == "group" else "好友", exc)
             return ()
         if isinstance(raw, (str, bytes)) or not isinstance(raw, Iterable):
             return ()
         names = tuple(sorted({str(name).strip() for name in raw if str(name).strip()}))
-        # 枚举得到不等于读得到：还没有消息分库的群（例如刚建/只有系统消息的会话）
+        # 枚举得到不等于读得到：还没有消息分库的会话（例如刚建/只有系统消息）
         # resolve 会失败，此时 UIA 兜底只会多一次开窗超时，什么也读不到。
         resolver = getattr(source, "resolve_username", None)
         if not callable(resolver):
-            return names
+            return () if kind == "friend" else names
+        kind_of = getattr(source, "peer_kind", None)
         kept: list[str] = []
         for name in names:
             try:
-                if resolver(name):
-                    kept.append(name)
+                if not resolver(name):
+                    continue
+                # 好友必须同时确认类型，避免把同名群误当私聊。
+                if kind == "friend":
+                    if not callable(kind_of) or kind_of(name) != "friend":
+                        continue
+                kept.append(name)
             except Exception as exc:  # noqa: BLE001 - 解析失败按「读不到」处理
-                logger.debug("解析本地库群 %r 失败：%s", name, exc)
+                logger.debug("解析本地库会话 %r 失败：%s", name, exc)
         return tuple(kept)
 
-    def _scope(self) -> tuple[str, ...]:
-        """本轮允许轮询的群显示名；面板是唯一来源。
+    def _kind_of_session(self, name: str) -> str | None:
+        """会话类型：本地库优先，其次身份表；判断不出来返回 None。"""
+        source = self.localdb
+        kind_of = getattr(source, "peer_kind", None)
+        if callable(kind_of):
+            try:
+                kind = kind_of(name)
+            except Exception as exc:  # noqa: BLE001 - 类型判断失败按未知处理
+                logger.debug("本地库判断会话 %r 类型失败：%s", name, exc)
+            else:
+                if kind in ("group", "friend"):
+                    return str(kind)
+        all_peers = getattr(self.registry, "all_peers", None)
+        if callable(all_peers):
+            peers_fn = cast(Callable[[], Iterable[Any]], all_peers)
+            try:
+                kinds: set[str] = set()
+                for peer in peers_fn():
+                    live = bool(getattr(peer, "live", False))
+                    answers = getattr(peer, "answers_to", lambda _: False)
+                    if live and answers(name):
+                        kinds.add(str(peer.kind))
+            except Exception as exc:  # noqa: BLE001 - 身份表坏了只影响类型
+                logger.debug("身份表判断会话 %r 类型失败：%s", name, exc)
+            else:
+                if len(kinds) == 1:
+                    return str(next(iter(kinds)))
+        return None
 
-        - 面板白名单非空：只返回其中能解析成存活群会话的那些；
-        - 面板白名单为空：返回本地库枚举到的全部群（本地库不能枚举时一个
-          都不轮询——UIA 没有可靠的会话清单，宁可少开窗）；
-        - 面板读不出来（None）：fail-closed，返回空（不轮询任何群）。
+    def _scope(self) -> tuple[str, ...]:
+        """本轮允许轮询的会话显示名；面板是唯一来源。
+
+        - 面板白名单非空：只返回其中能解析成存活会话的那些（好友还要求
+          `private_enabled`）；
+        - 面板白名单为空：返回本地库枚举到的全部群；`private_enabled` 时再
+          加上全部好友（本地库不能枚举时一个都不轮询——UIA 没有可靠的会话
+          清单，宁可少开窗）；
+        - 面板读不出来（None）：fail-closed，返回空（不轮询任何会话）。
         """
         panel = self._panel_whitelist()
         if panel is None:
             return ()
         if not panel:
-            return self._localdb_group_names()
+            groups = self._localdb_group_names()
+            friends = self._localdb_friend_names()
+            if not friends:
+                return tuple(sorted(set(groups)))
+            overlap = set(groups) & set(friends)
+            if overlap:
+                # 群/好友重名无法判定类型：跳过，绝不让私聊抢走群会话。
+                logger.warning(
+                    "本地库里有显示名同时属于群和好友，已跳过：%s", sorted(overlap)
+                )
+            return tuple(sorted((set(groups) | set(friends)) - overlap))
         names: set[str] = set()
         for chat_id in panel:
             alias = _alias_of(chat_id)
@@ -609,7 +672,10 @@ class PollingLoop:
             peer = self._peer(alias)
             if peer is None or not getattr(peer, "live", False):
                 continue
-            if str(getattr(peer, "kind", "group")) != "group":
+            kind = str(getattr(peer, "kind", "group"))
+            if kind not in ("group", "friend"):
+                continue
+            if kind == "friend" and not self.private_enabled:
                 continue
             name = str(getattr(peer, "display_name", "") or "").strip()
             if name:
@@ -620,12 +686,21 @@ class PollingLoop:
         """出站闸门：面板白名单非空时只放行列出的会话，空 = 不限群。
 
         面板读不出来（None）时一律拒绝：没有可信的白名单就不发送。
+        好友私聊还要求 `private_enabled`，关闭时即使白名单里列了也拒绝。
         """
-        if _alias_of(chat_id) is None:
-            # 桥只管微信会话：面板放开的只是「哪些群」，不是别的通道。
+        alias = _alias_of(chat_id)
+        if alias is None:
+            # 桥只管微信会话：面板放开的只是「哪些会话」，不是别的通道。
             return False
         panel = self._panel_whitelist()
         if panel is None:
+            return False
+        peer = self._peer(alias)
+        if (
+            peer is not None
+            and str(getattr(peer, "kind", "group")) == "friend"
+            and not self.private_enabled
+        ):
             return False
         if panel:
             return str(chat_id or "").strip() in panel
@@ -668,7 +743,8 @@ class PollingLoop:
             handle = await self._ui_call(self.driver.open_chat, group)
             snapshot = await self._ui_call(self.driver.snapshot, handle)
             entries = snapshot.get("messages") if isinstance(snapshot, dict) else []
-        aligner = self._aligner(group)
+        kind = self._kind_of_session(group) or "group"
+        aligner = self._aligner(group, kind)
         if aligner is None:
             return []
         result = aligner.poll(entries or [])
@@ -712,12 +788,15 @@ class PollingLoop:
         messages = snapshot.get("messages")
         return list(messages) if isinstance(messages, list) else None
 
-    def _aligner(self, group: str) -> SessionAligner | None:
-        cached = self._aligners.get(group)
+    def _aligner(self, group: str, kind: str = "group") -> SessionAligner | None:
+        cache_key = (group, kind)
+        cached = self._aligners.get(cache_key)
         if cached is not None:
             return cached
+        registry_kind = "friend" if kind == "friend" else "group"
+        chat_type = "private" if kind == "friend" else "group"
         try:
-            chat_id = str(self.registry.chat_id(group, kind="group"))
+            chat_id = str(self.registry.chat_id(group, kind=registry_kind))
         except Exception as exc:  # noqa: BLE001 - 身份歧义时 fail-closed，不猜
             logger.warning("会话 %r 无法解析稳定 alias，跳过：%s", group, exc)
             return None
@@ -725,7 +804,7 @@ class PollingLoop:
             chat_id,
             group,
             account_nickname=self._account_nickname,
-            chat_type="group",
+            chat_type=chat_type,
             clock=self._clock,
         )
         # 旧替身没有 seed：跳过续跑，退回「第一轮只建基线」的语义。
@@ -736,7 +815,7 @@ class PollingLoop:
                 seed(restored)
             except Exception as exc:  # noqa: BLE001 - 坏状态只影响一轮，不阻断轮询
                 logger.warning("会话 %r 的对齐窗口还原失败：%s", group, exc)
-        self._aligners[group] = aligner
+        self._aligners[cache_key] = aligner
         return aligner
 
     def _remember_align_window(self, group: str, aligner: Any) -> None:

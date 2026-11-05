@@ -26,11 +26,12 @@ from urllib.request import urlopen
 from .version import get_version
 
 # 任务约定的六个端口：面板、控制口、微信桥、微信 hook、NapCat、opencode。
+# hook 端口以 config.yaml 的 gateway.wechat.hook_url 为准，这里只是诊断展示。
 PORTS: tuple[tuple[int, str], ...] = (
     (8787, "supervisor 面板"),
     (8788, "bot 控制口"),
     (8790, "微信桥"),
-    (30011, "微信 hook"),
+    (30012, "微信 hook"),
     (8080, "NapCat 反向 WS"),
     (24310, "opencode serve"),
 )

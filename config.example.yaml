@@ -72,6 +72,13 @@ gateway:
     local_db_root: ""
     # 解密镜像的最小同步间隔（秒）；0 = 每轮同步。
     local_db_refresh_seconds: 1.0
+    # 微信私聊（好友会话）入站：默认关闭。开启后本地库会把 wxid_* 好友的
+    # 私聊纳入轮询；只管「看得见」，要不要自动回由 private_reply 决定。
+    # 系统号（文件传输助手、服务通知、公众号…）和 @openim 永远不算好友。
+    private_enabled: false
+    # 微信私聊自动回复：默认关闭。private_enabled=true 且此项为 true 才回；
+    # 关闭时消息照常入库、面板可见，命令（/status 等）仍然可用。
+    private_reply: false
     # 出站后端：uia（默认，桌面自动化，锁屏不可用）/ hook（HTTP 注入，不依赖桌面，
     # 但需 hook_url + local_db_enabled，群 username 从本地库解析）/ auto（先 hook，
     # 只有明确「没发出去」时才回落 UIA；超时这类结果不明的情况不回落，避免重复发送）。

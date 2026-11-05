@@ -116,7 +116,7 @@ class LocalDbSource:
 
     # ------------------------------------------------------------- 查询
     def snapshot(self, display_name: str) -> dict[str, Any] | None:
-        """返回该群最近 50 条消息；不可用时返回 None（调用方回落 UIA）。"""
+        """返回该会话最近 50 条消息；不可用时返回 None（调用方回落 UIA）。"""
         store = self._ensure()
         if store is None:
             return None
@@ -124,9 +124,9 @@ class LocalDbSource:
         if not name:
             return None
         try:
-            ref = store.resolve(name)
+            ref = store.resolve_any(name)
             if ref is None:
-                log.debug("本地库找不到群 %r（可能改名/未同步），回落 UIA", name)
+                log.debug("本地库找不到会话 %r（可能改名/未同步），回落 UIA", name)
                 return None
             messages = store.recent(ref, 50)
         except Exception as exc:  # noqa: BLE001 - 读失败只能回落 UIA
@@ -145,8 +145,19 @@ class LocalDbSource:
             log.debug("枚举群名失败：%s", exc)
             return []
 
-    def resolve_username(self, display_name: str) -> str | None:
-        """群显示名 -> ``xxx@chatroom``；不可用/歧义时返回 None（调用方 fail-closed）。"""
+    def friend_names(self) -> list[str]:
+        """本地库能枚举到的好友显示名；不可用时返回空列表。"""
+        store = self._ensure()
+        if store is None:
+            return []
+        try:
+            return list(store.friend_names())
+        except Exception as exc:  # noqa: BLE001 - 只影响私聊范围
+            log.debug("枚举好友名失败：%s", exc)
+            return []
+
+    def peer_kind(self, display_name: str) -> str | None:
+        """会话类型：``group`` / ``friend``；不存在或群/好友重名返回 None。"""
         store = self._ensure()
         if store is None:
             return None
@@ -154,9 +165,26 @@ class LocalDbSource:
         if not name:
             return None
         try:
-            ref = store.resolve(name)
+            return store.kind_of(name)
+        except Exception as exc:  # noqa: BLE001 - 判断失败按「不知道」处理
+            log.debug("判断会话 %r 类型失败：%s", name, exc)
+            return None
+
+    def resolve_username(self, display_name: str) -> str | None:
+        """显示名 -> username（群 ``xxx@chatroom`` 或好友 ``wxid_*``）。
+
+        不可用/歧义时返回 None（调用方 fail-closed）。
+        """
+        store = self._ensure()
+        if store is None:
+            return None
+        name = str(display_name or "").strip()
+        if not name:
+            return None
+        try:
+            ref = store.resolve_any(name)
         except Exception as exc:  # noqa: BLE001 - 解析失败只是「没解析到」
-            log.debug("本地库解析群 %r 失败：%s", name, exc)
+            log.debug("本地库解析会话 %r 失败：%s", name, exc)
             return None
         return str(getattr(ref, "username", "") or "") or None
 
@@ -171,7 +199,7 @@ class LocalDbSource:
         if not name:
             return None
         try:
-            ref = store.resolve(name)
+            ref = store.resolve_any(name)
             if ref is None:
                 return None
             return store.find_self_message(ref, text, since=since)
@@ -207,9 +235,10 @@ class LocalDbSource:
             self._store = store
             self._last_error = ""
         log.info(
-            "本地消息库就绪：%s（群 %d 个，镜像 %s）",
+            "本地消息库就绪：%s（群 %d 个，好友 %d 个，镜像 %s）",
             store,
             len(self.group_names()),
+            len(self.friend_names()),
             self._mirror_dir,
         )
         return store

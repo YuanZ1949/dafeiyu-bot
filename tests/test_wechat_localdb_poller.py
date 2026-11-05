@@ -252,3 +252,57 @@ async def test_localdb_targets_skip_groups_without_resolvable_username(
 
     assert await loop._targets() == ("老友群",)
     assert driver.opened == []
+
+class PrivateLocalDb:
+    """只暴露一个好友会话的假本地库。"""
+
+    available = True
+
+    def __init__(self) -> None:
+        self.messages: dict[str, list[dict[str, Any]]] = {
+            "好友甲": [{"nickname": "好友甲", "text": "在么"}]
+        }
+
+    def group_names(self) -> list[str]:
+        return []
+
+    def friend_names(self) -> list[str]:
+        return ["好友甲"]
+
+    def resolve_username(self, name: str) -> str | None:
+        return "wxid_f1" if name == "好友甲" else None
+
+    def peer_kind(self, name: str) -> str | None:
+        return "friend" if name == "好友甲" else None
+
+    def snapshot(self, name: str) -> dict[str, Any] | None:
+        return {"messages": list(self.messages.get(name, []))}
+
+
+async def test_private_frames_use_private_chat_type(started: Any) -> None:
+    driver = FakeDriver()
+    localdb = PrivateLocalDb()
+    loop = started(driver, localdb, private_enabled=True)
+    await loop.start()
+
+    first = await _drain_round(loop)
+    assert [f for f in first if f.get("type") == "message"] == []
+
+    localdb.messages["好友甲"].append({"nickname": "好友甲", "text": "睡了吗"})
+    second = await _drain_round(loop)
+
+    messages = [f for f in second if f.get("type") == "message"]
+    assert [f["text"] for f in messages] == ["睡了吗"]
+    assert messages[0]["chat_type"] == "private"
+    assert messages[0]["chat_id"] == "wxg:好友甲"
+    assert driver.opened == []
+
+
+async def test_private_disabled_never_polls_friends(started: Any) -> None:
+    driver = FakeDriver()
+    localdb = PrivateLocalDb()
+    loop = started(driver, localdb)
+    await loop.start()
+
+    assert await loop._targets() == ()
+    assert driver.opened == []

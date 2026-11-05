@@ -298,6 +298,31 @@ CREATE INDEX IF NOT EXISTS idx_usage_chat_date ON usage (chat_type, chat_id, dat
 -- 全局/月度预算按日期扫全表，单独建索引（老库 init_schema 时自动补上）。
 CREATE INDEX IF NOT EXISTS idx_usage_date ON usage (date);
 
+-- 决策流水：每一次「要不要开口」的判定结果，含模型原文 read/think/reason。
+-- 不是日志：面板按它展示决策细节、沉默率与拦截归因。
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_type TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    trigger TEXT NOT NULL DEFAULT 'batch',
+    outcome TEXT NOT NULL,
+    checkpoint TEXT NOT NULL DEFAULT '',
+    message_ids TEXT NOT NULL DEFAULT '[]',
+    message_count INTEGER NOT NULL DEFAULT 0,
+    addressed INTEGER NOT NULL DEFAULT 0,
+    read TEXT NOT NULL DEFAULT '',
+    think TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    reply_preview TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_created ON decisions (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_decisions_chat ON decisions (chat_type, chat_id, created_at DESC);
+
 -- 记忆旁路的失败冷却与配额熔断；存到库里才能跨进程重启存活。
 CREATE TABLE IF NOT EXISTS memory_backoff (
     key TEXT PRIMARY KEY,
@@ -3691,6 +3716,294 @@ class Store:
             }
             for row in rows
         ]
+
+    # ---- decisions -------------------------------------------------
+    def record_decision(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        *,
+        outcome: str,
+        trigger: str = "batch",
+        checkpoint: str = "",
+        message_ids: Sequence[str] = (),
+        message_count: int | None = None,
+        addressed: bool = False,
+        read: str = "",
+        think: str = "",
+        reason: str = "",
+        reply_preview: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: int = 0,
+        detail: dict[str, Any] | None = None,
+    ) -> int:
+        """写入一条决策流水，返回新行 id。
+
+        ``reason`` 只做 500 字兜底截断（防异常长文本），不套日志里的 120 字；
+        ``message_ids`` 最多保留 20 个，避免把整批历史塞进一行。
+
+        ``held`` 是「刻意攒着不投」，热聊群里每来一条新消息都会重判一次；同群
+        同原因 60 秒内只留一条，否则决策流会被重复的「攒着」挤满。
+        """
+        if outcome == "held" and checkpoint:
+            recent = self._conn.execute(
+                """
+                SELECT 1 FROM decisions
+                WHERE chat_type = ? AND chat_id = ? AND outcome = 'held'
+                  AND checkpoint = ? AND created_at >= ?
+                LIMIT 1
+                """,
+                (chat_type.value, chat_id, checkpoint, time.time() - 60),
+            ).fetchone()
+            if recent is not None:
+                return 0
+        payload_ids = [str(item) for item in list(message_ids)[:20]]
+        cursor = self._conn.execute(
+            """
+            INSERT INTO decisions
+                (chat_type, chat_id, created_at, trigger, outcome, checkpoint,
+                 message_ids, message_count, addressed, read, think, reason,
+                 reply_preview, prompt_tokens, completion_tokens, latency_ms, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chat_type.value,
+                chat_id,
+                time.time(),
+                trigger,
+                outcome,
+                checkpoint,
+                json.dumps(payload_ids, ensure_ascii=False),
+                len(payload_ids) if message_count is None else int(message_count),
+                1 if addressed else 0,
+                read,
+                think,
+                reason[:500],
+                reply_preview[:200],
+                int(prompt_tokens),
+                int(completion_tokens),
+                int(latency_ms),
+                json.dumps(detail or {}, ensure_ascii=False),
+            ),
+        )
+        self._conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def mark_decision_retried(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        origin_message_id: str,
+        *,
+        retry_after_seconds: int,
+        outbox_id: int = 0,
+    ) -> int:
+        """补发成功后，把原「发送失败」决策原地改成 ``replied``。
+
+        同一个决策只该占一行：失败时记 ``error/send_failed``，补发成功后再
+        插一条 ``replied`` 会让面板同时多出一次回复和一次错误，统计全偏。
+        这里按触发消息 id 找到最近的那条失败决策，改 outcome 并在 ``detail``
+        标注补发耗时，返回被更新的 id；找不到返回 0。
+        """
+        origin = str(origin_message_id or "")
+        if not origin:
+            return 0
+        rows = self._conn.execute(
+            """
+            SELECT id, detail, message_ids
+            FROM decisions
+            WHERE chat_type = ? AND chat_id = ?
+              AND outcome = 'error' AND checkpoint = 'send_failed'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 20
+            """,
+            (chat_type.value, chat_id),
+        ).fetchall()
+        for row in rows:
+            try:
+                ids = json.loads(str(row["message_ids"]))
+            except (TypeError, ValueError):
+                ids = []
+            if not isinstance(ids, list) or origin not in [str(item) for item in ids]:
+                continue
+            try:
+                detail = json.loads(str(row["detail"]))
+            except (TypeError, ValueError):
+                detail = {}
+            if not isinstance(detail, dict):
+                detail = {}
+            detail.update(
+                {
+                    "retried": True,
+                    "retry_after_seconds": max(0, int(retry_after_seconds)),
+                    "outbox_id": int(outbox_id),
+                }
+            )
+            self._conn.execute(
+                """
+                UPDATE decisions
+                SET outcome = 'replied', checkpoint = '', detail = ?
+                WHERE id = ?
+                """,
+                (json.dumps(detail, ensure_ascii=False), int(row["id"])),
+            )
+            self._conn.commit()
+            return int(row["id"])
+        return 0
+
+    def list_decisions(
+        self,
+        *,
+        limit: int = 50,
+        chat_type: ChatType | None = None,
+        chat_id: str | None = None,
+        outcome: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """按时间倒序返回最近决策；JSON 列解析失败时退化为空对象/空数组。"""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if chat_type is not None:
+            clauses.append("chat_type = ?")
+            params.append(chat_type.value)
+        if chat_id is not None:
+            clauses.append("chat_id = ?")
+            params.append(chat_id)
+        if outcome:
+            clauses.append("outcome = ?")
+            params.append(outcome)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(200, int(limit))))
+        rows = self._conn.execute(
+            f"""
+            SELECT id, chat_type, chat_id, created_at, trigger, outcome, checkpoint,
+                   message_ids, message_count, addressed, read, think, reason,
+                   reply_preview, prompt_tokens, completion_tokens, latency_ms, detail
+            FROM decisions{where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                detail = json.loads(str(row["detail"]))
+            except (TypeError, ValueError):
+                detail = {}
+            if not isinstance(detail, dict):
+                detail = {}
+            try:
+                message_ids = json.loads(str(row["message_ids"]))
+            except (TypeError, ValueError):
+                message_ids = []
+            if not isinstance(message_ids, list):
+                message_ids = []
+            created_at = float(row["created_at"])
+            items.append(
+                {
+                    "id": int(row["id"]),
+                    "chat_type": str(row["chat_type"]),
+                    "chat_id": row["chat_id"],
+                    "created_at": created_at,
+                    "at": datetime.fromtimestamp(created_at, SHANGHAI).isoformat(),
+                    "trigger": str(row["trigger"]),
+                    "outcome": str(row["outcome"]),
+                    "checkpoint": str(row["checkpoint"]),
+                    "message_ids": message_ids,
+                    "message_count": int(row["message_count"]),
+                    "addressed": bool(row["addressed"]),
+                    "read": str(row["read"]),
+                    "think": str(row["think"]),
+                    "reason": str(row["reason"]),
+                    "reply_preview": str(row["reply_preview"]),
+                    "prompt_tokens": int(row["prompt_tokens"]),
+                    "completion_tokens": int(row["completion_tokens"]),
+                    "latency_ms": int(row["latency_ms"]),
+                    "detail": detail,
+                }
+            )
+        return items
+
+    def decision_stats(
+        self, *, days: int = 1, now_ts: float | None = None
+    ) -> dict[str, Any]:
+        """窗口内的决策聚合：沉默率、拦截归因、延迟与 token。"""
+        window_days = max(1, int(days))
+        since = (time.time() if now_ts is None else float(now_ts)) - window_days * 86400
+        rows = self._conn.execute(
+            """
+            SELECT outcome, COUNT(*) AS count
+            FROM decisions
+            WHERE created_at >= ?
+            GROUP BY outcome
+            """,
+            (since,),
+        ).fetchall()
+        by_outcome = {"replied": 0, "silent": 0, "blocked": 0, "held": 0, "error": 0}
+        for row in rows:
+            by_outcome[str(row["outcome"])] = int(row["count"])
+        total = sum(by_outcome.values())
+
+        checkpoint_rows = self._conn.execute(
+            """
+            SELECT checkpoint, COUNT(*) AS count
+            FROM decisions
+            WHERE created_at >= ? AND checkpoint <> ''
+            GROUP BY checkpoint
+            ORDER BY count DESC
+            """,
+            (since,),
+        ).fetchall()
+        by_checkpoint = {
+            str(row["checkpoint"]): int(row["count"]) for row in checkpoint_rows
+        }
+
+        aggregate = self._conn.execute(
+            """
+            SELECT COALESCE(
+                       AVG(CASE WHEN latency_ms > 0 THEN latency_ms END), 0
+                   ) AS avg_latency,
+                   COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                   COALESCE(SUM(completion_tokens), 0) AS completion_tokens
+            FROM decisions
+            WHERE created_at >= ?
+            """,
+            (since,),
+        ).fetchone()
+
+        reason_rows = self._conn.execute(
+            """
+            SELECT reason, COUNT(*) AS count
+            FROM decisions
+            WHERE created_at >= ? AND reason <> ''
+            GROUP BY reason
+            ORDER BY count DESC, reason ASC
+            LIMIT 5
+            """,
+            (since,),
+        ).fetchall()
+
+        replied = by_outcome["replied"]
+        silent = by_outcome["silent"]
+        denominator = replied + silent
+        return {
+            "window_days": window_days,
+            "total": total,
+            "by_outcome": by_outcome,
+            "by_checkpoint": by_checkpoint,
+            "avg_latency_ms": int(aggregate["avg_latency"] or 0),
+            "tokens": {
+                "prompt": int(aggregate["prompt_tokens"] or 0),
+                "completion": int(aggregate["completion_tokens"] or 0),
+            },
+            "top_reasons": [
+                {"reason": str(row["reason"]), "count": int(row["count"])}
+                for row in reason_rows
+            ],
+            "reply_rate": (replied / denominator) if denominator else 0.0,
+            "silence_rate": (silent / denominator) if denominator else 0.0,
+        }
 
     def recent_errors(self, limit: int = 10) -> list[dict[str, object]]:
         """最近的 brain 错误时间线；created_at 是 UTC，这里直接换成上海时间展示串。"""

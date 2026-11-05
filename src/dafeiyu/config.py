@@ -265,6 +265,11 @@ class WeChatConfig:
     local_db_root: str = ""
     # 镜像同步的最小间隔（秒）；0 = 每轮都同步。
     local_db_refresh_seconds: float = 1.0
+    # 微信私聊：默认关闭。开启后本地库会把好友私聊也纳入入站轮询
+    # （`private_enabled`），`private_reply` 再决定 bot 要不要自动回。
+    # 两个开关分开是为了支持「先只看不回」的灰度阶段。
+    private_enabled: bool = False
+    private_reply: bool = False
     # 出站后端：uia = 桌面自动化（现状，锁屏不可用）；hook = HTTP 注入（不依赖桌面，
     # 需配 hook_url，群 username 从本地库解析）；auto = 先 hook，只有明确「没发出去」
     # 时才回落 UIA（HTTP 超时这类结果不明的情况不回落，避免重复发送）。
@@ -1075,6 +1080,12 @@ def _build_wechat(
         ),
         local_db_root=str(section.get("local_db_root") or "").strip(),
         local_db_refresh_seconds=local_db_refresh,
+        private_enabled=_bool(
+            section.get("private_enabled", False), "gateway.wechat.private_enabled"
+        ),
+        private_reply=_bool(
+            section.get("private_reply", False), "gateway.wechat.private_reply"
+        ),
         outbound=outbound,
         hook_url=hook_url,
         hook_at_url=hook_at_url,

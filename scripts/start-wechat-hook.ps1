@@ -21,22 +21,52 @@ $script = Join-Path $root "scripts\wechat_hook_server.py"
 $logDir = Join-Path $root "logs"
 $logFile = Join-Path $logDir "wechat-hook.log"
 
+function Get-PortListener {
+    # 端口占用者。提权进程的命令行读不到，只能靠这个判断「有人占着」。
+    param([int]$Port)
+    try {
+        Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop |
+            Select-Object -First 1
+    } catch {
+        $null
+    }
+}
+
 function Get-HookProcess {
-    # 兼容历史实例：早先是 python.exe，现在是 pythonw.exe。
+    # 兼容历史实例（python.exe / pythonw.exe），且只认「本端口」：
+    # 不同端口可以并存，避免把 30011 上的旧实例当成自己要启动的实例。
+    param([int]$Port)
+    $needle = "--port\s+" + [regex]::Escape([string]$Port) + "(\s|$)"
     Get-CimInstance Win32_Process |
         Where-Object {
             ($_.Name -eq "python.exe" -or $_.Name -eq "pythonw.exe") -and
-            $_.CommandLine -like "*wechat_hook_server.py*"
+            $_.CommandLine -like "*wechat_hook_server.py*" -and
+            $_.CommandLine -match $needle
         }
 }
 
 if ($Stop) {
-    $procs = Get-HookProcess
-    if (-not $procs) { Write-Host "hook 服务未在运行"; exit 0 }
+    $procs = Get-HookProcess -Port $Port
+    if (-not $procs) {
+        $listener = Get-PortListener -Port $Port
+        if ($listener) {
+            Write-Warning "端口 $Port 仍被 pid=$($listener.OwningProcess) 占用，但读不到它的命令行（通常是更高权限启动的旧实例）。请用管理员结束它。"
+            exit 1
+        }
+        Write-Host "hook 服务未在运行"
+        exit 0
+    }
     foreach ($p in $procs) {
         Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         Write-Host "已停止 pid=$($p.ProcessId)"
     }
+    Start-Sleep -Milliseconds 500
+    $listener = Get-PortListener -Port $Port
+    if ($listener) {
+        Write-Warning "已发送停止命令，但端口 $Port 仍被 pid=$($listener.OwningProcess) 占用（可能是另一个权限级别的实例）。"
+        exit 1
+    }
+    Write-Host "hook 服务已停止，端口 $Port 已释放"
     exit 0
 }
 
@@ -44,10 +74,16 @@ if (-not (Test-Path $python)) { throw "找不到 helper 的 Python：$python（�
 if (-not (Test-Path $script)) { throw "找不到 $script" }
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
-$existing = Get-HookProcess
+$existing = Get-HookProcess -Port $Port
 if ($existing) {
     Write-Host "hook 服务已在运行：pid=$($existing.ProcessId | Select-Object -First 1)"
 } else {
+    $listener = Get-PortListener -Port $Port
+    if ($listener) {
+        # 端口有人但命令行读不到：多半是更高权限启动的旧实例。
+        # 继续启动只会再起一个收不到请求的重复实例，还让 /health 读到旧状态。
+        throw "端口 $Port 已被 pid=$($listener.OwningProcess) 占用，但无法识别为本项目的 hook（可能由更高权限启动）。请用管理员结束该进程，或换一个 -Port。"
+    }
     $cliArgs = @("`"$script`"", "--helper-root", "`"$HelperRoot`"", "--port", "$Port",
                  "--log-file", "`"$logFile`"")
     if ($Account) { $cliArgs += @("--account", "`"$Account`"") }

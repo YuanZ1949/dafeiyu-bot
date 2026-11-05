@@ -837,6 +837,8 @@ def _default_poller_factory(wechat: WeChatConfig, driver: Any) -> Any:
         panel=PanelGroups().whitelist,
         # 对齐窗口落盘：桥崩溃重启后把停机期间的新消息补出来。
         align_state_path=DEFAULT_ALIGN_STATE,
+        # 微信私聊入站：默认关闭，只有显式打开才枚举/轮询好友会话。
+        private_enabled=bool(getattr(wechat, "private_enabled", False)),
     )
 
 

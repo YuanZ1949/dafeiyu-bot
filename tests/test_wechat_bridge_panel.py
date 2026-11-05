@@ -256,3 +256,115 @@ def test_panel_groups_broken_on_first_read_returns_none(tmp_path: Path) -> None:
     path.write_text("groups: [", encoding="utf-8")
 
     assert PanelGroups(path).whitelist() is None
+
+# ------------------------------------------------- 微信私聊（好友）范围与闸门
+FRIEND = "好友甲"
+FRIEND_ALIAS = "f1"
+
+
+class _FriendLocalDb:
+    """群 + 好友都能枚举的假本地库；私聊开关关闭时好友不能被触碰。"""
+
+    available = True
+
+    def __init__(self, groups: list[str], friends: list[str]) -> None:
+        self._groups = list(groups)
+        self._friends = list(friends)
+        self.friend_calls = 0
+        self.calls: list[str] = []
+
+    def group_names(self) -> list[str]:
+        return list(self._groups)
+
+    def friend_names(self) -> list[str]:
+        self.friend_calls += 1
+        return list(self._friends)
+
+    def resolve_username(self, name: str) -> str | None:
+        if name in self._groups:
+            return "111@chatroom"
+        if name in self._friends:
+            return "wxid_f1"
+        return None
+
+    def peer_kind(self, name: str) -> str | None:
+        if name in self._friends:
+            return "friend"
+        if name in self._groups:
+            return "group"
+        return None
+
+    def snapshot(self, name: str) -> dict[str, Any] | None:
+        self.calls.append(name)
+        return {"chat_name": name, "messages": []}
+
+
+def test_private_disabled_keeps_friends_out_of_default_scope() -> None:
+    localdb = _FriendLocalDb(["老友群"], [FRIEND])
+    loop, _ = _loop(panel=lambda: frozenset(), localdb=localdb)
+
+    assert loop._scope() == ("老友群",)
+    # 开关关闭时连枚举都不该发生。
+    assert localdb.friend_calls == 0
+
+
+def test_private_enabled_adds_friends_to_default_scope() -> None:
+    localdb = _FriendLocalDb(["老友群"], [FRIEND])
+    loop, _ = _loop(panel=lambda: frozenset(), localdb=localdb, private_enabled=True)
+
+    assert loop._scope() == (FRIEND, "老友群")
+
+
+def test_private_scope_skips_names_shared_by_group_and_friend() -> None:
+    localdb = _FriendLocalDb(["同名"], ["同名", FRIEND])
+    loop, _ = _loop(panel=lambda: frozenset(), localdb=localdb, private_enabled=True)
+
+    assert loop._scope() == (FRIEND,)
+
+
+def test_private_scope_drops_friend_without_resolvable_username() -> None:
+    class _BadFriend(_FriendLocalDb):
+        def resolve_username(self, name: str) -> str | None:
+            return None if name == FRIEND else "111@chatroom"
+
+    loop, _ = _loop(
+        panel=lambda: frozenset(),
+        localdb=_BadFriend(["老友群"], [FRIEND]),
+        private_enabled=True,
+    )
+
+    assert loop._scope() == ("老友群",)
+
+
+def test_private_outbound_requires_private_enabled() -> None:
+    peers = _Peers({FRIEND_ALIAS: (FRIEND, True, "friend")})
+    loop, _ = _loop(
+        panel=lambda: frozenset({f"wxg:{FRIEND_ALIAS}"}), registry=peers
+    )
+
+    assert loop._scope() == ()
+    assert loop.allows_chat(f"wxg:{FRIEND_ALIAS}") is False
+
+
+def test_private_outbound_allowed_when_enabled_and_listed() -> None:
+    peers = _Peers({FRIEND_ALIAS: (FRIEND, True, "friend")})
+    loop, _ = _loop(
+        panel=lambda: frozenset({f"wxg:{FRIEND_ALIAS}"}),
+        registry=peers,
+        private_enabled=True,
+    )
+
+    assert loop._scope() == (FRIEND,)
+    assert loop.allows_chat(f"wxg:{FRIEND_ALIAS}") is True
+
+
+def test_group_outbound_unaffected_by_private_switch() -> None:
+    peers = _Peers({"g1": ("老友群", True, "group")})
+    loop, _ = _loop(
+        panel=lambda: frozenset({"wxg:g1"}),
+        registry=peers,
+        private_enabled=False,
+    )
+
+    assert loop._scope() == ("老友群",)
+    assert loop.allows_chat("wxg:g1") is True
