@@ -950,3 +950,73 @@ LSP（basedpyright）：本轮改动的 `align.py` / `poller.py` / `wechat.py` /
   `channels.wechat.receipts` 六项齐全；重启后尚无入站事件，故
   `inbound_state.json` 未生成（符合「有帧才落盘」）。
 
+
+## 22. 表情保真、表情弱信号与微信图片现状（2026-11-05 第十轮）
+
+### 22.1 微信/QQ 表情保真
+
+- 微信 `type=47` 解压后的 `<emoji md5="..." desc="..." attachedtext="..."/>`
+  现在优先用 `desc`/`attachedtext` 作可读名，缺失时用 md5 前 8 位，统一渲染成
+  `[表情:<标识>]`；解析失败、无 emoji 节点或旧库不带该属性时回退 `[表情]`。
+  消息 `kind` 仍是 `sticker`。
+- 微信 `type=47` 的附件 `kind` 改用媒体自身 kind（图片即 `image`），
+  这样贴纸图片能进入图片物化管线（此前按 `sticker` 被当成不支持的媒体丢弃）。
+- QQ `face` 段渲染成 `[表情:<数字 id>]`（非数字回退 `[表情]`），
+  `mface` 段用压缩空白并截断 20 字的 `summary`（空则回退 `[表情]`），
+  表情不再渲染成空正文。
+
+### 22.2 表情弱信号
+
+- `moment.is_sticker_content()` 识别「整条只有一个表情占位」，兼容旧 `[表情]`、
+  带名 `[表情:狗头]` 和物化后的「（图存 ...）」注记。
+- `is_short_only()` 把带名字的表情也算短消息：`[表情:狗头]` 超过 4 字，
+  以前会把一整批无信息量消息误判成「有话可接」。
+- 新增 `MomentSignals.sticker`；`hint()` 在纯表情批次下从「倾向不说」改为
+  「有同感可简短接一句，不必硬找话题」。
+- `moment.follows_bot_expression()`：上一条是 bot、本条是纯表情、间隔不超过
+  180 秒，视为弱回应。`Service._weakly_addressed()` 用它（与
+  `answers_bot_question` 同口径，仅群聊），让 `_opportunity_hold` 不再一票否决，
+  并让 `_run_batch_locked` 的 `followed_up` 覆盖这种情况。它不并入
+  `_is_addressed`，避免表情重置 no_reply/降频、影响调度防抖与预算。
+- `brain/persona.md` 与 `brain/agent_template.md` 各加一句：看到 `[表情:xxx]`
+  别只当刷屏，可能是在回你。
+
+### 22.3 微信图片：链路已通，真实可见仍缺两块
+
+- 真实会话快照（4 个群，`LocalDbSource.snapshot`）为 78 text / 3 sticker /
+  11 image / 1 quote，但 **`with_media=0`**。原因有二：
+  1. `repository._media_rows` 只查 message 分库与
+     `message/message_resource.db`，**从不打开 `hardlink/hardlink.db`**，
+     所以帧里 `media` 恒为 null；
+  2. `snapshot()` 返回帧不含 `local_id`/`media` 字段，适配层也拿不到媒体。
+- `media/dat.py` 只支持旧容器（无头 / 单字节 XOR），**不支持微信 4.2 的 V2 容器**：
+  `07 08 56 32 08 07` + `aes_size(u32 LE)` + `xor_size(u32 LE)` + pad，
+  body = `[AES-128-ECB 密文][raw 16B][XOR 段]`。
+- 已在真实库只读实证 V2 解码：`msg/attach/<talker>/<YYYY-MM>/Img/<md5>.dat`
+  的 `_t.dat` 用 `aes_key = md5("1721210299" + wxid)[:16]`、`xor=0xBB`、`raw=16`
+  解出完整 JPEG（`FFD8FF` 头、`FFD9` 尾）。`cfgDword=1721210299` 的低字节
+  `0xBB` 即 XOR key：可从 V2 文件尾（JPEG `FFD9`）反推 XOR key，再扫
+  Weixin.exe 内存中低字节相同的 u32，用 `md5(str(dword)+wxid)[:16]` 验证首块魔数。
+  图片索引在 `hardlink/hardlink.db` 的 `image_hardlink_info_v4`
+  （md5/file_name/file_size/dir1/dir2）。
+- 表情缓存 `cache/<YYYY-MM>/Emoticon/<md5[:2]>/<md5>` 既非 V2 也非单字节 XOR，
+  容器格式未知；当前只做正文保真，不做图片化。
+- 依赖现状：venv 无 `cryptography`/`Crypto`。AES-128-ECB 可走 Windows
+  `bcrypt.dll`（ctypes 已验证可解），或内置纯 Python 实现，二者都不必新增依赖。
+- 待决策：是否接受读 Weixin.exe 进程内存取 `cfgDword`、是否新增 AES 依赖。
+
+### 22.4 图片清理
+
+- 微信/QQ 共用的图片目录复用 `images.retention_days`，在
+  `media.materialize_attachments` 首次真正落盘前惰性清理；`> 0` 删除超期文件，
+  `0` 不清理，清理失败只 debug 日志、不影响主流程。
+
+### 22.5 验证
+
+- 定向：`tests/test_moment.py test_opportunity.py test_qq_parse.py
+  test_wechat_localdb_repository.py test_wechat_adapter.py test_media.py`
+  = 180 passed。
+- 全量：`pytest -q` = 2764 passed, 20 skipped, 1 failed（5:09）；失败项
+  `test_wechat_hook_server.py::test_unknown_path_is_404_not_crash` 单独重跑通过，
+  属端口/事件循环偶发，与本次改动无关。
+- basedpyright：改动文件无新增 error（既有 error 未处理）。
