@@ -5,6 +5,7 @@ import contextlib
 import inspect
 import logging
 import re
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
@@ -28,6 +29,7 @@ from .commands import CommandRegistry, CommandSpec
 from .config import GroupsConfig, InjectionConfig, Settings
 from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
+from .hotconfig import WeChatRuntime, WeChatRuntimeView
 from .images import materialize
 from .keepalive import Keepalive
 from .media import materialize_attachments
@@ -67,6 +69,23 @@ _ATTACHMENT_NOTE_BY_KIND = {
     "video": "\n[视频] {path}",
     "file": "\n[文件] {name} ({path})",
 }
+
+
+# 面板可热改的私聊开关（P1-6）：按「启动时解析出的 defaults」缓存视图，
+# 同一进程同一启动配置只建一个 WeChatRuntimeView；测试可直接整表替换
+# （`_WECHAT_RUNTIME_VIEWS.clear()`）或预置自己的视图注入。
+_WECHAT_RUNTIME_VIEWS: dict[WeChatRuntime, WeChatRuntimeView] = {}
+_WECHAT_RUNTIME_LOCK = threading.Lock()
+
+
+def _wechat_runtime_view(defaults: WeChatRuntime) -> WeChatRuntimeView:
+    """按 defaults 惰性取（必要时建）共享视图；线程安全、幂等。"""
+    with _WECHAT_RUNTIME_LOCK:
+        view = _WECHAT_RUNTIME_VIEWS.get(defaults)
+        if view is None:
+            view = WeChatRuntimeView(defaults)
+            _WECHAT_RUNTIME_VIEWS[defaults] = view
+        return view
 
 
 def _forward_message_nodes(item: Attachment) -> list[dict[str, Any]]:
@@ -2984,19 +3003,41 @@ class Service:
 
         asyncio.create_task(run())
 
+    def _wechat_runtime_defaults(self) -> WeChatRuntime:
+        """启动配置值：覆盖层缺失时的回落值（也是不需要热键时的基线）。"""
+        wechat = getattr(self.settings, "wechat", None)
+        return WeChatRuntime(
+            private_enabled=bool(getattr(wechat, "private_enabled", False)),
+            private_reply=bool(getattr(wechat, "private_reply", False)),
+            private_allow=frozenset(getattr(wechat, "private_allow", None) or ()),
+            private_deny=frozenset(getattr(wechat, "private_deny", None) or ()),
+        )
+
     def _wechat_private_readonly(self, msg: Message) -> bool:
-        """微信私聊只读：`gateway.wechat.private_reply=false` 时只落库不回复。
+        """微信私聊只读：运行时 `private_reply=false` 时只落库不回复。
 
         入站开关（`private_enabled`）由桥负责；这里只管「能不能回」。命令分支
         在 `handle()` 里先于本函数执行，所以只读模式下 `/status` 等命令仍可用。
         只认 ``wxg:`` 会话：QQ 私聊不受微信开关影响。
+
+        开关读自 `hotconfig.WeChatRuntimeView`（面板覆盖层热加载）；视图/读取
+        失败一律回落到启动配置 `self.settings.wechat.private_reply`。
         """
         if msg.chat_type is not ChatType.PRIVATE:
             return False
         if not str(msg.chat_id or "").startswith("wxg:"):
             return False
-        wechat = getattr(self.settings, "wechat", None)
-        if bool(getattr(wechat, "private_reply", False)):
+        try:
+            runtime = _wechat_runtime_view(self._wechat_runtime_defaults()).current()
+        except Exception as exc:  # noqa: BLE001 - 热配置坏了走启动默认值
+            log.warning("读取私聊运行时开关失败，按启动配置处理：%s", exc)
+            runtime = None
+        reply_enabled = (
+            bool(getattr(self.settings.wechat, "private_reply", False))
+            if runtime is None
+            else bool(runtime.private_reply)
+        )
+        if reply_enabled:
             return False
         self._record_decision(
             msg.chat_type,

@@ -286,3 +286,84 @@ def test_overlay_mind_must_be_mapping(tmp_path, monkeypatch):
 
     with pytest.raises(config.ConfigError, match="mind"):
         config.load_settings(config_file=CONFIG_FIXTURE, env_file=ENV_FIXTURE)
+
+
+# ------------------------------------------------- P1-5/6: 覆盖层 wechat 段
+def test_overlay_wechat_private_keys_are_applied(tmp_path, monkeypatch):
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides(
+        {"wechat": {"private_enabled": True, "private_reply": True}}, path
+    )
+
+    s = config.load_settings(config_file=CONFIG_FIXTURE, env_file=ENV_FIXTURE)
+
+    assert s.wechat.private_enabled is True
+    assert s.wechat.private_reply is True
+    assert s.brain.mode == "free"  # 其它段互不影响
+
+
+def test_overlay_wechat_private_lists_are_applied(tmp_path, monkeypatch):
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides(
+        {
+            "wechat": {
+                "private_allow": ["wxg:AbC"],
+                "private_deny": ["WXG:spam"],
+            }
+        },
+        path,
+    )
+
+    s = config.load_settings(config_file=CONFIG_FIXTURE, env_file=ENV_FIXTURE)
+
+    assert s.wechat.private_allow == frozenset({"wxg:abc"})
+    assert s.wechat.private_deny == frozenset({"wxg:spam"})
+
+
+def test_overlay_wechat_ignores_keys_outside_whitelist(tmp_path, monkeypatch):
+    """覆盖层只认四个键：其它 gateway.wechat 参数仍由 config.yaml 管。"""
+    config_file = tmp_path / "config-wechat.yaml"
+    config_file.write_text(
+        BASE_YAML + "gateway:\n  wechat:\n    outbound: uia\n    poll_seconds: 9\n",
+        encoding="utf-8",
+    )
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides(
+        {
+            "wechat": {
+                "outbound": "hook",
+                "poll_seconds": 0.1,
+                "unknown": {"x": 1},
+            }
+        },
+        path,
+    )
+
+    s = config.load_settings(config_file=config_file, env_file=ENV_FIXTURE)
+
+    assert s.wechat.outbound == "uia"
+    assert s.wechat.poll_seconds == 9
+
+
+def test_overlay_wechat_private_enabled_must_be_bool(tmp_path, monkeypatch):
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides({"wechat": {"private_enabled": "true"}}, path)
+
+    with pytest.raises(config.ConfigError, match="gateway.wechat.private_enabled"):
+        config.load_settings(config_file=CONFIG_FIXTURE, env_file=ENV_FIXTURE)
+
+
+def test_overlay_wechat_private_allow_rejects_qq_ids(tmp_path, monkeypatch):
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides({"wechat": {"private_allow": ["qq:123456"]}}, path)
+
+    with pytest.raises(config.ConfigError, match="wxg: 前缀"):
+        config.load_settings(config_file=CONFIG_FIXTURE, env_file=ENV_FIXTURE)
+
+
+def test_overlay_wechat_must_be_mapping(tmp_path, monkeypatch):
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides({"wechat": ["not", "a", "map"]}, path)
+
+    with pytest.raises(config.ConfigError, match="wechat"):
+        config.load_settings(config_file=CONFIG_FIXTURE, env_file=ENV_FIXTURE)

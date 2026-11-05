@@ -390,3 +390,43 @@ async def test_qq_private_is_not_gated_by_wechat_private_reply(tmp_path):
 
     assert adapter.sent == [(ChatType.PRIVATE, "qq:504567327", "在呢")]
     assert store.list_decisions()[0]["outcome"] == "replied"
+
+
+# ------------------------------------------------- P1-6: private_reply 热切换
+async def test_wechat_private_reply_hot_toggles_from_overlay(tmp_path, monkeypatch):
+    """面板写覆盖层 private_reply=false：不重启 service，下一条私聊立即只读。"""
+    import dafeiyu.hotconfig as hotconfig
+    import dafeiyu.service as service_module
+    from dafeiyu.settings_local import write_overrides
+
+    path = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(hotconfig, "DEFAULT_PATH", path)
+    service_module._WECHAT_RUNTIME_VIEWS.clear()
+    try:
+        service, store, adapter = build_wechat_private(
+            tmp_path, SpeakingBrain(), private_reply=True
+        )
+
+        await service.handle(make_wx_msg())
+        await service.drain()
+
+        assert adapter.sent == [(ChatType.PRIVATE, "wxg:friend1", "在呢")]
+
+        write_overrides({"wechat": {"private_reply": False}}, path)
+
+        await service.handle(make_wx_msg(message_id="wx-m2"))
+        await service.drain()
+
+        # 覆盖层切换后不再回复。
+        assert adapter.sent == [(ChatType.PRIVATE, "wxg:friend1", "在呢")]
+        readonly = [
+            item
+            for item in store.list_decisions()
+            if item["checkpoint"] == "private_readonly"
+        ]
+        assert len(readonly) == 1
+        assert readonly[0]["outcome"] == "silent"
+        assert readonly[0]["trigger"] == "private"
+        assert readonly[0]["detail"] == {"private_reply": False}
+    finally:
+        service_module._WECHAT_RUNTIME_VIEWS.clear()

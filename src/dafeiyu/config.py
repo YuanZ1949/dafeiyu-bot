@@ -270,6 +270,10 @@ class WeChatConfig:
     # 两个开关分开是为了支持「先只看不回」的灰度阶段。
     private_enabled: bool = False
     private_reply: bool = False
+    # 私聊白/黑名单（P1-5）：元素是 `wxg:<alias>` 稳定会话 id；deny 优先于
+    # allow，allow 为空 = 不限制（仍受 private_enabled 与 groups.whitelist 约束）。
+    private_allow: frozenset[str] = frozenset()
+    private_deny: frozenset[str] = frozenset()
     # 出站后端：uia = 桌面自动化（现状，锁屏不可用）；hook = HTTP 注入（不依赖桌面，
     # 需配 hook_url，群 username 从本地库解析）；auto = 先 hook，只有明确「没发出去」
     # 时才回落 UIA（HTTP 超时这类结果不明的情况不回落，避免重复发送）。
@@ -920,6 +924,35 @@ def parse_group_ids(value: Any, field: str) -> frozenset[str]:
     return frozenset(ids)
 
 
+def parse_wechat_peer_ids(value: Any, field: str) -> frozenset[str]:
+    """微信私聊 allow/deny 名单：只接受 `wxg:<alias>` 字符串，统一 casefold。
+
+    校验强度与 `parse_group_ids` 一致，但**只**认 `wxg:` 前缀：纯数字（多为
+    QQ 号/群号）与 `qq:` 前缀一律拒绝，避免把 QQ 名单写进微信私聊开关后
+    在运行期静默失效。
+    """
+    if value is None:
+        return frozenset()
+    if not isinstance(value, list):
+        raise ConfigError(f"{field} 必须是列表")
+    ids: set[str] = set()
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, str):
+            raise ConfigError(f"{field} 的元素必须是带 wxg: 前缀的字符串")
+        text = item.strip()
+        lowered = text.casefold()
+        if not lowered.startswith("wxg:"):
+            raise ConfigError(
+                f"{field} 的元素必须带 wxg: 前缀"
+                f"（不接受纯数字或 qq: 前缀）：{item!r}"
+            )
+        _, _, rest = lowered.partition(":")
+        if not rest:
+            raise ConfigError(f"{field} 的元素缺少冒号后的 alias：{item!r}")
+        ids.add(f"wxg:{rest}")
+    return frozenset(ids)
+
+
 def _build_wechat(
     raw: Any,
     env: dict[str, str],
@@ -1085,6 +1118,12 @@ def _build_wechat(
         ),
         private_reply=_bool(
             section.get("private_reply", False), "gateway.wechat.private_reply"
+        ),
+        private_allow=parse_wechat_peer_ids(
+            section.get("private_allow"), "gateway.wechat.private_allow"
+        ),
+        private_deny=parse_wechat_peer_ids(
+            section.get("private_deny"), "gateway.wechat.private_deny"
         ),
         outbound=outbound,
         hook_url=hook_url,
@@ -1309,6 +1348,28 @@ def _apply_mind_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> Non
             target[name] = section[name]
 
 
+def _apply_wechat_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """面板保存的私聊开关：只认四个键，其余静默忽略（与 mind 同风格）。
+
+    `private_enabled` / `private_reply` 必须是布尔值；`private_allow` /
+    `private_deny` 用 `parse_wechat_peer_ids` 校验。桥与 bot 每个轮询周期
+    经 `hotconfig` 热读这些键，其它 `gateway.wechat.*` 参数不允许在运行期被面板改。
+    """
+    section = overrides.get("wechat")
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        raise ConfigError("覆盖层的 wechat 必须是映射")
+    target = _overlay_subtarget(raw, "gateway", "wechat")
+    for name in ("private_enabled", "private_reply"):
+        if name in section:
+            target[name] = _overlay_bool(section[name], f"gateway.wechat.{name}")
+    for name in ("private_allow", "private_deny"):
+        if name in section:
+            parse_wechat_peer_ids(section[name], f"gateway.wechat.{name}")
+            target[name] = section[name]
+
+
 def _apply_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> bool:
     """把覆盖层白名单键盖到 raw 上，返回覆盖层是否显式给了 brain.mode。
 
@@ -1318,6 +1379,7 @@ def _apply_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> bool:
     _apply_behavior_overrides(raw, overrides)
     _apply_groups_overrides(raw, overrides)
     _apply_mind_overrides(raw, overrides)
+    _apply_wechat_overrides(raw, overrides)
     brain_override = overrides.get("brain")
     if brain_override is None:
         return False

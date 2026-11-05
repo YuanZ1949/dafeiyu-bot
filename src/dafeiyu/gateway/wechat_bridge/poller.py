@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from .align import SessionAligner
+from ...hotconfig import WeChatRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -342,6 +343,7 @@ class PollingLoop:
         panel: Callable[[], frozenset[str] | None] | None = None,
         align_state_path: str | Path | None = None,
         private_enabled: bool | None = None,
+        runtime: Callable[[], WeChatRuntime | None] | None = None,
     ) -> None:
         self.wechat = wechat
         self.driver = driver
@@ -355,10 +357,15 @@ class PollingLoop:
         self._panel_none_warned = False
         # 微信私聊：默认关闭。关闭时不枚举好友、面板里列了也不轮询，
         # `allows_chat` 也不放行好友出站；开启后才把好友纳入范围。
+        # `private_enabled` 参数仍是启动默认值：热开关（`runtime`）读不出来时
+        # 的 fallback（P1-6）。
         raw_private = private_enabled
         if raw_private is None:
             raw_private = bool(getattr(wechat, "private_enabled", False))
         self.private_enabled = bool(raw_private)
+        # 私聊运行时开关（可选）：返回 WeChatRuntime 或 None。每次现取，
+        # 面板改 `wechat.private_enabled/reply/allow/deny` 一个轮询周期内生效。
+        self._runtime = runtime
         self.ui = ui if ui is not None else UiThread()
         self._owns_ui = ui is None
         if registry is None:
@@ -571,6 +578,57 @@ class PollingLoop:
             self._panel_none_warned = True
         return panel
 
+    def _fallback_runtime(self) -> WeChatRuntime:
+        """启动配置值：没有热开关视图或它读不出来时用这份。"""
+        wechat = self.wechat
+        return WeChatRuntime(
+            private_enabled=self.private_enabled,
+            private_reply=bool(getattr(wechat, "private_reply", False)),
+            private_allow=frozenset(getattr(wechat, "private_allow", None) or ()),
+            private_deny=frozenset(getattr(wechat, "private_deny", None) or ()),
+        )
+
+    def _runtime_wechat(self) -> WeChatRuntime:
+        """当前私聊运行时开关；无注入或读取失败时退回启动默认值。
+
+        调用方每轮/每闸门各取一次（mtime 缓存使单次开销接近零），不得在高频
+        路径（每帧）上重复读取。
+        """
+        reader = self._runtime
+        if reader is None:
+            return self._fallback_runtime()
+        try:
+            current = reader()
+        except Exception as exc:  # noqa: BLE001 - 热开关坏了不能拖垮轮询
+            logger.warning("读取私聊运行时开关失败，退回启动默认值：%s", exc)
+            return self._fallback_runtime()
+        if current is None:
+            return self._fallback_runtime()
+        return current
+
+    def _friend_allowed(self, name: str, runtime: WeChatRuntime) -> bool:
+        """好友私聊的 allow/deny 筛选；deny 优先，registry 判不行时宁可不发。
+
+        - deny 非空且命中 → False；
+        - allow 非空且未命中 → False；
+        - 两个名单都空 → 不限制（True）；
+        - registry 不可用/抛错 → 无法判定时 fail-closed（False）。
+        只对 kind == 'friend' 调用；群聊完全不受 allow/deny 影响。
+        """
+        if not runtime.private_allow and not runtime.private_deny:
+            return True
+        try:
+            chat_id = str(self.registry.chat_id(name, kind="friend"))
+        except Exception as exc:  # noqa: BLE001 - 解析不出来就跳过这个好友
+            logger.debug("好友 %r 解析稳定会话 id 失败，跳过：%s", name, exc)
+            return False
+        chat_id = chat_id.strip().casefold()
+        if runtime.private_deny and chat_id in runtime.private_deny:
+            return False
+        if runtime.private_allow and chat_id not in runtime.private_allow:
+            return False
+        return True
+
     def _peer(self, alias: str) -> Any | None:
         lookup = getattr(self.registry, "by_alias", None)
         if not callable(lookup):
@@ -585,11 +643,19 @@ class PollingLoop:
         """本地库能枚举到的全部群显示名；不可用/无能力时返回空元组。"""
         return self._localdb_names("group")
 
-    def _localdb_friend_names(self) -> tuple[str, ...]:
-        """本地库能枚举到的好友显示名；私聊关闭/无能力时返回空元组。"""
-        if not self.private_enabled:
+    def _localdb_friend_names(self, runtime: WeChatRuntime) -> tuple[str, ...]:
+        """本地库能枚举到的好友显示名；私聊关闭/无能力时返回空元组。
+
+        非空 allow 或 deny 名单在场时同样过滤好友（群不受影响）。
+        """
+        if not runtime.private_enabled:
             return ()
-        return self._localdb_names("friend")
+        names = self._localdb_names("friend")
+        if not (runtime.private_allow or runtime.private_deny):
+            return names
+        return tuple(
+            sorted(name for name in names if self._friend_allowed(name, runtime))
+        )
 
     def _localdb_names(self, kind: str) -> tuple[str, ...]:
         source = self.localdb
@@ -657,18 +723,20 @@ class PollingLoop:
         """本轮允许轮询的会话显示名；面板是唯一来源。
 
         - 面板白名单非空：只返回其中能解析成存活会话的那些（好友还要求
-          `private_enabled`）；
+          运行时 `private_enabled`，且不被 allow/deny 名单拦下）；
         - 面板白名单为空：返回本地库枚举到的全部群；`private_enabled` 时再
           加上全部好友（本地库不能枚举时一个都不轮询——UIA 没有可靠的会话
           清单，宁可少开窗）；
         - 面板读不出来（None）：fail-closed，返回空（不轮询任何会话）。
+        群聊（kind == 'group'）完全不受 allow/deny 名单影响。
         """
+        runtime = self._runtime_wechat()
         panel = self._panel_whitelist()
         if panel is None:
             return ()
         if not panel:
             groups = self._localdb_group_names()
-            friends = self._localdb_friend_names()
+            friends = self._localdb_friend_names(runtime)
             if not friends:
                 return tuple(sorted(set(groups)))
             overlap = set(groups) & set(friends)
@@ -689,18 +757,23 @@ class PollingLoop:
             kind = str(getattr(peer, "kind", "group"))
             if kind not in ("group", "friend"):
                 continue
-            if kind == "friend" and not self.private_enabled:
-                continue
             name = str(getattr(peer, "display_name", "") or "").strip()
-            if name:
-                names.add(name)
+            if not name:
+                continue
+            if kind == "friend":
+                if not runtime.private_enabled:
+                    continue
+                if not self._friend_allowed(name, runtime):
+                    continue
+            names.add(name)
         return tuple(sorted(names))
 
     def allows_chat(self, chat_id: str) -> bool:
         """出站闸门：面板白名单非空时只放行列出的会话，空 = 不限群。
 
         面板读不出来（None）时一律拒绝：没有可信的白名单就不发送。
-        好友私聊还要求 `private_enabled`，关闭时即使白名单里列了也拒绝。
+        好友私聊还要求运行时 `private_enabled` 打开，且不被 allow/deny
+        名单拦下（deny 优先）：出站同样不能给被禁好友发消息。群聊不受影响。
         """
         alias = _alias_of(chat_id)
         if alias is None:
@@ -709,13 +782,17 @@ class PollingLoop:
         panel = self._panel_whitelist()
         if panel is None:
             return False
+        runtime = self._runtime_wechat()
         peer = self._peer(alias)
         if (
             peer is not None
             and str(getattr(peer, "kind", "group")) == "friend"
-            and not self.private_enabled
         ):
-            return False
+            if not runtime.private_enabled:
+                return False
+            name = str(getattr(peer, "display_name", "") or "").strip()
+            if not self._friend_allowed(name, runtime):
+                return False
         if panel:
             return str(chat_id or "").strip() in panel
         return True

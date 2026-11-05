@@ -401,3 +401,55 @@ def test_wechat_quiet_hours_explicit_wins(tmp_path: Path) -> None:
     settings = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
     assert settings.wechat.quiet_hours == ("22:00", "06:00")
     assert settings.triggers.quiet_hours == ("01:00", "07:00")
+
+
+# ------------------------------------------ P1-5: 私聊白名单 / 黑名单（config 侧）
+def test_parse_wechat_peer_ids_normalizes_to_casefolded_wxg() -> None:
+    from dafeiyu.config import parse_wechat_peer_ids
+
+    assert parse_wechat_peer_ids(None, "f") == frozenset()
+    assert parse_wechat_peer_ids([], "f") == frozenset()
+    assert parse_wechat_peer_ids(["wxg:a1", "WXG:A1"], "f") == frozenset({"wxg:a1"})
+
+
+def test_wechat_private_allow_deny_defaults_empty(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    settings = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+
+    assert settings.wechat.private_allow == frozenset()
+    assert settings.wechat.private_deny == frozenset()
+
+
+def test_wechat_private_allow_deny_parsed(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + (
+        "gateway:\n"
+        "  wechat:\n"
+        "    private_allow: [wxg:AbC, WXG:def, wxg:abc]\n"
+        '    private_deny: ["wxg:spam"]\n'
+    )
+    settings = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+    assert settings.wechat.private_allow == frozenset({"wxg:abc", "wxg:def"})
+    assert settings.wechat.private_deny == frozenset({"wxg:spam"})
+
+
+@pytest.mark.parametrize(
+    ("section", "match"),
+    [
+        ("    private_allow: 123\n", "private_allow"),
+        ("    private_allow: [123]\n", "private_allow"),
+        ("    private_allow: [\"123\"]\n", "wxg: 前缀"),
+        ("    private_allow: [\"qq:123\"]\n", "wxg: 前缀"),
+        ("    private_allow: [\"wxg:\"]\n", "缺少冒号后的"),
+        ("    private_deny: [\"wx:123\"]\n", "private_deny"),
+    ],
+)
+def test_wechat_private_lists_reject_bad_values(
+    tmp_path: Path, section: str, match: str
+) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + "gateway:\n  wechat:\n" + section
+
+    with pytest.raises(ConfigError, match=match):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))

@@ -18,11 +18,12 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from ...hotconfig import WeChatRuntime, WeChatRuntimeView
 from ...settings_local import DEFAULT_PATH, OverrideError, read_overrides
 
 log = logging.getLogger(__name__)
 
-__all__ = ["PanelGroups"]
+__all__ = ["PanelGroups", "PanelRuntime"]
 
 
 class PanelGroups:
@@ -71,3 +72,29 @@ class PanelGroups:
             str(value).strip() for value in values if str(value).strip()
         )
         return self._whitelist
+
+
+class PanelRuntime:
+    """面板私聊运行时开关（覆盖层 ``wechat:`` 段）的只读缓存。
+
+    `wechat()` 返回 :class:`WeChatRuntime`；``None`` = 覆盖层存在但从未成功
+    解析（调用方按 fail-safe 用启动默认值）。文件不存在 = 面板没改过 =
+    返回全默认的 :class:`WeChatRuntime`。值与 mtime 缓存由
+    :class:`~dafeiyu.hotconfig.WeChatRuntimeView` 负责。
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = Path(path) if path is not None else DEFAULT_PATH
+        self._view = WeChatRuntimeView(WeChatRuntime(), self.path)
+
+    def wechat(self) -> WeChatRuntime | None:
+        result = self._view.current()
+        if self._view.parsed_ok:
+            return result
+        # 还没有一次成功解析：区分「没有覆盖层」（面板没改过 = 默认值）与
+        # 「覆盖层存在但读不出来」（返回 None，调用方 fail-safe 用启动默认）。
+        try:
+            self.path.stat()
+        except FileNotFoundError:
+            return result
+        return None

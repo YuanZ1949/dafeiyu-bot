@@ -24,6 +24,7 @@ from dafeiyu.config import WeChatConfig
 from dafeiyu.gateway.wechat_bridge.driver import ChatHandle
 from dafeiyu.gateway.wechat_bridge.poller import PollingLoop
 from dafeiyu.gateway.wechat_bridge.server import BridgeServer
+from dafeiyu.hotconfig import WeChatRuntime
 
 STEP = 5.0
 TOKEN = "task18b-token"
@@ -907,3 +908,157 @@ def test_aligner_factory_without_user_alias_kwarg_still_works(tmp_path: Path) ->
     assert isinstance(aligner, _Double)
     assert aligner.chat_id == "wxg:friend1"
     assert aligner.chat_type == "private"
+
+
+# ------------------------------------------------- (k) P1-5/6: 私聊名单与热切换
+GN = "老友群"
+FRIEND = "好友甲"
+
+
+class _FriendNamesLocalDb:
+    """群 + 好友都能枚举的假本地库（与面板测试里的形状一致）。"""
+
+    available = True
+
+    def __init__(self, groups: tuple[str, ...], friends: tuple[str, ...]) -> None:
+        self._groups = groups
+        self._friends = friends
+
+    def group_names(self) -> tuple[str, ...]:
+        return self._groups
+
+    def friend_names(self) -> tuple[str, ...]:
+        return self._friends
+
+    def resolve_username(self, name: str) -> str | None:
+        if name in self._groups:
+            return "111@chatroom"
+        if name in self._friends:
+            return "wxid_x"
+        return None
+
+    def peer_kind(self, name: str) -> str | None:
+        if name in self._friends:
+            return "friend"
+        if name in self._groups:
+            return "group"
+        return None
+
+
+class _IdRegistry:
+    """显示名 -> 固定 `wxg:<alias>` 的假身份表（含 by_alias，供出站闸门用）。"""
+
+    def __init__(
+        self, mapping: dict[str, str], *, friends: tuple[str, ...] = ()
+    ) -> None:
+        self._mapping = mapping
+        self._friends = set(friends)
+
+    def chat_id(self, display_name: str, *, kind: str = "group") -> str:
+        return self._mapping[display_name]
+
+    def by_alias(self, alias: str) -> Any | None:
+        for name, chat_id in self._mapping.items():
+            if chat_id.casefold() == f"wxg:{alias}":
+                kind = "friend" if name in self._friends else "group"
+                return SimpleNamespace(
+                    alias=alias, display_name=name, live=True, kind=kind
+                )
+        return None
+
+
+def _runtime_loop(
+    tmp_path: Path,
+    registry: _IdRegistry,
+    runtime: Any | None = None,
+    **kwargs: Any,
+) -> PollingLoop:
+    """空白名单 + 群/好友本地库的最小轮询循环。"""
+    defaults: dict[str, Any] = {
+        "probe": _probe,
+        "registry": registry,
+        "localdb": _FriendNamesLocalDb((GN,), (FRIEND,)),
+        "panel": lambda: frozenset(),
+        "clock": lambda: 1.0,
+        "poll_seconds": 0.02,
+        "runtime": runtime,
+    }
+    defaults.update(kwargs)
+    return PollingLoop(_wechat(tmp_path), FakeDriver(), **defaults)
+
+
+_REGISTRY = _IdRegistry({GN: "wxg:g1", FRIEND: "wxg:f1"}, friends=(FRIEND,))
+
+
+def test_private_deny_hit_removes_friend_from_default_scope(tmp_path: Path) -> None:
+    runtime = WeChatRuntime(private_enabled=True, private_deny=frozenset({"wxg:f1"}))
+    poller = _runtime_loop(tmp_path, _REGISTRY, runtime=lambda: runtime)
+
+    assert poller._scope() == (GN,)
+    assert poller.allows_chat("wxg:g1") is True
+    assert poller.allows_chat("wxg:f1") is False
+
+
+def test_private_allow_hit_keeps_only_matched_friend(tmp_path: Path) -> None:
+    runtime = WeChatRuntime(private_enabled=True, private_allow=frozenset({"wxg:f1"}))
+    poller = _runtime_loop(tmp_path, _REGISTRY, runtime=lambda: runtime)
+
+    assert poller._scope() == (FRIEND, GN)
+
+    other = WeChatRuntime(private_enabled=True, private_allow=frozenset({"wxg:f2"}))
+    poller._runtime = lambda: other
+
+    assert poller._scope() == (GN,)
+    assert poller.allows_chat("wxg:f1") is False
+    assert poller.allows_chat("wxg:g1") is True
+
+
+def test_private_lists_never_touch_groups(tmp_path: Path) -> None:
+    runtime = WeChatRuntime(
+        private_enabled=True,
+        private_allow=frozenset({"wxg:f1"}),
+        private_deny=frozenset({"wxg:g1"}),
+    )
+    poller = _runtime_loop(tmp_path, _REGISTRY, runtime=lambda: runtime)
+
+    # deny 即使含群 id 也只作用于好友：群照常轮询、出站照常放行。
+    assert poller._scope() == (FRIEND, GN)
+    assert poller.allows_chat("wxg:g1") is True
+
+
+async def test_private_runtime_hot_toggle_applies_next_round(tmp_path: Path) -> None:
+    """true→false 的热切换：下一轮 `_targets`（= 本轮要打开的会话）不再含好友。"""
+    holder = {"runtime": WeChatRuntime(private_enabled=True)}
+    poller = _runtime_loop(tmp_path, _REGISTRY, runtime=lambda: holder["runtime"])
+
+    assert FRIEND in poller._scope()
+    assert FRIEND in await poller._targets()
+
+    holder["runtime"] = WeChatRuntime()
+
+    assert FRIEND not in poller._scope()
+    assert FRIEND not in await poller._targets()   # 下一轮不再轮询好友
+    assert poller.allows_chat("wxg:f1") is False
+    assert poller.allows_chat("wxg:g1") is True
+
+
+def test_private_runtime_reader_none_falls_back_to_bootstrap_default(
+    tmp_path: Path,
+) -> None:
+    """runtime 读不出来（None）= 用启动默认值（此处 private_enabled=True）。"""
+    poller = _runtime_loop(
+        tmp_path, _REGISTRY, runtime=lambda: None, private_enabled=True
+    )
+
+    assert poller._scope() == (FRIEND, GN)
+
+
+def test_private_allow_fail_closed_when_registry_unresolvable(tmp_path: Path) -> None:
+    runtime = WeChatRuntime(private_enabled=True, private_allow=frozenset({"wxg:f1"}))
+    poller = _runtime_loop(
+        tmp_path, _IdRegistry({GN: "wxg:g1"}), runtime=lambda: runtime
+    )
+
+    # 好友解析不出稳定 id：allow 非空时 fail-closed，只轮询群。
+    assert poller._scope() == (GN,)
+    assert poller.allows_chat("wxg:g1") is True
