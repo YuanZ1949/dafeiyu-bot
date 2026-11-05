@@ -136,6 +136,19 @@ def _clip_first(value: Any, limit: int) -> str:
     return _clip(text, limit) if text else ""
 
 
+def _render_face(data: dict[str, Any]) -> str:
+    """face 段：用数字 id 区分不同表情；缺失或非数字回退占位。"""
+    face_id = str(data.get("id") or "").strip()
+    return f"[表情:{face_id}]" if face_id.isdigit() else _PLACEHOLDERS["face"]
+
+
+def _render_mface(data: dict[str, Any]) -> str:
+    """mface 段：用商店表情的 summary 区分；去换行并截断，空则回退占位。"""
+    summary = " ".join(str(data.get("summary") or "").split())
+    summary = _clip(summary, 20)
+    return f"[表情:{summary}]" if summary else _PLACEHOLDERS["mface"]
+
+
 def _render_at(data: dict[str, Any], bot_qq: int) -> str:
     """@ 段渲染成文字：@你 / @全体成员 / @群友。
 
@@ -311,6 +324,10 @@ def _render_segments(
         elif seg_type == "file":
             name = _clip_first(data.get("name") or data.get("file"), 60)
             parts.append(f"[文件] {name}".rstrip())
+        elif seg_type == "face":
+            parts.append(_render_face(data))
+        elif seg_type == "mface":
+            parts.append(_render_mface(data))
         elif seg_type in _PLACEHOLDERS:
             parts.append(_PLACEHOLDERS[seg_type])
         elif seg_type == "reply":

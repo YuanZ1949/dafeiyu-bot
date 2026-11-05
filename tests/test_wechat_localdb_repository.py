@@ -504,6 +504,52 @@ def test_broken_xml_does_not_raise(tmp_path: Path) -> None:
     assert entry["text"] == ""
 
 
+def test_emoji_md5_prefix_when_name_empty(tmp_path: Path) -> None:
+    xml = '<msg><emoji md5="745c9c20deadbeef" desc="" attachedtext="" /></msg>'
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, f"wxid_a:\n{xml}", local_type=47)
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["kind"] == "sticker"
+    assert entry["text"] == "[表情:745c9c20]"
+
+
+def test_emoji_uses_readable_desc(tmp_path: Path) -> None:
+    xml = '<msg><emoji md5="745c9c20deadbeef" desc="捂脸" attachedtext="" /></msg>'
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, f"wxid_a:\n{xml}", local_type=47)
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["kind"] == "sticker"
+    assert entry["text"] == "[表情:捂脸]"
+
+
+def test_emoji_broken_xml_degrades_to_placeholder(tmp_path: Path) -> None:
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, 'wxid_a:\n<msg><emoji md5="745c9c20"', local_type=47)
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["kind"] == "sticker"
+    assert entry["text"] == "[表情]"
+
+
+def test_emoji_without_emoji_node_degrades_to_placeholder(tmp_path: Path) -> None:
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, "wxid_a:\n<msg><img aeskey='abc' /></msg>", local_type=47)
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["kind"] == "sticker"
+    assert entry["text"] == "[表情]"
+
+
 # ------------------------------------------------------------ 7. 高位标志位
 def test_high_bit_local_type_is_masked_to_appmsg(tmp_path: Path) -> None:
     xml = "<msg><appmsg><title>高位标志</title><type>5</type></appmsg></msg>"

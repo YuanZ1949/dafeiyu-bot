@@ -665,6 +665,36 @@ async def test_message_media_without_path_keeps_placeholder_attachment() -> None
     assert message.attachments[0].name == "[图片]"
 
 
+async def test_sticker_media_uses_media_kind_for_attachment() -> None:
+    envelope = message_envelope(
+        text="[表情:745c9c20]",
+        kind="sticker",
+        media={"kind": "image", "path": "C:/wx/media/e.dat", "name": "e.png"},
+    )
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.kind == "sticker"
+    assert len(message.attachments) == 1
+    attachment = message.attachments[0]
+    assert attachment.kind == "image"
+    assert attachment.path == "C:/wx/media/e.dat"
+    assert attachment.name == "e.png"
+
+
+async def test_sticker_media_without_path_falls_back_to_sticker() -> None:
+    envelope = message_envelope(
+        text="[表情:745c9c20]", kind="sticker", media={"kind": "image"}
+    )
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert len(message.attachments) == 1
+    assert message.attachments[0].kind == "sticker"
+    assert message.attachments[0].path == ""
+    assert message.attachments[0].name == "[表情:745c9c20]"
+
+
 async def test_message_media_non_dict_is_ignored() -> None:
     envelope = message_envelope(text="[图片]", kind="image", media="oops")
     message = WeChatAdapter(make_config(1))._parse_message(envelope)

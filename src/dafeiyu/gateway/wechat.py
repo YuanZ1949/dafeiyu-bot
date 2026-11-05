@@ -488,9 +488,17 @@ class WeChatAdapter:
                 name = str(media.get("name") or "").strip()
                 if not name:
                     name = content[:60] or path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                # type47 的消息 kind 是 sticker，但媒体 kind 是 image：按媒体
+                # 自身的 kind 建附件，贴纸图片才能进入图片物化；其它类型两者一致。
+                media_kind = media.get("kind")
+                attachment_kind = (
+                    media_kind
+                    if isinstance(media_kind, str) and media_kind.strip()
+                    else kind
+                )
                 return [
                     Attachment(
-                        kind=kind,
+                        kind=attachment_kind,
                         path=path,
                         name=name,
                         size=_int(media.get("size")),

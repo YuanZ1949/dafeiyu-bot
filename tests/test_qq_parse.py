@@ -236,7 +236,7 @@ def test_mixed_segments_render_placeholders() -> None:
     event = group_event(segments=[text("文字"), image(), face()])
     m = parse_event(event, bot_qq=BOT_QQ)
     assert m is not None
-    assert m.content == "文字[图片][表情]"
+    assert m.content == "文字[图片][表情:1]"
 
 
 def test_unknown_segment_does_not_raise() -> None:
@@ -513,10 +513,43 @@ def test_face_mface_and_video_mappings() -> None:
         bot_qq=BOT_QQ,
     )
     assert isinstance(m, Message)
-    assert m.content == "[表情][表情][视频]"
+    assert m.content == "[表情:1][表情:猫猫表情][视频]"
     assert [(a.kind, a.name, a.duration) for a in m.attachments] == [
         ("sticker", "1", 0),
         ("sticker", "猫猫表情", 0),
         ("video", "", 7),
     ]
+
+
+def test_face_renders_numeric_id() -> None:
+    m = parse_event(group_event(segments=[face()]), bot_qq=BOT_QQ)
+    assert isinstance(m, Message)
+    assert m.content == "[表情:1]"
+
+
+def test_face_without_numeric_id_falls_back() -> None:
+    m = parse_event(
+        group_event(segments=[{"type": "face", "data": {"id": "abc"}}]),
+        bot_qq=BOT_QQ,
+    )
+    assert isinstance(m, Message)
+    assert m.content == "[表情]"
+
+
+def test_mface_renders_summary() -> None:
+    m = parse_event(
+        group_event(segments=[{"type": "mface", "data": {"summary": "猫猫表情"}}]),
+        bot_qq=BOT_QQ,
+    )
+    assert isinstance(m, Message)
+    assert m.content == "[表情:猫猫表情]"
+
+
+def test_mface_without_summary_falls_back() -> None:
+    m = parse_event(
+        group_event(segments=[{"type": "mface", "data": {}}]),
+        bot_qq=BOT_QQ,
+    )
+    assert isinstance(m, Message)
+    assert m.content == "[表情]"
 

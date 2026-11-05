@@ -90,6 +90,9 @@ _PLACEHOLDER_BY_TYPE: dict[int, tuple[str, str]] = {
     50: ("call", "[通话]"),
 }
 
+#: 表情 XML 里可作为可读名的属性，按优先级排列（实测大多为空）。
+_EMOJI_NAME_ATTRS = ("desc", "attachedtext")
+
 #: appmsg 的引用回复类型。
 _APPMSG_QUOTE = 57
 
@@ -735,10 +738,43 @@ def _render_body(local_type: int, body: str) -> tuple[str, str, str, str]:
     """返回 ``(kind, text, reply_to, reply_author)``。"""
     if local_type == 1:
         return "text", body, "", ""
+    if local_type == 47:
+        # 表情仍按 sticker 归类，但正文尽量带上可读标识（名称或 md5）。
+        return "sticker", _render_emoji(body), "", ""
     if local_type == 49:
         return _render_appmsg(body)
     kind, placeholder = _PLACEHOLDER_BY_TYPE[local_type]
     return kind, placeholder, "", ""
+
+
+def _render_emoji(body: str) -> str:
+    """从表情 XML 生成 ``[表情:<name>]`` / ``[表情:<md5 前 8>]``。
+
+    节点形如 ``<emoji md5="..." desc="..." attachedtext="..." .../>``，实测
+    desc/attachedtext 多为空，md5 才稳定可区分。解析失败或无 emoji 节点时退回
+    纯占位；绝不抛异常。
+    """
+    placeholder = _PLACEHOLDER_BY_TYPE[47][1]
+    root = _parse_xml(body)
+    if root is None:
+        return placeholder
+    node = root.find(".//emoji")
+    if node is None:
+        return placeholder
+    name = ""
+    for attr in _EMOJI_NAME_ATTRS:
+        name = str(node.get(attr) or "").strip()
+        if name:
+            break
+    if name:
+        # 去换行并截断，避免占位把单行正文撑破。
+        name = re.sub(r"\s+", " ", name).strip()[:20]
+        if name:
+            return f"[表情:{name}]"
+    md5 = str(node.get("md5") or "").strip()
+    if md5:
+        return f"[表情:{md5[:8]}]"
+    return placeholder
 
 
 def _render_appmsg(body: str) -> tuple[str, str, str, str]:
