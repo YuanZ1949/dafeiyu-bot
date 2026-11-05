@@ -1076,11 +1076,10 @@ LSP（basedpyright）：本轮改动的 `align.py` / `poller.py` / `wechat.py` /
 
 ### 23.5 仍未解决
 
-- 表情缓存 `cache/<YYYY-MM>/Emoticon/<md5[:2]>/<md5>` 既非 V2 也非单字节 XOR，
-  容器格式未知；表情目前仍是「正文保真 + type47 贴纸走图片管线」，
-  Name 表情本身不做图片化。
 - `hardlink/hardlink.db` 当前打不开（`file is not a database`，疑似加密/新容器），
   媒体发现没有依赖它；若未来 `message_resource.db` 不可用，可再研究该库。
+
+> 表情缓存已于同日补齐，见 §24。
 
 ### 23.6 验证
 
@@ -1089,3 +1088,57 @@ LSP（basedpyright）：本轮改动的 `align.py` / `poller.py` / `wechat.py` /
   tests/test_media.py` = 111 passed。
 - 全量：见本轮提交说明（若出现 `test_wechat_hook_server` 偶发失败，单独重跑确认）。
 - basedpyright：改动文件无 error（既有 warning 保留）。
+
+## 24. 表情贴纸落盘（2026-11-06，已完成）
+
+### 24.1 格式（本机实测）
+
+- 位置：`<账号根>/cache/<YYYY-MM>/Emoticon/<md5[:2]>/<md5>`；文件名与消息
+  XML 的 `<emoji md5="...">` 完全一致（`message_resource.db` 里没有这些行）。
+- 加密：裸 AES-128-CBC，`IV == key`，整文件单流，PKCS7 填充；
+  **没有任何文件头**。
+- 密钥：与图片 V2 共用 `cfgDword`，但派生串多 `EMOTICON` 且取 raw digest：
+
+  ```python
+  key = md5(f"{cfgDword}{wxid}EMOTICON").digest()[:16]
+  ```
+
+  对照：图片 `.dat` 是 `md5(f"{cfgDword}{wxid}").hexdigest()[:16].encode()`
+  （ASCII 十六进制字符）。
+- 明文：`wxgf` 容器。22 字节头（`wxgf` + 版本/宽高等），随后是裸 HEVC
+  Annex B（`00 00 00 01 40 01` 起）。本机两个样本：300x288 / 300x300，
+  单帧，转 PNG 后 90KB / 136KB。
+
+### 24.2 实现
+
+- `media/aes.py`：新增 `aes_cbc_decrypt` / `aes_cbc_encrypt`（纯 Python，
+  无新依赖）。
+- `media/keygen.py`：新增 `derive_emoticon_key`；`MediaKeyResolver` 新增
+  `emoticon_key()` 与 `dword` 属性。缓存读取拆成 `_cache_values_from_disk`
+  （只校验结构与 wxid，不需要 V2 样本），图片路径仍会在使用时用样本验证。
+- `media/emoticon.py`（新）：`decrypt_emoticon`（CBC + PKCS7 + 必须以
+  `wxgf` 开头）→ `wxgf_hevc`（在头部 64 字节内找起始码）→ `transcode`
+  （ffmpeg；先用 `ffprobe -count_frames` 判单帧/多帧，单帧 PNG、多帧 GIF）。
+  外部程序优先 `DAFEIYU_FFMPEG` 环境变量，否则 `PATH`；缺失/失败/超时
+  一律返回 `None` 保留占位。
+- `localdb/repository.py`：type 47 从正文 XML 的 `md5` 直接定位缓存文件
+  （`cache/*/Emoticon/<md5[:2]>/<md5>`），不依赖媒体索引；路径仍走
+  `_media_meta` 的越界/大小校验。
+- `media.py`：decode 触发条件从「`*.dat`」放宽到「`.dat` 或 32 位 hex
+  文件名」；`decode` 允许返回 awaitable。
+- `service.py`：`_decode_wechat_dat` 改为 async：先走图片 `.dat`，失败再试
+  表情；表情的 CBC + ffmpeg 全部在 `asyncio.to_thread` 里跑，事件环不阻塞。
+  缺 `dword` 时把 `prewarm()` 丢到后台线程。
+
+### 24.3 验证
+
+- 新增 `tests/test_wechat_emoticon.py`；`test_media.py` 补 32-hex 文件名与
+  async decode；`test_wechat_media_keygen.py` 补表情密钥缓存；
+  `test_wechat_localdb_repository.py` 补表情缓存发现（含 md5 缺失/文件缺失/
+  开关关闭）；`test_service_wechat_media.py` 改为 async 并补表情分支。
+- 真实数据端到端：从 `message_0.db` 读到 `[表情:745c9c20]`，仓库定位到
+  `cache/2026-11/Emoticon/74/745c...`，Service 解码后写入
+  `<workspace>/images/*.png`（90590 字节，PNG 魔数正确）。
+- 定向：`tests/test_wechat_emoticon.py tests/test_service_wechat_media.py
+  tests/test_media.py tests/test_wechat_media_keygen.py
+  tests/test_wechat_localdb_repository.py` = 128 passed。
