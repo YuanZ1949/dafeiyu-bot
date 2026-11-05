@@ -1020,3 +1020,72 @@ LSP（basedpyright）：本轮改动的 `align.py` / `poller.py` / `wechat.py` /
   `test_wechat_hook_server.py::test_unknown_path_is_404_not_crash` 单独重跑通过，
   属端口/事件循环偶发，与本次改动无关。
 - basedpyright：改动文件无新增 error（既有 error 未处理）。
+
+## 23. 微信图片真正可见：媒体索引 + V2 解密 + 自动取 key（2026-11-05 第十一轮）
+
+### 23.1 结论
+
+微信入站图片/贴纸现在能真正落盘并被模型 `read` 查看。真实库只读验证：
+
+- `LocalDbSource.snapshot` 在 4 个群中统计到 **13 条 image，全部 `with_media=13`**
+  （上一轮为 `with_media=0`）；
+- 取 10 条真实 `.dat` 用自动发现的 key 解码，**10/10 成功**：
+  4 张 `_h`（2 张 PNG，最大 2.6MB；2 张 JPEG）+ 6 张 `_t` JPEG；
+  大图 PNG 的 330 个 chunk **CRC 全部通过**、IEND 后无多余字节；
+- `materialize_attachments` 端到端：真实 `_h.dat` → JPEG 写入
+  `<workspace.dir>/images/`，正文变成
+  `[图片]（图存 images/…，可用 read 查看）`。
+
+### 23.2 媒体发现（`localdb/repository.py`）
+
+- `_media_rows` 新增 `username` 参数，除原有路径列/`message_resource.db` 表查询外，
+  追加 `_resource_media`：
+  - 从 `MessageResourceInfo.packed_info` 的 blob 里取 32 位 hex md5；
+  - 只在能找到 `chat_id`（`ChatName2Id` rowid）时按会话过滤，
+    定位失败则只按 `message_local_id` 查（fail-open，最多多一次磁盘探测）；
+  - 按 `msg/attach/<md5(chat)>/<YYYY-MM>/Img/<md5>[_h|_t].dat` 找盘上文件。
+- `_media_root()` 改为返回 `db_storage` 的**父目录**（4.x 的 `msg/attach` 在账号根）。
+- 变体优先级 `_h` > `_t` > 原图（`_VARIANT_ORDER`）：原图多为 `wxgf`，
+  `read` 打不开；`align.Entry` 已透传 `media`，帧里可直接带路径。
+- 新来源只补缺（`setdefault`），不覆盖旧路径列结果；任何异常都返回空。
+
+### 23.3 V2 解码（`media/dat.py` + `media/aes.py`）
+
+- 新增纯 Python AES-128/192/256 ECB（S 盒运行时生成），FIPS-197 三组向量通过；
+  不新增第三方依赖。
+- `decode_dat(data, aes_key=..., xor_key=...)`：
+  - 旧单字节 XOR / 明文透传行为不变；
+  - V2 布局：`15B 头 + AES((aes_size//16+1)*16) + 明文 middle + XOR(xor_size)`；
+    middle 长度不写死，兼容「16B 分隔」与「1MiB 以上的大图明文」；
+  - 缺 key / 长度不符 / 解密失败一律 `None`；`wxgf` 即使解出也返回 `None`。
+
+### 23.4 密钥发现（`media/keygen.py`）
+
+- `derive_aes_key(dword, wxid)` = `md5(f"{dword}{wxid}").hexdigest()[:16]`；
+- `guess_xor_key(sample)` 从 V2 尾部的 JPEG `FFD9` / PNG `IEND` 反推单字节 key；
+- `MediaKeyResolver`：
+  - 先查 `data/wechat-bridge/localdb/media_key.json`，用当前样本完整解码验证，
+    无效/换账号自动重扫；
+  - 只读扫描 `Weixin.exe`（`keyscan.ProcessMemory`）：先按 wxid 预筛进程、
+    再扫 wxid 邻近 ±4KB 的 u32，最后全量兜底；强图片头过滤 `BM`/`RIFF`
+    一类短魔数误命中，再用完整 `decode_dat` 复核；
+  - 失败冷却 300s，避免每张图都重扫。
+- `Service` 接线：`start()` 后台线程 `prewarm()`；`handle()` 用
+  `_decode_wechat_dat`，命中进程内缓存同步解，未命中只把扫描丢到后台线程
+  （同一时刻最多一个），事件环不做内存扫描；任何失败保留占位。
+
+### 23.5 仍未解决
+
+- 表情缓存 `cache/<YYYY-MM>/Emoticon/<md5[:2]>/<md5>` 既非 V2 也非单字节 XOR，
+  容器格式未知；表情目前仍是「正文保真 + type47 贴纸走图片管线」，
+  Name 表情本身不做图片化。
+- `hardlink/hardlink.db` 当前打不开（`file is not a database`，疑似加密/新容器），
+  媒体发现没有依赖它；若未来 `message_resource.db` 不可用，可再研究该库。
+
+### 23.6 验证
+
+- 定向：`tests/test_wechat_dat_v2.py tests/test_wechat_media_keygen.py
+  tests/test_service_wechat_media.py tests/test_wechat_localdb_repository.py
+  tests/test_media.py` = 111 passed。
+- 全量：见本轮提交说明（若出现 `test_wechat_hook_server` 偶发失败，单独重跑确认）。
+- basedpyright：改动文件无 error（既有 warning 保留）。
