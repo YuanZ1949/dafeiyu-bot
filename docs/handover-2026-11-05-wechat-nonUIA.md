@@ -8,7 +8,7 @@
 
 ## 0. 一句话
 
-微信出站已经**不依赖 UI 自动化**：bot → 本地 hook 服务(:30011) → `Prometheus-first/helper`
+微信出站已经**不依赖 UI 自动化**：bot → 本地 hook 服务(:30012) → `Prometheus-first/helper`
 的原生桥 DLL 注入微信发送队列，锁屏也能发；入站读微信本地库镜像。大脑从「免费档
 （上游 429）」切到了**自备 DeepSeek Key 档**，全量测试 2551 passed。
 
@@ -22,7 +22,7 @@
 | supervisor / 面板 | `http://127.0.0.1:8787`（局域网 192.168.2.161:8787） | 在跑 |
 | bot 控制口 | `127.0.0.1:8788`（`X-Control-Token`） | 在跑 |
 | 微信桥 | `ws://127.0.0.1:8790/wechat-bridge` | 已连（本地库 4 群） |
-| 微信 hook 服务 | `http://127.0.0.1:30011` | ready，微信 4.2.0.11 |
+| 微信 hook 服务 | `http://127.0.0.1:30012` | ready，微信 4.2.0.11 |
 | QQ 网关 | `127.0.0.1:8080`（NapCat 反向 WS） | 已连 |
 | opencode serve | `127.0.0.1:24310`（`vendor\opencode\opencode.exe`） | 在跑 |
 | 大脑 | `dafeiyu-key/deepseek-flash`（`https://api.deepseek.com`） | `mode=key`, `has_key=true` |
@@ -37,7 +37,7 @@
 入站 QQ     NapCat(8080) ──ws──┐
 入站 微信   微信本地库镜像 ──> 桥(8790) ──ws──┤
                                               ├─> bot(:8788 控制口)
-出站 微信   bot ──HTTP──> hook 服务(:30011) ──> helper 原生桥 ──> 微信发送队列（无键鼠）
+出站 微信   bot ──HTTP──> hook 服务(:30012) ──> helper 原生桥 ──> 微信发送队列（无键鼠）
 出站 QQ     bot ──ws──> NapCat
 大脑        bot ──HTTP──> opencode serve(24310) ──> api.deepseek.com
 托管        supervisor(8787) 管 opencode / bot / napcat / 桥；hook 服务独立进程
@@ -46,7 +46,7 @@
 要点：
 
 - **桥和 hook 是两套进程**。桥(8790) 负责入站观测 + 发送编排（限速、补发、@解析），
-  hook(30011) 只负责「把这条消息真正塞进微信」。
+  hook(30012) 只负责「把这条消息真正塞进微信」。
 - hook 服务**不在 supervisor 的进程树里**，由 `scripts/start-wechat-hook.ps1` 用
   `Win32_Process.Create` 脱离终端启动，`stop.ps1` 会顺带收掉。
 - `start-all.ps1` 在拉起 supervisor 之前会先幂等拉起 hook 服务。
@@ -82,7 +82,7 @@ gateway:
   wechat:
     enabled: true
     outbound: hook            # uia / hook / auto
-    hook_url: http://127.0.0.1:30011/send_text
+    hook_url: http://127.0.0.1:30012/send_text
     hook_timeout_seconds: 30  # 原生桥单次 1–3s，5s 太紧
     local_db_enabled: true    # 入站 + 群名→xxx@chatroom 解析
     local_db_root: C:\MyFile\Data\xwechat_files\wxid_516rht3txzox22_8eb6\db_storage
@@ -206,14 +206,14 @@ powershell -ExecutionPolicy Bypass -File scripts\stop.ps1   # 先停 hook，再�
 
 ```powershell
 # hook 是否就绪
-Invoke-RestMethod http://127.0.0.1:30011/health | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:30012/health | ConvertTo-Json
 
 # 大脑档位 / Key 是否就位 / 免费档是否可用
 $t=(Get-Content data\supervisor.token -Raw).Trim()
 Invoke-RestMethod http://127.0.0.1:8788/api/brain -Headers @{'X-Control-Token'=$t} | ConvertTo-Json -Depth 4
 
 # 端口
-foreach ($p in 8787,8788,8790,30011,8080,24310) {
+foreach ($p in 8787,8788,8790,30012,8080,24310) {
   "$p=" + (Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue | Measure-Object).Count
 }
 ```
@@ -331,7 +331,7 @@ cd C:\MyFile\AICoding\dafeiyu-bot
 
 - e2e：`scripts\qa_wechat_smoke.py`（会临时打开 `allow_test_inject`，跑完自动关；
   **它会往真实群注入消息并可能触发真实回复**，别在生产号/真群上随手跑）。
-- 手工验证发送：`Invoke-RestMethod :30011/health` → `ready:true`，然后从面板发一条。
+- 手工验证发送：`Invoke-RestMethod :30012/health` → `ready:true`，然后从面板发一条。
 
 ---
 
@@ -448,3 +448,277 @@ fe3d018 fix(config): gateway.wechat.quiet_hours 未配置时继承 triggers
 powershell -ExecutionPolicy Bypass -File scripts\diag.ps1 -DryRun
 powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -DryRun
 ```
+
+---
+
+## 15. 决策流水与面板瘦身（2026-11-05 第三轮）
+
+### 15.1 为什么要做
+
+在此之前，「她打不打算回话、当时怎么想的」只存在于日志里：
+
+- `speak=false` 只有一条 INFO 日志，`reason` 被截到 120 字；
+- 模型的 `read` / `think` 是 **DEBUG** 级别，默认配置下根本不落盘；
+- 批次本身没有表，事后只能从 `delivered_messages` 反查，且分不清
+  「模型自决沉默」和「被规则拦下」。
+
+### 15.2 `decisions` 表
+
+新表（`CREATE TABLE IF NOT EXISTS`，老库 `init_schema()` 自动补建，
+`SCHEMA_VERSION` 仍是 2）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `outcome` | `replied` 已回复 / `silent` 模型决定不说 / `blocked` 规则拦截 / `held` 刻意攒着 / `error` 失败 |
+| `checkpoint` | 空 = 模型自主决策；否则为拦截点：`intensity_quiet` `opportunity_hold` `budget` `recalled` `restricted` `guard_dropped` `brain_error` `send_failed` |
+| `read` / `think` / `reason` | 模型原文；`reason` 仅 500 字兜底，不再套日志的 120 字 |
+| `reply_preview` | 实际发出正文前 200 字 |
+| `latency_ms` / `prompt_tokens` / `completion_tokens` | 本次决策的成本 |
+| `message_ids` / `message_count` / `addressed` | 这一批判定涉及的消息 |
+| `detail` | JSON，预算拦截的 scope/reason 等 |
+
+写入点（`service.py`）：批次级拦截 4 处、模型返回后（回话 / 沉默 / 被言论
+限制 / 被守卫丢光 / 发送失败）、私聊单条路径同构。写库异常在
+`Service._record_decision` 内吞掉，**绝不影响发送**。
+
+判定口径：**一个分片都没真正发出**就是 `error/send_failed`，与是否进待发
+队列无关（入队也失败时 `defer=0`，早期实现会误记成 `replied`，已修）。
+
+`held`（攒着不投）在热聊群会按条重判，同群同原因 60 秒内只留一条，
+避免决策流被重复项挤满。
+
+### 15.3 面板
+
+- 新增「决策流」卡：今日次数 / 回复 / 沉默 / 拦截 / 模型沉默率 / 平均延迟，
+  支持按结果筛选；每条可展开看 `读 / 想 / 理由 / 回复` 与 token、延迟。
+- 接口：`GET /api/decisions?limit=&days=&outcome=&chat_type=&chat_id=`
+  （bot 控制口实现，面板 `proxy_get` 透传），返回 `items` + `stats`。
+- 去重（同一信息只保留一个权威位置）：
+  - 进程状态：删掉健康卡里的进程小结，只留 `#processes`；
+  - 健康 kv：删掉「QQ 网关 / 配额 / 备份 / 告警」四行（分别由通道卡、
+    全局红条、备份卡、告警卡负责）；
+  - `brain-hint`：删掉 OneBot 连接态（通道卡负责）；
+  - 记忆卡：删掉「配额暂停中」文案，只留「解除熔断」按钮；
+  - 配置卡：标签改为「配置·大脑」「配置·预算」，明确是配置文件值，
+    与实时状态区分。
+
+### 15.4 验收
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+# 2026-11-05 第三轮：2619 passed, 20 skipped（约 4.5 分钟）
+curl -H "X-Control-Token: $(Get-Content data\supervisor.token)" `
+  "http://127.0.0.1:8788/api/decisions?limit=5"
+```
+
+已知边界：单条消息级的规则拦截（muted / quiet / blacklist / downshift）
+仍只记在 `delivered_messages.skipped_reason`，**不**进决策流（否则会按条
+刷屏）；决策流只回答「这一批为什么没开口」。
+
+### 15.5 补发成功后的决策口径
+
+发送失败会记 `error/send_failed`，同时把分片排进待发队列。补发成功后
+（`Service._flush_outbox`）**不再新增一条 `replied`**，而是调用
+`Store.mark_decision_retried(...)` 把原来那条失败决策原地改成 `replied`：
+
+- 匹配键：`chat_type + chat_id + origin_message_id`，只在
+  `outcome='error' AND checkpoint='send_failed'` 里找最近一条；
+- `checkpoint` 清空，`detail` 合并 `retried=true` /
+  `retry_after_seconds` / `outbox_id`；
+- 找不到匹配（老数据、重复补发）返回 0，静默跳过；
+- 与 `_record_decision` 相同，写库异常全部吞掉，**补发本身不受影响**。
+
+这样面板统计里「一次决策」始终只占一行，不会出现「1 条失败 + 1 条回复」
+把回复率和失败数同时算高的情况。
+
+---
+
+## 16. hook 端口迁移与占用守卫（2026-11-05）
+
+### 16.1 现象
+
+面板通道卡报 `degraded / logged_in=false / desktop=no_wechat`，但
+`http://127.0.0.1:30011/health` 一直返回 `ready:true`、`last_error` 为空。
+
+### 16.2 根因
+
+- `01:29:41` 有一个 hook 实例以管理员权限启动（`logs/wechat-hook.log:17-19`），
+  之后一直没退出，以 `0.0.0.0:30011` 持有监听。
+- 微信客户端在 `02:1x` 退出；该实例的 `NativeTextService` 仍缓存旧会话，
+  `/health` 继续返回旧的 `self_wxid / wechat_version`，属于**假阳性**。
+- 10:59、11:15 两次重启产生的新实例绑 `127.0.0.1:30011`，连接被先绑的
+  wildcard socket 接走；新实例日志只能反复刷
+  `helper 原生桥未就绪：等待微信账号完成登录`。
+- `start-wechat-hook.ps1` 旧实现只按命令行匹配进程；提权进程的命令行读不到，
+  于是既停不掉旧实例，又认不出端口已被占用，`start-all.ps1` 还把旧实例的
+  `ready:true` 当成启动成功。
+
+### 16.3 处理
+
+- hook 端口从 `30011` 迁到 `30012`：改 `gateway.wechat.hook_url` 即可，
+  `start-all.ps1` 从 URL 解析端口并传给 `start-wechat-hook.ps1 -Port`。
+- `start-wechat-hook.ps1` 增加端口守卫：
+  - 启动前用 `Get-NetTCPConnection -LocalPort` 检查，占用者不是本端口实例时直接报错；
+  - `-Stop` 后校验端口确实释放，未释放则非 0 退出并提示提权；
+  - 进程匹配同时校验 `--port <当前端口>`，不同端口可以并存。
+- `diag.py` 的端口清单同步为 `30012`。
+
+### 16.4 遗留
+
+`30011` 上的提权旧实例（`PID 39764 → 39812`，创建于 `01:29:41`）仍在运行，
+需要一次管理员权限才能结束；它已不影响新链路，择机清理即可。
+
+### 16.5 验收
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\start-wechat-hook.ps1 -Stop -Port 30012
+powershell -ExecutionPolicy Bypass -File scripts\start-wechat-hook.ps1 -Port 30012
+Invoke-RestMethod http://127.0.0.1:30012/health
+```
+
+注意：微信客户端未登录时，`/health` 应返回 `ready:false` 且 `last_error` 非空——
+这是**正确**状态，不要再用 `ready:true` 作为启动成功的唯一判据。
+
+## 17. 微信好友私聊（2026-11-05 第四轮）
+
+### 17.1 开关
+
+两个独立开关，均在 `gateway.wechat` 下，默认 **false**：
+
+| 配置键 | 作用 |
+| --- | --- |
+| `private_enabled` | 本地库把好友会话纳入入站轮询（面板可见、入库） |
+| `private_reply` | bot 是否自动回复好友私聊 |
+
+分开是为了支持「先只看不回」的灰度：`private_enabled=true` +
+`private_reply=false` 时消息照常入库与展示，`/status` 等命令仍可用，
+普通聊天不触发模型。两开关都只在桥/ bot 启动时读取，改完需重启 supervisor。
+
+### 17.2 好友判定
+
+只认 `contact` 表里以 `wxid_` 开头的会话，并排除：
+
+- 自己（`self_username`，从库目录名解析）；
+- 系统/官方号：`filehelper`、`notifymessage`、`weixin`、`fmessage`、
+  `medianote`、`floatbottle`、`gh_*`（公众号）、`@openim`（外部联系人）。
+
+`@chatroom` 仍然只按群处理。好友必须有对应的 `Msg_<md5>` 消息表，否则
+枚举阶段就会被剔除（UIA 兜底只会白等一次开窗超时）。
+
+### 17.3 解析与歧义
+
+- `LocalMessageStore.resolve(name, kind)`：`kind` 为 `group` / `friend`；
+- `resolve_any(name)`：群、好友任一命中；**同名群和好友同时存在时返回
+  `None`**（fail-closed），`kind_of(name)` 同样返回 `None`；
+- 轮询范围里发现群/好友重名：整条名字跳过，并打 warning；
+- 身份表 `peers.json` 新增 `kind="friend"` 条目；好友帧的 `chat_type`
+  为 `private`，`chat_id` 仍是 `wxg:<alias>`（与群共用别名空间，但按 kind 隔离）。
+
+### 17.4 出站闸门
+
+`PollingLoop.allows_chat()` 对好友多一道条件：`private_enabled` 为真才放行。
+面板白名单里列出好友 alias 但开关关闭时，既不会轮询也不会发送。
+QQ 私聊（`qq:` 前缀）完全不受这两个开关影响。
+
+### 17.5 只读决策口径
+
+`private_reply=false` 时，微信私聊（`wxg:` 会话）在命令分支之后、预算检查
+之前直接返回，并写一条决策：
+
+```text
+outcome=silent, trigger=private, checkpoint=private_readonly,
+detail={"private_reply": false}
+```
+
+命令分支先于该闸门执行，因此只读模式下仍可远程执行 `/status` 等命令。
+
+### 17.6 验收与排查
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+# 2026-11-05 第四轮：2642 passed, 20 skipped
+
+# 桥日志应出现「群 N 个，好友 M 个」
+Get-Content logs\supervisor\wechat_bridge.log -Tail 10
+```
+
+| 症状 | 先查 |
+| --- | --- |
+| 面板看不到私聊 | `private_enabled` 是否为 true；桥是否重启过；`contact` 里好友是否有 `Msg_` 表 |
+| 私聊入库但不回复 | `private_reply` 是否为 true；决策流是否 `silent/private_readonly` |
+| 发送 `chat_name_unresolved` | 好友显示名是否在本地库唯一；是否与群重名 |
+| 私聊消息被当成群 | 身份表 `peers.json` 里该会话的 `kind` 是否错误；本地库 `peer_kind` 是否返回 None |
+
+已知边界：微信 4.2.0.11 没升级；系统号/公众号永远不会被当作好友；同名群与
+好友无法自动判定，宁可两条都不回，也不猜。
+
+---
+
+## 18. 回执死锁与断线丢帧修复（2026-11-05 第五轮）
+
+### 18.1 现象（14:46-14:49 实测）
+
+- `14:46:47` 好友「苑长」发「在么」，回复在 `14:46:52` 已写进微信本地库
+  （`local_id=3`），但 bot 侧一直等不到回执；`14:49:20` 报
+  「微信发送等待回执超时」并入待发队列，`14:49:27` 补发成功 →
+  用户收到**两条相同回复**（`local_id=3` 与 `local_id=6`）。
+- `14:48:14` 的「没啥事」+ 表情在微信本地库和 `align-state.json` 里都有，
+  但主库 `messages` 没有，也没有回复。
+- 桥日志：`14:47:53` 帧泵广播超时（外层 5s `wait_for` 取消内层
+  `connection.send`），`TimeoutError` 冒到泵外，泵退出 → supervisor
+  `14:47:58` 重启桥；bot 直到 `14:49:22` 才重连。无人接收期间 poller 继续
+  推进并落盘对齐窗口，这两条消息被当成基线永久吞掉。
+
+### 18.2 根因
+
+1. **回执死锁**：收帧循环 `async for raw in ws: await self._handle_raw(raw)`
+   内联 `await handler(message)`；handler 里 `await send()` 等回执，而回执
+   只有同一个循环能读 → 自锁，必然等满 `_SEND_TIMEOUT=150s` 后重试。
+2. **广播超时杀泵 + 无客户端空转推进**：泵用
+   `asyncio.wait_for(server.broadcast(item), 5s)` 包广播；慢客户端时外层
+   取消内层 `connection.send`，`CancelledError` 不在 broadcast 的 except 里，
+   冒泡成 `TimeoutError`，泵当成致命错误退出。桥在无客户端时仍 poll，
+   `broadcast` 到空集合返回，帧丢但对齐器已推进。
+
+### 18.3 修复
+
+- `gateway/wechat.py`：
+  - `message` / `recall` 在收帧循环里只做受理判定（parse + 回声过滤 +
+    `last_event_at`），随后转后台任务；回执 / health / resync 仍在循环内
+    即时处理。
+  - 每 `(chat_type, chat_id)` 一把 FIFO 锁保序，不同会话并行；任务登记 +
+    done 回调记录异常。
+  - 断线只 `_fail_pending`，**不取消**在途 handler（`send` 抛
+    `GatewayError` → 服务层待发队列）；仅 `stop()` 取消并回收，避免抖动
+    丢掉半路回复。
+- `wechat_bridge/server.py`：
+  - `broadcast` 返回送达连接数，慢客户端只断自己；泵不再包外层
+    `wait_for`，单次广播超时按 `delivered=0` 留帧重试，泵不退出。
+  - 新增 `has_clients` / `closed` / `wait_for_client()`；无客户端时生产者
+    不拉帧（对齐器冻结），`asyncio.Queue(maxsize=64)` + `await put` 背压。
+  - 未送达帧持有一帧（pending），重连后先重投再继续队列，保序不丢；
+    等客户端不计入 stall，只有「有客户端但源无产出」才按
+    `idle_timeout/stall_limit` 停泵。
+- 测试适配：`test_run_exits_nonzero_when_pump_dies` 增加一个客户端连接
+  （否则按新语义泵不会推进到源耗尽）；断言不变。
+
+### 18.4 验收
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+# 2026-11-05 第五轮：2651 passed, 20 skipped（新增 9 个回归测试）
+```
+
+实测 `16:25`：连发「测试1」「测试2」→ 单次回复、无超时、无补发、两条都
+入库；第二条在第一条回复发送途中就被收帧循环读到。
+
+### 18.5 已知边界
+
+- 好友私聊的 `user_id` 仍是 aligner 进程内随机别名
+  （`wxg:2279b5dda8fd`），桥重启会变；`chat_id`（`wxg:<alias>`）稳定。
+  按会话记忆不受影响，但「按人」的跨会话画像会断。后续应让私聊帧直接
+  复用稳定的 friend alias 作为 `user_id`，或把 `name → alias` 落进身份表。
+- 某次发送真超过 150s 才成功时仍可能重试重复（系统性自锁已消除，这是
+  极端慢发送的残余窗口）。
+- 桥进程被硬杀（非正常停机）时，内存中未投递的 pending/队列帧仍会丢；
+  正常停机与重连不会。

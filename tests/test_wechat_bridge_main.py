@@ -508,9 +508,268 @@ async def test_pump_stall_limit_stops_pump_when_source_is_dead() -> None:
     assert elapsed >= 0.10, "没等满 stall_limit 次空转就停泵了"
 
 
+# ------------------------------------- (f3) loss-free 回归：闸门 / 持帧 / 重投
+def _bridge_msg(text: str) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "chat_id": "wxg:laoyouqun",
+        "message_id": f"1:{text}",
+        "text": text,
+    }
+
+
+class _StaticConn:
+    """broadcast 的假快速连接：send 立即成功。"""
+
+    def __init__(self) -> None:
+        self.received: list[str] = []
+
+    async def send(self, payload: str) -> None:
+        self.received.append(payload)
+
+
+class _HangingConn:
+    """send 永远挂起的假连接：模拟收不动帧的慢客户端。"""
+
+    def __init__(self) -> None:
+        self.received: list[str] = []
+
+    async def send(self, payload: str) -> None:
+        self.received.append(payload)
+        await asyncio.sleep(30)  # 由 broadcast 的逐连接 wait_for 取消
+
+
+async def _wait_absent(server: Any) -> None:
+    """等断线收尾：has_clients 翻转为 False。"""
+
+    async def _poll() -> None:
+        while server.has_clients:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll(), STEP)
+
+
+async def test_broadcast_counts_clients_and_drops_slow_one() -> None:
+    """broadcast 返回送达数；发送超时的连接在广播内被剔除，超时不外泄。"""
+    server = BridgeServer(broadcast_timeout=0.05)
+    port = await asyncio.wait_for(server.start(), STEP)
+    try:
+        # 真实客户端：在场信号翻转 + 送达计数。
+        async with connect(_uri(port)) as ws:
+            assert server.has_clients is True
+            assert (
+                await asyncio.wait_for(
+                    server.broadcast({"type": "message", "text": "ok"}), STEP
+                )
+                == 1
+            )
+            frame = await _recv_until(ws, lambda f: f.get("type") == "message")
+            assert frame["text"] == "ok"
+        # 断开是异步收尾：等在场信号翻转，再走无假连接检查。
+        await asyncio.wait_for(_wait_absent(server), STEP)
+        assert server.has_clients is False
+
+        # 假连接：一个能收，一个 send 挂死；计数只算成功者，挂死者被剔除。
+        fast = _StaticConn()
+        slow = _HangingConn()
+        server._connections.update({fast, slow})
+        assert (
+            await asyncio.wait_for(
+                server.broadcast({"type": "message", "text": "慢客户端"}), STEP
+            )
+            == 1
+        )
+        assert fast in server._connections
+        assert slow not in server._connections
+        assert fast.received and "慢客户端" in fast.received[-1]
+
+        # 全部掉线：0 个客户端，广播返回 0，不报错。
+        server._connections.clear()
+        assert await asyncio.wait_for(server.broadcast(_bridge_msg("没人")), STEP) == 0
+    finally:
+        await asyncio.wait_for(server.stop(), STEP)
+    assert server.has_clients is False
+
+
+class _TimeoutOnceServer:
+    """第一次 broadcast 超时且把客户端判掉线的假服务器（事故形态复刻）。"""
+
+    def __init__(self) -> None:
+        self.frames: list[dict[str, Any]] = []
+        self._present = asyncio.Event()
+        self._present.set()  # 泵启动时就有一个客户端在场
+        self._client = True
+        self.fail_once = True
+
+    @property
+    def has_clients(self) -> bool:
+        return self._client
+
+    def connect(self) -> None:
+        self._client = True
+        self._present.set()
+
+    async def wait_for_client(self) -> None:
+        await self._present.wait()
+
+    async def broadcast(self, frame: dict[str, Any]) -> int:
+        if self.fail_once:
+            self.fail_once = False
+            self._client = False
+            self._present.clear()
+            raise asyncio.TimeoutError()
+        self.frames.append(frame)
+        return 1
+
+
+async def test_pump_survives_broadcast_timeout_and_retries() -> None:
+    """broadcast 抛 TimeoutError 不杀泵：同一帧等客户端回来后重投，顺序不变。"""
+    server = _TimeoutOnceServer()
+
+    async def source() -> Any:
+        yield _bridge_msg("第一帧")
+        yield _bridge_msg("第二帧")
+
+    pump = asyncio.create_task(pump_frames(server, source(), idle_timeout=STEP))
+    try:
+        # 超时只按 delivered=0 处理：泵活着，帧被持有，不外抛也不丢。
+        await asyncio.sleep(0.1)
+        assert not pump.done()
+        assert server.frames == []
+
+        server.connect()
+        await asyncio.wait_for(pump, STEP)
+        assert [f["text"] for f in server.frames] == ["第一帧", "第二帧"]
+    finally:
+        pump.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump
+
+
+async def test_pump_pauses_source_until_client_connects() -> None:
+    """无客户端时帧源不被拉动；接入后先送达已有帧，断线期间计数冻结。"""
+    server = BridgeServer()
+    port = await asyncio.wait_for(server.start(), STEP)
+    counter = 0
+    step2 = asyncio.Event()
+    step3 = asyncio.Event()
+
+    async def source() -> Any:
+        nonlocal counter
+        counter += 1
+        yield _bridge_msg("m1")
+        await step2.wait()
+        counter += 1
+        yield _bridge_msg("m2")
+        await step3.wait()
+        counter += 1
+        yield _bridge_msg("m3")
+
+    pump = asyncio.create_task(pump_frames(server, source(), idle_timeout=STEP))
+    try:
+        # 阶段 1：无人能收帧——帧源一次都不该被碰。
+        await asyncio.sleep(0.15)
+        assert counter == 0
+        assert not pump.done()
+
+        # 阶段 2：客户端接入 → 第一帧送达，源被拉动一格。
+        async with connect(_uri(port)) as ws:
+            first = await _recv_until(ws, lambda f: f.get("type") == "message")
+            assert first["text"] == "m1"
+            step2.set()
+            second = await _recv_until(
+                ws, lambda f: f.get("type") == "message" and f.get("text") == "m2"
+            )
+            assert second["v"] == 1
+            assert counter == 2
+
+        # 阶段 3：断开期间生产与消费都被闸住，计数冻结。
+        await asyncio.sleep(0.15)
+        assert counter == 2
+
+        # 阶段 4：客户端回来，闸门放开，最后的帧送达且泵自然收尾。
+        async with connect(_uri(port)) as ws:
+            step3.set()
+            third = await _recv_until(
+                ws, lambda f: f.get("type") == "message" and f.get("text") == "m3"
+            )
+            assert third["text"] == "m3"
+            assert counter == 3
+        await asyncio.wait_for(pump, STEP)
+    finally:
+        pump.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump
+        await asyncio.wait_for(server.stop(), STEP)
+
+
+class _DroppingServer:
+    """可控「投递窗口掉线」的假服务器：断线前已产出的帧重连后原序补投。"""
+
+    def __init__(self) -> None:
+        self.frames: list[dict[str, Any]] = []
+        self._present = asyncio.Event()
+        self._present.set()  # 泵启动时就有一个客户端在场
+        self._client = True
+        self.drop_next = False
+
+    @property
+    def has_clients(self) -> bool:
+        return self._client
+
+    def connect(self) -> None:
+        self._client = True
+        self._present.set()
+
+    async def wait_for_client(self) -> None:
+        await self._present.wait()
+
+    async def broadcast(self, frame: dict[str, Any]) -> int:
+        if self.drop_next:
+            self.drop_next = False
+            self._client = False
+            self._present.clear()
+            return 0  # 客户端恰好在投递窗口断线：无人收到
+        self.frames.append(frame)
+        return 1
+
+
+async def test_pump_delivers_frame_from_before_disconnect_after_reconnect() -> None:
+    """断线瞬间已产出未送达的帧不丢：重连后先补投它，再按序投积压帧。"""
+    server = _DroppingServer()
+    ready = asyncio.Event()
+
+    async def source() -> Any:
+        yield _bridge_msg("m1")
+        await ready.wait()
+        yield _bridge_msg("m2")
+        yield _bridge_msg("m3")
+
+    pump = asyncio.create_task(pump_frames(server, source(), idle_timeout=STEP))
+    try:
+        await asyncio.sleep(0.1)
+        assert [f["text"] for f in server.frames] == ["m1"]
+
+        # 掉线：m2 已产出但无人收到——被持有，不静默丢弃。
+        server.drop_next = True
+        ready.set()
+        await asyncio.sleep(0.1)
+        assert [f["text"] for f in server.frames] == ["m1"]
+
+        # 客户端回来：m2 补投，m3 排在后面 —— 无丢失、顺序保持。
+        server.connect()
+        await asyncio.wait_for(pump, STEP)
+        assert [f["text"] for f in server.frames] == ["m1", "m2", "m3"]
+    finally:
+        pump.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump
+
+
 async def test_run_exits_nonzero_when_pump_dies(tmp_path: Path) -> None:
     """帧泵在轮询仍应继续时结束 = 入站静默失效：非 0 退出交给 supervisor 重启。"""
     wechat = _wechat(kill_switch_file=str(tmp_path / "wechat.stop"))
+    holder: dict[str, Any] = {}
 
     class FakeDriver:
         """本用例不触碰驱动。"""
@@ -544,6 +803,11 @@ async def test_run_exits_nonzero_when_pump_dies(tmp_path: Path) -> None:
 
     poller = DeadPoller()
 
+    def server_factory(*args: Any, **kwargs: Any) -> BridgeServer:
+        server = BridgeServer(*args, **kwargs)
+        holder["server"] = server
+        return server
+
     async def command_handler(
         action: str, params: dict[str, Any], command_id: str
     ) -> dict[str, Any] | None:
@@ -553,12 +817,25 @@ async def test_run_exits_nonzero_when_pump_dies(tmp_path: Path) -> None:
         bridge_main.run(
             settings=SimpleNamespace(wechat=wechat),
             driver_factory=FakeDriver,
+            server_factory=server_factory,
             command_handler=command_handler,
             poller_factory=lambda _config, _driver: poller,
         )
     )
-    assert await asyncio.wait_for(run_task, STEP) == 1
-    assert poller.stop_calls == 1
+    try:
+        # 帧源只有在有人能收帧时才会被拉动（loss-free 闸门）：接入一个客户端，
+        # 让泵把 DeadPoller 的帧源跑到耗尽，才能观测「泵结束 -> 退出 1」的路径。
+        server = await _wait_for_port(holder)
+        async with connect(
+            _uri(server.port), additional_headers={"Authorization": f"Bearer {TOKEN}"}
+        ):
+            assert await asyncio.wait_for(run_task, STEP) == 1
+        assert poller.stop_calls == 1
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(run_task, STEP)
 
 
 async def test_probe_and_bad_version_do_not_crash_loop() -> None:

@@ -27,7 +27,7 @@ import contextlib
 import hmac
 import json
 import logging
-from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable
 from http import HTTPStatus
 from typing import Any, cast
 
@@ -103,6 +103,7 @@ class BridgeServer:
         command_handler: CommandHandler | None = None,
         on_stop_requested: Callable[[], None] | None = None,
         send_timeout: float | None = None,
+        broadcast_timeout: float | None = None,
     ) -> None:
         self.host = host
         self._requested_port = int(port)
@@ -114,11 +115,18 @@ class BridgeServer:
         self._send_timeout = (
             _SEND_AWAIT_TIMEOUT if send_timeout is None else float(send_timeout)
         )
+        # 单连接广播发送的上限：测试可注入更短值，默认与 5s 护栏一致。
+        self._broadcast_timeout: float = (
+            _AWAIT_TIMEOUT if broadcast_timeout is None else float(broadcast_timeout)
+        )
         self._server: Any | None = None
         self._stop: asyncio.Future[None] | None = None
-        self._closed = False
+        self._closed: bool = False
         self.port: int | None = None
         self._connections: set[ServerConnection] = set()
+        # 客户端在场信号：有客户端置于 set、无人/已收摊时 clear。
+        # wait_for_client 的等待者靠它挂起/唤醒（Python 3.10+ Event 不绑 loop）。
+        self._client_event: asyncio.Event = asyncio.Event()
         # 健康快照：新客户端一批上来先收到最近一帧，绝不干等下一次周期上报。
         self._latest_health: dict[str, Any] | None = None
 
@@ -134,6 +142,37 @@ class BridgeServer:
 
     def client_count(self) -> int:
         return len(self._connections)
+
+    @property
+    def has_clients(self) -> bool:
+        """当前是否有至少一个客户端连接在场（帧泵的暂停/重试信号）。"""
+        return bool(self._connections)
+
+    @property
+    def closed(self) -> bool:
+        """服务器是否已收摊（`stop()` 之后为 True；帧泵以此退出客户端等待）。"""
+        return self._closed
+
+    def _refresh_clients(self) -> None:
+        """翻动在场信号：场所变化必须唤醒/挂起 wait_for_client 的等待者。
+
+        已收摊时显式 set：让还挂在 wait() 上的泵至少醒来一次，
+        由 `wait_for_client` 的循环条件判断退出，不会原地死等。
+        """
+        if self._closed or self._connections:
+            self._client_event.set()
+        else:
+            self._client_event.clear()
+
+    async def wait_for_client(self) -> None:
+        """阻塞到至少有一个客户端连接（或服务器已收摊）。
+
+        供帧泵在无人接收帧时暂停拉取帧源：连接建立/断开都会翻动内部
+        Event，先查后等之间接入的客户端不会漏（add 时已置位）。
+        可重复调用；收摊后立即返回，调用方用 `has_clients`/`closed` 判断。
+        """
+        while not self._connections and not self._closed:
+            await self._client_event.wait()
 
     # ------------------------------------------------------------- 生命周期
     async def start(self) -> int:
@@ -177,6 +216,7 @@ class BridgeServer:
                     connection.close(code=_CLOSE_CODE_GOING_AWAY), _AWAIT_TIMEOUT
                 )
         self._connections.clear()
+        self._refresh_clients()
         if server is not None:
             server.close()
             with contextlib.suppress(Exception):
@@ -184,11 +224,14 @@ class BridgeServer:
         self.request_stop()
 
     # --------------------------------------------------------------- 推帧
-    async def broadcast(self, frame: dict[str, Any]) -> None:
-        """推送事件帧到所有已连接客户端（message/recall/health/resync）。
+    async def broadcast(self, frame: dict[str, Any]) -> int:
+        """推送事件帧到所有已连接客户端，返回成功送达的连接数。
 
         帧没有 `v`/`channel` 时补默认值（§2.1 两字段必填）；health 帧留作
-        新客户端接入时的首帧快照。断线/超时的客户端直接剔除。
+        新客户端接入时的首帧快照。逐连接限时发送：慢/断线客户端直接剔除
+        （同步翻动在场信号），所以单个收不动的客户端只会让本连接丢弃，
+        绝不会把 TimeoutError/CancelledError 泄到广播之外——帧泵以此判断
+        delivered==0，把帧留到客户端回来重试而不是杀掉泵。
         """
         if not isinstance(frame, dict):
             raise TypeError("broadcast 需要一条 v1 信封 dict")
@@ -197,12 +240,19 @@ class BridgeServer:
         if envelope.get("type") == "health":
             self._latest_health = dict(envelope)
         payload = json.dumps(envelope, ensure_ascii=False)
+        sent = 0
         for connection in list(self._connections):
             try:
-                await asyncio.wait_for(connection.send(payload), _AWAIT_TIMEOUT)
+                await asyncio.wait_for(
+                    connection.send(payload), self._broadcast_timeout
+                )
             except (TimeoutError, ConnectionClosed, OSError, RuntimeError) as exc:
                 logger.debug("微信桥广播失败，断开该客户端：%s", exc)
                 self._connections.discard(connection)
+                self._refresh_clients()
+            else:
+                sent += 1
+        return sent
 
     # ----------------------------------------------------------- 连接入口
     def _process_request(
@@ -225,6 +275,7 @@ class BridgeServer:
 
     async def _handle_connection(self, connection: ServerConnection) -> None:
         self._connections.add(connection)
+        self._refresh_clients()
         try:
             snapshot = self._latest_health
             if snapshot is not None:
@@ -256,6 +307,7 @@ class BridgeServer:
             logger.exception("微信桥连接处理异常")
         finally:
             self._connections.discard(connection)
+            self._refresh_clients()
 
     async def _send(
         self, connection: ServerConnection, envelope: dict[str, Any]
@@ -356,6 +408,66 @@ class _FrameSourceFailure:
 
 _FRAME_SOURCE_END = object()
 
+#: 生产队列上限：投递停滞时生产者 `await queue.put` 背压顶住帧源，
+#: 不会在无人接收时无限生产。
+_QUEUE_MAX = 64
+#: 失败/结束标记挤队上限：满员的队列最多等这么久，等不到就放弃——
+#: 消费侧的空转护栏仍能停泵，不会因此挂死收摊。
+_QUEUE_PUT_TIMEOUT = 1.0
+
+
+class _ClientGate:
+    """`wait_for_client` / `has_clients` 的鸭子类型闸门。
+
+    只实现 broadcast 的替身服务器（旧测试）没有这两个接缝时，
+    闸门全通：泵行为与旧版一致。真实 BridgeServer 两个接缝都在。
+    """
+
+    __slots__: tuple[str, ...] = ("_server", "active")
+
+    def __init__(self, server: Any) -> None:
+        wait = getattr(server, "wait_for_client", None)
+        # has_clients 若是 property，getattr 即取值（总是 bool，不会是 None）；
+        # 没有该接缝的替身 getattr 落到 None，闸门禁用。
+        self._server: Any = server
+        self.active: bool = callable(wait) and (
+            getattr(server, "has_clients", None) is not None
+        )
+
+    def present(self) -> bool:
+        """此刻是否有客户端连接（每次动态取值）。"""
+        return bool(getattr(self._server, "has_clients", False))
+
+    def closed(self) -> bool:
+        """服务器是否已收摊（收摊且无人时等待方该停泵）。"""
+        return bool(getattr(self._server, "closed", False))
+
+    async def wait(self) -> bool:
+        """等至少一个客户端接入；返回 False = 已收摊且无人会来，该停泵。
+
+        先查后等：连接在检查与等待之间接入也不会漏（Event 已被置位）。
+        """
+        if not self.active:
+            return True
+        wait = getattr(self._server, "wait_for_client")
+        while True:
+            await wait()
+            if self.present():
+                return True
+            if self.closed():
+                return False
+            # wait() 被瞬时加/撤连接唤醒但仍无人在线：继续等。
+
+
+async def _put_marker(queue: asyncio.Queue[Any], item: Any) -> None:
+    """失败/结束标记也要穿过满员队列：最多等一小会，等不到交给空转护栏。"""
+    try:
+        await asyncio.wait_for(queue.put(item), _QUEUE_PUT_TIMEOUT)
+    except (TimeoutError, asyncio.CancelledError):
+        # CancelledError 只可能是泵收摊取消；标记丢了没关系，
+        # 消费侧的空转护栏照样能停泵。不可再吞生产数据帧。
+        pass
+
 
 async def pump_frames(
     server: BridgeServer,
@@ -371,43 +483,100 @@ async def pump_frames(
     异步生成器进入不可恢复的状态，进而静默停泵——经队列中转后超时只取消
     `Queue.get()`，帧源本身毫发无损。
 
+    三个 loss-free 接缝：
+    -   无客户端时暂停源：生产者拉下一帧前先过 `wait_for_client()` 闸门
+        （服务器没这两个接缝的替身则全通），SessionAligner 不在没人收帧时
+        推进；队列 `maxsize=_QUEUE_MAX` + `await queue.put` 给源头背压。
+    -   投递失败不丢帧：`broadcast` 超时/无人收到时该帧被持有，客户端回来
+        后先重投这一帧再继续队列积压帧——绝不乱序、绝不静默丢
+        message/recall/resync。`broadcast` 返回 None 的旧替身按「已送达」算。
+    -   广播超时不外泄：单次 broadcast 抛 TimeoutError 只按 delivered=0
+        记警告继续，泵绝不因此退出。
+
     `idle_timeout` 是「帧源多久不出帧算一次空转」的显式接缝：默认 5s；
     轮询循环每轮至少一帧 health，帧间隔约等于 `WeChatConfig.poll_seconds`，
     所以 `__main__` 传 `max(5s, 2 * poll_seconds)`。
 
-    `stall_limit` 决定连续空转几次才真正停泵：默认 0 = 旧行为（第一次超时即
-    返回）；生产路径传 3——单次慢轮询只记警告并继续等待，连续 3 次才放弃。
+    `stall_limit` 决定连续空转几次才真正停泵：默认 0 = 第一次超时即返回；
+    生产路径传 3——单次慢轮询只记警告并继续等待，连续 3 次才放弃。空转
+    只对「有客户端在场但源无产出」成立：等客户端接入期间的挂起不算。
     真卡死时泵仍会退出，由 `__main__` 的完成回调请求停机、交给 supervisor
     重启，不会出现「进程活着但永不推帧」的假活。
     """
     timeout = _AWAIT_TIMEOUT if idle_timeout is None else float(idle_timeout)
     limit = max(0, int(stall_limit))
-    queue: asyncio.Queue[Any] = asyncio.Queue()
+    queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=_QUEUE_MAX)
+    clients = _ClientGate(server)
 
     async def _produce() -> None:
         try:
             if hasattr(source, "__anext__"):
-                async_source = cast(AsyncIterable[dict[str, Any]], source)
-                async for frame in async_source:
-                    queue.put_nowait(frame)
+                # 不能用 `async for`：它会先把第一帧拉出来才进循环体，
+                # 闸门就晚了一步。显式 next：有人能收帧才拉下一帧，
+                # 帧源（及其推进的对齐状态）冻结在闸前。
+                async_source = cast(AsyncIterator[dict[str, Any]], source)
+                async_next: Callable[[], Awaitable[dict[str, Any]]] = (
+                    async_source.__anext__
+                )
+                while True:
+                    if not await clients.wait():
+                        return
+                    try:
+                        frame = await async_next()
+                    except StopAsyncIteration:
+                        break
+                    await queue.put(frame)
             else:
                 sync_source = cast(Iterable[dict[str, Any]], source)
-                for frame in sync_source:
-                    queue.put_nowait(frame)
+                iterator = iter(sync_source)
+                while True:
+                    if not await clients.wait():
+                        return
+                    try:
+                        frame = next(iterator)
+                    except StopIteration:
+                        break
+                    await queue.put(frame)
         except asyncio.CancelledError:
             raise
         except BaseException as exc:  # noqa: BLE001 - 原样转交给消费侧抛出
-            queue.put_nowait(_FrameSourceFailure(exc))
+            await _put_marker(queue, _FrameSourceFailure(exc))
         finally:
-            queue.put_nowait(_FRAME_SOURCE_END)
+            await _put_marker(queue, _FRAME_SOURCE_END)
+
+    async def _deliver(frame: dict[str, Any]) -> int:
+        """推一帧；返回送达连接数（0 = 没人收到，该帧要留下来重试）。"""
+        try:
+            result: Any = await server.broadcast(frame)
+        except TimeoutError:
+            # 广播超时不外泄（事故根因）：按 delivered=0 留帧重试。
+            logger.warning("微信桥帧广播超时，该帧留待客户端可用后重试")
+            return 0
+        # 返回 None 的替身 = 已送达现有客户端。
+        return 1 if result is None else int(result or 0)
 
     producer = asyncio.create_task(_produce(), name="wechat-bridge-frame-source")
     stalls = 0
+    pending: dict[str, Any] | None = None
     try:
         while True:
+            # 待重试帧最先投：积压帧排在队列里，顺序不会被跳过。
+            if pending is not None:
+                if not await clients.wait():
+                    return
+                if await _deliver(pending):
+                    pending = None
+                continue
+            # 无人收帧就不取帧：等客户端（不算帧源空转）。
+            if not await clients.wait():
+                return
             try:
                 item = await asyncio.wait_for(queue.get(), timeout)
             except TimeoutError:
+                # 有客户端在场才谈空转：等客户端接入的挂起不该累计 stall。
+                if clients.active and not clients.present():
+                    logger.debug("微信桥无客户端可收帧，暂停灌帧等待客户端")
+                    continue
                 stalls += 1
                 if limit <= 0:
                     logger.warning("微信桥帧源超时无产出，停止灌帧")
@@ -431,7 +600,8 @@ async def pump_frames(
             if isinstance(item, _FrameSourceFailure):
                 raise item.exc
             stalls = 0
-            await asyncio.wait_for(server.broadcast(item), _AWAIT_TIMEOUT)
+            if await _deliver(item) == 0:
+                pending = item
     finally:
         producer.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):

@@ -554,3 +554,152 @@ async def test_message_media_non_dict_is_ignored() -> None:
     assert len(message.attachments) == 1
     assert message.attachments[0].path == ""
     assert message.attachments[0].name == "[图片]"
+
+
+# ---- 死锁回归：消息处理转后台任务，收帧循环永不被 handler 阻塞 ----
+async def test_handler_send_returns_while_still_pending() -> None:
+    """handler 里 await send 必须能等到回执：收帧循环不能被 handler 卡死。
+
+    2026-11-05 事故：dispatch 内联 await handler → 唯一读循环被 send 的
+    回执等待占住 → 回执永远读不进来 → 150s 超时 → 重试 → 用户收到重复回复。
+    """
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        handler_done = asyncio.Event()
+        send_results: list[str | None] = []
+
+        async def on_message(message: Message) -> None:
+            message_id = await adapter.send(
+                ChatType.PRIVATE, "wxg:private1", "x"
+            )
+            send_results.append(message_id)
+            handler_done.set()
+
+        adapter.on_message(on_message)
+        await bridge.push(
+            message_envelope(chat_type="private", chat_id="wxg:private1")
+        )
+
+        await asyncio.wait_for(handler_done.wait(), timeout=2.0)
+        assert send_results == ["3:99"]
+
+
+async def test_same_chat_messages_run_in_arrival_order() -> None:
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        order: list[str] = []
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def on_message(message: Message) -> None:
+            order.append(message.message_id)
+            if message.message_id == f"{EPOCH}:1":
+                first_started.set()
+                await release_first.wait()
+
+        adapter.on_message(on_message)
+        await bridge.push(message_envelope())
+        await first_started.wait()
+
+        # 同 chat 第二条不许在第一条挂着时插队。
+        await bridge.push(message_envelope(message_id=f"{EPOCH}:2"))
+        await asyncio.sleep(0.1)
+        assert order == [f"{EPOCH}:1"]
+
+        release_first.set()
+        await wait_for(lambda: order == [f"{EPOCH}:1", f"{EPOCH}:2"])
+
+
+async def test_different_chats_not_serialized_behind_each_other() -> None:
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        processed: list[str] = []
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def on_message(message: Message) -> None:
+            if message.chat_id == GROUP_CHAT:
+                first_started.set()
+                await release_first.wait()
+            processed.append(message.chat_id)
+
+        adapter.on_message(on_message)
+        await bridge.push(message_envelope())
+        await first_started.wait()
+
+        # 第一条还在挂起：别的 chat 不许被它串行堵住。
+        await bridge.push(
+            message_envelope(chat_id="wxg:second", message_id=f"{EPOCH}:2")
+        )
+        await wait_for(lambda: "wxg:second" in processed)
+        assert GROUP_CHAT not in processed
+
+        release_first.set()
+        await wait_for(lambda: GROUP_CHAT in processed)
+
+
+async def test_stop_cancels_pending_inbound_tasks() -> None:
+    async with FakeBridge() as bridge:
+        adapter = WeChatAdapter(make_config(bridge.port))
+        await adapter.start()
+        await wait_for(lambda: adapter.connected)
+
+        started = asyncio.Event()
+        held = asyncio.Event()
+
+        async def on_message(message: Message) -> None:
+            started.set()
+            await held.wait()
+
+        adapter.on_message(on_message)
+        await bridge.push(message_envelope())
+        await started.wait()
+        assert adapter._inbound_tasks
+
+        await asyncio.wait_for(adapter.stop(), timeout=2.0)
+
+        assert adapter._inbound_tasks == set()
+
+
+async def test_transient_disconnect_lets_handler_finish_and_reconnect() -> None:
+    """桥重启抖动不许变成静默丢工作：handler 要收场并进服务重试队列。
+
+    2026-11-05 事故修复的补丁修正：断线 teardown 只 fail 在途回执，
+    绝不取消后台任务；取消只属于 stop()（彻底停机）。
+    """
+    async with FakeBridge() as bridge:
+        adapter = WeChatAdapter(make_config(bridge.port))
+        await adapter.start()
+        await wait_for(lambda: adapter.connected)
+
+        outcomes: list[str] = []
+        first_started = asyncio.Event()
+
+        async def on_message(message: Message) -> None:
+            if message.message_id == f"{EPOCH}:1":
+                first_started.set()
+                try:
+                    await adapter.send(ChatType.PRIVATE, "wxg:private1", "x")
+                    outcomes.append("send_ok")
+                except GatewayError:
+                    # send 失败由服务层捕获并入重试队列；CancelledError 反而
+                    # 意味着 handler 被掐死，回复会静默丢失。
+                    outcomes.append("gateway_error")
+            else:
+                outcomes.append(message.message_id)
+
+        adapter.on_message(on_message)
+        await bridge.push(message_envelope())
+        await first_started.wait()
+
+        # 桥侧断开：此时 handler 正卡在 send 等回执。
+        stale_ws = bridge.ws
+        await bridge.close_from_bridge()
+
+        await wait_for(lambda: outcomes == ["gateway_error"])
+
+        # 重连后新消息仍被处理，且排在第一个 handler 正常收场之后。
+        await wait_for(lambda: adapter.connected, timeout=5.0)
+        await wait_for(lambda: bridge.ws is not stale_ws, timeout=5.0)
+        await bridge.push(message_envelope(message_id=f"{EPOCH}:2"))
+        await wait_for(lambda: outcomes == ["gateway_error", f"{EPOCH}:2"])
+
+        await adapter.stop()
+        assert adapter._inbound_tasks == set()

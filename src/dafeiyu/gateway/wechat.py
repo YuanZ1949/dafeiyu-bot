@@ -79,6 +79,12 @@ class WeChatAdapter:
         self._recall_handler: Callable[[RecallEvent], Awaitable[None]] | None = None
         self._ws: Any | None = None
         self._task: asyncio.Task[None] | None = None
+        # 入站 message/recall 在后台任务里处理，收帧循环从此不被 handler 阻塞
+        # （否则 handler 里 await send 的回执永远读不进来 → 150s 超时 + 重复回复）。
+        self._inbound_tasks: set[asyncio.Task[None]] = set()
+        # 每 (chat_type, chat_id) 一把锁保证单聊内按到达顺序串行；asyncio.Lock
+        # 的 acquire 是 FIFO，任务创建顺序即到达顺序。
+        self._chat_locks: dict[tuple[ChatType, str], asyncio.Lock] = {}
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._sent_echo: deque[tuple[str, str, float]] = deque(maxlen=_SENT_ECHO_MAX)
         self._echo_seed: Callable[[], Sequence[tuple[str, str, int]]] | None = None
@@ -157,6 +163,8 @@ class WeChatAdapter:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        # 兜底：连接断开的 teardown 已收过一轮，这里保证 stop() 返回时必空。
+        await self._cancel_inbound_tasks()
         self._fail_pending(GatewayError("微信桥已关闭"))
 
     def enter_kill_switch(self) -> None:
@@ -235,25 +243,98 @@ class WeChatAdapter:
             logger.info("微信桥已连接 %s", uri)
             try:
                 async for raw in ws:
-                    await self._handle_raw(raw)
+                    envelope = self._parse_frame(raw)
+                    if envelope is None:
+                        continue
+                    # message/recall 转后台任务：handler 里可能 await send 等回执，
+                    # 回执/健康/resync 必须仍在本收帧循环里立刻处理。
+                    if self._schedule_inbound(envelope):
+                        continue
+                    await self.dispatch_envelope(envelope)
             except ConnectionClosed:
                 pass
             finally:
                 self._socket_open = False
                 self._ws = None
                 self.last_disconnect_at = time.time()
+                # 只失败在途回执让 handler 自然收场（send 抛错 → 服务层记入
+                # 重试队列）；后台任务不取消，断线抖动不许丢掉半路的回复，
+                # 彻底停机时才由 stop() 统一收割。
                 self._fail_pending(GatewayError("微信桥连接已断开"))
                 logger.info("微信桥连接已断开")
 
-    async def _handle_raw(self, raw: str | bytes) -> None:
+    def _parse_frame(self, raw: str | bytes) -> dict[str, Any] | None:
         try:
             envelope = json.loads(raw)
         except (TypeError, ValueError):
             logger.warning("收到无法解析的微信桥帧")
-            return
+            return None
         if not isinstance(envelope, dict):
+            return None
+        return envelope
+
+    # --------------------------------------------------------- 入站后台任务
+    def _schedule_inbound(self, envelope: dict[str, Any]) -> bool:
+        """message/recall 且 handler 已登记时转后台任务；返回是否已接手。
+
+        受理判定（parse + 回声过滤）在这里同步做：last_event_at 保持「信封被
+        接受即更新、回声/无效不更新」的语义，且写在调度之前；后台任务里
+        dispatch_envelope 会对同一信封重复判定，结果一致，无副作用。
+        """
+        kind = envelope.get("type")
+        if kind == "message" and self._handler is not None:
+            message = self._parse_message(envelope)
+            if message is None or self._is_echo(message.chat_id, message.content):
+                return False
+            self.last_event_at = time.time()
+            self._spawn_inbound(
+                (message.chat_type, message.chat_id), envelope
+            )
+            return True
+        if kind == "recall" and self._recall_handler is not None:
+            event = self._parse_recall(envelope)
+            if event is None:
+                return False
+            self.last_event_at = time.time()
+            self._spawn_inbound((event.chat_type, event.chat_id), envelope)
+            return True
+        return False
+
+    def _spawn_inbound(
+        self, key: tuple[ChatType, str], envelope: dict[str, Any]
+    ) -> None:
+        lock = self._chat_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_locks[key] = lock
+        task = asyncio.create_task(
+            self._run_inbound(lock, envelope), name="wechat-inbound"
+        )
+        self._inbound_tasks.add(task)
+        task.add_done_callback(self._on_inbound_done)
+
+    async def _run_inbound(
+        self, lock: asyncio.Lock, envelope: dict[str, Any]
+    ) -> None:
+        # 同一 chat 拿同一把锁 → 到达顺序即处理顺序；不同 chat 各自的锁互不阻塞。
+        async with lock:
+            await self.dispatch_envelope(envelope)
+
+    def _on_inbound_done(self, task: asyncio.Task[None]) -> None:
+        self._inbound_tasks.discard(task)
+        if task.cancelled():
             return
-        await self.dispatch_envelope(envelope)
+        exc = task.exception()
+        if exc is not None:
+            logger.exception("微信入站处理任务异常", exc_info=exc)
+
+    async def _cancel_inbound_tasks(self) -> None:
+        tasks, self._inbound_tasks = list(self._inbound_tasks), set()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
     # ------------------------------------------------------------- 信封分派
     async def dispatch_envelope(self, envelope: dict[str, Any]) -> None:
