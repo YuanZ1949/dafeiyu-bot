@@ -311,7 +311,7 @@ select chat_id, purpose, prompt_tokens, completion_tokens, created_at
 
 | # | 事项 | 说明 |
 | --- | --- | --- |
-| 1 | 7 个提交未 push | `origin` 落后 7，`gitea` 落后 85；gitea 凭据交互曾失败 |
+| 1 | 提交未 push | 第二轮结束后见 `git rev-list --count origin/feat/qq-bot..HEAD`；`gitea` 凭据交互曾失败，失败不阻塞 |
 | 2 | e2e 消息已真实发出 | 01:26:51 往群「我们一起搞事情吖」发了 `E2E-hook-…` 的回复（补发机制），确认真假群，必要时人工撤回 |
 | 3 | agent 文件入库问题 | 彻底解法：移出 git，或让生成目录落到 `data/opencode-runtime/` |
 | 4 | 01:29 的重启无来源记录 | supervisor 不记录「谁发起停止」，建议加审计 |
@@ -325,7 +325,8 @@ select chat_id, purpose, prompt_tokens, completion_tokens, created_at
 ```powershell
 cd C:\MyFile\AICoding\dafeiyu-bot
 .\.venv\Scripts\python.exe -m pytest -q
-# 2026-11-05: 2551 passed, 20 skipped（约 4.5 分钟）
+# 2026-11-05 第一轮：2551 passed, 20 skipped
+# 2026-11-05 第二轮：2602 passed, 20 skipped（约 4.5 分钟）
 ```
 
 - e2e：`scripts\qa_wechat_smoke.py`（会临时打开 `allow_test_inject`，跑完自动关；
@@ -386,3 +387,64 @@ fe3d018 fix(config): gateway.wechat.quiet_hours 未配置时继承 triggers
 | `brain/opencode.py` | `npm root -g` 加隐藏窗口标志 |
 | `scripts/register-supervisor-task.ps1`（新增） | 计划任务注册/更新（直接 pythonw + WorkingDirectory，支持 `-DryRun`） |
 | `scripts/start-wechat-hook.ps1` | 后台启动优先 helper 的 `pythonw.exe` |
+
+---
+
+## 14. 后续补强（2026-11-05 第二轮）
+
+按「一口气都做了」把梳理出的欠账落地，原则：**新能力默认关闭或只记日志，
+不改变现有回复路径**。
+
+### 14.1 面板与控制口
+
+- `dashboard.py` 新增 `/api/mind`（GET/PUT）、`/api/workspace/file`、
+  `/api/channels/wechat/inject` 代理，修掉面板心智卡和工作区查看的 404。
+- `control.py` 新增 `POST /api/memory/unblock`，配 `store.clear_backoff` 与
+  `FailureWorker.reset()`；面板上的配额熔断现在能点按钮解除，而不是只能看。
+
+### 14.2 孤立配置接线
+
+| 配置 | 现在的行为 |
+| --- | --- |
+| `gateway.wechat.ack_requires_observed` | true（默认）：本地库观察不到就标 `receipt_unverified`（仍 `ok=true`，不重发）；false：只写日志 |
+| `gateway.wechat.keepalive` | true：桥每 60 秒探一次 hook `/health`，失败只 warning；默认 false |
+| `mind.emoji_reactions` / `emoji_reaction_id` | true：QQ 消息发出后尝试 `set_msg_emoji_like`；默认 false |
+
+### 14.3 QQ 新能力（默认安全）
+
+- **notice 事件**：`group_poke` / `friend_poke` / `group_increase` /
+  `group_decrease` / `group_ban` 解析成 `NoticeEvent`，只记日志，**不触发模型回复**。
+- **合并转发出站**：模型协议新增 `{"type": "forward", "nodes": [...]}`（最多 5 条、
+  单条 200 字），`Service._send_chunk` 调 `send_forward`；失败降级为一行
+  `[合并转发 N 条]` 文本。
+- **表情回应**：`QQAdapter.set_msg_emoji_like`，失败吞掉不影响发送。
+
+### 14.4 记忆与评估
+
+- `memory/context.py` 开始消费 `episodes.importance/mood/phase` 与
+  `open_loops.kind`（此前只写不读）。
+- 新增 `scripts/eval_reply_judgment.py`：只读 `data/dafeiyu.db`，按批次反推
+  「该回没回」，输出 Markdown/JSON，chat_id 一律脱敏。修复了两处 SQL 参数
+  未绑定和窗口时间戳渲染的 bug，并补了临时库测试。
+
+```powershell
+.\.venv\Scripts\python.exe scripts\eval_reply_judgment.py --days 1 --json
+.\.venv\Scripts\python.exe scripts\eval_reply_judgment.py --days 7 --out data\eval.md
+```
+
+### 14.5 产品化与文档
+
+- `dafeiyu --version`、`scripts/diag.ps1`（诊断包，自动脱敏）、
+  `scripts/update.ps1`（`git pull --ff-only` + 重装依赖，不动 data/config/.env）。
+- 校正文档漂移：微信出站媒体已接线、`p4-summary-evolution` 已实现、
+  合并转发/notice 能力矩阵。
+
+### 14.6 验收
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+# 2026-11-05 第二轮：见 §11 的测试基线更新
+.\.venv\Scripts\python.exe -m dafeiyu --version    # dafeiyu 0.1.0
+powershell -ExecutionPolicy Bypass -File scripts\diag.ps1 -DryRun
+powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -DryRun
+```
