@@ -1346,3 +1346,279 @@ async def test_dedupe_absent_key_keeps_legacy_behavior() -> None:
         assert server._dedupe == {}
     finally:
         await _stopped(server)
+
+
+# ------------------------------------- 入站 seq/ack/hello 水位（P3-10 / P3-11）
+async def test_inbound_seq_only_on_event_frames_and_monotonic(tmp_path: Path) -> None:
+    """seq 只给 message/recall，从 1 起单调递增；health 永不带 seq 但带水位。"""
+    server = BridgeServer(state_path=tmp_path / "inbound.json")
+    port = await asyncio.wait_for(server.start(), STEP)
+    try:
+        async with connect(_uri(port)) as ws:
+            msg1 = _bridge_msg("m1")
+            await asyncio.wait_for(server.broadcast(msg1), STEP)
+            first = await _recv_until(ws, lambda f: f.get("type") == "message")
+            assert first["seq"] == 1
+            # seq 写回帧源对象：帧泵 pending 重试同一 dict 时不会再发号。
+            assert msg1["seq"] == 1
+
+            await asyncio.wait_for(server.broadcast(_bridge_msg("m2")), STEP)
+            second = await _recv_until(
+                ws, lambda f: f.get("type") == "message" and f.get("text") == "m2"
+            )
+            assert second["seq"] == 2
+
+            await asyncio.wait_for(
+                server.broadcast({"type": "health", **HEALTH_FRAME}), STEP
+            )
+            health = await _recv_until(
+                ws, lambda f: f.get("type") == "health" and "inbound_seq" in f
+            )
+            assert "seq" not in health
+            assert health["inbound_seq"] == 2
+            assert health["inbound_acked"] == 0
+            assert health["unacked_count"] == 2
+
+            # recall 同样带 seq，且在 message 的水位之上。
+            await asyncio.wait_for(
+                server.broadcast(
+                    {"type": "recall", "chat_id": "wxg:g", "message_id": "1:9"}
+                ),
+                STEP,
+            )
+            recall = await _recv_until(ws, lambda f: f.get("type") == "recall")
+            assert recall["seq"] == 3
+    finally:
+        await asyncio.wait_for(server.stop(), STEP)
+
+
+async def test_ack_trims_unacked_and_persists(tmp_path: Path) -> None:
+    """ack 后未确认缓冲裁剪 + 水位即时落盘（seq / acked 两个键）。"""
+    server = BridgeServer(state_path=tmp_path / "state.json")
+    port = await asyncio.wait_for(server.start(), STEP)
+    try:
+        async with connect(_uri(port)) as ws:
+            await asyncio.wait_for(server.broadcast(_bridge_msg("m1")), STEP)
+            await asyncio.wait_for(server.broadcast(_bridge_msg("m2")), STEP)
+            await _recv_until(
+                ws, lambda f: f.get("type") == "message" and f.get("seq") == 2
+            )
+            assert len(server._unacked) == 2
+
+            await asyncio.wait_for(
+                ws.send(
+                    json.dumps({"v": 1, "id": "a1", "action": "ack", "params": {"seq": 2}})
+                ),
+                STEP,
+            )
+            receipt = await _recv_until(ws, lambda f: f.get("id") == "a1")
+            assert receipt["ok"] is True
+            assert receipt["error_code"] is None
+            assert len(server._unacked) == 0
+            assert server._inbound_acked == 2
+            assert server._inbound_seq == 2
+
+            state = json.loads((tmp_path / "state.json").read_text("utf-8"))
+            assert state == {"seq": 2, "acked": 2}
+    finally:
+        await asyncio.wait_for(server.stop(), STEP)
+
+
+async def test_ack_bad_params_replied_without_crashing(tmp_path: Path) -> None:
+    """非法 seq 回 bad_params；连接保持可用，水位置零不动。"""
+    server = BridgeServer(state_path=tmp_path / "state.json")
+    port = await asyncio.wait_for(server.start(), STEP)
+    try:
+        async with connect(_uri(port)) as ws:
+            await asyncio.wait_for(server.broadcast(_bridge_msg("m1")), STEP)
+            await _recv_until(ws, lambda f: f.get("type") == "message")
+
+            for bad in ("x", None, True, -1):
+                await asyncio.wait_for(
+                    ws.send(
+                        json.dumps(
+                            {
+                                "v": 1,
+                                "id": f"bad-{bad}",
+                                "action": "ack",
+                                "params": {"seq": bad},
+                            }
+                        )
+                    ),
+                    STEP,
+                )
+                receipt = await _recv_until(
+                    ws, lambda f: f.get("id") == f"bad-{bad}"
+                )
+                assert receipt["ok"] is False
+                assert receipt["error_code"] == "bad_params"
+
+            # 连接还活着：probe 照常有回执。
+            await asyncio.wait_for(
+                ws.send(json.dumps({"v": 1, "id": "p1", "action": "probe", "params": {}})),
+                STEP,
+            )
+            assert (await _recv_until(ws, lambda f: f.get("id") == "p1"))["ok"] is True
+            assert len(server._unacked) == 1
+            assert server._inbound_acked == 0
+    finally:
+        await asyncio.wait_for(server.stop(), STEP)
+
+
+async def test_hello_redelivers_higher_seq_only_once_per_connection(
+    tmp_path: Path,
+) -> None:
+    """hello 只重投 > last_seq 的帧（升序带原 seq）；重复 hello 不再重投。"""
+    server = BridgeServer(state_path=tmp_path / "state.json")
+    port = await asyncio.wait_for(server.start(), STEP)
+    try:
+        async with connect(_uri(port)) as ws:
+            frames = {}
+            for text in ("m1", "m2", "m3"):
+                frame = _bridge_msg(text)
+                frames[text] = frame
+                await asyncio.wait_for(server.broadcast(frame), STEP)
+                await _recv_until(
+                    ws, lambda f: f.get("text") == text, limit=6
+                )
+
+            await asyncio.wait_for(
+                ws.send(
+                    json.dumps({"v": 1, "id": "h1", "action": "hello", "params": {"last_seq": 1}})
+                ),
+                STEP,
+            )
+            redelivered = await _recv_json(ws)
+            assert redelivered["type"] == "message" and redelivered["seq"] == 2
+            assert redelivered["text"] == "m2"
+            redelivered = await _recv_json(ws)
+            assert redelivered["seq"] == 3
+            hello_receipt = await _recv_json(ws)
+            assert hello_receipt["id"] == "h1" and hello_receipt["ok"] is True
+
+            # 同一连接的第二个 hello：只更新高水位，不重投——下一帧是自己的回执。
+            await asyncio.wait_for(
+                ws.send(
+                    json.dumps({"v": 1, "id": "h2", "action": "hello", "params": {"last_seq": 0}})
+                ),
+                STEP,
+            )
+            # 帧泵 pending 重试同一 dict（已带 seq=2/3）：已重投过的 seq 不再出现。
+            await asyncio.wait_for(server.broadcast(frames["m2"]), STEP)
+            await asyncio.wait_for(server.broadcast(frames["m3"]), STEP)
+            hi_receipt = await _recv_json(ws)
+            assert hi_receipt["id"] == "h2" and hi_receipt["ok"] is True
+            # 同一帧不得对同一连接出现第二遍：下一条必须是探针回执而非消息帧。
+            await asyncio.wait_for(
+                ws.send(
+                    json.dumps({"v": 1, "id": "p9", "action": "probe", "params": {}})
+                ),
+                STEP,
+            )
+            probe_receipt = await _recv_json(ws)
+            assert probe_receipt["id"] == "p9", probe_receipt
+    finally:
+        await asyncio.wait_for(server.stop(), STEP)
+
+
+async def test_ack_out_of_order_never_lowers_watermark(tmp_path: Path) -> None:
+    """ack(3) 后再收 ack(2)：水位不回退，帧不复活，unacked_count 保持 0。"""
+    server = BridgeServer(state_path=tmp_path / "state.json")
+    port = await asyncio.wait_for(server.start(), STEP)
+    try:
+        async with connect(_uri(port)) as ws:
+            for text in ("m1", "m2", "m3"):
+                await asyncio.wait_for(server.broadcast(_bridge_msg(text)), STEP)
+            await _recv_until(
+                ws, lambda f: f.get("type") == "message" and f.get("seq") == 3, limit=6
+            )
+
+            for command_id, seq in (("a3", 3), ("a2", 2)):
+                await asyncio.wait_for(
+                    ws.send(
+                        json.dumps(
+                            {
+                                "v": 1,
+                                "id": command_id,
+                                "action": "ack",
+                                "params": {"seq": seq},
+                            }
+                        )
+                    ),
+                    STEP,
+                )
+                receipt = await _recv_until(ws, lambda f: f.get("id") == command_id)
+                assert receipt["ok"] is True
+
+            assert server._inbound_acked == 3
+            assert len(server._unacked) == 0
+
+            await asyncio.wait_for(
+                server.broadcast({"type": "health", **HEALTH_FRAME}), STEP
+            )
+            health = await _recv_until(
+                ws, lambda f: f.get("type") == "health" and "unacked_count" in f
+            )
+            assert health["inbound_seq"] == 3
+            assert health["inbound_acked"] == 3
+            assert health["unacked_count"] == 0
+    finally:
+        await asyncio.wait_for(server.stop(), STEP)
+
+
+async def test_inbound_state_never_regresses_across_restart(tmp_path: Path) -> None:
+    """重启后的新实例从水位文件恢复 seq：绝不回退到 0 重新发号。"""
+    path = tmp_path / "state.json"
+    server = BridgeServer(state_path=path)
+    port = await asyncio.wait_for(server.start(), STEP)
+    try:
+        async with connect(_uri(port)) as ws:
+            for text in ("m1", "m2"):
+                await asyncio.wait_for(server.broadcast(_bridge_msg(text)), STEP)
+            await _recv_until(
+                ws, lambda f: f.get("type") == "message" and f.get("seq") == 2, limit=6
+            )
+            await asyncio.wait_for(
+                ws.send(json.dumps({"v": 1, "id": "a1", "action": "ack", "params": {"seq": 2}})),
+                STEP,
+            )
+            assert (await _recv_until(ws, lambda f: f.get("id") == "a1"))["ok"] is True
+    finally:
+        await asyncio.wait_for(server.stop(), STEP)
+
+    assert json.loads(path.read_text("utf-8")) == {"seq": 2, "acked": 2}
+
+    server2 = BridgeServer(state_path=path)
+    assert server2._inbound_seq == 2
+    assert server2._inbound_acked == 2
+    port2 = await asyncio.wait_for(server2.start(), STEP)
+    try:
+        async with connect(_uri(port2)) as ws:
+            await asyncio.wait_for(server2.broadcast(_bridge_msg("m3")), STEP)
+            third = await _recv_until(ws, lambda f: f.get("type") == "message")
+            assert third["seq"] == 3, "重启后 seq 必须接着水位继续，而不是回到 1"
+    finally:
+        await asyncio.wait_for(server2.stop(), STEP)
+    # seq=3 不属于任何落盘点（ack 与每 50 帧才落）：文件不被回退覆盖，
+    # 仍保留上次 ack 时的水位。
+    assert json.loads(path.read_text("utf-8")) == {"seq": 2, "acked": 2}
+
+
+async def test_corrupt_state_file_treated_as_zero_without_crash(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """损坏的水位文件按 0 处理并告警：构造、启动、发号全程不崩。"""
+    path = tmp_path / "state.json"
+    path.write_text("{not json at all", encoding="utf-8")
+
+    server = BridgeServer(state_path=path)
+    assert server._inbound_seq == 0
+    assert server._inbound_acked == 0
+    with caplog.at_level("WARNING", logger="dafeiyu.gateway.wechat_bridge.server"):
+        port = await asyncio.wait_for(server.start(), STEP)
+    try:
+        assert await asyncio.wait_for(server.broadcast(_bridge_msg("m1")), STEP) == 0
+        assert server._inbound_seq == 1
+        assert "水位" in caplog.text or "watermark" in caplog.text
+    finally:
+        await asyncio.wait_for(server.stop(), STEP)

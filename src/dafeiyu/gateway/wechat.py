@@ -6,6 +6,8 @@
 - `message` / `recall` / `health` / `resync` 四类事件转成进程内的 `Message` /
   `RecallEvent` / 健康字段；
 - 发送走 `send_text` 指令 + 同 `id` 回执（照抄 OneBot 的 echo/pending 模式）；
+- 入站可靠投递（P3-10/P3-11）：连接建立发一次 `hello`（带内存 `_last_inbound_seq`），
+  handler 成功消化 message/recall 后回 `ack`（带 `seq`），桥据此做有界重投；
 - 三层回声过滤：`is_bot:true`、本地 (chat, text, 时间窗)、`resync` 清空。
 
 本模块**不允许** import pyweixin / pywinauto / pyautogui：微信桥的桌面依赖
@@ -92,6 +94,9 @@ class WeChatAdapter:
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._sent_echo: deque[tuple[str, str, float]] = deque(maxlen=_SENT_ECHO_MAX)
         self._echo_seed: Callable[[], Sequence[tuple[str, str, int]]] | None = None
+        # 入站 message/recall 的高水位（内存，P3-10）：只在收到更高 seq 时前进，
+        # 重连时通过 hello 报给桥，换回断线期间未确认的帧。
+        self._last_inbound_seq: int = 0
         self._stopping = False
         self._socket_open = False
         self._health_connected = True
@@ -244,6 +249,7 @@ class WeChatAdapter:
             self._socket_open = True
             self._health_connected = True
             self._last_health_at = time.monotonic()
+            await self._send_hello(ws)
             logger.info("微信桥已连接 %s", uri)
             try:
                 async for raw in ws:
@@ -354,24 +360,39 @@ class WeChatAdapter:
             return
 
         kind = envelope.get("type")
+        seq = envelope.get("seq")
         if kind == "message":
+            self._record_inbound_seq(seq)
             message = self._parse_message(envelope)
             if message is None:
+                # 坏帧当场消化（永远不会再进 handler）：ack 掉避免缓冲虚高。
+                await self._send_ack(seq)
                 return
             if self._is_echo(message.chat_id, message.content):
                 logger.debug("回声过滤命中 %s", message.message_id)
+                await self._send_ack(seq)
                 return
             self.last_event_at = time.time()
             if self._handler is not None:
+                # handler 抛异常时不发送 ack：异常沿调用链上抛（后台任务里由
+                # done-callback 记日志），帧留在桥的未确认缓冲等待重投。
                 await self._handler(message)
+                await self._send_ack(seq)
+            else:
+                await self._send_ack(seq)
             return
         if kind == "recall":
+            self._record_inbound_seq(seq)
             event = self._parse_recall(envelope)
             if event is None:
+                await self._send_ack(seq)
                 return
             self.last_event_at = time.time()
             if self._recall_handler is not None:
                 await self._recall_handler(event)
+                await self._send_ack(seq)
+            else:
+                await self._send_ack(seq)
             return
         if kind == "health":
             self._apply_health(envelope)
@@ -517,6 +538,49 @@ class WeChatAdapter:
         if future is None or future.done():
             return
         future.set_result(envelope)
+
+    def _record_inbound_seq(self, seq: Any) -> None:
+        """记录入站事件帧高水位：重连时 hello 用它换回未确认帧。"""
+        if type(seq) is int and seq > self._last_inbound_seq:
+            self._last_inbound_seq = seq
+
+    async def _send_hello(self, ws: Any) -> None:
+        """连接建立即报 hello（带内存 last_seq）；桥对未确认帧做有界重投。
+
+        每个 WS 连接只发一次；hello 只是重投优化，发不出去不打断连接流程。
+        """
+        envelope = {
+            "v": _PROTOCOL_VERSION,
+            "id": uuid.uuid4().hex,
+            "action": "hello",
+            "params": {"last_seq": self._last_inbound_seq},
+        }
+        try:
+            await ws.send(json.dumps(envelope, ensure_ascii=False))
+        except Exception as exc:
+            logger.debug("微信桥 hello 发送失败：%s", exc)
+
+    async def _send_ack(self, seq: Any) -> None:
+        """给已消化的入站帧回 ack（params.seq）；失败只 debug，绝不影响收帧。
+
+        与 send 不同，ack 没有回执等待：桥的单调裁剪按 seq 语义幂等，
+        重复/乱序的 ack 无害，丢了也有 hello 兜底。
+        """
+        if type(seq) is not int or seq <= 0:
+            return
+        ws = self._ws
+        if ws is None:
+            return
+        envelope = {
+            "v": _PROTOCOL_VERSION,
+            "id": uuid.uuid4().hex,
+            "action": "ack",
+            "params": {"seq": seq},
+        }
+        try:
+            await ws.send(json.dumps(envelope, ensure_ascii=False))
+        except Exception as exc:
+            logger.debug("微信桥 ack 发送失败 seq=%s：%s", seq, exc)
 
     def _is_echo(self, chat_id: str, text: str) -> bool:
         """第二层回声过滤：同 chat + 同文本 + 在窗口内。"""

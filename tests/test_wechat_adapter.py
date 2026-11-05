@@ -116,6 +116,15 @@ def make_config(port: int, **overrides: object) -> WeChatConfig:
     return WeChatConfig(**base)
 
 
+def send_frames(bridge: FakeBridge) -> list[dict]:
+    """出站指令帧（send_*）：hello / ack / stop 是传输级控制帧，不混入计数。"""
+    return [
+        command
+        for command in bridge.commands
+        if command.get("action") in ("send_text", "send_at", "send_media")
+    ]
+
+
 async def wait_for(predicate, timeout: float = 2.0) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -457,8 +466,8 @@ async def test_send_at_sends_one_frame_and_records_echo() -> None:
         )
 
         assert message_id == "3:99"
-        assert len(bridge.commands) == 1
-        frame = bridge.commands[0]
+        assert len(send_frames(bridge)) == 1
+        frame = send_frames(bridge)[0]
         assert frame["action"] == "send_at"
         assert frame["params"] == {
             "chat_id": GROUP_CHAT,
@@ -472,9 +481,12 @@ async def test_send_at_empty_at_degrades_to_send_text() -> None:
     async with FakeBridge() as bridge, running(bridge) as adapter:
         await adapter.send_at(ChatType.GROUP, GROUP_CHAT, "你好", [])
 
-        assert len(bridge.commands) == 1
-        assert bridge.commands[0]["action"] == "send_text"
-        assert bridge.commands[0]["params"] == {"chat_id": GROUP_CHAT, "text": "你好"}
+        assert len(send_frames(bridge)) == 1
+        assert send_frames(bridge)[0]["action"] == "send_text"
+        assert send_frames(bridge)[0]["params"] == {
+            "chat_id": GROUP_CHAT,
+            "text": "你好",
+        }
 
 
 async def test_send_media_unsupported_returns_false_without_echo() -> None:
@@ -490,8 +502,8 @@ async def test_send_media_unsupported_returns_false_without_echo() -> None:
         )
 
         assert ok is False
-        assert len(bridge.commands) == 1
-        assert bridge.commands[0]["action"] == "send_media"
+        assert len(send_frames(bridge)) == 1
+        assert send_frames(bridge)[0]["action"] == "send_media"
         assert len(adapter._sent_echo) == 0
         assert adapter.last_send_at is None
 
@@ -712,8 +724,8 @@ async def test_send_with_dedupe_key_carries_key_in_params() -> None:
             ChatType.GROUP, GROUP_CHAT, "你好", dedupe_key="reply:wxg:abc:m1:0"
         )
 
-        assert bridge.commands[0]["action"] == "send_text"
-        assert bridge.commands[0]["params"] == {
+        assert send_frames(bridge)[0]["action"] == "send_text"
+        assert send_frames(bridge)[0]["params"] == {
             "chat_id": GROUP_CHAT,
             "text": "你好",
             "dedupe_key": "reply:wxg:abc:m1:0",
@@ -724,15 +736,111 @@ async def test_send_without_dedupe_key_frame_has_no_dedupe_field() -> None:
     """不带 key 的 send 帧与旧协议逐字节同形：线协议 v1 不变。"""
     async with FakeBridge() as bridge, running(bridge) as adapter:
         await adapter.send(ChatType.GROUP, GROUP_CHAT, "你好")
-        assert "dedupe_key" not in bridge.commands[0]["params"]
+        assert "dedupe_key" not in send_frames(bridge)[0]["params"]
 
 
 async def test_send_blank_or_whitespace_dedupe_key_is_omitted() -> None:
     """空串/空白 key 视同不带 key：桥不去重、帧里也不带字段。"""
     async with FakeBridge() as bridge, running(bridge) as adapter:
         await adapter.send(ChatType.GROUP, GROUP_CHAT, "你好", dedupe_key="   ")
-        assert "dedupe_key" not in bridge.commands[0]["params"]
+        assert "dedupe_key" not in send_frames(bridge)[0]["params"]
 
 
 async def test_adapter_declares_dedupe_support() -> None:
     assert WeChatAdapter.supports_dedupe_key is True
+
+
+# ------------------------------------- 入站 seq/ack/hello（P3-10 / P3-11）
+async def test_seq_frame_acked_after_handler_success() -> None:
+    """带 seq 的 message 消化成功后必须回 ack，且 last_seq 记到最高位。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        received: list[Message] = []
+
+        async def on_message(message: Message) -> None:
+            received.append(message)
+
+        adapter.on_message(on_message)
+        await bridge.push(message_envelope(seq=7))
+        await wait_for(lambda: received)
+        await wait_for(
+            lambda: any(
+                command.get("action") == "ack"
+                and command.get("params") == {"seq": 7}
+                for command in bridge.commands
+            )
+        )
+        assert adapter._last_inbound_seq == 7
+
+
+async def test_recall_seq_frame_acked() -> None:
+    """recall 的 ack 语义与 message 完全一致。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        recalls: list[RecallEvent] = []
+
+        async def on_recall(event: RecallEvent) -> None:
+            recalls.append(event)
+
+        adapter.on_recall(on_recall)
+        await bridge.push(message_envelope(type="recall", seq=4))
+        await wait_for(lambda: recalls)
+        await wait_for(
+            lambda: any(
+                command.get("action") == "ack"
+                and command.get("params") == {"seq": 4}
+                for command in bridge.commands
+            )
+        )
+
+
+async def test_handler_error_records_seq_but_skips_ack() -> None:
+    """handler 抛异常绝不发 ack：帧留在桥的缓冲里，等 hello/重启换回重投。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+
+        async def on_message(message: Message) -> None:
+            raise RuntimeError("handler boom")
+
+        adapter.on_message(on_message)
+        await bridge.push(message_envelope(seq=8))
+        await wait_for(lambda: adapter._last_inbound_seq == 8)
+        await asyncio.sleep(0.2)
+
+        assert all(command.get("action") != "ack" for command in bridge.commands)
+
+
+async def test_reconnect_sends_hello_once_per_connection_last_seq_grows() -> None:
+    """每次连接发一次 hello；重连后的 last_seq 携带内存里已见的最高 seq。"""
+    async with FakeBridge() as bridge:
+        adapter = WeChatAdapter(make_config(bridge.port))
+        await adapter.start()
+        await wait_for(lambda: adapter.connected)
+
+        def hellos() -> list[int]:
+            return [
+                command["params"]["last_seq"]
+                for command in bridge.commands
+                if command.get("action") == "hello"
+                and isinstance(command.get("params"), dict)
+            ]
+
+        await wait_for(lambda: hellos() == [0])
+
+        received: list[Message] = []
+
+        async def on_message(message: Message) -> None:
+            received.append(message)
+
+        adapter.on_message(on_message)
+        await bridge.push(message_envelope(seq=9))
+        await wait_for(lambda: received)
+
+        stale_ws = bridge.ws
+        await bridge.close_from_bridge()
+        await wait_for(
+            lambda: bridge.ws is not None and bridge.ws is not stale_ws,
+            timeout=5.0,
+        )
+        await wait_for(lambda: adapter.connected, timeout=5.0)
+
+        await wait_for(lambda: hellos() == [0, 9])
+        await adapter.stop()
+        assert adapter._last_inbound_seq == 9

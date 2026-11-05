@@ -27,9 +27,12 @@ import contextlib
 import hmac
 import json
 import logging
+import os
 import time
+from collections import deque
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, cast
 
 from websockets.asyncio.server import ServerConnection, serve
@@ -47,8 +50,27 @@ __all__ = [
 # 与 wechat.py 客户端逐字一致的三件套。
 BRIDGE_PATH = "/wechat-bridge"
 PROTOCOL_VERSION = 1
-_KNOWN_ACTIONS = ("send_text", "send_at", "send_media", "probe", "stop", "resume")
+_KNOWN_ACTIONS = (
+    "send_text",
+    "send_at",
+    "send_media",
+    "probe",
+    "stop",
+    "resume",
+    "ack",
+    "hello",
+)
 _MAX_FRAME = 1 << 20
+
+#: 入站事件帧（message/recall）的未确认缓冲上限：有界重投窗口（P3-11），
+#: ack 到位后从头裁剪；窗口之外的帧为已知残余（健康帧 `unacked_count` 可见）。
+UNACKED_MAX = 200
+#: 入站水位默认落盘路径：与 `DEFAULT_KILL_SWITCH` / 对齐状态同一 `data/` 约定。
+DEFAULT_INBOUND_STATE = "data/wechat-bridge/inbound_state.json"
+#: 入站 seq 每推进这么多帧落一次盘（ack 每次即时落盘，不逐帧 fsync）。
+_INBOUND_SAVE_EVERY = 50
+#: 每个连接记录的已发 seq 历史上限：广播重试与 hello 重投按它对同一连接去重。
+_CONN_SEQ_MAX = 2048
 
 # 反挂死护栏：服务器内的每一个 await 都有显式超时（发送除外，见下）。
 _AWAIT_TIMEOUT = 5.0
@@ -146,6 +168,7 @@ class BridgeServer:
         on_stop_requested: Callable[[], None] | None = None,
         send_timeout: float | None = None,
         broadcast_timeout: float | None = None,
+        state_path: str | Path | None = None,
     ) -> None:
         self.host = host
         self._requested_port = int(port)
@@ -161,6 +184,10 @@ class BridgeServer:
         self._broadcast_timeout: float = (
             _AWAIT_TIMEOUT if broadcast_timeout is None else float(broadcast_timeout)
         )
+        # 入站水位文件：默认 data/wechat-bridge/inbound_state.json（测试传 tmp_path）。
+        self.state_path = (
+            Path(str(state_path)) if state_path else Path(DEFAULT_INBOUND_STATE)
+        )
         self._server: Any | None = None
         self._stop: asyncio.Future[None] | None = None
         self._closed: bool = False
@@ -174,6 +201,17 @@ class BridgeServer:
         # 发送去重表：key = (action, chat_id, dedupe_key)。只在 params 带非空
         # dedupe_key 时启用；无 key 指令完全不受影响。
         self._dedupe: dict[tuple[str, str, str], _DedupeEntry] = {}
+        # 入站帧水位（P3-10/P3-11）：seq 单调递增只发给 message/recall 事件帧，
+        # hello/ack 指令维护未确认缓冲；水位落盘让崩溃/重启后 seq 不回退。
+        self._inbound_seq: int = 0
+        self._inbound_acked: int = 0
+        self._unacked: deque[tuple[int, dict[str, Any]]] = deque(maxlen=UNACKED_MAX)
+        # 每个连接已发事件帧 seq 的有界历史：广播 pending 重试与 hello 重投
+        # 在此汇合，同一帧对同一连接绝不出两遍。
+        self._conn_seq_hist: dict[ServerConnection, deque[int]] = {}
+        # 每连接 hello 高水位：只有首个 hello 触发重投，重复 hello 只更新水位。
+        self._conn_hello: dict[ServerConnection, int] = {}
+        self._load_inbound_state()
 
     @property
     def is_running(self) -> bool:
@@ -282,11 +320,23 @@ class BridgeServer:
             raise TypeError("broadcast 需要一条 v1 信封 dict")
         envelope: dict[str, Any] = {"v": PROTOCOL_VERSION, "channel": "wechat"}
         envelope.update(frame)
+        if envelope.get("type") in ("message", "recall"):
+            self._stamp_inbound(envelope, frame)
         if envelope.get("type") == "health":
+            # 健康帧暴露入站水位：丢帧窗口 = inbound_seq - inbound_acked。
+            envelope["inbound_seq"] = self._inbound_seq
+            envelope["inbound_acked"] = self._inbound_acked
+            envelope["unacked_count"] = len(self._unacked)
             self._latest_health = dict(envelope)
         payload = json.dumps(envelope, ensure_ascii=False)
         sent = 0
         for connection in list(self._connections):
+            seq = envelope.get("seq")
+            if type(seq) is int and seq in self._conn_seq_hist.get(connection, ()):
+                # 该连接已拿到这个 seq（通常 hello 重投先到）：跳过即算送达，
+                # 让帧泵的 pending 重试拿到确定答案，同一帧不重复投递。
+                sent += 1
+                continue
             try:
                 await asyncio.wait_for(
                     connection.send(payload), self._broadcast_timeout
@@ -297,7 +347,124 @@ class BridgeServer:
                 self._refresh_clients()
             else:
                 sent += 1
+                if type(seq) is int:
+                    history = self._conn_seq_hist.get(connection)
+                    if history is None:
+                        history = deque(maxlen=_CONN_SEQ_MAX)
+                        self._conn_seq_hist[connection] = history
+                    history.append(seq)
         return sent
+
+    def _stamp_inbound(
+        self, envelope: dict[str, Any], frame: dict[str, Any]
+    ) -> None:
+        """给 message/recall 事件帧分配单调递增 seq 并进入未确认缓冲（P3-10）。
+
+        health/startup 帧永不带 seq。已带合法 seq 的帧（帧泵 pending 对同一
+        dict 的重试）沿用原 seq，不再发号、不再入缓冲——seq 同时写回调用方
+        的帧对象，重试广播才能认得它。
+        """
+        seq = frame.get("seq")
+        if type(seq) is int:
+            return
+        self._inbound_seq += 1
+        frame["seq"] = self._inbound_seq
+        envelope["seq"] = self._inbound_seq
+        self._unacked.append((self._inbound_seq, envelope))
+        if self._inbound_seq % _INBOUND_SAVE_EVERY == 0:
+            self._save_inbound_state()
+
+    # ------------------------------------------------------- 入站水位（P3-11）
+    def _load_inbound_state(self) -> None:
+        """启动时恢复水位；缺文件/损坏一律从 0 开始并告警，绝不因此崩溃。"""
+        path = self.state_path
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+            if isinstance(raw, dict):
+                seq = int(raw.get("seq", 0))
+                acked = int(raw.get("acked", 0))
+                if seq >= 0 and 0 <= acked <= seq:
+                    self._inbound_seq = seq
+                    self._inbound_acked = acked
+                    return
+        except Exception as exc:  # noqa: BLE001 - 水位只影响重投，不许影响启动
+            logger.warning("微信桥入站水位文件损坏，按 0 处理：%s", exc)
+            return
+        logger.warning("微信桥入站水位文件内容非法，按 0 处理：%s", path)
+
+    def _save_inbound_state(self) -> None:
+        """水位落盘：临时文件 + ``os.replace`` 原子替换；失败只记 debug。"""
+        path = self.state_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(
+                    {"seq": self._inbound_seq, "acked": self._inbound_acked},
+                    ensure_ascii=False,
+                ),
+                "utf-8",
+            )
+            os.replace(tmp, path)
+        except Exception as exc:  # noqa: BLE001 - 落盘失败只影响重投
+            logger.debug("写入微信桥入站水位失败：%s", exc)
+
+    def _handle_ack(self, params: dict[str, Any], command_id: str) -> dict[str, Any]:
+        """ack 指令：丢弃所有 seq <= 参数值的未确认帧并落盘，回 ok。"""
+        seq = params.get("seq")
+        if type(seq) is not int or seq < 0:
+            return _receipt(command_id, False, "bad_params")
+        seq = min(seq, self._inbound_seq)
+        if seq > self._inbound_acked:
+            # 单调取大：乱序/重复 ack 不回退水位，也不重复裁剪。
+            self._inbound_acked = seq
+            while self._unacked and self._unacked[0][0] <= seq:
+                self._unacked.popleft()
+            self._save_inbound_state()
+        return _receipt(command_id, True, None)
+
+    async def _handle_hello(
+        self, params: dict[str, Any], connection: ServerConnection, command_id: str
+    ) -> dict[str, Any]:
+        """hello 指令：记录该连接高水位；首个 hello 立即重投 seq 更高的帧。"""
+        last_seq = params.get("last_seq")
+        if type(last_seq) is not int or last_seq < 0:
+            return _receipt(command_id, False, "bad_params")
+        known = self._conn_hello.get(connection)
+        self._conn_hello[connection] = last_seq
+        if known is not None:
+            # 同一连接只回投一次；重复 hello 只更新高水位，不重复重投。
+            return _receipt(command_id, True, None)
+        await self._redeliver_inbound(connection, last_seq)
+        return _receipt(command_id, True, None)
+
+    async def _redeliver_inbound(
+        self, connection: ServerConnection, last_seq: int
+    ) -> None:
+        """按 seq 升序给新连接重投 > last_seq 的未确认帧（带原 seq）。
+
+        以客户端报的 ``last_seq`` 为准，**不看**该连接的已发历史：历史只说明
+        「发过」，不说明「客户端处理过」；同一连接重连前的 socket 缓冲丢失时，
+        hello 是唯一的补救。逐帧记入已发历史是为了让随后的帧泵 pending 广播
+        因历史命中被跳过，同一帧对同一连接只出一遍。帧照旧留在缓冲里，
+        ack 到位后才裁剪。没有 hello 的新连接不走这里（客户端没准备好时
+        不重复投递）。
+        """
+        for seq, envelope in list(self._unacked):
+            if seq <= last_seq:
+                continue
+            try:
+                await self._send(connection, dict(envelope))
+            except (TimeoutError, ConnectionClosed, OSError, RuntimeError) as exc:
+                logger.debug("微信桥 hello 重投失败 seq=%s：%s", seq, exc)
+                return
+            hist = self._conn_seq_hist.get(connection)
+            if hist is None:
+                hist = deque(maxlen=_CONN_SEQ_MAX)
+                self._conn_seq_hist[connection] = hist
+            hist.append(seq)
 
     # ----------------------------------------------------------- 连接入口
     def _process_request(
@@ -326,7 +493,7 @@ class BridgeServer:
             if snapshot is not None:
                 await self._send(connection, snapshot)
             async for raw in connection:
-                reply, close, stop = await self._handle_frame(raw)
+                reply, close, stop = await self._handle_frame(raw, connection)
                 try:
                     if reply is not None:
                         # 回执必须先落网再停机：`stop` 指令的回执被 run() 的
@@ -352,6 +519,8 @@ class BridgeServer:
             logger.exception("微信桥连接处理异常")
         finally:
             self._connections.discard(connection)
+            self._conn_seq_hist.pop(connection, None)
+            self._conn_hello.pop(connection, None)
             self._refresh_clients()
 
     async def _send(
@@ -362,7 +531,7 @@ class BridgeServer:
 
     # --------------------------------------------------------- 帧分派
     async def _handle_frame(
-        self, raw: Any
+        self, raw: Any, connection: ServerConnection
     ) -> tuple[dict[str, Any] | None, bool, bool]:
         """解析一帧；返回 (回执|None, 是否断开, 回执发出后是否停机)。
 
@@ -405,6 +574,13 @@ class BridgeServer:
         if action == "stop":
             logger.info("微信桥收到 stop 指令，开始停机")
             return _receipt(command_id, True, None), False, True
+
+        # 传输级指令：ack / hello 只操作入站水位，不走 command_handler 注入。
+        if action == "ack":
+            return self._handle_ack(params, command_id), False, False
+        if action == "hello":
+            reply = await self._handle_hello(params, connection, command_id)
+            return reply, False, False
 
         return (
             await self._dispatch_command(action, params, command_id),
