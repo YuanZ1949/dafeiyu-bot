@@ -1105,22 +1105,47 @@ LSP（basedpyright）：本轮改动的 `align.py` / `poller.py` / `wechat.py` /
 
   对照：图片 `.dat` 是 `md5(f"{cfgDword}{wxid}").hexdigest()[:16].encode()`
   （ASCII 十六进制字符）。
-- 明文：`wxgf` 容器。22 字节头（`wxgf` + 版本/宽高等），随后是裸 HEVC
-  Annex B（`00 00 00 01 40 01` 起）。本机两个样本：300x288 / 300x300，
-  单帧，转 PNG 后 90KB / 136KB。
+- 明文：`wxgf` 容器。头部固定部分 13 字节：`wxgf` + 版本(1) + 宽(u32 BE)
+  + 高(u16 BE) + 帧数-1(u16 BE)；之后到 HEVC 起点之间的长度**随版本变化**：
+
+  | 版本 | 首个 VPS 偏移 | 头部之后的内容 |
+  |---|---|---|
+  | `0x12` | 22 | 9 字节尾部字段，HEVC 紧跟其后 |
+  | `0x13` | 961 | 约 790 字节内嵌数据（含 `00 00 00 01` 样式的假起始码） |
+  | `0x14` | 894 / 1303 | 同上，长度不定 |
+
+  因此不能按固定偏移切，也不能只认「第一个起始码」：4d2c… 在 795 处有一个
+  NAL 类型 22 的假起始码，从那里截断 ffmpeg 一帧都解不出。正确做法是找
+  **第一个参数集 NAL**（`00 00 00 01` + `nal_unit_type ∈ {32 VPS, 33 SPS,
+  34 PPS}`），实际就是 `00 00 00 01 40 01`。
+- 本机 5 个真实样本（均解码成功）：
+
+  | md5 前缀 | 密文 | 版本 | 分辨率 | 帧数 | 输出 |
+  |---|---|---|---|---|---|
+  | `745c9c20` | 9.4KB | 0x12 | 300x288 | 1 | PNG 88KB |
+  | `f4eddadf` | 19.5KB | 0x12 | 300x300 | 1 | PNG 133KB |
+  | `f1e8478e` | 14.1KB | 0x14 | 240x240 | 1 | PNG 83KB |
+  | `0fde1ed7` | 6.9KB | 0x13 | 240x240 | 25 | GIF 6.8KB |
+  | `4d2cd37e` | 584KB | 0x14 | 300x300 | 96 | GIF 2.5MB |
+
+  帧数与头部里的「帧数-1」字段完全吻合，可作为定位是否正确的交叉校验。
+- 性能（本机，纯 Python AES）：598KB 的 96 帧贴纸解密 2.6s + 转码 0.5s；
+  静态贴纸合计 0.2–0.3s。首次冷启动因杀软扫描实测到 19.98s，因此超时定在
+  30s（第二次起约 3s）。
 
 ### 24.2 实现
 
 - `media/aes.py`：新增 `aes_cbc_decrypt` / `aes_cbc_encrypt`（纯 Python，
-  无新依赖）。
+  无新依赖）。列混合改用 GF(2^8) 乘法表代替逐位 `_mul`：598KB 的 96 帧
+  贴纸 CBC 解密从 ~20s 降到 ~2.6s；FIPS-197 向量与 ECB/CBC 往返测试全过。
 - `media/keygen.py`：新增 `derive_emoticon_key`；`MediaKeyResolver` 新增
   `emoticon_key()` 与 `dword` 属性。缓存读取拆成 `_cache_values_from_disk`
   （只校验结构与 wxid，不需要 V2 样本），图片路径仍会在使用时用样本验证。
 - `media/emoticon.py`（新）：`decrypt_emoticon`（CBC + PKCS7 + 必须以
-  `wxgf` 开头）→ `wxgf_hevc`（在头部 64 字节内找起始码）→ `transcode`
-  （ffmpeg；先用 `ffprobe -count_frames` 判单帧/多帧，单帧 PNG、多帧 GIF）。
-  外部程序优先 `DAFEIYU_FFMPEG` 环境变量，否则 `PATH`；缺失/失败/超时
-  一律返回 `None` 保留占位。
+  `wxgf` 开头）→ `wxgf_hevc`（在前 64KB 内找第一个参数集 NAL 的起始码）→
+  `transcode`（ffmpeg；先用 `ffprobe -count_frames` 判单帧/多帧，单帧 PNG、
+  多帧 GIF）。外部程序优先 `DAFEIYU_FFMPEG` 环境变量，否则 `PATH`；
+  缺失/失败/超时一律返回 `None` 保留占位。
 - `localdb/repository.py`：type 47 从正文 XML 的 `md5` 直接定位缓存文件
   （`cache/*/Emoticon/<md5[:2]>/<md5>`），不依赖媒体索引；路径仍走
   `_media_meta` 的越界/大小校验。
@@ -1139,9 +1164,13 @@ LSP（basedpyright）：本轮改动的 `align.py` / `poller.py` / `wechat.py` /
 - 真实数据端到端：从 `message_0.db` 读到 `[表情:745c9c20]`，仓库定位到
   `cache/2026-11/Emoticon/74/745c...`，Service 解码后写入
   `<workspace>/images/*.png`（90590 字节，PNG 魔数正确）。
-- 真实 ffmpeg 多帧验证（本机既有两个样本都是单帧，故用 ffmpeg 现造
-  HEVC 覆盖 GIF 分支）：`testsrc` 5 帧 → `transcode` 输出 `GIF89a`
-  （4660B）；1 帧 → `PNG`（2763B）；`ffprobe` 缺失时 1 帧仍按 PNG 处理。
+- 真实 ffmpeg 多帧验证（最初两个样本都是单帧，故用 ffmpeg 现造 HEVC
+  覆盖 GIF 分支）：`testsrc` 5 帧 → `transcode` 输出 `GIF89a`（4660B）；
+  1 帧 → `PNG`（2763B）；`ffprobe` 缺失时 1 帧仍按 PNG 处理。
+- 真实多帧贴纸（用户后来补发的 3 个）：5 个缓存文件全部解码成功，
+  `0fde1ed7` 25 帧 → GIF 6.8KB，`4d2cd37e` 96 帧 → GIF 2.5MB，其余 3 个
+  单帧 → PNG。抽首帧/中间帧目视确认内容正确（动漫贴纸 / 汗滴表情）。
+  这一步同时暴露了 v0x13/v0x14 头部的定位问题（见 §24.1），修复后复测通过。
 - 定向：`tests/test_wechat_emoticon.py tests/test_service_wechat_media.py
   tests/test_media.py tests/test_wechat_media_keygen.py
-  tests/test_wechat_localdb_repository.py` = 128 passed。
+  tests/test_wechat_localdb_repository.py` = 130 passed。
