@@ -1139,6 +1139,9 @@ LSP（basedpyright）：本轮改动的 `align.py` / `poller.py` / `wechat.py` /
 - 真实数据端到端：从 `message_0.db` 读到 `[表情:745c9c20]`，仓库定位到
   `cache/2026-11/Emoticon/74/745c...`，Service 解码后写入
   `<workspace>/images/*.png`（90590 字节，PNG 魔数正确）。
+- 真实 ffmpeg 多帧验证（本机既有两个样本都是单帧，故用 ffmpeg 现造
+  HEVC 覆盖 GIF 分支）：`testsrc` 5 帧 → `transcode` 输出 `GIF89a`
+  （4660B）；1 帧 → `PNG`（2763B）；`ffprobe` 缺失时 1 帧仍按 PNG 处理。
 - 定向：`tests/test_wechat_emoticon.py tests/test_service_wechat_media.py
   tests/test_media.py tests/test_wechat_media_keygen.py
   tests/test_wechat_localdb_repository.py` = 128 passed。
