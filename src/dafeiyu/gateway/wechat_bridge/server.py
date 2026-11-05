@@ -27,6 +27,7 @@ import contextlib
 import hmac
 import json
 import logging
+import time
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable
 from http import HTTPStatus
 from typing import Any, cast
@@ -55,6 +56,14 @@ _AWAIT_TIMEOUT = 5.0
 # 客户端按 §7.6 换新 id 重试就会重复发送。客户端 _SEND_TIMEOUT 必须更大。
 _SEND_AWAIT_TIMEOUT = 120.0
 _SEND_ACTIONS = ("send_text", "send_at", "send_media")
+
+# 进程内发送去重（兜底「发送成功、回执丢失」窗口）：
+# params 里带非空 dedupe_key 的指令按 (action, chat_id, dedupe_key) 认领；
+# 已完成结果在 TTL 内直接重放（回执 id 用当前请求的），在途请求合流到同一执行。
+# TTL/容量是模块级常量：可读、可 monkeypatch 便于测试，不落盘——桥重启丢缓存
+# 是已知残余窗口。
+DEDUPE_TTL_SECONDS = 3600.0
+DEDUPE_MAX_ENTRIES = 1024
 _CLOSE_CODE_VERSION_MISMATCH = 1002
 _CLOSE_CODE_GOING_AWAY = 1001
 
@@ -62,6 +71,25 @@ _CLOSE_CODE_GOING_AWAY = 1001
 CommandHandler = Callable[[str, dict[str, Any], str], Awaitable[dict[str, Any] | None]]
 
 _RESULT_KEYS = ("ok", "error_code", "delivered", "message_id")
+
+#: 共享执行的结局：(handler 回执字段表|None, 失败码|None)。error 非 None 表示
+#: 执行抛异常/超时——失败结局绝不缓存，后续同 key 请求重新执行。
+_DedupeOutcome = tuple[dict[str, Any] | None, str | None]
+
+
+class _DedupeEntry:
+    """一个 dedupe key 的共享状态：在途任务或已完成结局。
+
+    创建时挂 task；任务结束时要么写出 outcome 进入 TTL 缓存，
+    要么把自己从表里摘掉（失败不缓存）。
+    """
+
+    __slots__ = ("task", "outcome", "done_at")
+
+    def __init__(self, task: "asyncio.Task[_DedupeOutcome]") -> None:
+        self.task = task
+        self.outcome: _DedupeOutcome | None = None
+        self.done_at = 0.0
 
 
 def _receipt(
@@ -80,6 +108,20 @@ def _receipt(
         "delivered": delivered or ("observed" if ok else "failed"),
         "message_id": message_id,
     }
+
+
+def _receipt_from_result(
+    command_id: Any, result: dict[str, Any] | None
+) -> dict[str, Any]:
+    """把 handler 结局表折算成回执：id 永远是当前请求的 id。"""
+    receipt = _receipt(command_id, False, "not_implemented")
+    if result is not None:
+        for key in _RESULT_KEYS:
+            if key in result:
+                receipt[key] = result[key]
+    if receipt["ok"] and receipt["error_code"] == "not_implemented":
+        receipt["error_code"] = None
+    return receipt
 
 
 def _command_id(envelope: dict[str, Any]) -> str:
@@ -129,6 +171,9 @@ class BridgeServer:
         self._client_event: asyncio.Event = asyncio.Event()
         # 健康快照：新客户端一批上来先收到最近一帧，绝不干等下一次周期上报。
         self._latest_health: dict[str, Any] | None = None
+        # 发送去重表：key = (action, chat_id, dedupe_key)。只在 params 带非空
+        # dedupe_key 时启用；无 key 指令完全不受影响。
+        self._dedupe: dict[tuple[str, str, str], _DedupeEntry] = {}
 
     @property
     def is_running(self) -> bool:
@@ -370,6 +415,24 @@ class BridgeServer:
     async def _dispatch_command(
         self, action: str, params: dict[str, Any], command_id: str
     ) -> dict[str, Any]:
+        dedupe_key = params.get("dedupe_key")
+        if isinstance(dedupe_key, str) and dedupe_key:
+            chat_key = params.get("chat_id")
+            cache_key = (
+                action,
+                chat_key if isinstance(chat_key, str) else "",
+                dedupe_key,
+            )
+            entry = self._dedupe_entry(cache_key)
+            if entry is None:
+                entry = self._dedupe_start(cache_key, action, params, command_id)
+            outcome = await asyncio.shield(entry.task)
+            result, error = outcome
+            if error is not None:
+                # 超时/异常与直接执行同一套回执码；结局没有缓存。
+                return _receipt(command_id, False, error)
+            return _receipt_from_result(command_id, result)
+
         handler = self.command_handler
         result: dict[str, Any] | None = None
         timeout = self._send_timeout if action in _SEND_ACTIONS else _AWAIT_TIMEOUT
@@ -388,13 +451,80 @@ class BridgeServer:
         if not isinstance(result, dict):
             # 注入前的默认行为：明确告诉对端这个动作还没实现。
             return _receipt(command_id, False, "not_implemented")
-        receipt = _receipt(command_id, False, "not_implemented")
-        for key in _RESULT_KEYS:
-            if key in result:
-                receipt[key] = result[key]
-        if receipt["ok"] and receipt["error_code"] == "not_implemented":
-            receipt["error_code"] = None
+        receipt = _receipt_from_result(command_id, result)
         return receipt
+
+    # --------------------------------------------------------- 发送去重
+    def _dedupe_entry(
+        self, cache_key: tuple[str, str, str]
+    ) -> _DedupeEntry | None:
+        """取可复用的表项；过期缓存顺手淘汰。"""
+        entry = self._dedupe.get(cache_key)
+        if entry is None:
+            return None
+        if entry.outcome is None:
+            return entry  # 在途：合流（通过 entry.task await）。
+        if time.monotonic() - entry.done_at > DEDUPE_TTL_SECONDS:
+            self._dedupe.pop(cache_key, None)
+            return None
+        return entry
+
+    def _dedupe_start(
+        self,
+        cache_key: tuple[str, str, str],
+        action: str,
+        params: dict[str, Any],
+        command_id: str,
+    ) -> _DedupeEntry:
+        """登记新执行：容量到顶淘汰最旧（不淘汰在途项）。"""
+        while len(self._dedupe) >= DEDUPE_MAX_ENTRIES:
+            stale = next(
+                (key for key, old in self._dedupe.items() if old.outcome is not None),
+                None,
+            )
+            if stale is None:
+                break
+            self._dedupe.pop(stale)
+        entry = _DedupeEntry(
+            asyncio.create_task(
+                self._dedupe_run(cache_key, action, params, command_id),
+                name="wechat-bridge-dedupe-send",
+            )
+        )
+        self._dedupe[cache_key] = entry
+        return entry
+
+    async def _dedupe_run(
+        self,
+        cache_key: tuple[str, str, str],
+        action: str,
+        params: dict[str, Any],
+        command_id: str,
+    ) -> _DedupeOutcome:
+        """共享执行的唯一实现：超时策略与直接执行完全一致。"""
+        entry = self._dedupe.get(cache_key)
+        timeout = self._send_timeout if action in _SEND_ACTIONS else _AWAIT_TIMEOUT
+        try:
+            handler = self.command_handler
+            result: dict[str, Any] | None = None
+            if handler is not None:
+                result = await asyncio.wait_for(
+                    handler(action, params, command_id), timeout
+                )
+        except asyncio.CancelledError:
+            self._dedupe.pop(cache_key, None)
+            raise
+        except TimeoutError:
+            self._dedupe.pop(cache_key, None)
+            return (None, "timeout")
+        except Exception:
+            self._dedupe.pop(cache_key, None)
+            logger.exception("微信桥指令处理异常 action=%s", action)
+            return (None, "internal_error")
+        if entry is not None:
+            entry.outcome = (result, None)
+            entry.done_at = time.monotonic()
+        return (result, None)
 
 
 class _FrameSourceFailure:

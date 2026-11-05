@@ -29,6 +29,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 import dafeiyu.gateway.wechat_bridge.__main__ as bridge_main
+import dafeiyu.gateway.wechat_bridge.server as bridge_server
 from dafeiyu.config import ConfigError, WeChatConfig
 from dafeiyu.gateway.wechat_bridge.server import BridgeServer, pump_frames
 
@@ -1082,3 +1083,266 @@ def test_default_receipt_verifier_carries_ack_requirement() -> None:
     assert strict is not None and loose is not None
     assert strict._required is True
     assert loose._required is False
+
+
+# --------------------------------------------------- (h) 发送去重（dedupe_key）
+_RESULT = {"ok": True, "error_code": None, "delivered": "observed", "message_id": "7:1"}
+
+
+async def _stopped(server: BridgeServer) -> None:
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(server.stop(), STEP)
+
+
+async def test_dedupe_replays_completed_result_with_current_receipt_id() -> None:
+    """同一个 dedupe_key 连发两次：handler 只执行一次，两次回执都 ok 且
+    message_id 相同，但 id 各自是当前请求的（回执复用 _receipt 的合并）。"""
+    calls: list[str] = []
+
+    async def handler(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any]:
+        calls.append(command_id)
+        return dict(_RESULT)
+
+    server = BridgeServer(command_handler=handler, send_timeout=STEP)
+    try:
+        params = {"chat_id": "wxg:a", "text": "hi", "dedupe_key": "k1"}
+        first = await asyncio.wait_for(
+            server._dispatch_command("send_text", params, "r1"), STEP
+        )
+        second = await asyncio.wait_for(
+            server._dispatch_command("send_text", params, "r2"), STEP
+        )
+        assert calls == ["r1"], "第二次必须直接重放缓存结果，不得重复执行 handler"
+        assert first["id"] == "r1" and second["id"] == "r2"
+        assert first["ok"] is second["ok"] is True
+        assert first["message_id"] == second["message_id"] == "7:1"
+        assert second["delivered"] == "observed"
+    finally:
+        await _stopped(server)
+
+
+async def test_dedupe_different_key_or_chat_executes_separately() -> None:
+    calls: list[str] = []
+
+    async def handler(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any]:
+        calls.append(command_id)
+        return dict(_RESULT)
+
+    server = BridgeServer(command_handler=handler, send_timeout=STEP)
+    try:
+        base = {"chat_id": "wxg:a", "text": "hi", "dedupe_key": "k1"}
+        await asyncio.wait_for(
+            server._dispatch_command("send_text", dict(base), "r1"), STEP
+        )
+        await asyncio.wait_for(
+            server._dispatch_command("send_text", {**base, "dedupe_key": "k2"}, "r2"),
+            STEP,
+        )
+        await asyncio.wait_for(
+            server._dispatch_command(
+                "send_text", {**base, "chat_id": "wxg:b"}, "r3"
+            ),
+            STEP,
+        )
+        assert sorted(calls) == ["r1", "r2", "r3"]
+    finally:
+        await _stopped(server)
+
+
+async def test_dedupe_in_flight_requests_merge_into_one_execution() -> None:
+    """并发两个同 key 请求：卡住 handler，第二个必须合流而不是再执行一次。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def handler(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any]:
+        calls.append(command_id)
+        started.set()
+        await release.wait()
+        return dict(_RESULT)
+
+    server = BridgeServer(command_handler=handler, send_timeout=STEP)
+    try:
+        params = {"chat_id": "wxg:a", "text": "hi", "dedupe_key": "k1"}
+        first = asyncio.create_task(server._dispatch_command("send_text", params, "r1"))
+        await asyncio.wait_for(started.wait(), STEP)
+        second = asyncio.create_task(server._dispatch_command("send_text", params, "r2"))
+        release.set()
+        one = await asyncio.wait_for(first, STEP)
+        two = await asyncio.wait_for(second, STEP)
+        assert calls == ["r1"]
+        assert one["id"] == "r1" and two["id"] == "r2"
+        assert one["ok"] is two["ok"] is True
+        assert one["message_id"] == two["message_id"] == "7:1"
+    finally:
+        await _stopped(server)
+
+
+async def test_dedupe_caller_cancel_does_not_cancel_shared_execution() -> None:
+    """合流用 asyncio.shield：请求方取消只取消它自己，共享执行照常完成。"""
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def handler(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any]:
+        calls.append(command_id)
+        await release.wait()
+        return dict(_RESULT)
+
+    server = BridgeServer(command_handler=handler, send_timeout=STEP)
+    try:
+        params = {"chat_id": "wxg:a", "text": "hi", "dedupe_key": "k1"}
+        first = asyncio.create_task(server._dispatch_command("send_text", params, "r1"))
+        while not calls:
+            await asyncio.sleep(0.01)
+        first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(first, STEP)
+        # 共享执行没被掐死：后续同 key 合流到同一个在途执行。
+        second = asyncio.create_task(server._dispatch_command("send_text", params, "r2"))
+        await asyncio.sleep(0.02)
+        assert len(calls) == 1
+        release.set()
+        receipt = await asyncio.wait_for(second, STEP)
+        assert receipt["id"] == "r2"
+        assert receipt["ok"] is True
+        assert receipt["message_id"] == "7:1"
+    finally:
+        await _stopped(server)
+
+
+async def test_dedupe_failure_result_is_not_cached() -> None:
+    calls: list[str] = []
+
+    async def handler(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any]:
+        calls.append(command_id)
+        raise RuntimeError("boom")
+
+    server = BridgeServer(command_handler=handler, send_timeout=STEP)
+    try:
+        params = {"chat_id": "wxg:a", "text": "hi", "dedupe_key": "k1"}
+        first = await asyncio.wait_for(
+            server._dispatch_command("send_text", params, "r1"), STEP
+        )
+        assert first["ok"] is False and first["error_code"] == "internal_error"
+        second = await asyncio.wait_for(
+            server._dispatch_command("send_text", params, "r2"), STEP
+        )
+        assert second["ok"] is False and second["error_code"] == "internal_error"
+        assert second["id"] == "r2"
+        assert len(calls) == 2, "失败结局不缓存：第二次要重新执行"
+    finally:
+        await _stopped(server)
+
+
+async def test_dedupe_timeout_receipt_and_reexecution() -> None:
+    calls: list[str] = []
+
+    async def handler(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any]:
+        calls.append(command_id)
+        await asyncio.sleep(0.5)
+        return dict(_RESULT)
+
+    server = BridgeServer(command_handler=handler, send_timeout=0.4)
+    try:
+        params = {"chat_id": "wxg:a", "text": "hi", "dedupe_key": "k1"}
+        first = await asyncio.wait_for(
+            server._dispatch_command("send_text", params, "r1"), STEP
+        )
+        assert first["ok"] is False and first["error_code"] == "timeout"
+        second = await asyncio.wait_for(
+            server._dispatch_command("send_text", params, "r2"), STEP
+        )
+        assert second["error_code"] == "timeout"
+        assert len(calls) == 2
+    finally:
+        await _stopped(server)
+
+
+async def test_dedupe_ttl_expires_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_server, "DEDUPE_TTL_SECONDS", 0.0)
+    calls: list[str] = []
+
+    async def handler(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any]:
+        calls.append(command_id)
+        await asyncio.sleep(0.01)
+        return dict(_RESULT)
+
+    server = BridgeServer(command_handler=handler, send_timeout=STEP)
+    try:
+        params = {"chat_id": "wxg:a", "text": "hi", "dedupe_key": "k1"}
+        await asyncio.wait_for(server._dispatch_command("send_text", params, "r1"), STEP)
+        await asyncio.sleep(0.02)
+        await asyncio.wait_for(server._dispatch_command("send_text", params, "r2"), STEP)
+        assert len(calls) == 2, "TTL 过期后允许重新执行"
+    finally:
+        await _stopped(server)
+
+
+async def test_dedupe_capacity_evicts_oldest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_server, "DEDUPE_MAX_ENTRIES", 1)
+    calls: list[str] = []
+
+    async def handler(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any]:
+        calls.append(command_id)
+        await asyncio.sleep(0)
+        return dict(_RESULT)
+
+    server = BridgeServer(command_handler=handler, send_timeout=STEP)
+    try:
+        base = {"chat_id": "wxg:a", "text": "hi"}
+        await asyncio.wait_for(
+            server._dispatch_command("send_text", {**base, "dedupe_key": "k1"}, "r1"),
+            STEP,
+        )
+        await asyncio.wait_for(
+            server._dispatch_command("send_text", {**base, "dedupe_key": "k2"}, "r2"),
+            STEP,
+        )
+        await asyncio.wait_for(
+            server._dispatch_command("send_text", {**base, "dedupe_key": "k1"}, "r3"),
+            STEP,
+        )
+        assert len(calls) == 3, "容量到顶按插入时间淘汰最旧，k1 已被 k2 挤出"
+    finally:
+        await _stopped(server)
+
+
+async def test_dedupe_absent_key_keeps_legacy_behavior() -> None:
+    """无 key 的指令完全不变：不进去重表，连发两次各执行一次。"""
+    calls: list[str] = []
+
+    async def handler(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any]:
+        calls.append(command_id)
+        return dict(_RESULT)
+
+    server = BridgeServer(command_handler=handler, send_timeout=STEP)
+    try:
+        params = {"chat_id": "wxg:a", "text": "hi"}
+        await asyncio.wait_for(server._dispatch_command("send_text", params, "r1"), STEP)
+        await asyncio.wait_for(server._dispatch_command("send_text", params, "r2"), STEP)
+        assert calls == ["r1", "r2"]
+        assert server._dedupe == {}
+    finally:
+        await _stopped(server)

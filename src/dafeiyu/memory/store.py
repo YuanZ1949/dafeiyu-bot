@@ -395,6 +395,9 @@ CREATE TABLE IF NOT EXISTS pending_outbox (
     chat_type TEXT NOT NULL,
     chat_id TEXT NOT NULL,
     text TEXT NOT NULL,
+    -- 首发/补发共用的去重键：桥侧按它合流同一逻辑分片的重复发送。
+    -- 空串 = 没有 key（旧行为，桥不 dedupe）。
+    dedupe_key TEXT NOT NULL DEFAULT '',
     origin_message_id TEXT NOT NULL DEFAULT '',
     attempts INTEGER NOT NULL DEFAULT 0,
     enqueued_at REAL NOT NULL DEFAULT 0,
@@ -460,6 +463,9 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         "downshift_until": "REAL",
         "last_prompt": "TEXT NOT NULL DEFAULT ''",
         "last_prompt_at": "REAL",
+    },
+    "pending_outbox": {
+        "dedupe_key": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -1780,6 +1786,7 @@ class Store:
         text: str,
         *,
         origin_message_id: str = "",
+        dedupe_key: str = "",
         now: float | None = None,
     ) -> int:
         """把没发出去的一条分片排进待发队列；返回行 id（0 = 空文本，未入队）。"""
@@ -1790,10 +1797,19 @@ class Store:
         cur = self._conn.execute(
             """
             INSERT INTO pending_outbox
-                (chat_type, chat_id, text, origin_message_id, enqueued_at, next_attempt_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (chat_type, chat_id, text, dedupe_key, origin_message_id,
+                 enqueued_at, next_attempt_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (chat_type.value, chat_id, body, str(origin_message_id or ""), stamp, stamp),
+            (
+                chat_type.value,
+                chat_id,
+                body,
+                str(dedupe_key or ""),
+                str(origin_message_id or ""),
+                stamp,
+                stamp,
+            ),
         )
         self._conn.commit()
         return int(cur.lastrowid or 0)
@@ -1803,7 +1819,8 @@ class Store:
         stamp = time.time() if now is None else float(now)
         rows = self._conn.execute(
             """
-            SELECT id, chat_type, chat_id, text, origin_message_id, attempts, enqueued_at
+            SELECT id, chat_type, chat_id, text, dedupe_key, origin_message_id,
+                   attempts, enqueued_at
             FROM pending_outbox
             WHERE next_attempt_at <= ?
             ORDER BY id

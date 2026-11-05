@@ -520,7 +520,15 @@ class Service:
                 # 通道还没恢复：留在队列里，等下一轮，不算尝试次数。
                 continue
             try:
-                message_id = await adapter.send(chat_type, chat_id, str(row["text"]))
+                # 补发沿用入队时记下的 dedupe_key：与首发同一逻辑分片同一个
+                # key，桥侧才能把「发送成功、回执丢失」的补发合流成一次。
+                message_id = await self._send_text(
+                    adapter,
+                    chat_type,
+                    chat_id,
+                    str(row["text"]),
+                    str(row.get("dedupe_key") or ""),
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - 失败只退避，不丢队列
@@ -1705,6 +1713,24 @@ class Service:
         if not ok:
             log.debug("表情回应未生效 %s/%s", chat_id, message_id)
 
+    async def _send_text(
+        self,
+        adapter: Any,
+        chat_type: ChatType,
+        chat_id: str,
+        text: str,
+        dedupe_key: str | None,
+    ) -> str | None:
+        """纯文本发送的唯一出口：只有声明支持的 adapter 才带 dedupe_key。
+
+        QQ 与旧测试替位的 send 是三参签名：没有 supports_dedupe_key 标记就
+        退回原样，绝不把 kwarg 灌给它们。
+        """
+        key = str(dedupe_key or "").strip()
+        if key and bool(getattr(adapter, "supports_dedupe_key", False)):
+            return await adapter.send(chat_type, chat_id, text, dedupe_key=key)
+        return await adapter.send(chat_type, chat_id, text)
+
     async def _send_chunk(
         self,
         chat_type: ChatType,
@@ -1715,12 +1741,15 @@ class Service:
         attachments: tuple[Attachment, ...] = (),
         at_qq_ids: tuple[str, ...] = (),
         at_names: tuple[str, ...] = (),
+        dedupe_key: str | None = None,
     ) -> str | None:
         """发一片回复；有附件/@/引用时升级为消息段，失败退回纯文本。
 
         引用、@、附件都只影响「这一条怎么发」，不能让回复本身发不出去：
         适配器没有对应能力（微信桥没有消息段）、NapCat 拒收（老版本/消息已
         撤回）或本地文件上传失败时一律降级为纯文本，且不重试。
+        dedupe_key 是这一片的去重键（仅纯文本路径生效）——桥把「发送成功但
+        回执丢失」的重复请求合流掉。
         """
         adapter = self._adapter_for(chat_id)
 
@@ -1833,7 +1862,7 @@ class Service:
         # 只有转发、没有正文/附件时，直接返回转发消息 id，避免再发一条空文本。
         if not chunk and not at_names and not attachments and not quote_id:
             return forward_id
-        return await adapter.send(chat_type, chat_id, chunk)
+        return await self._send_text(adapter, chat_type, chat_id, chunk, dedupe_key)
 
     def _safe_reply_attachments(
         self, reply: BrainReply, chat_id: str
@@ -2116,6 +2145,9 @@ class Service:
                     attachments=attachments if index == 0 else (),
                     at_qq_ids=at_qq_ids if index == 0 else (),
                     at_names=at_names if index == 0 else (),
+                    # 稳定去重键：同一逻辑分片（批锚点 + 片序号）首发与
+                    # outbox 补发共用，桥据此合流回执丢失导致的重复发送。
+                    dedupe_key=f"reply:{chat_id}:{batch[-1].message_id}:{index}",
                 )
             except asyncio.CancelledError:
                 raise
@@ -2123,9 +2155,13 @@ class Service:
                 log.warning("发送失败 %s/%s: %s", chat_id, batch[-1].message_id, exc)
                 # 失败这条和后面所有分片一起进待发队列：通道恢复后补发，
                 # 不让这段回复永久丢失。
-                for rest in chunks[index:]:
+                for offset, rest in enumerate(chunks[index:]):
                     if self.store.enqueue_outbox(
-                        chat_type, chat_id, rest, origin_message_id=batch[-1].message_id
+                        chat_type,
+                        chat_id,
+                        rest,
+                        origin_message_id=batch[-1].message_id,
+                        dedupe_key=f"reply:{chat_id}:{batch[-1].message_id}:{index + offset}",
                     ):
                         defer += 1
                 break
@@ -2869,14 +2905,19 @@ class Service:
                     attachments=attachments if index == 0 else (),
                     at_qq_ids=at_qq_ids if index == 0 else (),
                     at_names=at_names if index == 0 else (),
+                    dedupe_key=f"reply:{msg.chat_id}:{msg.message_id}:{index}",
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - 网络抖动不应拖垮整条链路
                 log.warning("发送失败 %s/%s: %s", msg.chat_id, msg.message_id, exc)
-                for rest in chunks[index:]:
+                for offset, rest in enumerate(chunks[index:]):
                     if self.store.enqueue_outbox(
-                        msg.chat_type, msg.chat_id, rest, origin_message_id=msg.message_id
+                        msg.chat_type,
+                        msg.chat_id,
+                        rest,
+                        origin_message_id=msg.message_id,
+                        dedupe_key=f"reply:{msg.chat_id}:{msg.message_id}:{index + offset}",
                     ):
                         defer += 1
                 break

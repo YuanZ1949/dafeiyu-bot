@@ -73,6 +73,10 @@ _SENT_ECHO_MAX = 200
 class WeChatAdapter:
     """微信桥客户端：字符串 id（`wxg:<alias>`）与 `wxg:self` 身份。"""
 
+    #: 声明 send() 支持 dedupe_key：service 只对有此标记的 adapter 传该 kwarg，
+    #: QQ 与测试替身的三参 send 完全不受影响。
+    supports_dedupe_key = True
+
     def __init__(self, config: WeChatConfig) -> None:
         self._config = config
         self._handler: Callable[[Message], Awaitable[None]] | None = None
@@ -534,10 +538,20 @@ class WeChatAdapter:
         """
         return bool(getattr(self._config, "outbound_requires_desktop", True))
 
-    async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str | None:
-        _ok, value = await self._send_action(
-            "send_text", {"chat_id": chat_id, "text": text}, echo_text=text
-        )
+    async def send(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        text: str,
+        *,
+        dedupe_key: str | None = None,
+    ) -> str | None:
+        """发文本；带 dedupe_key 时桥会对同一逻辑分片做去重/在途合流。"""
+        params: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        key = str(dedupe_key or "").strip()
+        if key:
+            params["dedupe_key"] = key
+        _ok, value = await self._send_action("send_text", params, echo_text=text)
         return value
 
     async def send_at(

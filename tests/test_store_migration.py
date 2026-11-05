@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -104,6 +105,54 @@ def test_old_chat_state_table_gets_new_columns(tmp_path: Path) -> None:
         assert row["downshift_until"] is None
         assert row["last_prompt"] == ""
         assert row["last_prompt_at"] is None
+    finally:
+        store.close()
+
+
+def test_old_pending_outbox_table_gets_dedupe_key_column(tmp_path: Path) -> None:
+    """跑过中间版本的库 pending_outbox 没有 dedupe_key；启动后自动补列。"""
+    path = tmp_path / "old-outbox.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE pending_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_type TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            origin_message_id TEXT NOT NULL DEFAULT '',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            enqueued_at REAL NOT NULL DEFAULT 0,
+            next_attempt_at REAL NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO pending_outbox (chat_type, chat_id, text, enqueued_at)
+        VALUES ('group', 'qq:1001', '旧积压', 1.0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    store.init_schema()
+    try:
+        columns = {
+            row["name"]
+            for row in store._conn.execute(
+                "PRAGMA table_info(pending_outbox)"
+            ).fetchall()
+        }
+        assert "dedupe_key" in columns
+
+        # 老行补列成空哨兵；新写入的行能带 key 且 due_outbox 原样取回。
+        store.enqueue_outbox(
+            ChatType.GROUP, "qq:1001", "新积压", dedupe_key="reply:qq:1001:m9:0"
+        )
+        rows = store.due_outbox(now=time.time() + 1)
+        by_text = {row["text"]: row["dedupe_key"] for row in rows}
+        assert by_text["旧积压"] == ""
+        assert by_text["新积压"] == "reply:qq:1001:m9:0"
     finally:
         store.close()
 

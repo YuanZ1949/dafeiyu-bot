@@ -703,3 +703,36 @@ async def test_transient_disconnect_lets_handler_finish_and_reconnect() -> None:
 
         await adapter.stop()
         assert adapter._inbound_tasks == set()
+
+
+# -------------------------------------------------- send 的 dedupe_key 透传
+async def test_send_with_dedupe_key_carries_key_in_params() -> None:
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        await adapter.send(
+            ChatType.GROUP, GROUP_CHAT, "你好", dedupe_key="reply:wxg:abc:m1:0"
+        )
+
+        assert bridge.commands[0]["action"] == "send_text"
+        assert bridge.commands[0]["params"] == {
+            "chat_id": GROUP_CHAT,
+            "text": "你好",
+            "dedupe_key": "reply:wxg:abc:m1:0",
+        }
+
+
+async def test_send_without_dedupe_key_frame_has_no_dedupe_field() -> None:
+    """不带 key 的 send 帧与旧协议逐字节同形：线协议 v1 不变。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        await adapter.send(ChatType.GROUP, GROUP_CHAT, "你好")
+        assert "dedupe_key" not in bridge.commands[0]["params"]
+
+
+async def test_send_blank_or_whitespace_dedupe_key_is_omitted() -> None:
+    """空串/空白 key 视同不带 key：桥不去重、帧里也不带字段。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        await adapter.send(ChatType.GROUP, GROUP_CHAT, "你好", dedupe_key="   ")
+        assert "dedupe_key" not in bridge.commands[0]["params"]
+
+
+async def test_adapter_declares_dedupe_support() -> None:
+    assert WeChatAdapter.supports_dedupe_key is True
