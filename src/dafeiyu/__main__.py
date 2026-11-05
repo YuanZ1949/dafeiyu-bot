@@ -30,6 +30,7 @@ from .router import Router
 from .runtime import load_runtime
 from .service import Service
 from .supervisor.audit import AuditLog
+from .version import get_version
 from .workers.failure import FailureBackoff, MemoryPaused
 from .workers.impressions import ImpressionWorker
 from .workers.observer import ObserverWorker, observer_loop
@@ -167,10 +168,31 @@ def build_memory_actions(store: Store, workers: Workers) -> MemoryActions | None
             raise MemoryPaused("配额暂停中，稍后再试")
         return await workers.impressions.extract(chat_type, chat_id)
 
+    def unblock() -> None:
+        # 只清库不够：FailureBackoff 在内存里记着单调时钟截止时间，配额暂停
+        # 期间不会回查数据库，不清内存就得等自然到期才真正恢复。
+        seen: set[int] = set()
+        for worker in (
+            workers.scheduler,
+            workers.impressions,
+            workers.observer,
+            workers.reflector,
+        ):
+            if worker is None:
+                continue
+            backoff = getattr(worker, "_backoff", None)
+            if backoff is None or id(backoff) in seen:
+                continue
+            seen.add(id(backoff))
+            reset = getattr(backoff, "reset", None)
+            if callable(reset):
+                reset()
+
     return MemoryActions(
         summarize=summarize,
         extract=extract,
         delete_impression=store.delete_impression,
+        unblock=unblock,
     )
 
 
@@ -509,6 +531,10 @@ async def main() -> None:
 
 
 def run() -> int:
+    # `python -m dafeiyu --version` 必须在配置加载前返回，不能拉起 asyncio 主循环。
+    if "--version" in sys.argv[1:]:
+        print(f"dafeiyu {get_version()}")
+        return 0
     try:
         asyncio.run(main())
     except ConfigError as exc:

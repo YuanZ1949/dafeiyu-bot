@@ -25,6 +25,7 @@ from .env_probe import (
 from .ids import normalize_chat_id
 from .memory.store import Store
 from .models import ChatType
+from .version import get_version
 
 CHAT_TYPES = ["group", "private"]
 
@@ -38,6 +39,11 @@ def _chat_id_arg(raw: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dafeiyu", description="溟月 / 大肥鱼 运维 CLI")
+    # 只打印版本就退出，不碰配置与网络；放在 subparsers 之前，
+    # argparse 的 required=True 也不会拦截 --version。
+    parser.add_argument(
+        "--version", action="version", version=f"dafeiyu {get_version()}"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     forget = sub.add_parser("forget", help="清空会话记忆")

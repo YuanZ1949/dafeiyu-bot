@@ -123,6 +123,13 @@ NapCat（QQ 协议端，独立进程）│  ③ 模型判断：一次调用同�
 Copy-Item .env.example .env
 ```
 
+先确认版本（只打印版本号，不加载配置、不连网）：
+
+```powershell
+.venv\Scripts\python -m dafeiyu --version
+# 用 [project.scripts] 安装后也可：dafeiyu --version
+```
+
 编辑 `.env`（**不要提交进 git**）：
 
 | 变量 | 必填 | 默认 | 说明 |
@@ -348,6 +355,21 @@ powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -Target D:\dafeiyu-r
 `dafeiyu doctor`（配置/编码/沙箱降权/脚本 BOM），有阻塞项就直接回滚，不会把服务停在半套代码上；
 健康检查以 `gateway.connected=true`（QQ 网关真的连上）为准，不看 HTTP 200。扫码/网关未连期间
 可用 `-AllowDisconnected` 显式放行，只拷文件不重启用 `-NoRestart`。
+
+### 从 git 升级
+
+直接跑更新脚本（先 `-DryRun` 看计划）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/update.ps1 -DryRun
+powershell -ExecutionPolicy Bypass -File scripts/update.ps1
+```
+
+脚本按 `git fetch --all --prune` → 显示 ahead/behind → `git pull --ff-only` →
+`.venv\Scripts\python -m pip install -e ".[dev]"` 的顺序执行；默认用当前分支，也可
+`-Branch main`，只想刷新依赖时加 `-NoPull`。任何一步失败都会立即退出非 0 并给出
+下一步提示；它**不会**动 `data/`、`config.yaml`、`.env`、`vendor/`，也**不会**自动
+重启服务——完成后按提示先 `scripts\stop.ps1` 再 `scripts\start-all.ps1`。
 
 ## 3.5 接入微信（可选，默认关闭）
 
@@ -716,6 +738,19 @@ bot 与 supervisor 会写同一文件，写入和轮转通过 `.audit.jsonl.lock
 | python / node / opencode 写用户目录或 `%TEMP%` 报 EPERM | 多半是工作区被沙箱降权成 Low 完整性，不是杀软；先跑 `doctor`，再按 `docs/deployment-notes-windows.md` P4/P5 查进程完整性级别 |
 | opencode 401 /「免费模型探测失败」/ 切档失败 | supervisor 会自动给 serve 和 bot 注入同一个 `OPENCODE_SERVER_PASSWORD`；只有手工/外部跑 `opencode serve` 时才需要在 `.env` 设它（P7） |
 | `.env` 中文注释变 `???` 或键丢失 | 文件编码不是 UTF-8；`doctor` 会报「编码不是 UTF-8」，按 `.env.example` 用 UTF-8 重写（P10） |
+
+出问题先导诊断包，省得来回截图：
+
+```powershell
+# 默认写到 data/diagnostics/diag-<时间戳>.zip；先 -DryRun 可只看计划
+powershell -ExecutionPolicy Bypass -File scripts/diag.ps1
+powershell -ExecutionPolicy Bypass -File scripts/diag.ps1 -DryRun
+powershell -ExecutionPolicy Bypass -File scripts/diag.ps1 -LogLines 500 -OutFile D:\diag.zip
+```
+
+包里有版本、`pip freeze`、端口监听、`/health`、最近日志和**脱敏后**的
+`config.redacted.yaml`；`data/`、`.env`、`*.db*`、`data/secrets`、
+`data/supervisor.token` 一律不打包，日志与配置里的 `sk-`/`Bearer` 值也会打码。
 
 > Windows 受限环境（沙箱降权、杀软、无管理员、opencode 认证、任务计划自启等）的实际部署
 > 踩坑记录见 [docs/deployment-notes-windows.md](docs/deployment-notes-windows.md)。

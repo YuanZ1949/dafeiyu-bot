@@ -1,4 +1,6 @@
 import json
+import sys
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +10,7 @@ from dafeiyu import cli, env_probe
 from dafeiyu.config import WeChatConfig
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
+from dafeiyu.version import get_version
 
 CONFIG = """\
 persona:
@@ -116,6 +119,42 @@ def test_config_error_returns_1(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     (tmp_path / "config.yaml").write_text(CONFIG, encoding="utf-8")
     assert cli.main(["stats", "--chat", "1"]) == 1
+
+
+# ---- --version：只打印版本，不加载配置 ------------------------------------
+
+
+def test_version_flag_prints_version_without_config(monkeypatch, capsys) -> None:
+    def _boom(*args, **kwargs):
+        raise AssertionError("--version 不应加载配置")
+
+    monkeypatch.setattr(cli, "load_settings", _boom)
+
+    rc = cli.main(["--version"])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == f"dafeiyu {get_version()}"
+
+
+def test_python_m_version_does_not_load_config(monkeypatch, capsys) -> None:
+    from dafeiyu import __main__ as bot_main
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("--version 不应加载配置")
+
+    monkeypatch.setattr(bot_main, "load_settings", _boom)
+    monkeypatch.setattr(sys, "argv", ["dafeiyu", "--version"])
+
+    assert bot_main.run() == 0
+    assert capsys.readouterr().out.strip() == f"dafeiyu {get_version()}"
+
+
+def test_package_version_matches_pyproject() -> None:
+    from dafeiyu import __version__
+
+    root = Path(__file__).resolve().parents[1]
+    data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    assert __version__ == data["project"]["version"]
 
 
 # ---- doctor：微信前置检查与 --json ---------------------------------------
