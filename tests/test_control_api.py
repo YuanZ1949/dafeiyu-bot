@@ -1397,6 +1397,95 @@ async def test_groups_snapshot_resolves_wxg_title_for_panel(tmp_path: Path) -> N
     assert payload["known"][0]["title"] == "锦绣壹号9#1101"
 
 
+def _seed_private_chat(
+    store: Store,
+    chat_id: str,
+    message_id: str,
+    *,
+    nickname: str = "好友",
+    timestamp: int = 1_700_000_000,
+    is_bot: bool = False,
+) -> None:
+    store.add_message(
+        Message(
+            chat_type=ChatType.PRIVATE,
+            chat_id=chat_id,
+            user_id="42",
+            nickname=nickname,
+            content="hi",
+            message_id=message_id,
+            is_bot=is_bot,
+            timestamp=timestamp,
+        )
+    )
+
+
+async def test_private_chats_lists_wxg_only_sorted_with_titles(
+    tmp_path: Path,
+) -> None:
+    """只列 wxg: 私聊；标题取最近非 bot 昵称，取不到回落 chat_id。"""
+    control, _, app = make_control(tmp_path)
+    store = control.store
+    _seed_private_chat(store, "wxg:abc", "a1", nickname="苑长", timestamp=300)
+    _seed_private_chat(
+        store, "wxg:abc", "a2", nickname="机器人", timestamp=400, is_bot=True
+    )
+    _seed_private_chat(store, "wxg:def", "d1", nickname="", timestamp=100)
+    _seed_private_chat(store, "wxg:none", "n1", nickname="旧友", timestamp=200)
+    store.set_brain_session("opencode", ChatType.PRIVATE, "wxg:empty", "ses_empty")
+    # 非微信私聊与微信群都不应出现。
+    _seed_message(store, "g1", "群消息", chat_id=100)
+    _seed_private_chat(store, "qq:1001", "p1", nickname="QQ 私聊")
+    store.bump_session_stats(ChatType.PRIVATE, "wxg:abc", messages=3, tokens=10)
+    store.set_brain_session("opencode", ChatType.PRIVATE, "wxg:def", "ses_private")
+
+    async with running(app) as client:
+        resp = await client.get("/api/private/chats")
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload["note"] == "仅列出已产生消息的微信好友私聊"
+    assert [item["chat_id"] for item in payload["chats"]] == [
+        "wxg:abc",
+        "wxg:none",
+        "wxg:def",
+        "wxg:empty",
+    ]
+    first = payload["chats"][0]
+    assert first["title"] == "苑长"  # 更新的 bot 消息被跳过
+    assert first["message_count"] == 2
+    assert first["last_message_at"] == 400
+    assert first["delivered_count"] == 3
+    assert payload["chats"][1]["title"] == "旧友"
+    def_chat = payload["chats"][2]
+    assert def_chat["title"] == "wxg:def"
+    assert def_chat["session_id"] == "ses_private"
+    empty_chat = payload["chats"][3]
+    assert empty_chat["title"] == "wxg:empty"
+    assert empty_chat["message_count"] == 0
+    assert empty_chat["last_message_at"] is None
+
+
+async def test_private_chats_title_failure_falls_back_to_chat_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """单条会话读标题失败只回落 chat_id，接口仍返回 200。"""
+    control, _, app = make_control(tmp_path)
+    _seed_private_chat(control.store, "wxg:abc", "a1", nickname="苑长")
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("读消息失败")
+
+    monkeypatch.setattr(control.store, "recent_messages", boom)
+
+    async with running(app) as client:
+        resp = await client.get("/api/private/chats")
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload["chats"][0]["title"] == "wxg:abc"
+
+
 def test_dashboard_exposes_new_panels() -> None:
     html = (
         Path(__file__).resolve().parents[1]
@@ -1420,6 +1509,9 @@ def test_dashboard_exposes_new_panels() -> None:
         'id="groups-known"',
         'id="btn-save-groups"',
         'id="btn-refresh-groups"',
+        'id="private-chats-state"',
+        'id="private-chats-body"',
+        'id="btn-refresh-private-chats"',
     ):
         assert anchor in html, f"面板缺少 {anchor}"
     assert "/api/usage?days=" in html
@@ -1429,6 +1521,7 @@ def test_dashboard_exposes_new_panels() -> None:
     assert "/api/config" in html
     assert "/api/behavior" in html
     assert "/api/groups" in html
+    assert "/api/private/chats" in html
     assert "/api/backup" in html
     assert "loadSessions(true)" in html
     assert "c.memory.retention_days" in html

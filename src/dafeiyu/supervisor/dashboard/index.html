@@ -332,6 +332,18 @@
   .session-row .meta { color: var(--muted); font-size: var(--fs-sm); flex: 1; min-width: 180px; }
   .session-row .acts { display: flex; gap: 6px; flex-wrap: wrap; }
   .session-row .btn { padding: 4px 8px; font-size: var(--fs-sm); }
+  .private-chats-scroll { margin-top: 8px; overflow-x: auto; }
+  .private-chats { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+  .private-chats th {
+    padding: 6px 8px; text-align: left; white-space: nowrap;
+    color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--line);
+  }
+  .private-chats td { padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  .private-chats tr:last-child td { border-bottom: none; }
+  .private-chats .chat-id {
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: var(--fs-xs); color: var(--muted); white-space: nowrap;
+  }
   .decision-stats { justify-content: flex-start; gap: 6px; margin-bottom: 8px; }
   .decision-stats .pill { color: var(--muted); }
   .decision-stats .pill b { color: var(--text); font-weight: 600; }
@@ -1003,6 +1015,25 @@
     </div>
     <div class="kv" style="margin-top:8px">留空 = 所有群都按判定回复；非空 = 只有名单内的群会被主动回复，@ / 引用 / 叫名字仍然必回。这里同时决定「回不回」和「抓哪些微信群」（桥只轮询这里的微信会话）。</div>
     <div class="kv" id="groups-known" style="margin-top:8px">已知群：（暂无）</div>
+  </section>
+
+  <section class="card">
+    <div class="row card-head">
+      <h2>微信私聊</h2>
+      <span class="kv" id="private-chats-hint">只读</span>
+      <span class="spacer"></span>
+      <button class="btn" id="btn-refresh-private-chats">刷新</button>
+    </div>
+    <div class="kv" style="margin-top:8px">只展示已产生消息的微信好友私聊；本卡片只读，不提供开关或黑白名单编辑。</div>
+    <div class="kv" id="private-chats-state" style="margin-top:8px">加载中…</div>
+    <div class="private-chats-scroll" id="private-chats-wrap" hidden>
+      <table class="private-chats">
+        <thead>
+          <tr><th>标题</th><th>会话 id</th><th>消息数</th><th>最近活跃</th><th>已投递数</th></tr>
+        </thead>
+        <tbody id="private-chats-body"></tbody>
+      </table>
+    </div>
   </section>
 
   <section class="card span-full">
@@ -3221,6 +3252,59 @@ async function saveGroups() {
 }
 
 
+async function loadPrivateChats() {
+  const state = $("private-chats-state");
+  const wrap = $("private-chats-wrap");
+  const body = $("private-chats-body");
+  state.textContent = "加载中…";
+  wrap.hidden = true;
+  try {
+    const data = await api("/api/private/chats");
+    const chats = data.chats || [];
+    body.replaceChildren();
+    if (!chats.length) {
+      state.textContent = "还没有好友私聊记录";
+      $("private-chats-hint").textContent = "只读";
+      return;
+    }
+    chats.forEach((chat) => {
+      const row = document.createElement("tr");
+      const title = document.createElement("td");
+      title.textContent = chat.title || chat.chat_id;
+      const id = document.createElement("td");
+      id.className = "chat-id";
+      id.textContent = chat.chat_id;
+      const count = document.createElement("td");
+      count.textContent = String(chat.message_count ?? 0);
+      const active = document.createElement("td");
+      active.textContent = privateChatTime(chat.last_message_at);
+      if (chat.last_message_at) {
+        active.title = new Date(Number(chat.last_message_at) * 1000)
+          .toLocaleString("zh-CN", { hour12: false });
+      }
+      const delivered = document.createElement("td");
+      delivered.textContent = String(chat.delivered_count ?? 0);
+      row.append(title, id, count, active, delivered);
+      body.appendChild(row);
+    });
+    $("private-chats-hint").textContent = `共 ${chats.length} 个好友私聊 · 只读`;
+    state.textContent = data.note || "仅列出已产生消息的微信好友私聊";
+    wrap.hidden = false;
+  } catch (err) {
+    state.textContent = `读取失败：${err.message}`;
+    $("private-chats-hint").textContent = "只读";
+  }
+}
+
+function privateChatTime(timestamp) {
+  const value = Number(timestamp);
+  if (!value) return "—";
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+
 async function wechatStop() {
   if (!confirm("急停微信通道？会写入急停文件并立即停止微信轮询（QQ 不受影响）。")) return;
   try {
@@ -3873,6 +3957,7 @@ $("btn-refresh-config").addEventListener("click", loadConfig);
 $("btn-refresh-behavior").addEventListener("click", loadBehavior);
 $("btn-save-behavior").addEventListener("click", saveBehavior);
 $("btn-refresh-groups").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadGroups));
+$("btn-refresh-private-chats").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadPrivateChats));
 $("btn-save-groups").addEventListener("click", (ev) => withBusy(ev.currentTarget, saveGroups));
 $("btn-refresh-mind").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadMind));
 $("btn-save-mind").addEventListener("click", (ev) => withBusy(ev.currentTarget, saveMind));
@@ -3957,6 +4042,7 @@ loadConfig();
 loadBehavior();
 loadMind();
 loadGroups();
+loadPrivateChats();
 setInterval(refresh, 5000);
 setInterval(() => { if (!document.hidden) refreshHealth(); }, 10000);
 setInterval(() => { if (!document.hidden && !alertsDisabled) refreshAlerts(); }, 10000);

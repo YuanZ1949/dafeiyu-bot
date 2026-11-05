@@ -556,6 +556,40 @@ async def test_memory_reports_bot_offline(tmp_path: Path) -> None:
     assert "bot" in data["error"]
 
 
+async def test_private_chats_proxies_bot_payload(tmp_path: Path) -> None:
+    payload = {
+        "chats": [
+            {
+                "chat_id": "wxg:abc",
+                "title": "苑长",
+                "message_count": 12,
+                "last_message_at": 1_699_999_999,
+                "delivered_count": 8,
+                "session_id": None,
+            }
+        ],
+        "note": "仅列出已产生消息的微信好友私聊",
+    }
+
+    async def private_chats_endpoint(_: web.Request) -> web.Response:
+        return web.json_response(payload)
+
+    bot_app = web.Application()
+    bot_app.router.add_get("/api/private/chats", private_chats_endpoint)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    try:
+        app, _, _ = make_app(tmp_path, bot_url=url)
+        async with running(app) as client:
+            resp = await client.get("/api/private/chats")
+            data = await resp.json()
+        assert resp.status == 200
+        assert data == payload
+    finally:
+        await bot_client.close()
+
+
 class RotateSupervisor(FakeSupervisor):
     def __init__(self, token: str = "old-token") -> None:
         super().__init__()

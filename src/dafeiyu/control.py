@@ -1797,6 +1797,54 @@ class BrainControl:
             self.settings = replace(self.settings, groups=groups)
         return self.groups_snapshot()
 
+    def private_chats_snapshot(self) -> dict[str, Any]:
+        """微信好友私聊只读列表；标题失败只回落 chat_id，不影响其它会话。"""
+
+        def as_count(value: Any) -> int:
+            """统计列只用于展示：非整数一律按 0，不让脏数据把整张卡带崩。"""
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return 0
+            return int(value)
+
+        chats: list[dict[str, Any]] = []
+        for item in self.store.chat_overview():
+            if str(item.get("chat_type") or "") != ChatType.PRIVATE.value:
+                continue
+            chat_id = str(item.get("chat_id") or "")
+            if not chat_id.startswith("wxg:"):
+                continue
+            message_count = as_count(item.get("message_count"))
+            title = chat_id
+            try:
+                recent = self.store.recent_messages(
+                    ChatType.PRIVATE, chat_id, 20
+                )
+            except Exception as exc:  # noqa: BLE001 - 标题只是展示信息
+                log.warning("读取微信私聊标题失败 %s：%s", chat_id, exc)
+                recent = []
+            for message in reversed(recent):
+                nickname = str(message.nickname or "").strip()
+                if nickname and not message.is_bot:
+                    title = nickname
+                    break
+            chats.append(
+                {
+                    "chat_id": chat_id,
+                    "title": title,
+                    "message_count": message_count,
+                    "last_message_at": item.get("last_message_at"),
+                    "delivered_count": as_count(item.get("delivered_count")),
+                    "session_id": item.get("session_id"),
+                }
+            )
+        chats.sort(
+            key=lambda chat: int(chat["last_message_at"] or 0), reverse=True
+        )
+        return {
+            "chats": chats,
+            "note": "仅列出已产生消息的微信好友私聊",
+        }
+
     def _brain_supports_observer(self) -> bool:
         brain = getattr(self.service, "brain", None)
         return callable(getattr(brain, "complete_detailed", None))
@@ -2765,6 +2813,16 @@ def create_app(
                 {"error": f"保存群白名单失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def get_private_chats(_: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.private_chats_snapshot())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取微信私聊失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取微信私聊失败：{exc.__class__.__name__}"},
+                status=500,
+            )
+
     async def get_mind(_: web.Request) -> web.Response:
         try:
             return web.json_response(control.mind_snapshot())
@@ -2892,6 +2950,7 @@ def create_app(
     app.router.add_put("/api/behavior", put_behavior)
     app.router.add_get("/api/groups", get_groups)
     app.router.add_put("/api/groups", put_groups)
+    app.router.add_get("/api/private/chats", get_private_chats)
     app.router.add_get("/api/mind", get_mind)
     app.router.add_put("/api/mind", put_mind)
     app.router.add_get("/api/backup", backup)

@@ -766,6 +766,9 @@ def create_app(
         code, data = await bot_call("POST", "/api/channels/wechat/inject", payload)
         return web.json_response(data, status=code)
 
+    async def private_chats(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/private/chats")
+
     async def get_mind(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/mind")
 
@@ -1203,6 +1206,7 @@ def create_app(
     app.router.add_put("/api/behavior", save_behavior)
     app.router.add_get("/api/groups", groups)
     app.router.add_put("/api/groups", save_groups)
+    app.router.add_get("/api/private/chats", private_chats)
     app.router.add_get("/api/mind", get_mind)
     app.router.add_put("/api/mind", save_mind)
     app.router.add_get("/api/workspace/file", workspace_file)
