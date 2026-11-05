@@ -236,7 +236,7 @@ class FakeClock:
 
 
 def _verifier(lookup: Any, *, available: bool = True, timeout: float = 2.0,
-              interval: float = 0.5) -> tuple[ReceiptVerifier, FakeClock]:
+              interval: float = 0.5, required: bool = True) -> tuple[ReceiptVerifier, FakeClock]:
     clock = FakeClock()
     source = SimpleNamespace(available=available)
     verifier = ReceiptVerifier(
@@ -247,6 +247,7 @@ def _verifier(lookup: Any, *, available: bool = True, timeout: float = 2.0,
         clock=clock,
         sleep=clock.sleep,
         lookup=lookup,
+        required=required,
     )
     return verifier, clock
 
@@ -329,6 +330,25 @@ async def test_apply_times_out_but_never_fails_the_send() -> None:
     assert out["error_code"] == UNVERIFIED
     # 2s 窗口 / 0.5s 间隔：4 次等待后到点。
     assert clock.sleeps == [0.5, 0.5, 0.5, 0.5]
+
+
+async def test_apply_marks_unverified_when_required() -> None:
+    verifier, _ = _verifier(lambda *args: None, timeout=0.0, required=True)
+
+    out = await verifier.apply(GROUP_NAME, "x", 0.0, dict(TYPED))
+
+    assert out["ok"] is True
+    assert out["delivered"] == "typed"
+    assert out["error_code"] == UNVERIFIED
+
+
+async def test_apply_keeps_plain_typed_when_not_required() -> None:
+    # ack_requires_observed=false：只写日志，不改回执，保持历史行为。
+    verifier, _ = _verifier(lambda *args: None, timeout=0.0, required=False)
+
+    out = await verifier.apply(GROUP_NAME, "x", 0.0, dict(TYPED))
+
+    assert out == TYPED
 
 
 async def test_apply_preserves_existing_error_code_on_timeout() -> None:

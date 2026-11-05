@@ -100,10 +100,14 @@ gateway:
     quiet_hours: ["23:30", "08:00"]
     # 模拟打字的延迟区间（秒）。
     typing_delay_seconds: [0.6, 1.2]
-    # 发送后必须观察到已发出的消息才算成功；超时按失败处理。
+    # true：回执必须在本地库观察到这条消息；观察不到时标记
+    # error_code=receipt_unverified（仍 ok=true，不重发，避免重复消息）。
+    # false：只写日志，回执保持普通 typed。
     ack_requires_observed: true
     # 观察回声消息的时间窗口（秒）。
     echo_window_seconds: 120.0
+    # 微信桥保活：true 时每 60 秒探一次 hook /health；失败只告警，
+    # 由 supervisor 的重启兜底。默认关闭。
     keepalive: false
     # 发送前要求微信窗口前台且空闲（防误操作到别的窗口）。
     require_foreground_idle: true

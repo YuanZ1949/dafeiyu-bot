@@ -739,3 +739,69 @@ def test_ui_thread_driver_self_input_age_is_none_without_hook() -> None:
     facade = bridge_main._UiThreadDriver(SimpleNamespace(), SimpleNamespace())
 
     assert facade.last_synthetic_input_age() is None
+
+
+# ------------------------------------------------------- keepalive（默认关闭）
+def test_hook_health_url_derives_from_send_endpoint() -> None:
+    assert (
+        bridge_main._hook_health_url("http://127.0.0.1:30011/send_text?x=1")
+        == "http://127.0.0.1:30011/health"
+    )
+    assert bridge_main._hook_health_url("") == ""
+    assert bridge_main._hook_health_url("127.0.0.1:30011/send_text") == ""
+
+
+def test_start_keepalive_is_off_by_default() -> None:
+    assert bridge_main._start_keepalive(_wechat()) is None
+    assert (
+        bridge_main._start_keepalive(
+            _wechat(keepalive=True, hook_url="")
+        )
+        is None
+    )
+
+
+async def test_start_keepalive_creates_cancellable_task() -> None:
+    task = bridge_main._start_keepalive(
+        _wechat(keepalive=True, hook_url="http://127.0.0.1:1/send_text")
+    )
+    assert task is not None
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_keepalive_loop_survives_probe_errors() -> None:
+    calls: list[str] = []
+    done = asyncio.Event()
+
+    async def probe(url: str) -> bool:
+        calls.append(url)
+        if len(calls) == 1:
+            raise RuntimeError("hook is gone")
+        done.set()
+        return False
+
+    task = asyncio.create_task(
+        bridge_main._keepalive_loop("http://x/health", interval=0.01, probe=probe)
+    )
+    await asyncio.wait_for(done.wait(), STEP)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert calls[:2] == ["http://x/health", "http://x/health"]
+
+
+def test_default_receipt_verifier_carries_ack_requirement() -> None:
+    poller = SimpleNamespace(localdb=object())
+    strict = bridge_main._default_receipt_verifier(
+        _wechat(send_verify=True, ack_requires_observed=True), poller
+    )
+    loose = bridge_main._default_receipt_verifier(
+        _wechat(send_verify=True, ack_requires_observed=False), poller
+    )
+
+    assert strict is not None and loose is not None
+    assert strict._required is True
+    assert loose._required is False

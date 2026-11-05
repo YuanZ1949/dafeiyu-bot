@@ -42,6 +42,8 @@ import time
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import urlopen
 
 from dafeiyu.config import ConfigError, Settings, WeChatConfig, load_settings
 
@@ -228,10 +230,75 @@ def _default_receipt_verifier(wechat: WeChatConfig, poller: Any) -> Any | None:
             source,
             timeout=float(getattr(wechat, "send_verify_timeout_seconds", 8.0)),
             interval=float(getattr(wechat, "send_verify_interval_seconds", 0.5)),
+            required=bool(getattr(wechat, "ack_requires_observed", True)),
         )
     except (TypeError, ValueError) as exc:
         logger.warning("回执校验参数无效，跳过本地库确认：%s", exc)
         return None
+
+
+#: 保活探测间隔（秒）：只探 hook 的 /health，不发业务请求。
+_KEEPALIVE_INTERVAL = 60.0
+#: 单次探测超时（秒）；hook 在本机，超过这个值基本等于失联。
+_KEEPALIVE_TIMEOUT = 5.0
+
+
+def _hook_health_url(hook_url: str) -> str:
+    """从 hook 发送地址（如 ``.../send_text``）推导 ``/health``；非法返回空串。"""
+    text = str(hook_url or "").strip()
+    if not text:
+        return ""
+    parsed = urlsplit(text)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    return urlunsplit((parsed.scheme, parsed.netloc, "/health", "", ""))
+
+
+async def _probe_hook_health(url: str, *, timeout: float = _KEEPALIVE_TIMEOUT) -> bool:
+    """探测一次 hook 健康口；阻塞 IO 放线程里，不卡事件循环。"""
+
+    def _get() -> bool:
+        with urlopen(url, timeout=timeout) as response:  # noqa: S310 - 仅本机 hook
+            status = getattr(response, "status", None) or response.getcode()
+            return 200 <= int(status) < 300
+
+    return await asyncio.to_thread(_get)
+
+
+async def _keepalive_loop(
+    url: str,
+    *,
+    interval: float = _KEEPALIVE_INTERVAL,
+    probe: Callable[[str], Awaitable[bool]] = _probe_hook_health,
+) -> None:
+    """周期性探测 hook；失败只告警，由 supervisor 的重启兜底。
+
+    不另造重连：bridge 的发送与轮询各有自己的失败路径，保活只负责把
+    「hook 静默失联」变成可见日志，避免桥看起来活着但所有发送都超时。
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            ok = await probe(url)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 探测失败绝不拖垮桥
+            logger.warning("微信桥保活探测异常：%s（%s）", url, exc)
+            continue
+        if not ok:
+            logger.warning("微信桥保活探测未通过：%s", url)
+
+
+def _start_keepalive(wechat: WeChatConfig) -> asyncio.Task[None] | None:
+    """按 ``gateway.wechat.keepalive`` 启动探测任务；关闭或没地址时返回 None。"""
+    if not bool(getattr(wechat, "keepalive", False)):
+        return None
+    url = _hook_health_url(getattr(wechat, "hook_url", ""))
+    if not url:
+        logger.info("gateway.wechat.keepalive 已开启，但 hook_url 为空，跳过保活")
+        return None
+    logger.info("微信桥保活已启动：每 %ss 探测 %s", int(_KEEPALIVE_INTERVAL), url)
+    return asyncio.create_task(_keepalive_loop(url))
 
 
 def _failed(code: str) -> dict[str, Any]:
@@ -523,6 +590,7 @@ async def run(
     # 生产路径的探测在 poller 启动后投到 UIA 线程执行；只有注入 frame_source
     # 的测试/替身路径（无 poller）用 fail-closed 帧，不做任何驱动调用。
     startup_health: dict[str, Any] | None = None
+    keepalive_task: asyncio.Task[None] | None = None
 
     try:
         if frame_source is None:
@@ -549,6 +617,7 @@ async def run(
             await asyncio.wait_for(server.broadcast(startup_health), _AWAIT_TIMEOUT)
 
         pump_task = _start_pump(source)
+        keepalive_task = _start_keepalive(wechat)
         await _wait_for_stop(stop, loop)
     finally:
         # 1) 让轮询循环和排队中的发送一起停手（幂等，可在异常路径重复调用）。
@@ -566,6 +635,11 @@ async def run(
             # Exception），显式收下：这是我们自己发的取消，不是停机失败。
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(pump_task, _AWAIT_TIMEOUT)
+        # 2.5) 保活探测与泵一起收尾：它平时在 sleep，取消后 1 个 await 即退出。
+        if keepalive_task is not None:
+            keepalive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(keepalive_task, _AWAIT_TIMEOUT)
         # 3) join UIA 线程（带超时；即使上面某步炸了也必须走到）。
         if poller is not None:
             with contextlib.suppress(Exception):

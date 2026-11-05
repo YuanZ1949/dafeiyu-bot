@@ -286,6 +286,9 @@ class WeChatConfig:
     send_max_per_day: int = 60
     quiet_hours: tuple[str, str] = ("23:30", "08:00")
     typing_delay_seconds: tuple[float, float] = (0.6, 1.2)
+    # 严格回执：true 时未在本地库观察到发送结果会标记 `receipt_unverified`
+    # （仍 ok=True，避免客户端换 id 重发造成重复消息）；false 时只写日志，
+    # 回执保持普通 typed。
     ack_requires_observed: bool = True
     echo_window_seconds: float = 120.0
     keepalive: bool = False

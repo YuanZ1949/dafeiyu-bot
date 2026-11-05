@@ -51,6 +51,7 @@ class ReceiptVerifier:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Any] = asyncio.sleep,
         lookup: Callable[..., Any] | None = None,
+        required: bool = True,
     ) -> None:
         self._source = source
         self._timeout = max(0.0, float(timeout))
@@ -59,6 +60,8 @@ class ReceiptVerifier:
         self._clock = clock
         self._sleep = sleep
         self._lookup = lookup
+        #: true 时未观察到会标记 ``receipt_unverified``；false 只写日志。
+        self._required = bool(required)
 
     # ------------------------------------------------------------- 公共 API
     async def apply(
@@ -95,7 +98,7 @@ class ReceiptVerifier:
         )
         out = dict(receipt)
         out["delivered"] = "typed"
-        if not out.get("error_code"):
+        if self._required and not out.get("error_code"):
             out["error_code"] = UNVERIFIED
         return out
 
