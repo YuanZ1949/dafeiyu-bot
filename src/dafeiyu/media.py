@@ -15,10 +15,11 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +35,12 @@ _FILE_PREFIX = "[文件]"
 
 #: 可被注记的图片/表情占位；表情可带名称或 md5 前缀。
 _PLACEHOLDER_RE = re.compile(r"\[(?:图片|表情(?::[^\]\r\n]*)?)\]")
+
+#: 微信表情缓存文件名：32 位 hex、无扩展名（见 media/emoticon）。
+_HEX32_NAME_RE = re.compile(r"[0-9a-fA-F]{32}")
+
+#: ``decode`` 允许同步或异步：表情解码要调 ffmpeg，实现方会放到线程里。
+Decode = Callable[[bytes], bytes | None | Awaitable[bytes | None]]
 
 #: 与 ``images.py`` 相同的魔数表。这里刻意复制一份：本模块只依赖 models，
 #: 不调用另一个模块的私有函数（那会让两边的生命周期互相绑定）。
@@ -113,12 +120,13 @@ async def materialize_attachments(
     msg: Message,
     settings: Settings,
     *,
-    decode: Callable[[bytes], bytes | None] | None = None,
+    decode: Decode | None = None,
 ) -> int:
     """把带本地路径的附件物化进 workspace，返回成功写盘的图片数量。
 
-    ``decode`` 只对 ``.dat`` 源生效；传 ``None`` 表示不解码、按原字节复制。
-    任何失败都保留原占位，绝不抛出。
+    ``decode`` 对微信 ``.dat`` 图片与表情缓存（32 位 hex 文件名）生效；可以
+    返回 awaitable（表情转码要起 ffmpeg 子进程）。传 ``None`` 表示不解码、
+    按原字节复制。任何失败都保留原占位，绝不抛出。
     """
     try:
         workspace = getattr(settings, "workspace", None)
@@ -183,8 +191,14 @@ async def materialize_attachments(
                 updated.append(attachment)
                 continue
 
-            if source_path.suffix.lower() == ".dat" and decode is not None:
-                data = decode(data)
+            if decode is not None and (
+                source_path.suffix.lower() == ".dat"
+                or _HEX32_NAME_RE.fullmatch(source_path.name)
+            ):
+                decoded = decode(data)
+                if inspect.isawaitable(decoded):
+                    decoded = await decoded
+                data = decoded
                 if data is None:
                     log.debug("附件解码失败，保持占位：msg=%s", msg.message_id)
                     updated.append(attachment)

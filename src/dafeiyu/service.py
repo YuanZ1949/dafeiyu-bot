@@ -774,11 +774,12 @@ class Service:
         except RuntimeError:
             log.debug("微信图片密钥预热线程无法启动")
 
-    def _decode_wechat_dat(self, data: bytes) -> bytes | None:
+    async def _decode_wechat_dat(self, data: bytes) -> bytes | None:
         """``materialize_attachments`` 用的 ``decode``：只解已能证明是图片的。
 
-        V2 需要 AES key。命中本进程缓存就同步解；没命中先按旧格式尝试（V2
-        会保持占位），同时把扫描丢到后台线程——事件环上不能做内存扫描。
+        先按图片 ``.dat`` 处理（V2 需要 AES key，命中本进程缓存就同步解；
+        没命中先按旧格式尝试，同时把扫描丢到后台线程）。失败再试表情缓存：
+        表情是 AES-CBC + ``wxgf``/HEVC，必须起 ffmpeg，所以放线程里跑。
         """
         try:
             from .gateway.wechat_bridge.media.dat import decode_dat
@@ -789,12 +790,38 @@ class Service:
             return decode_dat(data)
         key = resolver.cached(data)
         if key is not None:
-            return decode_dat(data, aes_key=key.aes_key, xor_key=key.xor_key)
-        self._kick_media_key_scan(data)
-        return decode_dat(data)
+            decoded = decode_dat(data, aes_key=key.aes_key, xor_key=key.xor_key)
+        else:
+            self._kick_media_key_scan(data)
+            decoded = decode_dat(data)
+        if decoded is not None:
+            return decoded
+        return await self._decode_wechat_emoticon(data)
 
-    def _kick_media_key_scan(self, sample: bytes) -> None:
-        """同一时刻最多一个后台扫描；失败由 resolver 自己的冷却兜住。"""
+    async def _decode_wechat_emoticon(self, data: bytes) -> bytes | None:
+        """表情缓存：CBC 解密 + ffmpeg 转码；缺密钥时把扫描放后台。"""
+        try:
+            from .gateway.wechat_bridge.media.emoticon import decode_emoticon
+        except Exception:  # noqa: BLE001 - 模块缺失只影响表情
+            return None
+        resolver = self._media_key_resolver()
+        if resolver is None:
+            return None
+        key = resolver.emoticon_key()
+        if key is None:
+            # 密钥还没解析出来：下一轮再解。扫描在后台线程里做。
+            self._kick_media_key_scan(prewarm=True)
+            return None
+        return await asyncio.to_thread(decode_emoticon, data, key)
+
+    def _kick_media_key_scan(
+        self, sample: bytes | None = None, *, prewarm: bool = False
+    ) -> None:
+        """同一时刻最多一个后台扫描；失败由 resolver 自己的冷却兜住。
+
+        ``prewarm=True`` 时不需要 V2 样本，直接找一张真实图片当样本；表情
+        缓存只需要 ``cfgDword``，但发现流程仍复用图片样本的强头部校验。
+        """
         resolver = self._media_resolver
         if resolver is None:
             return

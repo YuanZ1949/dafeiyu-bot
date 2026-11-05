@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ AES_KEY = b"0123456789abcdef"
 XOR_KEY = 0x5A
 HEAD = b"\xff\xd8\xff\xe0" + bytes(range(28))
 TAIL = bytes(range(32, 64))
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 
 
 def _pkcs7_pad(data: bytes, block: int = 16) -> bytes:
@@ -38,6 +40,8 @@ class StubResolver:
         self.key = key
         self.samples: list[bytes] = []
         self.scanned = threading.Event()
+        self.prewarmed = threading.Event()
+        self.emoticon: bytes | None = None
 
     def cached(self, sample: bytes) -> MediaKey | None:
         return self.key
@@ -46,6 +50,13 @@ class StubResolver:
         self.samples.append(sample)
         self.scanned.set()
         return self.key
+
+    def emoticon_key(self) -> bytes | None:
+        return self.emoticon
+
+    def prewarm(self) -> bool:
+        self.prewarmed.set()
+        return False
 
 
 def _service(resolver: StubResolver | None, *, enabled: bool = True) -> Service:
@@ -71,14 +82,18 @@ def test_media_disabled_falls_back_to_legacy_decode() -> None:
     png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
     encoded = bytes(byte ^ 0x37 for byte in png)
 
-    assert service._decode_wechat_dat(encoded) == png
-    assert service._decode_wechat_dat(_sample()) is None
+    assert _decode(service, encoded) == png
+    assert _decode(service, _sample()) is None
+
+
+def _decode(service: Service, data: bytes) -> bytes | None:
+    return asyncio.run(service._decode_wechat_dat(data))
 
 
 def test_cached_key_decodes_v2() -> None:
     service = _service(StubResolver(MediaKey(AES_KEY, XOR_KEY)))
 
-    assert service._decode_wechat_dat(_sample()) == HEAD + TAIL
+    assert _decode(service, _sample()) == HEAD + TAIL
 
 
 def test_miss_kicks_background_scan_and_keeps_placeholder() -> None:
@@ -86,7 +101,7 @@ def test_miss_kicks_background_scan_and_keeps_placeholder() -> None:
     service = _service(resolver)
     sample = _sample()
 
-    assert service._decode_wechat_dat(sample) is None
+    assert _decode(service, sample) is None
     assert resolver.scanned.wait(2.0) is True
     assert resolver.samples == [sample]
 
@@ -94,4 +109,30 @@ def test_miss_kicks_background_scan_and_keeps_placeholder() -> None:
 def test_miss_without_resolver_does_not_raise() -> None:
     service = _service(None)
 
-    assert service._decode_wechat_dat(_sample()) is None
+    assert _decode(service, _sample()) is None
+
+
+def test_emoticon_key_runs_cbc_decode(monkeypatch) -> None:
+    resolver = StubResolver(MediaKey(AES_KEY, XOR_KEY))
+    resolver.emoticon = b"0123456789abcdef"
+    service = _service(resolver)
+    calls: list[tuple[bytes, bytes]] = []
+
+    def fake_decode(data: bytes, key: bytes, **_kwargs) -> bytes:
+        calls.append((data, key))
+        return PNG
+
+    monkeypatch.setattr(
+        "dafeiyu.gateway.wechat_bridge.media.emoticon.decode_emoticon", fake_decode
+    )
+
+    assert _decode(service, b"\x00" * 32) == PNG
+    assert calls == [(b"\x00" * 32, resolver.emoticon)]
+
+
+def test_emoticon_miss_kicks_prewarm() -> None:
+    resolver = StubResolver(MediaKey(AES_KEY, XOR_KEY))
+    service = _service(resolver)
+
+    assert _decode(service, b"\x00" * 16) is None
+    assert resolver.prewarmed.wait(2.0) is True

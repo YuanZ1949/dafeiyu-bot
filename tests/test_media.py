@@ -254,7 +254,9 @@ async def test_second_call_is_idempotent(tmp_path: Path) -> None:
     assert message.content.count("（图存") == 1
 
 
-async def test_sticker_placeholder_is_annotated_and_idempotent(tmp_path: Path) -> None:
+async def test_sticker_placeholder_is_annotated_and_idempotent(
+    tmp_path: Path,
+) -> None:
     source = write_dat(tmp_path)
     settings = make_settings(tmp_path)
     message = make_message(str(source), content="[表情:745c9c20]")
@@ -268,6 +270,41 @@ async def test_sticker_placeholder_is_annotated_and_idempotent(tmp_path: Path) -
     assert content.count("（图存") == 1
     assert second == 0
     assert message.content == content
+
+
+async def test_emoticon_cache_file_uses_async_decode(tmp_path: Path) -> None:
+    digest = "745c9c20f715400b40f5d679bd12ebdb"
+    source = tmp_path / digest
+    source.write_bytes(b"cipher")
+    settings = make_settings(tmp_path)
+    message = make_message(
+        str(source), content="[表情:745c9c20]"
+    )
+
+    async def decode(_data: bytes) -> bytes:
+        return PNG
+
+    count = await materialize_attachments(message, settings, decode=decode)
+
+    assert count == 1
+    attachment = message.attachments[0]
+    assert attachment.path.startswith("images/")
+    assert attachment.path.endswith(".png")
+    assert (tmp_path / "ws" / attachment.path).read_bytes() == PNG
+    assert "[表情:745c9c20]（图存 images/" in message.content
+
+
+async def test_hex_named_file_without_decode_is_copied(tmp_path: Path) -> None:
+    digest = "745c9c20f715400b40f5d679bd12ebdb"
+    source = tmp_path / digest
+    source.write_bytes(PNG)
+    settings = make_settings(tmp_path)
+    message = make_message(str(source), content="[表情:745c9c20]")
+
+    count = await materialize_attachments(message, settings, decode=None)
+
+    assert count == 1
+    assert message.attachments[0].path.endswith(".png")
 
 
 async def test_materialize_cleans_expired_images(tmp_path: Path) -> None:
