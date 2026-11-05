@@ -118,6 +118,7 @@ def make_msg(
     *,
     message_id: str,
     at_bot: bool = False,
+    is_bot: bool = False,
     timestamp: int | None = None,
 ) -> Message:
     return Message(
@@ -128,7 +129,7 @@ def make_msg(
         content=content,
         message_id=message_id,
         segments=[],
-        is_bot=False,
+        is_bot=is_bot,
         at_bot=at_bot,
         timestamp=int(time.time()) if timestamp is None else timestamp,
     )
@@ -165,6 +166,31 @@ async def test_hot_chat_batch_is_held_without_marking_skipped(tmp_path):
     assert [
         m.message_id for m in store.pending_batch(ChatType.GROUP, GROUP, ids[-1])
     ] == ids
+
+
+async def test_sticker_right_after_bot_message_is_not_held(tmp_path):
+    """表情紧跟 bot 发言 = 弱回应：热聊批次里也不该一票否决。"""
+    service, store, brain, _ = build(tmp_path)
+    seed_cursor(store)
+    add_hot_chat(store, count=5)
+    store.add_message(make_msg("今天先这样吧", message_id="bot1", is_bot=True))
+    store.add_message(make_msg("[表情:狗头]", message_id="sticker"))
+
+    await service._run_batch(ChatType.GROUP, GROUP)
+
+    assert brain.reply_calls == 1
+
+
+async def test_sticker_without_bot_context_still_held(tmp_path):
+    """没人接话的纯热聊表情批次照旧攒着，不因为出现表情就放行。"""
+    service, store, brain, _ = build(tmp_path)
+    seed_cursor(store)
+    add_hot_chat(store, count=5)
+    store.add_message(make_msg("[表情:狗头]", message_id="sticker"))
+
+    await service._run_batch(ChatType.GROUP, GROUP)
+
+    assert brain.reply_calls == 0
 
 
 async def test_held_batch_goes_out_with_next_addressed_message(tmp_path):

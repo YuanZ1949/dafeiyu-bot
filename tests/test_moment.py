@@ -6,8 +6,10 @@ from dafeiyu.models import ChatType, Message
 from dafeiyu.moment import (
     analyze,
     answers_bot_question,
+    follows_bot_expression,
     is_question,
     is_short_only,
+    is_sticker_content,
     reopened_by_question,
 )
 
@@ -51,6 +53,43 @@ def test_short_only_detection() -> None:
     assert is_short_only([make_msg("哈哈"), make_msg("草")])
     assert is_short_only([make_msg("[图片]")])
     assert not is_short_only([make_msg("这个方案我觉得可以，但得先确认依赖")])
+
+
+def test_sticker_content_detection() -> None:
+    assert is_sticker_content("[表情]")
+    assert is_sticker_content("[表情:狗头]")
+    assert is_sticker_content("[表情:狗头]（图存 images/dog.png，可用 read 查看）")
+    # 表情后面还跟着别的内容，就不是单纯一个表情了。
+    assert not is_sticker_content("[表情][图片]")
+    assert not is_sticker_content("哈哈")
+    assert not is_sticker_content("[表情:狗头] 你也来一个")
+
+
+def test_short_only_sticker_hint_is_soft() -> None:
+    signals = analyze([make_msg("[表情:狗头]")], now_ts=1000)
+    assert signals.short_only is True
+    assert signals.sticker is True
+    assert "有同感" in signals.hint()
+    assert "倾向不说" not in signals.hint()
+
+
+def test_short_only_without_sticker_keeps_old_hint() -> None:
+    signals = analyze([make_msg("哈哈")], now_ts=1000)
+    assert signals.short_only is True
+    assert signals.sticker is False
+    assert signals.hint() == "【时机】这批没什么可接的内容，倾向不说。"
+
+
+def test_follows_bot_expression() -> None:
+    bot = make_msg("发个图给你看看", is_bot=True, timestamp=1000, nickname="溟月")
+    sticker = make_msg("[表情:狗头]", timestamp=1005)
+
+    assert follows_bot_expression(sticker, bot) is True
+    # 上一条是人、或者隔得太久，都只当普通刷屏。
+    assert follows_bot_expression(sticker, make_msg("哈哈", timestamp=1000)) is False
+    assert follows_bot_expression(
+        make_msg("[表情:狗头]", timestamp=2000), bot
+    ) is False
 
 
 def test_analyze_question_scores_higher() -> None:

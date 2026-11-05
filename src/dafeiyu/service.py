@@ -40,7 +40,12 @@ from .memory.store import Store
 from .memory.timeline import TIMELINE_LIMIT, build_batch_prompt, time_label
 from .memory.workspace import Workspace
 from .models import QQ_PREFIX, Attachment, ChatType, Message, RecallEvent, channel_of
-from .moment import analyze, answers_bot_question, reopened_by_question
+from .moment import (
+    analyze,
+    answers_bot_question,
+    follows_bot_expression,
+    reopened_by_question,
+)
 from .reply_media import build_onebot_segments, resolve_at_names, resolve_attachments
 from .router import Router, now_shanghai
 from .sender import is_technical_question, segment_reply, shape_reply
@@ -671,6 +676,19 @@ class Service:
         if msg.chat_type is not ChatType.GROUP or msg.is_bot:
             return False
         return answers_bot_question(msg, self._previous_message(msg))
+
+    def _weakly_addressed(self, msg: Message) -> bool:
+        """弱点名：回答 bot 的上一句提问，或紧跟 bot 发言甩了个表情。
+
+        只用于「机会检测放行」和提示层；不并入 `_is_addressed`，
+        避免表情重置 no_reply/降频、影响调度防抖与预算。
+        """
+        if msg.chat_type is not ChatType.GROUP or msg.is_bot:
+            return False
+        previous = self._previous_message(msg)
+        return answers_bot_question(msg, previous) or follows_bot_expression(
+            msg, previous
+        )
 
     def _is_addressed(self, msg: Message) -> bool:
         """显式点名（@/引用/别名）+ 隐式接话（回答 bot 的上一句提问）。"""
@@ -1452,12 +1470,16 @@ class Service:
         if len(batch) + backlog >= PENDING_BATCH_LIMIT:
             return False
         signals = analyze(batch, now_ts=now_ts, addressed=addressed)
-        return (
+        if not (
             signals.hot
             and not signals.question
             and not signals.help
             and signals.score <= OPPORTUNITY_HOLD_SCORE
-        )
+        ):
+            return False
+        # 本来该 hold，但批里有「紧跟 bot 的表情」这类弱回应：别一票否决。
+        # 只在确定要 hold 时才查上一条，正常批次不增加额外 DB 查询。
+        return not any(self._weakly_addressed(m) for m in batch)
 
     async def _run_batch_locked(self, chat_type: ChatType, chat_id: str) -> None:
         latest = self.store.recent_messages(chat_type, chat_id, 1)
@@ -2608,7 +2630,7 @@ class Service:
                 messages,
                 now_ts=int(moment.timestamp()),
                 addressed=any(self._is_addressed(m) for m in messages),
-                followed_up=any(self._answers_bot_question(m) for m in messages),
+                followed_up=any(self._weakly_addressed(m) for m in messages),
                 pending_loop=pending_loop,
             )
             hint = signals.hint()
