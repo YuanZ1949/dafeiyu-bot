@@ -392,6 +392,19 @@ class Service:
                 status[channel]["logged_in"] = adapter.logged_in
             if hasattr(adapter, "desktop"):
                 status[channel]["desktop"] = adapter.desktop
+            # 回执计数同样是「有才补」：读取失败只告警，不带键，不影响
+            # 其它通道的状态快照。
+            receipt_stats = getattr(adapter, "receipt_stats", None)
+            if callable(receipt_stats):
+                try:
+                    receipts = receipt_stats()
+                except Exception:
+                    log.warning(
+                        "通道 %s 回执统计读取失败", channel, exc_info=True
+                    )
+                else:
+                    if isinstance(receipts, dict):
+                        status[channel]["receipts"] = receipts
         return status
 
     async def start(self) -> None:

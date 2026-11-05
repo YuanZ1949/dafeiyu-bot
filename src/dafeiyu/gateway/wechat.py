@@ -111,6 +111,14 @@ class WeChatAdapter:
         self.last_event_at: float | None = None
         self.last_disconnect_at: float | None = None
         self.last_send_at: float | None = None
+        # 发送回执口径：只记次数与最近时刻，不保存消息正文。
+        self.receipts: dict[str, int] = {
+            "observed": 0,
+            "typed": 0,
+            "unverified": 0,
+            "failed": 0,
+        }
+        self.last_receipt_at: float | None = None
 
     # ----------------------------------------------------------- 身份/状态
     @property
@@ -132,6 +140,46 @@ class WeChatAdapter:
         return (time.monotonic() - self._last_health_at) <= (
             3 * self._config.poll_seconds
         )
+
+    def receipt_stats(self) -> dict[str, Any]:
+        """发送回执计数快照；只读副本，任何情况下都不抛异常。
+
+        ``unverified_rate`` 的分母是「有回执的尝试」（observed + typed +
+        unverified），失败的尝试没有回执，不进分母。保留 3 位小数。
+        """
+        try:
+            observed = int(self.receipts.get("observed", 0))
+            typed = int(self.receipts.get("typed", 0))
+            unverified = int(self.receipts.get("unverified", 0))
+            failed = int(self.receipts.get("failed", 0))
+            acknowledged = observed + typed + unverified
+            rate = round(unverified / acknowledged, 3) if acknowledged else 0.0
+            return {
+                "observed": observed,
+                "typed": typed,
+                "unverified": unverified,
+                "failed": failed,
+                "total": acknowledged + failed,
+                "unverified_rate": rate,
+                "last_at": self.last_receipt_at,
+            }
+        except Exception:  # pragma: no cover - 防御性兜底，状态读取不许拖垮通道
+            logger.warning("微信回执计数读取失败", exc_info=True)
+            return {
+                "observed": 0,
+                "typed": 0,
+                "unverified": 0,
+                "failed": 0,
+                "total": 0,
+                "unverified_rate": 0.0,
+                "last_at": None,
+            }
+
+    def _record_receipt(self, outcome: str) -> None:
+        """累加一次发送回执/失败尝试；未知口径归入 failed。"""
+        key = outcome if outcome in self.receipts else "failed"
+        self.receipts[key] += 1
+        self.last_receipt_at = time.time()
 
     def on_message(self, handler: Callable[[Message], Awaitable[None]]) -> None:
         self._handler = handler
@@ -674,9 +722,16 @@ class WeChatAdapter:
             await ws.send(json.dumps(envelope, ensure_ascii=False))
             receipt = await asyncio.wait_for(future, _SEND_TIMEOUT)
         except TimeoutError as exc:
+            self._record_receipt("failed")
             raise GatewayError("微信发送等待回执超时") from exc
         except ConnectionClosed as exc:
+            self._record_receipt("failed")
             raise GatewayError("微信桥连接已断开") from exc
+        except GatewayError:
+            # 断线/停机时由 _fail_pending 注入 future：同样是一次没有回执的
+            # 发送失败，按 failed 计数后原样抛出。
+            self._record_receipt("failed")
+            raise
         finally:
             self._pending.pop(command_id, None)
 
@@ -686,13 +741,22 @@ class WeChatAdapter:
         if not ok or delivered == "failed":
             if unsupported_media and error_code == "unsupported_media":
                 # 明确不支持：不重试、不回落、不记回声，调用方继续发文本。
+                # 这不是一次投递尝试，回执计数不动。
                 logger.info(
                     "微信桥不支持媒体发送 %s kind=%s",
                     params.get("chat_id"),
                     params.get("kind"),
                 )
                 return False, None
+            self._record_receipt("failed")
             raise GatewayError(f"微信发送失败：{error_code or delivered}")
+
+        if delivered == "observed":
+            self._record_receipt("observed")
+        elif error_code == "receipt_unverified":
+            self._record_receipt("unverified")
+        else:
+            self._record_receipt("typed")
 
         message_id = receipt.get("message_id")
         value = str(message_id) if message_id is not None else None

@@ -133,6 +133,106 @@ def test_channel_status_raw_fallback_adds_wechat_extras(tmp_path):
     }
 
 
+class _RawStatusAdapter:
+    """没有 snapshot() 的最小适配器：channel_status 走裸属性分支。"""
+
+    def __init__(self) -> None:
+        self.connected = True
+        self.degraded = False
+        self.last_event_at = 123.0
+        self.last_disconnect_at = None
+        self.last_send_at = 456.0
+
+
+class _ReceiptStatusAdapter(_RawStatusAdapter):
+    def __init__(self, receipts: dict) -> None:
+        super().__init__()
+        self._receipts = receipts
+
+    def receipt_stats(self) -> dict:
+        return dict(self._receipts)
+
+
+class _BrokenReceiptStatusAdapter(_RawStatusAdapter):
+    def receipt_stats(self) -> dict:
+        raise RuntimeError("回执统计坏了")
+
+
+def _service_with_adapters(tmp_path, adapters):
+    store = Store(str(tmp_path / "t.db"))
+    store.init_schema()
+    settings = make_settings()
+    service = Service(
+        settings,
+        store,
+        None,
+        adapters=adapters,
+        router=Router(settings, store, clock=lambda: None),
+        persona_text="test",
+    )
+    return service, store
+
+
+def test_channel_status_fallback_exposes_receipt_stats(tmp_path):
+    receipts = {
+        "observed": 3,
+        "typed": 1,
+        "unverified": 2,
+        "failed": 1,
+        "total": 7,
+        "unverified_rate": 0.333,
+        "last_at": 789.0,
+    }
+    service, _store = _service_with_adapters(
+        tmp_path,
+        {
+            "qq": _RawStatusAdapter(),
+            "wechat": _ReceiptStatusAdapter(receipts),
+        },
+    )
+
+    status = service.channel_status()
+
+    assert status["wechat"]["receipts"] == receipts
+    assert status["wechat"]["connected"] is True
+    assert "receipts" not in status["qq"]
+
+
+def test_channel_status_fallback_without_receipt_stats_has_no_key(tmp_path):
+    service, _store = _service_with_adapters(
+        tmp_path, {"wechat": _RawStatusAdapter()}
+    )
+
+    status = service.channel_status()
+
+    assert "receipts" not in status["wechat"]
+    assert status["wechat"] == {
+        "connected": True,
+        "degraded": False,
+        "last_event_at": 123.0,
+        "last_disconnect_at": None,
+        "last_send_at": 456.0,
+    }
+
+
+def test_channel_status_receipt_stats_error_keeps_other_fields(tmp_path):
+    service, _store = _service_with_adapters(
+        tmp_path, {"wechat": _BrokenReceiptStatusAdapter()}
+    )
+
+    status = service.channel_status()
+
+    assert "receipts" not in status["wechat"]
+    assert status["wechat"] == {
+        "connected": True,
+        "degraded": False,
+        "last_event_at": 123.0,
+        "last_disconnect_at": None,
+        "last_send_at": 456.0,
+    }
+
+
+
 async def test_start_and_stop_visit_every_adapter(tmp_path):
     service, _store, qq, wx = make_service(tmp_path)
 

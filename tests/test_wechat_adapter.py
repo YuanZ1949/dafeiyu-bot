@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 from typing import Self
 
 import pytest
 from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosed
 
 import dafeiyu.gateway.wechat as wechat_module
 from dafeiyu.config import ConfigError, WeChatConfig
@@ -277,6 +279,111 @@ async def test_typed_receipt_returns_id_and_warns(caplog) -> None:
             assert message_id == "3:99"
             assert "typed" in caplog.text
             assert adapter.last_send_at is not None
+
+
+# ------------------------------------------------------- 回执口径（P2-9）
+async def test_receipt_stats_counts_four_outcomes() -> None:
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        await adapter.send(ChatType.GROUP, GROUP_CHAT, "已送达")
+
+        bridge.receipt = {"delivered": "typed"}
+        await adapter.send(ChatType.GROUP, GROUP_CHAT, "仅打字")
+
+        bridge.receipt = {
+            "delivered": "typed",
+            "error_code": "receipt_unverified",
+        }
+        await adapter.send(ChatType.GROUP, GROUP_CHAT, "未确认一")
+        await adapter.send(ChatType.GROUP, GROUP_CHAT, "未确认二")
+
+        bridge.receipt = {
+            "ok": False,
+            "error_code": "not_focused",
+            "delivered": "failed",
+            "message_id": None,
+        }
+        with pytest.raises(GatewayError, match="not_focused"):
+            await adapter.send(ChatType.GROUP, GROUP_CHAT, "失败")
+
+        stats = adapter.receipt_stats()
+
+        assert stats["observed"] == 1
+        assert stats["typed"] == 1
+        assert stats["unverified"] == 2
+        assert stats["failed"] == 1
+        assert stats["total"] == 5
+        assert stats["unverified_rate"] == 0.5
+        assert stats["last_at"] is not None
+        assert adapter.last_receipt_at == stats["last_at"]
+
+
+async def test_receipt_stats_unsupported_media_is_not_counted() -> None:
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        bridge.receipt = {
+            "ok": False,
+            "error_code": "unsupported_media",
+            "delivered": "failed",
+        }
+
+        ok = await adapter.send_media(
+            ChatType.GROUP, GROUP_CHAT, "image", "C:/tmp/a.png"
+        )
+
+        assert ok is False
+        assert adapter.receipt_stats() == {
+            "observed": 0,
+            "typed": 0,
+            "unverified": 0,
+            "failed": 0,
+            "total": 0,
+            "unverified_rate": 0.0,
+            "last_at": None,
+        }
+
+
+async def test_receipt_stats_timeout_counts_failed(monkeypatch) -> None:
+    monkeypatch.setattr(wechat_module, "_SEND_TIMEOUT", 0.3)
+    async with FakeBridge() as bridge:
+        bridge.receipt_id_override = "not-this-command"
+        async with running(bridge) as adapter:
+            with pytest.raises(GatewayError, match="超时"):
+                await adapter.send(ChatType.GROUP, GROUP_CHAT, "等不到")
+
+            stats = adapter.receipt_stats()
+            assert stats["failed"] == 1
+            assert stats["total"] == 1
+            assert stats["last_at"] is not None
+
+
+async def test_receipt_stats_connection_closed_counts_failed() -> None:
+    class _ClosedWs:
+        async def send(self, _raw: str) -> None:
+            raise ConnectionClosed(None, None)
+
+    adapter = WeChatAdapter(make_config(1))
+    adapter._socket_open = True
+    adapter._health_connected = True
+    adapter._last_health_at = time.monotonic()
+    adapter._ws = _ClosedWs()
+
+    with pytest.raises(GatewayError, match="连接已断开"):
+        await adapter.send(ChatType.GROUP, GROUP_CHAT, "断线")
+
+    stats = adapter.receipt_stats()
+    assert stats["failed"] == 1
+    assert stats["total"] == 1
+    assert stats["last_at"] is not None
+
+
+def test_receipt_stats_returns_a_copy() -> None:
+    adapter = WeChatAdapter(make_config(1))
+    snapshot = adapter.receipt_stats()
+    snapshot["observed"] = 99
+    snapshot["total"] = 99
+
+    assert adapter.receipt_stats()["observed"] == 0
+    assert adapter.receipt_stats()["total"] == 0
+
 
 
 async def test_is_bot_event_is_dropped() -> None:
