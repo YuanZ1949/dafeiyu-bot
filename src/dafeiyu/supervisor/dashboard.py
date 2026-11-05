@@ -118,7 +118,7 @@ def create_app(
     qr_path: Path,
     bot_url: str,
     token: str | Callable[[], str] = "",
-    on_shutdown: Callable[[], Awaitable[None]] | None = None,
+    on_shutdown: Callable[..., Awaitable[None]] | None = None,
     napcat_login: NapCatLogin | None = None,
     auth: DashboardAuth | None = None,
     ops: OpsServices | None = None,
@@ -1152,7 +1152,12 @@ def create_app(
             return web.json_response({"error": "不支持退出"}, status=400)
         write_audit(request, "shutdown", target="all")
         loop = asyncio.get_running_loop()
-        loop.call_later(0.3, lambda: asyncio.create_task(on_shutdown()))
+        # actor 必须在 handler 返回前算好：call_later 里的 request 对象可能已释放。
+        actor = audit_actor(request)
+        loop.call_later(
+            0.3,
+            lambda: asyncio.create_task(on_shutdown(reason="dashboard", actor=actor)),
+        )
         return web.json_response({"ok": True, "message": "正在关闭所有进程"})
 
     app.router.add_get("/", index)
@@ -1261,7 +1266,7 @@ async def serve(
     qr_path: Path,
     bot_url: str,
     token: str | Callable[[], str] = "",
-    on_shutdown: Callable[[], Awaitable[None]] | None = None,
+    on_shutdown: Callable[..., Awaitable[None]] | None = None,
     napcat_login: NapCatLogin | None = None,
     ops: OpsServices | None = None,
     control_token: ControlToken | None = None,

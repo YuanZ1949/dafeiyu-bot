@@ -8,12 +8,14 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import urllib.request
 import webbrowser
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 
@@ -401,6 +403,58 @@ def build_ops(
     )
 
 
+@dataclass
+class StopOrigin:
+    """进程内停止来源登记：所有停机入口都先在这里留下是谁/为什么。"""
+
+    reason: str = "unknown"
+    actor: str = "system"
+    signal: str | None = None
+
+
+def record_supervisor_stop(
+    origin: StopOrigin,
+    audit: AuditLog | None,
+    *,
+    reason: str,
+    actor: str = "system",
+    signal_name: str | None = None,
+    uptime_seconds: float | None = None,
+) -> None:
+    """登记停机来源；审计日志可用时落一条 ``supervisor.stop``。"""
+    origin.reason = reason
+    origin.actor = actor
+    origin.signal = signal_name
+    if audit is None:
+        return
+    detail: dict[str, Any] = {"reason": reason, "pid": os.getpid()}
+    if signal_name is not None:
+        detail["signal"] = signal_name
+    if uptime_seconds is not None:
+        detail["uptime_seconds"] = round(uptime_seconds, 1)
+    audit.write("supervisor.stop", actor=actor, target="supervisor", detail=detail)
+
+
+def signal_stop(
+    stop: asyncio.Event,
+    origin: StopOrigin,
+    audit: AuditLog | None,
+    signal_name: str,
+    *,
+    uptime_seconds: float | None = None,
+) -> None:
+    """SIGINT/SIGTERM 触发的停机：登记来源（system/signal）后置 stop。"""
+    record_supervisor_stop(
+        origin,
+        audit,
+        reason="signal",
+        actor="system",
+        signal_name=signal_name,
+        uptime_seconds=uptime_seconds,
+    )
+    stop.set()
+
+
 async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
     try:
         await asyncio.wait_for(stop.wait(), timeout=max(0.0, seconds))
@@ -463,16 +517,26 @@ async def backup_loop(
         await _sleep_or_stop(stop, interval)
 
 
-def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop: asyncio.Event) -> None:
-    def request() -> None:
+def _install_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    stop: asyncio.Event,
+    on_signal: Callable[[str], None] | None = None,
+) -> None:
+    def request(sig_name: str = "") -> None:
+        if on_signal is not None and sig_name:
+            on_signal(sig_name)
         stop.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
+        name = signal.Signals(sig).name
         try:
-            loop.add_signal_handler(sig, request)
+            loop.add_signal_handler(sig, request, name)
         except (NotImplementedError, RuntimeError, ValueError):
             try:
-                signal.signal(sig, lambda *_: loop.call_soon_threadsafe(request))
+                signal.signal(
+                    sig,
+                    lambda *_, _name=name: loop.call_soon_threadsafe(request, _name),
+                )
             except (ValueError, OSError):
                 pass
 
@@ -574,7 +638,25 @@ async def run() -> int:
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    _install_signal_handlers(loop, stop)
+    started_at = time.monotonic()
+    # 停止来源登记：ops（含 audit）要到 build_ops 之后才可用，先用 holder 持有，
+    # 闭包里每次现读，避免时序问题导致审计丢失。
+    stop_origin = StopOrigin()
+    audit_holder: list[AuditLog | None] = [None]
+
+    def uptime_seconds() -> float:
+        return time.monotonic() - started_at
+
+    def on_signal(name: str) -> None:
+        signal_stop(
+            stop,
+            stop_origin,
+            audit_holder[0],
+            name,
+            uptime_seconds=uptime_seconds(),
+        )
+
+    _install_signal_handlers(loop, stop, on_signal)
 
     # 双开拦截：pid 文件 + dashboard 端口占用。Windows 的 SO_REUSEADDR
     # 会让两个进程同时绑定同一端口，不能只靠 bind 失败来发现。
@@ -597,7 +679,17 @@ async def run() -> int:
 
     bot_url = f"http://{settings.supervisor.control_host}:{settings.supervisor.control_port}"
 
-    async def request_shutdown() -> None:
+    async def request_shutdown(
+        reason: str = "unknown",
+        actor: str = "system",
+    ) -> None:
+        record_supervisor_stop(
+            stop_origin,
+            audit_holder[0],
+            reason=reason,
+            actor=actor,
+            uptime_seconds=uptime_seconds(),
+        )
         stop.set()
 
     napcat_login = NapCatLogin(load_webui_auth())
@@ -615,6 +707,7 @@ async def run() -> int:
         _eprint(f"[大肥鱼] 运维服务初始化失败：{exc}")
         _clear_pid()
         return 1
+    audit_holder[0] = ops.audit
 
     runner = await serve(
         supervisor,
@@ -644,6 +737,7 @@ async def run() -> int:
     if settings.backup.enabled:
         tasks.append(asyncio.create_task(backup_loop(ops, settings, stop), name="backup-loop"))
 
+    clean = True
     try:
         # opencode 先起、bot 后起：agent 文件若还钉着上一个档位的模型，整个
         # 会话都会用错模型（聊天错档、记忆旁路撞免费额度）。启动前按当前
@@ -651,6 +745,10 @@ async def run() -> int:
         selfheal_agent_files(settings, logs)
         await supervisor.start_all()
         await stop.wait()
+    except BaseException:
+        # 异常路径同样要收摊；clean 标记为不干净，但退出顺序保持不变。
+        clean = False
+        raise
     finally:
         for task in tasks:
             task.cancel()
@@ -661,16 +759,31 @@ async def run() -> int:
         try:
             await asyncio.wait_for(supervisor.shutdown(), timeout=45)
         except TimeoutError:
+            clean = False
             logs.write("supervisor", "停止子进程超时，强制退出")
         logs.write("supervisor", "子进程已停止，关闭 dashboard")
         try:
             await asyncio.wait_for(runner.cleanup(), timeout=15)
         except TimeoutError:
+            clean = False
             logs.write("supervisor", "dashboard 关闭超时，强制退出")
         with contextlib.suppress(Exception):
             await ops.health.close()
         _clear_pid()
         logs.write("supervisor", "已退出")
+        audit = audit_holder[0]
+        if audit is not None:
+            audit.write(
+                "supervisor.exit",
+                actor=stop_origin.actor,
+                target="supervisor",
+                detail={
+                    "reason": stop_origin.reason,
+                    "actor": stop_origin.actor,
+                    "uptime_seconds": round(uptime_seconds(), 1),
+                    "clean": clean,
+                },
+            )
     return 0
 
 

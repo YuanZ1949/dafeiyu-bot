@@ -16,6 +16,7 @@ from dafeiyu.supervisor.auth import DashboardAuth
 from dafeiyu.supervisor.control_token import ControlToken
 from dafeiyu.supervisor.dashboard import create_app
 from dafeiyu.supervisor.logs import LogHub
+from dafeiyu.supervisor.main import StopOrigin, record_supervisor_stop
 from dafeiyu.supervisor.manager import ProcSpec
 from dafeiyu.supervisor.ops import OpsServices
 
@@ -398,7 +399,7 @@ async def test_logs_download_rejects_unknown_source_and_missing_file(
 async def test_shutdown_invokes_callback(tmp_path: Path) -> None:
     called = asyncio.Event()
 
-    async def on_shutdown() -> None:
+    async def on_shutdown(**_kwargs: object) -> None:
         called.set()
 
     app, _, _ = make_app(tmp_path, on_shutdown=on_shutdown)
@@ -413,6 +414,41 @@ async def test_shutdown_without_callback_is_rejected(tmp_path: Path) -> None:
     async with running(app) as client:
         resp = await client.post("/api/shutdown", json={})
     assert resp.status == 400
+
+
+async def test_shutdown_audits_supervisor_stop(tmp_path: Path, monkeypatch) -> None:
+    """面板停机要在审计里留下 supervisor.stop：来源=dashboard + 登录用户。
+
+    这里复现 run() 的接线：dashboard 只透传 reason/actor，登记由 main 侧
+    （record_supervisor_stop，等价于 request_shutdown）完成。
+    """
+    called = asyncio.Event()
+    origin = StopOrigin()
+    audit_slot: list[AuditLog] = []
+
+    async def on_shutdown(reason: str, actor: str) -> None:
+        record_supervisor_stop(origin, audit_slot[0], reason=reason, actor=actor)
+        called.set()
+
+    app, _supervisor, _ops, audit, _holder = make_rotate_app(
+        tmp_path, monkeypatch, auth=make_auth(True), on_shutdown=on_shutdown
+    )
+    audit_slot.append(audit)
+    async with running(app) as client:
+        await login(client)
+        resp = await client.post("/api/shutdown", json={})
+        assert resp.status == 200
+        await asyncio.wait_for(called.wait(), timeout=2.0)
+
+    rows = audit.query(20)
+    stops = [row for row in rows if row["action"] == "supervisor.stop"]
+    assert len(stops) == 1
+    assert stops[0]["result"] == "ok"
+    assert stops[0]["actor"].startswith("dashboard:admin@")
+    assert stops[0]["detail"]["reason"] == "dashboard"
+    assert origin.reason == "dashboard"
+    # HTTP 级 shutdown 记录保留，supervisor.stop 是统一的停止来源。
+    assert any(row["action"] == "shutdown" for row in rows)
 
 async def test_open_log_stream_does_not_block_cleanup(tmp_path: Path) -> None:
     """SSE 长连接不能挡住 runner.cleanup()，否则退出会卡满 shutdown_timeout。"""
@@ -567,6 +603,7 @@ def make_rotate_app(
     token: str = "old-token",
     supervisor=None,
     bot_url: str = BOT_URL,
+    on_shutdown=None,
 ):
     monkeypatch.setattr(control_token, "harden_token_file", lambda _path: None)
     supervisor = supervisor or RotateSupervisor(token)
@@ -582,6 +619,7 @@ def make_rotate_app(
         qr_path=tmp_path / "qrcode.png",
         bot_url=bot_url,
         token=lambda: holder.value,
+        on_shutdown=on_shutdown,
         auth=auth or make_auth(False),
         ops=ops,
         control_token=holder,

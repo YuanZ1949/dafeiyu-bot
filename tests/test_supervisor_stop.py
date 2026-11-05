@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -9,7 +10,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from dafeiyu.supervisor import stop as stop_mod
+from dafeiyu.supervisor.audit import AuditLog
 from dafeiyu.supervisor.auth import COOKIE_NAME
+from dafeiyu.supervisor.main import StopOrigin, signal_stop
 
 
 def _fake_dashboard(*, login_status: int, require_cookie: bool):
@@ -268,3 +271,35 @@ async def test_stop_forces_when_shutdown_unavailable(tmp_path):
     assert result.method == "forced"
     assert time.monotonic() - started < 15
     assert not path.exists()
+
+
+async def test_signal_stop_writes_supervisor_stop_audit(tmp_path):
+    """SIGINT/SIGTERM 的等价回调：来源=system/signal，审计带 signal 名称。"""
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    stop = asyncio.Event()
+    origin = StopOrigin()
+
+    signal_stop(stop, origin, audit, "SIGTERM", uptime_seconds=12.3)
+
+    assert stop.is_set()
+    rows = [row for row in audit.query(10) if row["action"] == "supervisor.stop"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["actor"] == "system"
+    assert row["result"] == "ok"
+    assert row["detail"]["reason"] == "signal"
+    assert row["detail"]["signal"] == "SIGTERM"
+    assert row["detail"]["uptime_seconds"] == 12.3
+
+
+async def test_signal_stop_without_audit_still_records_origin():
+    """审计不可用（ops 还没建好）时也要在进程内登记来源。"""
+    stop = asyncio.Event()
+    origin = StopOrigin()
+
+    signal_stop(stop, origin, None, "SIGINT")
+
+    assert stop.is_set()
+    assert origin.reason == "signal"
+    assert origin.actor == "system"
+    assert origin.signal == "SIGINT"
