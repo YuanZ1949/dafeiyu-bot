@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 import zstandard
@@ -72,6 +74,14 @@ class PathOnlyMirrors:
 
     def path_for(self, rel: str) -> Path:
         return self.root / rel
+
+
+class DbRootMirrors(PathOnlyMirrors):
+    """额外暴露 ``db_root``：4.x attach 目录从它推出来。"""
+
+    @property
+    def db_root(self) -> Path:
+        return self.root
 
 
 # ------------------------------------------------------------------ 夹具构建
@@ -900,6 +910,208 @@ def test_media_absent_index_db_is_fail_open(tmp_path: Path) -> None:
 
     assert row["text"] == "[图片]"
     assert "media" not in row
+
+# ------------------------------------ 4.x: message_resource + attach 目录约定
+# 真实 4.x 库没有路径列：md5 藏在 `MessageResourceInfo.packed_info`，文件按
+# `msg/attach/<md5(chat)>/<YYYY-MM>/Img/<md5>[_h|_t].dat` 落盘。
+RESOURCE_INFO_DDL = """
+CREATE TABLE MessageResourceInfo(
+    message_id INTEGER, chat_id INTEGER, sender_id INTEGER,
+    message_local_type INTEGER, message_create_time INTEGER,
+    message_local_id INTEGER, message_svr_id INTEGER,
+    message_origin_source INTEGER, packed_info BLOB
+)
+"""
+
+RESOURCE_DETAIL_DDL = """
+CREATE TABLE MessageResourceDetail(
+    resource_id INTEGER PRIMARY KEY, message_id INTEGER, type INTEGER, size INTEGER
+)
+"""
+
+IMAGE_MD5 = "0123456789abcdef0123456789abcdef"
+STICKER_MD5 = "fedcba9876543210fedcba9876543210"
+ATTACH_PAYLOAD = b"\x07\x08V2payload"
+
+
+def make_resource_db(
+    path: Path,
+    *,
+    infos: list[tuple[int, int, str]],
+    details: list[tuple[int, int]],
+) -> None:
+    """``infos``: (message_id, message_local_id, md5)；
+    ``details``: (message_id, type)，type 131073/65537/262145。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as con:
+        con.execute(RESOURCE_INFO_DDL)
+        con.execute(RESOURCE_DETAIL_DDL)
+        for message_id, local_id, digest in infos:
+            # 与真实 blob 同形：protobuf 字段头 + 后面跟着 32 位 hex md5。
+            packed = b'\x12"\n ' + digest.encode("ascii")
+            con.execute(
+                "INSERT INTO MessageResourceInfo"
+                "(message_id, message_local_id, packed_info) VALUES (?, ?, ?)",
+                (message_id, local_id, packed),
+            )
+        con.executemany(
+            "INSERT INTO MessageResourceDetail(message_id, type, size) "
+            "VALUES (?, ?, 0)",
+            details,
+        )
+
+
+def build_attach_store(
+    tmp_path: Path,
+    *,
+    infos: list[tuple[int, int, str]],
+    details: list[tuple[int, int]],
+    files: dict[str, bytes],
+    with_resource_db: bool = True,
+) -> tuple[LocalMessageStore, Path]:
+    root = tmp_path / "mirror"
+    make_contact_db(
+        root / "contact/contact.db",
+        contacts=[(GROUP, "", GROUP_NAME)],
+    )
+    make_message_db(
+        root / "message/message_0.db",
+        name2id={1: GROUP, 2: SELF},
+        tables={GROUP: [(3, 2, 1000, "", 0), (47, 2, 1001, "", 0)]},
+    )
+    if with_resource_db:
+        make_resource_db(
+            root / "message/message_resource.db", infos=infos, details=details
+        )
+    attach = (
+        root.parent
+        / "msg"
+        / "attach"
+        / hashlib.md5(GROUP.encode("utf-8")).hexdigest()
+        / "2026-11"
+        / "Img"
+    )
+    attach.mkdir(parents=True, exist_ok=True)
+    for name, payload in files.items():
+        (attach / name).write_bytes(payload)
+    store = LocalMessageStore(
+        DbRootMirrors(root),
+        self_username=SELF,
+        self_display_name=SELF_NAME,
+        message_rels=["message/message_0.db"],
+        media_enabled=True,
+        media_max_bytes=1024 * 1024,
+    )
+    return store, attach
+
+
+def _media_by_text(store: LocalMessageStore) -> dict[str, Any]:
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+    return {row["text"]: row for row in store.recent(ref, 10)}
+
+
+def test_resource_attach_discovers_image_and_sticker(tmp_path: Path) -> None:
+    store, attach = build_attach_store(
+        tmp_path,
+        infos=[(101, 1, IMAGE_MD5), (102, 2, STICKER_MD5)],
+        details=[(101, 262145), (102, 262145)],
+        files={
+            f"{IMAGE_MD5}_t.dat": ATTACH_PAYLOAD,
+            f"{STICKER_MD5}_t.dat": ATTACH_PAYLOAD,
+        },
+    )
+
+    rows = _media_by_text(store)
+
+    image = rows["[图片]"]
+    assert image["media"]["kind"] == "image"
+    assert Path(image["media"]["path"]) == (attach / f"{IMAGE_MD5}_t.dat").resolve()
+
+    sticker = rows["[表情]"]
+    assert sticker["media"]["kind"] == "image"
+    assert Path(sticker["media"]["path"]) == (
+        attach / f"{STICKER_MD5}_t.dat"
+    ).resolve()
+
+
+def test_resource_attach_prefers_readable_variant_over_original(
+    tmp_path: Path,
+) -> None:
+    # 4.x 原图解密后是 wxgf（read 打不开）；有 `_t` 时优先 `_t`。
+    store, attach = build_attach_store(
+        tmp_path,
+        infos=[(101, 1, IMAGE_MD5)],
+        details=[(101, 131073), (101, 262145)],
+        files={
+            f"{IMAGE_MD5}.dat": b"wxgf-original",
+            f"{IMAGE_MD5}_t.dat": b"thumb",
+        },
+    )
+
+    row = _media_by_text(store)["[图片]"]
+
+    assert Path(row["media"]["path"]) == (attach / f"{IMAGE_MD5}_t.dat").resolve()
+
+
+def test_resource_attach_prefers_high_variant(tmp_path: Path) -> None:
+    store, attach = build_attach_store(
+        tmp_path,
+        infos=[(101, 1, IMAGE_MD5)],
+        details=[(101, 131073), (101, 65537), (101, 262145)],
+        files={
+            f"{IMAGE_MD5}.dat": b"wxgf-original",
+            f"{IMAGE_MD5}_h.dat": b"high",
+            f"{IMAGE_MD5}_t.dat": b"thumb",
+        },
+    )
+
+    row = _media_by_text(store)["[图片]"]
+
+    assert Path(row["media"]["path"]) == (attach / f"{IMAGE_MD5}_h.dat").resolve()
+
+
+def test_resource_attach_falls_back_when_original_missing(tmp_path: Path) -> None:
+    # 详情库声称有原图（131073），但磁盘上只有缩略图：以磁盘为准。
+    store, attach = build_attach_store(
+        tmp_path,
+        infos=[(101, 1, IMAGE_MD5)],
+        details=[(101, 131073), (101, 262145)],
+        files={f"{IMAGE_MD5}_t.dat": ATTACH_PAYLOAD},
+    )
+
+    row = _media_by_text(store)["[图片]"]
+
+    assert Path(row["media"]["path"]) == (attach / f"{IMAGE_MD5}_t.dat").resolve()
+
+
+def test_resource_attach_missing_file_keeps_placeholder(tmp_path: Path) -> None:
+    store, _ = build_attach_store(
+        tmp_path,
+        infos=[(101, 1, IMAGE_MD5)],
+        details=[(101, 262145)],
+        files={},
+    )
+
+    row = _media_by_text(store)["[图片]"]
+
+    assert "media" not in row
+
+
+def test_resource_absent_db_is_fail_open(tmp_path: Path) -> None:
+    store, _ = build_attach_store(
+        tmp_path,
+        infos=[(101, 1, IMAGE_MD5)],
+        details=[(101, 262145)],
+        files={f"{IMAGE_MD5}_t.dat": ATTACH_PAYLOAD},
+        with_resource_db=False,
+    )
+
+    rows = _media_by_text(store)
+
+    assert set(rows) == {"[图片]", "[表情]"}
+    assert "media" not in rows["[图片]"]
+    assert "media" not in rows["[表情]"]
 
 # ------------------------------------------------- 4. 好友私聊（wxid_*）
 FRIEND = "wxid_friend"

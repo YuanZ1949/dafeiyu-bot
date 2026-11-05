@@ -126,6 +126,16 @@ _MEDIA_KIND_BY_TYPE: dict[int, str] = {3: "image", 34: "voice", 43: "video", 47:
 #: 已知的微信媒体索引库（仓库里没有可验证的 schema，按「存在才读」适配）。
 _MEDIA_REL = "message/message_resource.db"
 
+#: 变体优先级：`_h` > `_t` > 原图；磁盘上没有时才退到下一档。
+#:
+#: 4.x 的原图（无后缀 `.dat`）解密后多是微信私有的 ``wxgf`` 容器，``read``
+#: 工具读不了；`_h` / `_t` 才是标准 JPEG/PNG。这里按「模型能不能真看到」
+#: 排序，而不是按分辨率排序。
+_VARIANT_ORDER: tuple[str, ...] = ("_h", "_t", "")
+
+#: 从 `packed_info` protobuf blob 里捞 32 位 hex md5（前后不能再接 hex 字符）。
+_MD5_IN_BLOB_RE = re.compile(rb"(?<![0-9a-fA-F])[0-9a-fA-F]{32}(?![0-9a-fA-F])")
+
 #: 表名优先级；实际列名在运行时从 schema 读，绝不按固定 DDL 假设。
 _MEDIA_TABLE_PRIORITY = (
     "message_resource",
@@ -355,7 +365,7 @@ class LocalMessageStore:
                 log.debug("读取 %s.%s 失败：%s", shard, table, exc)
                 return []
             media_raw = (
-                self._media_rows(con, [_safe_int(row[0]) for row in rows])
+                self._media_rows(con, [_safe_int(row[0]) for row in rows], username)
                 if self._media_enabled
                 else {}
             )
@@ -572,12 +582,17 @@ class LocalMessageStore:
 
     # ------------------------------------------------------------- 媒体元数据
     def _media_rows(
-        self, con: sqlite3.Connection, local_ids: Sequence[int]
+        self,
+        con: sqlite3.Connection,
+        local_ids: Sequence[int],
+        username: str = "",
     ) -> dict[int, dict[str, Any]]:
         """``local_id -> {path,name,size,duration}``；任何失败都返回空。
 
         schema 不可验证（仓库里没有真实媒体库）：只在**确实存在**的表里按列名
-        适配，读不到就当没有媒体，绝不猜路径。
+        适配，读不到就当没有媒体，绝不猜路径。除旧库的路径列外，再按 4.x 的
+        ``MessageResourceInfo.packed_info`` + attach 目录约定补一份来源；新来源
+        只补缺，不覆盖已经从路径列读到的结果。
         """
         wanted = {_safe_int(value) for value in local_ids}
         wanted.discard(0)
@@ -591,7 +606,123 @@ class LocalMessageStore:
                     found.update(self._query_media_tables(resource_con, wanted))
             except (sqlite3.Error, OSError) as exc:
                 log.debug("打开媒体索引库失败：%s", exc)
+        for key, value in self._resource_media(wanted, username).items():
+            found.setdefault(key, value)
         return found
+
+    def _resource_media(
+        self, ids: set[int], username: str
+    ) -> dict[int, dict[str, Any]]:
+        """从 ``message_resource.db`` 的 md5 推 attach 路径；失败一律返回空。
+
+        4.x 的实际布局是 ``msg/attach/<md5(chat)>/<YYYY-MM>/Img/<md5>[_h|_t].dat``，
+        索引库里没有路径列，只有 ``packed_info`` blob 里的 md5。这里只负责
+        「算出候选路径并确认磁盘上确实有文件」，最终是否放行仍交给
+        :meth:`_media_meta`（root 越界/大小校验都在那里）。
+        """
+        if not username or not ids:
+            return {}
+        try:
+            resource = self._mirror_path(_MEDIA_REL)
+            if resource is None:
+                return {}
+            with closing(_connect(resource)) as con:
+                columns_by_table = _table_columns(con)
+                info_table = _table_named(columns_by_table, "MessageResourceInfo")
+                if info_table is None:
+                    return {}
+                info_columns = {name.lower(): name for name in columns_by_table[info_table]}
+                local_column = info_columns.get("message_local_id")
+                packed_column = info_columns.get("packed_info")
+                if local_column is None or packed_column is None:
+                    return {}
+                message_id_column = info_columns.get("message_id")
+                chat_column = info_columns.get("chat_id")
+
+                placeholders = ",".join("?" for _ in ids)
+                quoted_local = f'"{_quote_ident(local_column)}"'
+                quoted_packed = f'"{_quote_ident(packed_column)}"'
+                quoted_message_id = (
+                    f'"{_quote_ident(message_id_column)}"'
+                    if message_id_column is not None
+                    else "NULL"
+                )
+                where = f"{quoted_local} IN ({placeholders})"
+                params: list[Any] = sorted(ids)
+                # `message_local_id` 只在单个会话内唯一；能定位到 chat_id 时必须
+                # 一起过滤，否则会把别的会话的同号媒体串过来。定位失败则退回
+                # 只按 local_id 查（fail-open，最多多一次磁盘探测）。
+                chat_id = (
+                    self._chat_rowid(con, columns_by_table, username)
+                    if chat_column is not None
+                    else None
+                )
+                if chat_column is not None and chat_id is not None:
+                    where += f' AND "{_quote_ident(chat_column)}" = ?'
+                    params.append(chat_id)
+                rows = con.execute(
+                    f"SELECT {quoted_local}, {quoted_message_id}, {quoted_packed} "
+                    f'FROM "{_quote_ident(info_table)}" '
+                    f"WHERE {where}",
+                    tuple(params),
+                ).fetchall()
+
+                root = self._media_root()
+                if root is None:
+                    return {}
+                base = (
+                    Path(root)
+                    / "msg"
+                    / "attach"
+                    / hashlib.md5(username.encode("utf-8")).hexdigest()
+                )
+                found: dict[int, dict[str, Any]] = {}
+                for local_id, _message_id, packed in rows:
+                    key = _safe_int(local_id)
+                    digest = _blob_md5(packed)
+                    if not key or not digest:
+                        continue
+                    path = _attach_file(base, digest)
+                    if path is not None:
+                        found[key] = {
+                            "path": str(path),
+                            "name": path.name,
+                            "size": 0,
+                            "duration": 0,
+                        }
+                return found
+        except Exception as exc:  # noqa: BLE001 - 媒体发现永远不能打断消息读取
+            log.debug("从 message_resource.db 推导媒体路径失败：%s", exc)
+            return {}
+
+    def _chat_rowid(
+        self,
+        con: sqlite3.Connection,
+        columns_by_table: dict[str, set[str]],
+        username: str,
+    ) -> int | None:
+        """``ChatName2Id`` 里 ``username`` 对应的 rowid（即 ``chat_id``）。
+
+        表结构是 ``(user_name, update_time)``，会话 id 就是 rowid。缺表/缺列/
+        查不到都返回 None，调用方据此跳过会话过滤。
+        """
+        table = _table_named(columns_by_table, "ChatName2Id")
+        if table is None:
+            return None
+        columns = {name.lower(): name for name in columns_by_table[table]}
+        name_column = columns.get("user_name") or columns.get("username")
+        if name_column is None:
+            return None
+        try:
+            row = con.execute(
+                f'SELECT rowid FROM "{_quote_ident(table)}" '
+                f'WHERE "{_quote_ident(name_column)}" = ? LIMIT 1',
+                (username,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            log.debug("解析 ChatName2Id 失败：%s", exc)
+            return None
+        return _safe_int(row[0]) if row is not None else None
 
     def _query_media_tables(
         self, con: sqlite3.Connection, ids: set[int]
@@ -683,7 +814,8 @@ class LocalMessageStore:
         if root is None:
             return None
         try:
-            return Path(root)
+            # `db_root` 是 `db_storage`；4.x 的 attach 在账号根（它的父目录）下。
+            return Path(root).parent
         except TypeError:
             return None
 
@@ -919,6 +1051,48 @@ def _first_present(columns: set[str], candidates: Sequence[str]) -> str | None:
         found = lowered.get(candidate.lower())
         if found is not None:
             return found
+    return None
+
+
+def _table_named(columns_by_table: dict[str, set[str]], name: str) -> str | None:
+    """按大小写不敏感的表名精确匹配；找不到返回 None。"""
+    wanted = name.lower()
+    for table in columns_by_table:
+        if table.lower() == wanted:
+            return table
+    return None
+
+
+def _blob_md5(value: Any) -> str:
+    """从 ``packed_info`` protobuf blob 中取第一个 32 位 hex md5（小写）。"""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        data = bytes(value)
+    elif isinstance(value, str):
+        data = value.encode("utf-8", "ignore")
+    else:
+        return ""
+    match = _MD5_IN_BLOB_RE.search(data)
+    return match.group(0).decode("ascii").lower() if match is not None else ""
+
+
+def _attach_file(base: Path, digest: str) -> Path | None:
+    """在 ``<base>/<YYYY-MM>/Img/`` 下按变体优先级找第一个真实文件。
+
+    优先级见 :data:`_VARIANT_ORDER`：可被 ``read`` 直接打开的 ``_h`` / ``_t``
+    排在微信私有的原图（``wxgf``）之前；磁盘上不存在才退到下一档。
+    """
+    for suffix in _VARIANT_ORDER:
+        try:
+            matches = sorted(base.glob(f"*/Img/{digest}{suffix}.dat"))
+        except OSError as exc:
+            log.debug("枚举 attach 目录失败：%s", exc)
+            continue
+        for match in matches:
+            try:
+                if match.is_file():
+                    return match
+            except OSError as exc:
+                log.debug("检查 attach 文件失败：%s", exc)
     return None
 
 
