@@ -44,6 +44,10 @@ EPISODE_PHASES: tuple[str, ...] = (
     "closed",
 )
 EPISODE_STATUSES: tuple[str, ...] = ("open", "closed", "stale")
+# 可注入的阶段：closed 已经收尾，旧库里未知的残值也不该进 prompt。
+INJECTABLE_EPISODE_PHASES: tuple[str, ...] = tuple(
+    phase for phase in EPISODE_PHASES if phase != "closed"
+)
 OPEN_LOOP_KINDS: tuple[str, ...] = ("question", "promise", "plan", "running_joke")
 
 # 所有带 chat_type / chat_id 列的「会话派生表」：forget_chat 逐表按会话清除。
@@ -2516,6 +2520,32 @@ class Store:
             (chat_type.value, chat_id, status),
         ).fetchone()
         return None if row is None else self._row_to_episode(row)
+
+    def episodes_for_injection(
+        self, chat_type: ChatType, chat_id: str, limit: int = 3
+    ) -> list[Episode]:
+        """注入用的 episode：只取 open 且阶段未收尾的，按重要度倒序。
+
+        重要度高的先占注入预算；同分取新的。低分的在同预算下先被截断，
+        closed/stale 的留在库里回看，不再进 prompt。
+        """
+        placeholders = ", ".join("?" for _ in INJECTABLE_EPISODE_PHASES)
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM episodes
+            WHERE chat_type = ? AND chat_id = ? AND status = 'open'
+              AND phase IN ({placeholders})
+            ORDER BY importance DESC, id DESC
+            LIMIT ?
+            """,
+            (
+                chat_type.value,
+                chat_id,
+                *INJECTABLE_EPISODE_PHASES,
+                max(0, limit),
+            ),
+        ).fetchall()
+        return [self._row_to_episode(r) for r in rows]
 
     def episodes_between(
         self,

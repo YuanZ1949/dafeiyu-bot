@@ -1,16 +1,21 @@
 
 import pytest
 
+from dafeiyu.config import InjectionConfig
 from dafeiyu.memory.context import (
     CONTEXT_BUDGET,
+    INJECTION_BOUNDARY,
+    INJECTION_EPISODE_HEADER,
+    INJECTION_OPEN_LOOP_HEADER,
     OUTPUT_RESERVE,
     SYSTEM_MAX_TOKENS,
     ContextBundle,
     build_context,
+    build_injection,
     estimate_tokens,
 )
 from dafeiyu.memory.store import Store
-from dafeiyu.models import ChatType, Message
+from dafeiyu.models import ChatType, Episode, Message, OpenLoop
 
 GROUP = ChatType.GROUP
 CHAT = 10001
@@ -124,3 +129,154 @@ def test_estimated_tokens_never_reports_under_budget(store: Store) -> None:
         estimate_tokens(m["content"]) for m in bundle.messages
     )
     assert bundle.estimated_tokens <= CONTEXT_BUDGET - OUTPUT_RESERVE
+
+
+# ---- episodes 注入：importance / phase / mood ---------------------------
+
+CHAT_ID = str(CHAT)
+
+
+def _seed_episode(
+    store: Store,
+    *,
+    start: str,
+    topic: str,
+    summary: str,
+    importance: float = 0.5,
+    mood: str = "",
+    phase: str = "discussion",
+) -> int:
+    return store.save_episode(
+        Episode(
+            chat_type=GROUP,
+            chat_id=CHAT_ID,
+            start_message_id=start,
+            last_message_id=start,
+            topic=topic,
+            summary=summary,
+            importance=importance,
+            mood=mood,
+            phase=phase,
+            started_at=100,
+        )
+    )
+
+
+def _episode_body(text: str) -> str:
+    prefix = f"{INJECTION_EPISODE_HEADER}\n{INJECTION_BOUNDARY}\n"
+    return text.split(prefix, 1)[1]
+
+
+def test_episodes_order_by_importance_and_truncate_low_first(store: Store) -> None:
+    """重要度高的先占预算；同预算下低分的先被截掉。"""
+    _seed_episode(store, start="m1", topic="低分", summary="低分摘要", importance=0.1)
+    _seed_episode(store, start="m3", topic="高分", summary="高分摘要", importance=0.9)
+    _seed_episode(store, start="m2", topic="中分", summary="中分摘要", importance=0.5)
+    cfg = InjectionConfig(inject_episodes=True, episode_chars=16)
+
+    text = build_injection(store, None, GROUP, CHAT_ID, cfg, today="2026-10-24")
+
+    assert text.index("高分：高分摘要") < text.index("中分：中分摘要")
+    assert "低分" not in text
+    assert len(_episode_body(text)) <= 16
+
+
+def test_episodes_skip_closed_and_invalid_phases(store: Store) -> None:
+    """closed 阶段和旧库里的脏 phase 都不进注入。"""
+    _seed_episode(
+        store, start="m1", topic="已收尾", summary="不看了", importance=0.99, phase="closed"
+    )
+    _seed_episode(store, start="m2", topic="进行中", summary="还在聊", importance=0.1)
+    dirty = _seed_episode(store, start="m3", topic="脏阶段", summary="旧数据", importance=0.8)
+    store._conn.execute("UPDATE episodes SET phase = 'mystery' WHERE id = ?", (dirty,))
+    store._conn.commit()
+    cfg = InjectionConfig(inject_episodes=True)
+
+    text = build_injection(store, None, GROUP, CHAT_ID, cfg, today="2026-10-24")
+
+    assert "进行中：还在聊" in text
+    assert "已收尾" not in text
+    assert "脏阶段" not in text
+
+
+def test_episode_mood_is_a_separate_observation_line(store: Store) -> None:
+    _seed_episode(store, start="m1", topic="鱼缸", summary="水草", mood="轻松愉快")
+    cfg = InjectionConfig(inject_episodes=True)
+
+    text = build_injection(store, None, GROUP, CHAT_ID, cfg, today="2026-10-24")
+
+    assert "群气氛：轻松愉快" in text
+    assert text.index(INJECTION_EPISODE_HEADER) < text.index("群气氛：")
+
+
+def test_episode_without_mood_has_no_empty_mood_line(store: Store) -> None:
+    """没有 mood 时输出保持原样，不写「群气氛：」。"""
+    _seed_episode(store, start="m1", topic="鱼缸", summary="水草", mood="  ")
+    cfg = InjectionConfig(inject_episodes=True)
+
+    text = build_injection(store, None, GROUP, CHAT_ID, cfg, today="2026-10-24")
+
+    assert "鱼缸：水草" in text
+    assert "群气氛" not in text
+
+
+def test_episode_mood_fits_episode_chars_budget(store: Store) -> None:
+    """mood 行也从 episode_chars 里出，不能把预算撑破。"""
+    _seed_episode(
+        store,
+        start="m1",
+        topic="鱼缸",
+        summary="很长的讨论" * 20,
+        mood="紧张",
+    )
+    cfg = InjectionConfig(inject_episodes=True, episode_chars=20)
+
+    text = build_injection(store, None, GROUP, CHAT_ID, cfg, today="2026-10-24")
+
+    body = _episode_body(text)
+    assert len(body) <= 20
+    assert "群气氛：紧张" in body
+
+
+# ---- open_loops 注入：kind 话术分流 -------------------------------------
+
+
+def test_open_loop_kind_uses_specific_phrasing(store: Store) -> None:
+    store.add_open_loop(OpenLoop(GROUP, CHAT_ID, "question", "显卡怎么装"))
+    store.add_open_loop(OpenLoop(GROUP, CHAT_ID, "promise", "周末发照片"))
+    store.add_open_loop(OpenLoop(GROUP, CHAT_ID, "running_joke", "鱼片梗"))
+    store.add_open_loop(OpenLoop(GROUP, CHAT_ID, "plan", "周末去钓鱼"))
+    cfg = InjectionConfig(inject_open_loops=True, open_loop_topk=4)
+
+    text = build_injection(store, None, GROUP, CHAT_ID, cfg, today="2026-10-24")
+
+    assert INJECTION_OPEN_LOOP_HEADER in text
+    assert "- 显卡怎么装（等答复）" in text
+    assert "- 周末发照片（等兑现）" in text
+    assert "- 鱼片梗（延续梗）" in text
+    # plan 不在本轮话术表里，保持原来的纯内容文案。
+    assert "- 周末去钓鱼" in text
+    assert "- 周末去钓鱼（" not in text
+
+
+def test_open_loop_unknown_kind_falls_back_to_plain_line(store: Store) -> None:
+    """旧库里的未知 kind 不猜口吻，按原样输出。"""
+    loop_id = store.add_open_loop(OpenLoop(GROUP, CHAT_ID, "question", "旧库脏数据"))
+    store._conn.execute(
+        "UPDATE open_loops SET kind = ? WHERE id = ?", ("mystery", loop_id)
+    )
+    store._conn.commit()
+    cfg = InjectionConfig(inject_open_loops=True)
+
+    text = build_injection(store, None, GROUP, CHAT_ID, cfg, today="2026-10-24")
+
+    assert "- 旧库脏数据" in text
+    assert "- 旧库脏数据（" not in text
+
+
+def test_mind_injection_empty_store_stays_empty(store: Store) -> None:
+    cfg = InjectionConfig(inject_episodes=True, inject_open_loops=True)
+
+    text = build_injection(store, None, GROUP, CHAT_ID, cfg, today="2026-10-24")
+
+    assert text == ""

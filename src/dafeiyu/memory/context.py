@@ -41,6 +41,10 @@ INJECTION_RECALL_HEADER = "【相关旧记忆】"
 # 注入受 memory.inject_episodes / memory.inject_open_loops 控制，默认关。
 INJECTION_EPISODE_HEADER = "【正在聊的事】"
 INJECTION_OPEN_LOOP_HEADER = "【没有下文的事】"
+# 一次最多注入几段 episode：重要度高的在前，低分的先被 episode_chars 截断。
+EPISODE_MAX_ITEMS = 3
+# 群气氛只作为观察段里的一行提示，不写进「系统指令」。
+EPISODE_MOOD_PREFIX = "群气氛："
 # 关系卡与本鱼近况（P1）：数据由 Reflector / 规则写，注入受 mind 总闸控制。
 INJECTION_RELATION_HEADER = "【你和他】"
 INJECTION_STATE_HEADER = "【本鱼的近况】"
@@ -308,25 +312,65 @@ def _focus_user_ids(
 def _episode_block(
     store: Store, chat_type: ChatType, chat_id: str, cfg: InjectionConfig
 ) -> str:
-    """正在聊的事：一句话题 + 两三句进展。只取最新一条 open。"""
-    episode = store.latest_episode(chat_type, chat_id)
-    if episode is None:
+    """正在聊的事：按重要度取最近几段，重要的先占预算。
+
+    mood 只取最靠前那段的「群气氛」，单独占一行；没有就整行省略，
+    不写空串。episode 正文先让出 mood 行的额度，保证预算仍由
+    episode_chars 封顶。
+    """
+    episodes = store.episodes_for_injection(chat_type, chat_id, EPISODE_MAX_ITEMS)
+    lines: list[str] = []
+    for episode in episodes:
+        topic = episode.topic.strip()
+        summary = episode.summary.strip()
+        text = f"{topic}：{summary}" if topic and summary else (topic or summary)
+        if text:
+            lines.append(text)
+    if not lines:
         return ""
-    topic = episode.topic.strip()
-    summary = episode.summary.strip()
-    text = f"{topic}：{summary}" if topic and summary else (topic or summary)
-    return _clip(text, cfg.episode_chars)
+
+    mood = episodes[0].mood.strip()
+    mood_line = f"{EPISODE_MOOD_PREFIX}{mood}" if mood else ""
+    if not mood_line:
+        return _clip("\n".join(lines), cfg.episode_chars)
+
+    room = cfg.episode_chars - len(mood_line) - 1
+    if room <= 0:
+        return _clip(mood_line, cfg.episode_chars)
+    body = _clip("\n".join(lines), room)
+    if not body:
+        return _clip(mood_line, cfg.episode_chars)
+    return f"{body}\n{mood_line}"
+
+
+# open_loop 的 kind 决定接话口吻；plan / 未知值保持原来的纯内容文案。
+OPEN_LOOP_KIND_LABELS: dict[str, str] = {
+    "question": "等答复",
+    "promise": "等兑现",
+    "running_joke": "延续梗",
+}
 
 
 def _open_loop_block(
-    store: Store, chat_type: ChatType, chat_id: str, cfg: InjectionConfig
+    store: Store,
+    chat_type: ChatType,
+    chat_id: str,
+    cfg: InjectionConfig,
+    *,
+    with_kind: bool = True,
 ) -> str:
-    """没有下文的事：一句一行，只给 1–3 条，别把 prompt 塞成待办列表。"""
-    lines = [
-        f"- {loop.content.strip()}"
-        for loop in store.open_loops(chat_type, chat_id, cfg.open_loop_topk)
-        if loop.content.strip()
-    ]
+    """没有下文的事：一句一行，只给 1–3 条，别把 prompt 塞成待办列表。
+
+    kind 只加一个括号后缀说明「这条在等什么」，不改变原来的条目主体；
+    未知 kind、老数据和预算极紧时（with_kind=False）仍按原样输出。
+    """
+    lines: list[str] = []
+    for loop in store.open_loops(chat_type, chat_id, cfg.open_loop_topk):
+        content = loop.content.strip()
+        if not content:
+            continue
+        label = OPEN_LOOP_KIND_LABELS.get(loop.kind) if with_kind else None
+        lines.append(f"- {content}（{label}）" if label else f"- {content}")
     return _clip("\n".join(lines), cfg.open_loop_chars)
 
 
@@ -450,6 +494,17 @@ def _mind_blocks(
             break
         if sum(len(body) for _, body in blocks.values()) <= budget:
             break
+        # 轮到「没有下文的事」且预算紧到装不下 kind 后缀时，先退回原来的
+        # 纯内容文案，再考虑整段丢弃：话术是锦上添花，不能把整段挤掉。
+        if name == "loops" and "loops" in blocks:
+            head = blocks["loops"][0]
+            plain = _open_loop_block(
+                store, chat_type, chat_id, cfg, with_kind=False
+            )
+            if plain:
+                blocks["loops"] = (head, plain)
+                if sum(len(body) for _, body in blocks.values()) <= budget:
+                    break
         blocks.pop(name, None)
     if blocks and sum(len(body) for _, body in blocks.values()) > budget:
         # 只剩一段仍超预算（或预算小到必须截断），只截数据体，不截标题。
