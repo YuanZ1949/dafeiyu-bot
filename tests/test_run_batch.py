@@ -83,12 +83,14 @@ class FakeBrain:
         *,
         speak: bool = True,
         text: str = "在呢",
+        parts: tuple[str, ...] = (),
         error: bool = False,
         fire_tool: bool = False,
         summary: str = "大家在聊鱼缸和水草",
     ) -> None:
         self.speak = speak
         self.text = text
+        self.parts = parts
         self.error = error
         self.fire_tool = fire_tool
         self.summary = summary
@@ -109,7 +111,7 @@ class FakeBrain:
             await on_tool("webfetch")
         if self.error:
             raise BrainError("boom")
-        return BrainReply(self.speak, self.text, "test", 100, 50)
+        return BrainReply(self.speak, self.text, "test", 100, 50, parts=self.parts)
 
     def reset_session(self, chat_type, chat_id) -> None:
         self.reset_calls += 1
@@ -595,7 +597,8 @@ async def test_downshift_skips_batch(tmp_path):
     assert adapter.texts() == []
 
 
-async def test_multi_sentence_reply_is_sent_in_segments(tmp_path):
+async def test_multi_sentence_string_stays_single_message(tmp_path):
+    """字符串回复不再被自动拆句：分条由模型用数组决定。"""
     delays: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
@@ -611,8 +614,8 @@ async def test_multi_sentence_reply_is_sent_in_segments(tmp_path):
 
     await service._run_batch(ChatType.GROUP, CHAT)
 
-    assert len(adapter.texts()) == 2
-    assert delays == [0.8]
+    assert len(adapter.texts()) == 1
+    assert delays == []
 
 
 async def test_short_reply_stays_single_message(tmp_path):
@@ -629,17 +632,18 @@ async def test_short_reply_stays_single_message(tmp_path):
     assert delays == []
 
 
-async def test_private_reply_is_segmented(tmp_path):
+async def test_private_reply_with_parts_is_segmented(tmp_path):
     delays: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
         delays.append(seconds)
 
     brain = FakeBrain(
-        text=(
-            "结论是这个方案能跑，配置和依赖都没问题，今天就可以直接上线。"
-            "原因有两个，一个是开关没打开，一个是网络不稳，这两点都确认过了。"
-        )
+        text="结论是这个方案能跑。\n原因有两个，一个是开关没打开，一个是网络不稳。",
+        parts=(
+            "结论是这个方案能跑，配置和依赖都没问题，今天就可以直接上线。",
+            "原因有两个，一个是开关没打开，一个是网络不稳，这两点都确认过了。",
+        ),
     )
     service, _store, _brain, adapter = build(tmp_path, brain=brain, sleep=fake_sleep)
 
@@ -735,6 +739,83 @@ async def test_closed_thread_sample_miss_skips(tmp_path):
     await service._handle_batched(msg)
 
     assert brain.reply_calls == 0
+
+
+async def test_closed_thread_keeps_message_for_next_addressed_batch(tmp_path):
+    """收尾窗口里的消息不做终局丢弃：下次被点名时要能一起进 prompt。"""
+    service, store, brain, _adapter = build(tmp_path, rng=_FixedRng(0.9))
+    service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
+    service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
+
+    msg = make_msg("刚才那个问题的背景是这样的", message_id="m2")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+
+    # 没有 mark_skipped：消息仍在待投队列里。
+    assert store.skip_reason(ChatType.GROUP, CHAT, "m2") is None
+    assert brain.reply_calls == 0
+
+    await service.handle(make_msg("大肥鱼在吗", message_id="m3", at_bot=True))
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    assert brain.reply_calls == 1
+    assert "刚才那个问题的背景是这样的" in brain.last_prompt
+
+
+async def test_downshift_keeps_message_for_next_addressed_batch(tmp_path):
+    service, store, brain, _adapter = build(tmp_path)
+    for _ in range(3):
+        service.router.note_no_reply(ChatType.GROUP, CHAT)
+
+    msg = make_msg("刚才那个问题的背景是这样的", message_id="m2")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+
+    assert store.skip_reason(ChatType.GROUP, CHAT, "m2") is None
+    assert brain.reply_calls == 0
+
+    await service.handle(make_msg("大肥鱼在吗", message_id="m3", at_bot=True))
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    assert "刚才那个问题的背景是这样的" in brain.last_prompt
+
+
+async def test_continuation_request_reopens_closed_thread(tmp_path):
+    """用户说「继续说」不是普通闲聊：收尾窗口也要把模型叫起来。"""
+    service, store, brain, _adapter = build(tmp_path, rng=_FixedRng(0.9))
+    service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
+    service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
+    assert service.router.is_thread_closed(ChatType.GROUP, CHAT) is True
+
+    msg = make_msg("继续说", message_id="m2")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    assert brain.reply_calls == 1
+
+
+async def test_addressed_long_reply_is_sent_in_full(tmp_path):
+    """被点名要完整答案时不能砍尾：分条发也要把最后一句发出去。"""
+    text = (
+        "三个原因，按重要性排：第一，美联储的降息预期突然降温，长久期资产先被杀估值，"
+        "估值一收缩，跌幅就被放大了。"
+        "第二，几家半导体设备商的订单指引低于市场预期，投资者开始担心这轮资本开支"
+        "已经见顶，于是先卖再说。"
+        "第三，前期涨得太快，拥挤交易一松动就踩踏，量化止损和杠杆盘一起被动减仓，"
+        "把跌幅进一步放大。"
+    )
+    assert len(text) > 120
+    service, store, _brain, adapter = build(tmp_path, brain=FakeBrain(text=text))
+
+    msg = make_msg("@小菜鱼 说说半导体为什么跌", message_id="m2", at_bot=True)
+    store.add_message(msg)
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    assert "".join(adapter.texts()) == text
+    assert len(adapter.texts()) <= 3
+    assert all(not chunk.endswith("…") for chunk in adapter.texts())
 
 
 async def test_closed_thread_addressed_still_replies(tmp_path):

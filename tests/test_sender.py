@@ -1,4 +1,12 @@
-from dafeiyu.sender import is_technical_question, segment_reply, shape_reply
+from dafeiyu.sender import (
+    MAX_CHUNK,
+    MAX_LONGFORM,
+    MAX_PARTS,
+    is_technical_question,
+    segment_reply,
+    shape_reply,
+    shape_reply_parts,
+)
 
 
 def test_short_reply_passes_through() -> None:
@@ -10,31 +18,109 @@ def test_empty_returns_no_chunks() -> None:
     assert shape_reply("   ") == []
 
 
-def test_long_text_without_punctuation_is_hard_cut() -> None:
-    chunks = shape_reply("鲸" * 200)
-    assert len(chunks) == 1
-    assert chunks[0].endswith("…")
-    assert len(chunks[0]) <= 120
+def test_soft_limit_no_longer_truncates() -> None:
+    """120/300 只是提示词软目标：200 字无标点也不再被砍成 120。"""
+    text = "鲸" * 200
+    assert shape_reply(text) == [text]
 
 
-def test_long_text_cuts_at_last_sentence_end() -> None:
+def test_multi_sentence_reply_is_not_cut_at_soft_limit() -> None:
     text = "第一句话说完了。" + "继续说" * 40 + "。"
-    chunks = shape_reply(text)
-    assert chunks == ["第一句话说完了。"]
+    assert shape_reply(text) == [text]
 
 
-def test_technical_limit_is_300() -> None:
+def test_technical_soft_limit_is_not_enforced() -> None:
     text = "码" * 200
     chunks = shape_reply(text, is_technical=True)
     assert chunks == [text]
 
 
-def test_very_long_text_is_split_into_500_char_chunks() -> None:
-    text = ("段" * 250 + "\n") * 3 + "尾" * 49
-    chunks = shape_reply(text, max_chars=1000)
-    assert len(chunks) == 2
-    assert all(len(c) <= 500 for c in chunks)
+def test_text_over_hard_part_is_split_at_500() -> None:
+    text = "段" * 1200
+    chunks = shape_reply(text)
+    assert len(chunks) == 3
+    assert all(len(c) <= MAX_CHUNK for c in chunks)
     assert "".join(chunks) == text
+
+
+def test_model_newlines_become_message_boundaries() -> None:
+    first = "结论是这个方案能跑，配置和依赖都没问题。"
+    second = "原因有两个：开关没打开，网络也不稳。"
+    assert shape_reply(first + "\n" + second) == [first, second]
+
+
+def test_code_fence_is_not_split_across_messages() -> None:
+    text = (
+        "先看这段：\n"
+        "```python\nprint('a。b')\nprint('c。d')\n```\n"
+        "改完再跑。"
+    )
+    chunks = shape_reply(text)
+    code = [chunk for chunk in chunks if "print" in chunk]
+    assert len(code) == 1
+    assert "print('a。b')\nprint('c。d')" in code[0]
+    assert code[0].rstrip().endswith("```")
+
+
+def test_shape_reply_parts_keeps_model_boundaries() -> None:
+    assert shape_reply_parts(["第一条", "第二条", "   "]) == ["第一条", "第二条"]
+
+
+def test_shape_reply_parts_ignores_non_strings() -> None:
+    assert shape_reply_parts(["甲", 1, None, "乙"]) == ["甲", "乙"]  # type: ignore[list-item]
+
+
+def test_shape_reply_parts_holds_hard_total() -> None:
+    parts = ["鱼" * 600, "鲸" * 600, "虾" * 1200]
+    chunks = shape_reply_parts(parts)
+    assert len(chunks) > 1
+    assert sum(len(chunk) for chunk in chunks) <= MAX_LONGFORM
+
+
+def test_shape_reply_parts_merges_over_cap_without_losing_text() -> None:
+    parts = [f"第{i}句。" for i in range(MAX_PARTS + 5)]
+    chunks = shape_reply_parts(parts)
+    assert len(chunks) == MAX_PARTS
+    assert "".join(chunks).replace("\n", "") == "".join(parts)
+
+
+def test_shape_reply_parts_merge_still_respects_hard_part() -> None:
+    """极端分布（20 条 1 字 + 1 条长文）合并后也不能超单条上限。"""
+    parts = ["鱼"] * 20 + ["鲸" * 1000]
+    chunks = shape_reply_parts(parts)
+    assert all(len(chunk) <= MAX_CHUNK for chunk in chunks)
+    assert "".join(chunks).replace("\n", "") == "".join(parts)
+
+
+def test_longform_keeps_source_list_tail() -> None:
+    """被点名要来源时不砍尾：链接和最后一条都得发出去。"""
+    text = (
+        "来了来了，本鱼的出处都在这，自己看：第一条是台积电最新季度财报，"
+        "营收和毛利率都写得很清楚，管理层还给了下季度指引。"
+        "第二条是费城半导体指数的成分股调整，从权重变化能看出资金往哪边走。"
+        "第三条是两家券商对明年资本开支的判断，分歧主要落在存储和先进制程上，"
+        "链接 https://example.com/semi 里有原文。"
+    )
+    assert len(text) > 120
+    chunks = shape_reply(text, allow_longform=True)
+    assert "".join(chunks) == text
+    assert text.endswith("原文。")
+    assert all(not chunk.endswith("…") for chunk in chunks)
+
+
+def test_longform_still_capped_at_safety_limit() -> None:
+    text = "鱼" * (MAX_LONGFORM + 100)
+    chunks = shape_reply(text, allow_longform=True)
+    joined = "".join(chunks)
+    assert len(joined) <= MAX_LONGFORM
+    assert joined.endswith("…")
+
+
+def test_allow_longform_no_longer_changes_result() -> None:
+    """旧参数保留兼容，但新策略下默认路径与 allow_longform 已一致。"""
+    text = "第一句话说完了。" + "继续说" * 40 + "。"
+    assert shape_reply(text) == [text]
+    assert shape_reply(text, allow_longform=True) == [text]
 
 
 def test_is_technical_question_detects_code_questions() -> None:

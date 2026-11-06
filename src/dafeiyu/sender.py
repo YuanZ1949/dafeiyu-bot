@@ -5,7 +5,14 @@ from __future__ import annotations
 import re
 
 SPLIT_AT = "。！？!?；;\n"
+
+# 长度安全阀（硬边界）：提示词里的 120/300 只是软目标，发送前不再按它截断；
+# 真正兜住跑飞长度的是「整轮 2000 字 / 单条 500 字」。超出才截（并保留省略号）。
+MAX_LONGFORM = 2000
 MAX_CHUNK = 500
+
+# 条数不设产品上限；超过这个数量只在发送前做技术性合并（不丢内容）。
+MAX_PARTS = 20
 
 # 拆成多条短消息：只有够长且真有多个句子才拆，避免把一句话拆碎。
 # 省略号不是句子边界（否则会把括号里的 OS 从中间切开）。
@@ -201,13 +208,129 @@ def shape_reply(
     max_chars: int = 120,
     max_chars_technical: int = 300,
     is_technical: bool = False,
+    allow_longform: bool = False,
+    *,
+    hard_total: int = MAX_LONGFORM,
+    hard_part: int = MAX_CHUNK,
 ) -> list[str]:
-    text = clean_markdown(text.strip())
-    if not text:
+    """把一段字符串回复整形为待发分片。
+
+    长度策略：``max_chars`` / ``max_chars_technical`` 只是写进提示词的软目标，
+    这里不再按它们砍尾；只守 ``hard_total``（整轮）与 ``hard_part``（单条）
+    两道硬边界。模型自己用换行分好的段优先按换行发（代码块不拆），
+    其余超长内容才按句末/长度切。
+
+    ``allow_longform`` / ``is_technical`` 保留为兼容参数：新策略下所有回复
+    一视同仁，不再因为「被点名」而走另一条截断分支。
+    """
+    del max_chars, max_chars_technical, is_technical, allow_longform
+    body = clean_markdown(text.strip())
+    if not body:
         return []
-    limit = max_chars_technical if is_technical else max_chars
-    chunks = [chunk for chunk in _split(_truncate(text, limit)) if chunk]
+    total = max(1, hard_total)
+    if len(body) > total:
+        body = _truncate(body, total)
+    return _split_message(body, max(1, hard_part))
+
+
+def shape_reply_parts(
+    parts: tuple[str, ...] | list[str],
+    *,
+    hard_total: int = MAX_LONGFORM,
+    hard_part: int = MAX_CHUNK,
+) -> list[str]:
+    """把模型显式给出的 ``reply`` 数组整形为待发分片。
+
+    数组元素就是模型指定的分条边界：逐条原样保留，不再做 DP 重排。
+    只有单条超过 ``hard_part``、整轮超过 ``hard_total`` 时才切/截。
+    """
+    cleaned: list[str] = []
+    for raw in parts:
+        if not isinstance(raw, str):
+            continue
+        text = clean_markdown(raw.strip())
+        if text:
+            cleaned.append(text)
+    if not cleaned:
+        return []
+    total = max(1, hard_total)
+    result: list[str] = []
+    used = 0
+    for text in cleaned:
+        remaining = total - used
+        if remaining <= 0:
+            break
+        if len(text) > remaining:
+            text = _truncate(text, remaining)
+        used += len(text)
+        if text:
+            result.extend(_split_message(text, max(1, hard_part)))
+    return _merge_to_cap(result, MAX_PARTS, max(1, hard_part))
+
+
+def _line_groups(text: str) -> list[str]:
+    """按模型自己的换行分组；代码围栏整段算一个不可拆的组。"""
+    groups: list[str] = []
+    buffer: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if in_fence:
+                in_fence = False
+                buffer.append(line)
+                groups.append("\n".join(buffer))
+                buffer = []
+            else:
+                in_fence = True
+                buffer = [line]
+            continue
+        if in_fence:
+            buffer.append(line)
+            continue
+        if not stripped:
+            continue
+        groups.append(line)
+    if buffer:
+        groups.append("\n".join(buffer))
+    return groups
+
+
+def _split_message(text: str, hard_part: int) -> list[str]:
+    """单条硬上限内的切分：优先按换行分条，单行超长再按句末/长度切。"""
+    groups = _line_groups(text)
+    if len(groups) <= 1:
+        return [chunk for chunk in _split(text, hard_part) if chunk]
+    chunks: list[str] = []
+    for group in groups:
+        chunks.extend(chunk for chunk in _split(group, hard_part) if chunk)
     return chunks
+
+
+def _merge_to_cap(
+    parts: list[str], cap: int, hard_part: int = MAX_CHUNK
+) -> list[str]:
+    """条数超限时做技术性合并：只拼相邻分片，内容一字不丢。
+
+    合并后仍逐片守单条硬上限：极端情况下（一小段配一大段）拼出来超过
+    ``hard_part`` 就再切一次，宁可多一条，也不发超长消息。
+    """
+    if cap < 1 or len(parts) <= cap:
+        return parts
+    limit = max(1, hard_part)
+    total = len(parts)
+    merged: list[str] = []
+    for index in range(cap):
+        start = index * total // cap
+        end = (index + 1) * total // cap
+        if start >= end:
+            continue
+        chunk = "\n".join(parts[start:end])
+        if len(chunk) <= limit:
+            merged.append(chunk)
+        else:
+            merged.extend(part for part in _split(chunk, limit) if part)
+    return merged
 
 
 def _sentences(text: str) -> list[str]:
