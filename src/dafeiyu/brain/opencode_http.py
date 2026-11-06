@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -41,12 +42,23 @@ TOOL_ACTIVE_STATES = {"pending", "running", "completed"}
 # compaction 是 opencode 自动压缩上下文时产生的消息，不是外来注入：
 # 漏掉它会把整轮 session 当成被污染而重置（13:09 实测踩过）。
 ALLOWED_MESSAGE_TYPES = {"user", "assistant", "idle", "compaction"}
+# system 是 opencode 自己写的旁路提示（日期/指令刷新），不是外来注入。
+# 之前把它当污染，11:44/12:02/12:18 各重置过一次 session，上下文全丢。
+# 只放行已知的良性 system（normalise 后含这些标记），其它未知 type 仍按污染处理。
+BENIGN_SYSTEM_MARKERS = ("instructions", "core/date", "Today's date is now")
 # 工作区关闭时的会话级兜底：不改 agent 文件重启 opencode 也能收回全部工具。
 DENY_ALL_PERMISSIONS: list[dict[str, Any]] = [
     {"action": "*", "resource": "*", "effect": "deny"}
 ]
 # 旁路（摘要/印象）用的 agent：只有一条指令、全工具禁用，不与群聊 agent 共用。
 DEFAULT_MEMORY_AGENT = "dafeiyu-memory"
+# 新建 session 的第一轮把本地最近对话作为前缀重放：session 被审计重置/轮换后
+# 模型对最近几轮完全失忆（用户实测「隔两三句就不记得」），本地窗口是唯一兜底。
+NEW_SESSION_HISTORY_LIMIT = 20
+NEW_SESSION_HISTORY_CHARS = 1800
+NEW_SESSION_PREFIX = (
+    "【此前对话】下面是本地保存的最近对话，只用于接上前文，不要复述："
+)
 
 
 class _UnknownSession(Exception):
@@ -69,6 +81,21 @@ def _join_text(message: dict[str, Any]) -> str:
 def _created(message: dict[str, Any]) -> float:
     value = (message.get("time") or {}).get("created")
     return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def _is_benign_system(message: dict[str, Any]) -> bool:
+    """opencode 自己写的 system 提示（日期/指令刷新）不算外来注入。
+
+    字段形状随版本变（``data`` 里套 ``metadata.notice``，或顶层直接给
+    ``description``），所以按序列化后的标记判断，不猜结构。
+    """
+    if message.get("type") != "system":
+        return False
+    try:
+        probe = json.dumps(message, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        probe = str(message)
+    return any(marker in probe for marker in BENIGN_SYSTEM_MARKERS)
 
 
 def _error_status(error: dict[str, Any]) -> int | None:
@@ -254,7 +281,7 @@ class OpenCodeHttpBrain:
             if created < since or created > until:
                 continue
             kind = message.get("type")
-            if kind not in ALLOWED_MESSAGE_TYPES:
+            if kind not in ALLOWED_MESSAGE_TYPES and not _is_benign_system(message):
                 hits.append(str(message.get("id") or ""))
             elif kind == "user":
                 users.append(message)
@@ -277,9 +304,15 @@ class OpenCodeHttpBrain:
 
         session_id = self.store.get_opencode_session(chat_type, chat_id)
         for attempt in (0, 1):
+            turn_prompt = prompt
+            if not session_id:
+                # 新 session 的第一轮：把本地最近对话垫在前面，别让模型裸开。
+                history = self._new_session_history(chat_type, chat_id)
+                if history:
+                    turn_prompt = f"{NEW_SESSION_PREFIX}\n{history}\n\n{prompt}"
             try:
                 sid = session_id or await self._create_session()
-                result = await self._ask(sid, prompt, on_tool=on_tool)
+                result = await self._ask(sid, turn_prompt, on_tool=on_tool)
             except _UnknownSession:
                 # session 被删或数据库重置：清映射，新开一个再试一次。
                 self.store.clear_opencode_session(chat_type, chat_id)
@@ -303,6 +336,39 @@ class OpenCodeHttpBrain:
             return self._reply_from(prompt, result)
 
         raise BrainError("OpenCode 调用失败：session 重建失败")
+
+    def _new_session_history(self, chat_type: ChatType, chat_id: str) -> str:
+        """本地最近对话的极简重放；查询失败/没有历史时静默返回空串。"""
+        try:
+            floor = self.store.last_delivered_id(chat_type, chat_id)
+            if floor is None:
+                # 还没有投递游标：说明本地也没「模型看过」的历史，不硬塞当前批次。
+                return ""
+            # 用现成的分页查询截到投递游标之前，避免把本轮待投的消息再灌一遍。
+            page = self.store.messages_page(
+                chat_type,
+                chat_id,
+                limit=NEW_SESSION_HISTORY_LIMIT,
+                before=floor + 1,
+            )
+            messages = page.messages
+        except Exception:  # noqa: BLE001 - 记忆兜底不能挡正常回复
+            log.debug("读取本地历史失败，跳过前文注入", exc_info=True)
+            return ""
+        lines: list[str] = []
+        total = 0
+        for message in reversed(messages):
+            content = (message.content or "").strip()
+            if not content:
+                continue
+            who = "我" if message.is_bot else (message.nickname or message.user_id or "群友")
+            line = f"{who}: {content}"
+            total += len(line) + 1
+            if total > NEW_SESSION_HISTORY_CHARS:
+                break
+            lines.append(line)
+        lines.reverse()
+        return "\n".join(lines)
 
     async def reply_fresh(
         self,
@@ -473,7 +539,8 @@ class OpenCodeHttpBrain:
             if message.get("finish") != "error":
                 return None
             error = message.get("error") or {}
-            data = error.get("data") if isinstance(error.get("data"), dict) else {}
+            raw_data = error.get("data")
+            data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
             kind = str(error.get("type") or error.get("name") or "unknown")
             detail = str(error.get("message") or data.get("message") or "").strip()
             text = (

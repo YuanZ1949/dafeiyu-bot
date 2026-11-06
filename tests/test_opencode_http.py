@@ -1,6 +1,7 @@
 import base64
 import json
 import time
+from typing import Any
 
 import httpx
 import pytest
@@ -14,7 +15,7 @@ from dafeiyu.brain.client import (
 )
 from dafeiyu.brain.opencode_http import OpenCodeHttpBrain
 from dafeiyu.memory.store import Store
-from dafeiyu.models import ChatType
+from dafeiyu.models import ChatType, Message
 
 
 @pytest.fixture
@@ -44,6 +45,8 @@ class FakeServer:
         missing_tokens: bool = False,
         steps: list[tuple[str, str]] | None = None,
         error: dict | None = None,
+        round_system: str | None = None,
+        round_extra: dict[str, Any] | None = None,
     ) -> None:
         self.answer = answer
         self.complete = complete
@@ -53,6 +56,9 @@ class FakeServer:
         self.missing_tokens = missing_tokens
         self.steps = list(steps) if steps is not None else None
         self.error = error
+        # 本轮窗口里额外出现的消息：模拟 opencode 自己写的 system 提示 / 外来注入。
+        self.round_system = round_system
+        self.round_extra = round_extra
         self.pending_steps = list(self.steps[1:]) if self.steps else []
         self.known = {"ses_old"}
         self.messages: dict[str, list[dict]] = {"ses_old": []}
@@ -93,6 +99,26 @@ class FakeServer:
         if not self.missing_tokens:
             entry["tokens"] = {"input": 100, "output": 35}
         self.messages[sid].append(entry)
+
+    def _append_round_extras(self, sid: str) -> None:
+        """在 assistant 之后追加本轮额外消息，确保落在审计窗口内。"""
+        if self.round_system is not None:
+            self.messages[sid].append(
+                {
+                    "id": "msg_sys",
+                    "type": "system",
+                    "time": {"created": self._stamp()},
+                    "metadata": {
+                        "notice": "instructions",
+                        "instructionSources": ["core/date"],
+                    },
+                    "text": self.round_system,
+                }
+            )
+        if self.round_extra is not None:
+            entry = dict(self.round_extra)
+            entry["time"] = {"created": self._stamp()}
+            self.messages[sid].append(entry)
 
     def _idle(self) -> bool:
         if not self.complete or self.pending_steps:
@@ -209,6 +235,7 @@ class FakeServer:
                 self.messages[sid].append(entry)
             else:
                 self._append_step(sid, self.steps[0])
+            self._append_round_extras(sid)
             return httpx.Response(
                 200, json={"data": {"id": "msg_u", "time": {"created": user_created}}}
             )
@@ -279,6 +306,162 @@ async def test_reply_rebuilds_after_unknown_session(store: Store) -> None:
 
     assert reply.reply == "在群聊卖萌"
     assert store.get_opencode_session(ChatType.PRIVATE, 42) == "ses_new"
+
+
+# ---- 审计：良性 system 不算注入，未知类型仍然算 -------------------------
+
+
+def _round_messages() -> list[dict[str, Any]]:
+    return [
+        {"id": "msg_u", "type": "user", "time": {"created": 100.0}},
+        {
+            "id": "msg_a",
+            "type": "assistant",
+            "time": {"created": 110.0},
+            "content": [{"type": "text", "text": "在"}],
+        },
+        {
+            "id": "msg_sys",
+            "type": "system",
+            "time": {"created": 120.0},
+            "metadata": {
+                "notice": "instructions",
+                "instructionSources": ["core/date"],
+            },
+            "text": "Today's date is now: Fri Nov 06 2026",
+        },
+    ]
+
+
+async def test_audit_ignores_benign_system_instructions(store: Store) -> None:
+    server = FakeServer()
+    server.messages["ses_old"] = _round_messages()
+    brain = make_brain(store, server)
+
+    assert await brain._audit_round("ses_old", 50.0, 200.0) == []
+    await brain.aclose()
+
+
+async def test_benign_system_does_not_clear_session(
+    store: Store, caplog: pytest.LogCaptureFixture
+) -> None:
+    store.set_opencode_session(ChatType.PRIVATE, "42", "ses_old")
+    server = FakeServer(round_system="Today's date is now: Fri Nov 06 2026")
+    brain = make_brain(store, server)
+
+    with caplog.at_level("WARNING"):
+        reply = await brain.reply(ChatType.PRIVATE, "42", "在吗")
+    await brain.aclose()
+
+    assert reply.reply == "在群聊卖萌"
+    # 良性 system 提示不算污染：映射保留，下一轮继续复用同一个 session。
+    assert store.get_opencode_session(ChatType.PRIVATE, "42") == "ses_old"
+    assert "出现外来消息" not in caplog.text
+
+
+async def test_unknown_message_type_still_clears_session(
+    store: Store, caplog: pytest.LogCaptureFixture
+) -> None:
+    store.set_opencode_session(ChatType.PRIVATE, "42", "ses_old")
+    server = FakeServer(
+        round_extra={
+            "id": "msg_syn",
+            "type": "synthetic",
+            "content": [{"type": "text", "text": "外部注入"}],
+        }
+    )
+    brain = make_brain(store, server)
+
+    with caplog.at_level("WARNING"):
+        reply = await brain.reply(ChatType.PRIVATE, "42", "在吗")
+    await brain.aclose()
+
+    assert reply.reply == "在群聊卖萌"
+    assert store.get_opencode_session(ChatType.PRIVATE, "42") is None
+    assert "msg_syn" in caplog.text
+
+
+# ---- 新 session 第一轮：重放本地最近对话 --------------------------------
+
+
+def _seed_history(store: Store) -> None:
+    """写两条已投递消息，并推进投递游标（模拟上一轮已经聊过）。"""
+    for message_id, content, is_bot in (
+        ("h1", "昨天聊到鱼缸和水草", False),
+        ("h2", "是啊，水草也长起来了", True),
+    ):
+        store.add_message(
+            Message(
+                chat_type=ChatType.PRIVATE,
+                chat_id="42",
+                user_id="qq:1",
+                nickname="阿鱼" if not is_bot else "溟月",
+                content=content,
+                message_id=message_id,
+                is_bot=is_bot,
+                timestamp=1,
+            )
+        )
+    store.mark_delivered(ChatType.PRIVATE, "42", "h2")
+
+
+async def test_new_session_replays_recent_local_history(store: Store) -> None:
+    _seed_history(store)
+    server = FakeServer()
+    brain = make_brain(store, server)
+
+    await brain.reply(ChatType.PRIVATE, "42", "接着说")
+    await brain.aclose()
+
+    prompt = server.prompts[0]
+    assert prompt.startswith("【此前对话】")
+    assert "昨天聊到鱼缸和水草" in prompt
+    assert "水草也长起来了" in prompt
+    assert "不要复述" in prompt
+    assert prompt.endswith("接着说")
+
+
+async def test_existing_session_does_not_replay_history(store: Store) -> None:
+    _seed_history(store)
+    store.set_opencode_session(ChatType.PRIVATE, "42", "ses_old")
+    server = FakeServer()
+    brain = make_brain(store, server)
+
+    await brain.reply(ChatType.PRIVATE, "42", "接着说")
+    await brain.aclose()
+
+    assert "【此前对话】" not in server.prompts[0]
+    assert server.prompts[0] == "接着说"
+
+
+async def test_replay_only_happens_on_first_new_session_round(store: Store) -> None:
+    _seed_history(store)
+    server = FakeServer()
+    brain = make_brain(store, server)
+
+    await brain.reply(ChatType.PRIVATE, "42", "第一句")
+    await brain.reply(ChatType.PRIVATE, "42", "第二句")
+    await brain.aclose()
+
+    assert "【此前对话】" in server.prompts[0]
+    assert "【此前对话】" not in server.prompts[1]
+
+
+async def test_history_query_failure_does_not_block_reply(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*args, **kwargs):
+        raise RuntimeError("db broken")
+
+    monkeypatch.setattr(store, "messages_page", boom)
+    server = FakeServer()
+    brain = make_brain(store, server)
+
+    reply = await brain.reply(ChatType.PRIVATE, "42", "在吗")
+    await brain.aclose()
+
+    assert reply.reply == "在群聊卖萌"
+    assert server.prompts[0] == "在吗"
 
 
 async def test_reply_times_out_without_completed_message(store: Store) -> None:

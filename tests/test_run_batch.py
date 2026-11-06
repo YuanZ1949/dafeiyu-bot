@@ -17,7 +17,7 @@ from dafeiyu.config import (
 )
 from dafeiyu.memory.store import Store
 from dafeiyu.memory.workspace import Workspace
-from dafeiyu.models import ChatType, Message
+from dafeiyu.models import Attachment, ChatType, Message
 from dafeiyu.router import Router
 from dafeiyu.service import Service, ToolUse
 from dafeiyu.timeutil import today_shanghai
@@ -890,3 +890,173 @@ async def test_closed_thread_samples_once_in_model_mode(tmp_path):
 
     assert brain.reply_calls == 1
     assert rng.calls == 1
+
+
+# ----------------------------------------------------------- 增量 token 统计
+async def test_incremental_tokens_counts_only_growth(tmp_path):
+    service, _store, _brain, _adapter = build(tmp_path)
+
+    first = service._incremental_tokens(
+        ChatType.GROUP,
+        CHAT,
+        BrainReply(True, "好", prompt_tokens=1000, completion_tokens=40),
+    )
+    assert first == 1040
+
+    # opencode 报的是整段上下文：第二轮 prompt 涨到 1200，只应计 200 增量。
+    second = service._incremental_tokens(
+        ChatType.GROUP,
+        CHAT,
+        BrainReply(True, "好", prompt_tokens=1200, completion_tokens=40),
+    )
+    assert second == 240
+
+    # 上下文变小（压缩/重建）时不能出现负数，只计本轮输出。
+    third = service._incremental_tokens(
+        ChatType.GROUP,
+        CHAT,
+        BrainReply(True, "好", prompt_tokens=300, completion_tokens=20),
+    )
+    assert third == 20
+
+
+async def test_session_stats_count_only_incremental_tokens(tmp_path):
+    service, store, _brain, _adapter = build(tmp_path)
+
+    await service._run_batch(ChatType.GROUP, CHAT)
+    first = store.session_stats(ChatType.GROUP, CHAT)
+    assert first.token_estimate == 150  # 100 prompt + 50 completion
+
+    store.add_message(make_msg("第二轮", message_id="m2"))
+    await service._run_batch(ChatType.GROUP, CHAT)
+    second = store.session_stats(ChatType.GROUP, CHAT)
+    # 同一段上下文再报 100 prompt 不应重复累计，只加本轮输出 50。
+    assert second.token_estimate == 200
+
+
+# --------------------------------------------------------- 图片密钥迟到重试
+class _FakeResolver:
+    def __init__(self, key) -> None:
+        self.key = key
+
+    def prewarm(self) -> bool:
+        return False
+
+
+def _image_message(message_id: str = "m-img") -> Message:
+    msg = make_msg("[图片]", message_id=message_id)
+    msg.attachments = [
+        Attachment(kind="image", path="C:/wechat/msg/attach/aa/bb.dat")
+    ]
+    return msg
+
+
+def _wire_resolver(service, key) -> None:
+    service._media_resolver_ready = True
+    service._media_resolver = _FakeResolver(key)
+
+
+async def test_retry_pending_media_backfills_batch_content(tmp_path, monkeypatch):
+    service, _store, _brain, _adapter = build(tmp_path)
+    service._queue_media_retry(_image_message())
+    _wire_resolver(service, key=object())
+
+    async def fake_materialize(message, settings, *, decode=None):
+        message.content = "[图片]（图存 images/retry.png，可用 read 查看）"
+        return 1
+
+    monkeypatch.setattr(service_module, "materialize_attachments", fake_materialize)
+
+    # 批次里的对象来自库，和 ingest 时登记的附件对象不是同一个。
+    batch_message = _image_message()
+    await service._retry_pending_media([batch_message])
+
+    assert batch_message.message_id not in service._media_retry
+    assert "images/retry.png" in batch_message.content
+    assert batch_message.attachments[0].kind == "image"
+
+
+class _DelayedResolver:
+    """前几次读 key 返回 None，模拟重启后密钥扫描还没完成。"""
+
+    def __init__(self, key, *, misses: int = 1) -> None:
+        self._key = key
+        self._misses = misses
+
+    @property
+    def key(self):
+        if self._misses > 0:
+            self._misses -= 1
+            return None
+        return self._key
+
+    def prewarm(self) -> bool:
+        return False
+
+
+async def test_retry_pending_media_waits_for_delayed_key(tmp_path, monkeypatch):
+    service, _store, _brain, _adapter = build(tmp_path)
+    service._queue_media_retry(_image_message())
+    service._media_resolver_ready = True
+    service._media_resolver = _DelayedResolver(object())
+    monkeypatch.setattr(service, "_kick_media_key_scan", lambda *a, **k: None)
+    monkeypatch.setattr(service_module, "MEDIA_KEY_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(service_module, "MEDIA_KEY_WAIT_SECONDS", 5.0)
+
+    async def fake_materialize(message, settings, *, decode=None):
+        message.content = "[图片]（图存 images/delayed.png，可用 read 查看）"
+        return 1
+
+    monkeypatch.setattr(service_module, "materialize_attachments", fake_materialize)
+
+    batch_message = _image_message()
+    await service._retry_pending_media([batch_message])
+
+    # 等到 key 后必须重新物化一次，占位被路径注记替换。
+    assert "images/delayed.png" in batch_message.content
+    assert batch_message.message_id not in service._media_retry
+
+
+async def test_retry_pending_media_timeout_keeps_placeholder(tmp_path, monkeypatch):
+    service, _store, _brain, _adapter = build(tmp_path)
+    service._queue_media_retry(_image_message())
+    _wire_resolver(service, key=None)
+    monkeypatch.setattr(service, "_kick_media_key_scan", lambda *a, **k: None)
+    monkeypatch.setattr(service_module, "MEDIA_KEY_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(service_module, "MEDIA_KEY_POLL_SECONDS", 0.0)
+
+    called: list[object] = []
+
+    async def fake_materialize(*args, **kwargs):
+        called.append(args)
+        return 1
+
+    monkeypatch.setattr(service_module, "materialize_attachments", fake_materialize)
+
+    # 等不到密钥也必须直接返回，不能抛异常卡住整轮。
+    batch_message = _image_message()
+    await service._retry_pending_media([batch_message])
+
+    assert called == []
+    assert batch_message.message_id not in service._media_retry
+    assert batch_message.content == "[图片]"
+
+
+async def test_batch_still_replies_when_media_key_wait_times_out(
+    tmp_path, monkeypatch
+):
+    """密钥等不到也必须照常回复：图片保持占位，消息不能丢。"""
+    service, store, _brain, adapter = build(tmp_path)
+    image = _image_message("m-img")
+    store.add_message(image)
+    service._queue_media_retry(image)
+
+    _wire_resolver(service, key=None)
+    monkeypatch.setattr(service, "_kick_media_key_scan", lambda *a, **k: None)
+    monkeypatch.setattr(service_module, "MEDIA_KEY_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(service_module, "MEDIA_KEY_POLL_SECONDS", 0.0)
+
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    assert adapter.texts() == ["在呢"]
+    assert batch_ids(service) == []

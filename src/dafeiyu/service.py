@@ -119,6 +119,12 @@ OUTBOX_MAX_ATTEMPTS = 8
 OUTBOX_MAX_AGE_SECONDS = 6 * 3600
 # 轮换摘要的输入窗口（spec §9.2：最近 40 条）。
 ROTATION_WINDOW = 40
+# 微信图片密钥就绪等待：重启后缓存命中/内存扫描通常几秒内完成，留 20 秒余量。
+# 只在一批消息里确有「未物化图片」时等待；超时就按占位继续，绝不阻塞回复。
+MEDIA_KEY_WAIT_SECONDS = 20.0
+MEDIA_KEY_POLL_SECONDS = 0.5
+# 待重试的图片消息上限：只是重启后的一段过渡，不能无限攒。
+MEDIA_RETRY_MAX = 100
 # 「此刻」注入用的常量：群名缓存一小时，查不到就省略那半句。
 GROUP_NAME_TTL_SECONDS = 3600.0
 GROUP_NAME_TIMEOUT_SECONDS = 2.0
@@ -375,6 +381,11 @@ class Service:
         self._media_resolver_ready = False
         self._media_resolver_lock = threading.Lock()
         self._media_scan_lock = threading.Lock()
+        # 图片物化因密钥未就绪而失败的消息：等下一批送审前重试一次物化。
+        self._media_retry: dict[str, Message] = {}
+        # 每会话上一轮的 prompt_tokens：opencode 报的是整段上下文，累计会重复
+        # 计数，轮换阈值（rotation_tokens）只能按「本轮增量」累加。
+        self._last_prompt_tokens: dict[tuple[ChatType, str], int] = {}
 
     def _adapter_for(self, chat_id: str) -> Adapter:
         """按会话 id 的通道前缀选适配器；单一派生点是 channel_of。"""
@@ -853,6 +864,70 @@ class Service:
             self._media_scan_lock.release()
             log.debug("微信图片密钥扫描线程无法启动")
 
+    def _queue_media_retry(self, msg: Message) -> None:
+        """图片没物化成功时登记一条待重试；没有图片的消息零开销。"""
+        if not msg.attachments or "[图片]" not in (msg.content or ""):
+            return
+        pending = [
+            item
+            for item in msg.attachments
+            if item.kind == "image"
+            and item.path
+            and not item.path.replace("\\", "/").startswith("images/")
+        ]
+        if not pending:
+            return
+        if len(self._media_retry) >= MEDIA_RETRY_MAX:
+            self._media_retry.pop(next(iter(self._media_retry)), None)
+        self._media_retry[msg.message_id] = msg
+
+    async def _retry_pending_media(self, batch: list[Message]) -> None:
+        """送审前给「密钥迟到」的图片一次机会：等 key → 重新物化 → 回填 content。
+
+        只影响当前批次命中的消息；等待有硬上限，超时保持占位继续回复。
+        """
+        targets = [m for m in batch if m.message_id in self._media_retry]
+        if not targets:
+            return
+        resolver = self._media_key_resolver()
+        if resolver is None:
+            for message in targets:
+                self._media_retry.pop(message.message_id, None)
+            return
+        if resolver.key is None:
+            self._kick_media_key_scan(prewarm=True)
+            started = time.monotonic()
+            deadline = started + MEDIA_KEY_WAIT_SECONDS
+            while resolver.key is None and time.monotonic() < deadline:
+                await asyncio.sleep(MEDIA_KEY_POLL_SECONDS)
+            waited = time.monotonic() - started
+            if resolver.key is None:
+                log.info(
+                    "等待微信图片密钥 %.1fs 超时，本轮按占位继续：%s",
+                    waited,
+                    targets[0].message_id,
+                )
+                for message in targets:
+                    self._media_retry.pop(message.message_id, None)
+                return
+            log.info("等待微信图片密钥 %.1fs 后就绪，重试图片物化", waited)
+        for message in targets:
+            source = self._media_retry.pop(message.message_id, None)
+            if source is None:
+                continue
+            try:
+                done = await materialize_attachments(
+                    source, self.settings, decode=self._decode_wechat_dat
+                )
+            except Exception:  # noqa: BLE001 - 物化本身永不抛，这里只兜底
+                log.debug("图片重试物化失败：%s", message.message_id, exc_info=True)
+                continue
+            if done:
+                # batch 里的对象来自库（附件不入库），这里把重试结果回填给它。
+                message.content = source.content
+                message.attachments = source.attachments
+                log.info("图片重试物化成功：%s（%d 张）", message.message_id, done)
+
     async def handle(self, msg: Message) -> None:
         annotate = self._tools_enabled()
         # 图片物化必须在入库前：content 字符串是图片路径到达大脑的唯一载体。
@@ -865,6 +940,10 @@ class Service:
                 self._decode_wechat_dat if self._wechat_media_enabled() else None
             )
             await materialize_attachments(msg, self.settings, decode=decode)
+            if decode is not None:
+                # 密钥可能还没扫出来（重启后的第一张图）：先挂起，等这批送审
+                # 前再试一次，避免让模型看到一句「图片内容不可用」。
+                self._queue_media_retry(msg)
         # 机器人自己的消息也要先落库（作为 assistant 轮次），但不触发任何回复。
         if not self.store.add_message(msg):
             return
@@ -1720,6 +1799,9 @@ class Service:
 
         await self._maybe_rotate(chat_type, chat_id)
 
+        # 重启后第一张图常常卡在「密钥还没扫出来」：送审前等一次并重试物化。
+        await self._retry_pending_media(batch)
+
         continuation = self._continuation_for(chat_type, chat_id)
         fact_hint = self._shared_fact_hint(chat_type, chat_id, batch)
         prompt = self._build_prompt(
@@ -1788,7 +1870,7 @@ class Service:
             chat_type,
             chat_id,
             messages=len(batch),
-            tokens=reply.prompt_tokens + reply.completion_tokens,
+            tokens=self._incremental_tokens(chat_type, chat_id, reply),
         )
         self._continuations.pop(key, None)
         if continuation:
@@ -2493,6 +2575,23 @@ class Service:
             addressed,
         )
 
+    def _incremental_tokens(
+        self, chat_type: ChatType, chat_id: str, reply: BrainReply
+    ) -> int:
+        """本轮真正新增的 token 估算。
+
+        opencode 的 ``prompt_tokens`` 是整段 session 上下文：直接累加会让
+        ``rotation_tokens`` 在十几轮内被击穿（历史上下文被重复计数 N 次）。
+        这里只计「比上一轮多出来的部分 + 本轮输出」；进程重启/会话重建时
+        上一轮值缺失，退化为整段 prompt（相当于重新起算）。
+        """
+        key = (chat_type, chat_id)
+        prompt = max(0, int(reply.prompt_tokens or 0))
+        previous = self._last_prompt_tokens.get(key, 0)
+        if prompt:
+            self._last_prompt_tokens[key] = prompt
+        return max(0, prompt - previous) + max(0, int(reply.completion_tokens or 0))
+
     def _continuation_for(self, chat_type: ChatType, chat_id: str) -> str | None:
         """本轮要注入的接续语：内存优先，重启后回落到库里的 24h 摘要。
 
@@ -2528,6 +2627,8 @@ class Service:
             self._continuations[(chat_type, chat_id)] = continuation
             # 轮换产出了新接续语，旧的「已消费」标记必须失效，否则这条新语不会注入。
             self._continuation_used.discard((chat_type, chat_id))
+            # 新 session 的上下文从头算：上一轮 prompt_tokens 不再可比。
+            self._last_prompt_tokens.pop((chat_type, chat_id), None)
 
     def _check_workspace(self, chat_type: ChatType, chat_id: str) -> None:
         """每轮结束后 stat 一次；超上限保留尾部并留截断注释。"""
