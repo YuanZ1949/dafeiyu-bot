@@ -32,6 +32,8 @@ def make_settings(
     media: bool = True,
     max_bytes: int = 1024 * 1024,
     retention_days: int = 0,
+    images: bool = True,
+    speech: bool = False,
 ) -> Settings:
     return cast(
         Settings,
@@ -44,8 +46,27 @@ def make_settings(
                 wechat=SimpleNamespace(
                     media=SimpleNamespace(enabled=media, max_bytes=max_bytes)
                 ),
-                # workspace/images 与 QQ 侧共用，保留期沿用 images.retention_days。
-                images=SimpleNamespace(retention_days=retention_days),
+                # workspace/images 与 QQ 侧共用，保留期沿用 images.retention_days；
+                # QQ 只有 URL 的附件（语音/视频）由 images.enabled 门控。
+                images=SimpleNamespace(
+                    enabled=images,
+                    max_bytes=max_bytes,
+                    timeout_seconds=8.0,
+                    retention_days=retention_days,
+                ),
+                speech=SimpleNamespace(
+                    enabled=speech,
+                    model="base",
+                    language="zh",
+                    device="cpu",
+                    compute_type="int8",
+                    beam_size=1,
+                    max_seconds=60,
+                    timeout_seconds=10.0,
+                    concurrency=1,
+                    max_bytes=20 * 1024 * 1024,
+                    hf_endpoint="",
+                ),
             ),
         ),
     )
@@ -57,6 +78,8 @@ def make_message(
     kind: str = "image",
     content: str = "[图片]",
     name: str = "",
+    source: str = "",
+    duration: int = 0,
 ) -> Message:
     return Message(
         chat_type=ChatType.GROUP,
@@ -66,7 +89,11 @@ def make_message(
         content=content,
         message_id="1:1",
         kind=kind,
-        attachments=[Attachment(kind=kind, path=path, name=name)],
+        attachments=[
+            Attachment(
+                kind=kind, path=path, name=name, source=source, duration=duration
+            )
+        ],
     )
 
 
@@ -525,3 +552,189 @@ async def test_video_second_call_is_idempotent(
     assert second == 0
     assert message.content == content
     assert content.count("（已抽帧") == 1
+
+
+# --------------------------------------------------------------- 语音转写
+SILK = b"#!SILK_V3" + b"0" * 64
+
+
+async def test_voice_with_local_path_is_stored_and_transcribed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "voice.silk"
+    source.write_bytes(SILK)
+    calls: list[Path] = []
+
+    async def fake_transcribe(path: Path, _settings: object) -> str:
+        calls.append(path)
+        return "今天天气不错"
+
+    monkeypatch.setattr(media_module.speech, "transcribe", fake_transcribe)
+    settings = make_settings(tmp_path, speech=True)
+    message = make_message(
+        str(source), kind="voice", content="[语音]", name="voice.silk", duration=3
+    )
+
+    count = await materialize_attachments(message, settings)
+
+    assert count == 0  # 返回值仍是成功写盘的图片数
+    attachment = message.attachments[0]
+    assert attachment.path.startswith("voices/")
+    assert attachment.path.endswith(".silk")
+    stored = tmp_path / "ws" / attachment.path
+    assert stored.read_bytes() == SILK
+    assert calls == [stored]
+    assert message.content == (
+        f"[语音]（转写：今天天气不错，原文件 {attachment.path}）"
+    )
+
+
+async def test_voice_with_url_is_downloaded_even_when_wechat_media_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = "https://example.com/voice.silk"
+    fetched: list[tuple[str, float, int]] = []
+
+    async def fake_fetch(
+        source: str, timeout: float, max_bytes: int
+    ) -> bytes:
+        fetched.append((source, timeout, max_bytes))
+        return SILK
+
+    async def fake_transcribe(_path: Path, _settings: object) -> str:
+        return "在吗"
+
+    monkeypatch.setattr(media_module.speech, "transcribe", fake_transcribe)
+    settings = make_settings(tmp_path, media=False, images=True, speech=True)
+    message = make_message(
+        "",
+        kind="record",
+        content="[语音]",
+        source=url,
+        duration=2,
+    )
+
+    count = await materialize_attachments(message, settings, fetch=fake_fetch)
+
+    assert count == 0
+    assert fetched and fetched[0][0] == url
+    attachment = message.attachments[0]
+    assert attachment.path.startswith("voices/")
+    assert (tmp_path / "ws" / attachment.path).read_bytes() == SILK
+    assert "转写：在吗" in message.content
+    assert f"原文件 {attachment.path}" in message.content
+
+
+async def test_voice_disabled_keeps_placeholder_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "voice.silk"
+    source.write_bytes(SILK)
+
+    async def boom(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("speech 关闭时不允许转写")
+
+    monkeypatch.setattr(media_module.speech, "transcribe", boom)
+    settings = make_settings(tmp_path, speech=False)
+    message = make_message(str(source), kind="voice", content="[语音]")
+
+    count = await materialize_attachments(message, settings)
+
+    assert count == 0
+    assert message.content == "[语音]"
+    assert message.attachments[0].path == str(source)
+    assert not (tmp_path / "ws" / "voices").exists()
+
+
+async def test_voice_annotate_false_keeps_transcript_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "voice.silk"
+    source.write_bytes(SILK)
+
+    async def fake_transcribe(_path: Path, _settings: object) -> str:
+        return "晚安"
+
+    monkeypatch.setattr(media_module.speech, "transcribe", fake_transcribe)
+    settings = make_settings(tmp_path, speech=True)
+    message = make_message(str(source), kind="voice", content="[语音]")
+
+    await materialize_attachments(message, settings, annotate=False)
+
+    assert message.content == "[语音]（转写：晚安）"
+    assert message.attachments[0].path.startswith("voices/")
+
+
+async def test_too_long_voice_is_not_transcribed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "voice.silk"
+    source.write_bytes(SILK)
+
+    async def boom(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("超长语音不允许转写")
+
+    monkeypatch.setattr(media_module.speech, "transcribe", boom)
+    settings = make_settings(tmp_path, speech=True)
+    message = make_message(
+        str(source), kind="voice", content="[语音]", duration=120
+    )
+
+    await materialize_attachments(message, settings)
+
+    assert "太长，未转写" in message.content
+    assert message.content.count("（") == 1
+
+
+# --------------------------------------------------- QQ 视频：只有 URL 没有 path
+async def test_video_url_is_downloaded_and_framed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = "https://example.com/clip.mp4"
+    calls = patch_video_ffmpeg(monkeypatch)
+
+    async def fake_fetch(
+        source: str, _timeout: float, max_bytes: int
+    ) -> bytes:
+        assert source == url
+        assert max_bytes >= len(MP4)
+        return MP4
+
+    settings = make_settings(tmp_path, media=False, images=True)
+    message = make_message("", kind="video", content="[视频]", source=url)
+
+    count = await materialize_attachments(message, settings, fetch=fake_fetch)
+
+    assert count == 0
+    attachment = message.attachments[0]
+    assert attachment.path.startswith("videos/")
+    assert attachment.path.endswith(".mp4")
+    assert (tmp_path / "ws" / attachment.path).read_bytes() == MP4
+    assert len(calls) == 4
+    assert message.content.startswith("[视频]（已抽帧 images/video-")
+    assert "原文件 videos/" in message.content
+    # 临时下载文件必须清理干净。
+    assert list((tmp_path / "ws" / "videos").glob(".incoming-*")) == []
+
+
+async def test_url_attachment_is_skipped_when_both_gates_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def boom(
+        *_args: object, **_kwargs: object
+    ) -> bytes:
+        raise AssertionError("两个开关都关时不允许下载")
+
+    settings = make_settings(tmp_path, media=False, images=False, speech=True)
+    message = make_message(
+        "",
+        kind="record",
+        content="[语音]",
+        source="https://example.com/voice.silk",
+    )
+
+    count = await materialize_attachments(message, settings, fetch=boom)
+
+    assert count == 0
+    assert message.content == "[语音]"
+    assert not (tmp_path / "ws" / "voices").exists()

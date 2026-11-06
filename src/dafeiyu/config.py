@@ -148,6 +148,12 @@ class MindConfig:
     # emoji id 的具体取值需按 NapCat/QQ 版本验证，先留成配置项。
     emoji_reactions: bool = False
     emoji_reaction_id: str = "128"
+    # 跨群立场（P3）：Reflector 每晚写入，注入还受 mind.enabled 总闸控制。
+    stances_enabled: bool = True
+    # 入站语音/图片先贴个表情回应（P3）：默认关闭，避免对每条媒体消息都贴。
+    inbound_media_reactions: bool = False
+    # 同一会话两次入站反应的最小间隔（秒），防止刷屏。
+    inbound_media_reaction_cooldown_seconds: int = 600
 
 
 @dataclass(frozen=True)
@@ -181,6 +187,12 @@ class InjectionConfig:
     state_chars: int = 100
     inject_relations: bool = False
     relation_chars: int = 160
+    # 「我的立场」（跨群共享，P3）：只有 mind 总闸 + stances_enabled 同时打开才注入。
+    inject_stances: bool = False
+    stances_topk: int = 3
+    stances_chars: int = 160
+    # 群气氛：确定性统计出来的一行观察，拼进「此刻」；默认关，先灰度。
+    atmosphere_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -207,6 +219,26 @@ class ImagesConfig:
     max_bytes: int = 10 * 1024 * 1024
     timeout_seconds: float = 8.0
     retention_days: int = 7
+
+
+@dataclass(frozen=True)
+class SpeechConfig:
+    """入站语音转写（faster-whisper）。默认关闭，关掉时不下载、不转写。"""
+
+    enabled: bool = False
+    model: str = "base"
+    language: str = "zh"
+    device: str = "cpu"
+    compute_type: str = "int8"
+    beam_size: int = 1
+    max_seconds: int = 60
+    timeout_seconds: float = 90.0
+    concurrency: int = 1
+    max_bytes: int = 20 * 1024 * 1024
+    #: faster-whisper 的 initial_prompt：引导输出简体中文；空串 = 不传。
+    initial_prompt: str = "以下是普通话的句子，请用简体中文转写。"
+    #: 空 = 不设置 HF_ENDPOINT（直连 huggingface.co）；国内建议填镜像。
+    hf_endpoint: str = ""
 
 
 @dataclass(frozen=True)
@@ -503,6 +535,7 @@ class Settings:
     injection: InjectionConfig = field(default_factory=InjectionConfig)
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     images: ImagesConfig = field(default_factory=ImagesConfig)
+    speech: SpeechConfig = field(default_factory=SpeechConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     wechat: WeChatConfig = field(default_factory=WeChatConfig)
@@ -789,6 +822,44 @@ def _build_images(raw: dict[str, Any]) -> ImagesConfig:
     )
 
 
+def _speech_text(
+    raw: dict[str, Any], name: str, default: str
+) -> str:
+    """字符串字段：strip 后为空就用默认值。"""
+    value = raw.get(name, default)
+    text = str(value).strip() if value is not None else ""
+    return text or default
+
+
+def _build_speech(raw: dict[str, Any]) -> SpeechConfig:
+    """解析可选的 ``speech:`` 段；缺段 = 全默认（enabled=false）。"""
+    if not isinstance(raw, dict):
+        raise ConfigError("config.yaml 的 speech 必须是映射")
+    timeout = _float(raw.get("timeout_seconds", 90.0), "speech.timeout_seconds")
+    if timeout <= 0:
+        raise ConfigError("speech.timeout_seconds 必须大于 0")
+    return SpeechConfig(
+        enabled=_bool(raw.get("enabled", False), "speech.enabled"),
+        model=_speech_text(raw, "model", "base"),
+        language=_speech_text(raw, "language", "zh"),
+        device=_speech_text(raw, "device", "cpu"),
+        compute_type=_speech_text(raw, "compute_type", "int8"),
+        beam_size=_positive_int(raw.get("beam_size"), "speech.beam_size", 1),
+        max_seconds=_positive_int(raw.get("max_seconds"), "speech.max_seconds", 60),
+        timeout_seconds=timeout,
+        concurrency=_positive_int(raw.get("concurrency"), "speech.concurrency", 1),
+        max_bytes=_positive_int(
+            raw.get("max_bytes"), "speech.max_bytes", 20 * 1024 * 1024
+        ),
+        initial_prompt=_speech_text(
+            raw,
+            "initial_prompt",
+            "以下是普通话的句子，请用简体中文转写。",
+        ),
+        hf_endpoint=_speech_text(raw, "hf_endpoint", ""),
+    )
+
+
 def _build_mind(raw: dict[str, Any]) -> MindConfig:
     """解析可选的 ``mind:`` 段；缺段 = 全默认（enabled=false），老配置不受影响。"""
     if not isinstance(raw, dict):
@@ -825,6 +896,18 @@ def _build_mind(raw: dict[str, Any]) -> MindConfig:
             raw.get("emoji_reactions", False), "mind.emoji_reactions"
         ),
         emoji_reaction_id=str(raw.get("emoji_reaction_id") or "128").strip() or "128",
+        stances_enabled=_bool(
+            raw.get("stances_enabled", True), "mind.stances_enabled"
+        ),
+        inbound_media_reactions=_bool(
+            raw.get("inbound_media_reactions", False),
+            "mind.inbound_media_reactions",
+        ),
+        inbound_media_reaction_cooldown_seconds=_non_negative_int(
+            raw.get("inbound_media_reaction_cooldown_seconds"),
+            "mind.inbound_media_reaction_cooldown_seconds",
+            600,
+        ),
     )
 
 
@@ -887,6 +970,16 @@ def _build_injection(
         inject_relations=mind.enabled,
         relation_chars=_positive_int(
             memory_raw.get("relation_chars"), "memory.relation_chars", 160
+        ),
+        inject_stances=mind.enabled and mind.stances_enabled,
+        stances_topk=_positive_int(
+            memory_raw.get("stance_topk"), "memory.stance_topk", 3
+        ),
+        stances_chars=_positive_int(
+            memory_raw.get("stance_chars"), "memory.stance_chars", 160
+        ),
+        atmosphere_enabled=_bool(
+            memory_raw.get("atmosphere_enabled", False), "memory.atmosphere_enabled"
         ),
     )
 
@@ -1794,6 +1887,7 @@ def load_settings(
         injection=_build_injection(workspace_raw, memory_raw, mind),
         workspace=_build_workspace(workspace_raw),
         images=_build_images(raw.get("images") or {}),
+        speech=_build_speech(raw.get("speech") or {}),
         logging=LoggingConfig(
             level=str(logging_raw.get("level", "INFO")),
             dir=str(logging_raw.get("dir", "logs")),

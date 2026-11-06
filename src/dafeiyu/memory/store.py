@@ -14,6 +14,7 @@ from typing import Any, ClassVar
 from dafeiyu.config import ConfigError
 from dafeiyu.memory import shared_facts
 from dafeiyu.models import (
+    BotStance,
     BotState,
     ChatType,
     Episode,
@@ -205,6 +206,20 @@ CREATE TABLE IF NOT EXISTS bot_state (
     mood_note TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 跨群立场（P3）：话题 → 我的观点，全局共享、不按群隔离。
+-- 由 Reflector 每晚写入；confidence 只用来排注入顺序，不是概率校准值。
+CREATE TABLE IF NOT EXISTS bot_stances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic TEXT NOT NULL,
+    stance TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.5,
+    source_message_id TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (topic)
+);
+CREATE INDEX IF NOT EXISTS idx_bot_stances_rank
+    ON bot_stances (confidence DESC, updated_at DESC);
 
 -- Observer 运行游标与每日调用计数（按会话）：游标落库，重启不从 0 重跑；
 -- daily_calls 与日期一起存，跨天自动归零（不依赖进程内定时器）。
@@ -2904,6 +2919,77 @@ class Store:
         self.set_bot_state(mood_note=text)
         return True
 
+    # ---------------------------------------------------------------- 跨群立场
+    def upsert_stance(
+        self,
+        topic: str,
+        stance: str,
+        *,
+        confidence: float = 0.5,
+        source_message_id: str = "",
+    ) -> BotStance | None:
+        """写一条立场；同一话题覆盖旧观点，空话题/空观点直接忽略。
+
+        话题是唯一键：立场必须能被「再提到同一个话题」命中，重复写入同一
+        话题等于修正原来的说法，而不是攒出一堆近义条目。
+        """
+        clean_topic = topic.strip()[:60]
+        clean_stance = stance.strip()[:200]
+        if not clean_topic or not clean_stance:
+            return None
+        try:
+            value = float(confidence)
+        except (TypeError, ValueError):
+            value = 0.5
+        value = min(1.0, max(0.0, value))
+        self._conn.execute(
+            """
+            INSERT INTO bot_stances
+                (topic, stance, confidence, source_message_id, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT (topic) DO UPDATE SET
+                stance = excluded.stance,
+                confidence = excluded.confidence,
+                source_message_id = excluded.source_message_id,
+                updated_at = datetime('now')
+            """,
+            (clean_topic, clean_stance, value, source_message_id.strip()),
+        )
+        self._conn.commit()
+        return BotStance(
+            topic=clean_topic,
+            stance=clean_stance,
+            confidence=value,
+            source_message_id=source_message_id.strip(),
+        )
+
+    def list_stances(self, limit: int = 3) -> list[BotStance]:
+        """按把握程度取靠前的立场；没有数据时返回空列表。"""
+        rows = self._conn.execute(
+            """
+            SELECT id, topic, stance, confidence, source_message_id, updated_at
+            FROM bot_stances
+            ORDER BY confidence DESC, updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (max(0, limit),),
+        ).fetchall()
+        return [
+            BotStance(
+                id=int(row["id"]),
+                topic=str(row["topic"] or ""),
+                stance=str(row["stance"] or ""),
+                confidence=float(row["confidence"] or 0.0),
+                source_message_id=str(row["source_message_id"] or ""),
+                updated_at=str(row["updated_at"] or ""),
+            )
+            for row in rows
+        ]
+
+    def clear_stances(self) -> None:
+        self._conn.execute("DELETE FROM bot_stances")
+        self._conn.commit()
+
     def get_mind_state(self, key: str, default: str = "") -> str:
         """心智层的小标记（如「这个群今天自省过了」）；没有就返回默认值。"""
         row = self._conn.execute(
@@ -3938,8 +4024,54 @@ class Store:
                     "completion_tokens": int(row["completion_tokens"]),
                     "latency_ms": int(row["latency_ms"]),
                     "detail": detail,
+                    "messages": [],
                 }
             )
+
+        # 思考回放：把每条决策的 message_ids 还原成「她当时看到的那批消息」。
+        # 按 (chat_type, chat_id) 分组后一次 IN 查询，绝不逐条消息查库（N+1）；
+        # 返回时再按 message_ids 原顺序拼回去，查不到的 id 直接跳过。
+        wanted: dict[tuple[str, str], list[str]] = {}
+        for item in items:
+            key = (str(item["chat_type"]), str(item["chat_id"]))
+            bucket = wanted.setdefault(key, [])
+            for raw_id in item["message_ids"][:20]:
+                message_id = str(raw_id)
+                if message_id and message_id not in bucket:
+                    bucket.append(message_id)
+        found: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for (group_chat_type, group_chat_id), ids in wanted.items():
+            # SQLite 变量上限保守取 400，留出 chat_type/chat_id 两个位置。
+            for start in range(0, len(ids), 400):
+                batch = ids[start : start + 400]
+                marks = ",".join("?" for _ in batch)
+                rows = self._conn.execute(
+                    f"""
+                    SELECT message_id, user_id, nickname, is_bot, content, timestamp
+                    FROM messages
+                    WHERE chat_type = ? AND chat_id = ? AND message_id IN ({marks})
+                    """,
+                    (group_chat_type, group_chat_id, *batch),
+                ).fetchall()
+                for row in rows:
+                    mid = str(row["message_id"])
+                    found[(group_chat_type, group_chat_id, mid)] = {
+                        "message_id": mid,
+                        "user_id": str(row["user_id"]),
+                        "nickname": str(row["nickname"]),
+                        "is_bot": bool(row["is_bot"]),
+                        "content": str(row["content"])[:300],
+                        "timestamp": float(row["timestamp"]),
+                    }
+        for item in items:
+            item_chat_type = str(item["chat_type"])
+            item_chat_id = str(item["chat_id"])
+            seen_messages: list[dict[str, Any]] = []
+            for raw_id in item["message_ids"][:20]:
+                message = found.get((item_chat_type, item_chat_id, str(raw_id)))
+                if message is not None:
+                    seen_messages.append(message)
+            item["messages"] = seen_messages
         return items
 
     def decision_stats(
@@ -4164,6 +4296,7 @@ class Store:
         # 角色状态是全局单行（没有 chat_type/chat_id），不在这两份清单里；
         # 「忘掉一切」也要把「本鱼在意什么」清空。
         self._conn.execute("DELETE FROM bot_state")
+        self._conn.execute("DELETE FROM bot_stances")
         self._conn.execute("DELETE FROM mind_state")
         self._conn.commit()
         for table in CHAT_SCOPED_TABLES:

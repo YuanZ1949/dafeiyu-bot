@@ -34,6 +34,7 @@ from .images import materialize
 from .keepalive import Keepalive
 from .media import materialize_attachments
 from .memory import shared_facts
+from .memory.atmosphere import describe_atmosphere
 from .memory.context import build_injection
 from .memory.rotation import apply_rotation, needs_rotation
 from .memory.store import Store
@@ -129,6 +130,16 @@ MEDIA_RETRY_MAX = 100
 GROUP_NAME_TTL_SECONDS = 3600.0
 GROUP_NAME_TIMEOUT_SECONDS = 2.0
 _WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+# 群气氛统计取最近多少条消息；只在实际打开 memory.atmosphere_enabled 时查询。
+ATMOSPHERE_WINDOW_MESSAGES = 60
+# 入站媒体反应只认这几种附件：语音在 QQ 是 record、在微信是 voice。
+INBOUND_MEDIA_KINDS = frozenset({"image", "voice", "record", "video"})
+
+
+def _has_media_attachment(message: Message) -> bool:
+    return any(
+        attachment.kind in INBOUND_MEDIA_KINDS for attachment in message.attachments
+    )
 
 
 def _period_of_day(hour: int) -> str:
@@ -386,6 +397,8 @@ class Service:
         # 每会话上一轮的 prompt_tokens：opencode 报的是整段上下文，累计会重复
         # 计数，轮换阈值（rotation_tokens）只能按「本轮增量」累加。
         self._last_prompt_tokens: dict[tuple[ChatType, str], int] = {}
+        # 入站媒体表情回应的节流时刻（只有 mind.inbound_media_reactions 打开时才写）。
+        self._inbound_reaction_at: dict[tuple[ChatType, str], float] = {}
 
     def _adapter_for(self, chat_id: str) -> Adapter:
         """按会话 id 的通道前缀选适配器；单一派生点是 channel_of。"""
@@ -934,22 +947,22 @@ class Service:
         # materialize 内部永不抛异常，失败保持 [图片] 占位。
         # 没有 read 工具的大脑看不到图，路径字符串只是噪音：直接跳过物化。
         await materialize(msg, self.settings, annotate=annotate)
-        if annotate:
-            # 微信本地库附件同理：只有能被 read 看到时才值得落盘。
-            decode = (
-                self._decode_wechat_dat if self._wechat_media_enabled() else None
-            )
-            await materialize_attachments(msg, self.settings, decode=decode)
-            if decode is not None:
-                # 密钥可能还没扫出来（重启后的第一张图）：先挂起，等这批送审
-                # 前再试一次，避免让模型看到一句「图片内容不可用」。
-                self._queue_media_retry(msg)
+        # 微信图片解码依赖 read 工具；QQ 语音/视频的门控在 media 内部按来源判断，
+        # 不能被 annotate 或 wechat.media.enabled 一起挡掉。
+        decode = self._decode_wechat_dat if (annotate and self._wechat_media_enabled()) else None
+        await materialize_attachments(msg, self.settings, decode=decode, annotate=annotate)
+        if annotate and decode is not None:
+            # 密钥可能还没扫出来（重启后的第一张图）：先挂起，等这批送审
+            # 前再试一次，避免让模型看到一句「图片内容不可用」。
+            self._queue_media_retry(msg)
         # 机器人自己的消息也要先落库（作为 assistant 轮次），但不触发任何回复。
         if not self.store.add_message(msg):
             return
         if msg.is_bot:
             return
         self._note_mood(msg)
+        # 语音/图片的「收到了」反应是旁路：不参与回复判定，也不拖延主链路。
+        self._schedule_inbound_reaction(msg)
 
         # 重启后网关内存里的 bot_message_ids 是空的；引用老消息时回库确认
         # 「被引用的是不是我」，否则会漏掉一次点名。
@@ -1949,16 +1962,26 @@ class Service:
         return None
 
     async def _maybe_emoji_reaction(
-        self, chat_type: ChatType, chat_id: str, message_id: str | None
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        message_id: str | None,
+        *,
+        gate: str = "outbound",
     ) -> None:
-        """mind.emoji_reactions 开启时，给刚发出的 QQ 消息贴一个表情回应。
+        """给一条 QQ 消息贴表情回应；失败只记 debug，不影响主流程。
 
-        只有适配器真的实现 ``set_msg_emoji_like`` 时才尝试；任何失败只记
-        debug，不影响已经完成的发送。
+        ``gate="outbound"`` 受 ``mind.emoji_reactions`` 控制（回的是自己刚发的
+        消息）；``gate="inbound"`` 受 ``mind.inbound_media_reactions`` 控制
+        （听到语音/看到图片先给个反应，P3）。
         """
         if not message_id:
             return
-        if not bool(getattr(self.settings.mind, "emoji_reactions", False)):
+        mind = self.settings.mind
+        if gate == "inbound":
+            if not bool(getattr(mind, "inbound_media_reactions", False)):
+                return
+        elif not bool(getattr(mind, "emoji_reactions", False)):
             return
         adapter = self._adapter_for(chat_id)
         react = cast(
@@ -1967,7 +1990,7 @@ class Service:
         )
         if not callable(react):
             return
-        emoji = str(getattr(self.settings.mind, "emoji_reaction_id", "128") or "128")
+        emoji = str(getattr(mind, "emoji_reaction_id", "128") or "128")
         try:
             ok = await react(chat_type, chat_id, str(message_id), emoji)
         except asyncio.CancelledError:
@@ -1977,6 +2000,37 @@ class Service:
             return
         if not ok:
             log.debug("表情回应未生效 %s/%s", chat_id, message_id)
+
+    def _schedule_inbound_reaction(self, msg: Message) -> None:
+        """入站语音/图片先贴个表情回应（P3）；同会话按冷却秒数节流。
+
+        只在群聊、且消息真的带语音/图片/视频时触发。反应是后台任务：网关慢
+        或适配器不支持都不占回复链路的时间。
+        """
+        mind = self.settings.mind
+        if not bool(getattr(mind, "inbound_media_reactions", False)):
+            return
+        if msg.chat_type is not ChatType.GROUP:
+            return
+        if not msg.message_id or not _has_media_attachment(msg):
+            return
+        key = (msg.chat_type, msg.chat_id)
+        now = time.monotonic()
+        cooldown = max(
+            0,
+            int(getattr(mind, "inbound_media_reaction_cooldown_seconds", 600)),
+        )
+        last = self._inbound_reaction_at.get(key)
+        if last is not None and now - last < cooldown:
+            return
+        self._inbound_reaction_at[key] = now
+        task = asyncio.ensure_future(
+            self._maybe_emoji_reaction(
+                msg.chat_type, msg.chat_id, msg.message_id, gate="inbound"
+            )
+        )
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     async def _send_text(
         self,
@@ -2795,6 +2849,18 @@ class Service:
             name = self._group_names.get(chat_id, ("", 0.0))[0]
             if name:
                 parts.append(f"本群：{name}")
+        injection_cfg = self.injection or InjectionConfig()
+        if injection_cfg.atmosphere_enabled and chat_type is ChatType.GROUP:
+            # 只在显式打开时多查一次库；气氛是观察，不是判定依据。
+            try:
+                recent = self.store.recent_messages(
+                    chat_type, chat_id, ATMOSPHERE_WINDOW_MESSAGES
+                )
+            except Exception:  # noqa: BLE001 - 气氛读不到就省略这半句
+                recent = []
+            atmosphere = describe_atmosphere(recent, now_ts=now.timestamp())
+            if atmosphere:
+                parts.append(f"群气氛：{atmosphere}")
         try:
             state = self.store.load_chat_state(chat_type, chat_id) or {}
         except Exception:  # noqa: BLE001 - 状态读不到就不提这半句

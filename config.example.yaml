@@ -285,6 +285,33 @@ images:
   # 落盘图片保留天数，0 = 永久保留。
   retention_days: 7
 
+# 入站语音转写（QQ 语音 / 微信语音）。默认关闭：关掉时语音完全不处理，
+# 正文只保留 [语音] 占位，也不下载、不落盘。
+# 需要可选依赖：pip install -e ".[stt]"（faster-whisper + silk-python）。
+# 另外需要 ffmpeg（可用 DAFEIYU_FFMPEG 指定路径）；ffmpeg 没有 SILK 解码器，
+# SILK 由 pysilk 先解码成 PCM 再交给 ffmpeg。
+speech:
+  enabled: false
+  # faster-whisper 模型名或本地目录：tiny/base/small/medium/large-v3。
+  model: base
+  language: zh
+  device: cpu
+  compute_type: int8
+  beam_size: 1
+  # 超过这个时长（秒）的语音不转写，只记原文件路径。
+  max_seconds: 60
+  # 单条语音的下载/解码/转写总超时（秒）。
+  timeout_seconds: 90
+  # 同时转写的语音数；CPU 上建议保持 1。
+  concurrency: 1
+  # 单条语音文件大小上限（字节）；QQ 语音通常远小于此。
+  max_bytes: 20971520
+  # 引导模型输出简体中文；实测 base 默认会吐繁体。留空 = 不传。
+  initial_prompt: "以下是普通话的句子，请用简体中文转写。"
+  # HuggingFace 镜像：本机直连 huggingface.co 会超时，国内建议填镜像。
+  # 留空 = 不设置 HF_ENDPOINT（直连）。
+  hf_endpoint: "https://hf-mirror.com"
+
 memory:
   window_size: 20
   impression_topk: 3
@@ -310,11 +337,16 @@ memory:
   open_loop_topk: 3
   open_loop_chars: 200
   episode_chars: 220
-  # 「正在聊的事 + 没有下文的事 + 你和他 + 本鱼的近况 + 群友印象」的合计
-  # 字符预算；超了按「印象 → 未了事 → 关系卡 → 近况」丢弃，最后截断正在聊的事。
+  # 「正在聊的事 + 没有下文的事 + 你和他 + 本鱼的近况 + 我的立场 + 群友印象」的合计
+  # 字符预算；超了按「印象 → 未了事 → 关系卡 → 立场 → 近况」丢弃，最后截断正在聊的事。
   mind_chars: 600
   state_chars: 100
   relation_chars: 160
+  # 「我的立场」：跨群共享的观点条数/字符预算；只在 mind 总闸打开时注入。
+  stance_topk: 3
+  stance_chars: 160
+  # 群气氛：把最近 10 分钟的消息量/人数/问句比例拼进「此刻」；默认关。
+  atmosphere_enabled: false
 
 # 心智层（P1）：默认全关，灰度打开；关掉即回到当前行为（软回滚）。
 # 缺这一段也能启动——所有字段都有默认值。
@@ -337,6 +369,13 @@ mind:
   # emoji id 与 NapCat/QQ 版本相关，上线前先用真实环境验证。
   emoji_reactions: false
   emoji_reaction_id: "128"
+  # 跨群立场（P3）：Reflector 每晚把「明确表过态的观点」写库，注入受
+  # mind.enabled 总闸控制；关掉只停止注入，已写入的立场保留。
+  stances_enabled: true
+  # 入站语音/图片先贴个表情回应（P3）：默认关闭，避免对每条媒体消息都贴。
+  inbound_media_reactions: false
+  # 同一会话两次入站反应的最小间隔（秒）。
+  inbound_media_reaction_cooldown_seconds: 600
 
 # 面板「聊天行为」卡片可实时改；这里的值只是默认值，面板改动写
 # data/settings.local.yaml，重启后仍然保留。

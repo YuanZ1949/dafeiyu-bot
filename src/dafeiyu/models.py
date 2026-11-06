@@ -203,6 +203,23 @@ class BotState:
 
 
 @dataclass
+class BotStance:
+    """跨群共享的「我的立场」：话题 → 观点。
+
+    与 ``bot_state`` 不同，立场不是瞬时状态而是稳定观点：A 群讨论过的
+    结论，到 B 群被问起时应该还记得。Reflector 每晚更新，注入按
+    ``confidence`` 取靠前的几条。
+    """
+
+    topic: str
+    stance: str
+    confidence: float = 0.5
+    source_message_id: str = ""
+    updated_at: str = ""
+    id: int | None = None
+
+
+@dataclass
 class RelationshipCard:
     """关系卡：聚合出来的「这个人是谁、聊过多少、上次怎么回的」。
 

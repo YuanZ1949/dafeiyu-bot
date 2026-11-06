@@ -48,6 +48,8 @@ EPISODE_MOOD_PREFIX = "群气氛："
 # 关系卡与本鱼近况（P1）：数据由 Reflector / 规则写，注入受 mind 总闸控制。
 INJECTION_RELATION_HEADER = "【你和他】"
 INJECTION_STATE_HEADER = "【本鱼的近况】"
+# 跨群立场（P3）： 她说过的话不该随群改变。
+INJECTION_STANCE_HEADER = "【我的立场】"
 INJECTION_IMPRESSION_TOPK = 3
 # 关系卡只给当前批次里最靠前的几个发言人，别把整群通讯录塞进 prompt。
 INJECTION_RELATION_SPEAKERS = 3
@@ -440,14 +442,28 @@ def _state_block(store: Store, cfg: InjectionConfig) -> str:
     return _clip("\n".join(lines), cfg.state_chars)
 
 
+def _stance_block(store: Store, cfg: InjectionConfig) -> str:
+    """「我的立场」：跨群共享的稳定观点，一条一行，空的整段省略。"""
+    if not cfg.inject_stances:
+        return ""
+    lines: list[str] = []
+    for stance in store.list_stances(max(1, cfg.stances_topk)):
+        topic = stance.topic.strip()
+        text = stance.stance.strip()
+        if not text:
+            continue
+        lines.append(f"- {topic}：{text}" if topic else f"- {text}")
+    return _clip("\n".join(lines), cfg.stances_chars)
+
+
 def _mind_blocks(
     store: Store, chat_type: ChatType, chat_id: str, cfg: InjectionConfig
 ) -> list[str]:
-    """注意力段（spec §5.5）：正在聊的事 → 没有下文的事 → 你和他 → 本鱼近况 → 群友印象。
+    """注意力段（spec §5.5）：正在聊的事 → 没有下文的事 → 你和他 → 本鱼近况 → 我的立场 → 群友印象。
 
-    五段共用 mind_chars 合计预算。和别的段落一致，预算只数数据体、不数
+    六段共用 mind_chars 合计预算。和别的段落一致，预算只数数据体、不数
     header 与边界行：header/边界是固定文案，数进去会让「默认 600」在各段
-    都写满时误伤最后一段。超预算时按「印象 → 未了事 → 关系卡 → 近况」的
+    都写满时误伤最后一段。超预算时按「印象 → 未了事 → 关系卡 → 立场 → 近况」的
     顺序整段丢弃，正在聊的事最后才截断；预算再小也不能抛异常，裁完为空
     的块不进注入。
     """
@@ -484,12 +500,19 @@ def _mind_blocks(
             state,
         )
 
+    stances = _stance_block(store, cfg)
+    if stances:
+        blocks["stances"] = (
+            f"{INJECTION_STANCE_HEADER}\n{INJECTION_BOUNDARY}",
+            stances,
+        )
+
     impressions = _impression_body(store, chat_type, chat_id, cfg)
     if impressions:
         blocks["impressions"] = (INJECTION_IMPRESSION_HEADER, impressions)
 
     budget = max(0, cfg.mind_chars)
-    for name in ("impressions", "loops", "relations", "state"):
+    for name in ("impressions", "loops", "relations", "stances", "state"):
         if len(blocks) <= 1:
             break
         if sum(len(body) for _, body in blocks.values()) <= budget:
@@ -512,7 +535,7 @@ def _mind_blocks(
         head, body = blocks[name]
         blocks[name] = (head, _clip(body, budget))
 
-    order = ("episode", "loops", "relations", "state", "impressions")
+    order = ("episode", "loops", "relations", "state", "stances", "impressions")
     return [
         f"{blocks[name][0]}\n{blocks[name][1]}"
         for name in order

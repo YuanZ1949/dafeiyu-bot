@@ -33,6 +33,13 @@ wechat = [
     # 不装也能跑 UIA 路线；开了本地库但缺这个包时正文会退化成空串。
     "zstandard>=0.23",
 ]
+# 入站语音转写（speech.enabled）。可选：不装时语音只保留 [语音] 占位。
+# 发行包 `silk-python` 的实际 import 名是 `pysilk`（SILK 解码）；
+# `faster-whisper` 首次运行会从 HF 下载模型（国内建议配 speech.hf_endpoint）。
+stt = [
+    "faster-whisper>=1.1",
+    "silk-python>=0.2.9",
+]
 
 [project.scripts]
 dafeiyu = "dafeiyu.cli:main"

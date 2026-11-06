@@ -230,6 +230,41 @@ def test_scene_injection_can_be_disabled(tmp_path, monkeypatch) -> None:
     assert "【此刻】" not in prompt
 
 
+def test_scene_hint_includes_atmosphere_when_enabled(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "now_shanghai", lambda: NOW)
+    service, store, _adapter = build(
+        tmp_path, injection=InjectionConfig(atmosphere_enabled=True)
+    )
+    now_ts = int(NOW.timestamp())
+    for index in range(10):
+        store.add_message(
+            Message(
+                chat_type=ChatType.GROUP,
+                chat_id=GROUP,
+                user_id=f"qq:{index % 5}",
+                nickname=f"人{index}",
+                content="为什么？" if index % 2 else "哈哈哈",
+                message_id=f"seed-{index}",
+                timestamp=now_ts - 300 + index * 20,
+            )
+        )
+
+    scene = service._scene_hint(ChatType.GROUP, GROUP, [make_msg()])
+
+    assert "群气氛：" in scene
+    assert "聊得正热" in scene
+    assert "好几个人在场" in scene
+
+
+def test_scene_hint_omits_atmosphere_by_default(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "now_shanghai", lambda: NOW)
+    service, _store, _adapter = build(tmp_path)
+
+    scene = service._scene_hint(ChatType.GROUP, GROUP, [make_msg()])
+
+    assert "群气氛" not in scene
+
+
 def test_period_of_day_and_duration_labels() -> None:
     assert _period_of_day(2) == "凌晨"
     assert _period_of_day(7) == "清晨"

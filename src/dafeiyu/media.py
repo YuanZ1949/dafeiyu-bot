@@ -27,8 +27,12 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 
+import httpx
+
+from . import speech
 from .config import Settings
 from .models import Attachment, Message
+from .netssl import default_ssl_context
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +46,22 @@ _VIDEO_PLACEHOLDER = "[视频]"
 _VIDEO_MARK_FRAMES = "（已抽帧"
 _VIDEO_MARK_ORIGINAL = "（原文件"
 _VIDEO_MARKS = (_VIDEO_MARK_FRAMES, _VIDEO_MARK_ORIGINAL)
+
+#: 语音占位：QQ 语音段是 ``[语音]``，微信同样。注记独立于图片正则。
+_VOICE_PLACEHOLDER = "[语音]"
+#: 任何 ``[语音]（…）`` 都视为已注记，避免第二次调用重复替换。
+_VOICE_ANNOTATION_MARK = "（"
+_VOICE_PLACEHOLDER_RE = re.compile(re.escape(_VOICE_PLACEHOLDER))
+
+#: QQ/微信语音段常见的下载地址后缀。
+_VOICE_URL_SUFFIXES = frozenset(
+    {".silk", ".amr", ".wav", ".mp3", ".m4a", ".ogg", ".aac", ".flac"}
+)
+_VIDEO_URL_SUFFIXES = frozenset(
+    {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".flv", ".webm", ".wmv", ".3gp"}
+)
+
+_HTTP_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 #: 抽帧位置（时长百分比）与抽出来的文件名前缀。
 _VIDEO_FRAME_PERCENTS: tuple[float, ...] = (0.10, 0.35, 0.60, 0.85)
@@ -70,6 +90,25 @@ _HEX32_NAME_RE = re.compile(r"[0-9a-fA-F]{32}")
 
 #: ``decode`` 允许同步或异步：表情解码要调 ffmpeg，实现方会放到线程里。
 Decode = Callable[[bytes], bytes | None | Awaitable[bytes | None]]
+
+#: QQ 语音/视频只有 URL 没有本地路径：下载函数可注入，签名与 images 一致。
+FetchFn = Callable[[str, float, int], Awaitable[bytes]]
+
+
+async def _default_fetch(url: str, timeout: float, max_bytes: int) -> bytes:
+    """流式下载，边收边判上限，超限即断。"""
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=True, verify=default_ssl_context()
+    ) as client, client.stream("GET", url) as resp:
+        resp.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"附件超过大小上限 {max_bytes} 字节")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 #: 与 ``images.py`` 相同的魔数表。这里刻意复制一份：本模块只依赖 models，
 #: 不调用另一个模块的私有函数（那会让两边的生命周期互相绑定）。
@@ -139,6 +178,192 @@ def _annotate_video(content: str, suffix: str) -> str:
         if not tail.startswith(_VIDEO_MARKS):
             return content[: match.start()] + match.group(0) + suffix + tail
     return content
+
+
+def _annotate_voice(content: str, suffix: str) -> str:
+    """把第一个未注记的 ``[语音]`` 换成本轮转写/原文件注记。"""
+    for match in _VOICE_PLACEHOLDER_RE.finditer(content):
+        tail = content[match.end() :]
+        if not tail.startswith(_VOICE_ANNOTATION_MARK):
+            return content[: match.start()] + match.group(0) + suffix + tail
+    return content
+
+
+def _ext_from_url(url: str, allowed: frozenset[str]) -> str:
+    suffix = Path(url.split("?", 1)[0].split("#", 1)[0]).suffix.lower()
+    return suffix if suffix in allowed else ""
+
+
+def _voice_ext(data: bytes, source: str) -> str:
+    """按魔数猜语音扩展名；认不出时退回 URL 后缀，兜底 ``.bin``。"""
+    if data.startswith((b"\x02#!SILK_V", b"#!SILK_V3")):
+        return ".silk"
+    if data.startswith(b"#!AMR"):
+        return ".amr"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WAVE":
+        return ".wav"
+    if data.startswith(b"OggS"):
+        return ".ogg"
+    if data.startswith(b"ID3") or data[:2] in (
+        b"\xff\xfb",
+        b"\xff\xf3",
+        b"\xff\xf2",
+        b"\xff\xf1",
+    ):
+        return ".mp3"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return ".m4a"
+    return _ext_from_url(source, _VOICE_URL_SUFFIXES) or ".bin"
+
+
+def _voice_target(directory: Path, source: str, data: bytes) -> Path:
+    """``voices/<时间戳>-<md5(来源)[:6]><扩展名>``。"""
+    digest = hashlib.md5(source.encode("utf-8", "ignore")).hexdigest()[:6]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return directory / f"{stamp}-{digest}{_voice_ext(data, source)}"
+
+
+def _has_media_source(attachment: Attachment) -> bool:
+    """带本地路径的附件，或只有 http(s) 来源的语音/视频（QQ）。"""
+    if attachment.path:
+        return True
+    if attachment.kind not in ("voice", "record", "video"):
+        return False
+    return bool(_HTTP_RE.match((attachment.source or "").strip()))
+
+
+async def _download_video(
+    source: str,
+    *,
+    root: Path,
+    settings: Settings,
+    fetch: FetchFn,
+) -> Path | None:
+    """把 QQ 视频 URL 流式下载到临时文件；失败返回 ``None``。"""
+    images_cfg = getattr(settings, "images", None)
+    timeout = float(getattr(images_cfg, "timeout_seconds", 8.0) or 8.0)
+    try:
+        data = await fetch(source, timeout, _MAX_VIDEO_BYTES)
+    except Exception:
+        log.info("视频下载失败，保持占位：%s", source, exc_info=True)
+        return None
+    if not data or len(data) > _MAX_VIDEO_BYTES:
+        log.info(
+            "视频大小不可接受（%d 字节，上限 %d），保持占位：%s",
+            len(data) if data else 0,
+            _MAX_VIDEO_BYTES,
+            source,
+        )
+        return None
+    ext = (
+        _sniff_video_ext(data)
+        or _ext_from_url(source, _VIDEO_URL_SUFFIXES)
+        or ".mp4"
+    )
+    digest = hashlib.md5(source.encode("utf-8", "ignore")).hexdigest()[:8]
+    directory = root / "videos"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f".incoming-{digest}{ext}"
+        await asyncio.to_thread(target.write_bytes, data)
+    except OSError:
+        log.info("视频临时文件写盘失败：%s", source, exc_info=True)
+        return None
+    return target
+
+
+async def _materialize_voice(
+    msg: Message,
+    attachment: Attachment,
+    *,
+    root: Path,
+    settings: Settings,
+    fetch: FetchFn,
+    annotate: bool,
+) -> Attachment:
+    """语音落盘 + 转写；任何失败都退回原附件、保留 ``[语音]``。"""
+    cfg = getattr(settings, "speech", None)
+    if cfg is None or not getattr(cfg, "enabled", False):
+        # 关闭时完全不处理：不下载、不落盘、不改 content。
+        return attachment
+
+    source_value = attachment.path or (attachment.source or "").strip()
+    data: bytes | None = None
+    if attachment.path:
+        try:
+            data = await asyncio.to_thread(Path(attachment.path).read_bytes)
+        except OSError:
+            log.info(
+                "语音读取失败，保持占位：msg=%s", msg.message_id, exc_info=True
+            )
+            return attachment
+    elif _HTTP_RE.match(source_value):
+        max_bytes = int(getattr(cfg, "max_bytes", 0) or 0)
+        timeout = float(getattr(cfg, "timeout_seconds", 10.0) or 10.0)
+        try:
+            data = await fetch(
+                source_value, timeout, max_bytes or _MAX_VIDEO_BYTES
+            )
+        except Exception:
+            log.info(
+                "语音下载失败，保持占位：msg=%s", msg.message_id, exc_info=True
+            )
+            return attachment
+    else:
+        return attachment
+
+    if not data:
+        return attachment
+    max_bytes = int(getattr(cfg, "max_bytes", 0) or 0)
+    if max_bytes > 0 and len(data) > max_bytes:
+        log.info(
+            "语音大小不可接受（%d 字节，上限 %d），保持占位：msg=%s",
+            len(data),
+            max_bytes,
+            msg.message_id,
+        )
+        return attachment
+
+    directory = root / "voices"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        target = _voice_target(directory, source_value, data)
+        await asyncio.to_thread(target.write_bytes, data)
+    except OSError:
+        log.info("语音写盘失败，保持占位：msg=%s", msg.message_id, exc_info=True)
+        return attachment
+
+    relative = _materialized_relative(target, root) or f"voices/{target.name}"
+    duration = int(getattr(attachment, "duration", 0) or 0)
+    max_seconds = int(getattr(cfg, "max_seconds", 0) or 0)
+    if max_seconds > 0 and duration > max_seconds:
+        suffix = (
+            f"（太长，未转写；原文件 {relative}）"
+            if annotate
+            else "（太长，未转写）"
+        )
+    else:
+        # 转写不受 annotate 影响：本地模型没有 read 工具也能直接读正文。
+        text = await speech.transcribe(target, settings)
+        if text:
+            suffix = (
+                f"（转写：{text}，原文件 {relative}）"
+                if annotate
+                else f"（转写：{text}）"
+            )
+        else:
+            suffix = (
+                f"（听不清，原文件 {relative}）" if annotate else "（听不清）"
+            )
+    msg.content = _annotate_voice(msg.content, suffix)
+    return Attachment(
+        kind=attachment.kind,
+        source=attachment.source,
+        path=relative,
+        name=target.name,
+        size=len(data),
+        duration=attachment.duration,
+    )
 
 
 def _materialized_relative(path: Path, root: Path) -> str | None:
@@ -402,33 +627,42 @@ async def materialize_attachments(
     *,
     decode: Decode | None = None,
     annotate: bool = True,
+    fetch: FetchFn | None = None,
 ) -> int:
-    """把带本地路径的附件物化进 workspace，返回成功写盘的图片数量。
+    """把附件物化进 workspace，返回成功写盘的图片数量。
 
-    ``decode`` 对微信 ``.dat`` 图片与表情缓存（32 位 hex 文件名）生效；可以
-    返回 awaitable（表情转码要起 ffmpeg 子进程）。传 ``None`` 表示不解码、
-    按原字节复制。视频（``kind == "video"``）会复制原文件到 ``videos/``，
-    并在 ``annotate`` 为真时用 ffmpeg 抽帧到 ``images/``。任何失败都保留原
-    占位，绝不抛出。
+    - 带本地路径的附件（微信）仍由 ``wechat.media.enabled`` 门控；
+    - 只有 http(s) 来源的附件（QQ 语音/视频）由 ``images.enabled`` 门控；
+    - 语音（``voice`` / ``record``）落盘到 ``voices/`` 并转写；
+    - 视频（``kind == "video"``）复制原文件到 ``videos/``，``annotate`` 为真
+      时用 ffmpeg 抽帧到 ``images/``；URL 来源先下载到临时文件。
+
+    ``decode`` 对微信 ``.dat`` 图片与表情缓存生效；``fetch`` 可注入下载函数。
+    任何失败都保留原占位，绝不抛出。
     """
     try:
         workspace = getattr(settings, "workspace", None)
-        media_cfg = getattr(getattr(settings, "wechat", None), "media", None)
-        # 快路径：开关全关时连 Path 都不构造，避免无意义的文件系统探测。
+        # 快路径：workspace 关闭时连 Path 都不构造，避免文件系统探测。
         if not getattr(workspace, "enabled", False):
-            return 0
-        if not getattr(media_cfg, "enabled", False):
-            return 0
-        attachments = [item for item in msg.attachments if item.path]
-        if not attachments:
-            return 0
-
-        max_bytes = int(getattr(media_cfg, "max_bytes", 0) or 0)
-        if max_bytes <= 0:
             return 0
         workspace_dir = getattr(workspace, "dir", "")
         if not workspace_dir:
             return 0
+
+        media_cfg = getattr(getattr(settings, "wechat", None), "media", None)
+        path_enabled = bool(getattr(media_cfg, "enabled", False))
+        path_max = int(getattr(media_cfg, "max_bytes", 0) or 0)
+        images_cfg = getattr(settings, "images", None)
+        url_enabled = bool(getattr(images_cfg, "enabled", False))
+        url_max = int(getattr(images_cfg, "max_bytes", 0) or 0)
+        if not path_enabled and not url_enabled:
+            return 0
+
+        attachments = [item for item in msg.attachments if _has_media_source(item)]
+        if not attachments:
+            return 0
+
+        fetch_fn = fetch or _default_fetch
         root = Path(workspace_dir)
         directory = root / "images"
         prepared = False
@@ -436,19 +670,39 @@ async def materialize_attachments(
         updated: list[Attachment] = []
 
         for attachment in attachments:
-            source = attachment.path
-            source_path = Path(source)
+            attachment_path = (attachment.path or "").strip()
+            source_url = (attachment.source or "").strip()
+            is_url = not attachment_path and bool(_HTTP_RE.match(source_url))
 
-            # 已经在 workspace 里的相对路径 = 本模块上一轮的产物（或 images.py
-            # 的产物）：不再复制、不再注解，保持幂等。
-            if (
-                not source_path.is_absolute()
-                and (root / source_path).is_file()
-            ):
+            if attachment_path:
+                if not path_enabled or path_max <= 0:
+                    updated.append(attachment)
+                    continue
+                source = attachment_path
+                source_path: Path | None = Path(source)
+
+                # 已经在 workspace 里的相对路径 = 本模块上一轮的产物（或
+                # images.py 的产物）：不再复制、不再注解，保持幂等。
+                if (
+                    not source_path.is_absolute()
+                    and (root / source_path).is_file()
+                ):
+                    updated.append(attachment)
+                    continue
+            elif is_url:
+                if not url_enabled:
+                    updated.append(attachment)
+                    continue
+                source = source_url
+                source_path = None
+            else:
                 updated.append(attachment)
                 continue
 
             if attachment.kind == "file":
+                if source_path is None:
+                    updated.append(attachment)
+                    continue
                 note = _file_note(attachment)
                 if note not in msg.content:
                     msg.content = (
@@ -457,17 +711,71 @@ async def materialize_attachments(
                 updated.append(attachment)
                 continue
 
-            if attachment.kind == "video":
+            if attachment.kind in ("voice", "record"):
                 try:
                     updated.append(
-                        await _materialize_video(
+                        await _materialize_voice(
                             msg,
                             attachment,
                             root=root,
-                            decode=decode,
+                            settings=settings,
+                            fetch=fetch_fn,
                             annotate=annotate,
                         )
                     )
+                except Exception:  # 单条语音失败不能拖累其它附件
+                    log.warning(
+                        "语音物化失败，保持占位：msg=%s",
+                        msg.message_id,
+                        exc_info=True,
+                    )
+                    updated.append(attachment)
+                continue
+
+            if attachment.kind == "video":
+                try:
+                    if source_path is not None:
+                        updated.append(
+                            await _materialize_video(
+                                msg,
+                                attachment,
+                                root=root,
+                                decode=decode,
+                                annotate=annotate,
+                            )
+                        )
+                    else:
+                        temp = await _download_video(
+                            source, root=root, settings=settings, fetch=fetch_fn
+                        )
+                        if temp is None:
+                            updated.append(attachment)
+                            continue
+                        try:
+                            downloaded = Attachment(
+                                kind=attachment.kind,
+                                source=attachment.source,
+                                path=str(temp),
+                                name=temp.name,
+                                size=0,
+                                duration=attachment.duration,
+                            )
+                            updated.append(
+                                await _materialize_video(
+                                    msg,
+                                    downloaded,
+                                    root=root,
+                                    decode=decode,
+                                    annotate=annotate,
+                                )
+                            )
+                        finally:
+                            try:
+                                temp.unlink(missing_ok=True)
+                            except OSError:
+                                log.debug(
+                                    "清理视频临时文件失败：%s", temp, exc_info=True
+                                )
                 except Exception:  # 单个视频失败不能拖累其它附件
                     log.warning(
                         "视频物化失败，保持占位：msg=%s",
@@ -477,13 +785,13 @@ async def materialize_attachments(
                     updated.append(attachment)
                 continue
 
-            if attachment.kind != "image":
+            if attachment.kind != "image" or source_path is None:
                 updated.append(attachment)
                 continue
 
             try:
                 # 单次读取：不文件存在性预检，减少 TOCTOU 与多余系统调用。
-                data = source_path.read_bytes()
+                data = await asyncio.to_thread(source_path.read_bytes)
             except OSError:
                 log.info(
                     "附件读取失败，保持占位：msg=%s kind=%s",
@@ -507,11 +815,11 @@ async def materialize_attachments(
                     updated.append(attachment)
                     continue
 
-            if not data or len(data) > max_bytes:
+            if not data or len(data) > path_max:
                 log.info(
                     "附件大小不可接受（%d 字节，上限 %d），保持占位：msg=%s",
-                    len(data),
-                    max_bytes,
+                    len(data) if data else 0,
+                    path_max,
                     msg.message_id,
                 )
                 updated.append(attachment)
@@ -521,14 +829,12 @@ async def materialize_attachments(
                 # 目录与清理只在第一张真要落盘时才动，避免无图消息碰文件系统。
                 directory.mkdir(parents=True, exist_ok=True)
                 # workspace/images 与 images.py 共用，沿用同一保留期配置。
-                retention_days = getattr(
-                    getattr(settings, "images", None), "retention_days", 0
-                )
+                retention_days = getattr(images_cfg, "retention_days", 0)
                 _cleanup(directory, retention_days)
                 prepared = True
             target = _target(directory, source, data, source_path.suffix)
             try:
-                target.write_bytes(data)
+                await asyncio.to_thread(target.write_bytes, data)
             except OSError:
                 log.info(
                     "附件写盘失败，保持占位：msg=%s", msg.message_id, exc_info=True
