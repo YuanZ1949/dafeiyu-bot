@@ -311,11 +311,11 @@ select chat_id, purpose, prompt_tokens, completion_tokens, created_at
 
 | # | 事项 | 说明 |
 | --- | --- | --- |
-| 1 | 提交未 push | 第二轮结束后见 `git rev-list --count origin/feat/qq-bot..HEAD`；`gitea` 凭据交互曾失败，失败不阻塞 |
+| 1 | 提交未 push | **2026-11-06 已解决**：`origin` 与 `gitea` 的 `feat/qq-bot` 都推到 `da7e0e0`（gitea 由系统凭据管理器弹窗登录） |
 | 2 | e2e 消息已真实发出 | 01:26:51 往群「我们一起搞事情吖」发了 `E2E-hook-…` 的回复（补发机制），确认真假群，必要时人工撤回 |
 | 3 | agent 文件入库问题 | 彻底解法：移出 git，或让生成目录落到 `data/opencode-runtime/` |
 | 4 | 01:29 的重启无来源记录 | supervisor 不记录「谁发起停止」，建议加审计 |
-| 5 | 旧副本 | `C:\MyFile\AICoding\dafeiyu-release`（旧发布副本，Key 来源）是否清理 |
+| 5 | 旧副本 | **2026-11-06 已处理**：`dafeiyu-release` 已于 10-31 归档到 `_archive\dafeiyu-release-runtime-20261031`；线上实例改为直接跑本仓库 |
 | 6 | 免费档 429 | 与本次改动无关；key 档下不再使用，若回 free 需换端点或等限流恢复 |
 
 ---

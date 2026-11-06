@@ -342,6 +342,11 @@ NapCat 已连接
 
 ### 更新部署到 release 目录
 
+> 当前线上实例是**直接从本仓库运行**的（`scripts\start-all.ps1` 拉起 supervisor 及其子进程），
+> 旧的独立副本 `C:\MyFile\AICoding\dafeiyu-release` 已于 2026-10-31 归档到
+> `_archive\dafeiyu-release-runtime-20261031`。日常改完代码按下面「从 git 升级 / 停启」走即可，
+> `deploy.ps1` 留给「另建一份 release 副本（例如部署到别的机器）」的场景。
+
 改了代码后要更新正在跑的 release（例如 `C:\MyFile\AICoding\dafeiyu-release`）：
 
 ```powershell
