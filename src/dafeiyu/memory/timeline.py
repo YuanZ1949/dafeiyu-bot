@@ -30,16 +30,41 @@ def time_label(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, SHANGHAI).strftime("%m-%d %H:%M")
 
 
+QUOTE_TEXT_LIMIT = 40
+
+
+def _quote_mark(msg: Message, reply_names: dict[str, str] | None) -> str:
+    """引用块的渲染：优先显示作者 + 原文，其次退回「回复 谁」。"""
+    text = (msg.reply_to_text or "").replace("\n", " ").strip()
+    if len(text) > QUOTE_TEXT_LIMIT:
+        text = text[:QUOTE_TEXT_LIMIT].rstrip() + "…"
+    if msg.reply_to_bot:
+        return f"（引用你：{text}）" if text else "（引用回复你）"
+    if text and msg.reply_to_author:
+        return f"（引用 {msg.reply_to_author}：{text}）"
+    if text:
+        return f"（引用：{text}）"
+    if reply_names and msg.reply_to_message_id:
+        target = reply_names.get(msg.reply_to_message_id, "")
+        if target:
+            return f"（回复 {target}）"
+    if msg.reply_to_author:
+        return f"（引用 {msg.reply_to_author}）"
+    return ""
+
+
 def format_message_line(
     msg: Message,
     *,
     current: Message | None = None,
     reply_names: dict[str, str] | None = None,
+    mention_ids: frozenset[str] | None = None,
 ) -> str:
-    """一行一条消息；当前这条额外标出 @ 与引用，其他消息补「回复 谁」。
+    """一行一条消息；标出引用、@、@所有人 与「只是提到你」。
 
     群友之间的互回是判断「这句话在接谁」的关键线索；旧实现只标当前消息
-    对 bot 的 @/引用，A 回 B 的关系在时间线里完全丢失。
+    对 bot 的 @/引用，A 回 B 的关系在时间线里完全丢失。bot 自己的行统一用
+    「你：」，避免模型把自己的旧发言当成群友发言。
     """
     if msg.recalled_at:
         content = "[已撤回]"
@@ -47,17 +72,23 @@ def format_message_line(
         content = msg.content.strip() or EMPTY_CONTENT
     label = time_label(msg.timestamp)
     prefix = f"[{label}] " if label else ""
-    marks = ""
-    if current is not None and msg.message_id == current.message_id:
-        if current.reply_to_bot:
-            marks = "（引用回复你）"
-        elif current.at_bot:
-            marks = "（@了你）"
+    marks: list[str] = []
+    if msg.at_all:
+        marks.append("（@所有人）")
+    if msg.reply_to_bot or msg.reply_to_text or msg.reply_to_author:
+        quote = _quote_mark(msg, reply_names)
+        if quote:
+            marks.append(quote)
     elif reply_names and msg.reply_to_message_id:
         target = reply_names.get(msg.reply_to_message_id, "")
         if target:
-            marks = f"（回复 {target}）"
-    return f"{prefix}{msg.nickname}：{content}{marks}"
+            marks.append(f"（回复 {target}）")
+    if msg.at_bot:
+        marks.append("（@了你）")
+    if mention_ids and msg.message_id in mention_ids:
+        marks.append("（提到你，不确定）")
+    speaker = "你" if msg.is_bot else msg.nickname
+    return f"{prefix}{speaker}：{content}{''.join(marks)}"
 
 
 def build_delivery(
@@ -71,6 +102,8 @@ def build_delivery(
     omitted, pending = store.pending_messages(
         msg.chat_type, msg.chat_id, msg.message_id, limit
     )
+    # 库里不存引用原文/作者；当前这条用内存里的对象替换，别把引用信息丢掉。
+    pending = [msg if item.message_id == msg.message_id else item for item in pending]
     if len(pending) <= 1:
         single = pending[0] if pending else msg
         return format_message_line(single, current=msg), [single.message_id]
@@ -94,6 +127,7 @@ def build_batch_prompt(
     continuation: str | None = None,
     omitted: int = 0,
     reply_names: dict[str, str] | None = None,
+    mention_ids: frozenset[str] | None = None,
 ) -> str:
     """批次 prompt：注入段 →（接续）→ 新消息时间线。
 
@@ -117,7 +151,12 @@ def build_batch_prompt(
         for msg in messages:
             current = msg if (msg.at_bot or msg.reply_to_bot) else None
             lines.append(
-                format_message_line(msg, current=current, reply_names=reply_names)
+                format_message_line(
+                    msg,
+                    current=current,
+                    reply_names=reply_names,
+                    mention_ids=mention_ids,
+                )
             )
         if len(messages) > 1:
             lines.append(TIMELINE_HINT)

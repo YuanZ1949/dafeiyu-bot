@@ -75,6 +75,10 @@ class Message:
     # 消息类型与附件：同样只在内存中流转，不持久化（content 仍是唯一持久载体）。
     kind: str = "text"
     attachments: list[Attachment] = field(default_factory=list)
+    # 微信引用块的作者（协议可选字段）：只进提示词，不入库。
+    reply_to_author: str | None = None
+    # @所有人：不是点名，但时间线要能看出这是广播。
+    at_all: bool = False
 
     def to_prompt_line(self) -> str:
         return f"{self.nickname}: {self.content}"

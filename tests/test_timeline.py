@@ -37,6 +37,9 @@ def make_msg(
     at_bot: bool = False,
     reply_to_bot: bool = False,
     reply_to_message_id: str | None = None,
+    reply_to_text: str | None = None,
+    reply_to_author: str | None = None,
+    at_all: bool = False,
     is_bot: bool = False,
 ) -> Message:
     return Message(
@@ -49,6 +52,9 @@ def make_msg(
         at_bot=at_bot,
         reply_to_bot=reply_to_bot,
         reply_to_message_id=reply_to_message_id,
+        reply_to_text=reply_to_text,
+        reply_to_author=reply_to_author,
+        at_all=at_all,
         is_bot=is_bot,
         timestamp=timestamp,
     )
@@ -165,6 +171,50 @@ def test_group_reply_target_is_rendered(tmp_path) -> None:
         reply_names={"m1": "阿猫"},
     )
     assert line.endswith("（回复 阿猫）")
+
+
+def test_quote_renders_author_and_original_text() -> None:
+    """引用块要带作者与原文，模型才能看出「这句在接谁、接的什么」。"""
+    line = format_message_line(
+        make_msg(
+            "对，就是那个",
+            "m2",
+            reply_to_author="阿猫",
+            reply_to_text="这个方案能不能跑",
+        )
+    )
+    assert line.endswith("（引用 阿猫：这个方案能不能跑）")
+
+
+def test_quote_to_bot_uses_quote_text() -> None:
+    line = format_message_line(
+        make_msg(
+            "继续",
+            "m2",
+            reply_to_bot=True,
+            reply_to_author="大肥鱼",
+            reply_to_text="上一句结论",
+        )
+    )
+    assert line.endswith("（引用你：上一句结论）")
+
+
+def test_at_all_is_rendered() -> None:
+    line = format_message_line(make_msg("@所有人 开会了", "m1", at_all=True))
+    assert line.endswith("（@所有人）")
+    assert "（@了你）" not in line
+
+
+def test_bot_own_line_uses_second_person() -> None:
+    line = format_message_line(make_msg("本鱼在呢", "b1", nickname="溟月", is_bot=True))
+    assert "溟月：" not in line
+    assert "你：本鱼在呢" in line
+
+
+def test_alias_mention_is_marked_uncertain() -> None:
+    msg = make_msg("我刚才看到大肥鱼在别的地方冒泡", "m1")
+    line = format_message_line(msg, mention_ids=frozenset({"m1"}))
+    assert line.endswith("（提到你，不确定）")
 
 
 def test_batch_prompt_renders_reply_names() -> None:
