@@ -215,6 +215,33 @@ def reopened_by_question(text: str) -> bool:
     return is_question(text)
 
 
+# 「接着说」类请求：既不是问句，也不带求助词，但明确是在等 bot 说完。
+# 收尾/降频窗口里如果把它当普通闲聊吞掉，用户就会看到「说一半没下文」。
+CONTINUE_PREFIXES = ("继续", "接着", "说下去", "别停")
+CONTINUE_PHRASES = (
+    "继续说",
+    "继续说下去",
+    "接着说",
+    "说下去",
+    "别停",
+    "然后呢",
+    "还有呢",
+    "讲完",
+    "说完",
+)
+CONTINUE_MAX_CHARS = 30
+
+
+def requests_continuation(text: str) -> bool:
+    """短句里明确要求「接着说」，收尾/降频窗口里也算重新叫醒模型。"""
+    body = (text or "").strip()
+    if not body or len(body) > CONTINUE_MAX_CHARS:
+        return False
+    return body.startswith(CONTINUE_PREFIXES) or any(
+        phrase in body for phrase in CONTINUE_PHRASES
+    )
+
+
 def answers_bot_question(
     current: Message, previous: Message | None, *, max_gap_seconds: int = 180
 ) -> bool:

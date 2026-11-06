@@ -11,6 +11,7 @@ from dafeiyu.moment import (
     is_short_only,
     is_sticker_content,
     reopened_by_question,
+    requests_continuation,
 )
 
 
@@ -140,3 +141,15 @@ def test_answers_bot_question_only_for_direct_short_reply() -> None:
         timestamp=1005,
     )
     assert answers_bot_question(long, bot) is False
+
+
+def test_requests_continuation_recognizes_short_followups() -> None:
+    for text in ("继续说", "接着说", "然后呢", "还有呢", "继续说下去", "别停"):
+        assert requests_continuation(text) is True, text
+
+
+def test_requests_continuation_ignores_long_or_unrelated_text() -> None:
+    assert requests_continuation("今天中午吃什么") is False
+    assert requests_continuation("") is False
+    # 长文里只是顺带出现「继续」不算在催它接着说。
+    assert requests_continuation("我继续觉得这个方案不太行，原因是成本太高了") is False
