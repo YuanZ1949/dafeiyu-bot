@@ -45,10 +45,11 @@ from .moment import (
     answers_bot_question,
     follows_bot_expression,
     reopened_by_question,
+    requests_continuation,
 )
 from .reply_media import build_onebot_segments, resolve_at_names, resolve_attachments
 from .router import Router, now_shanghai
-from .sender import is_technical_question, segment_reply, shape_reply
+from .sender import shape_reply, shape_reply_parts
 from .workers.failure import (
     QUOTA_KEY,
     is_agent_missing_error,
@@ -403,6 +404,11 @@ class Service:
                 status[channel]["logged_in"] = adapter.logged_in
             if hasattr(adapter, "desktop"):
                 status[channel]["desktop"] = adapter.desktop
+            # 降级原因（如 hook 模式本地库不可用）：有才补，空串不带键，
+            # 保持 QQ 通道与旧快照的字段形状不变。
+            health_reason = getattr(adapter, "health_reason", "")
+            if isinstance(health_reason, str) and health_reason.strip():
+                status[channel]["reason"] = health_reason.strip()
             # 回执计数同样是「有才补」：读取失败只告警，不带键，不影响
             # 其它通道的状态快照。
             receipt_stats = getattr(adapter, "receipt_stats", None)
@@ -830,7 +836,10 @@ class Service:
 
         def run() -> None:
             try:
-                resolver.resolve(sample)
+                if prewarm or sample is None:
+                    resolver.prewarm()
+                else:
+                    resolver.resolve(sample)
             except Exception:  # noqa: BLE001 - 后台任务不能把进程带崩
                 log.debug("微信图片密钥后台扫描失败", exc_info=True)
             finally:
@@ -941,9 +950,11 @@ class Service:
 
         addressed = self._is_addressed(msg)
         reason = self._group_skip_reason(msg, addressed=addressed)
-        if reason == "intensity_quiet":
-            # 安静强度不是终局：消息留在待投队列，下次被点名时一起送模型。
-            log.debug("skip %s/%s: intensity_quiet", msg.chat_id, msg.message_id)
+        if reason in ("intensity_quiet", "closed", "downshift"):
+            # 这几道都是软闸门，不是终局：不 mark_skipped，把消息留在待投
+            # 队列里，下次被点名/问句/「接着说」时一起送模型。否则收尾或
+            # 降频窗口里的消息会永远进不了 prompt，用户看起来就是「不回复」。
+            log.debug("skip %s/%s: %s", msg.chat_id, msg.message_id, reason)
             return
         if reason is not None:
             self.store.mark_skipped(msg.chat_type, msg.chat_id, [msg.message_id], reason)
@@ -975,6 +986,7 @@ class Service:
         if self.behavior.chat_intensity != "active":
             reopened = (
                 reopened_by_question(msg.content)
+                or requests_continuation(msg.content)
                 or self._answers_bot_question(msg)
             )
             # 话题已收尾：明确问句/求助/回答 bot 的提问可以重开，否则按低概率抽样。
@@ -2224,6 +2236,25 @@ class Service:
                 "补发决策更新失败 %s/%s", chat_type.value, chat_id, exc_info=True
             )
 
+    def _shape_reply(self, reply: BrainReply, text: str, original: str) -> list[str]:
+        """按模型给的分条边界整形；被言论限制改写后才回到字符串路径。"""
+        total = int(getattr(self.settings.persona, "reply_hard_total", 2000))
+        part = int(getattr(self.settings.persona, "reply_hard_part", 500))
+        if reply.parts and text == original:
+            return shape_reply_parts(reply.parts, hard_total=total, hard_part=part)
+        return shape_reply(text, hard_total=total, hard_part=part)
+
+    @staticmethod
+    def _log_target(reply: BrainReply, chat_type: ChatType, chat_id: str) -> None:
+        """可选意图字段第一版只记日志：先观察模型判断准不准，再决定是否强制。"""
+        if reply.target:
+            log.info(
+                "模型标注对话对象 %s/%s target=%s",
+                chat_type.value,
+                chat_id,
+                reply.target,
+            )
+
     async def _send_batch_reply(
         self,
         batch: list[Message],
@@ -2274,21 +2305,15 @@ class Service:
             record("silent")
             return []
         addressed = any(self._is_addressed(m) for m in batch)
+        self._log_target(reply, chat_type, chat_id)
+        original = reply.reply
         reply_text = await self._apply_restrictions(
-            chat_type, chat_id, reply.reply, addressed=addressed
+            chat_type, chat_id, original, addressed=addressed
         )
         if reply_text is None:
             record("silent", "restricted")
             return []
-        chunks = shape_reply(
-            reply_text,
-            self.settings.persona.max_reply_chars,
-            self.settings.persona.max_reply_chars_technical,
-            is_technical=is_technical_question(batch[-1].content),
-        )
-        # 单条回复够长且有多句时拆成 2-3 条短消息；>500 字的技术长文仍按原分片走。
-        if len(chunks) == 1:
-            chunks = segment_reply(chunks[0])
+        chunks = self._shape_reply(reply, reply_text, original)
         if not chunks:
             record("silent", "guard_dropped")
             return []
@@ -2775,6 +2800,21 @@ class Service:
         if image_hint:
             injection = f"{injection}\n\n{image_hint}" if injection.strip() else image_hint
 
+        # 只是「提到你」而不是叫你：给模型一个弱提示，不硬触发回复。
+        mention_ids = frozenset(
+            m.message_id
+            for m in messages
+            if not m.is_bot and not m.recalled_at and self.router.alias_mention(m)
+        )
+        if mention_ids:
+            mention_hint = (
+                "本批有消息只是提到你（不是叫你）：先判断它是不是在跟你说话，"
+                "拿不准就别接。"
+            )
+            injection = (
+                f"{injection}\n\n{mention_hint}" if injection.strip() else mention_hint
+            )
+
         reply_ids = [
             m.reply_to_message_id for m in messages if m.reply_to_message_id
         ]
@@ -2789,6 +2829,7 @@ class Service:
             continuation=continuation,
             omitted=omitted,
             reply_names=reply_names,
+            mention_ids=mention_ids,
         )
 
     def _pending_loop_hint(self, chat_type: ChatType, chat_id: str) -> str:
@@ -2910,6 +2951,7 @@ class Service:
             self.settings.persona.max_reply_chars_technical,
             self.settings.persona.os_probability,
             tools_enabled=self._tools_enabled(),
+            reply_hard_part=self.settings.persona.reply_hard_part,
         )
         if (
             chat_id is not None
@@ -3041,14 +3083,10 @@ class Service:
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
 
-        chunks = shape_reply(
-            reply_text,
-            self.settings.persona.max_reply_chars,
-            self.settings.persona.max_reply_chars_technical,
-            is_technical=is_technical_question(msg.content),
-        )
-        if len(chunks) == 1:
-            chunks = segment_reply(chunks[0])
+        addressed = self._is_addressed(msg)
+        self._log_target(reply, msg.chat_type, msg.chat_id)
+        original = reply.reply
+        chunks = self._shape_reply(reply, reply_text, original)
         if not chunks:
             record("silent", "guard_dropped")
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
@@ -3068,7 +3106,7 @@ class Service:
         delay = float(getattr(self.settings.persona, "segment_delay_seconds", 0.0))
         quote_id = (
             msg.message_id
-            if self._is_addressed(msg) and self.settings.persona.quote_reply
+            if addressed and self.settings.persona.quote_reply
             else None
         )
         for index, chunk in enumerate(chunks):

@@ -221,12 +221,13 @@ async def test_active_intensity_opens_closed_and_downshifted_threads_for_both_ch
         assert router.is_downshifted(ChatType.GROUP, chat)
 
         # normal：非 @ 消息被 closed 闸门拦下，不进模型、不从适配器发出。
+        # 但不做终局丢弃（不 mark_skipped）：下次被点名时还要能一起进 prompt。
         normal_msg = group_msg(chat, message_id=f"n-{tag}")
         await service.handle(normal_msg)
         await service.drain()
         assert brain.calls == []
         assert adapter.sent == []
-        assert store.skip_reason(ChatType.GROUP, chat, normal_msg.message_id) == "closed"
+        assert store.skip_reason(ChatType.GROUP, chat, normal_msg.message_id) is None
         verdicts[tag] = service.explain_trigger(
             group_msg(chat, message_id=f"e-{tag}"), now=NOON
         )
