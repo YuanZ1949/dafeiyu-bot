@@ -932,6 +932,9 @@ class BrainControl:
                         for extra in ("logged_in", "desktop"):
                             if extra in item:
                                 entry[extra] = item[extra]
+                        reason = item.get("reason")
+                        if isinstance(reason, str) and reason.strip():
+                            entry["reason"] = reason.strip()
                         # 发送回执只保留计数与时间戳，消息正文不进健康快照。
                         raw_receipts = item.get("receipts")
                         if isinstance(raw_receipts, dict):
@@ -2026,6 +2029,8 @@ class BrainControl:
     def config_snapshot(self) -> dict[str, Any]:
         state = self.snapshot()
         persona = self.settings.persona
+        wechat = getattr(self.settings, "wechat", None)
+        self_nicknames = list(getattr(wechat, "self_nicknames", ()) or ())
         return {
             "brain": {
                 "provider": state["provider"],
@@ -2035,8 +2040,14 @@ class BrainControl:
             },
             "persona": {
                 "name": persona.name,
+                "aliases": list(persona.aliases),
+                "self_nicknames": self_nicknames,
+                # max_reply_chars* 现在只是写进提示词的软目标；真正发送前只守
+                # reply_hard_* 两条硬安全阀。面板必须分开显示，避免误导成截断值。
                 "max_reply_chars": persona.max_reply_chars,
                 "max_reply_chars_technical": persona.max_reply_chars_technical,
+                "reply_hard_total": persona.reply_hard_total,
+                "reply_hard_part": persona.reply_hard_part,
                 "os_probability": persona.os_probability,
                 "repeat_guard": persona.repeat_guard,
                 "opportunity_guard": persona.opportunity_guard,

@@ -1208,6 +1208,11 @@ async def test_config_endpoint_has_thresholds_and_no_secrets(tmp_path: Path) -> 
     assert "api_key" not in raw
     assert payload["brain"]["provider"] == "token"
     assert payload["persona"]["os_probability"] == 0.05
+    # 软目标与硬安全阀必须分开暴露：面板据此提示「只提示、不截断」。
+    assert payload["persona"]["reply_hard_total"] == 2000
+    assert payload["persona"]["reply_hard_part"] == 500
+    assert "aliases" in payload["persona"]
+    assert "self_nicknames" in payload["persona"]
     assert payload["cooldown"] == {}
     assert payload["behavior"]["chat_intensity"] == "normal"
     assert payload["behavior"]["restriction_mode"] == "off"

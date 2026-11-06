@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>大肥鱼控制台 · 登录</title>
 <style>
   :root {
@@ -62,6 +62,11 @@
   button:disabled { opacity: .55; cursor: not-allowed; }
   .error { min-height: 20px; margin-top: 12px; color: var(--bad); font-size: 12px; }
   .foot { margin-top: 18px; color: var(--muted); font-size: 11px; }
+  @media (max-width: 420px) {
+    .login-card { padding: 22px 18px; }
+    /* 16px 是 iOS Safari 不自动放大输入框的下限。 */
+    input { font-size: 16px; }
+  }
 </style>
 </head>
 <body>

@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>大肥鱼控制台</title>
 <style>
   :root {
@@ -534,6 +534,47 @@
   .delete-user-form { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
   .cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px 20px; }
   .cfg-grid b { color: var(--text); font-weight: 600; }
+  /* 手机端：窄屏单列、控件铺满、触控目标加大；桌面布局不受影响。 */
+  @media (max-width: 720px) {
+    /* 按钮换行后顶栏会占掉小半个屏幕，手机上让它随页面滚走。 */
+    header { position: static; padding: 10px 12px; gap: 8px; }
+    header h1 { width: 100%; font-size: 15px; }
+    header .spacer { display: none; }
+    header .btn { flex: 1 1 auto; min-height: 40px; padding: 8px 10px; font-size: 13px; }
+    .global-banner, .warn { padding: 8px 12px; }
+    main { padding: 10px 10px 32px; gap: 10px; }
+    .card { padding: 12px; border-radius: 8px; }
+    /* 这三处 minmax 的下限大于窄屏可用宽度，必须显式收成单列，否则会横向溢出。 */
+    .grid-2, .grid-3, .mem-grid { grid-template-columns: 1fr; }
+    .grow { flex-basis: 100%; min-width: 0; }
+    select, .log-toolbar input { min-width: 0; max-width: 100%; }
+    /* 16px 是 iOS Safari 不自动放大输入框的下限。 */
+    input, select, textarea { font-size: 16px; }
+    .w-id, .w-sid, .w-user, .w-token, .w-confirm { width: 100%; }
+    .w-label { min-width: 0; }
+    #qr-wrap { flex-direction: column; align-items: flex-start; gap: 12px; }
+    #qr, #qr-placeholder { width: 150px; height: 150px; }
+    .toast { left: 12px; right: 12px; bottom: 12px; max-width: none; }
+    pre#logs { height: 240px; }
+    .log-head { flex-wrap: wrap; }
+    .timeline-drawer { width: 100vw; border-left: none; }
+    .timeline-head, .timeline-metrics, .timeline-toolbar,
+    .timeline-body, .timeline-context { padding-left: 12px; padding-right: 12px; }
+    .timeline-msg { max-width: 100%; }
+    .timeline-context { max-height: 45vh; }
+    .session-row .who, .session-row .meta { min-width: 0; }
+    .decision-chat { max-width: 96px; }
+    .modal { width: calc(100vw - 24px); padding: 12px; }
+    .tab { min-height: 36px; padding: 6px 12px; }
+    .btn, .tab, .mode-card { touch-action: manipulation; }
+    .cfg-grid { gap: 6px 12px; overflow-wrap: anywhere; }
+  }
+  @media (max-width: 420px) {
+    header .btn { flex: 1 1 calc(50% - 8px); }
+    main { padding: 8px 8px 28px; }
+    .card { padding: 10px; }
+    .proc-actions .btn { flex: 1 1 auto; }
+  }
 </style>
 </head>
 <body>
@@ -1913,6 +1954,27 @@ function healthKv(label, value) {
   return item;
 }
 
+// 桥侧 health.reason 是稳定的英文片段（多个用 ; 连接）；能翻译的翻成中文，
+// 认不出的原样显示，方便排查又不会因为新增 reason 丢信息。
+const DEGRADED_REASONS = {
+  inbound_localdb_unavailable: "本地库不可用，这轮没读到消息（恢复后自动补读）",
+  kill_switch: "急停中",
+  no_wechat: "微信未运行",
+  desktop_locked: "桌面已锁定",
+  version_too_old: "微信版本过低",
+  language_mismatch: "微信语言不符",
+  integrity_mismatch: "进程完整性不一致",
+};
+
+function degradedReasonText(reason) {
+  return String(reason || "")
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => DEGRADED_REASONS[part] || part)
+    .join("；");
+}
+
 function renderHealth(data) {
   const ok = !!data.ok;
   const stateEl = $("health-state");
@@ -1976,6 +2038,12 @@ function renderHealth(data) {
       if (name === "wechat") {
         body.append(healthKv("登录态", item.logged_in === undefined ? "—" : item.logged_in ? "已登录" : "未登录"));
         body.append(healthKv("桌面", item.desktop || "—"));
+        if (item.degraded && item.reason) {
+          const reasonRow = healthKv("降级原因", degradedReasonText(item.reason));
+          reasonRow.style.color = "var(--warn)";
+          reasonRow.style.fontWeight = "600";
+          body.append(reasonRow);
+        }
         const receipts = item.receipts;
         if (receipts && typeof receipts === "object" && !Array.isArray(receipts)) {
           const total = Number(receipts.total) || 0;
@@ -3141,9 +3209,17 @@ async function loadConfig() {
     const c = await api("/api/config");
     const providerModel = c.brain.model ? `${c.brain.provider} · ${c.brain.model}` : c.brain.provider;
     const agent = c.brain.provider === "opencode" ? ` · agent ${c.brain.agent}` : "";
+    const persona = c.persona || {};
+    const os = Number(persona.os_probability) || 0;
+    // 旧服务端可能没有硬安全阀字段，缺省显示 —，不要把 undefined 直接渲染出去。
+    const hardTotal = persona.reply_hard_total ?? "—";
+    const hardPart = persona.reply_hard_part ?? "—";
+    const aliases = (persona.aliases || []).join("、") || "—";
+    const selfNames = (persona.self_nicknames || []).join("、") || "—";
     const rows = [
       ["配置·大脑", providerModel + agent],
-      ["人设", `${c.persona.name} · 回复 ${c.persona.max_reply_chars}/${c.persona.max_reply_chars_technical} 字 · OS ${(c.persona.os_probability * 100).toFixed(1)}%`],
+      ["人设", `${persona.name} · 软目标 ${persona.max_reply_chars} / ${persona.max_reply_chars_technical} 字（只提示，不截断） · 安全阀 整轮 ${hardTotal} / 单条 ${hardPart} 字 · OS ${(os * 100).toFixed(1)}%`],
+      ["称呼", `别名 ${aliases} · 微信自查 ${selfNames}`],
       ["限流", `${c.rate_limit.window_seconds / 60} 分钟内 ${c.rate_limit.threshold} 次 429 → 退避 ${c.rate_limit.backoff_seconds}s · 配额暂停 ${Math.round(c.rate_limit.quota_pause_seconds / 60)} 分钟`],
       ["配置·预算", `每日 ${c.budget.daily_calls} 次 / ${fmtTokens(c.budget.daily_tokens)} token`],
       ["记忆", `窗口 ${c.memory.window_size} 条 · 保留 ${c.memory.retention_days > 0 ? `${c.memory.retention_days} 天` : "永久"}`],
@@ -3241,11 +3317,13 @@ async function loadGroups() {
   try {
     const g = await api("/api/groups");
     const whitelist = g.whitelist || [];
+    const blacklist = g.blacklist || [];
+    const blackNote = blacklist.length ? ` · 黑名单 ${blacklist.length} 个` : "";
     $("groups-whitelist").value = whitelist.join("\n");
     renderKnownGroups(g.known || []);
     $("groups-hint").textContent = whitelist.length
-      ? `白名单 ${whitelist.length} 个群`
-      : "留空 = 不限制回复对象";
+      ? `白名单 ${whitelist.length} 个群${blackNote}`
+      : `留空 = 不限制回复对象${blackNote}`;
   } catch (err) {
     $("groups-hint").textContent = `读取失败：${err.message}`;
   }
@@ -3275,11 +3353,13 @@ async function saveGroups() {
       body: JSON.stringify({ whitelist }),
     });
     const saved = g.whitelist || [];
+    const blacklist = g.blacklist || [];
+    const blackNote = blacklist.length ? ` · 黑名单 ${blacklist.length} 个` : "";
     $("groups-whitelist").value = saved.join("\n");
     renderKnownGroups(g.known || []);
     $("groups-hint").textContent = saved.length
-      ? `已保存 · ${saved.length} 个群`
-      : "已保存 · 留空 = 不限制回复对象";
+      ? `已保存 · ${saved.length} 个群${blackNote}`
+      : `已保存 · 留空 = 不限制回复对象${blackNote}`;
     toast("群白名单已更新");
   } catch (err) {
     $("groups-hint").textContent = `保存失败：${err.message}`;
@@ -4178,7 +4258,10 @@ setInterval(() => { if (!document.hidden) refreshBackups(); }, 30000);
 setInterval(loadMemory, 30000);
 setInterval(loadUsage, 30000);
 setInterval(loadBudget, 30000);
-setInterval(loadSessions, 15000);
+// 用户点过「加载更多」后，定时刷新不能把列表打回第一页。
+setInterval(() => {
+  if (!document.hidden && sessionsOffset <= SESSIONS_PAGE) loadSessions();
+}, 15000);
 setInterval(() => { if (!document.hidden) loadDecisions(); }, 15000);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
@@ -4187,7 +4270,8 @@ document.addEventListener("visibilitychange", () => {
   if (!alertsDisabled) refreshAlerts();
   refreshBackups();
   loadMemory();
-  loadSessions();
+  // 回到前台也不要把用户已经翻过的会话列表打回第一页。
+  if (sessionsOffset <= SESSIONS_PAGE) loadSessions();
   loadGroups();
 });
 })();

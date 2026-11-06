@@ -250,6 +250,57 @@ def test_html_polling_intervals_are_throttled() -> None:
     assert "setInterval(refresh, 2000)" not in html
 
 
+def test_html_config_panel_reflects_soft_target_and_hard_limits() -> None:
+    """人设一行不能再把软目标写成实际截断值，硬安全阀必须一起显示。"""
+    html = read_html()
+    assert "reply_hard_total" in html
+    assert "reply_hard_part" in html
+    assert "软目标" in html
+    assert "安全阀" in html
+    # 微信自查名与 persona 别名都要能从 /api/config 回到面板。
+    assert "self_nicknames" in html
+    assert '"称呼"' in html or "称呼" in html
+
+
+def test_html_has_mobile_layout_rules() -> None:
+    """手机端：窄屏媒体查询、控件铺满、抽屉全宽、iOS 输入框不缩放。"""
+    html = read_html()
+    assert 'content="width=device-width, initial-scale=1, viewport-fit=cover"' in html
+    assert "@media (max-width: 720px)" in html
+    assert "@media (max-width: 420px)" in html
+    assert ".grid-2, .grid-3, .mem-grid { grid-template-columns: 1fr; }" in html
+    assert "header { position: static;" in html
+    assert ".timeline-drawer { width: 100vw; border-left: none; }" in html
+    assert "input, select, textarea { font-size: 16px; }" in html
+
+
+def test_html_surfaces_wechat_degraded_reason() -> None:
+    """微信通道降级时必须把桥侧 reason 翻成中文显示，不能只写「已连接（降级）」。"""
+    html = read_html()
+    # 映射表与渲染入口都在，避免 reason 只是被吞掉。
+    assert "DEGRADED_REASONS" in html
+    assert "degradedReasonText" in html
+    assert "inbound_localdb_unavailable" in html
+    assert "本地库不可用" in html
+    # 只在降级且带 reason 时追加一行，正常通道不多出空行。
+    assert 'item.degraded && item.reason' in html
+    assert '"降级原因"' in html
+
+
+def test_sessions_auto_refresh_keeps_loaded_pages() -> None:
+    """「加载更多」之后，定时/回前台刷新不能把列表重置回第一页。"""
+    html = read_html()
+    assert "sessionsOffset <= SESSIONS_PAGE" in html
+    assert "setInterval(loadSessions, 15000)" not in html
+
+
+def test_login_html_is_mobile_friendly() -> None:
+    login = HTML_PATH.with_name("login.html").read_text(encoding="utf-8")
+    assert "viewport-fit=cover" in login
+    assert "@media (max-width: 420px)" in login
+    assert "font-size: 16px;" in login
+
+
 async def test_dashboard_models_proxy_forwards_query_string(tmp_path: Path) -> None:
     seen: list[tuple[str, str, str]] = []
 
