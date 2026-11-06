@@ -148,6 +148,19 @@ def test_requests_continuation_recognizes_short_followups() -> None:
         assert requests_continuation(text) is True, text
 
 
+def test_requests_continuation_catches_missing_reply() -> None:
+    """收尾窗口里「点评一下」「你咋不回」必须重新叫醒，否则就是装死。"""
+    for text in (
+        "里面高赞的说法你点评一下",
+        "你咋不回",
+        "怎么不回我",
+        "你说说看",
+        "理我一下",
+        "继续说话",
+    ):
+        assert requests_continuation(text) is True, text
+
+
 def test_requests_continuation_ignores_long_or_unrelated_text() -> None:
     assert requests_continuation("今天中午吃什么") is False
     assert requests_continuation("") is False

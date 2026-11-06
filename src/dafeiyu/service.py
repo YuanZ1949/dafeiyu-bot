@@ -3058,12 +3058,22 @@ class Service:
             chat_id is not None
             and chat_type is ChatType.GROUP
             and self.router.is_thread_closed(chat_type, chat_id)
+            and not self._asks_to_continue(messages)
         ):
             prompt += (
                 "\n\n这个话题你刚收尾过。除非对方明显在问你、"
                 "或者话题被重新提起，否则不要接。"
             )
         return prompt
+
+    @staticmethod
+    def _asks_to_continue(messages: list[Message]) -> bool:
+        """批次里有人明确要它接着说/点评，就不该再贴「话题已收尾」的封条。"""
+        return any(
+            requests_continuation(message.content)
+            for message in messages
+            if not message.is_bot
+        )
 
     def _tools_enabled(self) -> bool:
         """只有 opencode 且工作区开着时，模型才真的有 read/edit/webfetch。"""

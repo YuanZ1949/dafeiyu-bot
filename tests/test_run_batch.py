@@ -876,6 +876,38 @@ async def test_open_thread_has_no_closed_hint(tmp_path):
     assert brain.reply_calls == 1
     assert "收尾" not in brain.systems[-1]
 
+
+async def test_continuation_request_drops_closed_hint(tmp_path):
+    """「你点评一下」是明确接话，不能一边放行一边还贴「话题已收尾」的封条。"""
+    brain = _HistoryBrain()
+    service, store, _brain, _adapter = build(tmp_path, brain=brain, rng=_FixedRng(0.9))
+    service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
+    service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
+    assert service.router.is_thread_closed(ChatType.GROUP, CHAT) is True
+
+    msg = make_msg("里面高赞的说法你点评一下", message_id="m3")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    assert brain.reply_calls == 1
+    assert "收尾" not in brain.systems[-1]
+
+
+async def test_missing_reply_complaint_reopens_closed_thread(tmp_path):
+    """「你咋不回」是最强的叫醒信号：收尾窗口里也必须有反应。"""
+    service, store, brain, _adapter = build(tmp_path, rng=_FixedRng(0.9))
+    service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
+    service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
+    assert service.router.is_thread_closed(ChatType.GROUP, CHAT) is True
+
+    msg = make_msg("你咋不回", message_id="m4")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    assert brain.reply_calls == 1
+
 async def test_closed_thread_samples_once_in_model_mode(tmp_path):
     """收尾期一条消息只抽一次：入队抽过，跑批次时不能再抽一次。"""
     rng = _FixedRng(0.0)
