@@ -22,7 +22,11 @@ from websockets.asyncio.client import connect
 import dafeiyu.gateway.wechat_bridge.__main__ as bridge_main
 from dafeiyu.config import WeChatConfig
 from dafeiyu.gateway.wechat_bridge.driver import ChatHandle
-from dafeiyu.gateway.wechat_bridge.poller import PollingLoop
+from dafeiyu.gateway.wechat_bridge.poller import (
+    BACKFILL_LIMIT,
+    INBOUND_LOCALDB_REASON,
+    PollingLoop,
+)
 from dafeiyu.gateway.wechat_bridge.server import BridgeServer
 from dafeiyu.hotconfig import WeChatRuntime
 
@@ -781,6 +785,229 @@ async def test_driver_without_unread_probe_keeps_full_polling(tmp_path: Path) ->
     async with _running_poller(wechat, driver, clock) as poller:
         poller._last_full_sweep = clock.now
         assert await poller._targets() == ALL_GROUPS
+
+
+# --------------------------------- (j) hook 模式桌面隔离：绝不回落 UIA/拉前台
+class _BrokenSnapshotLocalDb:
+    """声明就绪但快照必失败：模拟本地库被占用/解密失败。"""
+
+    available = True
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        self._names = names
+
+    def group_names(self) -> tuple[str, ...]:
+        return self._names
+
+    def snapshot(self, group: str) -> Any:
+        raise RuntimeError("本地库被占用")
+
+
+async def test_hook_outbound_never_falls_back_to_uia(tmp_path: Path) -> None:
+    """hook 不依赖桌面：本地库没就绪就整轮跳过，红点探测与开窗一次都不做。"""
+    clock = _Clock()
+    driver = UnreadDriver()
+    driver.unread_total_value = 5
+    driver.unread_sessions_value = {"同事群": 1}
+    wechat = _wechat(
+        tmp_path, outbound="hook", unread_gate=True, full_sweep_seconds=120.0
+    )
+
+    async with _running_poller(wechat, driver, clock) as poller:
+        assert poller._allow_uia_fallback is False
+        assert await poller._targets() == ()
+        assert await poller._poll_group("同事群") == []
+        assert poller._uia_skip_warned is True
+
+    assert driver.calls == []
+    assert driver.unread_calls == 0
+    assert driver.scan_calls == 0
+
+
+async def test_hook_outbound_skips_group_when_localdb_snapshot_fails(
+    tmp_path: Path,
+) -> None:
+    """本地库中途失败也只跳过这一轮，不拿 open_chat 兜底（会置顶微信窗口）。"""
+    driver = FakeDriver()
+    wechat = _wechat(tmp_path, outbound="hook")
+    poller = PollingLoop(
+        wechat,
+        driver,
+        probe=_probe,
+        registry=_Registry(),
+        localdb=_BrokenSnapshotLocalDb(GROUPS),
+        panel=_all_groups_panel,
+        poll_seconds=0.02,
+    )
+    await poller.start()
+    try:
+        assert await poller._poll_group("同事群") == []
+    finally:
+        poller.stop()
+
+    assert driver.calls == []
+
+
+# ---------------------- (k) 本地库恢复后宽窗补读：断档消息不能丢
+class _ToggleLocalDb:
+    """可用性可切换的本地库替身：记录每次快照请求的 limit。"""
+
+    def __init__(
+        self,
+        names: tuple[str, ...],
+        messages: dict[str, list[tuple[str, str]]],
+    ) -> None:
+        self.available = False
+        self._names = names
+        self._messages = messages
+        self.limits: list[int | None] = []
+
+    def group_names(self) -> tuple[str, ...]:
+        return self._names
+
+    def snapshot(self, group: str, *, limit: int = 50) -> dict[str, Any]:
+        self.limits.append(limit)
+        return {
+            "chat_name": group,
+            "messages": [
+                {"nickname": nickname, "text": text}
+                for nickname, text in self._messages[group]
+            ],
+        }
+
+
+def _hook_poller(tmp_path: Path, localdb: Any, driver: Any | None = None) -> PollingLoop:
+    return PollingLoop(
+        _wechat(tmp_path, outbound="hook"),
+        driver if driver is not None else FakeDriver(),
+        probe=_probe,
+        registry=_Registry(),
+        localdb=localdb,
+        panel=_all_groups_panel,
+        poll_seconds=0.02,
+    )
+
+
+async def test_hook_backfills_messages_missed_while_localdb_down(
+    tmp_path: Path,
+) -> None:
+    """断档期间 >窗口 的消息：恢复后一次宽窗读完，而不是 resync 丢弃。"""
+    history = [("甲", f"旧{i}") for i in range(50)]
+    missed = [("乙", f"漏{i}") for i in range(80)]
+    live = {"同事群": list(history)}
+    db = _ToggleLocalDb(GROUPS, live)
+    poller = _hook_poller(tmp_path, db)
+    await poller.start()
+    try:
+        # 第一轮：建基线，常规窗口（此时库里只有历史，还没有漏读的消息）。
+        db.available = True
+        assert await poller._poll_group("同事群") == []
+        assert db.limits[-1] == 50
+
+        # 本地库掉线期间又来了 80 条（超过窗口），错过整段。
+        live["同事群"].extend(missed)
+        db.available = False
+        assert await poller._targets() == ()
+        assert "同事群" in poller._backfill_groups
+
+        # 恢复：宽窗补读，80 条漏读全部补上（窄窗会重叠为 0 直接 resync）。
+        db.available = True
+        frames = await poller._poll_group("同事群")
+        assert [frame["text"] for frame in frames] == [f"漏{i}" for i in range(80)]
+        assert db.limits[-1] == BACKFILL_LIMIT
+        assert "同事群" not in poller._backfill_groups
+
+        # 补读只做一次：下一轮回到常规窗口。
+        await poller._poll_group("同事群")
+        assert db.limits[-1] == 50
+    finally:
+        poller.stop()
+
+
+async def test_hook_health_reports_localdb_unavailable(tmp_path: Path) -> None:
+    """hook 模式没有 UIA 兜底：本地库不可用要让面板看见「已连接（降级）」。"""
+    db = _ToggleLocalDb(GROUPS, {group: [] for group in GROUPS})
+    poller = _hook_poller(tmp_path, db)
+    await poller.start()
+    try:
+        degraded = await poller._health_frame(connected=True)
+        assert degraded["degraded"] is True
+        assert INBOUND_LOCALDB_REASON in str(degraded["reason"]).split(";")
+
+        db.available = True
+        healthy = await poller._health_frame(connected=True)
+        assert healthy["degraded"] is False
+        assert healthy["reason"] in (None, "")
+    finally:
+        poller.stop()
+
+
+async def test_hook_resume_schedules_backfill(tmp_path: Path) -> None:
+    """急停恢复后同样要补读：停机期间的消息不能因为没轮询就丢掉。"""
+    db = _ToggleLocalDb(GROUPS, {group: [] for group in GROUPS})
+    db.available = True
+    poller = _hook_poller(tmp_path, db)
+    await poller.start()
+    try:
+        assert poller.reset_for_resume() is True
+        assert set(poller._backfill_groups) == set(GROUPS)
+    finally:
+        poller.stop()
+
+
+async def test_legacy_localdb_snapshot_without_limit_still_works(
+    tmp_path: Path,
+) -> None:
+    """老替身/第三方帧源没有 limit 参数时按原签名调用，不能 TypeError。"""
+
+    class LegacyLocalDb:
+        available = True
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def group_names(self) -> tuple[str, ...]:
+            return GROUPS
+
+        def snapshot(self, group: str) -> dict[str, Any]:
+            self.calls.append(group)
+            return {"chat_name": group, "messages": [{"nickname": "甲", "text": "开场"}]}
+
+    legacy = LegacyLocalDb()
+    poller = _hook_poller(tmp_path, legacy)
+    poller._backfill_groups.add("同事群")
+    await poller.start()
+    try:
+        assert await poller._poll_group("同事群") == []
+    finally:
+        poller.stop()
+
+    assert legacy.calls == ["同事群"]
+
+
+@pytest.mark.parametrize("outbound", ["uia", "auto"])
+async def test_non_hook_outbound_still_falls_back_to_uia(
+    tmp_path: Path, outbound: str
+) -> None:
+    """uia / auto 保持原行为：本地库不可用仍开窗快照（auto 可能真回落 UIA 发送）。"""
+    driver = FakeDriver(windows={"同事群": [[("甲", "开场")]]})
+    wechat = _wechat(tmp_path, outbound=outbound)
+    poller = PollingLoop(
+        wechat,
+        driver,
+        probe=_probe,
+        registry=_Registry(),
+        localdb=_GroupNamesLocalDb(GROUPS),
+        panel=_all_groups_panel,
+        poll_seconds=0.02,
+    )
+    await poller.start()
+    try:
+        await poller._poll_group("同事群")
+    finally:
+        poller.stop()
+
+    assert driver.opened == ["同事群"]
 
 
 async def test_gated_round_still_emits_health_frames(tmp_path: Path) -> None:

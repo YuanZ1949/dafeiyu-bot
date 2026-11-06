@@ -179,6 +179,32 @@ async def test_wechat_stop_writes_kill_file_and_is_idempotent(
     assert adapter.kill_switch_entered == 2
 
 
+async def test_health_detail_forwards_channel_degraded_reason(tmp_path: Path) -> None:
+    """桥侧降级原因要穿到 /api/health/detail，面板才知道为什么「已连接（降级）」。"""
+    adapter = FakeWeChatAdapter()
+    control, service = make_control(tmp_path, adapters={"wechat": adapter})
+    app = create_app(control, "")
+    service.channel_status = lambda: {
+        "wechat": {
+            "connected": True,
+            "degraded": True,
+            "last_event_at": None,
+            "last_disconnect_at": None,
+            "last_send_at": None,
+            "logged_in": True,
+            "desktop": "interactive",
+            "reason": "inbound_localdb_unavailable",
+        }
+    }
+
+    async with running(app) as client:
+        detail = await (await client.get("/api/health/detail")).json()
+
+    entry = detail["channels"]["wechat"]
+    assert entry["degraded"] is True
+    assert entry["reason"] == "inbound_localdb_unavailable"
+
+
 # ------------------------------------------------------------------ resume
 async def test_wechat_resume_requires_kill_file_removed(tmp_path: Path) -> None:
     adapter = FakeWeChatAdapter()

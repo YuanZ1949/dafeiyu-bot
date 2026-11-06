@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import inspect
 from pathlib import Path
+from typing import Any, cast
 
 from fakes import FakeChannelAdapter
 from test_service import make_settings
@@ -131,6 +132,41 @@ def test_channel_status_raw_fallback_adds_wechat_extras(tmp_path):
         "last_disconnect_at",
         "last_send_at",
     }
+
+
+def test_channel_status_forwards_health_reason_only_when_present(tmp_path):
+    """降级原因有才带键：空串保持旧形状，有值原样透传给面板。"""
+
+    class ReasonAdapter:
+        def __init__(self, reason: str) -> None:
+            self.connected = True
+            self.degraded = bool(reason)
+            self.last_event_at = None
+            self.last_disconnect_at = None
+            self.last_send_at = None
+            self.logged_in = True
+            self.desktop = "interactive"
+            self.health_reason = reason
+
+    store = Store(str(tmp_path / "t.db"))
+    store.init_schema()
+    settings = make_settings()
+    qq_adapter: Any = ReasonAdapter("")
+    wx_adapter: Any = ReasonAdapter("inbound_localdb_unavailable")
+    service = Service(
+        settings,
+        store,
+        None,
+        {"qq": qq_adapter, "wechat": wx_adapter},
+        Router(settings, store, clock=cast(Any, lambda: None)),
+        "test",
+    )
+
+    status = service.channel_status()
+
+    assert "reason" not in status["qq"]
+    assert status["wechat"]["reason"] == "inbound_localdb_unavailable"
+    assert status["wechat"]["degraded"] is True
 
 
 class _RawStatusAdapter:
