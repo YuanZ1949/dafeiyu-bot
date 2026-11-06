@@ -164,6 +164,87 @@ def test_resync_restarts_seq_under_new_epoch() -> None:
     assert ids(after) == [f"{new_epoch}:1"]
 
 
+# ------------------------------------------------------- 断档后宽窗补读
+def test_narrow_window_would_drop_a_long_gap() -> None:
+    """反证：默认窄窗在缺口 > 窗口时重叠为 0，会把漏读消息当 resync 丢掉。"""
+    aligner = make_aligner()
+    history = [msg("阿猫", f"旧{i}") for i in range(50)]
+    aligner.poll(history)
+    missed = [msg("阿狗", f"漏{i}") for i in range(80)]
+
+    result = aligner.poll(history + missed)
+
+    assert result.messages == ()
+    assert result.resync is not None
+
+
+def test_wide_poll_backfills_the_whole_gap() -> None:
+    """本地库恢复后一次读回整段：旧窗口尾巴之后的消息全部补发。"""
+    aligner = make_aligner()
+    history = [msg("阿猫", f"旧{i}") for i in range(50)]
+    aligner.poll(history)
+    missed = [msg("阿狗", f"漏{i}") for i in range(80)]
+
+    result = aligner.poll(history + missed, wide=True)
+
+    assert result.resync is None
+    assert [event["text"] for event in result.messages] == [
+        f"漏{i}" for i in range(80)
+    ]
+    # seq 连续编号，补读结果拼接后没有重复/缺号。
+    assert ids(result) == [f"7:{i}" for i in range(1, 81)]
+
+    # 补读后窗口回到最后 K 条：同一份快照再喂一次不会再发一遍。
+    again = aligner.poll(history + missed, wide=True)
+    assert again.messages == ()
+
+
+def test_wide_poll_prefers_the_latest_duplicate_tail() -> None:
+    """旧窗口尾巴在快照里出现两次时取最靠后的一次，不重复补发。"""
+    aligner = make_aligner()
+    history = [msg("阿猫", "签到"), msg("阿猫", "签到"), msg("阿猫", "早")]
+    aligner.poll(history)
+
+    result = aligner.poll(
+        history
+        + [
+            msg("阿猫", "签到"),
+            msg("阿猫", "签到"),
+            msg("阿猫", "早"),
+            msg("阿狗", "新的"),
+        ],
+        wide=True,
+    )
+
+    assert [event["text"] for event in result.messages] == ["新的"]
+
+
+def test_wide_poll_requires_a_real_overlap() -> None:
+    """只命中 1 条（如「哈哈」）不算连续：宁可 resync 也不整段回灌。"""
+    aligner = make_aligner()
+    aligner.poll(
+        [msg("阿猫", "旧一"), msg("阿狗", "旧二"), msg("阿猫", "哈哈")]
+    )
+
+    result = aligner.poll(
+        [msg("阿狗", "别的"), msg("阿猫", "哈哈"), msg("阿狗", "新")], wide=True
+    )
+
+    assert result.messages == ()
+    assert result.resync is not None
+    assert result.resync["reason"] == "overlap_low"
+
+
+def test_wide_poll_without_overlap_still_resyncs() -> None:
+    aligner = make_aligner()
+    aligner.poll([msg("阿猫", f"旧{i}") for i in range(10)])
+
+    result = aligner.poll([msg("阿狗", f"新{i}") for i in range(30)], wide=True)
+
+    assert result.messages == ()
+    assert result.resync is not None
+
+
 # ---------------------------------------------------------------- at_bot / @
 def test_at_bot_matches_exact_nickname() -> None:
     aligner = make_aligner()
@@ -237,6 +318,44 @@ def test_reply_to_someone_else_is_not_a_reply_to_bot() -> None:
     event = result.messages[0]
     assert event["reply_to_bot"] is False
     assert event["reply_to_text"] is None
+
+
+def test_self_nicknames_match_group_alias_at_and_reply() -> None:
+    """群昵称「小菜鱼」也是 bot：@ 与引用都命中，发言标记 is_bot。"""
+    aligner = make_aligner(self_nicknames=["小菜鱼"])
+    aligner.poll([msg("阿猫", "开场")])
+
+    result = aligner.poll(
+        [
+            msg("阿猫", "开场"),
+            msg("阿猫", "@小菜鱼 在吗"),
+            msg("阿猫", "回答上面", reply_author="小菜鱼", reply_to="机器人上一条"),
+            msg("小菜鱼", "我自己发的"),
+        ]
+    )
+
+    at_event, reply_event, own_event = result.messages
+    assert at_event["at_bot"] is True
+    assert reply_event["reply_to_bot"] is True
+    assert reply_event["reply_to_author"] == "小菜鱼"
+    assert own_event["is_bot"] is True
+
+
+def test_reply_to_author_is_exposed_for_other_speakers() -> None:
+    """群友互回的引用作者要带出去，时间线据此标「引用 谁」。"""
+    aligner = make_aligner()
+    aligner.poll([msg("阿猫", "开场")])
+
+    result = aligner.poll(
+        [
+            msg("阿猫", "开场"),
+            msg("阿狗", "回阿猫", reply_author="阿猫", reply_to="阿猫的原话"),
+        ]
+    )
+
+    event = result.messages[0]
+    assert event["reply_to_bot"] is False
+    assert event["reply_to_author"] == "阿猫"
 
 
 def test_quote_without_author_degrades_to_not_a_reply(caplog) -> None:

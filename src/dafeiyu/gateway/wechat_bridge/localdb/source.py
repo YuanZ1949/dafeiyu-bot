@@ -115,8 +115,12 @@ class LocalDbSource:
         self._next_retry = 0.0
 
     # ------------------------------------------------------------- 查询
-    def snapshot(self, display_name: str) -> dict[str, Any] | None:
-        """返回该会话最近 50 条消息；不可用时返回 None（调用方回落 UIA）。"""
+    def snapshot(self, display_name: str, *, limit: int = 50) -> dict[str, Any] | None:
+        """返回该会话最近 ``limit`` 条消息；不可用时返回 None（调用方回落 UIA）。
+
+        ``limit`` 只有断档补读才会调大（见 ``poller.BACKFILL_LIMIT``）：
+        普通轮询保持 50 条，避免每轮都去读一大段历史。
+        """
         store = self._ensure()
         if store is None:
             return None
@@ -128,7 +132,7 @@ class LocalDbSource:
             if ref is None:
                 log.debug("本地库找不到会话 %r（可能改名/未同步），回落 UIA", name)
                 return None
-            messages = store.recent(ref, 50)
+            messages = store.recent(ref, limit)
         except Exception as exc:  # noqa: BLE001 - 读失败只能回落 UIA
             self._record_failure(f"读取 {name!r} 失败：{exc}")
             return None

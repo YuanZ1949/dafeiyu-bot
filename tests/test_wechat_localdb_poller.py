@@ -373,3 +373,32 @@ def test_private_source_snapshot_feeds_aligner(tmp_path: Any) -> None:
     # 引用 bot 的消息：作者 == account_nickname 才算回复机器人。
     assert messages[3]["reply_to_bot"] is True
     assert messages[3]["reply_to_text"] == QUOTED_ORIGINAL
+
+
+# ------------------------------------- 断档补读：snapshot(limit=...) 透传
+def test_source_snapshot_passes_backfill_limit(tmp_path: Any) -> None:
+    from dafeiyu.gateway.wechat_bridge.localdb.source import LocalDbSource
+
+    class _Store:
+        def __init__(self) -> None:
+            self.limits: list[int] = []
+
+        def resolve_any(self, _name: str) -> object:
+            return object()
+
+        def recent(self, _ref: object, limit: int = 50) -> list[dict[str, Any]]:
+            self.limits.append(limit)
+            return []
+
+    source = LocalDbSource(mirror_dir=tmp_path / "mirror")
+    store = _Store()
+    # 跳过真实的建库/解密：直接换上只记录 limit 的假 store。
+    source.__dict__["_store"] = store
+
+    assert source.snapshot("测试群") == {"chat_name": "测试群", "messages": []}
+    assert source.snapshot("测试群", limit=200) == {
+        "chat_name": "测试群",
+        "messages": [],
+    }
+
+    assert store.limits == [50, 200]

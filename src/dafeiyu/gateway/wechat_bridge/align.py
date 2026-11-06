@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     "CHAT_TYPES",
     "MIN_OVERLAP_RATIO",
+    "MIN_WIDE_OVERLAP",
     "Entry",
     "K",
     "PollResult",
@@ -39,6 +40,9 @@ __all__ = [
 
 K = 50
 MIN_OVERLAP_RATIO = 0.5
+#: 宽窗补读时，旧窗口尾巴至少要连续命中这么多条才认账。
+#: 只命中 1 条可能只是「哈哈」这种巧合，会把整段历史当成新消息灌回去。
+MIN_WIDE_OVERLAP = 3
 AT_ALL_TOKENS = ("@所有人", "@全体成员")
 #: 轮询结果里 `messages` 用的是事件信封，不是 models.Message。
 CHAT_TYPES = ("group", "private")
@@ -81,6 +85,7 @@ class SessionAligner:
         epoch: int | None = None,
         clock: Callable[[], float] = time.time,
         user_alias: Callable[[str], str] | None = None,
+        self_nicknames: Iterable[str] = (),
     ) -> None:
         if not chat_id.startswith("wxg:") or chat_id == "wxg:":
             raise ValueError(f"chat_id 必须形如 wxg:<alias>，收到 {chat_id!r}")
@@ -90,6 +95,17 @@ class SessionAligner:
         self.chat_name = str(chat_name or "")
         self.chat_type = chat_type
         self.account_nickname = str(account_nickname or "").strip()
+        # bot 在群里的全部身份：账号昵称 + 群昵称/别名。@ 与引用回复都按这组判。
+        self.self_nicknames = tuple(
+            dict.fromkeys(
+                name
+                for name in (
+                    self.account_nickname,
+                    *(str(item).strip() for item in self_nicknames),
+                )
+                if name
+            )
+        )
         self.window = int(window)
         self._clock = clock
         self._user_alias = user_alias
@@ -110,27 +126,44 @@ class SessionAligner:
     def seq(self) -> int:
         return self._seq
 
-    def poll(self, entries: Iterable[Any]) -> PollResult:
-        """喂一次窗口快照，返回本次要发的事件。"""
-        current = [_entry_from(raw) for raw in entries][-self.window :]
+    def poll(self, entries: Iterable[Any], *, wide: bool = False) -> PollResult:
+        """喂一次窗口快照，返回本次要发的事件。
+
+        ``wide=True`` 用于「断档后补读」：``entries`` 可能比 `window` 长得多
+        （本地库一次读回几百条），这时不能先截断再对齐——否则旧窗口的尾巴
+        已经被截掉，重叠为 0 会误判成 resync 并把整段漏读消息永久丢掉。
+        宽窗模式下改为「在整段快照里找旧窗口尾巴」，找到多少就补发它后面的
+        全部消息。找不到（缺口大于一次读取上限）仍然走 resync，不猜。
+        """
+        raw = [_entry_from(raw_entry) for raw_entry in entries]
+        current = raw if wide else raw[-self.window :]
 
         if not self._prev:
             # 第一轮只建立基线：不把「启动前就存在的历史」当成新消息回复。
-            self._prev = current
+            self._prev = current[-self.window :]
             return PollResult((), None, self._epoch)
 
-        overlap = _longest_overlap(self._prev, current)
-        baseline = min(len(self._prev), len(current))
-        if (
-            overlap == 0
-            or baseline == 0
-            or overlap / baseline < MIN_OVERLAP_RATIO
-        ):
-            return self._resync(current, reason="overlap_low" if baseline else "window_empty")
+        if wide:
+            located = _locate_overlap(self._prev, current)
+            if located is None:
+                return self._resync(current[-self.window :], reason="overlap_low")
+            index, size = located
+            fresh = current[index + size :]
+        else:
+            overlap = _longest_overlap(self._prev, current)
+            baseline = min(len(self._prev), len(current))
+            if (
+                overlap == 0
+                or baseline == 0
+                or overlap / baseline < MIN_OVERLAP_RATIO
+            ):
+                return self._resync(
+                    current, reason="overlap_low" if baseline else "window_empty"
+                )
+            fresh = current[overlap:]
 
-        fresh = current[overlap:]
         messages = tuple(self._build_message(entry) for entry in fresh)
-        self._prev = current
+        self._prev = current[-self.window :]
         return PollResult(messages, None, self._epoch)
 
     # --------------------------------------------------------- 重启续跑
@@ -208,6 +241,7 @@ class SessionAligner:
             "at_all": at_all,
             "reply_to_bot": reply_to_bot,
             "reply_to_text": reply_to_text,
+            "reply_to_author": entry.reply_author or None,
             "ts": entry.ts or int(self._clock()),
             "message_id": f"{self._epoch}:{self._seq}",
             # 自己的发言必须由桥自己标记：主进程侧还有两层回声过滤，但源头标对了
@@ -218,7 +252,7 @@ class SessionAligner:
         }
 
     def _is_bot(self, entry: Entry) -> bool:
-        return bool(self.account_nickname) and entry.nickname == self.account_nickname
+        return bool(entry.nickname) and entry.nickname in self.self_nicknames
 
     def _user_id(self, nickname: str) -> str:
         name = nickname.strip()
@@ -240,7 +274,7 @@ class SessionAligner:
         """返回 (at_bot, at_all)。@所有人 永远不算点名机器人。"""
         if any(token in text for token in AT_ALL_TOKENS):
             return False, True
-        if not self.account_nickname:
+        if not self.self_nicknames:
             if not self._warned_no_nickname:
                 self._warned_no_nickname = True
                 log.warning(
@@ -248,7 +282,7 @@ class SessionAligner:
                     self.chat_id,
                 )
             return False, False
-        return _mentions(text, self.account_nickname), False
+        return any(_mentions(text, name) for name in self.self_nicknames), False
 
     def _detect_reply(self, entry: Entry) -> tuple[bool, str | None]:
         """引用块作者 == 本账号昵称才算「回复机器人」。
@@ -263,9 +297,9 @@ class SessionAligner:
                     entry.reply_text[:40],
                 )
             return False, None
-        if not self.account_nickname:
+        if not self.self_nicknames:
             return False, None
-        if entry.reply_author.strip() != self.account_nickname:
+        if entry.reply_author.strip() not in self.self_nicknames:
             return False, None
         return True, (entry.reply_text or None)
 
@@ -326,6 +360,30 @@ def _longest_overlap(previous: Sequence[Entry], current: Sequence[Entry]) -> int
         if old_keys[-size:] == new_keys[:size]:
             return size
     return 0
+
+
+def _locate_overlap(
+    previous: Sequence[Entry], current: Sequence[Entry]
+) -> tuple[int, int] | None:
+    """在整段 ``current`` 里找 ``previous`` 的尾巴，返回 ``(起始下标, 长度)``。
+
+    宽窗补读专用：``current`` 可能包含大量旧历史，旧窗口的尾巴不一定落在开头。
+    取「最长匹配」，同长度时取最靠后的一次，避免把重复文本当成新消息再发一遍。
+    匹配长度不足 :data:`MIN_WIDE_OVERLAP`（或全部旧窗口）时返回 None——
+    宁可 resync 也不猜。
+    """
+    limit = min(len(previous), len(current))
+    need = min(MIN_WIDE_OVERLAP, len(previous))
+    if limit < need or need <= 0:
+        return None
+    old_keys = [(entry.nickname, entry.text) for entry in previous]
+    new_keys = [(entry.nickname, entry.text) for entry in current]
+    for size in range(limit, need - 1, -1):
+        tail = old_keys[-size:]
+        for start in range(len(new_keys) - size, -1, -1):
+            if new_keys[start : start + size] == tail:
+                return start, size
+    return None
 
 
 def _mentions(text: str, nickname: str) -> bool:
