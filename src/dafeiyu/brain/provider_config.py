@@ -2,11 +2,30 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from string import Template
 from typing import Any
 
 from ..config import BrainConfig, LocalModelConfig, Settings
+from .persona import (
+    DEFAULT_OS_PROBABILITY,
+    load_persona,
+    os_rule,
+    remove_tools_markers,
+    strip_tools_section,
+)
+
+# build_agent 单独被调用（测试/工具）时的默认渲染值；ensure_agent_files 会按
+# 实际配置覆盖。与 PersonaConfig 的默认值保持一致。
+_DEFAULT_PERSONA_VALUES: dict[str, str] = {
+    "max_chars": "120",
+    "max_chars_technical": "300",
+    "reply_hard_total": "2000",
+    "reply_hard_part": "500",
+    "os_rule": os_rule(DEFAULT_OS_PROBABILITY),
+}
 
 # 生成物首行的标记：配置写盘前据此判断是不是我们自己的文件。
 GENERATED_MARK = "// generated-by: dafeiyu"
@@ -265,23 +284,37 @@ def build_agent(
     template: str,
     cfg: BrainConfig | None = None,
     local: LocalModelConfig | None = None,
+    persona: str | None = None,
+    persona_values: Mapping[str, str] | None = None,
 ) -> str:
-    """把 persona 模板渲染成 opencode agent 文件。
+    """把 opencode 模板与人设渲染成 agent 文件。
 
     `.opencode/agents/<name>.md` 是唯一真正生效的一层（model 与 permissions
     都以它为准），所以这里把它当生成物写：前置区按档位钉模型，权限固定为
-    「通配 deny + 白名单」，正文原样取自 `agent_template.md`。
+    「通配 deny + 白名单」，正文 = `agent_template.md`（opencode 协议/工具）
+    + `persona.md`（人物规则，注入到 `$persona` 占位符）。
 
     布局契约：文件第一行必须是 `---`（opencode 只在这种情况下解析前置区，
     否则 model/permissions 整段失效、回落到默认值），因此 `AGENT_MARK` 落在
     闭合 `---` 之后的正文首行，再空一行接人设正文。
 
     lean=True 时去掉 read/edit、webfetch、websearch 白名单（工作区与联网都不开），
-    并在正文末尾补一句「本轮没有工具」；deny 通配与密钥 deny 保留。
+    persona 里的工具章节会换成「你现在没有工具」，并在正文末尾补一句
+    「本轮没有工具」；deny 通配与密钥 deny 保留。
     """
     cfg = cfg if cfg is not None else BrainConfig(mode=mode)
     local = local if local is not None else LocalModelConfig()
     model = _agent_model(mode, cfg, local)
+    persona_text = load_persona() if persona is None else persona
+    values = dict(_DEFAULT_PERSONA_VALUES)
+    if persona_values:
+        values.update({key: str(value) for key, value in persona_values.items()})
+    source = (
+        strip_tools_section(persona_text)
+        if lean
+        else remove_tools_markers(persona_text)
+    )
+    rendered_persona = Template(source.strip()).safe_substitute(values)
     head = [
         "---",
         f"description: {AGENT_DESCRIPTION}",
@@ -295,7 +328,11 @@ def build_agent(
         # 标记放在前置区之后：文件必须以 `---` 开头，opencode 才解析 model/permissions。
         AGENT_MARK,
     ]
-    body = template if template.endswith("\n") else f"{template}\n"
+    body = Template(template).safe_substitute(
+        persona=rendered_persona, **values
+    )
+    if not body.endswith("\n"):
+        body = f"{body}\n"
     if lean:
         trimmed = body.rstrip("\n")
         body = f"{trimmed}\n\n{AGENT_LEAN_NOTE}\n"
@@ -440,12 +477,33 @@ def ensure_agent_files(settings: Settings, *, root: Path | None = None) -> list[
     memory_template = (TEMPLATES_DIR / "memory_agent_template.md").read_text(
         encoding="utf-8"
     )
+    # persona 在旧调用方/测试里可能没有（它们只关心模型档位）：缺省时用内置值。
+    persona_cfg = getattr(settings, "persona", None)
+    persona_path = str(getattr(persona_cfg, "prompt_file", "") or "").strip()
+    try:
+        persona_text = load_persona(Path(persona_path) if persona_path else None)
+    except OSError:
+        # 人设文件读不出来时退回内置版本：agent 文件仍然要能生成。
+        persona_text = load_persona()
+    persona_values = {
+        "max_chars": str(getattr(persona_cfg, "max_reply_chars", 120)),
+        "max_chars_technical": str(
+            getattr(persona_cfg, "max_reply_chars_technical", 300)
+        ),
+        "reply_hard_part": str(getattr(persona_cfg, "reply_hard_part", 500)),
+        "reply_hard_total": str(getattr(persona_cfg, "reply_hard_total", 2000)),
+        "os_rule": os_rule(
+            float(getattr(persona_cfg, "os_probability", DEFAULT_OS_PROBABILITY))
+        ),
+    }
     chat_text = build_agent(
         mode,
         lean=local.lean if mode == "local_model" else False,
         template=chat_template,
         cfg=settings.brain,
         local=local,
+        persona=persona_text,
+        persona_values=persona_values,
     )
     memory_text = build_memory_agent(
         mode, template=memory_template, cfg=settings.brain, local=local

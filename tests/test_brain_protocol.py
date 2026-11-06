@@ -73,6 +73,35 @@ def test_sticker_without_name_dropped() -> None:
     assert [a.name for a in parsed] == ["1"]
 
 
+def test_reply_array_is_preserved_as_parts() -> None:
+    reply = parse_brain_reply(
+        '{"speak": true, "reply": ["第一句", "第二句", "   ", 3]}'
+    )
+    assert reply.reply == "第一句\n第二句"
+    assert reply.parts == ("第一句", "第二句")
+
+
+def test_reply_string_has_no_parts() -> None:
+    reply = parse_brain_reply('{"speak": true, "reply": "一句话"}')
+    assert reply.reply == "一句话"
+    assert reply.parts == ()
+
+
+def test_target_field_is_whitelisted() -> None:
+    assert parse_brain_reply('{"speak": true, "reply": "嗯", "to": "me"}').target == "me"
+    assert (
+        parse_brain_reply('{"speak": true, "reply": "嗯", "to": "someone"}').target == ""
+    )
+
+
+def test_array_reply_cleans_replacement_chars_in_parts() -> None:
+    reply = parse_brain_reply(
+        '{"speak": true, "reply": ["第一句\\ufffd", "第二句"]}'
+    )
+    assert all("\ufffd" not in part for part in reply.parts)
+    assert reply.parts == ("第一句", "第二句")
+
+
 def test_unknown_attachment_type_dropped() -> None:
     reply = parse_brain_reply(
         '{"speak": true, "reply": "看图", "attachments": ['

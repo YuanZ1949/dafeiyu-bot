@@ -27,7 +27,8 @@ OUTPUT_INSTRUCTION = """\
 只输出一个 JSON 对象，不要输出解释、前后缀或代码围栏。格式：
 {"read": "这轮大家在聊什么、情绪如何（≤40 字）", "think": "你打算怎么接、为什么（≤40 字）", "speak": true 或 false, "reply": "要对群里说的话", "reason": "一句话理由"}
 speak=false 时 reply 留空。read/think 写给自己看，不会发到群里；旧格式只有 speak/reply/reason 也认。
-可选字段："at": ["昵称"] 表示这条回复要 @ 谁；"attachments": [{"type": "image"|"file"|"voice"|"video", "path": "replies/xxx.png", "name": "可选"}] 只在确实产出文件时填写，path 必须相对 workspace，拿不准就省略；想发表情时用 {"type": "sticker", "name": "表情 id 或表情名"}，name 填纯数字表示 QQ 内置表情。；需要转发聊天记录时用 {"type": "forward", "nodes": [{"name": "谁", "content": "一句原话"}]}（最多 5 条）"""
+"reply" 可以是字符串，也可以是字符串数组：想分几条发就把每条放进数组，数组元素就是发送边界；不想分条就用字符串。单条尽量 ≤500 字，整轮 ≤2000 字，别为凑长度硬撑。
+可选字段："to": "me"|"other"|"topic"|"unknown" 表示这句话在跟谁说（第一版只记日志，不强制）；"at": ["昵称"] 表示这条回复要 @ 谁；"attachments": [{"type": "image"|"file"|"voice"|"video", "path": "replies/xxx.png", "name": "可选"}] 只在确实产出文件时填写，path 必须相对 workspace，拿不准就省略；想发表情时用 {"type": "sticker", "name": "表情 id 或表情名"}，name 填纯数字表示 QQ 内置表情。；需要转发聊天记录时用 {"type": "forward", "nodes": [{"name": "谁", "content": "一句原话"}]}（最多 5 条）"""
 
 FALLBACK_REPLY = "本鱼刚刚游神了…你再说一遍？🐋"
 
@@ -65,6 +66,10 @@ class BrainReply:
     # 协议 v2 的可选字段：同样追加在末尾，旧的位置参数构造保持可用。
     attachments: tuple[Attachment, ...] = ()
     at: tuple[str, ...] = ()
+    # 模型显式分条：每个元素就是一条待发消息；reply 仍是全文（旧字段兼容）。
+    parts: tuple[str, ...] = ()
+    # 可选意图：这条话在跟谁说（me/other/topic/unknown）。第一版只记日志。
+    target: str = ""
 
 
 def _strip_fence(text: str) -> str:
@@ -209,6 +214,34 @@ def parse_at(raw: object) -> tuple[str, ...]:
     return tuple(names)
 
 
+_TARGETS = frozenset({"me", "other", "topic", "unknown"})
+MAX_REPLY_PARTS = 50
+
+
+def _reply_parts(raw: object) -> tuple[str, tuple[str, ...]]:
+    """解析 reply：字符串原样返回；数组返回 (全文, 分条)。
+
+    数组里非字符串/空白的元素直接丢弃；全文用换行拼接，供旧路径与日志使用。
+    """
+    if isinstance(raw, list):
+        parts: list[str] = []
+        for item in cast(list[object], raw):
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if text:
+                parts.append(text)
+            if len(parts) >= MAX_REPLY_PARTS:
+                break
+        return "\n".join(parts), tuple(parts)
+    return str(raw or "").strip(), ()
+
+
+def _target_field(raw: object) -> str:
+    text = str(raw or "").strip().casefold()
+    return text if text in _TARGETS else ""
+
+
 def _reply_from_dict(data: dict) -> tuple[bool, str] | None:
     raw_speak = data.get("speak", True)
     if isinstance(raw_speak, str):
@@ -216,7 +249,7 @@ def _reply_from_dict(data: dict) -> tuple[bool, str] | None:
         speak = raw_speak.strip().casefold() not in ("false", "no", "0", "off", "")
     else:
         speak = bool(raw_speak)
-    reply = str(data.get("reply") or "").strip()
+    reply, _parts = _reply_parts(data.get("reply"))
     return (speak, reply) if reply else None
 
 
@@ -330,14 +363,20 @@ def parse_brain_reply(
         speak = raw_speak.strip().casefold() not in ("false", "no", "0", "off", "")
     else:
         speak = bool(raw_speak)
-    reply = str(data.get("reply") or "").strip()
+    reply, parts = _reply_parts(data.get("reply"))
     if "\ufffd" in reply:
         # JSON 合法但字符串里带着解码残渣（管道损坏的残留），清掉再发。
         log.warning("回复含 UTF-8 替换符，已清理（片段=%r）", reply[:160])
         reply = _clean_replacements(reply).strip()
+        parts = tuple(
+            cleaned
+            for cleaned in (_clean_replacements(part).strip() for part in parts)
+            if cleaned
+        )
     if speak and not reply:
         log.warning("模型返回 speak=true 但 reply 为空，降级为兜底话术")
         reply = FALLBACK_REPLY
+        parts = ()
     return BrainReply(
         speak=speak,
         reply=reply,
@@ -348,6 +387,8 @@ def parse_brain_reply(
         think=_short_field(data.get("think")),
         attachments=parse_reply_attachments(data.get("attachments")),
         at=parse_at(data.get("at")),
+        parts=parts,
+        target=_target_field(data.get("to")),
     )
 
 

@@ -24,7 +24,9 @@ SYSTEM_TEMPLATE = """$persona
 
 - 群名：$chat_title
 - 今天：$today
-- 字数上限：普通回复 $max_chars 字，技术问题 $max_chars_technical 字。
+- 长度基调：普通闲聊通常 $max_chars 字上下，技术问题通常 $max_chars_technical 字上下。
+  这只是参考，不是硬上限：内容需要就展开，别为凑长度硬撑，也别把答案腰斩。
+- 想分条发就把 reply 写成字符串数组，每条一个元素；单条尽量不超过 $reply_hard_part 字。
 """
 
 
@@ -85,12 +87,14 @@ def build_system_prompt(
     os_probability: float = DEFAULT_OS_PROBABILITY,
     *,
     tools_enabled: bool = True,
+    reply_hard_part: int = 500,
 ) -> str:
     values = {
         "chat_title": chat_title,
         "today": today,
         "max_chars": str(max_chars),
         "max_chars_technical": str(max_chars_technical),
+        "reply_hard_part": str(reply_hard_part),
         "os_rule": os_rule(os_probability),
     }
     # 人设本身也带占位符（$max_chars / $os_rule），必须先渲染再嵌入外层模板；
