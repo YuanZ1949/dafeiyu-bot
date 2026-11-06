@@ -7,8 +7,8 @@
 2. 这批是不是纯表情、纯短附和、纯刷屏（没有可接的内容）？
 3. 群是不是正聊得火热（这时插嘴最招人烦）？
 
-聊天强度、话题收尾、降频这些既有闸门仍在 Service 里；这里只提供信号，
-不让模块自己调模型或发消息。
+聊天强度、降频这些既有闸门仍在 Service 里；这里只提供信号，不让模块
+自己调模型或发消息。（话题收尾已降级为观测/提示信号，不再拦截。）
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ SUBSTANTIVE_CHARS = 12
 HOT_WINDOW_SECONDS = 60
 HOT_MIN_MESSAGES = 5
 
-# 分数阈值只用于提示文案；真正的取不取消由 Service 的强度/收尾闸门决定。
+# 分数阈值只用于提示文案；真正的取不取消由 Service 的强度/降频闸门决定。
 # 保留这些常量，方便以后在面板里做成可调项。
 QUESTION_SCORE = 0.6
 HELP_SCORE = 0.2
@@ -154,7 +154,7 @@ class MomentSignals:
 
     @property
     def worth_reopen(self) -> bool:
-        """收尾窗口内是否值得为它重新开口：只认明确的问句/求助/接话。"""
+        """降频窗口内是否值得为它重新开口：只认明确的问句/求助/接话。"""
         return self.question or self.help or self.followed_up
 
 
@@ -211,12 +211,12 @@ def analyze(
 
 
 def reopened_by_question(text: str) -> bool:
-    """收尾窗口里，只有明确的问句/求助值得重新叫醒模型。"""
+    """降频窗口里，只有明确的问句/求助值得重新叫醒模型。"""
     return is_question(text)
 
 
 # 「接着说」类请求：既不是问句，也不带求助词，但明确是在等 bot 说完。
-# 收尾/降频窗口里如果把它当普通闲聊吞掉，用户就会看到「说一半没下文」。
+# 降频窗口里如果把它当普通闲聊吞掉，用户就会看到「说一半没下文」。
 CONTINUE_PREFIXES = ("继续", "接着", "说下去", "别停")
 CONTINUE_PHRASES = (
     "继续说",
@@ -228,7 +228,7 @@ CONTINUE_PHRASES = (
     "还有呢",
     "讲完",
     "说完",
-    # 「点评/说说/细说」是明确的接话请求：收尾窗口里吞掉，用户只会看到
+    # 「点评/说说/细说」是明确的接话请求：降频窗口里吞掉，用户只会看到
     # 「我问了它却不回」（11-06 20:46「里面高赞的说法你点评一下」实测踩过）。
     "点评",
     "说说",
@@ -245,7 +245,7 @@ CONTINUE_MAX_CHARS = 30
 
 
 def requests_continuation(text: str) -> bool:
-    """短句里明确要求「接着说」，收尾/降频窗口里也算重新叫醒模型。"""
+    """短句里明确要求「接着说」，降频窗口里也算重新叫醒模型。"""
     body = (text or "").strip()
     if not body or len(body) > CONTINUE_MAX_CHARS:
         return False

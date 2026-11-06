@@ -1029,10 +1029,11 @@ class Service:
 
         addressed = self._is_addressed(msg)
         reason = self._group_skip_reason(msg, addressed=addressed)
-        if reason in ("intensity_quiet", "closed", "downshift"):
+        if reason in ("intensity_quiet", "downshift"):
             # 这几道都是软闸门，不是终局：不 mark_skipped，把消息留在待投
-            # 队列里，下次被点名/问句/「接着说」时一起送模型。否则收尾或
-            # 降频窗口里的消息会永远进不了 prompt，用户看起来就是「不回复」。
+            # 队列里，下次被点名/问句/「接着说」时一起送模型。否则降频窗口
+            # 里的消息会永远进不了 prompt，用户看起来就是「不回复」。
+            # （话题收尾已不再拦截，由模型判断接不接。）
             log.debug("skip %s/%s: %s", msg.chat_id, msg.message_id, reason)
             return
         if reason is not None:
@@ -1060,22 +1061,14 @@ class Service:
         # 等下次点名时一起给模型看，避免「这条永远不进 prompt」。
         if not addressed and self.behavior.chat_intensity == "quiet":
             return "intensity_quiet"
-        # 活跃强度：放开「话题收尾」和「连续空转降频」两个软闸门；
-        # 静音、黑白名单、预算仍然照旧。
+        # 被点名消息不受强度约束；非点名消息里降频窗口仍保留（失败保护）。
+        # 话题收尾不再拦截：一律进批次送模型，接不接由模型输出决定。
         if self.behavior.chat_intensity != "active":
             reopened = (
                 reopened_by_question(msg.content)
                 or requests_continuation(msg.content)
                 or self._answers_bot_question(msg)
             )
-            # 话题已收尾：明确问句/求助/回答 bot 的提问可以重开，否则按低概率抽样。
-            if (
-                not addressed
-                and self.router.is_thread_closed(msg.chat_type, msg.chat_id)
-                and not reopened
-                and not self.router.closed_sample(msg.chat_type, msg.chat_id)
-            ):
-                return "closed"
             # 连续三次选择不说后进入降频窗口：问句仍然可以破例，避免追问被吞。
             if (
                 not addressed
@@ -3054,26 +3047,11 @@ class Service:
             tools_enabled=self._tools_enabled(),
             reply_hard_part=self.settings.persona.reply_hard_part,
         )
-        if (
-            chat_id is not None
-            and chat_type is ChatType.GROUP
-            and self.router.is_thread_closed(chat_type, chat_id)
-            and not self._asks_to_continue(messages)
-        ):
-            prompt += (
-                "\n\n这个话题你刚收尾过。除非对方明显在问你、"
-                "或者话题被重新提起，否则不要接。"
-            )
+        if chat_id is not None and chat_type is ChatType.GROUP:
+            # 收尾只是观测信号：往 prompt 里放一句中立局势说明，把接不接的
+            # 决定权交给模型，不再写任何「不要接」式的封条。
+            prompt += self.router.closed_situation_note(chat_type, chat_id)
         return prompt
-
-    @staticmethod
-    def _asks_to_continue(messages: list[Message]) -> bool:
-        """批次里有人明确要它接着说/点评，就不该再贴「话题已收尾」的封条。"""
-        return any(
-            requests_continuation(message.content)
-            for message in messages
-            if not message.is_bot
-        )
 
     def _tools_enabled(self) -> bool:
         """只有 opencode 且工作区开着时，模型才真的有 read/edit/webfetch。"""

@@ -89,8 +89,8 @@ def build(
     settings = make_settings()
     settings = replace(
         settings,
-        # 收尾窗口默认有 5% 抽样，会让「normal 必被拦」的断言随机翻车；测试里
-        # 明确关掉，闸门行为只取决于 chat_intensity 本身。
+        # closed_sample_rate 已经废弃（收尾不再抽样放行）；明确置 0 是个
+        # 金丝雀：判定完全不依赖这个字段，行为只取决于 chat_intensity 本身。
         triggers=replace(settings.triggers, closed_sample_rate=0.0),
         behavior=BehaviorSettings(chat_intensity=chat_intensity),
     )
@@ -189,15 +189,16 @@ def test_judgment_is_identical_across_channels(tmp_path, content, at_bot):
 async def test_active_intensity_opens_closed_and_downshifted_threads_for_both_channels(
     tmp_path,
 ):
-    """chat_intensity=active 放开「话题收尾 / 降频」两个软闸门；normal 则拦下。
+    """非点名消息收尾后照常进模型；降频窗口在 quiet/normal 档仍拦截。
 
-    软闸门状态全部用公开 API 制造，不碰私有属性，两条通道流程完全相同：
-    - 收尾：router.note_bot_spoke(ambient=True) 连发到 ambient_max_turns 上限，
-      is_thread_closed 会把 thread_closed_until 钉到 now + thread_closed_seconds；
+    状态全部用公开 API 制造，不碰私有属性，两条通道流程完全相同：
+    - 收尾（只作观测/提示信号，不再拦截消息）：router.note_bot_spoke(
+      ambient=True) 连发到 ambient_max_turns 上限，is_thread_closed 会把
+      thread_closed_until 钉到 now + thread_closed_seconds；
     - 降频：router.note_no_reply 连续 3 次（连续三批选择不说）后进入
       downshift_until 降频窗口。
-    时钟是可变 holder，停在 NOON：两个窗口离过期都远。判定时先查收尾再查
-    降频，所以 normal 档被拦的原因固定是 closed。
+    时钟是可变 holder，停在 NOON：两个窗口离过期都远。收尾不再拦截，
+    所以 normal 档被拦的原因只剩降频（消息不带问句/接话请求）。
     """
     verdicts: dict[str, dict[str, object]] = {}
     for chat, tag in ((QQ_CHAT, "qq"), (WX_CHAT, "wx")):
@@ -220,8 +221,9 @@ async def test_active_intensity_opens_closed_and_downshifted_threads_for_both_ch
         assert router.is_thread_closed(ChatType.GROUP, chat)
         assert router.is_downshifted(ChatType.GROUP, chat)
 
-        # normal：非 @ 消息被 closed 闸门拦下，不进模型、不从适配器发出。
-        # 但不做终局丢弃（不 mark_skipped）：下次被点名时还要能一起进 prompt。
+        # normal：非 @ 消息在降频窗口里被拦下，不进模型、不从适配器发出。
+        # （话题收尾已不再拦截。）但不做终局丢弃（不 mark_skipped）：
+        # 下次被点名时还要能一起进 prompt。
         normal_msg = group_msg(chat, message_id=f"n-{tag}")
         await service.handle(normal_msg)
         await service.drain()
@@ -232,7 +234,8 @@ async def test_active_intensity_opens_closed_and_downshifted_threads_for_both_ch
             group_msg(chat, message_id=f"e-{tag}"), now=NOON
         )
 
-        # active：同一份收尾/降频状态下，新的非 @ 消息照常排批、进模型并发送。
+        # active（更精确地说：非 quiet/normal 档）：同一份收尾/降频状态下，
+        # 新的非 @ 消息不走降频闸门，照常排批、进模型并发送。
         service.set_behavior(BehaviorSettings(chat_intensity="active"))
         active_msg = group_msg(chat, message_id=f"a-{tag}")
         await service.handle(active_msg)

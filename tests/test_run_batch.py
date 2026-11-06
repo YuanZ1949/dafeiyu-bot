@@ -503,7 +503,7 @@ async def test_recalled_anchor_skips_batch(tmp_path):
 
 
 async def test_closed_thread_reopens_on_question(tmp_path):
-    """收尾窗口里出现明确问句：应该重新叫醒模型，而不是按 5% 抽签。"""
+    """收尾窗口里出现明确问句：照常进模型（rng 高低都不影响）。"""
     service, store, brain, _adapter = build(tmp_path, rng=_FixedRng(0.9))
     service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
     service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
@@ -655,15 +655,21 @@ async def test_private_reply_with_parts_is_segmented(tmp_path):
     assert delays == [0.8]
 
 
-async def test_closed_thread_skips_ambient_batch(tmp_path):
-    service, _store, brain, adapter = build(tmp_path)
+async def test_closed_thread_no_longer_blocks_ambient_batch(tmp_path):
+    """回归：收尾只留作提示信号，非点名普通消息照样进批次送模型。"""
+    service, store, brain, adapter = build(tmp_path)
     service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
     service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
+    assert service.router.is_thread_closed(ChatType.GROUP, CHAT) is True
 
-    await service.handle(make_msg("随便聊聊", message_id="m2"))
+    msg = make_msg("随便聊聊", message_id="m2")
+    store.add_message(msg)
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, CHAT)
 
-    assert brain.reply_calls == 0
-    assert adapter.texts() == []
+    assert brain.reply_calls == 1
+    assert store.skip_reason(ChatType.GROUP, CHAT, "m2") is None
+    assert adapter.texts()
 
 
 async def test_addressed_message_reopens_closed_batch(tmp_path):
@@ -713,8 +719,9 @@ class _FixedRng:
         return self.value
 
 
-async def test_closed_thread_samples_ambient_message(tmp_path):
-    service, store, brain, _adapter = build(tmp_path, rng=_FixedRng(0.0))
+async def test_closed_thread_prompt_has_situation_note(tmp_path):
+    """收尾时的 system prompt 是中立局势说明，不是「不要接」式封条。"""
+    service, store, brain, _adapter = build(tmp_path)
     service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
     service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
     assert service.router.is_thread_closed(ChatType.GROUP, CHAT) is True
@@ -725,11 +732,15 @@ async def test_closed_thread_samples_ambient_message(tmp_path):
     await service._run_batch(ChatType.GROUP, CHAT)
 
     assert brain.reply_calls == 1
-    assert "收尾" in service._system_prompt(ChatType.GROUP, [msg], CHAT)
+    prompt = service._system_prompt(ChatType.GROUP, [msg], CHAT)
+    assert "局势" in prompt
+    assert "不要接" not in prompt
 
 
-async def test_closed_thread_sample_miss_skips(tmp_path):
-    service, store, brain, _adapter = build(tmp_path, rng=_FixedRng(0.9))
+async def test_closed_thread_reaches_model_regardless_of_rng(tmp_path):
+    """旧的 closed 抽样已移除：rng 命中与否都不再影响消息进模型。"""
+    rng = _FixedRng(0.9)
+    service, store, brain, _adapter = build(tmp_path, rng=rng)
     service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
     service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
     assert service.router.is_thread_closed(ChatType.GROUP, CHAT) is True
@@ -737,8 +748,10 @@ async def test_closed_thread_sample_miss_skips(tmp_path):
     msg = make_msg("随便聊聊", message_id="m3")
     store.add_message(msg)
     await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, CHAT)
 
-    assert brain.reply_calls == 0
+    assert brain.reply_calls == 1
+    assert rng.calls == 0
 
 
 async def test_closed_thread_keeps_message_for_next_addressed_batch(tmp_path):
@@ -849,6 +862,7 @@ class _HistoryBrain(FakeBrain):
 
 
 async def test_closed_thread_hint_reaches_model_system_prompt(tmp_path):
+    """收尾状态下 system prompt 里有中立局势说明，且不再有禁令封条。"""
     brain = _HistoryBrain()
     service, store, _brain, _adapter = build(tmp_path, brain=brain, rng=_FixedRng(0.0))
     service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
@@ -861,7 +875,8 @@ async def test_closed_thread_hint_reaches_model_system_prompt(tmp_path):
     await service._run_batch(ChatType.GROUP, CHAT)
 
     assert brain.reply_calls == 1
-    assert "收尾" in brain.systems[-1]
+    assert "局势" in brain.systems[-1]
+    assert "不要接" not in brain.systems[-1]
 
 
 async def test_open_thread_has_no_closed_hint(tmp_path):
@@ -874,11 +889,11 @@ async def test_open_thread_has_no_closed_hint(tmp_path):
     await service._run_batch(ChatType.GROUP, CHAT)
 
     assert brain.reply_calls == 1
-    assert "收尾" not in brain.systems[-1]
+    assert "局势" not in brain.systems[-1]
 
 
-async def test_continuation_request_drops_closed_hint(tmp_path):
-    """「你点评一下」是明确接话，不能一边放行一边还贴「话题已收尾」的封条。"""
+async def test_continuation_request_gets_neutral_note_not_seal(tmp_path):
+    """「你点评一下」等接话请求照常进模型；prompt 只有局势说明，没有封条。"""
     brain = _HistoryBrain()
     service, store, _brain, _adapter = build(tmp_path, brain=brain, rng=_FixedRng(0.9))
     service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
@@ -891,7 +906,8 @@ async def test_continuation_request_drops_closed_hint(tmp_path):
     await service._run_batch(ChatType.GROUP, CHAT)
 
     assert brain.reply_calls == 1
-    assert "收尾" not in brain.systems[-1]
+    assert "局势" in brain.systems[-1]
+    assert "不要接" not in brain.systems[-1]
 
 
 async def test_missing_reply_complaint_reopens_closed_thread(tmp_path):
@@ -908,8 +924,8 @@ async def test_missing_reply_complaint_reopens_closed_thread(tmp_path):
 
     assert brain.reply_calls == 1
 
-async def test_closed_thread_samples_once_in_model_mode(tmp_path):
-    """收尾期一条消息只抽一次：入队抽过，跑批次时不能再抽一次。"""
+async def test_closed_thread_consumes_no_rng_in_model_mode(tmp_path):
+    """旧的入队抽样已移除：批次链路不再消耗 rng（预算/闸门都不随机）。"""
     rng = _FixedRng(0.0)
     service, store, brain, _adapter = build(tmp_path, rng=rng)
     service.router.note_bot_spoke(ChatType.GROUP, CHAT, ambient=True)
@@ -921,7 +937,7 @@ async def test_closed_thread_samples_once_in_model_mode(tmp_path):
     await service._run_batch(ChatType.GROUP, CHAT)
 
     assert brain.reply_calls == 1
-    assert rng.calls == 1
+    assert rng.calls == 0
 
 
 # ----------------------------------------------------------- 增量 token 统计

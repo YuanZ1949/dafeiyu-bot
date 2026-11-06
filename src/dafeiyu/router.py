@@ -119,7 +119,7 @@ class _ChatState:
     last_prompt_at: datetime | None = None
     # 连续 ambient 发言计数；被点名时清零。
     ambient_streak: int = 0
-    # 话题收尾窗口：非空且未过期时，不再主动接话。
+    # 话题收尾窗口：只作状态/提示信号（prompt 局势说明、面板指标），不拦截消息。
     thread_closed_until: datetime | None = None
     last_closed_at: datetime | None = None
 
@@ -229,10 +229,7 @@ def _check_detail(
         left = metrics["closed_remaining_seconds"]
         if left <= 0:
             return "话题进行中"
-        rate = metrics.get("effective_sample_rate", 0.0)
-        if status == "pass":
-            return f"话题已收尾，按 {rate:.0%} 抽样放行"
-        return f"话题已收尾，剩余 {int(left)} 秒，抽样未命中"
+        return f"话题已收尾，剩余 {int(left)} 秒（仅观测/提示，不再拦截）"
     if key == "hot":
         return "60 秒内消息充足" if status == "pass" else "热度不足"
     if key == "sample":
@@ -367,7 +364,12 @@ class Router:
     def is_thread_closed(
         self, chat_type: ChatType, chat_id: str, now: datetime | None = None
     ) -> bool:
-        """话题是否已经收尾：连续 ambient 发言超限，或发言后无人回应。"""
+        """话题是否已经收尾：连续 ambient 发言超限，或发言后无人回应。
+
+        只作状态/提示信号（prompt 局势说明、面板指标），不用于拦截消息；
+        调用会顺带写过期状态（清掉过期的收尾窗口与 ambient_streak），
+        prompt 提示依赖这一副作用。
+        """
         now = now or self.clock()
         st = self._state(chat_type, chat_id)
         closed_seconds = getattr(self.settings.triggers, "thread_closed_seconds", 600)
@@ -401,17 +403,39 @@ class Router:
         self._persist(chat_type, chat_id, st)
         return True
 
-    def closed_sample_rate(self) -> float:
-        return float(getattr(self.settings.triggers, "closed_sample_rate", 0.05))
-
-    def closed_sample(
+    def closed_situation_note(
         self, chat_type: ChatType, chat_id: str, now: datetime | None = None
-    ) -> bool:
-        """话题已收尾时，非点名消息是否还要送模型；0 表示彻底静默。"""
+    ) -> str:
+        """收尾状态的中立局势说明；供 system prompt 提示，不做任何拦截。
+
+        返回空串表示话题未收尾。内部会触发 is_thread_closed 的
+        过期清理副作用，保证提示基于最新状态。
+        """
+        now = now or self.clock()
         if not self.is_thread_closed(chat_type, chat_id, now):
-            return False
-        rate = self.closed_sample_rate()
-        return rate > 0 and self._rng.random() < rate
+            return ""
+        st = self._state(chat_type, chat_id)
+        minutes = (
+            int((now - st.last_bot_spoke).total_seconds() // 60)
+            if st.last_bot_spoke is not None
+            else 0
+        )
+        if st.ambient_streak > 0:
+            situation = f"你最近在这里连着主动说了 {st.ambient_streak} 条，"
+            if minutes >= 1:
+                situation += f"最后一条在约 {minutes} 分钟前，"
+            situation += "之后暂时没人接话。"
+        else:
+            situation = (
+                f"你上一条发言在约 {minutes} 分钟前，之后暂时没人接话。"
+                if minutes >= 1
+                else "你刚说过一轮，之后暂时没人接话。"
+            )
+        return (
+            "\n\n【局势】这个话题可能聊到收口了：" + situation
+            + "要不要再开口由你自己判断：话题说尽了就让 speak=false"
+            " 自然收住；对方还在跟你聊或抛了新话点，就正常接。"
+        )
 
     def note_reply(self, chat_type: ChatType, chat_id: str) -> None:
         st = self._state(chat_type, chat_id)
@@ -532,14 +556,8 @@ class Router:
 
         content = msg.content.strip()
 
-        # 话题已经收尾：不再硬拦，改成低概率放行让模型自己判断；
-        # 0 表示彻底静默，被点名仍走硬触发分支，不受这里影响。
-        if self.is_thread_closed(msg.chat_type, msg.chat_id, now):
-            rate = self.closed_sample_rate()
-            if rate > 0 and self._rng.random() < rate:
-                self._remember_prompt(msg.chat_type, msg.chat_id, st, content, now)
-                return True, "closed"
-            return False, "closed"
+        # 话题已收尾（is_thread_closed 可据此置位）不再是拦截条件：
+        # 非点名消息照常进入后续规则判定，接不接完全交给模型判断。
 
         # 同一句话在冷却窗口内重复出现（含并发重复投递），不重复回。
         if (
@@ -634,6 +652,9 @@ class Router:
         decision = probe.should_handle(msg)
         source = probe.addressed_source(msg)
         st = probe._state(msg.chat_type, msg.chat_id)
+        # 收尾只是观测信号：定期评估（is_thread_closed 的副作用只落在 probe
+        # 上，clone 不落库），让指标里能看到最新的收尾窗口。
+        probe.is_thread_closed(msg.chat_type, msg.chat_id, now)
         calls, tokens = self.store.usage_today(
             msg.chat_type, msg.chat_id, now.date().isoformat()
         )
@@ -651,12 +672,8 @@ class Router:
         if st.thread_closed_until is not None:
             closed_left = max(0.0, (st.thread_closed_until - now).total_seconds())
         base_rate = self.settings.triggers.sample_rate
-        if closed_left > 0:
-            effective_rate = self.closed_sample_rate()
-        elif downshift_left > 0:
-            effective_rate = base_rate / 2
-        else:
-            effective_rate = base_rate
+        # 收尾不再抽样：effective_sample_rate 只反映降频减半，不再受收尾影响。
+        effective_rate = base_rate / 2 if downshift_left > 0 else base_rate
         metrics: dict[str, Any] = {
             "usage_calls": calls,
             "usage_tokens": tokens,

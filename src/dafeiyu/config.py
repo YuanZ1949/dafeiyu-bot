@@ -76,7 +76,8 @@ class TriggerConfig:
     thread_idle_seconds: int = 300
     # 话题结束后，这么久内不再主动加入；被点名会立刻重开。
     thread_closed_seconds: int = 600
-    # 关窗期间非点名消息的采样率；0 表示彻底静默，被点名仍不受影响。
+    # 已废弃：话题收尾不再抽样放行（全部交给模型判断）。
+    # 字段保留只为兼容老配置；解析与校验不变，运行链路不再读取它。
     closed_sample_rate: float = 0.05
 
 
@@ -1240,6 +1241,7 @@ def _build_triggers(raw: dict[str, Any]) -> TriggerConfig:
     thread_closed = _int(
         raw.get("thread_closed_seconds", 600), "triggers.thread_closed_seconds"
     )
+    # 已废弃：收尾不再抽样放行（全部交给模型判断）；仅保留老配置兼容解析。
     closed_sample_rate = _float(
         raw.get("closed_sample_rate", 0.05), "triggers.closed_sample_rate"
     )

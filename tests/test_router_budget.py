@@ -242,7 +242,8 @@ def test_explain_reports_global_and_monthly_metrics(env) -> None:
     }
 
 
-def test_explain_reports_closed_thread(env) -> None:
+def test_explain_reports_closed_thread_as_observer_only(env) -> None:
+    """收尾只剩观测信号：explain 里 closed 不再是 blocked 的判定原因。"""
     build, _store = env
     router = build()
     router.note_bot_spoke(ChatType.GROUP, 1, ambient=True)
@@ -250,6 +251,12 @@ def test_explain_reports_closed_thread(env) -> None:
 
     data = router.explain(msg(), seed=0)
 
-    assert data["decision"]["reason"] == "closed"
+    assert data["decision"]["reason"] == "sample_skip"
     by_key = {check["key"]: check["status"] for check in data["checks"]}
-    assert by_key["closed"] == "blocked"
+    assert by_key["closed"] == "pass"
+    assert data["metrics"]["closed_remaining_seconds"] > 0
+    assert "不再拦截" in by_key_detail(data, "closed")
+
+
+def by_key_detail(data: dict, key: str) -> str:
+    return next(check["detail"] for check in data["checks"] if check["key"] == key)

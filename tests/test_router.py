@@ -467,9 +467,10 @@ def test_bot_message_going_unanswered_closes_thread() -> None:
     assert router.is_thread_closed(ChatType.GROUP, "qq:1") is False
     clock.advance(1)
     assert router.is_thread_closed(ChatType.GROUP, "qq:1") is True
+    # 收尾只作观测信号，不再拦截：消息照常经规则筛选（这里抽中 sample）。
     decision = router.should_handle(msg("随便聊聊"))
-    assert decision.call_model is False
-    assert decision.reason == "closed"
+    assert decision.call_model is True
+    assert decision.reason == "sample"
 
 
 def test_addressed_message_reopens_closed_thread() -> None:
@@ -488,7 +489,8 @@ def test_two_ambient_replies_close_thread() -> None:
     assert router.is_thread_closed(ChatType.GROUP, "qq:1") is False
     router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=True)
     assert router.is_thread_closed(ChatType.GROUP, "qq:1") is True
-    assert router.should_handle(msg("在聊什么")).reason == "closed"
+    # 收尾不再产生 closed 拦截原因；但 bot 刚说过话仍处于冷却。
+    assert router.should_handle(msg("在聊什么")).reason == "cooldown"
 
 
 def test_closed_window_expires_and_allows_ambient_again() -> None:
@@ -582,32 +584,19 @@ def test_duplicate_suppression_survives_restart() -> None:
     assert decision.reason == "duplicate"
 
 
-def test_closed_thread_samples_once_in_rules_mode() -> None:
+def test_closed_thread_does_not_block_rules_mode() -> None:
+    """收尾不再挂闸：消息照常走规则筛选（这里过冷却后抽中 sample）。"""
     rng = CountingRng(0.0)
     clock = FakeClock(datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI))
     router = Router(make_settings(), FakeStore(), clock=clock, rng=rng)
     close_thread(router)
+    clock.advance(61)
 
     decision = router.should_handle(msg("随便聊聊"))
 
     assert decision.call_model is True
+    assert decision.reason == "sample"
     assert rng.calls == 1
-
-
-def test_closed_sample_uses_closed_rate() -> None:
-    router, _, _ = make_router(rng=0.01, closed_sample_rate=0.05)
-    close_thread(router)
-    assert router.closed_sample(ChatType.GROUP, "qq:1") is True
-
-    router, _, _ = make_router(rng=0.2, closed_sample_rate=0.05)
-    close_thread(router)
-    assert router.closed_sample(ChatType.GROUP, "qq:1") is False
-
-
-def test_closed_sample_rate_zero_never_samples() -> None:
-    router, _, _ = make_router(rng=0.0, closed_sample_rate=0.0)
-    close_thread(router)
-    assert router.closed_sample(ChatType.GROUP, "qq:1") is False
 
 
 def test_persist_failure_does_not_break_state_updates() -> None:
@@ -628,11 +617,34 @@ def test_probe_does_not_persist() -> None:
     assert (ChatType.GROUP, "qq:1") not in store.states
 
 
-def test_closed_sampled_message_reaches_model_in_rules_mode() -> None:
-    router, _, _ = make_router(rng=0.0, closed_sample_rate=0.05)
+def test_closed_situation_note_describes_state() -> None:
+    """收尾提示是中立局势说明：包含连说了几条，不含「不要接」式封条。"""
+    router, _, clock = make_router()
     close_thread(router)
+    clock.advance(120)
+
+    note = router.closed_situation_note(ChatType.GROUP, "qq:1")
+
+    assert "局势" in note
+    assert "连着主动说了 2 条" in note
+    assert "2 分钟前" in note
+    assert "不要接" not in note
+
+
+def test_closed_situation_note_empty_when_thread_open() -> None:
+    router, _, _ = make_router()
+    assert router.closed_situation_note(ChatType.GROUP, "qq:1") == ""
+
+
+def test_closed_situation_note_survives_idle_close_without_streak() -> None:
+    """发言后无人接话触发的收尾：状态里没有连发条数，提示也要说得通。"""
+    router, _, clock = make_router()
+    router.note_bot_spoke(ChatType.GROUP, "qq:1", ambient=False)
+    clock.advance(301)
     assert router.is_thread_closed(ChatType.GROUP, "qq:1") is True
 
-    decision = router.should_handle(msg("随便聊聊"))
-    assert decision.call_model is True
-    assert decision.reason == "closed"
+    note = router.closed_situation_note(ChatType.GROUP, "qq:1")
+
+    assert "局势" in note
+    assert "5 分钟前" in note
+    assert "不要接" not in note
