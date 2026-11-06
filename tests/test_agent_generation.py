@@ -53,7 +53,7 @@ def test_build_agent_front_matter_parses_as_yaml():
     front_matter, body = _split_front_matter(text)
     assert front_matter["model"] == "opencode/deepseek-v4.1-flash-free"
     assert front_matter["mode"] == "primary"
-    assert front_matter["steps"] == 6
+    assert front_matter["steps"] == 12
     assert front_matter["permissions"][0] == {
         "action": "*",
         "resource": "*",

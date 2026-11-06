@@ -4,7 +4,10 @@ import pytest
 
 from dafeiyu.brain.provider_config import (
     GENERATED_MARK,
+    TEMPLATES_DIR,
+    build_agent,
     build_config,
+    build_memory_agent,
     normalize_base_url,
     render_config,
 )
@@ -77,3 +80,48 @@ def test_unknown_mode_raises_with_mode_name():
 )
 def test_normalize_base_url(raw, expected):
     assert normalize_base_url(raw) == expected
+
+
+AGENT_TEMPLATE = TEMPLATES_DIR / "agent_template.md"
+MEMORY_AGENT_TEMPLATE = TEMPLATES_DIR / "memory_agent_template.md"
+
+
+def _front_matter(text: str) -> str:
+    lines = text.splitlines()
+    assert lines[0] == "---"
+    return "\n".join(lines[1 : lines.index("---", 1)])
+
+
+def test_chat_agent_gets_steps_for_multi_round_retrieval():
+    text = build_agent(
+        "free", lean=False, template=AGENT_TEMPLATE.read_text(encoding="utf-8")
+    )
+    front_matter = _front_matter(text)
+    assert "steps: 12" in front_matter
+    assert "  - action: websearch" in front_matter
+    assert "  - action: webfetch" in front_matter
+
+
+def test_memory_agent_stays_single_step_without_tools():
+    text = build_memory_agent(
+        "free", template=MEMORY_AGENT_TEMPLATE.read_text(encoding="utf-8")
+    )
+    front_matter = _front_matter(text)
+    assert "steps: 1" in front_matter
+    assert "steps: 12" not in front_matter
+    assert "websearch" not in front_matter
+    assert "webfetch" not in front_matter
+
+
+def test_agent_template_documents_retrieval_policy():
+    text = AGENT_TEMPLATE.read_text(encoding="utf-8")
+    for needle in (
+        "必须先 `websearch`",
+        "两个独立来源",
+        "只有单一来源",
+        "查不到",
+        "`read`",
+        "3-4 次搜索/抓取",
+        "webfetch",
+    ):
+        assert needle in text, needle
