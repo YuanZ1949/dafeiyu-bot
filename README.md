@@ -236,8 +236,8 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `triggers.cooldown_seconds` | `60` | 同一群两次**非提问**发言的最小间隔（明确提问、@/引用/叫名字不受限） |
 | `triggers.sample_rate` | `0.05` | 普通消息被纳入模型判断的采样率 |
 | `triggers.thread_idle_seconds` | `300` | 机器人说完后这么久没人接，算话题结束 |
-| `triggers.thread_closed_seconds` | `600` | 话题结束后的收尾窗口；窗口内默认不主动接话，被点名立刻重开 |
-| `triggers.closed_sample_rate` | `0.05` | 收尾窗口内非点名消息的放行概率，命中了交给模型自己判断；`0` = 完全静默 |
+| `triggers.thread_closed_seconds` | `600` | 收尾窗口长度；窗口只用于 prompt 局势提示与面板观测，**不再拦截消息**（接不接由模型判断），被点名立刻重开 |
+| `triggers.closed_sample_rate` | `0.05` | **已废弃**：收尾不再抽样放行，字段只为兼容老配置保留，运行链路不读取 |
 | `triggers.quiet_hours` | `["01:00","07:00"]` | 静默时段，不主动插话（@ 仍会回） |
 | `triggers.keywords` | 怎么/为什么/崩了… | 命中即进入模型判断（问号结尾也算；「没什么」这类否定口语不算） |
 | `groups.whitelist` | `[]` | 留空 = 所有群；非空 = 只服务这些群号（被 @/引用/叫名字时不受限） |
@@ -280,7 +280,7 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `mind.observer_min_messages` | `8` | 单群至少累积多少条新消息才观察一次 |
 | `mind.observer_daily_calls` | `24` | 单群每天「观察 + 自省」总调用上限，与回复预算分开 |
 | `mind.reflection_hour` | `5` | 每天几点之后跑夜间自省（0-23，上海时区） |
-| `behavior.chat_intensity` | `normal` | 聊天强度：`quiet` 只回点名、`normal` 当前行为、`active` 放开话题收尾/降频闸门 |
+| `behavior.chat_intensity` | `normal` | 聊天强度：`quiet` 只回点名、`normal` 当前行为、`active` 放开连续空转的降频闸门（话题收尾已不拦截，两档一致） |
 | `behavior.restriction_mode` | `off` | 言论限制：`off` 关闭、`soft` 只注入提示、`strict` 命中关键词的整条回复丢弃、`regenerate` 先让模型改写（每批最多 2 次），仍命中则删掉含禁句的整句 |
 | `behavior.banned_phrases` | `[]` | 禁词（关键词级子串匹配，非语义审核） |
 | `behavior.banned_topics` | `[]` | 禁话题（注入提示；strict 模式也做关键词拦截） |
@@ -542,10 +542,10 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 - 引用她的消息继续问 —— 必回
 - 其他消息 —— 她按规则 + 模型判断决定要不要插话
 - 判断「是不是在跟她说话」比以前更宽：@、引用、叫名字，以及**紧接着回答她上一句提问**都算点名；被点名会重开已收尾的话题
-- 话题收尾窗口里，明确问句/求助会重新叫醒她，不再只靠 5% 随机抽样
+- 话题收尾窗口只做提示，不再拦截：窗口内的非点名消息照样进批次送模型，接不接由模型输出的 `speak` 决定（原来只有 5% 抽样放行，贴封条时还会被整段吞掉）
 - 被规则跳过的消息不会丢：下次接话时会把这些漏掉的消息按 `[时:分] 昵称：内容` 的时间线一起交给模型
 - 时间线会标出群友之间的「（回复 谁）」，模型能看出这句话在接谁
-- 支持的消息段：文字、@、图片、表情/商城表情、语音、视频、文件、分享、位置、名片、音乐、骰子/猜拳、Markdown、合并转发、小程序/网页卡片；语音/视频/文件本体不做识别，只保留可读占位与文件名
+- 支持的消息段：文字、@、图片、表情/商城表情、语音、视频、文件、分享、位置、名片、音乐、骰子/猜拳、Markdown、合并转发、小程序/网页卡片；语音与文件本体不做识别，只保留可读占位与文件名；视频在 `gateway.wechat.media.enabled` 时会落盘原文件并抽 4 帧，供模型 `read` 看画面（详见 `docs/message-types.md`）
 - 图片会落到 `data/bot-workspace/images/` 并把路径写进 prompt；模型有 `read` 时会被告知**先读最近一张图再回答**，动图按首帧理解。模型没有视觉/工具时只保留 `[图片]` 占位
 - 模型调用失败时保持安静，不再往群里发「本鱼断线了」；失败照常计入日志与错误统计
 - `/闭嘴`（或 `/shutup`）—— 本群静音 60 分钟（仅 `groups.admins` 可用）
