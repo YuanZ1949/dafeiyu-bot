@@ -453,3 +453,53 @@ def test_wechat_private_lists_reject_bad_values(
 
     with pytest.raises(ConfigError, match=match):
         load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+
+def test_persona_hard_limits_default_and_parse(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    default = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+    assert default.persona.reply_hard_total == 2000
+    assert default.persona.reply_hard_part == 500
+
+    yaml = BASE_YAML.replace(
+        "  os_probability: 0.05\n",
+        "  reply_hard_total: 1600\n  reply_hard_part: 400\n  os_probability: 0.05\n",
+    )
+    settings = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+    assert settings.persona.reply_hard_total == 1600
+    assert settings.persona.reply_hard_part == 400
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "  reply_hard_total: 100\n  reply_hard_part: 500\n",
+        "  reply_hard_total: 2000\n  reply_hard_part: 0\n",
+    ],
+)
+def test_persona_hard_limits_reject_bad_values(tmp_path: Path, extra: str) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML.replace("  os_probability: 0.05\n", extra + "  os_probability: 0.05\n")
+    with pytest.raises(ConfigError, match="reply_hard"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+
+def test_wechat_self_nicknames_default_empty_and_dedup(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    default = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+    assert default.wechat.self_nicknames == ()
+
+    yaml = BASE_YAML + (
+        "gateway:\n"
+        "  wechat:\n"
+        "    self_nicknames: [小菜鱼, 小菜鱼, '  ']\n"
+    )
+    settings = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+    assert settings.wechat.self_nicknames == ("小菜鱼",)
+
+
+def test_wechat_self_nicknames_rejects_non_list(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + "gateway:\n  wechat:\n    self_nicknames: 小菜鱼\n"
+    with pytest.raises(ConfigError, match="self_nicknames"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))

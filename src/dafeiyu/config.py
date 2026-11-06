@@ -48,6 +48,10 @@ class PersonaConfig:
     opportunity_guard: bool = True
     # 引用回复：被点名/被回复时把回复挂在原消息下；关掉后发送参数与无引用时一致。
     quote_reply: bool = True
+    # 长度安全阀：软目标（max_reply_chars*）只写进提示词，真正发送前只守这两条
+    # 硬边界——整轮总字数与单条字数。超出才截断，不再按软目标砍尾。
+    reply_hard_total: int = 2000
+    reply_hard_part: int = 500
 
 
 @dataclass(frozen=True)
@@ -308,6 +312,9 @@ class WeChatConfig:
     allow_test_inject: bool = False
     # 追加在最后：位置参数构造与旧测试保持不变。
     media: WeChatMediaConfig = field(default_factory=WeChatMediaConfig)
+    # bot 自己的其他昵称（群昵称、别名）：@ 与引用回复判定用。启动时会把
+    # `persona.aliases` 并进来，所以这里通常不用手写全。
+    self_nicknames: tuple[str, ...] = ()
 
     @property
     def outbound_requires_desktop(self) -> bool:
@@ -1077,6 +1084,17 @@ def _build_wechat(
             storage_root=str(media_raw.get("storage_root") or "").strip(),
         )
 
+    raw_self = section.get("self_nicknames")
+    if raw_self is None:
+        raw_self = []
+    if not isinstance(raw_self, (list, tuple)):
+        raise ConfigError("gateway.wechat.self_nicknames 必须是字符串列表")
+    self_nicknames = tuple(
+        dict.fromkeys(
+            str(item).strip() for item in raw_self if str(item).strip()
+        )
+    )
+
     return WeChatConfig(
         enabled=_bool(section.get("enabled", False), "gateway.wechat.enabled"),
         bridge_host=host,
@@ -1142,6 +1160,7 @@ def _build_wechat(
             section.get("allow_test_inject", False), "gateway.wechat.allow_test_inject"
         ),
         media=media,
+        self_nicknames=self_nicknames,
     )
 
 
@@ -1152,7 +1171,15 @@ def _build_persona(raw: dict[str, Any]) -> PersonaConfig:
     max_chars = _int(raw.get("max_reply_chars", 120), "persona.max_reply_chars")
     max_tech = _int(raw.get("max_reply_chars_technical", 300), "persona.max_reply_chars_technical")
     if max_chars < 1 or max_tech < 1:
-        raise ConfigError("persona 回复长度上限必须大于 0")
+        raise ConfigError("persona 回复长度目标必须大于 0")
+    hard_total = _int(
+        raw.get("reply_hard_total", 2000), "persona.reply_hard_total"
+    )
+    hard_part = _int(
+        raw.get("reply_hard_part", 500), "persona.reply_hard_part"
+    )
+    if hard_part < 1 or hard_total < hard_part:
+        raise ConfigError("persona.reply_hard_total 必须 >= reply_hard_part 且都大于 0")
     segment_delay = _float(
         raw.get("segment_delay_seconds", 0.8), "persona.segment_delay_seconds"
     )
@@ -1171,6 +1198,8 @@ def _build_persona(raw: dict[str, Any]) -> PersonaConfig:
             raw.get("opportunity_guard", True), "persona.opportunity_guard"
         ),
         quote_reply=_bool(raw.get("quote_reply", True), "persona.quote_reply"),
+        reply_hard_total=hard_total,
+        reply_hard_part=hard_part,
     )
 
 

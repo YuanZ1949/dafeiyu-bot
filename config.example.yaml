@@ -8,9 +8,12 @@
 
 persona:
   name: Deepseek娘
-  aliases: [Deepseek娘, 大肥鱼, 小鲸鱼, 鱼鱼, 肥鱼]
+  aliases: [Deepseek娘, 大肥鱼, 小鲸鱼, 小菜鱼, 鱼鱼, 肥鱼]
   max_reply_chars: 120
   max_reply_chars_technical: 300
+  # 长度安全阀：上面两个只是提示词里的软目标；真正发送前只守总字数/单条字数。
+  reply_hard_total: 2000
+  reply_hard_part: 500
   os_probability: 0.05
   # 重复守卫：同一句话最近 50 条里说过，就改写/换中性短句/这一片不说。
   repeat_guard: true
@@ -56,6 +59,9 @@ gateway:
     bridge_token: ""
     # 小号在群里的微信显示昵称（不是会话别名，别名由桥本地铸造）；启用时必填。
     account_nickname: ""
+    # bot 在群里的其他昵称（群昵称/别名）：@ 与引用回复判定用。
+    # persona.aliases 启动时会自动并入，一般不用重复写。
+    self_nicknames: []
     # RPA 侧轮询间隔（秒）。
     poll_seconds: 8.0
     # 未读门控：每个 tick 先读一次侧边栏红点（约 20ms），只有存在未读时才打开
