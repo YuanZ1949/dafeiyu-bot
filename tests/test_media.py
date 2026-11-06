@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -13,12 +14,15 @@ from typing import cast
 
 import pytest
 
+import dafeiyu.media as media_module
 from dafeiyu.config import Settings
 from dafeiyu.gateway.wechat_bridge.media.dat import decode_dat
 from dafeiyu.media import materialize_attachments
 from dafeiyu.models import Attachment, ChatType, Message
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 64
+JPG = b"\xff\xd8\xff\xe0" + b"0" * 64
+MP4 = b"\x00\x00\x00\x18ftypmp42" + b"video-bytes" * 8
 
 
 def make_settings(
@@ -346,3 +350,178 @@ async def test_retention_zero_keeps_expired_images(tmp_path: Path) -> None:
 
     assert count == 1
     assert old.is_file()
+
+
+# ------------------------------------------------------------- 视频物化与抽帧
+def patch_video_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    duration: float = 10.0,
+    fail: bool = False,
+) -> list[dict[str, object]]:
+    """替换 media 模块的 ffmpeg 入口，返回抽帧调用记录。"""
+    calls: list[dict[str, object]] = []
+
+    def fake_frame(
+        ffmpeg: str, source: Path, target: Path, offset: float
+    ) -> bool:
+        calls.append({"ffmpeg": ffmpeg, "source": source, "offset": offset})
+        if fail:
+            return False
+        Path(target).write_bytes(JPG)
+        return True
+
+    monkeypatch.setattr(media_module, "_locate", lambda name: name)
+    monkeypatch.setattr(
+        media_module, "_probe_duration", lambda *_a, **_k: duration
+    )
+    monkeypatch.setattr(media_module, "_extract_frame", fake_frame)
+    return calls
+
+
+async def test_video_is_copied_and_frames_are_annotated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(MP4)
+    calls = patch_video_ffmpeg(monkeypatch)
+    settings = make_settings(tmp_path)
+    message = make_message(
+        str(source), kind="video", content="[视频]", name="clip.mp4"
+    )
+
+    count = await materialize_attachments(message, settings)
+
+    # 视频不是图片：返回值仍是成功写盘的图片数。
+    assert count == 0
+    attachment = message.attachments[0]
+    assert attachment.kind == "video"
+    assert attachment.path.startswith("videos/")
+    assert attachment.path.endswith(".mp4")
+    assert attachment.size == len(MP4)
+    stored = tmp_path / "ws" / attachment.path
+    assert stored.is_file()
+    assert stored.read_bytes() == MP4
+
+    digest = hashlib.md5(str(source).encode("utf-8")).hexdigest()[:6]
+    assert [call["offset"] for call in calls] == [1.0, 3.5, 6.0, 8.5]
+    frames = sorted((tmp_path / "ws" / "images").glob(f"video-{digest}-*.jpg"))
+    assert len(frames) == 4
+    assert all(frame.read_bytes() == JPG for frame in frames)
+
+    assert message.content.startswith("[视频]（已抽帧 images/video-")
+    assert "、images/" in message.content
+    assert "，可用 read 查看；原文件 videos/" in message.content
+    assert message.content.count("（已抽帧") == 1
+
+
+async def test_video_without_ffmpeg_copies_original_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(MP4)
+    monkeypatch.setattr(media_module, "_locate", lambda _name: None)
+    settings = make_settings(tmp_path)
+    message = make_message(str(source), kind="video", content="[视频]")
+
+    count = await materialize_attachments(message, settings)
+
+    assert count == 0
+    attachment = message.attachments[0]
+    assert attachment.path.startswith("videos/")
+    assert (tmp_path / "ws" / attachment.path).read_bytes() == MP4
+    assert message.content == f"[视频]（原文件 {attachment.path}，无法抽帧）"
+    assert not (tmp_path / "ws" / "images").exists()
+
+
+async def test_video_frame_failure_keeps_original_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(MP4)
+    calls = patch_video_ffmpeg(monkeypatch, fail=True)
+    settings = make_settings(tmp_path)
+    message = make_message(str(source), kind="video", content="[视频]")
+
+    await materialize_attachments(message, settings)
+
+    assert len(calls) == 4
+    assert "（已抽帧" not in message.content
+    assert "，无法抽帧）" in message.content
+
+
+async def test_video_dat_decode_none_keeps_original_dat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "clip.dat"
+    source.write_bytes(b"not-a-real-image-container")
+    monkeypatch.setattr(media_module, "_locate", lambda _name: None)
+    settings = make_settings(tmp_path)
+    message = make_message(str(source), kind="video", content="[视频]")
+
+    count = await materialize_attachments(
+        message, settings, decode=lambda _data: None
+    )
+
+    assert count == 0
+    attachment = message.attachments[0]
+    assert attachment.path.endswith(".dat")
+    assert (tmp_path / "ws" / attachment.path).read_bytes() == source.read_bytes()
+    assert "，无法抽帧）" in message.content
+
+
+async def test_video_annotate_false_only_copies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(MP4)
+
+    async def boom(*_args: object, **_kwargs: object) -> list[str]:
+        raise AssertionError("annotate=False 时不允许抽帧")
+
+    monkeypatch.setattr(media_module, "_extract_video_frames", boom)
+    settings = make_settings(tmp_path)
+    message = make_message(str(source), kind="video", content="[视频]")
+
+    await materialize_attachments(message, settings, annotate=False)
+
+    assert (tmp_path / "ws" / message.attachments[0].path).is_file()
+    assert message.content == "[视频]"
+
+
+async def test_broken_video_does_not_block_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    valid = tmp_path / "a.png"
+    valid.write_bytes(PNG)
+    monkeypatch.setattr(media_module, "_locate", lambda _name: None)
+    settings = make_settings(tmp_path)
+    message = make_message(
+        str(tmp_path / "missing.mp4"), kind="video", content="[视频] [图片]"
+    )
+    message.attachments.append(Attachment(kind="image", path=str(valid)))
+
+    count = await materialize_attachments(message, settings)
+
+    assert count == 1
+    assert message.content.startswith("[视频] [图片]（图存 images/")
+    assert message.content.count("（图存") == 1
+
+
+async def test_video_second_call_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(MP4)
+    patch_video_ffmpeg(monkeypatch)
+    settings = make_settings(tmp_path)
+    message = make_message(str(source), kind="video", content="[视频]")
+
+    first = await materialize_attachments(message, settings)
+    content = message.content
+    second = await materialize_attachments(message, settings)
+
+    assert first == 0
+    assert second == 0
+    assert message.content == content
+    assert content.count("（已抽帧") == 1

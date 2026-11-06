@@ -161,6 +161,17 @@ _MEDIA_NAME_COLUMNS = ("file_name", "name")
 _MEDIA_SIZE_COLUMNS = ("file_size", "size", "filesize")
 _MEDIA_DURATION_COLUMNS = ("duration", "play_length", "voice_length")
 
+#: 视频单独的大小上限：不复用图片的 ``media_max_bytes``（默认 10 MiB 对视频太小）。
+MAX_VIDEO_BYTES = 100 * 1024 * 1024
+
+#: 视频目录名：4.x 实测是大写 ``Video``，旧版本可能是小写，两者都试。
+_VIDEO_DIR_NAMES = ("Video", "video")
+
+#: 视频原文件常见后缀；匹配 ``<md5>*`` 时只用于排序，不限制文件必须叫这些名字。
+_VIDEO_LIKE_SUFFIXES = frozenset(
+    {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".dat"}
+)
+
 
 @dataclass(frozen=True)
 class ChatRef:
@@ -369,7 +380,15 @@ class LocalMessageStore:
                 log.debug("读取 %s.%s 失败：%s", shard, table, exc)
                 return []
             media_raw = (
-                self._media_rows(con, [_safe_int(row[0]) for row in rows], username)
+                self._media_rows(
+                    con,
+                    [_safe_int(row[0]) for row in rows],
+                    username,
+                    {
+                        _safe_int(row[0]): _base_type(row[1]) or 0
+                        for row in rows
+                    },
+                )
                 if self._media_enabled
                 else {}
             )
@@ -594,13 +613,15 @@ class LocalMessageStore:
         con: sqlite3.Connection,
         local_ids: Sequence[int],
         username: str = "",
+        types: dict[int, int] | None = None,
     ) -> dict[int, dict[str, Any]]:
         """``local_id -> {path,name,size,duration}``；任何失败都返回空。
 
         schema 不可验证（仓库里没有真实媒体库）：只在**确实存在**的表里按列名
         适配，读不到就当没有媒体，绝不猜路径。除旧库的路径列外，再按 4.x 的
         ``MessageResourceInfo.packed_info`` + attach 目录约定补一份来源；新来源
-        只补缺，不覆盖已经从路径列读到的结果。
+        只补缺，不覆盖已经从路径列读到的结果。``types``（``local_id -> 基础
+        local_type``）决定按图片还是视频约定解析候选路径。
         """
         wanted = {_safe_int(value) for value in local_ids}
         wanted.discard(0)
@@ -614,17 +635,21 @@ class LocalMessageStore:
                     found.update(self._query_media_tables(resource_con, wanted))
             except (sqlite3.Error, OSError) as exc:
                 log.debug("打开媒体索引库失败：%s", exc)
-        for key, value in self._resource_media(wanted, username).items():
+        for key, value in self._resource_media(wanted, username, types).items():
             found.setdefault(key, value)
         return found
 
     def _resource_media(
-        self, ids: set[int], username: str
+        self,
+        ids: set[int],
+        username: str,
+        types: dict[int, int] | None = None,
     ) -> dict[int, dict[str, Any]]:
         """从 ``message_resource.db`` 的 md5 推 attach 路径；失败一律返回空。
 
         4.x 的实际布局是 ``msg/attach/<md5(chat)>/<YYYY-MM>/Img/<md5>[_h|_t].dat``，
-        索引库里没有路径列，只有 ``packed_info`` blob 里的 md5。这里只负责
+        视频则放在同级的 ``Video/``（也可能是小写 ``video/``）或 ``msg/video/``
+        下。索引库里没有路径列，只有 ``packed_info`` blob 里的 md5。这里只负责
         「算出候选路径并确认磁盘上确实有文件」，最终是否放行仍交给
         :meth:`_media_meta`（root 越界/大小校验都在那里）。
         """
@@ -690,7 +715,11 @@ class LocalMessageStore:
                     digest = _blob_md5(packed)
                     if not key or not digest:
                         continue
-                    path = _attach_file(base, digest)
+                    local_type = (types or {}).get(key)
+                    if _MEDIA_KIND_BY_TYPE.get(local_type or 0) == "video":
+                        path = _video_file(root, username, digest)
+                    else:
+                        path = _attach_file(base, digest)
                     if path is not None:
                         found[key] = {
                             "path": str(path),
@@ -803,7 +832,7 @@ class LocalMessageStore:
         except (OSError, ValueError) as exc:
             log.debug("媒体路径不可用：%s", exc)
             return None
-        if size <= 0 or size > self._media_max_bytes:
+        if size <= 0 or size > self._media_limit(kind):
             log.debug("媒体文件大小不可接受（%s）：%d 字节", candidate.name, size)
             return None
         name = str(raw.get("name") or "").strip() or candidate.name
@@ -814,6 +843,12 @@ class LocalMessageStore:
             "size": int(size),
             "duration": _safe_int(raw.get("duration")),
         }
+
+    def _media_limit(self, kind: str) -> int:
+        """按媒体类型返回大小上限：视频独立，图片/语音沿用配置值。"""
+        if kind == "video":
+            return MAX_VIDEO_BYTES
+        return self._media_max_bytes
 
     def _emoticon_media(self, body: str) -> dict[str, Any] | None:
         """从表情 XML 的 md5 找到 ``cache/<YYYY-MM>/Emoticon/...`` 缓存文件。
@@ -1150,6 +1185,88 @@ def _attach_file(base: Path, digest: str) -> Path | None:
             except OSError as exc:
                 log.debug("检查 attach 文件失败：%s", exc)
     return None
+
+
+def _video_file(root: Path, username: str, digest: str) -> Path | None:
+    """按 4.x 布局找视频原文件；找不到返回 ``None``。
+
+    候选顺序（前一组命中就不再往后找）：
+
+    1. ``msg/attach/<md5(当前会话)>/<YYYY-MM>/{Video,video}/<md5>*``；
+    2. ``msg/attach/<任意会话 md5>/<YYYY-MM>/{Video,video}/<md5>*``（会话目录
+       对不上时的兜底；同组内按路径排序保证确定性）；
+    3. ``msg/{video,Video}/**/<md5>*``（旧版本把视频单独放在 ``msg/video``）。
+
+    同组内多个匹配按「非 ``.dat`` 优先 → 常见视频后缀优先 → 更大的文件优先」
+    排序：``.dat`` 还要解密，能让 ffmpeg 直接吃的原文件更值得先试。
+    """
+    if not _HEX32_RE.fullmatch(digest):
+        return None
+
+    bases: list[Path] = []
+    attach = root / "msg" / "attach"
+    if username:
+        bases.append(attach / hashlib.md5(username.encode("utf-8")).hexdigest())
+    try:
+        bases.extend(
+            sorted(
+                path
+                for path in attach.glob("*")
+                if path.is_dir() and path not in bases
+            )
+        )
+    except OSError as exc:
+        log.debug("枚举视频 attach 目录失败：%s", exc)
+
+    for base in bases:
+        for folder in _VIDEO_DIR_NAMES:
+            for pattern in (f"*/{folder}/{digest}*", f"{folder}/{digest}*"):
+                path = _pick_video(_glob_files(base, pattern))
+                if path is not None:
+                    return path
+
+    for folder in _VIDEO_DIR_NAMES:
+        path = _pick_video(_glob_files(root / "msg" / folder, f"**/{digest}*"))
+        if path is not None:
+            return path
+    return None
+
+
+def _glob_files(directory: Path, pattern: str) -> list[Path]:
+    try:
+        return list(directory.glob(pattern))
+    except OSError as exc:
+        log.debug("枚举视频目录失败（%s）：%s", pattern, exc)
+        return []
+
+
+def _pick_video(candidates: Sequence[Path]) -> Path | None:
+    """从候选里挑一个真实存在且最适合交给 ffmpeg 的文件。"""
+    files: list[Path] = []
+    for path in candidates:
+        try:
+            if path.is_file():
+                files.append(path)
+        except OSError as exc:
+            log.debug("检查视频文件失败：%s", exc)
+    if not files:
+        return None
+    return min(files, key=_video_preference)
+
+
+def _video_preference(path: Path) -> tuple[int, int, int, str]:
+    """排序键：非 ``.dat`` > 常见视频后缀 > 更大文件 > 路径稳定。"""
+    suffix = path.suffix.lower()
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    return (
+        1 if suffix == ".dat" else 0,
+        0 if suffix in _VIDEO_LIKE_SUFFIXES else 1,
+        -size,
+        path.as_posix(),
+    )
 
 
 def _name2id(con: sqlite3.Connection) -> dict[int, str]:

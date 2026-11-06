@@ -1114,6 +1114,182 @@ def test_resource_absent_db_is_fail_open(tmp_path: Path) -> None:
     assert "media" not in rows["[表情]"]
 
 
+# ------------------------------------------- 4.x 视频：Video / video / msg/video
+VIDEO_MD5 = "aaaabbbbccccddddeeeeffff00001111"
+VIDEO_PAYLOAD = b"\x00\x00\x00\x18ftypmp42" + b"video-bytes" * 8
+
+
+def build_video_store(
+    tmp_path: Path,
+    *,
+    md5: str = VIDEO_MD5,
+    with_resource_db: bool = True,
+    media_max_bytes: int = 10,
+) -> LocalMessageStore:
+    """type 43（视频）夹具：media_max_bytes 故意很小，验证视频不复用图片上限。"""
+    root = tmp_path / "mirror"
+    make_contact_db(
+        root / "contact/contact.db",
+        contacts=[(GROUP, "", GROUP_NAME)],
+    )
+    make_message_db(
+        root / "message/message_0.db",
+        name2id={1: GROUP, 2: SELF},
+        tables={GROUP: [(43, 2, 1000, "", 0)]},
+    )
+    if with_resource_db:
+        make_resource_db(
+            root / "message/message_resource.db",
+            infos=[(201, 1, md5)],
+            details=[(201, 131074)],
+        )
+    return LocalMessageStore(
+        DbRootMirrors(root),
+        self_username=SELF,
+        self_display_name=SELF_NAME,
+        message_rels=["message/message_0.db"],
+        media_enabled=True,
+        media_max_bytes=media_max_bytes,
+    )
+
+
+def video_attach_dir(tmp_path: Path, *, folder: str = "Video") -> Path:
+    path = (
+        tmp_path
+        / "msg"
+        / "attach"
+        / hashlib.md5(GROUP.encode("utf-8")).hexdigest()
+        / "2026-11"
+        / folder
+    )
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_video_attach_dir_is_found_and_ignores_image_max_bytes(
+    tmp_path: Path,
+) -> None:
+    store = build_video_store(tmp_path, media_max_bytes=10)
+    path = video_attach_dir(tmp_path) / f"{VIDEO_MD5}.mp4"
+    path.write_bytes(VIDEO_PAYLOAD)
+
+    row = _media_by_text(store)["[视频]"]
+
+    assert row["kind"] == "video"
+    assert row["media"]["kind"] == "video"
+    assert Path(row["media"]["path"]) == path.resolve()
+    assert row["media"]["name"] == f"{VIDEO_MD5}.mp4"
+    assert row["media"]["size"] == len(VIDEO_PAYLOAD)
+
+
+def test_video_lowercase_dir_is_found(tmp_path: Path) -> None:
+    store = build_video_store(tmp_path)
+    path = video_attach_dir(tmp_path, folder="video") / f"{VIDEO_MD5}.mp4"
+    path.write_bytes(VIDEO_PAYLOAD)
+
+    row = _media_by_text(store)["[视频]"]
+
+    assert Path(row["media"]["path"]) == path.resolve()
+
+
+def test_video_msg_video_tree_is_found(tmp_path: Path) -> None:
+    store = build_video_store(tmp_path)
+    path = tmp_path / "msg" / "video" / "2026-11" / f"{VIDEO_MD5}.mp4"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(VIDEO_PAYLOAD)
+
+    row = _media_by_text(store)["[视频]"]
+
+    assert Path(row["media"]["path"]) == path.resolve()
+
+
+def test_video_dat_is_found(tmp_path: Path) -> None:
+    store = build_video_store(tmp_path)
+    path = video_attach_dir(tmp_path) / f"{VIDEO_MD5}.dat"
+    path.write_bytes(VIDEO_PAYLOAD)
+
+    row = _media_by_text(store)["[视频]"]
+
+    assert Path(row["media"]["path"]) == path.resolve()
+
+
+def test_video_prefers_non_dat_then_larger_file(tmp_path: Path) -> None:
+    store = build_video_store(tmp_path)
+    directory = video_attach_dir(tmp_path)
+    (directory / f"{VIDEO_MD5}.dat").write_bytes(b"x" * 999)
+    (directory / f"{VIDEO_MD5}.mp4").write_bytes(b"y" * 32)
+    preferred = directory / f"{VIDEO_MD5}_1.mp4"
+    preferred.write_bytes(b"z" * 64)
+
+    row = _media_by_text(store)["[视频]"]
+
+    assert Path(row["media"]["path"]) == preferred.resolve()
+
+
+def test_video_over_max_bytes_keeps_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = build_video_store(tmp_path)
+    (video_attach_dir(tmp_path) / f"{VIDEO_MD5}.mp4").write_bytes(VIDEO_PAYLOAD)
+    monkeypatch.setattr(repository, "MAX_VIDEO_BYTES", 8)
+
+    assert "media" not in _media_by_text(store)["[视频]"]
+
+
+def test_video_missing_file_keeps_placeholder(tmp_path: Path) -> None:
+    store = build_video_store(tmp_path)
+
+    row = _media_by_text(store)["[视频]"]
+
+    assert "media" not in row
+
+
+def test_video_without_resource_db_keeps_placeholder(tmp_path: Path) -> None:
+    # 视频的 md5 只在索引库里；索引库缺失时无法凭空发现文件。
+    store = build_video_store(tmp_path, with_resource_db=False)
+    (video_attach_dir(tmp_path) / f"{VIDEO_MD5}.mp4").write_bytes(VIDEO_PAYLOAD)
+
+    assert "media" not in _media_by_text(store)["[视频]"]
+
+
+def test_video_path_column_does_not_use_image_limit(tmp_path: Path) -> None:
+    root = tmp_path / "mirror"
+    (root / "media").mkdir(parents=True)
+    payload = b"\x00\x00\x00\x18ftypmp42" + b"x" * 64
+    (root / "media/clip.mp4").write_bytes(payload)
+    make_contact_db(
+        root / "contact/contact.db", contacts=[(GROUP, "", GROUP_NAME)]
+    )
+    make_message_db(
+        root / "message/message_0.db",
+        name2id={1: GROUP, 2: SELF},
+        tables={GROUP: [(43, 2, 1000, "", 0)]},
+    )
+    make_media_db(
+        root / "message/message_resource.db",
+        local_id=1,
+        local_path="media/clip.mp4",
+        name="clip.mp4",
+        size=len(payload),
+        duration=12_000,
+    )
+    store = LocalMessageStore(
+        DbRootMirrors(root),
+        self_username=SELF,
+        self_display_name=SELF_NAME,
+        message_rels=["message/message_0.db"],
+        media_enabled=True,
+        media_max_bytes=10,
+        media_storage_root=str(root),
+    )
+
+    row = _media_by_text(store)["[视频]"]
+
+    assert row["media"]["kind"] == "video"
+    assert row["media"]["size"] == len(payload)
+    assert row["media"]["duration"] == 12_000
+
+
 # ------------------------------------------------- 3b. 表情缓存（type 47）
 EMOTICON_MD5 = "745c9c20f715400b40f5d679bd12ebdb"
 

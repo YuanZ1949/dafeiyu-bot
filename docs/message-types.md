@@ -1,6 +1,6 @@
 # 消息类型能力矩阵
 
-本文只描述**当前代码已经做到的事**。没做到的（语音转写、视频转码、微信 UI 剪贴板发图等）在矩阵里明确写「不支持」，不要按「以后会有」理解。
+本文只描述**当前代码已经做到的事**。没做到的（语音转写、视频完整转码（只抽帧看画面，见「入站媒体」）、微信 UI 剪贴板发图等）在矩阵里明确写「不支持」，不要按「以后会有」理解。
 
 图例：
 
@@ -16,7 +16,7 @@
 | 文本 | 支持 | 支持 | 支持 | 支持（`send_text`） |
 | 图片 | 支持（`images.enabled` 时落盘并把路径写进正文；失败保留 `[图片]`） | 支持（`gateway.wechat.media.enabled` 时解密落盘给路径；否则占位） | 支持（`send_segments` 的 image 段） | 支持（hook 后端经 `send_media`；UIA 后端恒 `unsupported_media`，回落文本） |
 | 语音 | 占位（正文 `[语音]`；只记录来源/时长元数据，不转写） | 占位（正文 `[语音]`；不转写） | 支持（`send_segments` 的 record 段，kind 为 `record`/`voice`） | 支持（hook 后端 `send_media` kind=voice；UIA 不支持） |
-| 视频 | 占位（正文 `[视频]`；只记录来源/时长元数据，不转码） | 占位（正文 `[视频]`；不转码） | 支持（`send_segments` 的 video 段，路径同样受 `replies/` 与后缀白名单约束） | 支持（hook 后端 `send_media` kind=video；UIA 不支持） |
+| 视频 | 占位（正文 `[视频]`；只记录来源/时长元数据，不转码） | 支持（`gateway.wechat.media.enabled` 时复制原文件到 `videos/`，并用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`send_segments` 的 video 段，路径同样受 `replies/` 与后缀白名单约束） | 支持（hook 后端 `send_media` kind=video；UIA 不支持） |
 | 文件 | 只记录元数据（正文 `[文件] 名字`，记录名字/大小，不下载） | 占位（按 link/占位处理，不下载） | 支持（`upload_file`，模型附件 `kind=file`） | 支持（hook 后端 `send_media` kind=file；UIA 不支持） |
 | 表情 / 贴纸 | 占位但带标识（`face` → `[表情:<id>]`，`mface` → `[表情:<摘要>]`，缺失时回退 `[表情]`；同时记录 sticker 名字/id） | 占位但带标识（`[表情:<desc>]`，无名字用 `[表情:<md5 前 8>]`，解析失败回退 `[表情]`）；贴纸图片在 `gateway.wechat.media.enabled` 时按图片落盘，模型可 `read` 查看 | 支持（模型附件 `type=sticker`：纯数字 `name` 出 `face` 段，其它文本出 `mface` 摘要段） | 支持（hook 后端 `send_media` kind=sticker；UIA 不支持） |
 | @ | 支持（正文保留 `@名字`，并标记 `at_bot`） | 支持（正文保留原文，并标记 `at_bot`） | 支持（at 段；名字必须在本批次在场成员里，最多 3 个） | 支持（hook 后端 `send_at`；UIA 返回 `unsupported_at`，回落纯文本） |
@@ -50,17 +50,19 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 
 - QQ 图片：下载/复制到 `<workspace.dir>/images/`，文件名由时间戳 + 来源 md5 生成，不采信 URL 路径段；下载失败、超过大小上限、没有可用来源都保留 `[图片]` 占位。
 - 微信图片：只有 `gateway.wechat.media.enabled: true` 才会读取本地库发现的文件；路径必须 `resolve()` 到 `storage_root`（空 = 自动探测的镜像根目录）内，文件必须存在且大小在 `(0, max_bytes]`；`.dat` 解密失败保留占位。落盘位置同样是 `<workspace.dir>/images/`。type 47 贴纸同走这条管线（消息 `kind` 仍是 `sticker`，附件 `kind` 为 `image`），落盘后正文变成 `[表情:<标识>]（图存 images/...，可用 read 查看）`。
-  - **媒体发现**：4.x 的 `message/message_resource.db` 没有路径列，md5 在 `MessageResourceInfo.packed_info` 里；按 `msg/attach/<md5(会话)>/<YYYY-MM>/Img/<md5>.dat` 组合候选路径，以磁盘上真实存在为准。变体优先级 `_h` > `_t` > 原图：微信 4.x 的原图解密后常是私有 `wxgf` 容器，`read` 打不开，所以宁可用可读的 `_h`/`_t`。
+  - **媒体发现**：4.x 的 `message/message_resource.db` 没有路径列，md5 在 `MessageResourceInfo.packed_info` 里；图片按 `msg/attach/<md5(会话)>/<YYYY-MM>/Img/<md5>.dat` 组合候选路径，以磁盘上真实存在为准。变体优先级 `_h` > `_t` > 原图：微信 4.x 的原图解密后常是私有 `wxgf` 容器，`read` 打不开，所以宁可用可读的 `_h`/`_t`。
+  - **视频发现**：`local_type == 43` 时按顺序找 `msg/attach/<md5(当前会话)>/<YYYY-MM>/{Video,video}/<md5>*` → 其它会话目录下的同名 `Video/video` → `msg/{video,Video}/**/<md5>*`。同一组内多个候选按「非 `.dat` 优先 → 常见视频后缀优先 → 更大的文件优先」排序；`.dat` 不是图片格式时解码失败是正常情况，会保留原始字节。视频上限是独立的 **100 MiB**，不复用 `gateway.wechat.media.max_bytes`（默认 10 MiB）；超限或找不到文件时保留 `[视频]` 占位。
+  - **视频物化**：原文件复制到 `<workspace.dir>/videos/<时间戳>-<hash>.<ext>`（保留原始字节；复制失败时退化为只把源路径写进正文）。`annotate` 为真时用 ffmpeg 的 `ffprobe`（没有就解析 `ffmpeg -i` 的 `Duration:`）读时长，在 10% / 35% / 60% / 85% 处各抽 1 帧，写出 `<workspace.dir>/images/video-<hash>-<i>.jpg`，最多 4 张。正文注记为 `[视频]（已抽帧 images/...、...，可用 read 查看；原文件 videos/...）`；没有 ffmpeg 或抽帧失败时写 `[视频]（原文件 videos/...，无法抽帧）`；原文件都读不到时保持 `[视频]`。`ffmpeg` 定位与表情共用规则：优先 `DAFEIYU_FFMPEG`，否则查 `PATH`。
   - **`.dat` 解码**：支持旧的单字节 XOR（`0x37/0x38/0x39`）与 4.x 的 V2 容器（`07 08 56 32 08 07` + `aes_size`/`xor_size` + `[AES-128-ECB 头][明文 middle][XOR 尾]`）。V2 的 AES key 由 `cfgDword` 派生（`md5(str(cfgDword) + wxid)[:16]`，`xor_key = cfgDword & 0xFF`）：`media/keygen.py` 先从 V2 文件尾反推 XOR key，再只读扫描 `Weixin.exe` 内存里低字节相同的对齐 u32，用强图片头 + 完整解码双重校验；结果缓存在 `data/wechat-bridge/localdb/media_key.json`，微信换 key 后缓存会自动失效重扫。服务启动时后台预热，单条消息未命中时把扫描丢到后台线程，事件环从不做内存扫描。扫描失败只保留 `[图片]` 占位。
   - **贴纸缓存解码**：type 47 的贴纸不在 `msg/attach` 里，而是按消息 XML 的 `<emoji md5="...">` 到 `<storage_root>/cache/<YYYY-MM>/Emoticon/<md5[:2]>/<md5>` 找。文件是裸 AES-128-CBC（`IV == key`、整文件单流、PKCS7、无文件头），key 由同一个 `cfgDword` 派生：`md5(f"{cfgDword}{wxid}EMOTICON").digest()[:16]`——注意与图片 `.dat` 的 ASCII-hex key 不同。明文是 `wxgf` 容器：固定 13 字节头（魔数/版本/宽高/帧数）之后还有一段长度随版本变化的附加数据（v0x12 为 9 字节，v0x13/v0x14 可达 1KB 且含假起始码），真正的 HEVC 流从第一个参数集 NAL（`00 00 00 01 40 01`）开始；由外部 `ffmpeg` 转成 PNG（多帧转 GIF）。`ffmpeg` 优先取环境变量 `DAFEIYU_FFMPEG`，否则查 `PATH`；缺失时保留 `[表情]` 占位，不影响入站。转码在 `asyncio.to_thread` 里执行，事件环不阻塞。
   - **无新增依赖**：AES 是仓库内纯 Python 实现（`media/aes.py`），不需要 `cryptography`/`Crypto`。
 - 微信/QQ 共用的图片目录按 `images.retention_days` 惰性清理：`> 0` 时在每次物化前删掉超期文件，`0` = 不清理。
 - 微信文件：只追加一条 `[文件] 名字 (路径)` 注记，不复制、不读取内容。
-- 语音不转写、视频不转码；不新增第三方依赖。
+- 语音不转写；视频不转码，但会在 `gateway.wechat.media.enabled` 时复制原文件并抽帧（见上）。不新增第三方依赖。
 
 ### 相关配置键
 
-- `gateway.wechat.media.enabled`：微信入站图片落盘总开关，默认 `false`。
-- `gateway.wechat.media.max_bytes`：解密后单张图片上限，默认 `10485760`（10 MiB）。
+- `gateway.wechat.media.enabled`：微信入站图片/视频落盘总开关，默认 `false`。
+- `gateway.wechat.media.max_bytes`：解密后单张图片上限，默认 `10485760`（10 MiB）；视频不走这个键，固定上限 100 MiB。
 - `gateway.wechat.media.storage_root`：微信本地媒体根目录；空 = 自动探测。
 - `gateway.wechat.enabled`：微信通道总开关，默认 `false`。

@@ -705,6 +705,42 @@ async def test_message_media_non_dict_is_ignored() -> None:
     assert message.attachments[0].name == "[图片]"
 
 
+async def test_message_video_media_becomes_attachment_with_path() -> None:
+    envelope = message_envelope(
+        text="[视频]",
+        kind="video",
+        media={
+            "kind": "video",
+            "path": "C:/wx/msg/attach/x/2026-11/Video/a.mp4",
+            "name": "a.mp4",
+            "size": 4096,
+            "duration": 12,
+        },
+    )
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.kind == "video"
+    assert len(message.attachments) == 1
+    attachment = message.attachments[0]
+    assert attachment.kind == "video"
+    assert attachment.path == "C:/wx/msg/attach/x/2026-11/Video/a.mp4"
+    assert attachment.name == "a.mp4"
+    assert attachment.size == 4096
+    assert attachment.duration == 12
+
+
+async def test_message_video_without_media_keeps_placeholder_attachment() -> None:
+    envelope = message_envelope(text="[视频]", kind="video")
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert len(message.attachments) == 1
+    assert message.attachments[0].kind == "video"
+    assert message.attachments[0].path == ""
+    assert message.attachments[0].name == "[视频]"
+
+
 # ---- 死锁回归：消息处理转后台任务，收帧循环永不被 handler 阻塞 ----
 async def test_handler_send_returns_while_still_pending() -> None:
     """handler 里 await send 必须能等到回执：收帧循环不能被 handler 卡死。
