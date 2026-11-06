@@ -1174,3 +1174,105 @@ LSP（basedpyright）：本轮改动的 `align.py` / `poller.py` / `wechat.py` /
 - 定向：`tests/test_wechat_emoticon.py tests/test_service_wechat_media.py
   tests/test_media.py tests/test_wechat_media_keygen.py
   tests/test_wechat_localdb_repository.py` = 130 passed。
+
+## 25. hook 模式不再回落 UIA：入站也不碰桌面（2026-11-06）
+
+### 25.1 问题
+
+`outbound: hook` 时出站完全走 hook，但轮询循环在本地库尚未就绪
+（`_warmup_localdb` 是后台任务）或 `snapshot` 失败时仍会回落
+`driver.open_chat` / `driver.snapshot`。`driver._main_window()` →
+`pyweixin.Navigator.open_weixin()` 会 restore + `HWND_TOPMOST` + 居中，
+表现为「微信窗口隔一阵自己跳到屏幕中央/被置顶」。
+
+### 25.2 修复（`gateway/wechat_bridge/poller.py`）
+
+- `PollingLoop.__init__` 读 `wechat.outbound`：`outbound == "hook"` 时
+  `_allow_uia_fallback = False`；`uia` / `auto` 保持原行为（auto 仍可能
+  真的回落到 UIA 发送）。
+- `_targets()`：hook 模式下本地库不可用 → 直接返回空元组，连红点
+  （`unread_total` / `unread_sessions`）都不读——它们同样经由驱动碰窗口。
+- `_poll_group()`：hook 模式下本地库快照拿不到 → 返回空，不开窗。
+- 跳过只告警一次（`_uia_skip_warned`）；`_localdb_entries` 的日志按模式写
+  「本轮回落 UIA」或「本轮跳过（不回落 UIA）」，不再误导。
+
+### 25.3 验证
+
+- 新增回归（`tests/test_wechat_bridge_poller.py`）：hook + 本地库不可用 →
+  `driver.calls == []`、`unread_calls == 0`；hook + `snapshot` 抛错 → 不调用
+  `open_chat`；`uia` / `auto` 仍回落开窗（参数化）。
+- 定向：`pytest -q tests/test_wechat_bridge_poller.py`。
+- 全量：见本轮提交说明。
+
+### 25.4 断档后宽窗补读 + 降级标记（2026-11-06 追加）
+
+只「跳过」还不够：本地库不可用期间的消息仍在库里，恢复后如果按常规 50 条
+窗口读取，旧窗口尾巴早被挤出窗口，重叠为 0 → 会被判定成 resync 整段丢掉。
+
+- `PollingLoop._backfill_groups`：hook 模式下 `_targets()` 整轮跳过、或
+  `_poll_group()` 读不到快照时，记下这些会话；`reset_for_resume()`（急停恢复）
+  同样登记当前会话。
+- 恢复后 `_poll_group()` 对这些会话用 `BACKFILL_LIMIT=200` 宽窗读取
+  （`LocalDbSource.snapshot(..., limit=)`）；读成功后清除标记，下一轮回到 50。
+- `SessionAligner.poll(entries, wide=True)`：不先截断，而是在整段快照里找
+  「旧窗口尾巴」。至少连续命中 `MIN_WIDE_OVERLAP=3` 条才认账，同长度取最靠后
+  的一次（防重复文本重复补发）；找不到重叠（缺口 > 200）仍走 resync，不猜。
+- `/api/health/detail`：hook 模式且本地库不可用时，健康帧标
+  `degraded=true` / `reason=inbound_localdb_unavailable`。原因经
+  `WeChatAdapter.health_reason` → `Service.channel_status` →
+  `control.health_snapshot` 透传，面板微信通道显示「已连接（降级）」并追加
+  「降级原因」行（`DEGRADED_REASONS` 中文映射，认不出的 reason 原样显示）。
+- 兼容：`_snapshot_call()` 先探测 `snapshot` 是否接 `limit`，老替身/第三方帧源
+  没有该参数时按原签名调用，不会 TypeError。
+- 回归：`tests/test_wechat_align.py`（窄窗反证、宽窗全量补读、重复尾巴取最后、
+  弱重叠/无重叠 resync）、`tests/test_wechat_bridge_poller.py`（断档 80 条补读、
+  health 降级标记、急停恢复登记、旧替身无 limit）、
+  `tests/test_wechat_localdb_poller.py`（`snapshot(limit=)` 透传）、
+  `tests/test_service_channels.py` / `tests/test_control_channels.py`
+  （reason 透传形状）、`tests/test_dashboard_html.py`（面板降级原因行）。
+- 部署：运行中的桥是旧代码，需要重启桥（加载 poller/align/source）并重启 bot
+  （加载 wechat/service/control 与面板）才生效。
+
+
+## 26. 覆盖层缺 `wechat:` 段时私聊配置被全默认值覆盖（2026-11-06）
+
+### 26.1 问题
+
+生产上「微信好友发消息，bot 完全没反应」：`data/settings.local.yaml` 只有
+`brain:` 段（面板从未改过私聊开关），而 `PanelRuntime().__init__` 用
+`WeChatRuntimeView(WeChatRuntime(), path)`，即启动默认值是
+`private_enabled=False`。`WeChatRuntimeView._merge` 在覆盖层缺少 `wechat:`
+段时直接返回 defaults，于是：
+
+- 轮询器 `_runtime_wechat()` 拿到 `private_enabled=False`；
+- `_scope()` 不枚举好友、`allows_chat(wxg:<friend>)` 也拒绝；
+- `config.yaml` 里显式打开的 `private_enabled/private_reply` 从未生效。
+
+证据：好友「苑长」的两条消息（`local_id=11` 01:54:37 `[旺柴]`、`local_id=12`
+09:59:16 贴纸）在镜像库里，但 `align-state.json` / `inbound_state.json` 都没
+前进，`logs/dafeiyu.log` 当天没有任何微信「消息送审」。
+
+### 26.2 修复
+
+- `gateway/wechat_bridge/panel.py::PanelRuntime.__init__` 新增
+  `defaults: WeChatRuntime | None = None`，交给
+  `WeChatRuntimeView(defaults or WeChatRuntime(), path)`；覆盖层没有
+  `wechat:` 段时返回这份启动默认值，而不是全 False。
+- `gateway/wechat_bridge/__main__.py::_default_poller_factory` 用
+  `wechat.private_enabled/private_reply/private_allow/private_deny`
+  （`config.yaml` 的值）构造 `WeChatRuntime`，传给
+  `PanelRuntime(defaults=startup)`；`PollingLoop(private_enabled=...)` 也复用
+  同一份值，热开关读失败时的 fallback 保持一致。
+
+### 26.3 验证
+
+- 新增回归（`tests/test_wechat_bridge_panel.py`）：
+  - 文件不存在 → 返回启动默认值；
+  - 覆盖层只有 `brain:` → 返回启动默认值（本 bug 的直接回归）；
+  - 覆盖层只写 `wechat.private_reply` → 只覆盖该键，其余回落启动默认；
+  - 覆盖层坏 YAML 且无 defaults → 仍返回 `None`（fail-safe 不变）；
+  - `_default_poller_factory` 接线：覆盖层无 `wechat:` 段时 `_scope()`
+    仍包含 `config.yaml` 开启的好友。
+- 定向：`pytest -q tests/test_wechat_bridge_panel.py
+  tests/test_wechat_bridge_poller.py tests/test_hotconfig.py` = 74 passed。
+- 全量：见本轮提交说明。
