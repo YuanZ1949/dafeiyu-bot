@@ -175,7 +175,9 @@ def test_budget_ambient_ratio_parsed(tmp_path: Path) -> None:
 def test_agents_permissions_and_persona_sync() -> None:
     text = AGENT_FILE.read_text(encoding="utf-8")
     fm = text.split("---")[1]
-    assert "steps: 6" in fm
+    # 12 步留给「搜 → 换词补搜 → 抓原文 → 交叉验证 → 写笔记 → 出 JSON」这条链，
+    # 6 步时模型经常在第一次搜完就被截断，回答只剩空话。
+    assert "steps: 12" in fm
     # free 档基线钉免费模型；key/local 档下文件由 supervisor 按档位重写，
     # 这里只要求仍然显式钉住某个受支持的 provider，不能回落到全局默认。
     assert re.search(r"^model: (opencode|dafeiyu-key|dafeiyu-local)/\S+$", fm, re.M)
