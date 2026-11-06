@@ -287,6 +287,47 @@ def test_html_surfaces_wechat_degraded_reason() -> None:
     assert '"降级原因"' in html
 
 
+def test_html_health_detail_unwraps_bot_frame() -> None:
+    """健康快照的 bot 字段嵌在 data.bot 下，前端必须先解嵌套再渲染。
+
+    /api/health/detail 是 `{ok, generated_at, processes, bot, napcat, disk,
+    backups, alerts}`；uptime/version/gateway/channels/traffic/scheduler/quota/
+    memory 都在 bot 里。读错层级会让通道全显示「未启用」、时长/版本变「—」。
+    """
+    html = read_html()
+    assert "data.bot" in html
+
+    match = re.search(r"function renderHealth\(data\) \{\n(.*?)\n\}", html, re.DOTALL)
+    assert match is not None, "renderHealth 必须仍是一段可直接断言的函数体"
+    body = match.group(1)
+
+    # bot 健康帧内的字段一律从解嵌套后的 bot 取。
+    for token in (
+        "bot.uptime_seconds",
+        "bot.version",
+        "bot.traffic",
+        "bot.scheduler",
+        "bot.quota",
+        "bot.memory",
+        "bot.channels",
+        "bot.gateway",
+    ):
+        assert token in body, token
+    # 顶层字段不能跟着改成 bot.*。
+    assert "data.ok" in body
+    assert "data.generated_at" in body
+    assert "data.disk" in body
+    # 旧的错误层级不能再出现。
+    assert "data.channels" not in body
+    assert "data.traffic" not in body
+    assert "data.memory" not in body
+    assert "data.gateway" not in body
+    # 占位与降级文案保持不变。
+    assert '"未启用"' in body
+    assert '"已连接（降级）"' in body
+    assert '"降级原因"' in body
+
+
 def test_sessions_auto_refresh_keeps_loaded_pages() -> None:
     """「加载更多」之后，定时/回前台刷新不能把列表重置回第一页。"""
     html = read_html()

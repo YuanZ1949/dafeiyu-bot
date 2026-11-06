@@ -1976,19 +1976,23 @@ function degradedReasonText(reason) {
 }
 
 function renderHealth(data) {
-  const ok = !!data.ok;
+  // /api/health/detail 把 bot 的健康帧嵌在 data.bot 下（uptime/version/gateway/
+  // channels/traffic/scheduler/quota/memory），而 ok/generated_at/processes/
+  // disk/napcat/backups/alerts 仍在顶层。bot 帧缺失时回退到 data，兼容旧响应。
+  const bot = (data && data.bot && typeof data.bot === "object") ? data.bot : (data || {});
+  const ok = !!(data && data.ok);
   const stateEl = $("health-state");
   stateEl.className = `pill st-${ok ? "running" : "failed"}`;
   stateEl.innerHTML = `<span class="dot"></span>${ok ? "健康" : "异常"}`;
   $("health-hint").textContent =
-    `${data.generated_at || "—"} · 运行 ${fmtUptime(data.uptime_seconds)} · v${data.version || "—"}`;
+    `${(data && data.generated_at) || "—"} · 运行 ${fmtUptime(bot.uptime_seconds)} · v${bot.version || "—"}`;
 
-  const traffic = data.traffic || {};
-  const scheduler = data.scheduler || {};
-  const quota = data.quota || {};
+  const traffic = bot.traffic || {};
+  const scheduler = bot.scheduler || {};
+  const quota = bot.quota || {};
   healthQuotaPaused = Boolean(quota.paused);
-  const memory = data.memory || {};
-  const disk = data.disk || {};
+  const memory = bot.memory || {};
+  const disk = (data && data.disk) || {};
   const rows = [
     ["最后消息", traffic.last_message_at || "—"],
     ["最后回复", traffic.last_reply_at || "—"],
@@ -2005,11 +2009,12 @@ function renderHealth(data) {
   body.replaceChildren();
   rows.forEach(([label, value]) => body.append(healthKv(label, value)));
 
-  const channels = data.channels || {};
+  const channels = bot.channels || {};
   const channelBox = $("health-channels");
   channelBox.replaceChildren();
   const CHANNEL_TITLE = { qq: "QQ 通道", wechat: "微信通道" };
-  const qqEntry = channels.qq || (data.gateway ? { connected: !!data.gateway.connected, last_event_at: data.gateway.last_event_at, last_disconnect_at: data.gateway.last_disconnect_at } : null);
+  const gateway = bot.gateway || null;
+  const qqEntry = channels.qq || (gateway ? { connected: !!gateway.connected, last_event_at: gateway.last_event_at, last_disconnect_at: gateway.last_disconnect_at } : null);
   const wechatEntry = channels.wechat || null;
   const renderChannel = (name, item) => {
     const card = document.createElement("div");

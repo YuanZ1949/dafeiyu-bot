@@ -951,7 +951,8 @@ def test_dashboard_surfaces_quota_pause() -> None:
         Path(__file__).resolve().parents[1]
         / "src/dafeiyu/supervisor/dashboard/index.html"
     ).read_text(encoding="utf-8")
-    assert "data.quota" in html
+    # /api/health/detail 把 bot 的健康帧嵌在 data.bot 下，quota 也在这一层。
+    assert "bot.quota" in html
     assert "quota.paused" in html
     assert "配额暂停中" in html
 
