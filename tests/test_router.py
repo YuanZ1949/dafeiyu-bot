@@ -92,7 +92,7 @@ def make_settings(
     keywords: tuple[str, ...] = ("怎么", "为什么", "崩了"),
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        persona=SimpleNamespace(name="溟月", aliases=("大肥鱼", "小鲸鱼", "溟月", "鱼鱼")),
+        persona=SimpleNamespace(name="溟月", aliases=("大肥鱼", "小鲸鱼", "小菜鱼", "溟月", "鱼鱼")),
         triggers=SimpleNamespace(
             cooldown_seconds=60,
             sample_rate=sample_rate,
@@ -162,6 +162,33 @@ def test_at_bot_is_hard_trigger() -> None:
 def test_alias_in_text_is_hard_trigger() -> None:
     router, _, _ = make_router()
     assert router.should_handle(msg("大肥鱼你在干嘛")).hard is True
+
+
+def test_group_nickname_alias_counts_as_addressed() -> None:
+    """微信群里 @ 的是群昵称「小菜鱼」：正文带 @ 也要命中别名。"""
+    router, _, _ = make_router()
+    assert router.addressed_source(msg("@小菜鱼 分析美股半导体")) == "alias"
+
+
+def test_alias_as_vocative_is_addressed() -> None:
+    router, _, _ = make_router()
+    assert router.addressed_source(msg("大肥鱼，你怎么看")) == "alias"
+    assert router.addressed_source(msg("大肥鱼在吗")) == "alias"
+    assert router.addressed_source(msg("这事你怎么看，大肥鱼")) == "alias"
+
+
+def test_alias_mention_is_not_addressed() -> None:
+    """只是聊到 bot，不算点名，不强制回复。"""
+    router, _, _ = make_router()
+    text = msg("我刚才看到大肥鱼在别的地方冒泡了")
+    assert router.addressed_source(text) is None
+    assert router.alias_mention(text) is True
+    assert router.should_handle(text).hard is False
+
+
+def test_alias_vocative_is_not_a_mention() -> None:
+    router, _, _ = make_router()
+    assert router.alias_mention(msg("大肥鱼在吗")) is False
 
 
 def test_reply_to_bot_is_hard_trigger() -> None:

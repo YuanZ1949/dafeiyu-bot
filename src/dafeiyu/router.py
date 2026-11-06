@@ -18,6 +18,67 @@ log = logging.getLogger(__name__)
 # 关键词前一个字落在这些字上时，多半是否定口语（没什么 / 不怎么 / 别问什么）。
 _NEGATION_CHARS = "没不无别"
 
+# 别名判定：「称呼」是明确在叫 bot，必须回；「提及」只是聊到它，只给提示。
+# 称呼形态：文本开头就是别名、别名后跟标点/称呼后缀、文本以别名结尾、或 @别名。
+_ALIAS_ADDRESS_SUFFIXES = (
+    "在吗",
+    "在么",
+    "在不在",
+    "呢",
+    "啊",
+    "呀",
+    "吧",
+    "嘛",
+    "哦",
+    "喔",
+    "喂",
+    "你好",
+    "您好",
+    "帮我",
+    "帮忙",
+    "看看",
+    "出来",
+    "过来",
+    "醒醒",
+    "起床",
+    "说话",
+    "回答",
+    "解释",
+    "讲讲",
+    "说说",
+)
+_ALIAS_BOUNDARY = frozenset(
+    " \t\r\n@，。！？、,.!?;:：；~～…—()（）[]【】<>《》\"'“”‘’"
+)
+
+
+def _alias_is_vocative(text: str, alias: str) -> bool:
+    """判断别名在文本里是「在叫它」还是「只是提到它」。"""
+    needle = alias.casefold()
+    if not needle:
+        return False
+    lowered = text.casefold()
+    start = lowered.find(needle)
+    while start != -1:
+        end = start + len(needle)
+        previous = lowered[start - 1] if start else ""
+        following = lowered[end : end + 1]
+        if start == 0 or previous == "@":
+            return True
+        if end == len(lowered):
+            return True
+        if previous in _ALIAS_BOUNDARY and (
+            not following or following in _ALIAS_BOUNDARY
+        ):
+            return True
+        tail = lowered[end : end + 6]
+        if previous in _ALIAS_BOUNDARY and any(
+            tail.startswith(suffix) for suffix in _ALIAS_ADDRESS_SUFFIXES
+        ):
+            return True
+        start = lowered.find(needle, start + 1)
+    return False
+
 
 @dataclass(frozen=True)
 class TriggerDecision:
@@ -392,16 +453,33 @@ class Router:
 
     # ---- gates ----------------------------------------------------
     def addressed_source(self, msg: Message) -> str | None:
-        """返回点名来源：at / reply / alias；未点名为 None。"""
+        """返回点名来源：at / reply / alias；未点名为 None。
+
+        正文里的别名只在「称呼」形态下算点名（开头、后跟标点/称呼后缀、
+        结尾或 @别名）；「提到你」不算，避免把「我刚才看到大肥鱼…」当成叫她。
+        """
         if msg.at_bot:
             return "at"
         if msg.reply_to_bot:
             return "reply"
         text = msg.content.casefold()
         for alias in self.settings.persona.aliases:
-            if alias and alias.casefold() in text:
+            if alias and alias.casefold() in text and _alias_is_vocative(
+                msg.content, alias
+            ):
                 return "alias"
         return None
+
+    def alias_mention(self, msg: Message) -> bool:
+        """正文提到别名但不是在称呼：只给模型一个弱提示，不强制回复。"""
+        text = msg.content.casefold()
+        if not text:
+            return False
+        for alias in self.settings.persona.aliases:
+            if not alias or alias.casefold() not in text:
+                continue
+            return not _alias_is_vocative(msg.content, alias)
+        return False
 
     def is_addressed(self, msg: Message) -> bool:
         """被点名：@、引用回复、或正文里出现别名。批次模式用它决定防抖计时。"""
