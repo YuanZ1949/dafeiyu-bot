@@ -110,6 +110,17 @@ class FakeRestore:
         )
         return {"ok": True, "duration_seconds": 0.1}
 
+    async def restore_workspace(
+        self, backup_id: str, *, actor: str, ip: str = "", request_id: str = ""
+    ) -> dict:
+        self.calls.append({"backup_id": backup_id, "actor": actor, "ip": ip})
+        return {
+            "ok": True,
+            "backup_id": backup_id,
+            "restored_files": 2,
+            "restored_bytes": 10,
+        }
+
 
 def make_auth(enabled: bool = True) -> DashboardAuth:
     return DashboardAuth(
@@ -637,3 +648,27 @@ async def test_budget_passes_bot_error_status(tmp_path: Path) -> None:
 
     assert resp.status == 400
     assert "chat_type" in data["error"]
+
+
+async def test_restore_workspace_requires_confirm_and_passes_id(tmp_path: Path) -> None:
+    app, _supervisor, ops, audit = make_app(tmp_path)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        denied = await client.post(
+            "/api/backups/dafeiyu-20261026-040000-manual/restore-workspace", json={}
+        )
+        assert denied.status == 400
+        assert ops.restore.calls == []
+
+        ok = await client.post(
+            "/api/backups/dafeiyu-20261026-040000-manual/restore-workspace",
+            json={"confirm": "RESTORE"},
+        )
+        assert ok.status == 200
+        body = await ok.json()
+        assert body["result"]["restored_files"] == 2
+        assert ops.restore.calls[0]["backup_id"] == "dafeiyu-20261026-040000-manual"
+        assert ops.restore.calls[0]["actor"].startswith("dashboard:")
+    finally:
+        await client.close()

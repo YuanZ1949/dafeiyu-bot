@@ -533,3 +533,188 @@ async def test_stop_failure_does_not_touch_db(tmp_path: Path) -> None:
 
     assert exc.value.stage == "stop"
     assert rows(db) == ["v1"]
+
+
+
+
+# ---- workspace restore (R18) ----------------------------------------------
+
+async def test_restore_workspace_replaces_dir_and_keeps_previous(tmp_path: Path) -> None:
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    workspace = make_workspace(tmp_path)
+    manager = BackupManager(
+        db, tmp_path / "backups", workspace_dir=workspace, clock=FakeClock()
+    )
+    manifest = await manager.create("manual")
+    (workspace / "MEMORY.md").write_text("- 后来改坏了\n", encoding="utf-8")
+    (workspace / "junk.md").write_text("junk\n", encoding="utf-8")
+
+    restored = manager.restore_workspace(manifest.id)
+
+    assert restored.restored_files == 2
+    assert restored.restored_bytes > 0
+    assert (workspace / "MEMORY.md").read_text(encoding="utf-8") == "- 记住：群规\n"
+    assert not (workspace / "junk.md").exists()
+    assert restored.previous is not None and restored.previous.is_dir()
+    assert (restored.previous / "junk.md").exists()
+    assert list((tmp_path).glob("bot-workspace.pre-restore-*"))
+
+
+async def test_restore_workspace_rejects_sha_mismatch(tmp_path: Path) -> None:
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    workspace = make_workspace(tmp_path)
+    manager = BackupManager(
+        db, tmp_path / "backups", workspace_dir=workspace, clock=FakeClock()
+    )
+    manifest = await manager.create("manual")
+    zip_path = tmp_path / "backups" / manifest.workspace_filename
+    zip_path.write_bytes(zip_path.read_bytes() + b"tampered")
+    before = (workspace / "MEMORY.md").read_text(encoding="utf-8")
+
+    with pytest.raises(BackupError) as exc:
+        manager.restore_workspace(manifest.id)
+
+    assert "SHA256" in str(exc.value)
+    assert (workspace / "MEMORY.md").read_text(encoding="utf-8") == before
+
+
+async def test_restore_workspace_requires_snapshot(tmp_path: Path) -> None:
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    manager = BackupManager(db, tmp_path / "backups", clock=FakeClock())
+    manifest = await manager.create("manual")
+
+    with pytest.raises(BackupError) as exc:
+        manager.restore_workspace(manifest.id)
+    assert "没有工作区快照" in str(exc.value)
+
+
+async def test_restore_workspace_unknown_id(tmp_path: Path) -> None:
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    manager = BackupManager(db, tmp_path / "backups", clock=FakeClock())
+
+    with pytest.raises(BackupError):
+        manager.restore_workspace("dafeiyu-20000101-000000-manual")
+
+
+def test_validate_zip_members_rejects_traversal(tmp_path: Path) -> None:
+    from dafeiyu.supervisor.backup import _validate_zip_members
+
+    archive = tmp_path / "evil.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("../escape.txt", "x")
+
+    with zipfile.ZipFile(archive) as zf:
+        with pytest.raises(BackupError) as exc:
+            _validate_zip_members(zf)
+    assert "非法路径" in str(exc.value)
+
+
+def test_validate_zip_members_rejects_empty(tmp_path: Path) -> None:
+    from dafeiyu.supervisor.backup import _validate_zip_members
+
+    archive = tmp_path / "empty.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("dir/", "")
+
+    with zipfile.ZipFile(archive) as zf:
+        with pytest.raises(BackupError):
+            _validate_zip_members(zf)
+
+
+async def test_restore_workspace_leaves_dir_untouched_on_bad_zip(tmp_path: Path) -> None:
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    workspace = make_workspace(tmp_path)
+    manager = BackupManager(
+        db, tmp_path / "backups", workspace_dir=workspace, clock=FakeClock()
+    )
+    manifest = await manager.create("manual")
+    zip_path = tmp_path / "backups" / manifest.workspace_filename
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("../escape.txt", "x")
+    manifest_path = tmp_path / "backups" / (Path(manifest.filename).stem + ".json")
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw["workspace_sha256"] = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(BackupError):
+        manager.restore_workspace(manifest.id)
+
+    assert (workspace / "MEMORY.md").read_text(encoding="utf-8") == "- 记住：群规\n"
+    assert not list(tmp_path.glob("bot-workspace.pre-restore-*"))
+
+
+async def test_restore_workspace_service_stops_and_starts_bot(tmp_path: Path) -> None:
+    from dafeiyu.supervisor.restore import RestoreService
+
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    workspace = make_workspace(tmp_path)
+    supervisor = FakeSupervisor()
+    backups = BackupManager(
+        db, tmp_path / "backups", workspace_dir=workspace, clock=FakeClock()
+    )
+    manifest = await backups.create("manual")
+    (workspace / "MEMORY.md").write_text("- 改坏了\n", encoding="utf-8")
+    service = RestoreService(
+        db_path=db,
+        backups=backups,
+        supervisor=supervisor,
+        ready_check=lambda: _ready(True),
+        workspace_dir=workspace,
+    )
+
+    result = await service.restore_workspace(manifest.id, actor="dashboard:admin")
+
+    assert result["ok"] is True
+    assert result["restored_files"] == 2
+    assert supervisor.calls == [("stop", "bot"), ("start", "bot")]
+    assert (workspace / "MEMORY.md").read_text(encoding="utf-8") == "- 记住：群规\n"
+
+
+async def test_restore_workspace_service_rolls_back_when_start_fails(
+    tmp_path: Path,
+) -> None:
+    from dafeiyu.supervisor.restore import RestoreError, RestoreService
+
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    workspace = make_workspace(tmp_path)
+    supervisor = FakeSupervisor()
+    backups = BackupManager(
+        db, tmp_path / "backups", workspace_dir=workspace, clock=FakeClock()
+    )
+    manifest = await backups.create("manual")
+    (workspace / "MEMORY.md").write_text("- 改坏了\n", encoding="utf-8")
+    service = RestoreService(
+        db_path=db,
+        backups=backups,
+        supervisor=supervisor,
+        ready_check=lambda: _ready(True),
+        workspace_dir=workspace,
+    )
+    supervisor.fail_start = 1
+
+    with pytest.raises(RestoreError) as exc:
+        await service.restore_workspace(manifest.id, actor="test")
+
+    assert exc.value.stage == "health"
+    assert (workspace / "MEMORY.md").read_text(encoding="utf-8") == "- 改坏了\n"
+    assert supervisor.calls == [("stop", "bot"), ("start", "bot"), ("start", "bot")]
+
+
+async def test_restore_workspace_service_without_workspace_is_rejected(
+    tmp_path: Path,
+) -> None:
+    from dafeiyu.supervisor.restore import RestoreError
+
+    service, _db, backups = await make_restore(tmp_path)
+    manifest = await backups.create("manual")
+
+    with pytest.raises(RestoreError) as exc:
+        await service.restore_workspace(manifest.id, actor="test")
+    assert exc.value.status == 400

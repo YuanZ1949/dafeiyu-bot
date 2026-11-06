@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import zipfile
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .. import __version__
@@ -43,6 +45,11 @@ REQUIRED_COLUMNS = {
 REASONS = ("scheduled", "manual", "pre-restore")
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
+#: 工作区快照的硬上限：超过就不打 zip / 拒绝恢复（R20）。
+#: 没有上限时，工作区膨胀会拖慢备份，也给了 zip 炸弹一个入口。
+MAX_WORKSPACE_FILES = 20000
+MAX_WORKSPACE_BYTES = 512 * 1024 * 1024
+
 
 class BackupError(Exception):
     pass
@@ -62,6 +69,16 @@ class BackupManifest:
     # 旧 manifest 没有这两个键，带默认值保证反序列化兼容。
     workspace_filename: str = ""
     workspace_sha256: str = ""
+
+
+@dataclass(frozen=True)
+class WorkspaceRestore:
+    """一次工作区恢复的结果；``previous`` 用于启动失败时回滚。"""
+
+    target: Path
+    previous: Path | None
+    restored_files: int
+    restored_bytes: int
 
 
 def validate_database(
@@ -241,6 +258,16 @@ class BackupManager:
         )
         if not files:
             return "", ""
+        # 上限只影响「要不要打 zip」，不影响数据库备份本身。
+        if len(files) > MAX_WORKSPACE_FILES:
+            raise OSError(
+                f"工作区文件过多（{len(files)} > {MAX_WORKSPACE_FILES}），本次只备份数据库"
+            )
+        total_bytes = sum(path.stat().st_size for path in files)
+        if total_bytes > MAX_WORKSPACE_BYTES:
+            raise OSError(
+                f"工作区过大（{total_bytes} > {MAX_WORKSPACE_BYTES} 字节），本次只备份数据库"
+            )
         name = f"{db_backup.stem}-workspace.zip"
         target = self.backup_dir / name
         tmp = target.with_name(f".{os.getpid()}-workspace.tmp")
@@ -252,6 +279,130 @@ class BackupManager:
         finally:
             tmp.unlink(missing_ok=True)
         return name, _sha256(target)
+
+    # ------------------------------------------------------------- 工作区恢复
+    def restore_workspace(
+        self, backup_id: str, target_dir: Path | None = None
+    ) -> WorkspaceRestore:
+        """把某份备份里的 ``-workspace.zip`` 解压回工作区（R18）。
+
+        流程：校验 ID/清单 → SHA256 校验 → zip 成员安全检查 → 解压到同级
+        临时目录 → 目录交换（旧的改名为 ``<name>.pre-restore-<ts>``）。
+        任何一步失败都不动现有工作区。
+        """
+        if not backup_id or not _NAME_RE.match(backup_id):
+            raise BackupError("非法备份 ID")
+        manifest = next(
+            (item for item in self.list() if item.id == backup_id), None
+        )
+        if manifest is None:
+            raise BackupError("备份不存在")
+        if not manifest.workspace_filename:
+            raise BackupError("该备份没有工作区快照")
+        workspace = Path(target_dir) if target_dir is not None else self.workspace_dir
+        if workspace is None:
+            raise BackupError("未启用工作区（workspace.dir 为空）")
+        archive = self.backup_dir / manifest.workspace_filename
+        if not archive.is_file():
+            raise BackupError("工作区快照文件缺失")
+        if manifest.workspace_sha256:
+            digest = _sha256(archive)
+            if digest != manifest.workspace_sha256:
+                raise BackupError("工作区快照校验失败（SHA256 不匹配）")
+
+        workspace = Path(workspace)
+        try:
+            workspace.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise BackupError(f"工作区父目录不可用：{exc}") from exc
+
+        staging = workspace.with_name(f".{workspace.name}-restore-{os.getpid()}")
+        self._remove_tree(staging)
+        files = 0
+        size = 0
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                files, size = _validate_zip_members(zf)
+                try:
+                    zf.extractall(staging)
+                except (OSError, zipfile.BadZipFile) as exc:
+                    raise BackupError(f"工作区解压失败：{exc}") from exc
+            if not staging.is_dir():
+                raise BackupError("工作区解压后为空")
+            previous = self._swap_workspace(staging, workspace)
+        except BackupError:
+            self._remove_tree(staging)
+            raise
+        except OSError as exc:
+            self._remove_tree(staging)
+            raise BackupError(f"工作区替换失败：{exc}") from exc
+
+        self._prune_previous_workspaces(workspace.parent, workspace.name)
+        if self.audit is not None:
+            self.audit.write(
+                "backup.restore_workspace",
+                target=manifest.id,
+                detail={"files": files, "bytes": size},
+            )
+        return WorkspaceRestore(
+            target=workspace,
+            previous=previous,
+            restored_files=files,
+            restored_bytes=size,
+        )
+
+    def rollback_workspace(self, restored: WorkspaceRestore) -> None:
+        """启动失败时把工作区换回恢复前的目录；失败只记日志。"""
+        target = restored.target
+        try:
+            if target.exists():
+                failed = target.with_name(
+                    f"{target.name}.failed-{datetime.now():%Y%m%d-%H%M%S}"
+                )
+                os.replace(target, failed)
+            if restored.previous is not None and restored.previous.exists():
+                os.replace(restored.previous, target)
+        except OSError as exc:
+            log.exception("工作区回滚失败：%s", exc)
+        finally:
+            self._prune_previous_workspaces(target.parent, target.name)
+
+    def _swap_workspace(self, staging: Path, target: Path) -> Path | None:
+        """把 ``staging`` 换到 ``target``，返回旧目录（没有旧目录时为 None）。"""
+        previous: Path | None = None
+        if target.exists():
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            previous = target.with_name(f"{target.name}.pre-restore-{stamp}")
+            os.replace(target, previous)
+        try:
+            os.replace(staging, target)
+        except OSError:
+            if previous is not None and not target.exists():
+                with contextlib.suppress(OSError):
+                    os.replace(previous, target)
+            raise
+        return previous
+
+    def _prune_previous_workspaces(self, parent: Path, name: str) -> None:
+        """只保留最近一份 ``<name>.pre-restore-*``/``.failed-*``，避免越攒越大。"""
+        try:
+            candidates = sorted(
+                parent.glob(f"{name}.pre-restore-*"), key=lambda p: p.name
+            ) + sorted(parent.glob(f"{name}.failed-*"), key=lambda p: p.name)
+        except OSError:
+            return
+        for old in candidates[:-1]:
+            self._remove_tree(old)
+
+    @staticmethod
+    def _remove_tree(path: Path) -> None:
+        try:
+            if path.is_symlink():
+                path.unlink(missing_ok=True)
+            elif path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            log.debug("清理目录失败：%s", path, exc_info=True)
 
     def _unique_name(self, name: str) -> str:
         candidate = name
@@ -334,6 +485,42 @@ class BackupManager:
             if item.reason == "scheduled":
                 return item.created_at[:10]
         return None
+
+
+def _validate_zip_members(zf: zipfile.ZipFile) -> tuple[int, int]:
+    """检查 zip 成员是否可安全解压，返回 ``(文件数, 解压后总字节数)``。
+
+    拒绝：绝对路径、``..`` 越界、盘符、符号链接、超大/超多条目。
+    这些检查必须在 ``extractall`` 之前做完，不能边解边判。
+    """
+    files = 0
+    total = 0
+    for info in zf.infolist():
+        name = info.filename.replace("\\", "/")
+        path = PurePosixPath(name)
+        if (
+            not name
+            or path.is_absolute()
+            or any(part == ".." for part in path.parts)
+            or (path.parts and path.parts[0].endswith(":"))
+        ):
+            raise BackupError(f"工作区快照包含非法路径：{info.filename}")
+        mode = (info.external_attr >> 16) & 0o170000
+        if mode == 0o120000:
+            raise BackupError(f"工作区快照包含符号链接：{info.filename}")
+        if info.is_dir():
+            continue
+        files += 1
+        total += max(0, int(info.file_size))
+        if files > MAX_WORKSPACE_FILES:
+            raise BackupError(f"工作区快照文件过多（> {MAX_WORKSPACE_FILES}）")
+        if total > MAX_WORKSPACE_BYTES:
+            raise BackupError(
+                f"工作区快照解压后过大（> {MAX_WORKSPACE_BYTES} 字节）"
+            )
+    if files == 0:
+        raise BackupError("工作区快照没有文件")
+    return files, total
 
 
 def _sha256(path: Path) -> str:

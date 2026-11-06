@@ -364,6 +364,10 @@ def build_ops(
         audit=audit,
         ready_check=ready_check,
         ready_timeout=float(settings.opencode.startup_timeout_seconds),
+        # 工作区快照恢复（R18）；未启用工作区时为 None。
+        workspace_dir=(
+            _repo_path(settings.workspace.dir) if settings.workspace.enabled else None
+        ),
     )
     health = HealthMonitor(
         supervisor=supervisor,

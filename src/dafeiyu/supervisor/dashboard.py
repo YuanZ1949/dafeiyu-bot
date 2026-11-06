@@ -528,6 +528,36 @@ def create_app(
             upload_path.unlink(missing_ok=True)
         return web.json_response({"ok": True, "result": result})
 
+    async def restore_workspace_backup(request: web.Request) -> web.Response:
+        """把某份备份里的工作区快照恢复回 workspace.dir（R18）。
+
+        与数据库恢复一样是破坏性操作，必须显式 ``confirm: RESTORE``。
+        """
+        if ops is None or ops.restore is None:
+            return ops_unavailable()
+        payload = await _json_body(request)
+        confirm = str((payload or {}).get("confirm") or "")
+        if confirm != "RESTORE":
+            return web.json_response({"error": "confirm 必须是 RESTORE"}, status=400)
+        backup_id = request.match_info.get("backup_id", "")
+        try:
+            result = await ops.restore.restore_workspace(
+                backup_id,
+                actor=audit_actor(request),
+                ip=request.remote or "",
+                request_id=request.headers.get("X-Request-Id", ""),
+            )
+        except RestoreError as exc:
+            return web.json_response(
+                {"error": str(exc), "stage": exc.stage}, status=exc.status
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("恢复工作区失败：%s", exc)
+            return web.json_response(
+                {"error": f"恢复工作区失败：{exc.__class__.__name__}"}, status=500
+            )
+        return web.json_response({"ok": True, "result": result})
+
     async def audit_log(request: web.Request) -> web.Response:
         if ops is None or ops.audit is None:
             return ops_unavailable()
@@ -1186,6 +1216,9 @@ def create_app(
     app.router.add_get("/api/backups", backups)
     app.router.add_post("/api/backups", backups)
     app.router.add_post("/api/backups/restore", restore_backup)
+    app.router.add_post(
+        "/api/backups/{backup_id}/restore-workspace", restore_workspace_backup
+    )
     app.router.add_delete("/api/backups/{backup_id}", delete_backup)
     app.router.add_get("/api/audit", audit_log)
     app.router.add_get("/api/status", status)

@@ -36,6 +36,7 @@ class RestoreService:
         bot_name: str = "bot",
         ready_check: Callable[[], Awaitable[bool]] | None = None,
         ready_timeout: float = 30.0,
+        workspace_dir: Path | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.backups = backups
@@ -44,6 +45,8 @@ class RestoreService:
         self.bot_name = bot_name
         self.ready_check = ready_check
         self.ready_timeout = ready_timeout
+        # 工作区恢复（R18）：None = 未启用工作区，只允许数据库恢复。
+        self.workspace_dir = Path(workspace_dir) if workspace_dir else None
         self._lock = asyncio.Lock()
 
     @property
@@ -118,6 +121,78 @@ class RestoreService:
         if not ready:
             raise RuntimeError("健康检查未通过")
 
+    async def restore_workspace(
+        self,
+        backup_id: str,
+        *,
+        actor: str,
+        ip: str = "",
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """把某份备份里的工作区快照解压回 ``workspace.dir``（R18）。
+
+        与数据库恢复同样的顺序：停 bot → 校验并换目录 → 启动 → 健康检查。
+        启动失败会把工作区换回恢复前的目录，再尝试把 bot 拉起来。
+        """
+        if self.workspace_dir is None:
+            raise RestoreError("unsupported", "未启用工作区，无法恢复", 400)
+        if self._lock.locked():
+            raise RestoreError("locked", "已有恢复正在进行", 409)
+        async with self._lock:
+            started = time.monotonic()
+            try:
+                await self.supervisor.stop(self.bot_name)
+            except Exception as exc:
+                raise RestoreError(
+                    "stop", f"无法停止 bot：{exc.__class__.__name__}", 500
+                ) from exc
+
+            try:
+                restored = await asyncio.to_thread(
+                    self.backups.restore_workspace, backup_id, self.workspace_dir
+                )
+            except BackupError as exc:
+                await self._restart_quietly()
+                raise RestoreError("replace", str(exc), 400) from exc
+            except Exception as exc:  # noqa: BLE001 - 兜底成可读错误
+                await self._restart_quietly()
+                raise RestoreError(
+                    "replace", f"工作区恢复失败：{exc.__class__.__name__}", 500
+                ) from exc
+
+            try:
+                await self.supervisor.start(self.bot_name)
+                await self._wait_ready()
+            except Exception as exc:
+                self.backups.rollback_workspace(restored)
+                await self._restart_quietly()
+                raise RestoreError(
+                    "health", f"恢复后启动失败：{exc.__class__.__name__}", 500
+                ) from exc
+
+            result = {
+                "ok": True,
+                "backup_id": backup_id,
+                "restored_files": restored.restored_files,
+                "restored_bytes": restored.restored_bytes,
+                "bot_started": True,
+                "duration_seconds": round(time.monotonic() - started, 1),
+            }
+            self._audit(
+                actor,
+                ip,
+                request_id,
+                backup_id,
+                "ok",
+                {"stage": "done", "duration_seconds": result["duration_seconds"]},
+                action="backup.restore_workspace",
+            )
+            return result
+
+    async def _restart_quietly(self) -> None:
+        with contextlib.suppress(Exception):
+            await self.supervisor.start(self.bot_name)
+
     def _replace(self, upload: Path) -> None:
         self._remove_sidecars()
         os.replace(upload, self.db_path)
@@ -172,11 +247,13 @@ class RestoreService:
         target: str,
         result: str,
         detail: dict[str, Any],
+        *,
+        action: str = "backup.restore",
     ) -> None:
         if self.audit is None:
             return
         self.audit.write(
-            "backup.restore",
+            action,
             actor=actor,
             target=target,
             result=result,
