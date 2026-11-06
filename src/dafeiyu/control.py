@@ -30,7 +30,7 @@ from .brain.factory import (
     mode_status,
     normalize_provider,
 )
-from .brain.lmstudio import ensure_server
+from .brain.lmstudio import ensure_server, stop_server
 from .brain.provider_config import (
     SUPPORTED_MODES,
     agent_path,
@@ -1028,6 +1028,17 @@ class BrainControl:
             raise NotImplementedError("当前服务不支持批次预览")
         return cast(dict[str, Any], as_dict())
 
+    async def _stop_local_model_if_unused(self, target: str) -> None:
+        """离开本地档时关掉 LM Studio；失败只记日志，绝不影响切换结果。
+
+        `local_model.stop_when_unused = false` 时保持常驻（旧行为）。
+        """
+        if target == "local_model":
+            return
+        if not self.settings.local_model.stop_when_unused:
+            return
+        await stop_server(self.settings.local_model)
+
     async def switch(self, provider: str, model: str = "") -> dict[str, Any]:
         target = normalize_provider(provider)
         model = (model or "").strip()
@@ -1067,6 +1078,8 @@ class BrainControl:
             except OSError as exc:
                 log.warning("runtime.json 写入失败：%s", exc)
             asyncio.create_task(self._close_later(previous))
+            # 切走本地档后 LM Studio 就没用了：停掉，别让它一直占显存。
+            await self._stop_local_model_if_unused(target)
             log.info("大脑已切换：%s -> %s", before, target)
             return self.snapshot()
 
@@ -1329,6 +1342,11 @@ class BrainControl:
                     log.warning("runtime.json 写入失败：%s", exc)
                     warnings.append("runtime.json 写入失败，重启后可能回到旧 provider")
                 asyncio.create_task(self._close_later(previous))
+            # 三档里只有 local_model 需要 LM Studio；free/key 落盘成功后
+            # 顺手停掉端点，失败也只记日志，不影响本次切换的返回形状。
+            await self._stop_local_model_if_unused(
+                "local_model" if mode == "local_model" else "opencode"
+            )
             log.info("大脑模式已切换：%s（provider=%s）", mode, provider)
             return {
                 "mode": mode,

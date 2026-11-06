@@ -1,11 +1,13 @@
-"""LM Studio 自启：只测编排，不真的拉起进程。"""
+"""LM Studio 自启/自动停止：只测编排，不真的拉起/停掉进程。"""
 
 from __future__ import annotations
+
+import logging
 
 import pytest
 
 from dafeiyu.brain import lmstudio
-from dafeiyu.brain.lmstudio import EnsureResult, ensure_server
+from dafeiyu.brain.lmstudio import EnsureResult, ensure_server, stop_server
 from dafeiyu.config import LocalModelConfig
 
 
@@ -108,3 +110,70 @@ async def test_autostart_can_be_disabled() -> None:
     result = await ensure_server(cfg(autostart=False))
     assert result.ready is False
     assert result.detail == "autostart 已关闭"
+
+
+async def test_stop_skips_when_endpoint_is_down() -> None:
+    """端点本来就不可用 = 没有遗留进程，不该再调 lms。"""
+    calls: list[list[str]] = []
+
+    async def probe(_url: str) -> bool:
+        return False
+
+    result = await stop_server(cfg(), probe_fn=probe, stop_fn=calls.append)
+
+    assert result == EnsureResult(ready=False, started=False, detail="未在运行")
+    assert calls == []
+
+
+async def test_stop_calls_lms_when_endpoint_is_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lmstudio, "find_lms", lambda _explicit="": "lms.exe")
+    calls: list[list[str]] = []
+
+    async def probe(_url: str) -> bool:
+        return True
+
+    result = await stop_server(cfg(), probe_fn=probe, stop_fn=calls.append)
+
+    assert result == EnsureResult(ready=False, started=True, detail="已停止")
+    assert calls == [["lms.exe", "server", "stop"]]
+
+
+async def test_stop_without_lms_cli_only_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(lmstudio, "find_lms", lambda _explicit="": None)
+    calls: list[list[str]] = []
+
+    async def probe(_url: str) -> bool:
+        return True
+
+    with caplog.at_level(logging.WARNING, logger="dafeiyu.brain.lmstudio"):
+        result = await stop_server(cfg(), probe_fn=probe, stop_fn=calls.append)
+
+    assert result == EnsureResult(ready=True, started=False, detail="找不到 lms CLI")
+    assert calls == []
+    assert any("找不到 lms CLI" in rec.getMessage() for rec in caplog.records)
+
+
+async def test_stop_failure_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(lmstudio, "find_lms", lambda _explicit="": "lms.exe")
+
+    async def probe(_url: str) -> bool:
+        return True
+
+    def boom(_args: list[str]) -> None:
+        raise OSError("denied")
+
+    with caplog.at_level(logging.WARNING, logger="dafeiyu.brain.lmstudio"):
+        result = await stop_server(cfg(), probe_fn=probe, stop_fn=boom)
+
+    assert result.ready is True
+    assert result.started is False
+    assert "停止失败" in result.detail
+    assert any(
+        "停止 LM Studio server 失败" in rec.getMessage() for rec in caplog.records
+    )

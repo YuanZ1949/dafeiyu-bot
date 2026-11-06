@@ -1,8 +1,10 @@
-"""切到本地模型时按需拉起 LM Studio。
+"""切到本地模型时按需拉起 LM Studio，切走时再关掉。
 
 LM Studio 的 OpenAI 端点是 1234；server 没起时 bot 只会在第一次请求失败，
 表现成「她突然不理人」。这里先探活，再调 lms CLI 起服务，最后后台加载模型。
-所有外部动作都可注入，测试不需要真的启动 LM Studio。
+不用本地模型时端点会一直占着显存/内存，所以切走（或启动时发现当前档位不是
+本地模型）再调 lms CLI 停服务。所有外部动作都可注入，测试不需要真的
+启动/停止 LM Studio。
 """
 
 from __future__ import annotations
@@ -67,6 +69,58 @@ def _spawn_detached(args: list[str]) -> None:
         close_fds=True,
         **kwargs,
     )
+
+
+def _run_lms_stop(args: list[str], *, timeout: float = 15.0) -> None:
+    """同步执行 ``lms server stop``；调用点用 to_thread 包住，别卡事件循环。"""
+    if os.name == "nt":
+        subprocess.run(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        subprocess.run(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=True,
+        )
+
+
+async def stop_server(
+    cfg: LocalModelConfig,
+    *,
+    probe_fn: Callable[[str], Awaitable[bool]] | None = None,
+    stop_fn: Callable[[list[str]], None] | None = None,
+) -> EnsureResult:
+    """端点在线时用 lms CLI 停掉 LM Studio；失败只记日志，不抛异常。
+
+    先探活：端点本来就不可用，说明没有遗留进程，直接返回，避免白调一次 CLI。
+    停止动作放在线程里跑（subprocess 带 15s 超时），不会阻塞切换的事件循环。
+    """
+    check = probe_fn or probe
+    if not await check(cfg.base_url):
+        return EnsureResult(ready=False, started=False, detail="未在运行")
+
+    exe = find_lms(cfg.lms_path)
+    if not exe:
+        log.warning("LM Studio 仍在运行，但找不到 lms CLI，无法自动停止")
+        return EnsureResult(ready=True, started=False, detail="找不到 lms CLI")
+
+    stop = stop_fn or _run_lms_stop
+    try:
+        await asyncio.to_thread(stop, [exe, "server", "stop"])
+    except Exception as exc:  # noqa: BLE001 - 停止失败只降级
+        log.warning("停止 LM Studio server 失败：%s", exc)
+        return EnsureResult(ready=True, started=False, detail=f"停止失败：{exc}")
+
+    log.info("已停止 LM Studio server：%s", cfg.base_url)
+    return EnsureResult(ready=False, started=True, detail="已停止")
 
 
 async def ensure_server(

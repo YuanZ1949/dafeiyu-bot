@@ -368,6 +368,8 @@ class LocalModelConfig:
     reasoning_effort: str = ""
     # 切到本地模型时若端点没起，自动用 lms CLI 拉起 LM Studio server。
     autostart: bool = True
+    # 切走本地模型后自动停掉 LM Studio（lms server stop），释放显存/内存。
+    stop_when_unused: bool = True
     # 留空自动找 ~/.lmstudio/bin/lms.exe 或 PATH 里的 lms。
     lms_path: str = ""
     autostart_timeout_seconds: float = 20.0
@@ -1546,6 +1548,10 @@ def load_settings(
         ),
         reasoning_effort=str(local_model_raw.get("reasoning_effort") or "").strip(),
         autostart=bool(local_model_raw.get("autostart", True)),
+        stop_when_unused=_bool(
+            local_model_raw.get("stop_when_unused", True),
+            "local_model.stop_when_unused",
+        ),
         lms_path=str(local_model_raw.get("lms_path") or "").strip(),
         autostart_timeout_seconds=_float(
             local_model_raw.get("autostart_timeout_seconds", 20.0),

@@ -221,7 +221,8 @@ C:\AIWork\dafeiyu-bot\          # 仓库本体（标准布局，无 junction）
 - **模型档位**（`config.yaml` 的 `brain` + 面板切换）：
   - `free`：依赖 opencode 免费模型（需要 opencode 侧可用/认证；本机修好 P7 前一直不可用）；
   - `local_model`：需要本机 LM Studio/兼容端点（如 `http://127.0.0.1:1234/v1`）在位，否则
-    切档报 `连不上本地模型端点`；
+    切档报 `连不上本地模型端点`。切到这一档时端点没起会自动拉起，切走后自动停止
+    （`local_model.stop_when_unused: false` 可关掉自动停止，让 LM Studio 常驻）；
   - `key`：自备 Key（DeepSeek 官方或兼容网关），本机最终使用这一档并验证可正常回复。
 - **已固化**：`dafeiyu doctor` 会先把 `.env` 按 UTF-8 解码检查，不是合法 UTF-8 时直接报
   「`.env` 编码不是 UTF-8」并提示按 `.env.example` 重写；`config.yaml` 读不出 UTF-8 也不再抛

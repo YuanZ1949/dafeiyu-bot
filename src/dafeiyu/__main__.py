@@ -11,7 +11,7 @@ from typing import Any
 
 from .brain.client import BrainClient, BrainError
 from .brain.factory import build_brain, current_provider, local_model_name
-from .brain.lmstudio import ensure_server
+from .brain.lmstudio import ensure_server, stop_server
 from .brain.opencode import resolve_opencode_bin
 from .brain.opencode_auth import password_env, resolve_password
 from .brain.opencode_server import OpenCodeServer
@@ -383,6 +383,10 @@ async def main() -> None:
                 settings.local_model,
                 local_model_name(settings, runtime),
             )
+        elif settings.local_model.stop_when_unused:
+            # 上次不是本地档：清掉历史上切走时残留的 LM Studio 进程。
+            # 端点本来就不在时这里只探活一次，不会真调 lms。
+            await stop_server(settings.local_model)
         effective_server_url = settings.opencode.server_url
         if provider == "opencode" and settings.opencode.manage_server:
             # P7：bot 自己拉起 serve 时也要把 Basic 口令同时给 serve 与 HTTP 客户端，

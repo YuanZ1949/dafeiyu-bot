@@ -18,6 +18,7 @@ from conftest import TEST_CONFIG_YAML
 from dafeiyu import config as config_mod
 from dafeiyu import control as control_mod
 from dafeiyu import secrets_store
+from dafeiyu.brain.lmstudio import EnsureResult
 from dafeiyu.brain.provider_config import agent_path, config_path, memory_agent_path
 from dafeiyu.config import load_settings
 from dafeiyu.control import BrainControl, SwitchError, create_app
@@ -124,6 +125,22 @@ def control(tmp_path: Path, monkeypatch, store_spy: StoreSpy) -> BrainControl:
     monkeypatch.setattr(control_mod, "build_brain", fake_build_brain)
     ctrl.brain_builds = built  # type: ignore[attr-defined]
     return ctrl
+
+
+@pytest.fixture(autouse=True)
+def lm_stop_spy(monkeypatch) -> list[str]:
+    """拦截 control_mod.stop_server：测试里绝不真的停本机 LM Studio。
+
+    记录被停止的端点，专门用来断言「切走时停、切到本地档不停」。
+    """
+    calls: list[str] = []
+
+    async def fake_stop(cfg) -> EnsureResult:
+        calls.append(cfg.base_url)
+        return EnsureResult(ready=False, started=True, detail="已停止")
+
+    monkeypatch.setattr(control_mod, "stop_server", fake_stop)
+    return calls
 
 
 def key_file_target(config_file: Path) -> Path:
@@ -813,3 +830,50 @@ async def test_local_probe_falls_back_to_configured_token(
     assert read_secret(control_mod.LOCAL_KEY_PATH) == "sk-stored-1"
     generated = config_path(Path(control.settings.opencode.config_home))
     assert key_file_target(generated) == Path(control_mod.LOCAL_KEY_PATH).resolve()
+
+
+async def test_switch_mode_away_from_local_stops_lmstudio(
+    control: BrainControl, lm_stop_spy: list[str]
+) -> None:
+    await control.switch_mode({"mode": "free"})
+
+    assert lm_stop_spy == [control.settings.local_model.base_url]
+
+
+async def test_switch_mode_to_local_does_not_stop_lmstudio(
+    control: BrainControl, lm_stop_spy: list[str]
+) -> None:
+    await control.switch_mode(
+        {
+            "mode": "local_model",
+            "force": True,
+            "local": {"base_url": "http://h:1/v1", "model": "lm"},
+        }
+    )
+
+    assert lm_stop_spy == []
+
+
+async def test_stop_when_unused_can_be_disabled(
+    control: BrainControl, lm_stop_spy: list[str]
+) -> None:
+    control.settings = dc_replace(
+        control.settings,
+        local_model=dc_replace(
+            control.settings.local_model, stop_when_unused=False
+        ),
+    )
+
+    await control.switch_mode({"mode": "free"})
+
+    assert lm_stop_spy == []
+
+
+async def test_switch_provider_away_from_local_stops_lmstudio(
+    control: BrainControl, lm_stop_spy: list[str]
+) -> None:
+    """老协议入口 switch() 切离 local_model 时同样要停端点。"""
+    out = await control.switch("opencode")
+
+    assert out["provider"] == "opencode"
+    assert lm_stop_spy == [control.settings.local_model.base_url]

@@ -160,6 +160,8 @@ DEEPSEEK_REASONING_EFFORT=none
 
 Qwen3.5 默认会先输出一大段思考（`reasoning_content`），`max_tokens` 小时正文会为空。LM Studio 不认 `/no_think` 和 `chat_template_kwargs`，但认 `reasoning_effort: "none"`；本仓库已把它做成 `DEEPSEEK_REASONING_EFFORT` 配置项。若服务开了认证，把 `DEEPSEEK_API_KEY` 换成 LM Studio 里创建的 token。
 
+用面板切到 `local_model` 档时，若 1234 端口没起会自动用 `lms` CLI 拉起；切走后自动停止，释放显存/内存。不想让它自动停（比如还要用 LM Studio 干别的）就把 `config.yaml` 里的 `local_model.stop_when_unused` 设为 `false`。
+
 ### QQ 协议端 NapCat（已内嵌到项目）
 
 NapCat 的可执行文件较大（解压后约 345MB），放在 `vendor/napcat/`，已加入 `.gitignore`，不提交进 git。首次准备：
