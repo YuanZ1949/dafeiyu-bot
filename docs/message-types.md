@@ -1,6 +1,6 @@
 # 消息类型能力矩阵
 
-本文只描述**当前代码已经做到的事**。没做到的（语音转写、视频完整转码（只抽帧看画面，见「入站媒体」）、微信 UI 剪贴板发图等）在矩阵里明确写「不支持」，不要按「以后会有」理解。
+本文只描述**当前代码已经做到的事**。没做到的（视频完整转码（只抽帧看画面，见「入站媒体」）、微信 UI 剪贴板发图等）在矩阵里明确写「不支持」，不要按「以后会有」理解。
 
 图例：
 
@@ -15,8 +15,8 @@
 | --- | --- | --- | --- | --- |
 | 文本 | 支持 | 支持 | 支持 | 支持（`send_text`） |
 | 图片 | 支持（`images.enabled` 时落盘并把路径写进正文；失败保留 `[图片]`） | 支持（`gateway.wechat.media.enabled` 时解密落盘给路径；否则占位） | 支持（`send_segments` 的 image 段） | 支持（hook 后端经 `send_media`；UIA 后端恒 `unsupported_media`，回落文本） |
-| 语音 | 占位（正文 `[语音]`；只记录来源/时长元数据，不转写） | 占位（正文 `[语音]`；不转写） | 支持（`send_segments` 的 record 段，kind 为 `record`/`voice`） | 支持（hook 后端 `send_media` kind=voice；UIA 不支持） |
-| 视频 | 占位（正文 `[视频]`；只记录来源/时长元数据，不转码） | 支持（`gateway.wechat.media.enabled` 时复制原文件到 `videos/`，并用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`send_segments` 的 video 段，路径同样受 `replies/` 与后缀白名单约束） | 支持（hook 后端 `send_media` kind=video；UIA 不支持） |
+| 语音 | 支持（`speech.enabled` 且 URL 下载由 `images.enabled` 门控时落盘 `voices/` 并转写，正文变 `[语音]（转写：…）`；依赖缺失、超时、解码失败保留 `[语音]` 占位） | 支持（`speech.enabled` 与 `gateway.wechat.media.enabled` 都打开时读取本地文件落盘并转写；否则占位） | 支持（`send_segments` 的 record 段，kind 为 `record`/`voice`） | 支持（hook 后端 `send_media` kind=voice；UIA 不支持） |
+| 视频 | 支持（`images.enabled` 时下载 URL 原文件到 `videos/`，`annotate` 为真时用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`gateway.wechat.media.enabled` 时复制原文件到 `videos/`，并用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`send_segments` 的 video 段，路径同样受 `replies/` 与后缀白名单约束） | 支持（hook 后端 `send_media` kind=video；UIA 不支持） |
 | 文件 | 只记录元数据（正文 `[文件] 名字`，记录名字/大小，不下载） | 占位（按 link/占位处理，不下载） | 支持（`upload_file`，模型附件 `kind=file`） | 支持（hook 后端 `send_media` kind=file；UIA 不支持） |
 | 表情 / 贴纸 | 占位但带标识（`face` → `[表情:<id>]`，`mface` → `[表情:<摘要>]`，缺失时回退 `[表情]`；同时记录 sticker 名字/id） | 占位但带标识（`[表情:<desc>]`，无名字用 `[表情:<md5 前 8>]`，解析失败回退 `[表情]`）；贴纸图片在 `gateway.wechat.media.enabled` 时按图片落盘，模型可 `read` 查看 | 支持（模型附件 `type=sticker`：纯数字 `name` 出 `face` 段，其它文本出 `mface` 摘要段） | 支持（hook 后端 `send_media` kind=sticker；UIA 不支持） |
 | @ | 支持（正文保留 `@名字`，并标记 `at_bot`） | 支持（正文保留原文，并标记 `at_bot`） | 支持（at 段；名字必须在本批次在场成员里，最多 3 个） | 支持（hook 后端 `send_at`；UIA 返回 `unsupported_at`，回落纯文本） |
@@ -58,7 +58,8 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
   - **无新增依赖**：AES 是仓库内纯 Python 实现（`media/aes.py`），不需要 `cryptography`/`Crypto`。
 - 微信/QQ 共用的图片目录按 `images.retention_days` 惰性清理：`> 0` 时在每次物化前删掉超期文件，`0` = 不清理。
 - 微信文件：只追加一条 `[文件] 名字 (路径)` 注记，不复制、不读取内容。
-- 语音不转写；视频不转码，但会在 `gateway.wechat.media.enabled` 时复制原文件并抽帧（见上）。不新增第三方依赖。
+- **语音转写**：`speech.enabled: true` 时，语音先落盘到 `<workspace.dir>/voices/` 再转写。SILK（QQ `record`）由 `pysilk` 解码成裸 PCM 再交给 ffmpeg；其它格式直接交给 ffmpeg；最后进本地 faster-whisper（默认 `base`、`int8`、`vad_filter=True`，可用 `initial_prompt` 引导简体）。转写失败只保留 `[语音]`，不影响同一条消息的其它段。`speech.enabled: false` 时完全不处理：不下载、不落盘、不改正文。
+- 视频不完整转码，只复制原文件并按固定百分比抽帧（见上）。转写依赖是可选的 `.[stt]` extra（faster-whisper + silk-python）；不装也能启动，只是语音保持占位。
 
 ### 相关配置键
 
@@ -66,3 +67,12 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 - `gateway.wechat.media.max_bytes`：解密后单张图片上限，默认 `10485760`（10 MiB）；视频不走这个键，固定上限 100 MiB。
 - `gateway.wechat.media.storage_root`：微信本地媒体根目录；空 = 自动探测。
 - `gateway.wechat.enabled`：微信通道总开关，默认 `false`。
+- `images.enabled`：QQ 图片落盘开关，同时门控 QQ 语音/视频的 URL 下载，默认 `true`。
+- `speech.enabled`：语音转写总开关，默认 `false`；关闭时语音完全不处理。
+- `speech.model`：faster-whisper 模型名或本地目录，默认 `base`。
+- `speech.language` / `speech.device` / `speech.compute_type` / `speech.beam_size`：转写参数，默认 `zh` / `cpu` / `int8` / `1`。
+- `speech.max_seconds`：超过这个时长的语音不转写（只记原文件路径），默认 `60`。
+- `speech.timeout_seconds`：单条语音下载/解码/转写总超时，默认 `90`。
+- `speech.max_bytes`：单条语音文件大小上限，默认 `20971520`（20 MiB）。
+- `speech.initial_prompt`：引导模型输出简体中文的提示；留空 = 不传。
+- `speech.hf_endpoint`：HuggingFace 镜像地址；国内直连 `huggingface.co` 会超时，建议填 `https://hf-mirror.com`。

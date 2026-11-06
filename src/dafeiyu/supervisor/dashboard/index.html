@@ -385,6 +385,13 @@
   }
   .decision-line { white-space: pre-wrap; word-break: break-word; }
   .decision-line b { color: var(--muted); font-weight: 600; margin-right: 6px; }
+  .decision-messages { display: grid; gap: 3px; }
+  .decision-msg {
+    display: flex; gap: 6px; align-items: baseline;
+    line-height: 1.45; word-break: break-word;
+  }
+  .decision-msg-who { flex: 0 0 auto; color: var(--muted); font-weight: 600; }
+  .decision-msg-text { min-width: 0; }
   .decision-attribution { color: var(--warn); }
   .debug-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
   .debug-form label { display: grid; gap: 4px; color: var(--muted); font-size: var(--fs-sm); }
@@ -2144,12 +2151,26 @@ function decisionLine(label, text) {
   return `<div class="decision-line"><b>${label}</b>${escapeHtml(text)}</div>`;
 }
 
+function decisionMessagesHtml(item) {
+  const messages = Array.isArray(item.messages) ? item.messages.slice(0, 20) : [];
+  const head = `<div class="decision-line"><b>当时看到</b></div>`;
+  if (!messages.length) return `${head}<div class="kv">（消息已清理）</div>`;
+  const rows = messages.map((message) => {
+    const msg = message || {};
+    const who = msg.is_bot ? "我" : String(msg.nickname || "未知");
+    const text = String(msg.content == null ? "" : msg.content);
+    return `<div class="decision-msg"><span class="decision-msg-who">${escapeHtml(who)}</span><span class="decision-msg-text">${escapeHtml(text)}</span></div>`;
+  });
+  return `${head}<div class="decision-messages">${rows.join("")}</div>`;
+}
+
 function decisionDetailHtml(item) {
   const parts = [
     decisionLine("读", item.read),
     decisionLine("想", item.think),
     decisionLine("理由", item.reason),
     item.outcome === "replied" ? decisionLine("回复", item.reply_preview) : "",
+    decisionMessagesHtml(item),
   ];
   const meta = [
     `消息 ${Number(item.message_count) || 0}`,
@@ -2357,10 +2378,20 @@ async function refreshBackups() {
       box.appendChild(emptyState("暂无备份"));
     }
     items.forEach((backup) => {
-      const meta = `${backup.created_at} · ${backup.reason} · ${fmtBytes(backup.size_bytes)} · schema v${backup.schema_version}`;
+      const meta =
+        `${backup.created_at} · ${backup.reason} · ${fmtBytes(backup.size_bytes)} · schema v${backup.schema_version}` +
+        (backup.workspace_filename ? " · 含工作区" : "");
       const item = memItem(meta, backup.filename);
       const actions = document.createElement("div");
       actions.className = "mem-actions";
+      if (backup.workspace_filename) {
+        const restoreWs = document.createElement("button");
+        restoreWs.className = "btn";
+        restoreWs.textContent = "恢复工作区";
+        restoreWs.title = backup.workspace_filename;
+        restoreWs.addEventListener("click", () => restoreWorkspaceBackup(backup));
+        actions.append(restoreWs);
+      }
       const remove = document.createElement("button");
       remove.className = "btn";
       remove.textContent = "删除";
@@ -2432,6 +2463,29 @@ async function deleteBackup(id, filename) {
     await refreshBackups();
   } catch (err) {
     toast(`删除失败：${err.message}`, true);
+  }
+}
+
+async function restoreWorkspaceBackup(backup) {
+  const name = backup.workspace_filename || "工作区快照";
+  if (
+    !confirm(
+      `把 ${name} 恢复成当前工作区？会先停 Bot、替换 workspace 目录再重启，当前工作区会保留为 .pre-restore-*。`
+    )
+  )
+    return;
+  try {
+    const data = await api(
+      `/api/backups/${encodeURIComponent(backup.id)}/restore-workspace`,
+      { method: "POST", body: JSON.stringify({ confirm: "RESTORE" }) }
+    );
+    const result = (data && data.result) || {};
+    toast(
+      `工作区已恢复：${result.restored_files || 0} 个文件 · ${fmtBytes(result.restored_bytes || 0)}`
+    );
+    await refreshBackups();
+  } catch (err) {
+    toast(`恢复工作区失败：${err.message}`, true);
   }
 }
 

@@ -342,6 +342,26 @@ def test_login_html_is_mobile_friendly() -> None:
     assert "font-size: 16px;" in login
 
 
+def test_html_decision_replay_renders_seen_messages() -> None:
+    """思考回放要展示「当时看到」：昵称/正文转义，bot 显示「我」，空则提示已清理。"""
+    html = read_html()
+    assert "当时看到" in html
+    assert "decision-messages" in html
+    assert "decision-msg-who" in html
+    assert "（消息已清理）" in html
+    assert "decisionMessagesHtml(item)" in html
+
+    match = re.search(
+        r"function decisionMessagesHtml\(item\) \{\n(.*?)\n\}", html, re.DOTALL
+    )
+    assert match is not None, "decisionMessagesHtml 必须仍是一段可直接断言的函数体"
+    body = match.group(1)
+    assert "msg.is_bot" in body
+    assert '"我"' in body
+    assert "escapeHtml(who)" in body
+    assert "escapeHtml(text)" in body
+
+
 async def test_dashboard_models_proxy_forwards_query_string(tmp_path: Path) -> None:
     seen: list[tuple[str, str, str]] = []
 

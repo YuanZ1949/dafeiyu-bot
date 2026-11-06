@@ -271,7 +271,10 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `memory.mind_chars` | `600` | 「正在聊的事 + 没有下文的事 + 你和他 + 本鱼的近况 + 群友印象」合计预算；超了按印象→未了事→关系卡→近况丢弃，最后截断正在聊的事 |
 | `memory.state_chars` | `100` | 「本鱼的近况」段落的字符预算 |
 | `memory.relation_chars` | `160` | 「你和他」关系卡段落的字符预算 |
-| `mind.enabled` | `false` | 心智层总闸；关闭即回到旧行为（Observer/自省/关系卡/状态注入全部不启用） |
+| `memory.stance_topk` | `3` | 「我的立场」最多注入几条（跨群共享，按 confidence 排序） |
+| `memory.stance_chars` | `160` | 「我的立场」段落的字符预算 |
+| `memory.atmosphere_enabled` | `false` | 把最近 10 分钟的消息量/人数/问句比例拼进「此刻」（一行，不参与接话判定） |
+| `mind.enabled` | `false` | 心智层总闸；关闭即回到旧行为（Observer/自省/关系卡/状态/立场注入全部不启用） |
 | `mind.state_enabled` | `true` | 总闸打开时是否注入 `bot_state`（在意的事 + 心情） |
 | `mind.episodes_enabled` | `true` | 总闸打开时是否启用 episode/open_loop 的观察与写入 |
 | `mind.observer_enabled` | `false` | 是否启用 Observer 旁路（需要能调模型） |
@@ -280,6 +283,9 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `mind.observer_min_messages` | `8` | 单群至少累积多少条新消息才观察一次 |
 | `mind.observer_daily_calls` | `24` | 单群每天「观察 + 自省」总调用上限，与回复预算分开 |
 | `mind.reflection_hour` | `5` | 每天几点之后跑夜间自省（0-23，上海时区） |
+| `mind.stances_enabled` | `true` | 总闸打开时是否注入「我的立场」（Reflector 每晚写入，同一话题覆盖旧观点） |
+| `mind.inbound_media_reactions` | `false` | 群里的语音/图片到达时先贴个表情回应（旁路，失败只记日志） |
+| `mind.inbound_media_reaction_cooldown_seconds` | `600` | 同一会话两次入站反应的最小间隔（秒） |
 | `behavior.chat_intensity` | `normal` | 聊天强度：`quiet` 只回点名、`normal` 当前行为、`active` 放开连续空转的降频闸门（话题收尾已不拦截，两档一致） |
 | `behavior.restriction_mode` | `off` | 言论限制：`off` 关闭、`soft` 只注入提示、`strict` 命中关键词的整条回复丢弃、`regenerate` 先让模型改写（每批最多 2 次），仍命中则删掉含禁句的整句 |
 | `behavior.banned_phrases` | `[]` | 禁词（关键词级子串匹配，非语义审核） |
@@ -301,6 +307,11 @@ Observer（`mind.observer_enabled`）默认关闭，打开它需要同时满足 
 `mind.episodes_enabled: true`，且当前大脑提供 `complete_detailed`（面板的 `effective`
 字段把这三个条件一起算进去）。成本按「`mind.observer_daily_calls` × 白名单群数」粗估；
 白名单为空时面板显示「群白名单为空，暂不估算」，不会把 0 当成免费。
+
+Reflector（夜间自省，`mind.reflection_hour` 之后每个活跃群一次）在 `mind.enabled: true`
+时运行，产物是 `bot_state`（在意的事/心情）、跨群 `bot_stances`（话题 → 观点，同一话题
+覆盖）、该群笔记的 lessons 和全局 `MEMORY.md` 的 life。「我的立场」只在总闸打开时注入，
+关掉只停止注入，已写入的立场保留；`/forget` 清空当前会话不影响全局立场。
 
 各通道支持哪些消息类型、失败时怎么降级，以及附件的路径/大小/后缀边界，见
 [docs/message-types.md](docs/message-types.md)。
@@ -550,8 +561,11 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 - 话题收尾窗口只做提示，不再拦截：窗口内的非点名消息照样进批次送模型，接不接由模型输出的 `speak` 决定（原来只有 5% 抽样放行，贴封条时还会被整段吞掉）
 - 被规则跳过的消息不会丢：下次接话时会把这些漏掉的消息按 `[时:分] 昵称：内容` 的时间线一起交给模型
 - 时间线会标出群友之间的「（回复 谁）」，模型能看出这句话在接谁
-- 支持的消息段：文字、@、图片、表情/商城表情、语音、视频、文件、分享、位置、名片、音乐、骰子/猜拳、Markdown、合并转发、小程序/网页卡片；语音与文件本体不做识别，只保留可读占位与文件名；视频在 `gateway.wechat.media.enabled` 时会落盘原文件并抽 4 帧，供模型 `read` 看画面（详见 `docs/message-types.md`）
+- 支持的消息段：文字、@、图片、表情/商城表情、语音、视频、文件、分享、位置、名片、音乐、骰子/猜拳、Markdown、合并转发、小程序/网页卡片；文件本体不做识别，只保留可读占位与文件名
+- 语音：打开 `speech.enabled` 后，QQ 语音（`record`）和微信语音（`voice`）会先落盘再转写，正文替换成「[语音] 转写：…」；SILK 由 `pysilk` 解码，其余交给 ffmpeg，再进本地 faster-whisper。模型/依赖缺失、超时或解码失败都保持 `[语音]` 占位，不影响其它消息
+- 视频：QQ 与微信在各自媒体开关打开时都会下载原文件并抽 4 帧，供模型 `read` 看画面（详见 `docs/message-types.md`）
 - 图片会落到 `data/bot-workspace/images/` 并把路径写进 prompt；模型有 `read` 时会被告知**先读最近一张图再回答**，动图按首帧理解。模型没有视觉/工具时只保留 `[图片]` 占位
+- 打开 `mind.inbound_media_reactions` 后，群里的语音/图片到达时会先贴一个表情回应（同一会话按冷却秒数节流，失败只记日志）
 - 模型调用失败时保持安静，不再往群里发「本鱼断线了」；失败照常计入日志与错误统计
 - `/闭嘴`（或 `/shutup`）—— 本群静音 60 分钟（仅 `groups.admins` 可用）
 - `/醒来`（或 `/wake`）—— 解除静音（仅 `groups.admins` 可用）
@@ -686,6 +700,14 @@ pre-restore 备份回滚并写审计；回滚失败会留下 pre-restore 文件�
 `backup.restore` 记录处理。**恢复只覆盖 `data/dafeiyu.db`，不恢复 OpenCode 自己的数据库**
 （`data/opencode-bot.db`），也不恢复 `.env`、NapCat 票据和人设文件。
 
+**工作区恢复（R18）**：备份时如果 `workspace.dir` 存在，会额外打包一份
+`<备份名>-workspace.zip` 并在 manifest 里记 `workspace_filename` / `workspace_sha256`。
+面板备份项出现「恢复工作区」按钮（同样要求 `RESTORE` 确认）时，会先停 bot → 校验 SHA256
+与 zip 成员（拒绝绝对路径、`..`、符号链接、超过 20000 个文件或解压后 >512 MiB）→ 解压到
+同级临时目录 → 目录交换（旧目录保留为 `<name>.pre-restore-<时间>`）→ 重启并做健康检查；
+启动失败会把工作区换回恢复前的目录。工作区打包有同样的文件数/大小上限，超限时本次只备份
+数据库（不会让整次备份失败）。审计动作为 `backup.restore_workspace`。
+
 **安全与口令**：控制口令由 supervisor 首次启动生成到 `data/supervisor.token`，并尽量收紧为
 仅当前用户可读写；加固失败只写 warning。bot 与 supervisor 通过 `X-Control-Token` 校验，
 dashboard 每次请求动态读取当前口令。轮换必须输入 `ROTATE`；成功后更新 bot 环境变量、
@@ -725,6 +747,14 @@ bot 与 supervisor 会写同一文件，写入和轮转通过 `.audit.jsonl.lock
 ```
 
 全部用例不联网、不需要真实 QQ 账号：HTTP 用 `respx` 模拟，OneBot 事件用本地 fixture，WS 适配器起真实本地端口对打。
+
+### 评测
+黄金集在 `data/evals/golden_replies.json`，人工标注每段群聊现场应 `speak` 还是 `silent`。
+```powershell
+.venv\Scripts\python scripts/eval_golden.py --mode offline   # 只校验数据集，不联网、不调模型
+.venv\Scripts\python scripts/eval_golden.py --mode live      # 调 config.yaml 的模型，需 API Key 或本地模型
+```
+offline 数据集非法时退出码 2；live 单条失败/超时记为 skipped，不影响整体退出码。
 
 ## 7. 常见故障
 
