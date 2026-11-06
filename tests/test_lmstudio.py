@@ -17,6 +17,19 @@ def cfg(**overrides) -> LocalModelConfig:
     return LocalModelConfig(**base)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_kill(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """默认把「结束进程」换成本地替身，测试绝不碰真实 LM Studio。"""
+    calls: list[bool] = []
+
+    def fake_kill() -> bool:
+        calls.append(True)
+        return True
+
+    monkeypatch.setattr(lmstudio, "kill_app_processes", fake_kill)
+    return calls
+
+
 async def test_already_running_without_model_does_not_spawn() -> None:
     calls: list[list[str]] = []
 
@@ -113,7 +126,7 @@ async def test_autostart_can_be_disabled() -> None:
 
 
 async def test_stop_skips_when_endpoint_is_down() -> None:
-    """端点本来就不可用 = 没有遗留进程，不该再调 lms。"""
+    """端点本来就不可用 = 不用再调 lms；但驻留的 App 壳仍要清掉。"""
     calls: list[list[str]] = []
 
     async def probe(_url: str) -> bool:
@@ -121,7 +134,7 @@ async def test_stop_skips_when_endpoint_is_down() -> None:
 
     result = await stop_server(cfg(), probe_fn=probe, stop_fn=calls.append)
 
-    assert result == EnsureResult(ready=False, started=False, detail="未在运行")
+    assert result == EnsureResult(ready=False, started=True, detail="已结束残留进程")
     assert calls == []
 
 
@@ -136,8 +149,45 @@ async def test_stop_calls_lms_when_endpoint_is_up(
 
     result = await stop_server(cfg(), probe_fn=probe, stop_fn=calls.append)
 
-    assert result == EnsureResult(ready=False, started=True, detail="已停止")
+    assert result == EnsureResult(ready=False, started=True, detail="已停止并结束进程")
     assert calls == [["lms.exe", "server", "stop"]]
+
+
+async def test_stop_keeps_app_when_flag_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """显式关掉 stop_when_unused 就只停服务，不动 GUI 进程。"""
+    monkeypatch.setattr(lmstudio, "find_lms", lambda _explicit="": "lms.exe")
+    lms_calls: list[list[str]] = []
+
+    async def probe(_url: str) -> bool:
+        return True
+
+    result = await stop_server(
+        cfg(stop_when_unused=False), probe_fn=probe, stop_fn=lms_calls.append
+    )
+
+    assert result == EnsureResult(ready=False, started=True, detail="已停止")
+    assert lms_calls == [["lms.exe", "server", "stop"]]
+
+
+async def test_stop_reports_when_kill_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """taskkill 被拒也不能影响切档：只回报「服务已停」。"""
+    monkeypatch.setattr(lmstudio, "find_lms", lambda _explicit="": "lms.exe")
+
+    async def probe(_url: str) -> bool:
+        return True
+
+    result = await stop_server(
+        cfg(),
+        probe_fn=probe,
+        stop_fn=lambda _args: None,
+        kill_fn=lambda: False,
+    )
+
+    assert result == EnsureResult(ready=False, started=True, detail="已停止")
 
 
 async def test_stop_without_lms_cli_only_warns(

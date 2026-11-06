@@ -3,8 +3,10 @@
 LM Studio 的 OpenAI 端点是 1234；server 没起时 bot 只会在第一次请求失败，
 表现成「她突然不理人」。这里先探活，再调 lms CLI 起服务，最后后台加载模型。
 不用本地模型时端点会一直占着显存/内存，所以切走（或启动时发现当前档位不是
-本地模型）再调 lms CLI 停服务。所有外部动作都可注入，测试不需要真的
-启动/停止 LM Studio。
+本地模型）再调 lms CLI 停服务；``stop_when_unused`` 打开时还会把 LM Studio
+主程序一起结束——``lms server stop`` 只停服务，App 壳仍会驻留几百 MB。
+
+所有外部动作都可注入，测试不需要真的启动/停止 LM Studio。
 """
 
 from __future__ import annotations
@@ -59,15 +61,20 @@ async def probe(base_url: str, *, timeout: float = 1.5) -> bool:
 
 
 def _spawn_detached(args: list[str]) -> None:
-    kwargs: dict[str, object] = {}
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return
     subprocess.Popen(
         args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         close_fds=True,
-        **kwargs,
     )
 
 
@@ -92,35 +99,86 @@ def _run_lms_stop(args: list[str], *, timeout: float = 15.0) -> None:
         )
 
 
+LMSTUDIO_IMAGE = "LM Studio.exe"
+
+
+def kill_app_processes(*, timeout: float = 15.0) -> bool:
+    """结束 LM Studio 主程序（含子进程）。
+
+    ``lms server stop`` 只停 HTTP 服务，Electron 壳仍驻留（实测约 300MB）。
+    只在 Windows 用 taskkill；未找到进程时它返回 128，按「本来没开」处理。
+    退出码 0 = 确实结束了进程，供调用点区分「关了」和「本来就没有」。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        result = subprocess.run(
+            ["taskkill", "/IM", LMSTUDIO_IMAGE, "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("结束 LM Studio 进程失败：%s", exc)
+        return False
+    return result.returncode == 0
+
+
 async def stop_server(
     cfg: LocalModelConfig,
     *,
     probe_fn: Callable[[str], Awaitable[bool]] | None = None,
     stop_fn: Callable[[list[str]], None] | None = None,
+    kill_fn: Callable[[], bool] | None = None,
 ) -> EnsureResult:
-    """端点在线时用 lms CLI 停掉 LM Studio；失败只记日志，不抛异常。
+    """端点在线时停掉 LM Studio；``stop_when_unused`` 时连主程序一起结束。
 
-    先探活：端点本来就不可用，说明没有遗留进程，直接返回，避免白调一次 CLI。
-    停止动作放在线程里跑（subprocess 带 15s 超时），不会阻塞切换的事件循环。
+    先探活：端点不可用就不必再调 ``lms server stop``（但仍要清掉可能驻留的
+    App 壳，见下）。停止/结束进程都放在线程里跑，不会阻塞事件循环。
     """
     check = probe_fn or probe
-    if not await check(cfg.base_url):
-        return EnsureResult(ready=False, started=False, detail="未在运行")
+    running = await check(cfg.base_url)
+    stopped = False
+    detail = "未在运行"
 
-    exe = find_lms(cfg.lms_path)
-    if not exe:
-        log.warning("LM Studio 仍在运行，但找不到 lms CLI，无法自动停止")
-        return EnsureResult(ready=True, started=False, detail="找不到 lms CLI")
+    if running:
+        exe = find_lms(cfg.lms_path)
+        if not exe:
+            log.warning("LM Studio 仍在运行，但找不到 lms CLI，无法自动停止")
+            return EnsureResult(ready=True, started=False, detail="找不到 lms CLI")
 
-    stop = stop_fn or _run_lms_stop
+        stop = stop_fn or _run_lms_stop
+        try:
+            await asyncio.to_thread(stop, [exe, "server", "stop"])
+        except Exception as exc:  # noqa: BLE001 - 停止失败只降级
+            log.warning("停止 LM Studio server 失败：%s", exc)
+            return EnsureResult(ready=True, started=False, detail=f"停止失败：{exc}")
+
+        log.info("已停止 LM Studio server：%s", cfg.base_url)
+        stopped = True
+        detail = "已停止"
+
+    if not cfg.stop_when_unused:
+        return EnsureResult(ready=not stopped and running, started=stopped, detail=detail)
+
+    # `lms server stop` 只停 HTTP 服务，GUI 壳还占着几百 MB：一并结束。
+    kill = kill_fn or kill_app_processes
     try:
-        await asyncio.to_thread(stop, [exe, "server", "stop"])
-    except Exception as exc:  # noqa: BLE001 - 停止失败只降级
-        log.warning("停止 LM Studio server 失败：%s", exc)
-        return EnsureResult(ready=True, started=False, detail=f"停止失败：{exc}")
+        killed = await asyncio.to_thread(kill)
+    except Exception as exc:  # noqa: BLE001 - 结束进程失败只降级
+        log.warning("结束 LM Studio 进程失败：%s", exc)
+        killed = False
 
-    log.info("已停止 LM Studio server：%s", cfg.base_url)
-    return EnsureResult(ready=False, started=True, detail="已停止")
+    if not killed:
+        return EnsureResult(ready=False, started=stopped, detail=detail)
+
+    log.info("已结束 LM Studio 进程")
+    return EnsureResult(
+        ready=False,
+        started=True,
+        detail="已停止并结束进程" if stopped else "已结束残留进程",
+    )
 
 
 async def ensure_server(
