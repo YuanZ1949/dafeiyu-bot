@@ -40,6 +40,7 @@ import sys
 import threading
 import time
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -434,7 +435,29 @@ async def run(
     args = parser.parse_args(list(argv) if argv is not None else [])
     if settings is None:
         settings = load_settings(Path(args.env_file), Path(args.config))
-    wechat = settings.wechat
+    # persona 里的名字也是 bot 的身份：群昵称/别名与 @ 判定保持一致，
+    # 否则「@小菜鱼」会被当成 @ 别人、引用回复 bot 也漏判。
+    # 旧调用方/测试的 settings 可能没有 persona：缺省时不额外合并。
+    persona = getattr(settings, "persona", None)
+    persona_names: tuple[str, ...] = ()
+    if persona is not None:
+        persona_names = tuple(
+            dict.fromkeys(
+                (
+                    str(getattr(persona, "name", "") or ""),
+                    *(str(alias) for alias in getattr(persona, "aliases", ()) or ()),
+                )
+            )
+        )
+    merged_names = tuple(
+        dict.fromkeys(
+            (
+                *getattr(settings.wechat, "self_nicknames", ()),
+                *(name for name in persona_names if name),
+            )
+        )
+    )
+    wechat = replace(settings.wechat, self_nicknames=merged_names)
     _startup_checks(wechat)
 
     # 驱动门面只在函数体内加载（pyweixin 保持惰性）。
@@ -829,10 +852,20 @@ def _default_driver_factory() -> Any:
 
 def _default_poller_factory(wechat: WeChatConfig, driver: Any) -> Any:
     """默认轮询循环：`PollingLoop` 的 import 也留在函数体内，保持入口轻量。"""
+    from ...hotconfig import WeChatRuntime
     from .panel import PanelGroups, PanelRuntime
     from .poller import DEFAULT_ALIGN_STATE, PollingLoop
 
     localdb = _build_localdb_source(wechat)
+    # 覆盖层缺 `wechat:` 段（或没有覆盖层）时必须回落到 `config.yaml` 的值；
+    # 否则 `PanelRuntime` 的全默认 `WeChatRuntime()`（private_enabled=False）
+    # 会把配置里显式打开的私聊整体关掉。
+    startup = WeChatRuntime(
+        private_enabled=bool(getattr(wechat, "private_enabled", False)),
+        private_reply=bool(getattr(wechat, "private_reply", False)),
+        private_allow=frozenset(getattr(wechat, "private_allow", None) or ()),
+        private_deny=frozenset(getattr(wechat, "private_deny", None) or ()),
+    )
     # 范围以面板白名单为准（热加载，面板改完一个轮询间隔内生效）。
     return PollingLoop(
         wechat,
@@ -840,12 +873,12 @@ def _default_poller_factory(wechat: WeChatConfig, driver: Any) -> Any:
         localdb=localdb,
         panel=PanelGroups().whitelist,
         # 私聊运行时开关（private_enabled/reply/allow/deny）同样经面板覆盖层
-        # 热加载；`private_enabled` 参数保留为启动默认值（热读失败时的 fallback）。
-        runtime=PanelRuntime().wechat,
+        # 热加载；覆盖层没写的键回落到上面的启动配置值。
+        runtime=PanelRuntime(defaults=startup).wechat,
         # 对齐窗口落盘：桥崩溃重启后把停机期间的新消息补出来。
         align_state_path=DEFAULT_ALIGN_STATE,
-        # 微信私聊入站：默认关闭，只有显式打开才枚举/轮询好友会话。
-        private_enabled=bool(getattr(wechat, "private_enabled", False)),
+        # 启动默认值：热开关读不出来时 `PollingLoop` 用它兜底。
+        private_enabled=startup.private_enabled,
     )
 
 

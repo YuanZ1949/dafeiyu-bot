@@ -78,14 +78,18 @@ class PanelRuntime:
     """面板私聊运行时开关（覆盖层 ``wechat:`` 段）的只读缓存。
 
     `wechat()` 返回 :class:`WeChatRuntime`；``None`` = 覆盖层存在但从未成功
-    解析（调用方按 fail-safe 用启动默认值）。文件不存在 = 面板没改过 =
-    返回全默认的 :class:`WeChatRuntime`。值与 mtime 缓存由
-    :class:`~dafeiyu.hotconfig.WeChatRuntimeView` 负责。
+    解析（调用方按 fail-safe 用启动默认值）。文件不存在 / 覆盖层没有
+    ``wechat:`` 段 = 面板没改过 = 返回 ``defaults``（启动时从 `config.yaml`
+    读到的值）；省略 ``defaults`` 时沿用 :class:`WeChatRuntime` 的字段默认。
+    值与 mtime 缓存由 :class:`~dafeiyu.hotconfig.WeChatRuntimeView` 负责。
     """
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(
+        self, path: Path | None = None, defaults: WeChatRuntime | None = None
+    ) -> None:
         self.path = Path(path) if path is not None else DEFAULT_PATH
-        self._view = WeChatRuntimeView(WeChatRuntime(), self.path)
+        self.defaults = defaults if defaults is not None else WeChatRuntime()
+        self._view = WeChatRuntimeView(self.defaults, self.path)
 
     def wechat(self) -> WeChatRuntime | None:
         result = self._view.current()

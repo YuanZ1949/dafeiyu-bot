@@ -63,6 +63,8 @@ from ...hotconfig import WeChatRuntime
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "BACKFILL_LIMIT",
+    "INBOUND_LOCALDB_REASON",
     "KILL_SWITCH_REASON",
     "MAX_AWAIT",
     "PollingLoop",
@@ -79,23 +81,50 @@ def _alias_of(chat_id: str) -> str | None:
     return alias or None
 
 
-def _accepts_user_alias(factory: Callable[..., Any]) -> bool:
-    """工厂签名是否接 ``user_alias``：旧测试替身没有这个参数，不能硬塞。"""
+def _accepts_kwarg(factory: Callable[..., Any], name: str) -> bool:
+    """工厂签名是否接某个关键字参数：旧测试替身没有就不硬塞。"""
     try:
         signature = inspect.signature(factory)
     except (TypeError, ValueError):
         return False
     return any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        or parameter.name == "user_alias"
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == name
         for parameter in signature.parameters.values()
     )
+
+
+def _accepts_user_alias(factory: Callable[..., Any]) -> bool:
+    """工厂签名是否接 ``user_alias``。"""
+    return _accepts_kwarg(factory, "user_alias")
+
+
+def _snapshot_call(
+    source: Any, group: str, limit: int | None
+) -> dict[str, Any] | None:
+    """调本地库快照；``limit`` 只在补读时给，旧替身没有这个参数就按原样调。"""
+    snapshot = getattr(source, "snapshot", None)
+    if not callable(snapshot):
+        return None
+    call = cast(Callable[..., Any], snapshot)
+    result = (
+        call(group, limit=limit)
+        if limit is not None and _accepts_kwarg(call, "limit")
+        else call(group)
+    )
+    return result if isinstance(result, dict) else None
 
 #: 反挂死护栏：本模块的每一个 await 都不超过这个秒数（与 PART A 一致）。
 MAX_AWAIT = 5.0
 
 #: 杀开关健康帧的稳定 reason 片段。
 KILL_SWITCH_REASON = "kill_switch"
+
+#: hook 模式下入站读不到本地库时的稳定 reason 片段（面板显示「已连接（降级）」）。
+INBOUND_LOCALDB_REASON = "inbound_localdb_unavailable"
+
+#: 本地库恢复后一次补读的上限（条）。断档期间的消息都在库里，读宽一点才能和
+#: 上一窗口接上；超过这个量说明缺口太大，按 resync 处理，不无限回灌。
+BACKFILL_LIMIT = 200
 
 #: 默认的杀开关相对路径（与 `WeChatConfig.kill_switch_file` 默认值一致）。
 DEFAULT_KILL_SWITCH = "data/wechat.stop"
@@ -376,6 +405,17 @@ class PollingLoop:
         self._probe = probe if probe is not None else _default_probe(wechat)
         self._clock = clock
         self._aligner_factory = aligner_factory
+        # 出站后端决定入站能不能碰桌面：`hook` 完全不依赖 UIA，回落
+        # `open_chat`/`snapshot` 只会调 `Navigator.open_weixin()`（restore +
+        # 置顶 + 居中）把微信窗口拽到前台，用户明确要的是「不打扰」。
+        # 因此 hook 模式下本地库不可用时整轮跳过，绝不回落 UIA；
+        # `uia`/`auto`（auto 可能真的回落到 UIA 发送）保持原行为。
+        raw_outbound = str(getattr(wechat, "outbound", "uia") or "uia").strip()
+        self.outbound = raw_outbound.lower() or "uia"
+        self._allow_uia_fallback = self.outbound != "hook"
+        self._uia_skip_warned = False
+        # 断档期间跳过/读失败的会话：恢复后要用宽窗补读一次，把漏掉的消息补上。
+        self._backfill_groups: set[str] = set()
 
         raw_poll = poll_seconds
         if raw_poll is None:
@@ -394,6 +434,13 @@ class PollingLoop:
         self._skip_scan_until = 0.0
         account_nickname = str(getattr(wechat, "account_nickname", "") or "")
         self._account_nickname = account_nickname
+        # 群昵称/别名：@ 与引用回复判定都用这一组，不再只认账号昵称。
+        raw_self = getattr(wechat, "self_nicknames", ()) or ()
+        self._self_nicknames = tuple(
+            dict.fromkeys(
+                str(item).strip() for item in raw_self if str(item).strip()
+            )
+        )
 
         raw_kill = (
             kill_switch_path
@@ -452,6 +499,9 @@ class PollingLoop:
         # 恢复后第一轮必须全量：急停期间可能积压了消息，红点也可能已被清掉。
         self._last_full_sweep = 0.0
         self._skip_scan_until = 0.0
+        if not self._allow_uia_fallback:
+            # hook 停机期间没有轮询：恢复后按会话宽窗补读，别把积压消息漏掉。
+            self._backfill_groups.update(self._scope())
         return True
 
     # ------------------------------------------------------------- 发送
@@ -517,6 +567,12 @@ class PollingLoop:
         scope = self._scope()
         if self._uses_localdb():
             return scope
+        if not self._allow_uia_fallback:
+            # hook 模式：宁可这一轮什么都不读，也不去碰微信窗口。
+            # 同时记下这些会话：本地库恢复后要宽窗补读，断档期间的消息不能丢。
+            self._backfill_groups.update(scope)
+            self._warn_uia_skip_once("本地库尚未就绪")
+            return ()
         if not self.unread_gate:
             return scope
 
@@ -556,6 +612,17 @@ class PollingLoop:
             # 未读都在范围外：别每个 tick 都去翻会话列表，等下一轮全量兜底。
             self._skip_scan_until = now + self.full_sweep_seconds
         return targets
+
+    def _warn_uia_skip_once(self, reason: str) -> None:
+        """hook 模式跳过 UIA 回落时只告警一次，避免每个 tick 刷屏。"""
+        if self._uia_skip_warned:
+            return
+        self._uia_skip_warned = True
+        logger.warning(
+            "outbound=hook：%s，本轮跳过（不回落 UIA，避免把微信窗口拉到前台）；"
+            "本地库就绪后自动恢复",
+            reason,
+        )
 
     # ------------------------------------------------------- 轮询/发送范围
     def _panel_whitelist(self) -> frozenset[str] | None:
@@ -829,8 +896,23 @@ class PollingLoop:
             self._save_align_state()
 
     async def _poll_group(self, group: str) -> list[dict[str, Any]]:
-        entries = await self._localdb_entries(group) if self._uses_localdb() else None
+        uses_localdb = self._uses_localdb()
+        # 上一轮因为本地库不可用而跳过/读失败：这次读宽一点，把断档期间的消息补上。
+        wide = uses_localdb and group in self._backfill_groups
+        entries = (
+            await self._localdb_entries(
+                group, limit=BACKFILL_LIMIT if wide else None
+            )
+            if uses_localdb
+            else None
+        )
         if entries is None:
+            if not self._allow_uia_fallback:
+                # hook：开窗只为读消息是不必要的（还会把微信拉到前台），
+                # 读不到就跳过这一轮，下一轮本地库恢复后宽窗补读。
+                self._backfill_groups.add(group)
+                self._warn_uia_skip_once(f"会话 {group!r} 的本地库快照不可用")
+                return []
             handle = await self._ui_call(self.driver.open_chat, group)
             snapshot = await self._ui_call(self.driver.snapshot, handle)
             entries = snapshot.get("messages") if isinstance(snapshot, dict) else []
@@ -838,7 +920,12 @@ class PollingLoop:
         aligner = self._aligner(group, kind)
         if aligner is None:
             return []
-        result = aligner.poll(entries or [])
+        poll = aligner.poll
+        if wide and _accepts_kwarg(poll, "wide"):
+            result = poll(entries or [], wide=True)
+        else:
+            result = poll(entries or [])
+        self._backfill_groups.discard(group)
         self._remember_align_window(group, aligner)
         frames = list(result.messages)
         if result.resync is not None:
@@ -856,23 +943,26 @@ class PollingLoop:
             logger.debug("本地库状态检查失败：%s", exc)
             return False
 
-    async def _localdb_entries(self, group: str) -> list[Any] | None:
-        """后台线程取本地库快照；None = 本轮不可用，调用方回落 UIA。"""
+    async def _localdb_entries(
+        self, group: str, *, limit: int | None = None
+    ) -> list[Any] | None:
+        """后台线程取本地库快照；None = 本轮不可用，调用方决定是否回落 UIA。"""
         source = self.localdb
         if source is None:
             return None
+        fallback = "本轮回落 UIA" if self._allow_uia_fallback else "本轮跳过（不回落 UIA）"
         try:
             snapshot = await asyncio.wait_for(
-                asyncio.to_thread(source.snapshot, group), MAX_AWAIT
+                asyncio.to_thread(_snapshot_call, source, group, limit), MAX_AWAIT
             )
         except asyncio.CancelledError:
             raise
         except TimeoutError:
             # 首次建库可能在扫进程内存；线程还在跑，下一轮就绪后自动接管。
-            logger.warning("本地库快照超时（%r），本轮回落 UIA", group)
+            logger.warning("本地库快照超时（%r），%s", group, fallback)
             return None
         except Exception as exc:  # noqa: BLE001 - 任何异常都只降级，不打断轮询
-            logger.warning("本地库快照失败（%r），本轮回落 UIA：%s", group, exc)
+            logger.warning("本地库快照失败（%r），%s：%s", group, fallback, exc)
             return None
         if not isinstance(snapshot, dict):
             return None
@@ -904,6 +994,10 @@ class PollingLoop:
                 return chat_id
 
             aligner_kwargs["user_alias"] = stable_alias
+        if self._self_nicknames and _accepts_kwarg(
+            self._aligner_factory, "self_nicknames"
+        ):
+            aligner_kwargs["self_nicknames"] = self._self_nicknames
         aligner = self._aligner_factory(chat_id, group, **aligner_kwargs)
         # 旧替身没有 seed：跳过续跑，退回「第一轮只建基线」的语义。
         seed = getattr(aligner, "seed", None)
@@ -991,6 +1085,14 @@ class PollingLoop:
         out.setdefault("v", 1)
         out["type"] = "health"
         out["connected"] = bool(connected)
+        if not self._allow_uia_fallback and not self._uses_localdb():
+            # hook 模式没有 UIA 兜底：本地库不可用就意味着这一轮读不到消息。
+            # 标成降级让面板/告警看得见，而不是只在日志里留一句。
+            out["degraded"] = True
+            reasons = [part for part in str(out.get("reason") or "").split(";") if part]
+            if INBOUND_LOCALDB_REASON not in reasons:
+                reasons.append(INBOUND_LOCALDB_REASON)
+            out["reason"] = ";".join(reasons)
         return out
 
     async def _kill_switch_frame(self) -> dict[str, Any]:

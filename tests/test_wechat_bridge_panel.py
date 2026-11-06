@@ -16,8 +16,12 @@ import pytest
 
 import dafeiyu.gateway.wechat_bridge.__main__ as bridge_main
 from dafeiyu.config import WeChatConfig
-from dafeiyu.gateway.wechat_bridge.panel import PanelGroups
+from dafeiyu.gateway.wechat_bridge import identity as bridge_identity
+from dafeiyu.gateway.wechat_bridge import panel as bridge_panel
+from dafeiyu.gateway.wechat_bridge import poller as bridge_poller
+from dafeiyu.gateway.wechat_bridge.panel import PanelGroups, PanelRuntime
 from dafeiyu.gateway.wechat_bridge.poller import PollingLoop
+from dafeiyu.hotconfig import WeChatRuntime
 
 ALLOWED = "老友群"
 
@@ -368,3 +372,74 @@ def test_group_outbound_unaffected_by_private_switch() -> None:
 
     assert loop._scope() == ("老友群",)
     assert loop.allows_chat("wxg:g1") is True
+
+
+# ------------------------------------------- 私聊热开关的启动默认值（config.yaml）
+STARTUP = WeChatRuntime(
+    private_enabled=True,
+    private_reply=True,
+    private_allow=frozenset({"wxg:boot"}),
+)
+
+
+def test_panel_runtime_missing_file_returns_startup_defaults(tmp_path: Path) -> None:
+    path = tmp_path / "settings.local.yaml"
+
+    assert PanelRuntime(path, defaults=STARTUP).wechat() == STARTUP
+
+
+def test_panel_runtime_overlay_without_wechat_section_keeps_config_values(
+    tmp_path: Path,
+) -> None:
+    """回归：`settings.local.yaml` 只有 `brain:` 时不能把私聊配置抹成全 False。"""
+    path = tmp_path / "settings.local.yaml"
+    path.write_text("brain:\n  mode: key\n", encoding="utf-8")
+
+    assert PanelRuntime(path, defaults=STARTUP).wechat() == STARTUP
+
+
+def test_panel_runtime_overlay_wechat_section_overrides_only_written_keys(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "settings.local.yaml"
+    path.write_text("wechat:\n  private_reply: false\n", encoding="utf-8")
+
+    current = PanelRuntime(path, defaults=STARTUP).wechat()
+
+    assert current is not None
+    assert current.private_enabled is True
+    assert current.private_reply is False
+    assert current.private_allow == STARTUP.private_allow
+
+
+def test_panel_runtime_broken_overlay_without_defaults_is_still_none(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "settings.local.yaml"
+    path.write_text("wechat: [", encoding="utf-8")
+
+    assert PanelRuntime(path).wechat() is None
+
+
+def test_default_poller_factory_keeps_private_enabled_from_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """接线回归：覆盖层没有 `wechat:` 段时，轮询范围仍要包含配置里开启的好友。"""
+    overlay = tmp_path / "settings.local.yaml"
+    overlay.write_text("brain:\n  mode: key\n", encoding="utf-8")
+    localdb = _FriendLocalDb(["老友群"], [FRIEND])
+
+    monkeypatch.setattr(bridge_panel, "DEFAULT_PATH", overlay)
+    monkeypatch.setattr(
+        bridge_main, "_build_localdb_source", lambda wechat: localdb
+    )
+    monkeypatch.setattr(
+        bridge_poller, "DEFAULT_ALIGN_STATE", str(tmp_path / "align-state.json")
+    )
+    monkeypatch.setattr(bridge_identity, "PeerRegistry", lambda: _Peers({}))
+
+    loop = bridge_main._default_poller_factory(
+        _wechat(private_enabled=True), _Driver()
+    )
+
+    assert loop._scope() == (FRIEND, "老友群")

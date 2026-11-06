@@ -105,6 +105,8 @@ class WeChatAdapter:
         # 只公开快照需要的状态，不保留消息正文。
         self.logged_in = False
         self.degraded = False
+        # 桥侧给的降级原因（如 hook 模式本地库不可用）；空串 = 没有原因。
+        self.health_reason = ""
         self.queue_depth = 0
         self.wechat_version: str | None = None
         self.language: str | None = None
@@ -537,10 +539,16 @@ class WeChatAdapter:
             content=content,
             message_id=message_id,
             at_bot=bool(envelope.get("at_bot", False)),
+            at_all=bool(envelope.get("at_all", False)),
             reply_to_bot=bool(envelope.get("reply_to_bot", False)),
             reply_to_text=(
                 str(envelope["reply_to_text"])
                 if envelope.get("reply_to_text") is not None
+                else None
+            ),
+            reply_to_author=(
+                str(envelope["reply_to_author"])
+                if envelope.get("reply_to_author") is not None
                 else None
             ),
             timestamp=_int(envelope.get("ts")),
@@ -571,6 +579,7 @@ class WeChatAdapter:
         desktop = str(envelope.get("desktop") or "no_wechat")
         self._desktop = desktop if desktop in _DESKTOPS else "no_wechat"
         self.degraded = bool(envelope.get("degraded", False))
+        self.health_reason = str(envelope.get("reason") or "")
         self.queue_depth = _int(envelope.get("queue_depth"))
         version = envelope.get("wechat_version")
         self.wechat_version = str(version) if version is not None else None
