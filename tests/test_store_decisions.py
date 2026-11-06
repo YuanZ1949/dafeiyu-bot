@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from dafeiyu.memory.store import Store
-from dafeiyu.models import ChatType
+from dafeiyu.models import ChatType, Message
 
 
 def make_store(tmp_path: Path) -> Store:
@@ -90,6 +90,56 @@ def test_list_parses_bad_json_as_empty(tmp_path: Path) -> None:
 
     assert item["detail"] == {}
     assert item["message_ids"] == []
+    assert item["messages"] == []
+
+
+def test_list_decisions_attaches_seen_messages_in_order(tmp_path: Path) -> None:
+    """思考回放：按 message_ids 原顺序带出消息，缺 ID 跳过，bot 标记保留。"""
+    store = make_store(tmp_path)
+    now = int(time.time())
+    for message_id, nickname, content, is_bot in (
+        ("m1", "阿猫", "今晚吃啥", False),
+        ("m2", "小北", "火锅吧", False),
+        ("m3", "大肥鱼", "我投火锅一票", True),
+    ):
+        assert store.add_message(
+            Message(
+                chat_type=ChatType.GROUP,
+                chat_id="qq:1001",
+                user_id=f"u-{nickname}",
+                nickname=nickname,
+                content=content,
+                message_id=message_id,
+                is_bot=is_bot,
+                timestamp=now,
+            )
+        )
+    # 同 message_id 在别的会话里不能串进来。
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id="qq:2002",
+            user_id="u-other",
+            nickname="路人",
+            content="别的群",
+            message_id="m1",
+            timestamp=now,
+        )
+    )
+    store.record_decision(
+        ChatType.GROUP,
+        "qq:1001",
+        outcome="replied",
+        message_ids=["m2", "m1", "missing", "m3"],
+    )
+
+    item = store.list_decisions()[0]
+
+    assert [m["message_id"] for m in item["messages"]] == ["m2", "m1", "m3"]
+    assert item["messages"][0]["content"] == "火锅吧"
+    assert item["messages"][0]["is_bot"] is False
+    assert item["messages"][2]["is_bot"] is True
+    assert item["messages"][0]["timestamp"] == float(now)
 
 
 def test_message_ids_are_capped_at_twenty(tmp_path: Path) -> None:

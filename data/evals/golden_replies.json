@@ -1,0 +1,244 @@
+{
+  "version": 1,
+  "note": "人工标注的接话黄金集：每条给一段群聊现场，标注期望 verdict（speak / silent）。minutes_ago 越大表示越早，messages 按时间从旧到新排列。",
+  "cases": [
+    {
+      "id": "direct-question-dinner",
+      "tags": ["点名", "问句", "日常"],
+      "addressed": true,
+      "expect": "speak",
+      "note": "被点名问具体问题，应该回",
+      "messages": [
+        {"nickname": "阿猫", "content": "大肥鱼你今晚吃的啥", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "direct-question-choose",
+      "tags": ["点名", "问句", "求助"],
+      "addressed": true,
+      "expect": "speak",
+      "note": "被点名帮忙做选择，应该给出意见",
+      "messages": [
+        {"nickname": "小北", "content": "肥鱼帮我选一下，周末去爬山还是去看电影", "minutes_ago": 1.5}
+      ]
+    },
+    {
+      "id": "direct-chat-ping",
+      "tags": ["点名", "闲聊"],
+      "addressed": true,
+      "expect": "speak",
+      "note": "点名叫她冒泡，属于直接打招呼",
+      "messages": [
+        {"nickname": "橙子", "content": "肥鱼在不在，出来冒个泡", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "direct-at-private",
+      "tags": ["私聊", "点名", "问句"],
+      "addressed": true,
+      "expect": "speak",
+      "note": "私聊里被 @ 并说想问个事，应该回应",
+      "messages": [
+        {"nickname": "阿猫", "content": "@大肥鱼 你睡了吗，想问个事", "minutes_ago": 0.5}
+      ]
+    },
+    {
+      "id": "group-hot-banter",
+      "tags": ["群聊", "热场", "体育"],
+      "addressed": false,
+      "expect": "silent",
+      "note": "群友互相聊得正热，没有叫她，别硬插",
+      "messages": [
+        {"nickname": "小北", "content": "昨天那场比赛你们看了吗", "minutes_ago": 4.0},
+        {"nickname": "橙子", "content": "看了，最后那球太离谱", "minutes_ago": 3.0},
+        {"nickname": "小北", "content": "我说裁判是不是有问题", "minutes_ago": 2.5},
+        {"nickname": "橙子", "content": "确实有点偏，不过结果改不了了", "minutes_ago": 2.0}
+      ]
+    },
+    {
+      "id": "group-dinner-plan",
+      "tags": ["群聊", "热场", "约饭"],
+      "addressed": false,
+      "expect": "silent",
+      "note": "群友在约饭，流程自己走得通，不需要她参与",
+      "messages": [
+        {"nickname": "阿猫", "content": "周五晚上有人一起吃火锅吗", "minutes_ago": 5.0},
+        {"nickname": "小北", "content": "我我我", "minutes_ago": 4.0},
+        {"nickname": "阿猫", "content": "那定六点半老地方", "minutes_ago": 3.0}
+      ]
+    },
+    {
+      "id": "cold-monologue-tired",
+      "tags": ["冷场", "感慨"],
+      "addressed": false,
+      "expect": "speak",
+      "note": "冷场里的疲惫独白，接一句关心比继续沉默自然",
+      "messages": [
+        {"nickname": "路人甲", "content": "今天加班到现在，脑子已经转不动了", "minutes_ago": 2.0}
+      ]
+    },
+    {
+      "id": "cold-monologue-weather",
+      "tags": ["冷场", "陈述"],
+      "addressed": false,
+      "expect": "silent",
+      "note": "只是陈述地铁晚点，没有对象也没有需要回应的点",
+      "messages": [
+        {"nickname": "路人甲", "content": "地铁又晚点了，站台全是人", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "emoji-spam",
+      "tags": ["表情", "刷屏"],
+      "addressed": false,
+      "expect": "silent",
+      "note": "纯表情和图片刷屏，没有可接的文字",
+      "messages": [
+        {"nickname": "橙子", "content": "[表情]", "minutes_ago": 1.5},
+        {"nickname": "橙子", "content": "[表情]", "minutes_ago": 1.0},
+        {"nickname": "小北", "content": "[图片]", "minutes_ago": 0.5}
+      ]
+    },
+    {
+      "id": "repeat-spam",
+      "tags": ["刷屏", "重复"],
+      "addressed": false,
+      "expect": "silent",
+      "note": "同一个人重复刷同一句，接话只会助长刷屏",
+      "messages": [
+        {"nickname": "小北", "content": "有人吗", "minutes_ago": 3.0},
+        {"nickname": "小北", "content": "有人吗", "minutes_ago": 2.0},
+        {"nickname": "小北", "content": "有人吗", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "meme-joke",
+      "tags": ["玩梗", "接梗"],
+      "addressed": false,
+      "expect": "speak",
+      "note": "群友抛了个有画面的梗，适合顺着接一句",
+      "messages": [
+        {"nickname": "橙子", "content": "刚看到一张图，猫穿着西装在开周会", "minutes_ago": 2.0},
+        {"nickname": "小北", "content": "笑死，这不就是我们老板", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "late-night-feel",
+      "tags": ["深夜", "感慨"],
+      "addressed": false,
+      "expect": "speak",
+      "note": "深夜的情绪话，接一句轻的比装没看见好",
+      "messages": [
+        {"nickname": "阿猫", "content": "睡不着，突然觉得这半年过得好快", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "sensitive-topic",
+      "tags": ["敏感", "慎回"],
+      "addressed": false,
+      "expect": "silent",
+      "note": "涉及容易站队的敏感话题，群友已经主动降温",
+      "messages": [
+        {"nickname": "小北", "content": "你们怎么看网上那个吵架的事", "minutes_ago": 2.0},
+        {"nickname": "橙子", "content": "别聊这个了，容易吵起来", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "group-quarrel",
+      "tags": ["群聊", "吵架"],
+      "addressed": false,
+      "expect": "silent",
+      "note": "两个人正在翻旧账，机器人贸然劝架只会扩大战场",
+      "messages": [
+        {"nickname": "阿猫", "content": "你上次明明答应了的", "minutes_ago": 3.0},
+        {"nickname": "小北", "content": "我什么时候答应了，你别乱说", "minutes_ago": 2.0},
+        {"nickname": "阿猫", "content": "聊天记录还在呢", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "ad-spam",
+      "tags": ["广告", "垃圾消息"],
+      "addressed": false,
+      "expect": "silent",
+      "note": "广告号进来刷业务，直接无视",
+      "messages": [
+        {"nickname": "促销号", "content": "低价代练上分，加V详聊", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "already-answered",
+      "tags": ["问句", "已回答"],
+      "addressed": false,
+      "expect": "silent",
+      "note": "问题已经有人答了，再回一遍是噪音",
+      "messages": [
+        {"nickname": "阿猫", "content": "谁知道附近哪有修手机的", "minutes_ago": 3.0},
+        {"nickname": "小北", "content": "南门那家还行，我上周刚去过", "minutes_ago": 2.0}
+      ]
+    },
+    {
+      "id": "ignored-asks-again",
+      "tags": ["点名", "被无视", "追问"],
+      "addressed": true,
+      "expect": "speak",
+      "note": "连续被无视后再次点名确认，应该给个回应",
+      "messages": [
+        {"nickname": "阿猫", "content": "肥鱼？", "minutes_ago": 3.0},
+        {"nickname": "阿猫", "content": "肥鱼你是不是不在了", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "question-does-not-need-her",
+      "tags": ["问句", "不需要回"],
+      "addressed": false,
+      "expect": "silent",
+      "note": "问句是问群友的，而且已经有人接过去教了",
+      "messages": [
+        {"nickname": "小北", "content": "有人知道打印机怎么连吗", "minutes_ago": 2.0},
+        {"nickname": "橙子", "content": "我来教你，先看驱动装没装", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "direct-question-age",
+      "tags": ["点名", "问句", "简单"],
+      "addressed": true,
+      "expect": "speak",
+      "note": "点名问一个轻松的个人问题，可以随口答",
+      "messages": [
+        {"nickname": "橙子", "content": "肥鱼你几岁了", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "direct-thanks",
+      "tags": ["点名", "道谢"],
+      "addressed": true,
+      "expect": "speak",
+      "note": "被点名道谢，回一句不客气即可",
+      "messages": [
+        {"nickname": "阿猫", "content": "谢谢肥鱼刚才提醒我带伞", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "group-gaming-plan",
+      "tags": ["群聊", "热场", "游戏"],
+      "addressed": false,
+      "expect": "silent",
+      "note": "群里在组队，人员已经凑齐，不需要她插话",
+      "messages": [
+        {"nickname": "小北", "content": "今晚排位缺一个，谁来", "minutes_ago": 3.0},
+        {"nickname": "橙子", "content": "我我我，等我吃完饭", "minutes_ago": 2.0},
+        {"nickname": "小北", "content": "行，八点开", "minutes_ago": 1.0}
+      ]
+    },
+    {
+      "id": "direct-help-code",
+      "tags": ["点名", "求助", "问句"],
+      "addressed": true,
+      "expect": "speak",
+      "note": "点名求助具体问题，应该接过来看看",
+      "messages": [
+        {"nickname": "小北", "content": "肥鱼这串代码为啥报错，帮我看看", "minutes_ago": 1.0}
+      ]
+    }
+  ]
+}

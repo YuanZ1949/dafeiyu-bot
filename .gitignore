@@ -2,7 +2,10 @@
 __pycache__/
 *.pyc
 .env
-data/
+data/*
+!data/evals/
+data/evals/*
+!data/evals/golden_replies.json
 logs/
 .pytest_cache/
 .ruff_cache/
