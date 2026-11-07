@@ -154,6 +154,14 @@ class MindConfig:
     inbound_media_reactions: bool = False
     # 同一会话两次入站反应的最小间隔（秒），防止刷屏。
     inbound_media_reaction_cooldown_seconds: int = 600
+    # 承诺跟进（P3）：对「答应过但没下文」的 promise loop 主动追问一句。
+    # 默认关闭；打开后仍有每日上限与静音/预算门控，且会话里已有新的 bot
+    # 发言时不打断（对话还在继续）。
+    proactive_followup: bool = False
+    # 只有创建超过这么多小时、且之后没有 bot 发言的 loop 才会被跟进。
+    followup_after_hours: int = 24
+    # 同一会话每天最多追问几次，按上海日期计。
+    followup_daily_cap: int = 3
 
 
 @dataclass(frozen=True)
@@ -932,6 +940,15 @@ def _build_mind(raw: dict[str, Any]) -> MindConfig:
             raw.get("inbound_media_reaction_cooldown_seconds"),
             "mind.inbound_media_reaction_cooldown_seconds",
             600,
+        ),
+        proactive_followup=_bool(
+            raw.get("proactive_followup", False), "mind.proactive_followup"
+        ),
+        followup_after_hours=_positive_int(
+            raw.get("followup_after_hours"), "mind.followup_after_hours", 24
+        ),
+        followup_daily_cap=_positive_int(
+            raw.get("followup_daily_cap"), "mind.followup_daily_cap", 3
         ),
     )
 

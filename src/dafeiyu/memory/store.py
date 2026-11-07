@@ -2912,6 +2912,32 @@ class Store:
         ).fetchall()
         return [self._row_to_open_loop(r) for r in rows]
 
+    def due_promise_loops(
+        self, older_than_hours: float, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """超过阈值小时仍未了结的「承诺」，最老的在前；limit <= 0 直接空。
+
+        只取 ``kind='promise'`` 且还 open 的行：question/dropped/done 都不该
+        被主动追问。行映射与 ``due_reminders`` 同口径（dict），因为消费方是
+        worker 而不是注入层。``created_at`` 是不带时区的 UTC 文本，额外给出
+        ``created_epoch``（秒），调用方与消息 ``timestamp`` 比较时不用再解析。
+        """
+        hours = max(0.0, float(older_than_hours))
+        rows = self._conn.execute(
+            """
+            SELECT id, chat_type, chat_id, kind, subject_user_id, content,
+                   status, source_message_id, created_at, closed_at,
+                   CAST(strftime('%s', created_at) AS INTEGER) AS created_epoch
+            FROM open_loops
+            WHERE kind = 'promise' AND status = 'open'
+              AND created_at <= datetime('now', ?)
+            ORDER BY created_at, id
+            LIMIT ?
+            """,
+            (f"-{hours} hours", max(0, int(limit))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def latest_open_loop(
         self, chat_type: ChatType, chat_id: str, *, days: int = 7
     ) -> OpenLoop | None:
