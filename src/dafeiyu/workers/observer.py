@@ -38,6 +38,7 @@ JSON schema：
  "participants": [{"user_id": "qq:1", "nickname": "阿猫"}],
  "open_loops": [{"kind": "question|promise|plan|running_joke",
                  "user_id": "qq:1", "content": "谁问了什么 / 答应了什么"}],
+ "closed_loop_ids": [12, 13],
  "mood": "群里的气氛", "importance": 0.5}
 
 规则：
@@ -47,6 +48,8 @@ JSON schema：
   （含 "qq:"/"wxg:"），不得编造；没有就输出空数组。
 - open_loops 只记「有人问了没人接」「有人答应了没做」「群里在等什么」，
   每条 content 不超过 80 字；没有就输出空数组，宁可少记，不要臆测。
+- closed_loop_ids 只填「当前未了事」列表里这次对话已经解决的 id，最多 5 个；
+  没有就输出空数组，不要填没解决的或不在列表里的 id。
 - 不要记录隐私（手机号、住址、密码），不要输出 schema 之外的字段。"""
 
 MAX_SOURCE_MESSAGES = 40
@@ -58,6 +61,9 @@ MAX_MOOD_CHARS = 20
 MAX_LOOP_CHARS = 80
 MAX_PARTICIPANTS = 8
 MAX_OPEN_LOOPS = 3
+# 提示里最多列 5 条未了事，也只接受关闭这 5 条里的 id（校验归属的边界）。
+MAX_PROMPT_OPEN_LOOPS = 5
+MAX_CLOSED_LOOP_IDS = 5
 MAX_LINE_CHARS = 200
 # 超过这个空档就视为换了一段对话：新 episode 重新开一行，而不是把上午的事续上。
 EPISODE_GAP_SECONDS = 1800
@@ -238,6 +244,19 @@ class ObserverWorker:
             f"{message.content[:MAX_LINE_CHARS]}"
             for message in human
         )
+        # 复用现有查询：最多 5 条还没下文的事，带 id 喂给模型，模型才能回填
+        # closed_loop_ids。放在 user message 而不是 SYSTEM 常量里，避免污染
+        # 提示缓存；prompt_text 也随 body 一起更新，用量估算不含水分。
+        loops = self.store.open_loops(
+            chat_type, chat_id, limit=MAX_PROMPT_OPEN_LOOPS
+        )
+        loop_lines = "\n".join(
+            f"{loop.id}|{loop.kind}|{loop.content}"
+            for loop in loops
+            if loop.id is not None
+        )
+        if loop_lines:
+            body = f"当前未了事（id|kind|content）：\n{loop_lines}\n\n{body}"
         prompt_text = f"{OBSERVER_SYSTEM}\n{body}"
         try:
             content, prompt_tokens, completion_tokens = await self._current_brain().complete_detailed(
@@ -276,7 +295,13 @@ class ObserverWorker:
             return False
 
         self._write_episode(chat_type, chat_id, human, fresh_human, payload)
+        # 先写后关：add_open_loop 的去重只匹配 status='open' 的行。若先关，
+        # 本轮重复输出的同内容 loop 会绕过去重插一条新的 open 行，刚了结的事
+        # 就会复活；先写（命中原行）再关，才不会长出重复行。
         self._write_open_loops(chat_type, chat_id, human, payload)
+        self._close_resolved_loops(
+            payload, {loop.id for loop in loops if loop.id is not None}
+        )
 
         self.store.set_observer_cursor(chat_type, chat_id, total)
         self._backoff.mark_ok(key)
@@ -445,6 +470,37 @@ class ObserverWorker:
             except ValueError:
                 continue
             recorded += 1
+
+    def _close_resolved_loops(
+        self, payload: dict[str, Any], allowed: set[int]
+    ) -> int:
+        """关掉模型认为这次对话里已经解决的未了事。
+
+        只认本轮列给模型的那几个 id（``allowed``）；陌生/编造/类型不对的
+        一律静默丢弃——模型输出不可信，关闭不该让整次观察失败。
+        """
+        raw = payload.get("closed_loop_ids")
+        if not isinstance(raw, list):
+            return 0
+        closed = 0
+        seen: set[int] = set()
+        for item in raw:
+            if closed >= MAX_CLOSED_LOOP_IDS:
+                break
+            # bool 是 int 的子类，先排掉，避免 True/False 被当成 id。
+            if isinstance(item, bool) or not isinstance(item, int):
+                continue
+            if item in seen:
+                continue
+            seen.add(item)
+            if item not in allowed:
+                continue
+            try:
+                if self.store.close_open_loop(item, status="done"):
+                    closed += 1
+            except Exception:
+                log.exception("Observer 关闭未了事失败：id=%s", item)
+        return closed
 
 
 async def observer_loop(
