@@ -157,6 +157,27 @@ class MindConfig:
 
 
 @dataclass(frozen=True)
+class SocialConfig:
+    """社交动作（戳一戳/进群欢迎）：短句与模板都是确定性的，不调用模型。
+
+    ``social:`` 段是可选的：老配置没有这一段也要能启动，所以用
+    ``raw.get("social") or {}`` 读取，不能走 ``_section``。
+    """
+
+    # 被戳时回一句固定短句；默认关闭，避免升级后突然开始主动说话。
+    poke_enabled: bool = False
+    # 同一会话两次回应之间的最小间隔（秒）。
+    poke_cooldown_seconds: int = 300
+    # 同一会话每日最多回应次数，按上海日期计。
+    poke_daily_cap: int = 20
+    # 进群欢迎：模板为空串时即使开关打开也不发。
+    join_welcome_enabled: bool = False
+    join_welcome: str = ""
+    # 同一会话每日最多欢迎次数。
+    join_welcome_daily_cap: int = 10
+
+
+@dataclass(frozen=True)
 class InjectionConfig:
     """opencode 分支的注入预算，单位是字符数（不是 token）。"""
 
@@ -552,6 +573,8 @@ class Settings:
     behavior: BehaviorSettings = field(default_factory=BehaviorSettings)
     # 心智层（Observer/Reflector/状态/关系卡）总闸；默认全关，老配置无感。
     mind: MindConfig = field(default_factory=MindConfig)
+    # 社交动作（戳一戳/进群欢迎）：确定性的短句与模板，默认全关。
+    social: SocialConfig = field(default_factory=SocialConfig)
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -909,6 +932,28 @@ def _build_mind(raw: dict[str, Any]) -> MindConfig:
             raw.get("inbound_media_reaction_cooldown_seconds"),
             "mind.inbound_media_reaction_cooldown_seconds",
             600,
+        ),
+    )
+
+
+def _build_social(raw: dict[str, Any]) -> SocialConfig:
+    """解析可选的 ``social:`` 段；缺段 = 全默认（戳一戳关闭），老配置不受影响。"""
+    if not isinstance(raw, dict):
+        raise ConfigError("config.yaml 的 social 必须是映射")
+    return SocialConfig(
+        poke_enabled=_bool(raw.get("poke_enabled", False), "social.poke_enabled"),
+        poke_cooldown_seconds=_positive_int(
+            raw.get("poke_cooldown_seconds"), "social.poke_cooldown_seconds", 300
+        ),
+        poke_daily_cap=_positive_int(
+            raw.get("poke_daily_cap"), "social.poke_daily_cap", 20
+        ),
+        join_welcome_enabled=_bool(
+            raw.get("join_welcome_enabled", False), "social.join_welcome_enabled"
+        ),
+        join_welcome=str(raw.get("join_welcome") or "").strip(),
+        join_welcome_daily_cap=_positive_int(
+            raw.get("join_welcome_daily_cap"), "social.join_welcome_daily_cap", 10
         ),
     )
 
@@ -1945,4 +1990,5 @@ def load_settings(
         audit=_build_audit(raw.get("audit") or {}),
         behavior=behavior,
         mind=mind,
+        social=_build_social(raw.get("social") or {}),
     )

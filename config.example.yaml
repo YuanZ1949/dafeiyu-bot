@@ -394,6 +394,20 @@ behavior:
   banned_phrases: []
   banned_topics: []
 
+# 社交动作（戳一戳/进群欢迎）：短句与模板都是固定的，不调用模型。
+# 代码默认关闭；模板里打开戳一戳，让新部署也能给出反应。
+social:
+  # 被戳时回一句固定短句；仍受静音/聊天强度/预算/冷却/每日上限共同门控。
+  poke_enabled: true
+  # 同一会话两次回应之间的最小间隔（秒）。
+  poke_cooldown_seconds: 300
+  # 同一会话每日最多回应次数（按上海日期计）。
+  poke_daily_cap: 20
+  # 进群欢迎：默认关闭，模板为空串时即使开关打开也不发。
+  join_welcome_enabled: false
+  join_welcome: ""
+  join_welcome_daily_cap: 10
+
 logging:
   level: INFO
   dir: logs

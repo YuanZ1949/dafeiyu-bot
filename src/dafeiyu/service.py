@@ -51,6 +51,7 @@ from .moment import (
 from .reply_media import build_onebot_segments, resolve_at_names, resolve_attachments
 from .router import Router, now_shanghai
 from .sender import shape_reply, shape_reply_parts
+from .social import PokeReactor
 from .workers.failure import (
     QUOTA_KEY,
     is_agent_missing_error,
@@ -347,6 +348,7 @@ class Service:
         injection: InjectionConfig | None = None,
         audit: AuditLog | None = None,
         sleep=None,
+        poke_reactor: PokeReactor | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -399,6 +401,8 @@ class Service:
         self._last_prompt_tokens: dict[tuple[ChatType, str], int] = {}
         # 入站媒体表情回应的节流时刻（只有 mind.inbound_media_reactions 打开时才写）。
         self._inbound_reaction_at: dict[tuple[ChatType, str], float] = {}
+        # 戳一戳的冷却/每日上限：测试可注入带假时钟的实例。
+        self.poke_reactor = poke_reactor or PokeReactor(settings.social)
 
     def _adapter_for(self, chat_id: str) -> Adapter:
         """按会话 id 的通道前缀选适配器；单一派生点是 channel_of。"""
@@ -1044,17 +1048,67 @@ class Service:
             )
 
     async def _handle_poke(self, event: NoticeEvent) -> None:
-        """戳一戳回应占位：任务 8 在这里接冷却/每日上限/静音与预算门控。
+        """戳一戳：过完静音/强度/预算三道门后回一句固定短句，绝不调用模型。
 
-        ``event.user_id`` 是被戳者、``event.operator_id`` 是发起者；占位实现不发送。
+        ``event.user_id`` 是被戳者、``event.operator_id`` 是发起者，回应发回
+        ``event.chat_id``（群戳回群，私聊戳回私聊）。冷却与每日上限由
+        :class:`PokeReactor` 按 ``(chat_type, chat_id)`` 记账。
         """
+        if not isinstance(event.chat_type, ChatType) or not str(
+            event.chat_id or ""
+        ).strip():
+            log.info(
+                "poke 事件缺少有效会话（忽略）: kind=%s chat_id=%r",
+                event.kind,
+                event.chat_id,
+            )
+            return
+        social = self.settings.social
+        if not social.poke_enabled:
+            log.debug(
+                "poke %s/%s: social.poke_enabled=false",
+                event.chat_type.value,
+                event.chat_id,
+            )
+            return
+        if self.router.is_quiet(event.chat_type, event.chat_id):
+            log.debug(
+                "poke %s/%s: 静音/夜间静默", event.chat_type.value, event.chat_id
+            )
+            return
+        if self.behavior.chat_intensity == "quiet":
+            log.debug(
+                "poke %s/%s: intensity_quiet", event.chat_type.value, event.chat_id
+            )
+            return
+        decision = self.budget_guard.evaluate(
+            event.chat_type,
+            event.chat_id,
+            addressed=False,
+            purpose="ambient",
+        )
+        if decision.action != BudgetAction.ALLOW:
+            log.debug(
+                "poke %s/%s: budget=%s",
+                event.chat_type.value,
+                event.chat_id,
+                decision.action.value,
+            )
+            return
+        text = self.poke_reactor.claim(event.chat_type, event.chat_id)
+        if text is None:
+            log.debug(
+                "poke %s/%s: 冷却中或已达每日上限", event.chat_type.value, event.chat_id
+            )
+            return
         log.info(
-            "poke %s/%s target=%s operator=%s（占位，暂不回应）",
+            "poke %s/%s target=%s operator=%s → 回应",
             event.chat_type.value,
             event.chat_id,
             event.user_id,
             event.operator_id,
         )
+        await self._send_outbox(event.chat_type, event.chat_id, text, origin="poke")
 
     async def _handle_join_welcome(self, event: NoticeEvent) -> None:
         """进群欢迎占位：任务 9 在这里接模板渲染与每日上限；占位实现不发送。"""
