@@ -14,6 +14,8 @@ from .router import parse_command
 _GROUP = ChatType.GROUP
 _PRIVATE = ChatType.PRIVATE
 _BOTH = frozenset({_GROUP, _PRIVATE})
+# 群里仅管理员、私聊对所有人生效：注册表与 Service 共用同一份非对称名单。
+PRIVATE_UNRESTRICTED = frozenset({"forget", "remind"})
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,15 @@ _COMMANDS: tuple[CommandSpec, ...] = (
         cooldown_seconds=0,
         help="清空当前会话",
     ),
+    CommandSpec(
+        name="remind",
+        aliases=frozenset({"提醒"}),
+        scopes=_BOTH,
+        # 与 forget 同一套非对称权限：群内仅管理员，私聊所有人。
+        admin_only=True,
+        cooldown_seconds=0,
+        help="<分钟> <内容> · /remind list · /remind cancel <id>",
+    ),
 )
 
 
@@ -117,8 +128,8 @@ class CommandRegistry:
                 continue
             if not spec.admin_only:
                 available.append(spec)
-            elif spec.name == "forget" and chat_type is ChatType.PRIVATE:
-                # 私聊 /forget 对所有人生效（含管理员），放在可用命令里。
+            elif spec.name in PRIVATE_UNRESTRICTED and chat_type is ChatType.PRIVATE:
+                # 私聊里这些命令对所有人生效（含管理员），放在可用命令里。
                 available.append(spec)
             elif is_admin:
                 admin_commands.append(spec)

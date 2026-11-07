@@ -25,7 +25,7 @@ from .brain.guard import (
 from .brain.persona import build_system_prompt, os_probability_hint
 from .brain.tokens import estimate_tokens, resolve_usage
 from .budget import BudgetAction, BudgetDecision, BudgetReport, estimate_cost
-from .commands import CommandRegistry, CommandSpec
+from .commands import PRIVATE_UNRESTRICTED, CommandRegistry, CommandSpec
 from .config import GroupsConfig, InjectionConfig, Settings
 from .delivery.scheduler import BatchScheduler
 from .gateway.base import Adapter
@@ -139,6 +139,10 @@ def _forward_message_nodes(item: Attachment) -> list[dict[str, Any]]:
 SHUTUP_MINUTES = 60
 ADMIN_ONLY_REPLY = "这个命令只有管理员能用。"
 FORGET_REPLY = "记忆清空了，本鱼失忆中……🫧"
+REMIND_USAGE = "用法：/remind <分钟> <内容> · /remind list · /remind cancel <id>"
+REMIND_MAX_MINUTES = 10080
+REMIND_MAX_CONTENT_CHARS = 200
+_REMIND_STATUS_LABELS = {"pending": "待发", "sent": "已发", "canceled": "已取消"}
 # 待发队列：通道恢复后补发的轮询间隔 / 重试上限 / 消息保鲜期。
 OUTBOX_RETRY_SECONDS = 15.0
 OUTBOX_MAX_ATTEMPTS = 8
@@ -3636,8 +3640,10 @@ class Service:
     async def _run_command(self, msg: Message, spec: CommandSpec, args: str) -> bool:
         """权限 → 冷却 → 分发 → 审计；所有分支都返回「命令分支已接管」。"""
         is_admin = msg.user_id in self.settings.groups.admins
-        private_forget = spec.name == "forget" and msg.chat_type is ChatType.PRIVATE
-        if spec.admin_only and not is_admin and not private_forget:
+        private_unrestricted = (
+            spec.name in PRIVATE_UNRESTRICTED and msg.chat_type is ChatType.PRIVATE
+        )
+        if spec.admin_only and not is_admin and not private_unrestricted:
             if msg.chat_type is ChatType.GROUP:
                 # 群内保持原有静默行为，避免在群里公开点名权限问题。
                 log.info(
@@ -3674,6 +3680,8 @@ class Service:
             await self._cmd_budget(msg)
         elif spec.name == "forget":
             await self._forget_chat(msg)
+        elif spec.name == "remind":
+            await self._cmd_remind(msg, args)
         elif spec.name == "shutup":
             self.router.quiet(msg.chat_type, msg.chat_id, SHUTUP_MINUTES)
         elif spec.name == "wake":
@@ -3856,3 +3864,83 @@ class Service:
         if limit <= 0:
             return "未启用"
         return f"{int(used)}/{int(limit)}"
+
+    async def _cmd_remind(self, msg: Message, args: str) -> None:
+        """定时提醒：创建 / 列表 / 取消；参数不合法只回用法，不写库。"""
+        text = args.strip()
+        if not text:
+            await self._reply_command(msg, REMIND_USAGE)
+            return
+        head, _, rest = text.partition(" ")
+        keyword = head.casefold()
+        if keyword == "list":
+            if rest.strip():
+                await self._reply_command(msg, REMIND_USAGE)
+                return
+            await self._cmd_remind_list(msg)
+            return
+        if keyword == "cancel":
+            reminder_id = self._parse_reminder_id(rest.strip())
+            if reminder_id is None:
+                await self._reply_command(msg, REMIND_USAGE)
+                return
+            # 归属校验在 store：只有同会话的创建者、且仍 pending 才能取消。
+            canceled = self.store.cancel_reminder(
+                reminder_id, msg.chat_type, msg.chat_id, msg.user_id
+            )
+            if canceled:
+                await self._reply_command(msg, f"已取消提醒 #{reminder_id}。")
+            else:
+                await self._reply_command(msg, f"没找到可以取消的提醒 #{reminder_id}。")
+            return
+
+        try:
+            minutes = int(head)
+        except ValueError:
+            await self._reply_command(msg, REMIND_USAGE)
+            return
+        content = rest.strip()
+        if (
+            not 1 <= minutes <= REMIND_MAX_MINUTES
+            or not content
+            or len(content) > REMIND_MAX_CONTENT_CHARS
+        ):
+            await self._reply_command(msg, REMIND_USAGE)
+            return
+        due_at = time.time() + minutes * 60
+        reminder_id = self.store.add_reminder(
+            msg.chat_type, msg.chat_id, msg.user_id, content, due_at
+        )
+        if reminder_id <= 0:
+            await self._reply_command(msg, REMIND_USAGE)
+            return
+        await self._reply_command(
+            msg, f"记下了：{minutes} 分钟后提醒你「{content}」（#{reminder_id}）"
+        )
+
+    async def _cmd_remind_list(self, msg: Message) -> None:
+        rows = self.store.list_reminders(msg.chat_type, msg.chat_id)
+        if not rows:
+            await self._reply_command(msg, "没有提醒。")
+            return
+        lines = ["提醒："]
+        for row in rows:
+            status = str(row.get("status") or "")
+            label = _REMIND_STATUS_LABELS.get(status, status or "?")
+            due = time_label(int(float(row.get("due_at") or 0)))
+            lines.append(
+                f"#{int(row.get('id') or 0)} {due} {label} {row.get('content') or ''}"
+            )
+        await self._reply_command(msg, "\n".join(lines))
+
+    @staticmethod
+    def _parse_reminder_id(raw: str) -> int | None:
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    async def _reply_command(self, msg: Message, text: str) -> None:
+        """命令回复走普通回复路径（与 /help、/stats 一致），不是主动出站。"""
+        await self._adapter_for(msg.chat_id).send(msg.chat_type, msg.chat_id, text)
