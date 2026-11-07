@@ -10,6 +10,9 @@
 > **2026-10-31 更新**：文中 P4/P5/P7/P8/P10/P11 里能代码化的部分已经落地到仓库
 > （见文末第 6 节）。新机器先按 README / `dafeiyu doctor` 的提示走即可；本文继续保留，
 > 作为根因分析和人工排查参考。§5 的原改进建议已改写为「已落地 / 仍留文档」。
+>
+> **2026-11-08 更新**：新增 §7「备份异地镜像与运维告警阈值」（`backup.mirror_dir`、
+> `alerts.rules.backup_stale_hours`、`alerts.rules.memory_gap_days`）。
 
 ---
 
@@ -313,3 +316,61 @@ C:\AIWork\dafeiyu-bot\          # 仓库本体（标准布局，无 junction）
 > 注意：`.opencode/agents/*.md` 与 `data/settings.local.yaml` 是本机部署状态（当前为 key 档），
 > 会让「仓库内 agent 文件与 free 模板一致」「默认 provider」这类测试失败；这是本机数据导致的，
 > 与本次固化无关。部署到新机器时由 `ensure_agent_files` 按当前档位重新生成。
+
+---
+
+## 7. 备份异地镜像与运维告警阈值（2026-11-08）
+
+本节补充两项部署建议：把备份再存一份到别处，以及两条默认阈值足够、但值得按自己节奏调整的
+告警规则。配置都写在 `config.yaml`，改完重启 supervisor 生效；留空/不配即按默认值运行。
+
+### 7.1 `backup.mirror_dir`：给备份留第二份
+
+`backup.mirror_dir` 是**可选的第二份备份目录**，默认 `""`（空 = 关闭，不复制任何文件）。
+推荐指向**另一个物理位置**：
+
+- 局域网 NAS 的 UNC 共享：`\\nas\dafeiyu-backups`。先确认运行 bot 的账户对该共享有写权限；
+  从任务计划自启时，凭据来自该登录用户，不是当前交互会话。
+- 移动硬盘 / U 盘：`E:\dafeiyu-backups`。长期插着才可靠，拔盘期间镜像会失败（但主备份不受影响）。
+
+```yaml
+backup:
+  enabled: true
+  dir: data/backups
+  mirror_dir: '\\nas\dafeiyu-backups'   # 空字符串 = 关闭
+```
+
+行为边界（代码在 `src/dafeiyu/supervisor/backup.py`）：
+
+- **只在主备份成功落盘之后**才复制：复制 DB 备份、同名 manifest `.json`，以及存在的
+  workspace zip；每个文件都走「临时文件 + `os.replace`」，不会在镜像目录留下半截文件。
+- **镜像失败永远不影响主备份**：异常被隔离，只写入 `BackupService.status()` 中独立的
+  `mirror_last_error_at` / `mirror_last_error` 字段（`GET /api/backups` 的 `status` 里可见），
+  `last_success_at` 和主备份文件仍保持成功状态。共享掉线、盘符不存在、权限不足都只是镜像告警。
+- `mirror_dir` 与 `backup.dir` 相同时会跳过（复制等于覆盖自己）。
+- `prune()` 只按**主目录**的 manifest 统计配额，不会清理镜像目录；异地副本需自己按需删除。
+- 镜像到可离线保存的介质（NAS / 移动盘）才算「异地」；同一块盘上的另一个目录只能防误删，
+  防不了盘坏。
+
+### 7.2 `alerts.rules.backup_stale_hours`（默认 25 小时）
+
+`backup_stale` 规则在「从未成功备份过」或「最近一次成功备份早于 now − 25h」时触发。
+默认 25h 比每天 04:00 的定时备份多留 1 小时，避免调度抖动造成误报。
+
+- 备份频率更低（例如每周一次）时调大，建议 `24 * 7 + 1 = 169`。
+- 想更早发现停摆可调小（如 `6`），但要先确认备份间隔小于该值，否则会一直告警。
+- `backup.enabled: false` 时该规则自动豁免：本来就不备份，「没有成功备份」不是故障。
+
+### 7.3 `alerts.rules.memory_gap_days`（默认 2 天）
+
+`memory_gap` 规则在「有 ≥2 天消息还没生成摘要」时触发，文案为
+「有 N 天消息还没有生成摘要」。数据源与面板记忆健康卡一致
+（`health_snapshot.memory.pending_count`，复用同一段 lag 计算）。
+
+- 设为 `1`：昨天没摘要就告警，适合每天必须复盘的重度使用。
+- 设为 `3` 或更大：容忍周末或短期停机造成的缺口，减少噪音。
+- 额度熔断（`quota_pause` 正在生效）期间该规则不报：摘要本来就会暂停，避免在已知原因上
+  叠加一条噪音。
+
+两条规则都在 `alerts.rules` 下配置，默认值来自 `src/dafeiyu/config.py`；告警本身仍受
+`alerts.enabled` 总开关控制，关闭时不检查也不外呼。
