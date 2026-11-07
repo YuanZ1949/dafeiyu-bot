@@ -363,7 +363,7 @@ def test_mind_budget_drops_loops_when_budget_shrinks(store):
 
 
 def test_default_mind_budget_keeps_all_three_at_max(store):
-    """默认 600 ≥ 220 + 200 + 150：三段都写满也不该丢群友印象。"""
+    """默认 1000 ≥ 220 + 200 + 150：三段都写满也不该丢群友印象。"""
     store.save_episode(
         Episode(
             chat_type=GROUP,
@@ -406,5 +406,5 @@ def test_mind_budget_tiny_value_never_raises(store):
 
 def test_config_parses_mind_chars():
     assert _build_injection({}, {"mind_chars": 120}).mind_chars == 120
-    # 默认 600：正在聊 / 没下文 / 群友印象三段的合计预算。
-    assert _build_injection({}, {}).mind_chars == 600
+    # 默认 1000：六段的合计预算，装得下六段上限 990。
+    assert _build_injection({}, {}).mind_chars == 1000

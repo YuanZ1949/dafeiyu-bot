@@ -178,9 +178,11 @@ class InjectionConfig:
     open_loop_topk: int = 3
     open_loop_chars: int = 200
     episode_chars: int = 220
-    # 「正在聊的事 + 没有下文的事 + 群友印象」三段合计的字符预算；超了先砍
-    # 群友印象，再砍没有下文的事，最后截断正在聊的事（spec §5.5）。
-    mind_chars: int = 600
+    # 「正在聊的事 + 没有下文的事 + 你和他 + 本鱼的近况 + 我的立场 + 群友印象」
+    # 六段合计的字符预算（默认 1000，装得下六段上限 990）；超了按
+    # 「印象 → 立场 → 近况 → 关系卡 → 未了事」整段丢弃，正在聊的事永不主动丢，
+    # 只在最后截断（spec §5.5）。
+    mind_chars: int = 1000
     # 「本鱼的近况」（bot_state）与「你和他」（关系卡）：只有 mind.enabled
     # 打开后才由 _build_injection 置 true，直接构造 InjectionConfig 时默认关。
     inject_state: bool = False
@@ -960,7 +962,7 @@ def _build_injection(
             memory_raw.get("episode_chars"), "memory.episode_chars", 220
         ),
         mind_chars=_positive_int(
-            memory_raw.get("mind_chars", 600), "memory.mind_chars", 600
+            memory_raw.get("mind_chars", 1000), "memory.mind_chars", 1000
         ),
         # 心智段只在总闸打开时生效：老配置/直接构造 InjectionConfig 都不改变行为。
         inject_state=mind.enabled and mind.state_enabled,

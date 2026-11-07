@@ -82,7 +82,7 @@ def cfg(**overrides) -> InjectionConfig:
         "inject_impressions": True,
         "inject_state": True,
         "inject_relations": True,
-        "mind_chars": 600,
+        "mind_chars": 1000,
     }
     base.update(overrides)
     return InjectionConfig(**base)
@@ -167,16 +167,34 @@ def test_attention_order_follows_spec(store: Store) -> None:
     assert positions == sorted(positions)
 
 
-def test_budget_drops_impressions_then_loops(store: Store) -> None:
+def test_budget_drops_impressions_then_state(store: Store) -> None:
+    """预算 25：印象与近况先整段丢，关系卡先于未了事消失，episode 必保留。"""
     seed_all(store)
 
     text = render(store, mind_chars=25)
 
     assert INJECTION_IMPRESSION_HEADER not in text
-    assert INJECTION_OPEN_LOOP_HEADER not in text
-    # 近况与正在聊的事最后才砍。
-    assert INJECTION_STATE_HEADER in text
+    assert INJECTION_STATE_HEADER not in text
+    # 新顺序：关系卡先让位，未了事排最后才丢。
+    assert INJECTION_RELATION_HEADER not in text
+    assert INJECTION_OPEN_LOOP_HEADER in text
     assert INJECTION_EPISODE_HEADER in text
+
+
+def test_budget_drops_loops_last(store: Store) -> None:
+    """预算 12：未了事先降级为无 kind 仍保留；收到 10 才是最后被丢的段。"""
+    seed_all(store)
+
+    kept = render(store, mind_chars=12)
+    assert INJECTION_OPEN_LOOP_HEADER in kept
+    assert "（等答复）" not in kept
+    assert INJECTION_RELATION_HEADER not in kept
+    assert INJECTION_STATE_HEADER not in kept
+    assert INJECTION_EPISODE_HEADER in kept
+
+    dropped = render(store, mind_chars=10)
+    assert INJECTION_OPEN_LOOP_HEADER not in dropped
+    assert INJECTION_EPISODE_HEADER in dropped
 
 
 def test_tiny_budget_only_truncates_episode(store: Store) -> None:

@@ -462,10 +462,10 @@ def _mind_blocks(
     """注意力段（spec §5.5）：正在聊的事 → 没有下文的事 → 你和他 → 本鱼近况 → 我的立场 → 群友印象。
 
     六段共用 mind_chars 合计预算。和别的段落一致，预算只数数据体、不数
-    header 与边界行：header/边界是固定文案，数进去会让「默认 600」在各段
-    都写满时误伤最后一段。超预算时按「印象 → 未了事 → 关系卡 → 立场 → 近况」的
-    顺序整段丢弃，正在聊的事最后才截断；预算再小也不能抛异常，裁完为空
-    的块不进注入。
+    header 与边界行：header/边界是固定文案，数进去会让「默认 1000」在各段
+    都写满时误伤最后一段。超预算时按「印象 → 立场 → 近况 → 关系卡 → 未了事」
+    的顺序整段丢弃：正在聊的事永不主动丢，只在最后截断；未了事排最后，
+    前面几段都让位后才动它。预算再小也不能抛异常，裁完为空的块不进注入。
     """
     blocks: dict[str, tuple[str, str]] = {}
 
@@ -512,7 +512,9 @@ def _mind_blocks(
         blocks["impressions"] = (INJECTION_IMPRESSION_HEADER, impressions)
 
     budget = max(0, cfg.mind_chars)
-    for name in ("impressions", "loops", "relations", "stances", "state"):
+    # 丢弃顺序：印象最先让位，未了事排最后（关系卡先于未了事消失）；episode
+    # 不在元组里，永远不会被主动丢，只剩它时才截断。
+    for name in ("impressions", "stances", "state", "relations", "loops"):
         if len(blocks) <= 1:
             break
         if sum(len(body) for _, body in blocks.values()) <= budget:
