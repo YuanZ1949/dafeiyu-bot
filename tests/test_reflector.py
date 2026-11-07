@@ -4,7 +4,7 @@
 * 开关 / 时间闸 / 每群每日一次 / 额度池；
 * 全局 bot_state 只取消息量最大的群，lessons 落群笔记、life 落 MEMORY.md；
 * 非法 JSON 不冒泡，写标记并进入退避；
-* relationships 容忍但不写 impressions；
+* prompt 不再要求 relationships，旧 payload 带该键也能正常解析；
 * append_note / append_global 的创建、追加与空列表语义。
 """
 
@@ -25,7 +25,9 @@ from dafeiyu.timeutil import now_shanghai, today_shanghai
 from dafeiyu.workers.failure import FailureBackoff
 from dafeiyu.workers.reflector import (
     MAX_PROMPT_CHARS,
+    REFLECT_SYSTEM,
     ReflectorWorker,
+    parse_reflection,
     reflector_loop,
 )
 
@@ -150,6 +152,56 @@ def make_worker(
         backoff=backoff,
         now=lambda: moment.timestamp(),
     )
+
+
+# ---- prompt schema 与解析 -------------------------------------------
+
+
+def test_schema_no_longer_requests_relationships() -> None:
+    assert "relationships" not in REFLECT_SYSTEM
+    # 其它字段仍在 schema 里，避免删字段时连带删掉真正要写的产物。
+    for key in ("focus", "mood_note", "stances", "lessons", "life"):
+        assert f'"{key}"' in REFLECT_SYSTEM
+
+
+def test_parse_reflection_ignores_legacy_relationships() -> None:
+    """旧 payload 带 relationships 不报错，解析结果与不带该键完全一致。"""
+    base = {
+        "focus": "在意今天的鱼缸",
+        "mood_note": "有点困但开心",
+        "stances": [{"topic": "水草", "stance": "灯要够亮", "confidence": 0.7}],
+        "lessons": ["换水别太勤"],
+        "life": ["今天晒了太阳"],
+    }
+    legacy = dict(base, relationships=[{"user_id": "qq:1", "delta": 0.2, "note": "聊得来"}])
+
+    without_key = parse_reflection(json.dumps(base, ensure_ascii=False))
+    with_key = parse_reflection(json.dumps(legacy, ensure_ascii=False))
+
+    assert without_key is not None
+    assert with_key == without_key
+
+
+def test_parse_reflection_normal_payload_matches_old_behavior() -> None:
+    """去掉 relationships 后，正常 payload 的解析结果保持原有形状。"""
+    payload = json.dumps(
+        {
+            "focus": "在意今天的鱼缸",
+            "mood_note": "有点困但开心",
+            "stances": [{"topic": "水草", "stance": "灯要够亮", "confidence": 0.7}],
+            "lessons": ["换水别太勤"],
+            "life": ["今天晒了太阳"],
+        },
+        ensure_ascii=False,
+    )
+
+    assert parse_reflection(payload) == {
+        "focus": "在意今天的鱼缸",
+        "mood_note": "有点困但开心",
+        "stances": [{"topic": "水草", "stance": "灯要够亮", "confidence": 0.7}],
+        "lessons": ["换水别太勤"],
+        "life": ["今天晒了太阳"],
+    }
 
 
 # ---- 开关与时间闸 ---------------------------------------------------
