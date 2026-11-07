@@ -68,6 +68,30 @@ log = logging.getLogger(__name__)
 # images.materialize 写进 content 的路径注记；这里反过来抽取路径做「图片」提示。
 _IMAGE_PATH_RE = re.compile(r"图存\s+([^\s，)）]+)")
 
+# 进群欢迎模板的唯一合法占位符；``nickname`` 只是兼容旧模板，值与 user_id 相同。
+_JOIN_WELCOME_TOKEN_RE = re.compile(r"\{([^{}]*)\}")
+_JOIN_WELCOME_NAMES = frozenset({"user_id", "nickname"})
+
+
+def _render_join_welcome(template: str, user_id: str) -> str:
+    """渲染进群欢迎模板：只认 ``{user_id}`` / ``{nickname}``。
+
+    出现任何其它占位符（或 ``{}`` 这类空 token）就不做部分替换，直接返回
+    模板原文——宁可发出一个没填的模板，也不要半渲染的残句或抛异常。
+    """
+    unknown = False
+
+    def replace_token(match: re.Match[str]) -> str:
+        nonlocal unknown
+        if match.group(1) not in _JOIN_WELCOME_NAMES:
+            unknown = True
+            return match.group(0)
+        return user_id
+
+    rendered = _JOIN_WELCOME_TOKEN_RE.sub(replace_token, template)
+    return template if unknown else rendered
+
+
 # bot 出站附件的纯文本注记：content 是唯一持久载体，面板靠它做预览。
 # 路径写成 workspace 相对 posix 形式（replies/a.png），与 /api/workspace/file 对齐。
 _ATTACHMENT_NOTE_BY_KIND = {
@@ -1111,13 +1135,81 @@ class Service:
         await self._send_outbox(event.chat_type, event.chat_id, text, origin="poke")
 
     async def _handle_join_welcome(self, event: NoticeEvent) -> None:
-        """进群欢迎占位：任务 9 在这里接模板渲染与每日上限；占位实现不发送。"""
-        log.info(
-            "join %s/%s user=%s（占位，暂不欢迎）",
-            event.chat_type.value,
-            event.chat_id,
-            event.user_id,
+        """进群欢迎：默认关闭、模板单占位符、按会话每日限额，不调用模型。
+
+        渲染规则（``NoticeEvent`` 没有昵称字段，也不做额外资料查询）：
+
+        - ``{user_id}`` 与 ``{nickname}`` 都填 ``event.user_id``；
+        - 其它未知占位符（含 ``{}`` / ``{user_id!r}``）或渲染失败时，
+          原样发送模板文本，绝不抛异常。
+
+        每日计数复用 ``mind_state`` 的
+        ``join_welcome/<chat_type>/<chat_id>/<YYYY-MM-DD>`` 键，不新建表。
+        单进程 asyncio 下这里没有 ``await``，读-判-写不会被并发事件打断，
+        因此「读-检查-写」的计数方式足够（多进程不适用）。
+        """
+        if event.kind != "group_increase":
+            return
+        if not isinstance(event.chat_type, ChatType) or not str(
+            event.chat_id or ""
+        ).strip():
+            log.info(
+                "join 事件缺少有效会话（忽略）: kind=%s chat_id=%r",
+                event.kind,
+                event.chat_id,
+            )
+            return
+        social = self.settings.social
+        if not social.join_welcome_enabled:
+            log.debug(
+                "join %s/%s: social.join_welcome_enabled=false",
+                event.chat_type.value,
+                event.chat_id,
+            )
+            return
+        template = social.join_welcome.strip()
+        if not template:
+            log.debug(
+                "join %s/%s: social.join_welcome 为空（模板未配置）",
+                event.chat_type.value,
+                event.chat_id,
+            )
+            return
+        chat_id = str(event.chat_id)
+        cap = social.join_welcome_daily_cap
+        key = (
+            f"join_welcome/{event.chat_type.value}/{chat_id}/"
+            f"{self._join_welcome_day()}"
         )
+        try:
+            sent_today = int(self.store.get_mind_state(key, "0") or "0")
+        except (TypeError, ValueError):
+            sent_today = 0
+        if sent_today >= cap:
+            log.debug(
+                "join %s/%s: 已达每日欢迎上限 %s",
+                event.chat_type.value,
+                chat_id,
+                cap,
+            )
+            return
+        self.store.set_mind_state(key, str(sent_today + 1))
+        text = _render_join_welcome(template, event.user_id)
+        log.info(
+            "join %s/%s user=%s → 欢迎（当日第 %s/%s 条）",
+            event.chat_type.value,
+            chat_id,
+            event.user_id,
+            sent_today + 1,
+            cap,
+        )
+        await self._send_outbox(
+            event.chat_type, chat_id, text, origin="join_welcome"
+        )
+
+    def _join_welcome_day(self) -> str:
+        """当日上海日期（``YYYY-MM-DD``）；抽成方法便于测试注入固定日期。"""
+        return now_shanghai().date().isoformat()
 
     async def _handle_sync(self, msg: Message) -> None:
         """rules 模式：规则判定通过就同步等模型（旧行为，回滚用）。"""
