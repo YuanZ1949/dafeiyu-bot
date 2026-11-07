@@ -616,6 +616,27 @@ class PendingWeekly:
     days: int
 
 
+@dataclass(frozen=True)
+class CheckpointResult:
+    """一次 ``wal_checkpoint(TRUNCATE)`` 的结构化结果。
+
+    三种「什么都没发生」的旧返回值 ``(0, 0, 0)`` 在这里被拆开：
+
+    - ``log == -1``：库不是 WAL（或 ``:memory:``），没有 ``-wal`` 文件，
+      ``truncated`` 为 False；这不是错误。
+    - ``log == 0``：WAL 存在但没有待回写的帧，``truncated`` 为 True。
+    - ``busy > 0``：别的连接占着锁，本轮没做完，``truncated`` 为 False。
+
+    ``error`` 非空表示这次操作本身失败（消息已成形，调用方只记日志）。
+    """
+
+    busy: int
+    log: int
+    checkpointed: int
+    truncated: bool
+    error: str | None = None
+
+
 def _parse_day(value: str) -> datetime:
     """把 YYYY-MM-DD 解析成上海时区的当天零点。"""
     return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=SHANGHAI)
@@ -1030,23 +1051,61 @@ class Store:
     def close(self) -> None:
         self._conn.close()
 
-    def checkpoint(self) -> tuple[int, int, int]:
-        """执行一次 WAL TRUNCATE 检查点，返回 (busy, log, checkpointed)。
+    def checkpoint(self) -> CheckpointResult:
+        """在一次短超时连接上执行 WAL TRUNCATE 检查点。
 
-        非 WAL 库（含 ``:memory:``）上 SQLite 返回 (0, -1, -1)：统一归一成
-        (0, 0, 0)，调用方不必区分。任何 sqlite3.Error 也不外抛 —— 定时任务
-        不能因为一次锁冲突就退出。
+        主连接保留 ``busy_timeout=5000``（SQLite 的 busy_timeout 是连接级的，
+        不能只对一条语句生效）；这里另开一条只用于该操作的连接，200ms 拿不到
+        锁就返回 busy，事件循环不会被最长 5s 的同步等待拖住。
+
+        任何 sqlite3.Error 只记录在 ``error`` 里、不外抛 —— 定时任务不能因为
+        一次锁冲突就退出。``:memory:`` 库没有共享的 ``-wal`` 文件，也无法用另
+        一条连接访问，直接按「WAL 不存在」返回。
         """
+        if self.path == ":memory:":
+            return CheckpointResult(
+                busy=0, log=-1, checkpointed=-1, truncated=False
+            )
+        conn: sqlite3.Connection | None = None
         try:
-            row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        except sqlite3.Error:
-            return (0, 0, 0)
+            conn = sqlite3.connect(self.path, timeout=0.2)
+            conn.execute("PRAGMA busy_timeout=200")
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.Error as exc:
+            return CheckpointResult(
+                busy=0,
+                log=0,
+                checkpointed=0,
+                truncated=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    # 关闭失败的短连接不能把一次定时任务变成异常。
+                    pass
         if row is None:
-            return (0, 0, 0)
+            return CheckpointResult(
+                busy=0,
+                log=0,
+                checkpointed=0,
+                truncated=False,
+                error="wal_checkpoint 未返回结果",
+            )
         busy, log_pages, checkpointed = int(row[0]), int(row[1]), int(row[2])
-        if busy < 0 or log_pages < 0 or checkpointed < 0:
-            return (0, 0, 0)
-        return (busy, log_pages, checkpointed)
+        if log_pages < 0 or checkpointed < 0:
+            # 非 WAL 库：SQLite 返回 (0, -1, -1)，统一成「没有 WAL 文件」。
+            return CheckpointResult(
+                busy=0, log=-1, checkpointed=-1, truncated=False
+            )
+        return CheckpointResult(
+            busy=busy,
+            log=log_pages,
+            checkpointed=checkpointed,
+            truncated=busy == 0,
+        )
 
     def backup_to(self, path: str | Path) -> None:
         """用 SQLite backup API 写一致性快照（WAL 中已提交的内容也会带上）。"""

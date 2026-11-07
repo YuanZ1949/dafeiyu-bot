@@ -231,14 +231,20 @@ async def checkpoint_loop(
         except TimeoutError:
             pass
         try:
-            busy, log_pages, checkpointed = store.checkpoint()
-            if busy:
-                log.warning("WAL checkpoint 被占用（busy=%s），下一轮再试", busy)
+            # checkpoint 自己会等锁（最多 200ms）：放到工作线程，别卡住事件循环。
+            result = await asyncio.to_thread(store.checkpoint)
+            if result.error:
+                log.warning("WAL checkpoint 失败：%s", result.error)
+            elif result.busy:
+                log.warning("WAL checkpoint 被占用（busy=%s），下一轮再试", result.busy)
+            elif result.log < 0:
+                log.debug("WAL checkpoint 跳过：数据库不是 WAL 模式")
             else:
                 log.debug(
-                    "WAL checkpoint 完成（log=%s, checkpointed=%s）",
-                    log_pages,
-                    checkpointed,
+                    "WAL checkpoint 完成（log=%s, checkpointed=%s, truncated=%s）",
+                    result.log,
+                    result.checkpointed,
+                    result.truncated,
                 )
         except Exception:
             log.exception("WAL checkpoint 失败")
