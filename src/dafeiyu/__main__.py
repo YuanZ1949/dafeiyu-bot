@@ -36,6 +36,7 @@ from .workers.impressions import ImpressionWorker
 from .workers.observer import ObserverWorker, observer_loop
 from .workers.outcome import OutcomeWorker, outcome_loop
 from .workers.reflector import ReflectorWorker, reflector_loop
+from .workers.reminders import reminder_loop
 from .workers.retention import retention_loop
 from .workers.summary import SummaryScheduler, summary_loop
 
@@ -483,6 +484,8 @@ async def main() -> None:
             mind_tasks.append(
                 asyncio.create_task(outcome_loop(workers.outcome, interval=600))
             )
+        # 提醒轮询是主动链路：只走 outbox，不调用模型，也不需要 mind 开关。
+        mind_tasks.append(asyncio.create_task(reminder_loop(service)))
         retention_task = (
             asyncio.create_task(
                 retention_loop(store, settings.memory.retention_days)
