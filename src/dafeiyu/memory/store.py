@@ -1414,8 +1414,12 @@ class Store:
         chat_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
-    ) -> tuple[int, list[tuple[Message, str]]]:
-        """用多个词项做 OR 检索：一次 FTS 查询覆盖整句，适合召回长问句。"""
+    ) -> tuple[int, list[tuple[Message, str, float | None]]]:
+        """用多个词项做 OR 检索：一次 FTS 查询覆盖整句，适合召回长问句。
+
+        返回 (总数, [(消息, 命中摘录, bm25 排名)])。bm25 越小越相关；LIKE
+        回退路径（FTS 不可用或分词无命中）没有排名，第三项为 ``None``。
+        """
         cleaned: list[str] = []
         for raw in terms:
             term = (raw or "").strip()
@@ -1450,7 +1454,7 @@ class Store:
                 if total:
                     rows = self._conn.execute(
                         f"""
-                        SELECT m.*
+                        SELECT m.*, bm25(messages_fts) AS _rank
                         FROM messages_fts
                         JOIN messages m ON m.id = messages_fts.rowid
                         WHERE {where}
@@ -1460,7 +1464,11 @@ class Store:
                         (match, *params, page, skip),
                     ).fetchall()
                     return total, [
-                        (self._row_to_message(r), self._snippet_for_terms(r["content"], cleaned))
+                        (
+                            self._row_to_message(r),
+                            self._snippet_for_terms(r["content"], cleaned),
+                            float(r["_rank"]),
+                        )
                         for r in rows
                     ]
             except sqlite3.OperationalError:
@@ -1485,7 +1493,11 @@ class Store:
             (*params, *like_params, page, skip),
         ).fetchall()
         return int(total_row["total"] or 0), [
-            (self._row_to_message(r), self._snippet_for_terms(r["content"], cleaned))
+            (
+                self._row_to_message(r),
+                self._snippet_for_terms(r["content"], cleaned),
+                None,
+            )
             for r in rows
         ]
 

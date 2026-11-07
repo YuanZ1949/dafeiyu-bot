@@ -86,8 +86,9 @@ def test_term_search_matches_any_term_in_one_query(store: Store) -> None:
     total, hits = store.search_message_terms(terms, GROUP, 100)
 
     assert total == 1
-    assert [message.message_id for message, _ in hits] == ["m1"]
+    assert [message.message_id for message, _, _rank in hits] == ["m1"]
     assert "显卡驱" in hits[0][1]
+    assert hits[0][2] is not None
 
 
 def test_like_fallback_escapes_wildcards(store: Store) -> None:

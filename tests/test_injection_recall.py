@@ -8,6 +8,8 @@ from dafeiyu.memory.context import (
     INJECTION_BOUNDARY,
     INJECTION_RECALL_HEADER,
     InjectionConfig,
+    _recall_lines,
+    _recall_terms,
     build_injection,
 )
 from dafeiyu.memory.store import Store
@@ -162,6 +164,44 @@ def test_recall_respects_topk_and_char_budget(store: Store) -> None:
     )[1]
     assert len(clipped_body) <= 12
     assert clipped_body.endswith("…")
+
+
+def test_recall_orders_by_bm25_not_term_hit_count(store: Store) -> None:
+    """命中词多但文本冗长的旧消息，应排在命中词少但更匹配的短消息之后。"""
+    filler = "今天天气不错我们聊了很多别的事情比如吃饭睡觉打豆豆还有工作学习和生活"
+    for i in range(40):
+        store.add_message(make_msg(f"f{i}", f"{filler}{i}", timestamp=1 + i))
+    store.add_message(
+        make_msg("A", "显卡驱 卡驱动 驱动怎 " + filler * 6, timestamp=100)
+    )
+    store.add_message(make_msg("B", "显卡驱", timestamp=101))
+
+    terms = _recall_terms("显卡驱动怎么装")
+    _, hits = store.search_message_terms(terms, GROUP, "100", limit=50)
+    ranks = {message.message_id: rank for message, _snippet, rank in hits}
+    assert ranks["A"] is not None and ranks["B"] is not None
+    assert ranks["B"] < ranks["A"]  # bm25 越小越相关
+
+    lines = _recall_lines(store, GROUP, "100", ["显卡驱动怎么装"], 5, set())
+    # 旧实现按命中词数计分会让 A（3 词）排在 B（1 词）前面。
+    assert lines[0] == "鱼片: 显卡驱"
+    assert lines[1].startswith("鱼片: 显卡驱 卡驱动 驱动怎")
+
+
+def test_recall_like_fallback_has_no_rank_and_keeps_results(store: Store) -> None:
+    """FTS 不可用时走 LIKE 回退：不抛异常，rank 全为 None，按新的在前。"""
+    store.add_message(make_msg("old", "显卡驱动坏了", timestamp=10))
+    store.add_message(make_msg("new", "显卡驱动好了", timestamp=20))
+    store._messages_fts = False
+
+    total, hits = store.search_message_terms(["显卡驱"], GROUP, "100", limit=10)
+    assert total == 2
+    assert all(rank is None for _message, _snippet, rank in hits)
+
+    lines = _recall_lines(store, GROUP, "100", ["显卡驱动怎么装"], 5, set())
+    assert len(lines) == 2
+    assert lines[0].endswith("显卡驱动好了")
+    assert lines[1].endswith("显卡驱动坏了")
 
 
 def test_recall_ignores_empty_and_short_queries(store: Store) -> None:

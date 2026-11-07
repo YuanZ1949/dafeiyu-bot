@@ -264,8 +264,13 @@ def _recall_lines(
     topk: int,
     exclude_ids: set[str] | None,
 ) -> list[str]:
-    """按最近几条消息检索同会话旧消息；命中词项越多越靠前。"""
-    scores: dict[tuple[str, str, str], int] = {}
+    """按 FTS bm25 相关性召回同会话旧消息。
+
+    每条消息跨多个 query 取最小的非 None rank（越小越相关），升序排列；
+    rank 相同或都没有 rank 时按 ``-timestamp``（新的在前）。LIKE 回退路径
+    没有 rank，统一排在所有有 rank 的消息之后。
+    """
+    ranks: dict[tuple[str, str, str], float] = {}
     found: dict[tuple[str, str, str], Message] = {}
     excluded = exclude_ids or set()
     for raw in queries:
@@ -275,26 +280,31 @@ def _recall_lines(
         _, hits = store.search_message_terms(
             terms, chat_type, chat_id, limit=max(topk * 8, 20)
         )
-        for message, _ in hits:
+        for message, _snippet, rank in hits:
             if message.is_bot or message.message_id in excluded:
                 continue
             key = (message.chat_type.value, message.chat_id, message.message_id)
             found[key] = message
-            folded = message.content.casefold()
-            scores[key] = scores.get(key, 0) + sum(
-                1 for term in terms if term.casefold() in folded
-            )
-    ordered = sorted(
-        found.values(),
-        key=lambda message: (
-            -scores[(message.chat_type.value, message.chat_id, message.message_id)],
-            -int(message.timestamp),
-        ),
-    )
+            if rank is None:
+                continue
+            best = ranks.get(key)
+            if best is None or rank < best:
+                ranks[key] = rank
+    ordered = sorted(found.values(), key=lambda message: _recall_sort_key(message, ranks))
     return [
         f"{message.nickname}: {message.content}"
         for message in ordered[: max(1, min(10, topk))]
     ]
+
+
+def _recall_sort_key(
+    message: Message, ranks: dict[tuple[str, str, str], float]
+) -> tuple[int, float, int]:
+    """有 rank 的按 rank 升序在前，无 rank 的整段靠后；同组按新的在前。"""
+    rank = ranks.get((message.chat_type.value, message.chat_id, message.message_id))
+    if rank is None:
+        return (1, 0.0, -int(message.timestamp))
+    return (0, rank, -int(message.timestamp))
 
 
 def _focus_user_ids(
