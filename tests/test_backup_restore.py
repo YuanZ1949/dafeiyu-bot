@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -181,11 +182,14 @@ async def test_status_reports_last_success(tmp_path: Path) -> None:
     manager = BackupManager(db, tmp_path / "backups", clock=clock)
 
     assert manager.status()["count"] == 0
-    await manager.create()
+    manifest = await manager.create()
     status = manager.status()
     assert status["count"] == 1
     assert status["last_success_at"].startswith("2026-10-26T04:00:00")
     assert status["last_error_at"] is None
+    # 新的 size 语义：status 汇总与 prune 使用同一口径（含 workspace zip）。
+    assert status["total_bytes"] == manifest.size_bytes
+    assert status["max_total_bytes"] == manager.max_total_bytes
     assert manager.last_scheduled_date() is None
 
 
@@ -258,6 +262,9 @@ async def test_backup_includes_workspace_zip(tmp_path: Path) -> None:
     zip_path = tmp_path / "backups" / manifest.workspace_filename
     assert zip_path.exists()
     assert manifest.workspace_sha256 == hashlib.sha256(zip_path.read_bytes()).hexdigest()
+    # R20：配额按 manifest.size_bytes 求和，workspace zip 必须计入。
+    db_path = tmp_path / "backups" / manifest.filename
+    assert manifest.size_bytes >= db_path.stat().st_size + zip_path.stat().st_size
     with zipfile.ZipFile(zip_path) as zf:
         names = set(zf.namelist())
         assert "MEMORY.md" in names
@@ -305,6 +312,8 @@ async def test_backup_succeeds_when_workspace_packaging_fails(
     manifest_path = db_path.with_suffix(".json")
     assert db_path.exists()
     assert manifest_path.exists()
+    # 降级路径：打包失败时 size 只算数据库。
+    assert manifest.size_bytes == db_path.stat().st_size
     assert json.loads(manifest_path.read_text(encoding="utf-8"))["id"] == manifest.id
     assert [item.id for item in manager.list()] == [manifest.id]
 
@@ -347,6 +356,81 @@ async def test_prune_removes_workspace_zip(tmp_path: Path) -> None:
     zips = list((tmp_path / "backups").glob("*workspace.zip"))
     assert len(zips) == 1
     assert len(manager.list()) == 1
+
+
+async def test_prune_enforces_quota_counting_workspace_zip(tmp_path: Path) -> None:
+    """配额按 manifest.size_bytes（DB+zip）求和；触发时删到下限 3 份。"""
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    workspace = make_workspace(tmp_path)
+    clock = FakeClock()
+    backups = tmp_path / "backups"
+    manager = BackupManager(
+        db,
+        backups,
+        daily_keep=10,
+        weekly_keep=0,
+        workspace_dir=workspace,
+        clock=clock,
+    )
+
+    for _ in range(5):
+        await manager.create("scheduled")
+        clock.advance(1)
+    assert len(manager.list()) == 5
+
+    # 构造器把 max_total_gb 下限钳到 1 GiB；这里直接压属性模拟极小配额。
+    manager.max_total_bytes = 1
+    removed = manager.prune()
+
+    remaining = [item for item in manager.list() if item.reason == "scheduled"]
+    # 既有策略：配额不足时从最旧的删起，但至少保留 3 份（下限优先于配额）。
+    assert len(remaining) == 3
+    assert len(removed) == 2
+    assert len(list(backups.glob("*workspace.zip"))) == 3
+    assert manager.status()["total_bytes"] == sum(
+        item.size_bytes for item in remaining
+    )
+
+
+def test_tmp_path_helper_is_unique(tmp_path: Path) -> None:
+    from dafeiyu.supervisor.backup import _tmp_path
+
+    first = _tmp_path(tmp_path, "-workspace.tmp")
+    second = _tmp_path(tmp_path, "-workspace.tmp")
+
+    assert first != second
+    assert first.parent == second.parent == tmp_path
+    assert first.name.startswith(".") and first.name.endswith("-workspace.tmp")
+
+
+async def test_concurrent_create_uses_distinct_tmp_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dafeiyu.supervisor.backup as backup_module
+
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    workspace = make_workspace(tmp_path)
+    manager = BackupManager(
+        db, tmp_path / "backups", workspace_dir=workspace, clock=FakeClock()
+    )
+
+    seen: list[Path] = []
+    original = backup_module._tmp_path
+
+    def record(directory: Path, suffix: str) -> Path:
+        path = original(directory, suffix)
+        seen.append(path)
+        return path
+
+    monkeypatch.setattr(backup_module, "_tmp_path", record)
+
+    # 使用不同 reason 避免最终文件名竞争，只验证并发期间的临时名。
+    await asyncio.gather(manager.create("manual"), manager.create("scheduled"))
+
+    assert len(seen) == 4  # 2 个 DB tmp + 2 个 workspace tmp
+    assert len(set(seen)) == len(seen)
 
 
 def test_read_manifest_tolerates_missing_workspace_fields(tmp_path: Path) -> None:

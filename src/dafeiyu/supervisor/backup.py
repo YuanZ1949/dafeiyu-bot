@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
+from uuid import uuid4
 
 from .. import __version__
 from ..timeutil import now_shanghai
@@ -49,6 +50,11 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 #: 没有上限时，工作区膨胀会拖慢备份，也给了 zip 炸弹一个入口。
 MAX_WORKSPACE_FILES = 20000
 MAX_WORKSPACE_BYTES = 512 * 1024 * 1024
+
+
+def _tmp_path(directory: Path, suffix: str) -> Path:
+    """唯一临时文件名：同进程并发备份不会写坏同一个 tmp（R20）。"""
+    return directory / f".{uuid4().hex}{suffix}"
 
 
 class BackupError(Exception):
@@ -174,7 +180,7 @@ class BackupManager:
             self._record_error("源数据库不存在")
             raise BackupError(f"源数据库不存在：{self.db_path}")
         self._running = True
-        tmp = self.backup_dir / f".{os.getpid()}-{reason}.tmp"
+        tmp = _tmp_path(self.backup_dir, f"-{reason}.tmp")
         try:
             source = sqlite3.connect(
                 f"{self.db_path.as_uri()}?mode=ro", uri=True, timeout=5
@@ -203,12 +209,20 @@ class BackupManager:
             except OSError as exc:
                 log.warning("工作区打包失败，本次只备份数据库：%s", exc)
                 workspace_filename, workspace_sha256 = "", ""
+            # 配额按 manifest.size_bytes 求和（prune），workspace zip 必须一起算，
+            # 否则备份总量可以悄悄超过 max_total_gb（R20）。
+            workspace_bytes = 0
+            if workspace_filename:
+                with contextlib.suppress(OSError):
+                    workspace_bytes = (
+                        self.backup_dir / workspace_filename
+                    ).stat().st_size
             manifest = BackupManifest(
                 id=Path(filename).stem,
                 filename=filename,
                 created_at=now.isoformat(timespec="seconds"),
                 reason=reason,
-                size_bytes=target.stat().st_size,
+                size_bytes=target.stat().st_size + workspace_bytes,
                 sha256=digest,
                 schema_version=schema_version,
                 integrity_ok=True,
@@ -270,7 +284,7 @@ class BackupManager:
             )
         name = f"{db_backup.stem}-workspace.zip"
         target = self.backup_dir / name
-        tmp = target.with_name(f".{os.getpid()}-workspace.tmp")
+        tmp = _tmp_path(self.backup_dir, "-workspace.tmp")
         try:
             with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
                 for path in files:
@@ -472,11 +486,15 @@ class BackupManager:
             (self.backup_dir / manifest.workspace_filename).unlink(missing_ok=True)
 
     def status(self) -> dict[str, Any]:
+        manifests = self.list()
         return {
             "last_success_at": self._last_success_at,
             "last_error_at": self._last_error_at,
             "last_error": self._last_error,
-            "count": len(self.list()),
+            "count": len(manifests),
+            # size_bytes 现在含 workspace zip；total_bytes 与 prune 的配额口径一致。
+            "total_bytes": sum(item.size_bytes for item in manifests),
+            "max_total_bytes": self.max_total_bytes,
             "running": self._running,
         }
 
