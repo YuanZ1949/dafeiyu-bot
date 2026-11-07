@@ -70,6 +70,7 @@ CHAT_SCOPED_TABLES: tuple[str, ...] = (
     "delivered_messages",
     "pending_outbox",
     "session_summaries",
+    "reminders",
 )
 
 # forget_messages（软忘记）的子集：只清原文与投递状态、保留聚合记忆。
@@ -423,6 +424,27 @@ CREATE TABLE IF NOT EXISTS pending_outbox (
 
 CREATE INDEX IF NOT EXISTS idx_pending_outbox_due
     ON pending_outbox (next_attempt_at, id);
+
+-- 定时提醒（/remind）：due_at / created_at / sent_at / canceled_at 都是 epoch 秒，
+-- 和 messages.timestamp 同一口径，避免时区/夏令时把到期时间算歪。
+-- status: pending|sent|canceled；sent 是「已投递或已交给 outbox」的终态
+-- （at-most-once），投递失败原因只记在 last_error 上，不回退 pending。
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_type TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    due_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at REAL NOT NULL,
+    sent_at REAL,
+    canceled_at REAL,
+    last_error TEXT
+);
+
+-- 轮询只按 (到期时间, id) 取 pending，单列索引足够。
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (due_at, id);
 
 -- 跨群「查证结论」缓存：同一件事在一个群查清后，别的群再问到不必重查。
 -- question_key 是归一化问句（去标点/空白/大小写），写入前已做隐私过滤：
@@ -1889,6 +1911,113 @@ class Store:
             "SELECT attempts FROM pending_outbox WHERE id = ?", (int(row_id),)
         ).fetchone()
         return int(row["attempts"]) if row is not None else 0
+
+    # ------------------------------------------------------------ 定时提醒
+    # 提醒是「主动出站」的最小载体：只存一条待发文本与到期时刻，
+    # 由 worker 轮询取走。行映射统一用 dict（和 due_outbox 同口径），
+    # 因为消费方是 worker 而不是注入层，不需要再加 dataclass。
+
+    def add_reminder(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        creator_id: str,
+        content: str,
+        due_at: float,
+    ) -> int:
+        """记一条待发提醒，返回行 id（0 = 空内容，未写库）。"""
+        body = str(content or "").strip()
+        if not body:
+            return 0
+        cur = self._conn.execute(
+            """
+            INSERT INTO reminders
+                (chat_type, chat_id, creator_id, content, due_at, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                chat_type.value,
+                chat_id,
+                creator_id,
+                body,
+                float(due_at),
+                time.time(),
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def due_reminders(self, now: float, limit: int = 20) -> list[dict[str, Any]]:
+        """到点未发的提醒，按 (到期时间, id) 返回；limit <= 0 直接空。"""
+        rows = self._conn.execute(
+            """
+            SELECT id, chat_type, chat_id, creator_id, content, due_at,
+                   status, created_at, sent_at, canceled_at, last_error
+            FROM reminders
+            WHERE status = 'pending' AND due_at <= ?
+            ORDER BY due_at, id
+            LIMIT ?
+            """,
+            (float(now), max(0, int(limit))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_reminder_sent(
+        self, reminder_id: int, last_error: str | None = None
+    ) -> bool:
+        """把提醒标成已发（单事务写 status/sent_at/last_error）。
+
+        `last_error` 只记录投递失败原因，不阻止状态前进：提醒是 at-most-once，
+        失败时由 pending_outbox 兜底重发，同一行不会再次进入 due 列表。
+        """
+        error = None if last_error is None else str(last_error)[:300]
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                UPDATE reminders SET status = 'sent', sent_at = ?, last_error = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (time.time(), error, int(reminder_id)),
+            )
+        return cur.rowcount > 0
+
+    def cancel_reminder(
+        self, reminder_id: int, chat_type: ChatType, chat_id: str, creator_id: str
+    ) -> bool:
+        """只有创建者、且只在 pending 时能取消；跨会话/越权一律 False。"""
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                UPDATE reminders SET status = 'canceled', canceled_at = ?
+                WHERE id = ? AND chat_type = ? AND chat_id = ?
+                  AND creator_id = ? AND status = 'pending'
+                """,
+                (
+                    time.time(),
+                    int(reminder_id),
+                    chat_type.value,
+                    chat_id,
+                    creator_id,
+                ),
+            )
+        return cur.rowcount > 0
+
+    def list_reminders(
+        self, chat_type: ChatType, chat_id: str, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """某会话最近的提醒：pending 在前，同类里新的在前（/remind list 用）。"""
+        rows = self._conn.execute(
+            """
+            SELECT id, chat_type, chat_id, creator_id, content, due_at,
+                   status, created_at, sent_at, canceled_at, last_error
+            FROM reminders
+            WHERE chat_type = ? AND chat_id = ?
+            ORDER BY (status = 'pending') DESC, id DESC
+            LIMIT ?
+            """,
+            (chat_type.value, chat_id, max(0, int(limit))),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     # ---- 跨群查证缓存 ---------------------------------------------
     def add_shared_fact(
