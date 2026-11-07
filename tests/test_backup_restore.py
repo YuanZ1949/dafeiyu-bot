@@ -457,6 +457,165 @@ def test_read_manifest_tolerates_missing_workspace_fields(tmp_path: Path) -> Non
     assert manifest.workspace_sha256 == ""
 
 
+# ---- mirror (异地镜像) -----------------------------------------------------
+
+
+async def test_mirror_dir_copies_db_manifest_and_workspace_zip(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    workspace = make_workspace(tmp_path)
+    backups = tmp_path / "backups"
+    mirror = tmp_path / "mirror" / "nested"  # 故意不存在，验证 create 会建目录
+    manager = BackupManager(
+        db,
+        backups,
+        workspace_dir=workspace,
+        mirror_dir=mirror,
+        clock=FakeClock(),
+    )
+    assert not mirror.exists()
+
+    manifest = await manager.create()
+
+    assert mirror.is_dir()
+    assert manifest.workspace_filename
+    names = (
+        manifest.filename,
+        f"{manifest.id}.json",
+        manifest.workspace_filename,
+    )
+    for name in names:
+        source = backups / name
+        target = mirror / name
+        assert source.is_file()
+        assert target.is_file()
+        assert target.stat().st_size == source.stat().st_size
+    mirrored = json.loads((mirror / f"{manifest.id}.json").read_text(encoding="utf-8"))
+    assert mirrored["id"] == manifest.id
+    assert mirrored["workspace_filename"] == manifest.workspace_filename
+
+    status = manager.status()
+    assert Path(status["mirror_dir"]) == mirror
+    assert status["mirror_last_error_at"] is None
+    assert status["mirror_last_error"] == ""
+
+
+async def test_mirror_failure_is_isolated_from_main_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dafeiyu.supervisor.backup as backup_module
+
+    db = tmp_path / "dafeiyu.db"
+    store = make_db(db)
+    add_message(store)
+    store.close()
+    backups = tmp_path / "backups"
+    mirror = tmp_path / "mirror"
+    manager = BackupManager(
+        db, backups, mirror_dir=mirror, clock=FakeClock()
+    )
+
+    def fail_copy(*args: object, **kwargs: object) -> None:
+        raise OSError("mirror is not writable")
+
+    monkeypatch.setattr(backup_module.shutil, "copyfile", fail_copy)
+
+    manifest = await manager.create("manual")
+
+    # 主备份完整且成功：文件、manifest、校验、list 全部正常。
+    assert manifest.integrity_ok is True
+    db_backup = backups / manifest.filename
+    manifest_path = backups / f"{manifest.id}.json"
+    assert db_backup.is_file()
+    assert manifest_path.is_file()
+    assert manifest.sha256 == hashlib.sha256(db_backup.read_bytes()).hexdigest()
+    assert [item.id for item in manager.list()] == [manifest.id]
+
+    status = manager.status()
+    # 主错误字段完全没被污染。
+    assert status["last_success_at"] is not None
+    assert status["last_error_at"] is None
+    assert status["last_error"] == ""
+    # 镜像失败写在独立字段里。
+    assert status["mirror_last_error_at"] is not None
+    assert "not writable" in status["mirror_last_error"]
+    # 失败不会留下半截文件或 tmp。
+    assert list(mirror.glob("*")) == []
+
+
+async def test_mirror_disabled_copies_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dafeiyu.supervisor.backup as backup_module
+
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    manager = BackupManager(db, tmp_path / "backups", clock=FakeClock())
+
+    copied: list[tuple[Path, Path]] = []
+    original = backup_module._atomic_copy
+
+    def record(source: Path, target: Path) -> None:
+        copied.append((source, target))
+        original(source, target)
+
+    monkeypatch.setattr(backup_module, "_atomic_copy", record)
+
+    manifest = await manager.create()
+
+    assert copied == []
+    assert manager.status()["mirror_dir"] == ""
+    assert manager.status()["mirror_last_error_at"] is None
+    assert (tmp_path / "backups" / manifest.filename).is_file()
+    assert [item.id for item in manager.list()] == [manifest.id]
+
+
+def test_load_settings_backup_mirror_dir_defaults_empty(tmp_path: Path) -> None:
+    from dafeiyu.config import load_settings
+
+    base = """\
+persona:
+  name: 溟月
+  aliases: [大肥鱼]
+  max_reply_chars: 120
+  max_reply_chars_technical: 300
+  os_probability: 0.05
+triggers:
+  cooldown_seconds: 60
+  sample_rate: 0.05
+  quiet_hours: ["01:00", "07:00"]
+  keywords: [怎么]
+groups:
+  whitelist: []
+  blacklist: []
+budget:
+  daily_calls: 200
+  daily_tokens: 300000
+memory:
+  window_size: 20
+  impression_topk: 5
+  extract_every: 20
+logging:
+  level: INFO
+  dir: logs
+"""
+    env = tmp_path / "test.env"
+    env.write_text("DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n", encoding="utf-8")
+    config = tmp_path / "config.yaml"
+    config.write_text(base, encoding="utf-8")
+
+    default = load_settings(env_file=env, config_file=config)
+    assert default.backup.mirror_dir == ""
+
+    config.write_text(
+        base + "backup:\n  mirror_dir: '  D:/mirror  '\n", encoding="utf-8"
+    )
+    configured = load_settings(env_file=env, config_file=config)
+    assert configured.backup.mirror_dir == "D:/mirror"
+
+
 # ---- restore ---------------------------------------------------------------
 
 class FakeSupervisor:

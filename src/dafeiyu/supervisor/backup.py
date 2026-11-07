@@ -57,6 +57,16 @@ def _tmp_path(directory: Path, suffix: str) -> Path:
     return directory / f".{uuid4().hex}{suffix}"
 
 
+def _atomic_copy(source: Path, target: Path) -> None:
+    """镜像复制：先写同目录唯一 tmp，再 os.replace，避免半截文件。"""
+    tmp = _tmp_path(target.parent, f"-{target.name}.tmp")
+    try:
+        shutil.copyfile(source, tmp)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 class BackupError(Exception):
     pass
 
@@ -154,11 +164,14 @@ class BackupManager:
         audit: AuditLog | None = None,
         clock: Callable[[], datetime] | None = None,
         workspace_dir: Path | None = None,
+        mirror_dir: Path | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.backup_dir = Path(backup_dir)
         # 长期记忆工作区：None 时不产 zip，行为与旧版本完全一致。
         self.workspace_dir = Path(workspace_dir) if workspace_dir else None
+        # 异地镜像：None/空时完全关闭，不影响主备份路径。
+        self.mirror_dir = Path(mirror_dir) if mirror_dir else None
         self.daily_keep = max(0, int(daily_keep))
         self.weekly_keep = max(0, int(weekly_keep))
         self.max_total_bytes = max(1, int(max_total_gb)) * 1024**3
@@ -168,6 +181,9 @@ class BackupManager:
         self._last_success_at: str | None = None
         self._last_error_at: str | None = None
         self._last_error = ""
+        # 镜像失败独立记录：绝不污染主备份的 last_error/成功状态。
+        self._mirror_last_error_at: str | None = None
+        self._mirror_last_error = ""
         self.backup_dir.mkdir(parents=True, exist_ok=True)
 
     async def create(self, reason: str = "manual") -> BackupManifest:
@@ -243,6 +259,8 @@ class BackupManager:
                         "sha256": digest,
                     },
                 )
+            # 主备份已成功落盘：镜像只是附加动作，任何失败都不影响本次成功。
+            self._mirror(manifest)
             self.prune()
             return manifest
         except BackupError:
@@ -259,6 +277,41 @@ class BackupManager:
         self._last_error = message
         self._last_error_at = self._clock().isoformat(timespec="seconds")
         log.warning("备份失败：%s", message)
+
+    def _record_mirror_error(self, message: str) -> None:
+        self._mirror_last_error = message
+        self._mirror_last_error_at = self._clock().isoformat(timespec="seconds")
+        log.warning("备份镜像失败（主备份不受影响）：%s", message)
+
+    def _mirror(self, manifest: BackupManifest) -> None:
+        """把刚写好的 DB/manifest（以及存在的 workspace zip）复制到异地目录。
+
+        这是主备份成功之后的附加动作：任何异常都在这里吞掉，只写独立的
+        镜像错误字段，绝不改变主备份结果、也绝不向调用方抛出。
+        """
+        mirror = self.mirror_dir
+        if mirror is None:
+            return
+        try:
+            # 镜像目录若与主目录相同，复制等于就地覆盖自己，没有意义。
+            if mirror.resolve() == self.backup_dir.resolve():
+                log.debug("backup.mirror_dir 与 backup.dir 相同，跳过镜像")
+                return
+            mirror.mkdir(parents=True, exist_ok=True)
+            sources = [
+                self.backup_dir / manifest.filename,
+                self.backup_dir / f"{manifest.id}.json",
+            ]
+            if manifest.workspace_filename:
+                workspace = self.backup_dir / manifest.workspace_filename
+                if workspace.is_file():
+                    sources.append(workspace)
+            for source in sources:
+                _atomic_copy(source, mirror / source.name)
+        except Exception as exc:  # noqa: BLE001 - 镜像失败必须被隔离
+            self._record_mirror_error(str(exc))
+        else:
+            self._mirror_last_error = ""
 
     def _backup_workspace(self, db_backup: Path) -> tuple[str, str]:
         """把工作区打平成 `<db stem>-workspace.zip`；目录缺失或为空则不产文件。"""
@@ -496,6 +549,9 @@ class BackupManager:
             "total_bytes": sum(item.size_bytes for item in manifests),
             "max_total_bytes": self.max_total_bytes,
             "running": self._running,
+            "mirror_dir": str(self.mirror_dir) if self.mirror_dir is not None else "",
+            "mirror_last_error_at": self._mirror_last_error_at,
+            "mirror_last_error": self._mirror_last_error,
         }
 
     def last_scheduled_date(self) -> str | None:

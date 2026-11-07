@@ -541,6 +541,8 @@ class BackupConfig:
     schedule_hour: int = 4
     max_total_gb: int = 20
     max_upload_mb: int = 512
+    # 异地镜像目录：非空时每份成功备份再复制一份过去（空 = 关闭）。
+    mirror_dir: str = ""
 
 
 @dataclass(frozen=True)
@@ -822,6 +824,7 @@ def _build_backup(raw: dict[str, Any]) -> BackupConfig:
         schedule_hour=schedule_hour,
         max_total_gb=max_total_gb,
         max_upload_mb=max_upload_mb,
+        mirror_dir=str(raw.get("mirror_dir", "") or "").strip(),
     )
 
 

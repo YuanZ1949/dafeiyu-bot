@@ -351,6 +351,10 @@ def build_ops(
         workspace_dir=(
             _repo_path(settings.workspace.dir) if settings.workspace.enabled else None
         ),
+        # 异地镜像：backup.mirror_dir 为空时不启用。
+        mirror_dir=(
+            _repo_path(settings.backup.mirror_dir) if settings.backup.mirror_dir else None
+        ),
     )
 
     async def ready_check() -> bool:
