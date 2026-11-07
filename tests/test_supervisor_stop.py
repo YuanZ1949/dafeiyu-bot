@@ -180,7 +180,8 @@ async def test_stop_fallback_ignores_non_supervisor_port_owner(tmp_path):
     finally:
         _reap(proc)
 
-    assert result.status == "not_running"
+    assert result.status == "failed"
+    assert result.port_busy is True
     assert result.stale is False
     assert calls["shutdown"] == 0
     assert not path.exists()
@@ -223,7 +224,8 @@ async def test_stop_dead_pid_does_not_kill_unrelated_port_owner(tmp_path):
     finally:
         _reap(proc)
 
-    assert result.status == "not_running"
+    assert result.status == "failed"
+    assert result.port_busy is True
     assert result.stale is True
     assert calls["shutdown"] == 0
     assert not path.exists()

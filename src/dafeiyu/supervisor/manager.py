@@ -502,42 +502,78 @@ def pid_alive(pid: int) -> bool:
 
 
 def port_owner(port: int) -> int | None:
-    """返回监听该端口的 PID；无人监听返回 None。"""
+    """返回监听该端口的 PID；无人监听返回 None。
+
+    `dashboard.host` 可以是 `0.0.0.0`、`127.0.0.1`，也可以是 `::`/`::1`：
+    后者只监听 IPv6，只探 `127.0.0.1` 会把「端口仍被占着」误判成没人监听。
+    先探 IPv4，失败再单独尝试 IPv6（部分容器/机器没有 `::1`，connect 会立刻失败）。
+    """
+    reachable = False
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=0.3):
             pass
+        reachable = True
     except OSError:
+        pass
+    if not reachable:
+        try:
+            with socket.create_connection(("::1", port), timeout=0.3):
+                pass
+            reachable = True
+        except OSError:
+            pass
+    if not reachable:
         return None
     return _find_listener_pid(port)
+
+
+def _listener_pid_from_netstat(text: str, port: int) -> int | None:
+    """从一段 netstat 输出里找监听 `port` 的 PID。
+
+    本地地址可能是 `127.0.0.1:8080`，也可能是 `[::1]:8080` / `[::]:8080`：
+    IPv6 地址自身带冒号，因此端口只取最后一个冒号之后的那段（不能按冒号 split 取固定下标）。
+    """
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        local, state, pid = parts[1], parts[3].upper(), parts[4]
+        if state != "LISTENING":
+            continue
+        _, _, port_text = local.rpartition(":")
+        if not port_text.isdigit() or int(port_text) != port:
+            continue
+        try:
+            return int(pid)
+        except ValueError:
+            return None
+    return None
 
 
 def _find_listener_pid(port: int) -> int | None:
     if os.name != "nt":
         return None
-    try:
-        import subprocess
+    import subprocess
 
-        out = subprocess.run(
-            ["netstat", "-ano", "-p", "TCP"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            encoding="mbcs",
-            errors="replace",
-            check=False,
-            **hidden_kwargs(),
-        ).stdout
-    except Exception:  # noqa: BLE001 - 探测失败只表示「查不到」，调用方按无 PID 处理
-        return None
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 5 and parts[0].upper() == "TCP":
-            local, state, pid = parts[1], parts[3].upper(), parts[4]
-            if state == "LISTENING" and local.endswith(f":{port}"):
-                try:
-                    return int(pid)
-                except ValueError:
-                    return None
+    # IPv4 与 IPv6 的监听项分属两张表：host 为 `::` 时只有 TCPv6 里有记录。
+    # 任一表查询失败（老系统无 TCPv6 等）都只表示「这张表查不到」。
+    for family in ("TCP", "TCPv6"):
+        try:
+            out = subprocess.run(
+                ["netstat", "-ano", "-p", family],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                encoding="mbcs",
+                errors="replace",
+                check=False,
+                **hidden_kwargs(),
+            ).stdout
+        except Exception:  # noqa: BLE001 - 探测失败只表示「查不到」，调用方按无 PID 处理
+            continue
+        pid = _listener_pid_from_netstat(out or "", port)
+        if pid is not None:
+            return pid
     return None
 
 

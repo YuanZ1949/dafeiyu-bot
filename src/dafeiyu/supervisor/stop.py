@@ -30,6 +30,10 @@ PID_PATH = REPO_ROOT / "data" / "supervisor.pid"
 _STILL_ACTIVE = 259
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
+# 退出码：0 成功/未运行；1 通用失败；2 进程已退出但端口被别的进程占着（R17）。
+EXIT_FAILED = 1
+EXIT_PORT_BUSY = 2
+
 
 @dataclass
 class StopResult:
@@ -37,6 +41,9 @@ class StopResult:
     pid: int | None = None
     method: str | None = None  # shutdown | forced
     stale: bool = False
+    # 进程已退出（或 pid 文件指向的进程不是 supervisor）但端口仍被占用：
+    # 用来把「端口被别的进程占着」和普通的停止失败区分开。
+    port_busy: bool = False
 
 
 def read_pid(path: Path = PID_PATH) -> int | None:
@@ -177,6 +184,16 @@ def _supervisor_pid_on_port(
     return owner
 
 
+def _port_occupied(port: int, port_finder: PortFinder) -> bool:
+    """端口是否仍有进程监听；查询失败一律按「没占用」处理（与旧行为一致）。"""
+    try:
+        owner = port_finder(port)
+    except Exception:  # noqa: BLE001 - 查不到就不算占用
+        return False
+    # 自己持有端口不算「被别的进程占着」（进程退出后端口就释放了）。
+    return owner is not None and owner > 0 and owner != os.getpid()
+
+
 async def stop_supervisor(
     *,
     host: str = "127.0.0.1",
@@ -202,6 +219,15 @@ async def stop_supervisor(
         # pid 文件丢了/损坏/过期时，按端口兜底找回仍活着的 supervisor。
         fallback = _supervisor_pid_on_port(port, port_finder, cmdline_fn)
         if fallback is None:
+            if _port_occupied(port, port_finder):
+                # supervisor 已经不在，端口却还被别的进程占着：下次启动必然冲突，
+                # 不能再报 not_running（R17）。
+                return StopResult(
+                    status="failed",
+                    pid=recorded_pid,
+                    stale=stale,
+                    port_busy=True,
+                )
             return StopResult(status="not_running", pid=recorded_pid, stale=stale)
         pid = fallback
         stale = True
@@ -273,8 +299,16 @@ def main() -> int:
         else:
             print(f"supervisor 已关闭（pid {result.pid}）")
         return 0
+    if result.port_busy:
+        note = "（已清理残留 pid 文件）" if result.stale else ""
+        print(
+            f"停止失败：supervisor 进程已退出{note}，但端口 {dashboard.port} "
+            "仍被其它进程占用；请先结束占用该端口的进程再启动",
+            file=sys.stderr,
+        )
+        return EXIT_PORT_BUSY
     print(f"停止失败：进程 {result.pid} 仍在运行", file=sys.stderr)
-    return 1
+    return EXIT_FAILED
 
 
 if __name__ == "__main__":
