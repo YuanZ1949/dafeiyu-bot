@@ -40,7 +40,7 @@ from .memory.rotation import apply_rotation, needs_rotation
 from .memory.store import Store
 from .memory.timeline import TIMELINE_LIMIT, build_batch_prompt, time_label
 from .memory.workspace import Workspace
-from .models import QQ_PREFIX, Attachment, ChatType, Message, RecallEvent, channel_of
+from .models import QQ_PREFIX, Attachment, ChatType, Message, NoticeEvent, RecallEvent, channel_of
 from .moment import (
     analyze,
     answers_bot_question,
@@ -456,6 +456,10 @@ class Service:
             on_recall = getattr(adapter, "on_recall", None)
             if callable(on_recall):
                 on_recall(self.handle_recall)
+            # notice（戳一戳/进退群/禁言）同样「有才接」：没有该接口的适配器跳过。
+            on_notice = getattr(adapter, "on_notice", None)
+            if callable(on_notice):
+                on_notice(self.handle_notice)
             # 微信桥重启后 resync 时靠它从 messages 表重建回声；没有该接口的
             # 假/旧适配器自然跳过，不影响 QQ。
             seed = getattr(adapter, "set_echo_seed", None)
@@ -1009,6 +1013,57 @@ class Service:
     async def handle_recall(self, event: RecallEvent) -> None:
         """撤回只做标记：原文留库，时间线渲染成占位，摘要/抽取跳过。"""
         self.store.mark_recalled(event.chat_type, event.chat_id, event.message_id)
+
+    async def handle_notice(self, event: NoticeEvent) -> None:
+        """分发 QQ notice：社交动作走钩子，退群/禁言与未知类型只记日志。
+
+        poke 语义（任务 8 的戳一戳回应依赖它）：``event.user_id`` 是**被戳的人**，
+        ``event.operator_id`` 是**戳的人**；回应应发回 ``event.chat_id``。这两个
+        字段的方向与一般 notice 相反，别写反了。
+        """
+        if event.kind in ("group_poke", "friend_poke"):
+            await self._handle_poke(event)
+        elif event.kind == "group_increase":
+            await self._handle_join_welcome(event)
+        elif event.kind in ("group_decrease", "group_ban"):
+            log.info(
+                "notice %s %s/%s user=%s operator=%s duration=%s（只记日志，不发送）",
+                event.kind,
+                event.chat_type.value,
+                event.chat_id,
+                event.user_id,
+                event.operator_id,
+                event.duration,
+            )
+        else:
+            log.info(
+                "notice 未知类型 %s %s/%s（只记日志，不发送）",
+                event.kind,
+                event.chat_type.value,
+                event.chat_id,
+            )
+
+    async def _handle_poke(self, event: NoticeEvent) -> None:
+        """戳一戳回应占位：任务 8 在这里接冷却/每日上限/静音与预算门控。
+
+        ``event.user_id`` 是被戳者、``event.operator_id`` 是发起者；占位实现不发送。
+        """
+        log.info(
+            "poke %s/%s target=%s operator=%s（占位，暂不回应）",
+            event.chat_type.value,
+            event.chat_id,
+            event.user_id,
+            event.operator_id,
+        )
+
+    async def _handle_join_welcome(self, event: NoticeEvent) -> None:
+        """进群欢迎占位：任务 9 在这里接模板渲染与每日上限；占位实现不发送。"""
+        log.info(
+            "join %s/%s user=%s（占位，暂不欢迎）",
+            event.chat_type.value,
+            event.chat_id,
+            event.user_id,
+        )
 
     async def _handle_sync(self, msg: Message) -> None:
         """rules 模式：规则判定通过就同步等模型（旧行为，回滚用）。"""

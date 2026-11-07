@@ -527,6 +527,7 @@ class QQAdapter:
         self.bot_message_ids: deque[str] = deque(maxlen=max_bot_message_ids)
         self._handler: Callable[[Message], Awaitable[None]] | None = None
         self._recall_handler: Callable[[RecallEvent], Awaitable[None]] | None = None
+        self._notice_handler: Callable[[NoticeEvent], Awaitable[None]] | None = None
         self._server: Server | None = None
         self._ws: ServerConnection | None = None
         self._pending: dict[str, tuple[asyncio.Future[dict[str, Any]], str]] = {}
@@ -560,6 +561,9 @@ class QQAdapter:
 
     def on_recall(self, handler: Callable[[RecallEvent], Awaitable[None]]) -> None:
         self._recall_handler = handler
+
+    def on_notice(self, handler: Callable[[NoticeEvent], Awaitable[None]]) -> None:
+        self._notice_handler = handler
 
     async def start(self) -> None:
         if self._server is not None:
@@ -784,7 +788,6 @@ class QQAdapter:
             if event is None:
                 return
             if isinstance(event, NoticeEvent):
-                # 安全默认：只记录，不触发模型回复（后续要接再接）。
                 logger.info(
                     "QQ notice %s %s/%s user=%s operator=%s sub=%s duration=%s",
                     event.kind,
@@ -795,6 +798,12 @@ class QQAdapter:
                     event.sub_type,
                     event.duration,
                 )
+                # 未注册处理器时只记日志（安全默认）；注册后交给 Service 分发。
+                if self._notice_handler is None:
+                    return
+                task = asyncio.create_task(self._run_notice(event))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
                 return
             self.last_event_at = time.time()
             if isinstance(event, RecallEvent):
@@ -839,6 +848,13 @@ class QQAdapter:
             await self._recall_handler(event)
         except Exception:
             logger.exception("撤回处理器异常")
+
+    async def _run_notice(self, event: NoticeEvent) -> None:
+        assert self._notice_handler is not None
+        try:
+            await self._notice_handler(event)
+        except Exception:
+            logger.exception("notice 处理器异常")
 
     def _fail_pending(self, exc: Exception) -> None:
         for future, _action in self._pending.values():
