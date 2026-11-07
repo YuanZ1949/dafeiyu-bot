@@ -263,12 +263,12 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `memory.recall_topk` | `3` | 相关旧记忆最多注入几条 |
 | `memory.recall_chars` | `300` | 相关旧记忆段落的字符预算 |
 | `memory.scene_injection` | `true` | 注入「此刻」：现在几点、本群叫什么、距上次开口多久、刚才是谁在说；关掉后 prompt 里不再有这行 |
-| `memory.inject_episodes` | `false` | 注入「正在聊的事」（`episodes` 最新一条 open 的一句话摘要）；数据由 Observer 写，默认关 |
-| `memory.inject_open_loops` | `false` | 注入「没有下文的事」（谁问了没人接、谁答应了没做）；默认关 |
+| `memory.inject_episodes` | 示例/本机 `true`，代码 `false` | 注入「正在聊的事」（`episodes` 最新一条 open 的一句话摘要），数据由 Observer 写。示例配置与本机 `config.yaml` 默认 `true`（已打开）；`InjectionConfig` 代码默认 `false`，缺键的旧配置行为不变（仍不注入） |
+| `memory.inject_open_loops` | 示例/本机 `true`，代码 `false` | 注入「没有下文的事」（谁问了没人接、谁答应了没做）。示例配置与本机 `config.yaml` 默认 `true`（已打开）；`InjectionConfig` 代码默认 `false`，缺键的旧配置行为不变（仍不注入） |
 | `memory.open_loop_topk` | `3` | 「没有下文的事」最多注入几条 |
 | `memory.open_loop_chars` | `200` | 「没有下文的事」段落的字符预算 |
 | `memory.episode_chars` | `220` | 「正在聊的事」段落的字符预算 |
-| `memory.mind_chars` | `600` | 「正在聊的事 + 没有下文的事 + 你和他 + 本鱼的近况 + 群友印象」合计预算；超了按印象→未了事→关系卡→近况丢弃，最后截断正在聊的事 |
+| `memory.mind_chars` | `1000` | 「正在聊的事 + 没有下文的事 + 你和他 + 本鱼的近况 + 我的立场 + 群友印象」六段合计预算（默认 1000，装得下六段上限 990，只数数据体不数标题）；超了按印象→立场→近况→关系卡→未了事整段丢弃，正在聊的事永不主动丢、只在最后截断 |
 | `memory.state_chars` | `100` | 「本鱼的近况」段落的字符预算 |
 | `memory.relation_chars` | `160` | 「你和他」关系卡段落的字符预算 |
 | `memory.stance_topk` | `3` | 「我的立场」最多注入几条（跨群共享，按 confidence 排序） |
