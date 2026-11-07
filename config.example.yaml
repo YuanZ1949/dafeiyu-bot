@@ -329,11 +329,13 @@ memory:
   recall_enabled: true
   recall_topk: 3
   recall_chars: 300
-  # 记忆层（P1）：episodes / open_loops 由 Observer 写入，注入默认关。
+  # 记忆层（P1）：episodes / open_loops 由 Observer 写入。
   # 「正在聊的事」= 当前这段对话的一句话摘要，只注最新一条 open；
   # 「没有下文的事」= 谁问了没人接、谁答应了没做，取最近 1–3 条。
-  inject_episodes: false
-  inject_open_loops: false
+  # 示例配置与本机配置默认 true（打开注入）；代码默认 false，缺键的旧配置行为
+  # 不变，可软回滚到「不注入」。
+  inject_episodes: true
+  inject_open_loops: true
   open_loop_topk: 3
   open_loop_chars: 200
   episode_chars: 220
