@@ -286,10 +286,19 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `mind.stances_enabled` | `true` | 总闸打开时是否注入「我的立场」（Reflector 每晚写入，同一话题覆盖旧观点） |
 | `mind.inbound_media_reactions` | `false` | 群里的语音/图片到达时先贴个表情回应（旁路，失败只记日志） |
 | `mind.inbound_media_reaction_cooldown_seconds` | `600` | 同一会话两次入站反应的最小间隔（秒） |
+| `mind.proactive_followup` | `false` | 承诺跟进：只对 `kind=promise` 且超过 `followup_after_hours` 的未了事主动追问一句；默认关，开启后仍受静音与预算门控，不调用模型 |
+| `mind.followup_after_hours` | `24` | promise 类未了事创建后多少小时才允许跟进 |
+| `mind.followup_daily_cap` | `3` | 同一会话每日承诺跟进上限（按上海日期计） |
 | `behavior.chat_intensity` | `normal` | 聊天强度：`quiet` 只回点名、`normal` 当前行为、`active` 放开连续空转的降频闸门（话题收尾已不拦截，两档一致） |
 | `behavior.restriction_mode` | `off` | 言论限制：`off` 关闭、`soft` 只注入提示、`strict` 命中关键词的整条回复丢弃、`regenerate` 先让模型改写（每批最多 2 次），仍命中则删掉含禁句的整句 |
 | `behavior.banned_phrases` | `[]` | 禁词（关键词级子串匹配，非语义审核） |
 | `behavior.banned_topics` | `[]` | 禁话题（注入提示；strict 模式也做关键词拦截） |
+| `social.poke_enabled` | 示例 `true`，代码 `false` | 被戳一戳时用固定短句回应；仍受静音、聊天强度、预算、冷却与每日上限共同门控，不调用模型。示例配置已打开，代码默认关（旧配置行为不变） |
+| `social.poke_cooldown_seconds` | `300` | 同一会话两次戳一戳回应的最小间隔（秒） |
+| `social.poke_daily_cap` | `20` | 同一会话每日戳一戳回应上限（按上海日期计） |
+| `social.join_welcome_enabled` | `false` | 进群欢迎开关；默认关闭，模板为空时即使打开也不发送 |
+| `social.join_welcome` | `""` | 进群欢迎模板，仅支持 `{user_id}` 占位符；空串 = 不发送 |
+| `social.join_welcome_daily_cap` | `10` | 同一会话每日进群欢迎上限（按上海日期计） |
 | `gateway.wechat.media.enabled` | `false` | 微信入站图片落盘总开关；关闭时只保留 `[图片]` 占位，不读任何本地文件 |
 | `gateway.wechat.media.max_bytes` | `10485760` | 微信入站图片解密后的单张大小上限（10 MiB）；超限保留占位 |
 | `gateway.wechat.media.storage_root` | `""` | 微信本地媒体根目录；空 = 自动探测 `xwechat_files`，只接受该目录内的文件 |
@@ -312,6 +321,13 @@ Reflector（夜间自省，`mind.reflection_hour` 之后每个活跃群一次）
 时运行，产物是 `bot_state`（在意的事/心情）、跨群 `bot_stances`（话题 → 观点，同一话题
 覆盖）、该群笔记的 lessons 和全局 `MEMORY.md` 的 life。「我的立场」只在总闸打开时注入，
 关掉只停止注入，已写入的立场保留；`/forget` 清空当前会话不影响全局立场。
+
+主动链路（戳一戳回应 `social.poke_*`、进群欢迎 `social.join_welcome*`、承诺跟进
+`mind.proactive_followup`）默认全部关闭（示例配置只为戳一戳打开，代码默认仍为关），
+全部受 `triggers.quiet_hours` 静默时段与预算门控，且**不调用模型**：戳一戳用固定短句池、
+进群欢迎用固定模板、承诺跟进只对已写库的 promise 未了事发一句话。`group_ban` / `group_decrease`
+只写 info 日志，不发送。定时提醒由 `/remind` 写入 `reminders` 表、后台轮询 worker 发送，
+同样不调用模型。
 
 各通道支持哪些消息类型、失败时怎么降级，以及附件的路径/大小/后缀边界，见
 [docs/message-types.md](docs/message-types.md)。
@@ -569,10 +585,12 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 - 模型调用失败时保持安静，不再往群里发「本鱼断线了」；失败照常计入日志与错误统计
 - `/闭嘴`（或 `/shutup`）—— 本群静音 60 分钟（仅 `groups.admins` 可用）
 - `/醒来`（或 `/wake`）—— 解除静音（仅 `groups.admins` 可用）
+- `/提醒 30 喝水`（或 `/remind 30 喝水`）—— 30 分钟后在本群提醒（仅 `groups.admins` 可用）
 
 私聊：
 
 - 直接说话即可（不受冷却、白名单、静默限制，仍受预算限制）
+- `/remind 60 交报告`—— 60 分钟后提醒你（私聊所有人生效）
 
 命令（群聊/私聊都可用，权限和冷却不同）：
 
@@ -583,6 +601,12 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 | `/status` `/状态` | 仅管理员 | 仅管理员 | 30 秒 | 网关、调度、配额、预算状态与运行时长 |
 | `/budget` `/预算` | 仅管理员 | 仅管理员 | 30 秒 | 全局/月度/本会话预算与费用估算 |
 | `/forget` | 仅管理员 | 所有人 | 无 | 清空当前会话全部记忆（消息、摘要、印象、用量与会话映射，不可撤销） |
+| `/remind` `/提醒` | 仅管理员 | 所有人 | 无 | 定时提醒，三种写法：`/remind <分钟> <内容>` 新建、`/remind list` 查看本会话最近提醒、`/remind cancel <id>` 取消自己创建的提醒；分钟为 1–10080 的整数，内容非空且 ≤200 字；到点由后台 worker 发送 |
+
+`/remind` 与 `/forget` 一样是「群内仅管理员、私聊所有人」的非对称权限；提醒只在当前会话生效，
+取消也要求是创建者本人。提醒正文与状态存在 SQLite 的 `reminders` 表里（是**表名，不是配置节**），
+没有 `reminders:` 配置块。到点后由轮询 worker 经主动出站通道发送：受 `triggers.quiet_hours`
+与预算门控，失败会进 `pending_outbox` 重试，但不调用模型、不消耗模型额度。
 
 群内非管理员执行管理员命令会被静默忽略（不回复、不写审计）；私聊非管理员会收到
 「这个命令只有管理员能用。」。管理员命令成功后写 `command.admin` 审计（actor 为 QQ 号，
