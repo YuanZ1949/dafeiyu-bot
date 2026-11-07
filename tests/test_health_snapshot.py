@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -12,6 +13,7 @@ from dafeiyu.config import load_settings
 from dafeiyu.control import BrainControl, create_app
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
+from dafeiyu.timeutil import SHANGHAI
 
 
 class FakeBrain:
@@ -287,6 +289,38 @@ def test_health_snapshot_budget_storage_error_keeps_shape(
     assert budget["warnings"] == [
         {"scope": "storage_error", "ratio": 1.0, "calls": 0, "limit": 0}
     ]
+
+
+def test_health_snapshot_memory_pending_days_matches_memory_health(
+    tmp_path: Path,
+) -> None:
+    """健康快照与 memory_health 必须同源，否则告警阈值和面板会各说各话。"""
+    control, _adapter, store, _app = make_control(tmp_path)
+    noon = datetime.now(SHANGHAI).replace(
+        hour=12, minute=0, second=0, microsecond=0
+    )
+    for days_ago in (2, 3):
+        when = noon - timedelta(days=days_ago)
+        store.add_message(
+            Message(
+                chat_type=ChatType.GROUP,
+                chat_id="100",
+                user_id="1",
+                nickname="群友",
+                content="hi",
+                message_id=f"m{days_ago}",
+                timestamp=int(when.timestamp()),
+            )
+        )
+
+    snapshot = control.health_snapshot()
+    health = control.memory_health()
+
+    memory = snapshot["memory"]
+    assert memory["pending_count"] == 2
+    assert len(memory["pending_days"]) == 2
+    assert memory["pending_days"] == health["pending_days"]
+    assert memory["pending_count"] == health["pending_count"]
 
 
 def test_health_snapshot_db_failure_is_reported(tmp_path: Path, monkeypatch) -> None:

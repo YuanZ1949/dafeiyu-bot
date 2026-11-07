@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
+from conftest import TEST_CONFIG_YAML
 
-from dafeiyu.config import AlertRulesConfig, AlertsConfig
+from dafeiyu.config import AlertRulesConfig, AlertsConfig, load_settings
 from dafeiyu.supervisor.alerts import (
     AlertChannelError,
     AlertManager,
@@ -15,6 +18,7 @@ from dafeiyu.supervisor.alerts import (
     WebhookChannel,
 )
 from dafeiyu.supervisor.audit import AuditLog
+from dafeiyu.timeutil import SHANGHAI
 
 
 class Clock:
@@ -41,7 +45,7 @@ class ExplodingChannel:
         raise RuntimeError("channel down")
 
 
-def base_snapshot(**overrides):
+def base_snapshot(**overrides: Any) -> dict[str, Any]:
     snapshot = {
         "ok": True,
         "processes": {
@@ -62,13 +66,21 @@ def base_snapshot(**overrides):
     snapshot.update(overrides)
     return snapshot
 
-def down_snapshot():
+
+def iso_ago(clock: Clock, seconds: float) -> str:
+    return datetime.fromtimestamp(clock.now - seconds, SHANGHAI).isoformat(
+        timespec="seconds"
+    )
+
+def down_snapshot() -> dict[str, Any]:
     snapshot = base_snapshot()
     snapshot["bot"]["ok"] = False
     return snapshot
 
 
-def wechat_snapshot(*, bridge: str = "running", wechat: dict | None = None):
+def wechat_snapshot(
+    *, bridge: str = "running", wechat: dict[str, Any] | None = None
+) -> dict[str, Any]:
     snapshot = base_snapshot()
     snapshot["processes"]["wechat_bridge"] = {
         "status": bridge,
@@ -203,6 +215,18 @@ async def test_all_rules_activate(tmp_path: Path) -> None:
     clock.advance(200)
     await mgr.evaluate(snapshot)
 
+    # 第二轮触发两条新规则：老规则已在 firing，重复窗口未到，不会占用本轮
+    # 的 MAX_ALERTS_PER_CHECK 名额，因此可以逐条验证它们确实被派发。
+    snapshot["backups"] = {
+        "last_success_at": iso_ago(clock, 30 * 3600),
+        "last_error_at": iso_ago(clock, 10 * 3600),
+    }
+    snapshot["bot"]["memory"] = {
+        "pending_count": 2,
+        "pending_days": ["2026-10-31", "2026-11-01"],
+    }
+    await mgr.evaluate(snapshot)
+
     rules = {incident.rule for incident, _event in channel.sent}
     assert rules == {
         "process_failed",
@@ -214,6 +238,8 @@ async def test_all_rules_activate(tmp_path: Path) -> None:
         "reply_errors",
         "disk_low",
         "backup_failed",
+        "backup_stale",
+        "memory_gap",
     }
 
 
@@ -688,3 +714,132 @@ async def test_qq_admin_channel_resolves_callable_token_at_send_time() -> None:
 
     assert session.calls[0][1]["headers"]["X-Control-Token"] == "old-token"
     assert session.calls[1][1]["headers"]["X-Control-Token"] == "new-token"
+
+
+async def test_backup_stale_fires_when_success_is_older_than_threshold(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["backups"] = {
+        "last_success_at": iso_ago(clock, 30 * 3600),
+        "last_error_at": None,
+    }
+
+    await mgr.evaluate(snapshot)
+
+    assert [item.rule for item, _event in channel.sent] == ["backup_stale"]
+    incident = channel.sent[0][0]
+    assert incident.severity == "warning"
+    assert "25" in incident.detail
+
+
+async def test_backup_stale_fires_when_never_succeeded(tmp_path: Path) -> None:
+    """从未备份成功不能被当成「没有数据」，否则第一次失败后就永久静默。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["backups"] = {"last_success_at": None, "last_error_at": None}
+
+    await mgr.evaluate(snapshot)
+
+    assert [item.rule for item, _event in channel.sent] == ["backup_stale"]
+    assert "从未成功备份" in channel.sent[0][0].detail
+
+
+async def test_memory_gap_fires_for_two_pending_days(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["bot"]["memory"] = {
+        "pending_count": 2,
+        "pending_days": ["2026-10-31", "2026-11-01"],
+    }
+
+    await mgr.evaluate(snapshot)
+
+    assert [item.rule for item, _event in channel.sent] == ["memory_gap"]
+    assert "2 天" in channel.sent[0][0].detail
+
+
+async def test_memory_gap_silent_for_single_pending_day(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["bot"]["memory"] = {
+        "pending_count": 1,
+        "pending_days": ["2026-11-01"],
+    }
+
+    await mgr.evaluate(snapshot)
+
+    assert channel.sent == []
+
+
+async def test_memory_gap_silent_while_quota_paused(tmp_path: Path) -> None:
+    """额度熔断本来就是摘要不生成的原因，不该再叠一条记忆告警。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["bot"]["quota"]["paused_until"] = clock.now + 60
+    snapshot["bot"]["memory"] = {
+        "pending_count": 2,
+        "pending_days": ["2026-10-31", "2026-11-01"],
+    }
+
+    await mgr.evaluate(snapshot)
+
+    assert "memory_gap" not in {item.rule for item, _event in channel.sent}
+
+
+async def test_backup_and_memory_rules_silent_when_healthy(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+
+    await mgr.evaluate(base_snapshot())
+
+    assert channel.sent == []
+
+
+async def test_backup_stale_exempt_when_backups_disabled(tmp_path: Path) -> None:
+    """关闭备份的部署不该永远挂一条「备份过期」。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["backups"] = {
+        "last_success_at": None,
+        "last_error_at": None,
+        "enabled": False,
+    }
+
+    await mgr.evaluate(snapshot)
+
+    assert channel.sent == []
+    assert snapshot["backups"]["enabled"] is False
+
+
+def test_new_alert_rule_defaults_and_parsing(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(TEST_CONFIG_YAML, encoding="utf-8")
+    env = tmp_path / "test.env"
+    env.write_text("BOT_QQ=10001\nDEEPSEEK_API_KEY=sk-test\n", encoding="utf-8")
+    settings = load_settings(env_file=env, config_file=config)
+    assert settings.alerts.rules.backup_stale_hours == 25
+    assert settings.alerts.rules.memory_gap_days == 2
+
+    config.write_text(
+        TEST_CONFIG_YAML
+        + "\nalerts:\n  rules:\n    backup_stale_hours: 48\n    memory_gap_days: 3\n",
+        encoding="utf-8",
+    )
+    settings = load_settings(env_file=env, config_file=config)
+    assert settings.alerts.rules.backup_stale_hours == 48
+    assert settings.alerts.rules.memory_gap_days == 3

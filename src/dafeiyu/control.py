@@ -56,7 +56,7 @@ from .config import (
 from .gateway.base import GatewayError
 from .hotconfig import WeChatRuntime, WeChatRuntimeView
 from .ids import normalize_chat_id
-from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, Store
+from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, PendingSummary, Store
 from .model_probe import (
     FREE_PROBE_TTL,
     FreeProbeResult,
@@ -803,6 +803,21 @@ class BrainControl:
             "free_reason": self.runtime.free_reason,
         }
 
+    def _pending_summary_state(
+        self, now: datetime | None = None
+    ) -> tuple[list[str], list[PendingSummary]]:
+        """未生成摘要的日期与明细，``memory_health`` 与健康快照共用同一段计算。
+
+        「今天」永远不算缺口：摘要次日 4 点才生成。4 点前连「昨天」也还没到期，
+        窗口再往前收一天，避免每天凌晨面板/告警都在误报。
+        """
+        current = now or now_shanghai()
+        lag = 1 if current.hour >= 4 else 2
+        until = (current.date() - timedelta(days=lag)).isoformat()
+        slots = self.store.pending_summary_slots(until=until)
+        pending = sorted({slot.date for slot in slots})
+        return pending, slots
+
     def health_snapshot(self) -> dict[str, Any]:
         """给 supervisor 与 dashboard 用的不可变健康快照。
 
@@ -818,6 +833,9 @@ class BrainControl:
             "wal_bytes": 0,
             "message_count": 0,
             "schema_version": 0,
+            # 与 memory_health 同源：告警规则读 pending_count 判断记忆是否落后。
+            "pending_count": 0,
+            "pending_days": [],
         }
         errors: dict[str, Any] = {"recent_count": 0, "last_error_at": None}
         today_calls = 0
@@ -826,12 +844,15 @@ class BrainControl:
         ok = True
         try:
             stats = self.store.db_stats()
+            pending_days, _slots = self._pending_summary_state()
             memory = {
                 "db_path": str(stats.get("db_path") or ""),
                 "db_bytes": int(stats.get("db_bytes") or 0),
                 "wal_bytes": int(stats.get("wal_bytes") or 0),
                 "message_count": int(stats.get("message_count") or 0),
                 "schema_version": int(stats.get("schema_version") or 0),
+                "pending_count": len(pending_days),
+                "pending_days": pending_days,
             }
             today = self.store.today()
             today_calls, today_tokens = self.store.usage_totals(today, today)
@@ -1461,10 +1482,7 @@ class BrainControl:
         窗口再往前收一天，避免每天凌晨面板都在误报。
         """
         now = now or now_shanghai()
-        lag = 1 if now.hour >= 4 else 2
-        until = (now.date() - timedelta(days=lag)).isoformat()
-        slots = self.store.pending_summary_slots(until=until)
-        pending = sorted({slot.date for slot in slots})
+        pending, slots = self._pending_summary_state(now)
         latest = self.store.recent_summaries(1, 0)
         quota_until = self.store.load_backoff().get(QUOTA_KEY)
         quota_paused = bool(quota_until and float(quota_until) > time.time())

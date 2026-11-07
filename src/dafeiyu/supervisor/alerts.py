@@ -341,6 +341,24 @@ class AlertManager:
                 True, "warning", "额度熔断中", "记忆写入暂停，等待额度恢复"
             )
 
+        # 摘要缺口来自 control.health_snapshot 的 memory.pending_count（与
+        # memory_health 共用同一段 lag 计算）。额度熔断时摘要本来就不会生成，
+        # 此时不报，避免在已知原因上叠加一条噪音。
+        memory = bot.get("memory") or {}
+        if not isinstance(memory, dict):
+            memory = {}
+        try:
+            missing_days = int(memory.get("pending_count") or 0)
+        except (TypeError, ValueError):
+            missing_days = 0
+        if missing_days >= rules.memory_gap_days and not quota_active:
+            conditions["memory_gap"] = Condition(
+                True,
+                "warning",
+                "记忆落后",
+                f"有 {missing_days} 天消息还没有生成摘要",
+            )
+
         errors = bot.get("errors") or {}
         if not isinstance(errors, dict):
             errors = {}
@@ -387,6 +405,23 @@ class AlertManager:
             conditions["backup_failed"] = Condition(
                 True, "warning", "备份失败", "最近一次备份未成功"
             )
+
+        # backup.enabled=false 的部署本来就不备份：此时「没有成功备份」不是故障，
+        # 必须豁免，否则会挂一条永远无法恢复的告警（enabled 由 health.py 显式写入）。
+        if backups.get("enabled", True) is not False:
+            success_ts = _parse_ts(last_success)
+            never_succeeded = not last_success
+            stale_cutoff = now - int(rules.backup_stale_hours) * 3600
+            if never_succeeded or (success_ts and success_ts < stale_cutoff):
+                detail = (
+                    "从未成功备份过"
+                    if never_succeeded
+                    else f"最近一次成功备份在 {last_success}，"
+                    f"已超过 {rules.backup_stale_hours} 小时"
+                )
+                conditions["backup_stale"] = Condition(
+                    True, "warning", "备份过期", detail
+                )
 
         budget = snapshot.get("budget") or {}
         if rules.budget_warning and isinstance(budget, dict):

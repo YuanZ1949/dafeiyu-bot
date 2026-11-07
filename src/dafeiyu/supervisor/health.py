@@ -176,8 +176,17 @@ class HealthMonitor:
         }
 
     def _backup_status(self) -> dict[str, Any]:
+        # 告警规则要判断「备份过期」，但 backup.enabled=false 时必须豁免，
+        # 否则关掉备份的部署会永远挂着一条无法消除的告警。开关只有 Settings
+        # 里有真值，status() 不保证返回，所以每个分支都显式补上。
+        enabled = bool(self.settings.backup.enabled)
         if self.backups is None:
-            return {"last_success_at": None, "last_error_at": None, "count": 0}
+            return {
+                "last_success_at": None,
+                "last_error_at": None,
+                "count": 0,
+                "enabled": enabled,
+            }
         try:
             status = self.backups.status()
         except Exception as exc:  # noqa: BLE001
@@ -188,14 +197,21 @@ class HealthMonitor:
                 "last_error": exc.__class__.__name__,
                 "count": 0,
                 "running": False,
+                "enabled": enabled,
             }
         if not isinstance(status, dict):
-            return {"last_success_at": None, "last_error_at": None, "count": 0}
+            return {
+                "last_success_at": None,
+                "last_error_at": None,
+                "count": 0,
+                "enabled": enabled,
+            }
         return {
             "last_success_at": status.get("last_success_at"),
             "last_error_at": status.get("last_error_at"),
             "count": int(status.get("count") or 0),
             "running": bool(status.get("running")),
+            "enabled": enabled,
         }
 
 

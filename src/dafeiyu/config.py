@@ -510,6 +510,10 @@ class AlertRulesConfig:
     reply_error_window_seconds: int = 900
     reply_error_count: int = 3
     budget_warning: bool = True
+    # 备份超过这么多小时没有成功一次就告警；backup.enabled=false 时豁免。
+    backup_stale_hours: int = 25
+    # 记忆摘要缺口达到这么多天（pending_count）就告警；额度熔断时豁免。
+    memory_gap_days: int = 2
 
 
 @dataclass(frozen=True)
@@ -771,6 +775,14 @@ def _build_alerts(raw: dict[str, Any]) -> AlertsConfig:
         ),
         budget_warning=_bool(
             rules_raw.get("budget_warning", True), "alerts.rules.budget_warning"
+        ),
+        backup_stale_hours=_positive_int(
+            rules_raw.get("backup_stale_hours"),
+            "alerts.rules.backup_stale_hours",
+            25,
+        ),
+        memory_gap_days=_positive_int(
+            rules_raw.get("memory_gap_days"), "alerts.rules.memory_gap_days", 2
         ),
     )
     return AlertsConfig(

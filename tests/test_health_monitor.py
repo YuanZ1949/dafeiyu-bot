@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from aiohttp import web
@@ -278,6 +279,70 @@ async def test_backup_status_error_is_reported(tmp_path: Path) -> None:
 
     assert snap["backups"]["last_error_at"]
     assert snap["backups"]["count"] == 0
+
+
+async def test_backup_status_always_carries_enabled_flag(tmp_path: Path) -> None:
+    """告警靠 enabled 豁免关闭备份的部署：每个分支都必须带这个键。"""
+    settings = make_settings(tmp_path)
+
+    # 分支 1：没有备份服务（backups=None）。
+    monitor = HealthMonitor(
+        supervisor=FakeSupervisor(),
+        settings=settings,
+        bot_url="",
+    )
+    try:
+        snap = await monitor.snapshot()
+    finally:
+        await monitor.close()
+    assert snap["backups"]["enabled"] is True
+
+    # 分支 2：读取状态抛异常。
+    monitor = HealthMonitor(
+        supervisor=FakeSupervisor(),
+        settings=settings,
+        bot_url="",
+        backups=FakeBackups(error=RuntimeError("broken")),
+    )
+    try:
+        snap = await monitor.snapshot()
+    finally:
+        await monitor.close()
+    assert snap["backups"]["enabled"] is True
+
+    # 分支 3：status() 返回非映射。
+    class BadBackups:
+        def status(self):
+            return "nope"
+
+    monitor = HealthMonitor(
+        supervisor=FakeSupervisor(),
+        settings=settings,
+        bot_url="",
+        backups=BadBackups(),
+    )
+    try:
+        snap = await monitor.snapshot()
+    finally:
+        await monitor.close()
+    assert snap["backups"]["enabled"] is True
+
+    # 分支 4：正常状态 + 配置里关掉备份。
+    disabled = replace(
+        settings, backup=replace(settings.backup, enabled=False)
+    )
+    monitor = HealthMonitor(
+        supervisor=FakeSupervisor(),
+        settings=disabled,
+        bot_url="",
+        backups=FakeBackups(),
+    )
+    try:
+        snap = await monitor.snapshot()
+    finally:
+        await monitor.close()
+    assert snap["backups"]["enabled"] is False
+    assert snap["backups"]["count"] == 2
 
 
 async def test_napcat_login_error_is_reported(tmp_path: Path) -> None:
