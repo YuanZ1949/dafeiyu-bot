@@ -23,19 +23,22 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 import tempfile
 import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = REPO_ROOT / "data" / "evals" / "golden_replies.json"
+DEFAULT_OUT_DIR = REPO_ROOT / "data" / "evals" / "results"
 DEFAULT_CONFIG = REPO_ROOT / "config.yaml"
 DEFAULT_ENV = REPO_ROOT / ".env"
+STATUSES = ("passed", "failed", "skipped")
 
 # 临时库里所有 case 共用一个会话 id；不代表任何真实群。
 EVAL_CHAT_ID = "eval:golden"
@@ -126,6 +129,112 @@ def summarize(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "failed": failed,
         "skipped": skipped,
         "accuracy": (passed / judged) if judged else None,
+    }
+
+
+def _utc_iso() -> str:
+    """UTC 时间戳（ISO 8601，带微秒）。"""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _result_filename(generated_at: str, mode: str) -> str:
+    """把 ISO 时间戳压成文件名：Windows 不允许冒号。"""
+    stamp = generated_at.replace(":", "").replace("+00:00", "Z")
+    return f"{stamp}-{mode}.json"
+
+
+def statuses_from_results(results: Sequence[dict[str, Any]]) -> dict[str, bool]:
+    """把 golden 的 ``results[].status`` 适配成 ``diff_statuses`` 的快照。
+
+    ``skipped`` 直接剔除：离线模式或模型不可用时大量跳过，既不算失败也不算修复。
+    """
+    statuses: dict[str, bool] = {}
+    for result in results:
+        case_id = str(result.get("id") or "")
+        status = str(result.get("status") or "")
+        if not case_id:
+            continue
+        if status == "passed":
+            statuses[case_id] = True
+        elif status == "failed":
+            statuses[case_id] = False
+    return statuses
+
+
+def load_baseline_statuses(path: str | Path) -> dict[str, bool]:
+    """读取本脚本落盘的结果 JSON，返回 ``id → 是否通过``。
+
+    只接受 ``{"results": [{"id": ..., "status": passed|failed|skipped}]}``；
+    这是 golden 自己的形状，不是 ``eval.report.load_baseline`` 的 ``cases`` 形状。
+    """
+    baseline_path = Path(path)
+    try:
+        text = baseline_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"读不到 baseline 文件 {baseline_path}: {exc}") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"baseline 不是合法 JSON {baseline_path}: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        raise ValueError(
+            f"baseline 形状不符 {baseline_path}: 需要 golden 结果文件（顶层 results 列表），"
+            "不是 eval 的 cases 文件"
+        )
+    for index, item in enumerate(data["results"]):
+        if not isinstance(item, dict):
+            raise ValueError(f"baseline results[{index}] 必须是对象: {baseline_path}")
+        case_id = item.get("id")
+        if not isinstance(case_id, str) or not case_id:
+            raise ValueError(f"baseline results[{index}].id 必须是非空字符串: {baseline_path}")
+        if item.get("status") not in STATUSES:
+            raise ValueError(
+                f"baseline results[{index}].status 必须是 passed/failed/skipped: "
+                f"{baseline_path}"
+            )
+    return statuses_from_results(data["results"])
+
+
+def write_run_result(payload: dict[str, Any], out_dir: str | Path) -> Path:
+    """原子写入结果 JSON：同目录 tmp + ``os.replace``。失败时不留下半截文件。"""
+    directory = Path(out_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / _result_filename(
+        str(payload["generated_at"]), str(payload["mode"])
+    )
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        prefix=".tmp-eval-",
+        suffix=".json",
+        dir=directory,
+        delete=False,
+    )
+    tmp_path = Path(handle.name)
+    try:
+        with handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    return target
+
+
+def _diff_payload(diff: Any) -> dict[str, Any]:
+    return {
+        "new": list(diff.new),
+        "missing": list(diff.missing),
+        "regressed": list(diff.regressed),
+        "fixed": list(diff.fixed),
+        "new_failures": list(diff.new_failures),
     }
 
 
@@ -459,9 +568,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None, help="最多跑 N 条")
     parser.add_argument("--case", default="", help="只跑指定 case id")
     parser.add_argument("--model", default="", help="live 时覆盖模型名")
+    parser.add_argument(
+        "--out-dir",
+        default=str(DEFAULT_OUT_DIR),
+        help="结果 JSON 落盘目录（默认 data/evals/results）",
+    )
+    parser.add_argument(
+        "--baseline",
+        default="",
+        help="上一次本脚本落盘的结果 JSON（results 形状），用于回归对比",
+    )
+    parser.add_argument(
+        "--fail-on-regression",
+        action="store_true",
+        help="有回归（baseline 通过 → 当前失败）时以退出码 1 结束",
+    )
     args = parser.parse_args(argv)
 
     dataset = Path(args.dataset)
+    baseline: dict[str, bool] | None = None
+    if args.baseline:
+        try:
+            baseline = load_baseline_statuses(args.baseline)
+        except ValueError as exc:
+            print(f"baseline 读取失败：{exc}", file=sys.stderr)
+            return 2
+
     try:
         data = load_dataset(dataset)
     except (OSError, ValueError) as exc:
@@ -481,35 +613,69 @@ def main(argv: Sequence[str] | None = None) -> int:
         results = [
             _skipped_result(case, "offline：只校验数据集，不调用模型") for case in cases
         ]
-        summary = summarize(results)
-        if args.json:
-            _emit_json(
-                {
-                    "mode": "offline",
-                    "dataset": str(dataset),
-                    "summary": summary,
-                    "distribution": distribution,
-                    "results": results,
-                }
-            )
-        else:
-            print(_render_offline(dataset, cases, distribution))
-        return 0
-
-    results = asyncio.run(_run_live(cases, args.model))
-    summary = summarize(results)
-    if args.json:
-        _emit_json(
-            {
-                "mode": "live",
-                "dataset": str(dataset),
-                "summary": summary,
-                "distribution": distribution,
-                "results": results,
-            }
-        )
     else:
-        print(_render_live(dataset, results, summary))
+        results = asyncio.run(_run_live(cases, args.model))
+
+    summary = summarize(results)
+    generated_at = _utc_iso()
+    model = args.model.strip() or ("offline" if args.mode == "offline" else "")
+    payload: dict[str, Any] = {
+        "dataset": str(dataset),
+        "mode": args.mode,
+        "model": model,
+        "generated_at": generated_at,
+        "summary": summary,
+        "results": results,
+    }
+    try:
+        result_path = write_run_result(payload, args.out_dir)
+    except OSError as exc:
+        print(f"结果写入失败 {args.out_dir}：{exc}", file=sys.stderr)
+        return 2
+
+    diff = None
+    if baseline is not None:
+        from dafeiyu.eval.report import diff_statuses
+
+        diff = diff_statuses(baseline, statuses_from_results(results))
+
+    if args.json:
+        output = dict(payload)
+        output["distribution"] = distribution
+        output["result_path"] = str(result_path)
+        if diff is not None:
+            output["baseline"] = _diff_payload(diff)
+        _emit_json(output)
+    else:
+        if args.mode == "offline":
+            print(_render_offline(dataset, cases, distribution))
+        else:
+            print(_render_live(dataset, results, summary))
+        print(f"\n结果已写入：{result_path}")
+        if diff is not None:
+            print(
+                "Baseline diff：回归 {regressed}，新 case 失败 {new_failures}，"
+                "修复 {fixed}，新增 {new}，缺失 {missing}".format(
+                    regressed=", ".join(diff.regressed) or "无",
+                    new_failures=", ".join(diff.new_failures) or "无",
+                    fixed=", ".join(diff.fixed) or "无",
+                    new=", ".join(diff.new) or "无",
+                    missing=", ".join(diff.missing) or "无",
+                )
+            )
+
+    if args.fail_on_regression:
+        if diff is None:
+            print(
+                "[eval] 未提供 --baseline，回归门没有比较对象，跳过",
+                file=sys.stderr,
+            )
+        elif diff.regressed:
+            print(
+                f"[eval] 回归门拦截：{', '.join(diff.regressed)}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 

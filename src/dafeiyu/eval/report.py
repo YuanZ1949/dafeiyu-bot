@@ -78,15 +78,16 @@ def load_baseline(path: str | Path) -> dict[str, Any]:
     return data
 
 
-def diff_reports(baseline: dict[str, Any], current: EvalReport) -> BaselineDiff:
-    """按 case id 比较；baseline 与当前 case 集不同只报 new/missing。"""
-    base_status = {
-        case["id"]: bool(case.get("passed")) for case in baseline.get("cases", [])
-    }
-    current_status = {result.id: result.passed for result in current.cases}
+def diff_statuses(
+    base: dict[str, bool], current: dict[str, bool]
+) -> BaselineDiff:
+    """按 case id 比较两份「id → 是否通过」快照。
 
-    base_ids = set(base_status)
-    current_ids = set(current_status)
+    新增/缺失只看 id 集合；``regressed`` 只表示 baseline 通过、当前失败。
+    调用方可以先把 ``skipped`` 从快照里剔除，这样跳过既不算回归也不算修复。
+    """
+    base_ids = set(base)
+    current_ids = set(current)
     common = base_ids & current_ids
 
     new_ids = sorted(current_ids - base_ids)
@@ -97,20 +98,27 @@ def diff_reports(baseline: dict[str, Any], current: EvalReport) -> BaselineDiff:
             sorted(
                 case_id
                 for case_id in common
-                if base_status[case_id] and not current_status[case_id]
+                if base[case_id] and not current[case_id]
             )
         ),
         fixed=tuple(
             sorted(
                 case_id
                 for case_id in common
-                if not base_status[case_id] and current_status[case_id]
+                if not base[case_id] and current[case_id]
             )
         ),
-        new_failures=tuple(
-            case_id for case_id in new_ids if not current_status[case_id]
-        ),
+        new_failures=tuple(case_id for case_id in new_ids if not current[case_id]),
     )
+
+
+def diff_reports(baseline: dict[str, Any], current: EvalReport) -> BaselineDiff:
+    """按 case id 比较；baseline 与当前 case 集不同只报 new/missing。"""
+    base_status = {
+        case["id"]: bool(case.get("passed")) for case in baseline.get("cases", [])
+    }
+    current_status = {result.id: result.passed for result in current.cases}
+    return diff_statuses(base_status, current_status)
 
 
 def render_markdown(
