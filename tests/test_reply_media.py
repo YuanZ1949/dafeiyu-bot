@@ -309,6 +309,38 @@ def test_sticker_with_numeric_name_becomes_face_segment() -> None:
     ]
 
 
+def test_sticker_with_known_name_becomes_face_segment() -> None:
+    segments = build_onebot_segments(
+        "", attachments=(Attachment(kind="sticker", name="微笑"),)
+    )
+
+    assert segments == [{"type": "face", "data": {"id": "14"}}]
+
+
+def test_sticker_with_named_id_keeps_numeric_face() -> None:
+    segments = build_onebot_segments(
+        "", attachments=(Attachment(kind="sticker", name="178"),)
+    )
+
+    assert segments == [{"type": "face", "data": {"id": "178"}}]
+
+
+def test_sticker_with_unknown_name_becomes_mface_segment() -> None:
+    segments = build_onebot_segments(
+        "", attachments=(Attachment(kind="sticker", name="摸鱼"),)
+    )
+
+    assert segments == [{"type": "mface", "data": {"summary": "摸鱼"}}]
+
+
+def test_sticker_with_out_of_table_numeric_id_keeps_face_segment() -> None:
+    segments = build_onebot_segments(
+        "", attachments=(Attachment(kind="sticker", name="999999"),)
+    )
+
+    assert segments == [{"type": "face", "data": {"id": "999999"}}]
+
+
 def test_sticker_with_text_name_becomes_mface_segment() -> None:
     segments = build_onebot_segments(
         "", attachments=(Attachment(kind="sticker", name="摸鱼"),)

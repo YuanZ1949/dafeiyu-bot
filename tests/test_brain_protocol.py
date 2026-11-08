@@ -217,6 +217,13 @@ def test_output_instruction_keeps_required_format_and_adds_optional_fields() -> 
     assert "默认 false" in OUTPUT_INSTRUCTION
 
 
+def test_output_instruction_keeps_voice_field() -> None:
+    assert (
+        '"voice": true|false 表示这条回复是否发成语音消息，默认 false（发文字）'
+        in OUTPUT_INSTRUCTION
+    )
+
+
 def test_voice_true_parsed() -> None:
     reply = parse_brain_reply('{"speak": true, "reply": "x", "voice": true}')
 

@@ -14,6 +14,7 @@ from typing import Any
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
+from dafeiyu.faces import face_name
 from dafeiyu.gateway.base import GatewayError
 from dafeiyu.models import (
     QQ_PREFIX,
@@ -137,9 +138,12 @@ def _clip_first(value: Any, limit: int) -> str:
 
 
 def _render_face(data: dict[str, Any]) -> str:
-    """face 段：用数字 id 区分不同表情；缺失或非数字回退占位。"""
+    """face 段：表内 id 渲染名称，表外数字保留 id；缺失或非数字回退占位。"""
     face_id = str(data.get("id") or "").strip()
-    return f"[表情:{face_id}]" if face_id.isdigit() else _PLACEHOLDERS["face"]
+    if not face_id.isdigit():
+        return _PLACEHOLDERS["face"]
+    name = face_name(int(face_id))
+    return f"[表情:{name}]" if name else f"[表情:{face_id}]"
 
 
 def _render_mface(data: dict[str, Any]) -> str:

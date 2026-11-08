@@ -16,6 +16,7 @@ from typing import Any
 
 from dafeiyu.brain.client import BrainReply
 from dafeiyu.config import Settings
+from dafeiyu.faces import face_id
 from dafeiyu.models import Attachment, ChatType
 
 log = logging.getLogger(__name__)
@@ -235,8 +236,9 @@ _FACE_ID_RE = re.compile(r"\d{1,6}")
 def _sticker_segment(name: str) -> dict[str, Any] | None:
     """表情附件 → ``face`` 或 ``mface`` 段；非法 id / 空值返回 None。
 
-    模型只给 ``name``：纯数字（1–6 位、非 0）视为 QQ 内置表情 id，
-    其它文本当作表情包摘要（mface）。
+    模型只给 ``name``：纯数字（1–6 位、非 0）视为 QQ 内置表情 id；
+    其它文本先按内置表情名称反查（如 ``微笑``），命中出 face 段；
+    未命中当作表情包摘要（mface）。
     """
     value = name.strip()
     if not value:
@@ -245,6 +247,9 @@ def _sticker_segment(name: str) -> dict[str, Any] | None:
         if not _FACE_ID_RE.fullmatch(value) or int(value) <= 0:
             return None
         return {"type": "face", "data": {"id": value}}
+    resolved = face_id(value)
+    if resolved is not None:
+        return {"type": "face", "data": {"id": resolved}}
     return {"type": "mface", "data": {"summary": value}}
 
 

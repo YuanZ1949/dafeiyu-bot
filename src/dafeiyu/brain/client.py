@@ -28,7 +28,7 @@ OUTPUT_INSTRUCTION = """\
 {"read": "这轮大家在聊什么、情绪如何（≤40 字）", "think": "你打算怎么接、为什么（≤40 字）", "speak": true 或 false, "reply": "要对群里说的话", "reason": "一句话理由"}
 speak=false 时 reply 留空。read/think 写给自己看，不会发到群里；旧格式只有 speak/reply/reason 也认。
 "reply" 可以是字符串，也可以是字符串数组：想分几条发就把每条放进数组，数组元素就是发送边界；不想分条就用字符串。单条尽量 ≤500 字，整轮 ≤2000 字，别为凑长度硬撑。
-可选字段："to": "me"|"other"|"topic"|"unknown" 表示这句话在跟谁说（第一版只记日志，不强制）；"voice": true|false 表示这条回复是否发成语音消息，默认 false（发文字）；"at": ["昵称"] 表示这条回复要 @ 谁；"attachments": [{"type": "image"|"file"|"voice"|"video", "path": "replies/xxx.png", "name": "可选"}] 只在确实产出文件时填写，path 必须相对 workspace，拿不准就省略；想发表情时用 {"type": "sticker", "name": "表情 id 或表情名"}，name 填纯数字表示 QQ 内置表情。；需要转发聊天记录时用 {"type": "forward", "nodes": [{"name": "谁", "content": "一句原话"}]}（最多 5 条）"""
+可选字段："to": "me"|"other"|"topic"|"unknown" 表示这句话在跟谁说（第一版只记日志，不强制）；"voice": true|false 表示这条回复是否发成语音消息，默认 false（发文字）；"at": ["昵称"] 表示这条回复要 @ 谁；"attachments": [{"type": "image"|"file"|"voice"|"video", "path": "replies/xxx.png", "name": "可选"}] 只在确实产出文件时填写，path 必须相对 workspace，可放 replies/... 或本会话最近消息里出现过的 images/...，拿不准就省略；想发表情时用 {"type": "sticker", "name": "表情名或数字 id", "path": "可选"}，QQ 内置表情用名称（如 "微笑"）或数字 id，微信贴纸可另带 "path": "replies/xxx.gif" 或本会话收到过的 "images/xxx.gif"，非 GIF 会降级为图片；需要转发聊天记录时用 {"type": "forward", "nodes": [{"name": "谁", "content": "一句原话"}]}（最多 5 条）"""
 
 FALLBACK_REPLY = "本鱼刚刚游神了…你再说一遍？🐋"
 
