@@ -162,6 +162,8 @@ Qwen3.5 默认会先输出一大段思考（`reasoning_content`），`max_tokens
 
 用面板切到 `local_model` 档时，若 1234 端口没起会自动用 `lms` CLI 拉起；切走后自动停止，释放显存/内存。不想让它自动停（比如还要用 LM Studio 干别的）就把 `config.yaml` 里的 `local_model.stop_when_unused` 设为 `false`。
 
+`mind.observer_provider: local`（默认）时，Observer/Reflector 旁路不占用主脑额度，而是直连这个本地端点。此时 bot 启动会按 `local_model.autostart` 自动拉起 LM Studio，切换主脑离开本地档也不会停掉它——否则每次观察都会因连接失败（`ConnectError`）而写不进记忆。想让旁路复用主脑，把它改成 `main`。
+
 ### QQ 协议端 NapCat（已内嵌到项目）
 
 NapCat 的可执行文件较大（解压后约 345MB），放在 `vendor/napcat/`，已加入 `.gitignore`，不提交进 git。首次准备：

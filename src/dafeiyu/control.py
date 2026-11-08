@@ -51,6 +51,7 @@ from .config import (
     MindConfig,
     Settings,
     normalize_wechat_account,
+    observer_uses_local_model,
     parse_group_ids,
     parse_wechat_peer_ids,
 )
@@ -1125,8 +1126,12 @@ class BrainControl:
         """离开本地档时关掉 LM Studio；失败只记日志，绝不影响切换结果。
 
         `local_model.stop_when_unused = false` 时保持常驻（旧行为）。
+        旁路（Observer/Reflector）走本地模型时端点仍在使用，不能停：
+        否则主脑切到别处后，旁路每轮观察都会 ConnectError。
         """
         if target == "local_model":
+            return
+        if observer_uses_local_model(self.settings):
             return
         if not self.settings.local_model.stop_when_unused:
             return

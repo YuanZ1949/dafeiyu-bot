@@ -17,7 +17,12 @@ from .brain.opencode_auth import password_env, resolve_password
 from .brain.opencode_server import OpenCodeServer
 from .brain.persona import load_persona
 from .brain.runtime_config import server_env
-from .config import ConfigError, Settings, load_settings
+from .config import (
+    ConfigError,
+    Settings,
+    load_settings,
+    observer_uses_local_model,
+)
 from .control import MemoryActions, start_control_server
 from .gateway.base import Adapter
 from .gateway.channels import wechat_enabled_for
@@ -391,6 +396,11 @@ async def main() -> None:
                 settings.local_model,
                 local_model_name(settings, runtime),
             )
+        elif observer_uses_local_model(settings):
+            # 旁路（Observer/Reflector）直连本地端点，但主脑不是本地档：
+            # 不在这里拉起 LM Studio，旁路每轮观察都会 ConnectError，
+            # 心智层永远不会写库（表现为日志每 10 分钟一条「请求失败」）。
+            await ensure_server(settings.local_model, settings.local_model.model)
         elif settings.local_model.stop_when_unused:
             # 上次不是本地档：清掉历史上切走时残留的 LM Studio 进程。
             # 端点本来就不在时这里只探活一次，不会真调 lms。

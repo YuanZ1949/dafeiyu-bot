@@ -602,6 +602,23 @@ class Settings:
     social: SocialConfig = field(default_factory=SocialConfig)
 
 
+def observer_uses_local_model(settings: Settings) -> bool:
+    """Observer/Reflector 是否依赖本机 LM Studio 端点。
+
+    `mind.observer_provider=local` 时旁路不复用主脑，而是直连
+    `local_model.base_url`。启动时（要不要拉起/保留 LM Studio）与面板切脑时
+    （切走后能不能停掉端点）必须用同一份判断，否则旁路每轮都是 ConnectError。
+    """
+    mind = settings.mind
+    local = settings.local_model
+    return bool(
+        mind.enabled
+        and mind.observer_provider == "local"
+        and local.base_url.strip()
+        and local.model.strip()
+    )
+
+
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
     value = data.get(name)
     if not isinstance(value, dict):

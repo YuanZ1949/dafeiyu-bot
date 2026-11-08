@@ -17,7 +17,11 @@ from dafeiyu.__main__ import (
 )
 from dafeiyu.brain import factory
 from dafeiyu.brain.client import BrainClient
-from dafeiyu.config import GatewayConfig, load_settings
+from dafeiyu.config import (
+    GatewayConfig,
+    load_settings,
+    observer_uses_local_model,
+)
 from dafeiyu.gateway.channels import qq_enabled_for
 from dafeiyu.gateway.wechat import WeChatAdapter
 from dafeiyu.memory.store import Store
@@ -109,6 +113,34 @@ def test_worker_wiring_keeps_token_provider(tmp_path: Path) -> None:
         assert workers.scheduler is not None
     finally:
         store.close()
+
+
+def test_observer_uses_local_model_requires_local_provider(tmp_path: Path) -> None:
+    """启动时要不要拉起/保留 LM Studio 全看这个判断，必须与 build_workers 一致。"""
+    settings = make_settings(tmp_path)
+    # 默认 mind.enabled=false：本地端点与旁路无关。
+    assert observer_uses_local_model(settings) is False
+
+    enabled = replace(
+        settings,
+        mind=replace(settings.mind, enabled=True, observer_provider="local"),
+        local_model=replace(
+            settings.local_model, base_url="http://127.0.0.1:1234/v1", model="qwen/x"
+        ),
+    )
+    assert observer_uses_local_model(enabled) is True
+
+    # 旁路复用主脑时不占用本地端点。
+    on_main = replace(
+        enabled, mind=replace(enabled.mind, observer_provider="main")
+    )
+    assert observer_uses_local_model(on_main) is False
+
+    # 端点/模型没配置时 build_workers 会跳过旁路，这里也必须返回 False。
+    unset = replace(
+        enabled, local_model=replace(enabled.local_model, model="")
+    )
+    assert observer_uses_local_model(unset) is False
 
 
 def test_build_brain_passes_memory_agent(tmp_path: Path) -> None:

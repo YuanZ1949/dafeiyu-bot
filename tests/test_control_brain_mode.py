@@ -869,6 +869,23 @@ async def test_stop_when_unused_can_be_disabled(
     assert lm_stop_spy == []
 
 
+async def test_switch_away_keeps_lmstudio_when_observer_needs_local(
+    control: BrainControl, lm_stop_spy: list[str]
+) -> None:
+    """旁路直连本地端点时切走主脑不能停服务，否则每轮观察都是 ConnectError。"""
+    control.settings = dc_replace(
+        control.settings,
+        mind=dc_replace(
+            control.settings.mind, enabled=True, observer_provider="local"
+        ),
+        local_model=dc_replace(control.settings.local_model, model="qwen/x"),
+    )
+
+    await control.switch_mode({"mode": "free"})
+
+    assert lm_stop_spy == []
+
+
 async def test_switch_provider_away_from_local_stops_lmstudio(
     control: BrainControl, lm_stop_spy: list[str]
 ) -> None:
