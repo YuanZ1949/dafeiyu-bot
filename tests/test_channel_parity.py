@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from fakes import FakeChannelAdapter
@@ -23,29 +24,38 @@ from dafeiyu.config import (
     MemoryConfig,
     PersonaConfig,
     Settings,
+    SocialConfig,
+    SpeechConfig,
     TriggerConfig,
+    WorkspaceConfig,
 )
+from dafeiyu.gateway.base import GatewayError
 from dafeiyu.memory.store import Store
-from dafeiyu.models import ChatType, Message
+from dafeiyu.models import ChatType, Message, NoticeEvent
 from dafeiyu.router import Router
 from dafeiyu.service import Service
+from dafeiyu.social import POKE_REPLIES
 
 SHANGHAI = timezone(timedelta(hours=8))
 NOON = datetime(2026, 11, 3, 12, 0, tzinfo=SHANGHAI)
 QQ_CHAT = "qq:1001"
 WX_CHAT = "wxg:0d5c1f2a3b4c"
+QQ_PRIVATE = "qq:2002"
+WX_PRIVATE = "wxg:8a7b6c5d4e3f"
+REPLY_TEXT = "在呢"
 
 
 class RecordingBrain:
     """model 模式的假大脑：固定开口，记录收到的 prompt。"""
 
-    def __init__(self, text: str = "在呢") -> None:
+    def __init__(self, text: str = REPLY_TEXT, *, voice: bool = False) -> None:
         self.text = text
+        self.voice = voice
         self.calls: list[dict] = []
 
     async def reply(self, chat_type, chat_id, text, *, on_tool=None) -> BrainReply:
         self.calls.append({"chat_type": chat_type, "chat_id": chat_id, "prompt": text})
-        return BrainReply(True, self.text, "test", 10, 5)
+        return BrainReply(True, self.text, "test", 10, 5, voice=self.voice)
 
     async def aclose(self) -> None:
         pass
@@ -83,6 +93,15 @@ def build(
     *,
     clock: Callable[[], datetime] | None = None,
     chat_intensity: str = "normal",
+    tts: bool = False,
+    voice: bool = False,
+    qq_segments: bool = False,
+    qq_segments_error: Exception | None = None,
+    qq_notice: bool = False,
+    wx_media: bool = False,
+    wx_media_ok: bool = True,
+    wx_media_error: Exception | None = None,
+    poke_enabled: bool = False,
 ):
     store = Store(str(tmp_path / "t.db"))
     store.init_schema()
@@ -93,10 +112,32 @@ def build(
         # 金丝雀：判定完全不依赖这个字段，行为只取决于 chat_intensity 本身。
         triggers=replace(settings.triggers, closed_sample_rate=0.0),
         behavior=BehaviorSettings(chat_intensity=chat_intensity),
+        social=(
+            replace(settings.social, poke_enabled=True)
+            if poke_enabled
+            else settings.social
+        ),
+        # 语音需要 TTS 与工作区同时打开；工作区落在 tmp 下，不碰仓库 data/。
+        speech=SpeechConfig(tts_enabled=True) if tts else settings.speech,
+        workspace=(
+            WorkspaceConfig(dir=str(tmp_path / "ws")) if tts else settings.workspace
+        ),
     )
-    brain = RecordingBrain()
-    qq = FakeChannelAdapter(bot_id="qq:999", chat_id=QQ_CHAT)
-    wx = FakeChannelAdapter(bot_id="wxg:self", chat_id=WX_CHAT)
+    brain = RecordingBrain(voice=voice)
+    qq = FakeChannelAdapter(
+        bot_id="qq:999",
+        chat_id=QQ_CHAT,
+        segments=qq_segments,
+        segments_error=qq_segments_error,
+        notice=qq_notice,
+    )
+    wx = FakeChannelAdapter(
+        bot_id="wxg:self",
+        chat_id=WX_CHAT,
+        media=wx_media,
+        media_ok=wx_media_ok,
+        media_error=wx_media_error,
+    )
     router = Router(settings, store, clock=clock or (lambda: NOON))
     service = Service(
         settings,
@@ -129,6 +170,74 @@ def group_msg(
         reply_to_bot=False,
         timestamp=0,
     )
+
+
+def private_msg(
+    chat_id: str,
+    *,
+    content: str = "在吗",
+    message_id: str = "p1",
+) -> Message:
+    return Message(
+        chat_type=ChatType.PRIVATE,
+        chat_id=chat_id,
+        user_id=chat_id.split(":")[0] + ":u1",
+        nickname="阿鱼",
+        content=content,
+        message_id=message_id,
+        segments=[],
+        is_bot=False,
+        at_bot=False,
+        reply_to_bot=False,
+        timestamp=0,
+    )
+
+
+def _ok_tts(calls: list[tuple[str, str]] | None = None):
+    async def fake(text: str, path: Path, cfg) -> bool:
+        if calls is not None:
+            calls.append((text, path.name))
+        path.write_bytes(b"ID3" + b"\x00" * 64)
+        return True
+
+    return fake
+
+
+def _fail_tts(calls: list[tuple[str, str]] | None = None):
+    async def fake(text: str, path: Path, cfg) -> bool:
+        if calls is not None:
+            calls.append((text, path.name))
+        return False
+
+    return fake
+
+
+def _voice_deliveries(adapter: FakeChannelAdapter) -> int:
+    """voice 投递次数：QQ 数成功发出的 record 段，微信数成功的 voice 媒体。"""
+    if callable(getattr(adapter, "send_segments", None)):
+        return sum(
+            1
+            for _chat_type, _chat_id, segments in adapter.segments
+            for segment in segments
+            if segment.get("type") == "record"
+        )
+    return sum(
+        1
+        for _chat_type, _chat_id, kind, _path, _name in adapter.media_sent
+        if kind == "voice"
+    )
+
+
+def _assert_voice_xor_text(adapter: FakeChannelAdapter) -> None:
+    """speak=True 时投递形态必须二选一：一条 voice，或一条纯文本。"""
+    assert (_voice_deliveries(adapter), len(adapter.sent)) in {(1, 0), (0, 1)}
+
+
+def _bot_contents(store: Store, chat_id: str) -> list[str]:
+    return [
+        message.content
+        for message in store.recent_bot_messages_in(ChatType.GROUP, chat_id, 10)
+    ]
 
 
 async def test_wechat_non_at_message_reaches_model_and_sends(tmp_path):
@@ -292,3 +401,190 @@ async def test_set_groups_whitelist_applies_to_both_channels_and_empty_clears(
     await service.drain()
     assert [call["chat_id"] for call in brain.calls] == [QQ_CHAT, WX_CHAT]
     assert [sent[1] for sent in wx.sent] == [WX_CHAT]
+
+
+# ---------------------------------------------------------------- 语音出站矩阵
+
+
+async def test_voice_success_parity_is_one_voice_zero_text_on_both_channels(
+    tmp_path, monkeypatch
+):
+    """同一份 ``voice=True`` 回复：两条通道各投递且只投递一次语音。
+
+    QQ 用 ``send_segments`` 的 ``record`` 段承载，微信用 ``send_media(kind="voice")``；
+    两边都不得再补发正文，历史里仍保存原文（只多一条 ``[语音]`` 注记）。
+    """
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("dafeiyu.service.synthesize", _ok_tts(calls))
+    service, store, _brain, qq, wx = build(
+        tmp_path, tts=True, voice=True, qq_segments=True, wx_media=True
+    )
+
+    await service.handle(group_msg(QQ_CHAT, message_id="q-voice"))
+    await service.handle(group_msg(WX_CHAT, message_id="w-voice"))
+    await service.drain()
+
+    # QQ：恰好一段 record，没有 text 段，也没有退化成纯文本。
+    assert len(qq.segments) == 1
+    types = [segment["type"] for segment in qq.segments[0][2]]
+    assert types.count("record") == 1
+    assert "text" not in types
+    assert qq.sent == []
+
+    # 微信：恰好一次 voice 媒体，没有纯文本补发。
+    assert [entry[2] for entry in wx.media] == ["voice"]
+    _chat_type, chat_id, kind, path, name = wx.media[0]
+    assert (chat_id, kind) == (WX_CHAT, "voice")
+    assert Path(path).name == name
+    assert wx.sent == []
+
+    _assert_voice_xor_text(qq)
+    _assert_voice_xor_text(wx)
+
+    for chat_id in (QQ_CHAT, WX_CHAT):
+        contents = _bot_contents(store, chat_id)
+        assert len(contents) == 1
+        assert REPLY_TEXT in contents[0]
+    # 两条通道各合成一次，输入都是原文。
+    assert [text for text, _name in calls] == [REPLY_TEXT, REPLY_TEXT]
+
+
+async def test_voice_synthesis_failure_parity_is_one_text_zero_voice_on_both_channels(
+    tmp_path, monkeypatch
+):
+    """TTS 返回 False 时两条通道都只发一条原文文本，绝不出现 voice 段/媒体。"""
+    monkeypatch.setattr("dafeiyu.service.synthesize", _fail_tts())
+    service, store, _brain, qq, wx = build(
+        tmp_path, tts=True, voice=True, qq_segments=True, wx_media=True
+    )
+
+    await service.handle(group_msg(QQ_CHAT, message_id="q-fail"))
+    await service.handle(group_msg(WX_CHAT, message_id="w-fail"))
+    await service.drain()
+
+    assert qq.sent == [(ChatType.GROUP, QQ_CHAT, REPLY_TEXT)]
+    assert wx.sent == [(ChatType.GROUP, WX_CHAT, REPLY_TEXT)]
+    assert qq.segments == []
+    assert wx.media == []
+    assert wx.media_sent == []
+
+    _assert_voice_xor_text(qq)
+    _assert_voice_xor_text(wx)
+
+    for chat_id in (QQ_CHAT, WX_CHAT):
+        contents = _bot_contents(store, chat_id)
+        assert len(contents) == 1 and REPLY_TEXT in contents[0]
+
+
+@pytest.mark.parametrize("wechat_failure", ["unsupported_false", "gateway_error"])
+async def test_wechat_unsupported_media_falls_back_to_text(
+    tmp_path, monkeypatch, wechat_failure
+):
+    """微信桥明确 ``unsupported_media``（或直接抛网关错）时退回原文纯文本。
+
+    与 QQ 消息段被拒收完全同形：1 条纯文本、0 次成功的 voice 投递；
+    媒体失败只是加法项丢失，正文不能跟着丢。
+    """
+    monkeypatch.setattr("dafeiyu.service.synthesize", _ok_tts())
+    # unsupported_false = 桥明确回 False；gateway_error = 桥直接抛网关错。
+    unsupported = wechat_failure == "unsupported_false"
+    media_error = (
+        None if unsupported else GatewayError("微信发送失败：unsupported_media")
+    )
+    service, store, _brain, qq, wx = build(
+        tmp_path,
+        tts=True,
+        voice=True,
+        qq_segments=True,
+        qq_segments_error=GatewayError("NapCat 拒收语音段"),
+        wx_media=True,
+        wx_media_ok=not unsupported,
+        wx_media_error=media_error,
+    )
+
+    await service.handle(group_msg(QQ_CHAT, message_id="q-seg"))
+    await service.handle(group_msg(WX_CHAT, message_id="w-media"))
+    await service.drain()
+
+    # 两条通道最终都是「一条原文文本」；没有任何成功投递的语音。
+    assert qq.sent == [(ChatType.GROUP, QQ_CHAT, REPLY_TEXT)]
+    assert qq.segments == []
+    assert wx.sent == [(ChatType.GROUP, WX_CHAT, REPLY_TEXT)]
+    assert wx.segments == []
+    assert [entry[2] for entry in wx.media] == ["voice"]  # 尝试过
+    assert _voice_deliveries(qq) == 0
+    assert _voice_deliveries(wx) == 0
+
+    _assert_voice_xor_text(qq)
+    _assert_voice_xor_text(wx)
+
+    for chat_id in (QQ_CHAT, WX_CHAT):
+        contents = _bot_contents(store, chat_id)
+        assert len(contents) == 1 and REPLY_TEXT in contents[0]
+
+
+# ---------------------------------------------------------------- 社交/提醒
+
+
+async def test_poke_notice_is_qq_only_but_service_gating_is_shared(tmp_path):
+    """poke 的通道边界：微信桥协议没有 notice 事件。
+
+    ``WeChatAdapter`` 不实现 ``on_notice``，所以 ``Service.start()`` 只会给
+    QQ 适配器注册 notice 处理器——微信私聊根本收不到 poke 回应（不是
+    「收到了却不发」）。真正的门控（静音/强度/预算/冷却/每日上限）在
+    ``Service._handle_poke`` 里与 ``chat_id`` 前缀无关，两条通道共用同一份；
+    这里用 QQ 私聊 poke 证明它只发一条固定短句且绝不调用模型。
+    """
+    from dafeiyu.gateway.wechat import WeChatAdapter
+
+    assert not hasattr(WeChatAdapter, "on_notice")
+
+    service, _store, brain, qq, wx = build(
+        tmp_path, qq_notice=True, poke_enabled=True
+    )
+
+    await service.start()
+    try:
+        assert qq.notice_handlers == [service.handle_notice]
+        assert not callable(getattr(wx, "on_notice", None))
+        await qq.emit_notice(
+            NoticeEvent(
+                kind="friend_poke",
+                chat_type=ChatType.PRIVATE,
+                chat_id=QQ_PRIVATE,
+                user_id="qq:999",  # 被戳的是 bot
+                operator_id="qq:2002",  # 戳的人
+            )
+        )
+    finally:
+        await service.stop()
+
+    assert len(qq.sent) == 1
+    _chat_type, chat_id, text = qq.sent[0]
+    assert chat_id == QQ_PRIVATE
+    assert text in POKE_REPLIES
+    # 微信侧一个字节都没发：notice 根本进不了微信适配器。
+    assert wx.sent == []
+    assert brain.calls == []
+
+
+async def test_remind_writes_one_pending_row_per_channel(tmp_path):
+    """同一个 ``/remind 30 喝水``：qq: 与 wxg: 私聊各写且只写一条待发记录。"""
+    service, store, _brain, qq, wx = build(tmp_path)
+
+    for chat_id in (QQ_PRIVATE, WX_PRIVATE):
+        await service.handle(
+            private_msg(chat_id, content="/remind 30 喝水", message_id=f"r-{chat_id}")
+        )
+
+    for chat_id in (QQ_PRIVATE, WX_PRIVATE):
+        rows = store.list_reminders(ChatType.PRIVATE, chat_id)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["status"] == "pending"
+        assert row["content"] == "喝水"
+        assert row["creator_id"] == chat_id.split(":")[0] + ":u1"
+
+    # 回执也发回各自通道，不串线；两条通道各一条。
+    assert [entry[1] for entry in qq.sent] == [QQ_PRIVATE]
+    assert [entry[1] for entry in wx.sent] == [WX_PRIVATE]
