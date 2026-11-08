@@ -302,6 +302,11 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `gateway.wechat.media.enabled` | `false` | 微信入站图片落盘总开关；关闭时只保留 `[图片]` 占位，不读任何本地文件 |
 | `gateway.wechat.media.max_bytes` | `10485760` | 微信入站图片解密后的单张大小上限（10 MiB）；超限保留占位 |
 | `gateway.wechat.media.storage_root` | `""` | 微信本地媒体根目录；空 = 自动探测 `xwechat_files`，只接受该目录内的文件 |
+| `images.enabled` | `true` | QQ 图片落盘开关：落盘到 `workspace.dir/images/` 并把路径写进正文；关闭时只保留 `[图片]` 占位。同时门控 QQ 语音/视频的 URL 下载 |
+| `images.max_bytes` | `10485760` | 单张图片下载/落盘大小上限（10 MiB）；超限或下载失败保留 `[图片]` 占位 |
+| `images.timeout_seconds` | `8` | 单张图片下载/解码总超时（秒）；超时保留 `[图片]` 占位 |
+| `images.retention_days` | `7` | `images/` 落盘图片保留天数，每次物化前惰性清理超期文件；`0` = 永久保留 |
+| `images.max_edge` | `1280` | 入站图片最长边上限：超过则用 ffmpeg 等比缩小（缺 ffmpeg 时保留原图）；`0` = 不降采样；GIF 不处理（保动画） |
 | `backup.mirror_dir` | `""` | 备份镜像目录：主备份成功后把 `.db`、同名 manifest 和 workspace zip 再复制一份过去；空 = 关闭，与 `backup.dir` 相同则跳过。镜像失败只写独立的镜像错误字段，不影响主备份；相对路径按仓库根目录解析 |
 | `alerts.rules.backup_stale_hours` | `25` | 距上次成功备份超过这么多小时（或从未成功过）就报「备份过期」；`backup.enabled=false` 的部署豁免，不报 |
 | `alerts.rules.memory_gap_days` | `2` | `memory.pending_count`（还没生成摘要的天数）达到这个值就报「记忆落后」；额度熔断期间不报 |
