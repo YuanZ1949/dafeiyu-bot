@@ -812,6 +812,16 @@ def create_app(
         code, data = await bot_call("PUT", "/api/private/settings", payload)
         return web.json_response(data, status=code)
 
+    async def wechat_account(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/wechat/account")
+
+    async def save_wechat_account(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call("PUT", "/api/wechat/account", payload)
+        return web.json_response(data, status=code)
+
     async def get_mind(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/mind")
 
@@ -1256,6 +1266,8 @@ def create_app(
     app.router.add_get("/api/private/chats", private_chats)
     app.router.add_get("/api/private/settings", private_settings)
     app.router.add_put("/api/private/settings", save_private_settings)
+    app.router.add_get("/api/wechat/account", wechat_account)
+    app.router.add_put("/api/wechat/account", save_wechat_account)
     app.router.add_get("/api/mind", get_mind)
     app.router.add_put("/api/mind", save_mind)
     app.router.add_get("/api/workspace/file", workspace_file)

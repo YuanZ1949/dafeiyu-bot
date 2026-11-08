@@ -727,6 +727,11 @@ Bot 控制口（8788）与 OneBot 反向 WS（8080）仍只监听本机。**
   bot 并写审计。轮换完成后旧口令返回 401，新口令返回 200。
 - **运行配置**：只读展示当前模型、人设、冷却、限流、预算、记忆窗口与保留天数。
   要改配置请编辑 `config.yaml` 后重启；面板提供「重启 Bot」和「下载备份」。
+- **微信账号**：填写机器人自己的 wxid（`gateway.wechat.account`），保存到
+  `data/settings.local.yaml`。同时登录多个微信账号时**必须**填写，否则 hook 启动会报
+  「多个微信账号同时登录」；留空 = 仅登录一个账号时由 helper 自动识别。
+  `scripts/start-all.ps1` 下次启动 hook 时会读这个值并传给
+  `start-wechat-hook.ps1 -Account`，保存后需重启 hook/整体重启才生效。
 - **聊天行为**：手动切换聊天强度（安静 / 正常 / 活跃），设置言论限制（禁词、禁话题，
   关闭 / 提示模型 / 严格拦截）。保存后即时生效，并写入 `data/settings.local.yaml`，
   重启后保留；不会改动 `config.yaml` 的注释。

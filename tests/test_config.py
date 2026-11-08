@@ -386,6 +386,46 @@ def test_wechat_media_max_bytes_must_be_positive(tmp_path: Path) -> None:
         load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
 
 
+# ---------------------------------------------- 启动/面板：机器人微信账号（wxid）
+def test_wechat_account_defaults_unbound(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    settings = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+
+    # 空 = 不绑定：只在登录了一个微信时由 helper 自动识别。
+    assert settings.wechat.account == ""
+
+
+def test_wechat_account_is_trimmed(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + 'gateway:\n  wechat:\n    account: "  wxid_516rht3txzox22  "\n'
+    settings = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+    assert settings.wechat.account == "wxid_516rht3txzox22"
+
+
+@pytest.mark.parametrize(
+    "account",
+    ["filehelper", "gh_abcdef", "12345@chatroom", "wxid 123", "wxid_abc/def"],
+)
+def test_wechat_account_rejects_non_personal_ids(
+    tmp_path: Path, account: str
+) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + f'gateway:\n  wechat:\n    account: "{account}"\n'
+
+    with pytest.raises(ConfigError, match="gateway.wechat.account"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+
+def test_wechat_account_rejects_non_string(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + "gateway:\n  wechat:\n    account: 12345\n"
+
+    with pytest.raises(ConfigError, match="gateway.wechat.account 必须是字符串"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+
+
 def test_wechat_quiet_hours_inherit_triggers(tmp_path: Path) -> None:
     env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
     settings = load_settings(env_file=env, config_file=write_yaml(tmp_path))

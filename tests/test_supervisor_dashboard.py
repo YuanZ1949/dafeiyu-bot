@@ -590,6 +590,51 @@ async def test_private_chats_proxies_bot_payload(tmp_path: Path) -> None:
         await bot_client.close()
 
 
+async def test_wechat_account_get_and_put_proxy(tmp_path: Path) -> None:
+    """微信账号读写经 supervisor 原样转发，bot 的 400 不能被吞成 200。"""
+
+    async def get_endpoint(_: web.Request) -> web.Response:
+        return web.json_response({"account": "wxid_x", "restart_required": True})
+
+    seen: list[dict] = []
+
+    async def put_endpoint(request: web.Request) -> web.Response:
+        body = await request.json()
+        seen.append(body)
+        if not body.get("account"):
+            return web.json_response({"error": "缺少 account"}, status=400)
+        return web.json_response(
+            {"account": body["account"], "restart_required": True}
+        )
+
+    bot_app = web.Application()
+    bot_app.router.add_get("/api/wechat/account", get_endpoint)
+    bot_app.router.add_put("/api/wechat/account", put_endpoint)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    try:
+        app, _, _ = make_app(tmp_path, bot_url=url)
+        async with running(app) as client:
+            got = await client.get("/api/wechat/account")
+            got_data = await got.json()
+            saved = await client.put(
+                "/api/wechat/account", json={"account": "wxid_abc"}
+            )
+            saved_data = await saved.json()
+            bad = await client.put("/api/wechat/account", json={"account": ""})
+            bad_data = await bad.json()
+        assert got.status == 200
+        assert got_data["account"] == "wxid_x"
+        assert saved.status == 200
+        assert saved_data["account"] == "wxid_abc"
+        assert bad.status == 400
+        assert bad_data["error"] == "缺少 account"
+        assert seen == [{"account": "wxid_abc"}, {"account": ""}]
+    finally:
+        await bot_client.close()
+
+
 async def test_private_settings_get_and_put_proxy(tmp_path: Path) -> None:
     """GET/PUT 原样转发；PUT 保留 bot 的错误状态码与错误 JSON。"""
     payload = {

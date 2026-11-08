@@ -69,9 +69,25 @@ if ($wechatHook) {
     } catch {
         Write-Host "读取 hook 端口失败，回退 30011" -ForegroundColor DarkYellow
     }
+    # 机器人 wxid 同理以配置为准（面板「微信账号」保存到覆盖层）：同时登录多个
+    # 微信账号时，helper 必须显式绑定，否则报「多个微信账号同时登录」。
+    $hookAccount = ""
+    try {
+        $hookAccountText = & $python -c "from dafeiyu.config import load_settings; print(load_settings().wechat.account or '')" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $hookAccountText) {
+            $hookAccount = ($hookAccountText | Select-Object -Last 1).Trim()
+        }
+    } catch {
+        Write-Host "读取微信账号失败，按不绑定启动 hook" -ForegroundColor DarkYellow
+    }
     if (Test-Path -LiteralPath $hookScript) {
-        Write-Host "启动微信 hook 服务（非 UIA 出站，端口 $hookPort）..." -ForegroundColor Cyan
-        & powershell -ExecutionPolicy Bypass -File $hookScript -Port $hookPort
+        $hookLabel = if ($hookAccount) { "端口 $hookPort，账号 $hookAccount" } else { "端口 $hookPort，未绑定账号" }
+        Write-Host "启动微信 hook 服务（非 UIA 出站，$hookLabel）..." -ForegroundColor Cyan
+        $hookArgs = @("-Port", [string]$hookPort)
+        if ($hookAccount) {
+            $hookArgs += @("-Account", $hookAccount)
+        }
+        & powershell -ExecutionPolicy Bypass -File $hookScript @hookArgs
         if ($LASTEXITCODE -ne 0) {
             Write-Host "hook 服务未就绪：微信出站会失败，其余通道照常启动" -ForegroundColor Yellow
         }

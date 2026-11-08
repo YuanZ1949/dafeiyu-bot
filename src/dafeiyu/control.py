@@ -50,6 +50,7 @@ from .config import (
     GroupsConfig,
     MindConfig,
     Settings,
+    normalize_wechat_account,
     parse_group_ids,
     parse_wechat_peer_ids,
 )
@@ -2066,6 +2067,44 @@ class BrainControl:
         result["restart_required"] = False
         return result
 
+    def wechat_account_snapshot(self) -> dict[str, Any]:
+        """机器人微信账号（hook 启动时传给 helper 的 --account）。
+
+        只读当前生效值；空字符串 = 不绑定，由 helper 在仅登录一个账号时自动识别。
+        """
+        return {
+            "account": self.settings.wechat.account,
+            "note": "保存后下次启动 scripts/start-all.ps1 时用于绑定 hook 账号",
+            "restart_required": True,
+        }
+
+    def save_wechat_account(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """校验 → 落覆盖层 → 更新内存快照；hook 需要重启才生效。"""
+        if not isinstance(payload, dict):
+            raise ConfigError("请求体必须是对象")
+        allowed = {"account"}
+        unknown = sorted(set(payload) - allowed)
+        if unknown:
+            raise ConfigError(f"未知字段：{unknown[0]}")
+        if "account" not in payload:
+            raise ConfigError("缺少 account")
+        account = normalize_wechat_account(payload["account"], "wechat.account")
+
+        try:
+            existing = read_overrides(OVERRIDES_PATH)
+        except OverrideError as exc:
+            raise OverrideError(str(exc)) from exc
+        raw = existing.get("wechat")
+        section = dict(raw) if isinstance(raw, dict) else {}
+        section["account"] = account
+        existing["wechat"] = section
+        write_overrides(existing, OVERRIDES_PATH)
+
+        self.settings = replace(
+            self.settings, wechat=replace(self.settings.wechat, account=account)
+        )
+        return self.wechat_account_snapshot()
+
     def _brain_supports_observer(self) -> bool:
         brain = getattr(self.service, "brain", None)
         return callable(getattr(brain, "complete_detailed", None))
@@ -2181,6 +2220,7 @@ class BrainControl:
                 "retention_days": self.settings.memory.retention_days,
             },
             "gateway": {"provider": self.settings.gateway.provider},
+            "wechat": {"account": self.settings.wechat.account},
         }
 
 
@@ -3087,6 +3127,35 @@ def create_app(
                 status=500,
             )
 
+    async def get_wechat_account(_: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.wechat_account_snapshot())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取微信账号失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取微信账号失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def put_wechat_account(request: web.Request) -> web.Response:
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        try:
+            return web.json_response(control.save_wechat_account(payload))
+        except (ConfigError, OverrideError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except OSError as exc:
+            return web.json_response(
+                {"error": f"覆盖层写入失败：{exc.__class__.__name__}"}, status=500
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("保存微信账号失败：%s", exc)
+            return web.json_response(
+                {"error": f"保存微信账号失败：{exc.__class__.__name__}"}, status=500
+            )
+
     async def get_mind(_: web.Request) -> web.Response:
         try:
             return web.json_response(control.mind_snapshot())
@@ -3218,6 +3287,8 @@ def create_app(
     app.router.add_get("/api/private/chats", get_private_chats)
     app.router.add_get("/api/private/settings", get_private_settings)
     app.router.add_put("/api/private/settings", put_private_settings)
+    app.router.add_get("/api/wechat/account", get_wechat_account)
+    app.router.add_put("/api/wechat/account", put_wechat_account)
     app.router.add_get("/api/mind", get_mind)
     app.router.add_put("/api/mind", put_mind)
     app.router.add_get("/api/backup", backup)

@@ -1225,6 +1225,8 @@ async def test_config_endpoint_has_thresholds_and_no_secrets(tmp_path: Path) -> 
     }
     assert payload["budget"]["daily_calls"] == 200
     assert payload["memory"] == {"window_size": 20, "retention_days": 180}
+    # 面板「运行配置」也能看到当前绑定的微信账号（只读展示）。
+    assert payload["wechat"] == {"account": ""}
 
 
 async def test_behavior_get_and_put_persists_override(
@@ -1615,6 +1617,72 @@ async def test_private_settings_put_rejects_invalid_without_touching_file(
     assert control.settings.wechat.private_allow == frozenset({"wxg:abc"})
 
 
+async def test_wechat_account_get_defaults_unbound(tmp_path: Path) -> None:
+    """读不到账号 = 不绑定；保存必须重启 hook 才生效，所以 restart_required。"""
+    _, _, app = make_control(tmp_path)
+
+    async with running(app) as client:
+        resp = await client.get("/api/wechat/account")
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload["account"] == ""
+    assert payload["restart_required"] is True
+
+
+async def test_wechat_account_put_persists_and_updates_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    overrides = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_module, "OVERRIDES_PATH", overrides)
+    control, _, app = make_control(tmp_path)
+
+    async with running(app) as client:
+        saved_resp = await client.put(
+            "/api/wechat/account", json={"account": "  wxid_516rht3txzox22  "}
+        )
+        saved = await saved_resp.json()
+        got = await (await client.get("/api/wechat/account")).json()
+
+    assert saved_resp.status == 200
+    assert saved["account"] == "wxid_516rht3txzox22"
+    assert saved["restart_required"] is True
+    assert control.settings.wechat.account == "wxid_516rht3txzox22"
+    assert read_overrides(overrides)["wechat"] == {
+        "account": "wxid_516rht3txzox22"
+    }
+    assert got["account"] == "wxid_516rht3txzox22"
+
+
+async def test_wechat_account_put_rejects_invalid_without_touching_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    overrides = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_module, "OVERRIDES_PATH", overrides)
+    control, _, app = make_control(tmp_path)
+
+    async with running(app) as client:
+        group = await client.put(
+            "/api/wechat/account", json={"account": "12345@chatroom"}
+        )
+        blank = await client.put(
+            "/api/wechat/account", json={"account": "wxid a"}
+        )
+        unknown = await client.put(
+            "/api/wechat/account", json={"account": "wxid_ok", "x": 1}
+        )
+        missing = await client.put("/api/wechat/account", json={})
+        not_object = await client.put("/api/wechat/account", data="[]")
+
+    assert group.status == 400
+    assert blank.status == 400
+    assert unknown.status == 400
+    assert missing.status == 400
+    assert not_object.status == 400
+    assert not overrides.exists()
+    assert control.settings.wechat.account == ""
+
+
 def test_dashboard_exposes_new_panels() -> None:
     html = (
         Path(__file__).resolve().parents[1]
@@ -1646,6 +1714,9 @@ def test_dashboard_exposes_new_panels() -> None:
         'id="private-allow"',
         'id="private-deny"',
         'id="btn-save-private-settings"',
+        'id="wechat-account"',
+        'id="btn-save-wechat-account"',
+        'id="btn-refresh-wechat-account"',
     ):
         assert anchor in html, f"面板缺少 {anchor}"
     assert "/api/usage?days=" in html
@@ -1657,6 +1728,7 @@ def test_dashboard_exposes_new_panels() -> None:
     assert "/api/groups" in html
     assert "/api/private/chats" in html
     assert "/api/private/settings" in html
+    assert "/api/wechat/account" in html
     assert "/api/backup" in html
     assert "loadSessions(true)" in html
     assert "c.memory.retention_days" in html

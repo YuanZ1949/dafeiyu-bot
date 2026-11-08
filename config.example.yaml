@@ -59,6 +59,11 @@ gateway:
     bridge_token: ""
     # 小号在群里的微信显示昵称（不是会话别名，别名由桥本地铸造）；启用时必填。
     account_nickname: ""
+    # 机器人自己的微信 wxid（helper 的 wechat_account / --account）。
+    # 同时登录多个微信账号时必须填，否则 hook 启动会报「多个微信账号同时登录」；
+    # 留空 = 只在登录了一个账号时自动识别。也可在面板「微信账号」卡保存
+    # （写入 data/settings.local.yaml），start-all.ps1 启动 hook 时会读这里。
+    account: ""
     # bot 在群里的其他昵称（群昵称/别名）：@ 与引用回复判定用。
     # persona.aliases 启动时会自动并入，一般不用重复写。
     self_nicknames: []

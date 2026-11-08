@@ -1008,6 +1008,22 @@
 
   <section class="card">
     <div class="row card-head">
+      <h2>微信账号</h2>
+      <span class="kv" id="wechat-account-hint">保存后重启生效</span>
+      <span class="spacer"></span>
+      <button class="btn" id="btn-refresh-wechat-account">刷新</button>
+      <button class="btn primary" id="btn-save-wechat-account">保存</button>
+    </div>
+    <div class="debug-form">
+      <label class="debug-wide">机器人微信账号（wxid）
+        <input type="text" id="wechat-account" placeholder="例如 wxid_516rht3txzox22；留空 = 仅一个账号登录时自动识别" />
+      </label>
+    </div>
+    <div class="kv" style="margin-top:8px">同时登录多个微信账号时必须填写，否则 hook 启动会报「多个微信账号同时登录」。保存后下次运行 scripts/start-all.ps1 时用它启动 hook。</div>
+  </section>
+
+  <section class="card">
+    <div class="row card-head">
       <h2>聊天行为</h2>
       <span class="kv" id="behavior-hint">即时生效 · 重启后保留</span>
       <span class="spacer"></span>
@@ -3327,6 +3343,37 @@ async function loadConfig() {
   }
 }
 
+async function loadWechatAccount() {
+  try {
+    const data = await api("/api/wechat/account");
+    $("wechat-account").value = data.account || "";
+    $("wechat-account-hint").textContent = data.account
+      ? "已绑定 · 重启 hook 后生效"
+      : "未绑定 · 仅一个账号登录时自动识别";
+  } catch (err) {
+    $("wechat-account-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+async function saveWechatAccount() {
+  const account = $("wechat-account").value.trim();
+  try {
+    const data = await api("/api/wechat/account", {
+      method: "PUT",
+      body: JSON.stringify({ account }),
+    });
+    $("wechat-account").value = data.account || "";
+    $("wechat-account-hint").textContent = data.restart_required
+      ? "已保存 · 重启后生效"
+      : "已保存";
+    toast("微信账号已保存，下次启动 hook 时生效");
+  } catch (err) {
+    $("wechat-account-hint").textContent = `保存失败：${err.message}`;
+    toast(`保存失败：${err.message}`, true);
+  }
+}
+
+
 const INTENSITY_LABELS = { quiet: "安静", normal: "正常", active: "活跃" };
 const RESTRICTION_LABELS = { off: "关闭", soft: "提示模型", strict: "严格拦截", regenerate: "先改写（最多 2 次）" };
 
@@ -4251,6 +4298,8 @@ $("btn-save-behavior").addEventListener("click", saveBehavior);
 $("btn-refresh-groups").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadGroups));
 $("btn-refresh-private-chats").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadPrivateChats));
 $("btn-save-private-settings").addEventListener("click", (ev) => withBusy(ev.currentTarget, savePrivateSettings));
+$("btn-refresh-wechat-account").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadWechatAccount));
+$("btn-save-wechat-account").addEventListener("click", (ev) => withBusy(ev.currentTarget, saveWechatAccount));
 $("private-chats-body").addEventListener("click", (ev) => {
   const target = ev.target;
   const button = target instanceof Element
@@ -4345,6 +4394,7 @@ loadBehavior();
 loadMind();
 loadGroups();
 loadPrivateChats();
+loadWechatAccount();
 setInterval(refresh, 5000);
 setInterval(() => { if (!document.hidden) refreshHealth(); }, 10000);
 setInterval(() => { if (!document.hidden && !alertsDisabled) refreshAlerts(); }, 10000);

@@ -52,6 +52,12 @@ powershell -ExecutionPolicy Bypass -File scripts\start-wechat-hook.ps1 -Stop
 更高权限启动的旧实例），脚本会直接报错并要求你换端口或用管理员结束它，
 **不会**再起一个收不到请求、却让 `/health` 读到旧状态的重复实例。
 
+账号以 `gateway.wechat.account` 为准：`start-all.ps1` 读出后传给
+`start-wechat-hook.ps1 -Account`。同时登录了两个及以上微信账号时 helper 无法自动选择，
+必须显式绑定，否则启动报「多个微信账号同时登录，请用 wechat_account 绑定机器人账号」。
+该值可在面板「微信账号」卡片保存（写入 `data/settings.local.yaml`），留空 = 不绑定，
+仅在登录一个账号时自动识别。保存后要重启 hook 才生效。
+
 手动前台调试：
 
 ```powershell
@@ -102,7 +108,8 @@ gateway:
 
 - **封号风险自担**：DLL 注入属于侵入式改造，违反微信使用条款。
 - **版本绑定**：微信一升级，指纹校验失败会拒绝加载，需要等 helper 适配或回退版本。
-- **账号**：服务绑定“当前登录的账号”；换号后需要重启服务（日志会打印 wxid）。
+- **账号**：服务绑定“当前登录的账号”；多开微信时必须用 `-Account` / `gateway.wechat.account`
+  显式指定机器人 wxid（面板可配），换号后需要重启服务（日志会打印 wxid）。
 - **群名歧义**：同名群由本地库解析决定，解析不出就失败。
 - **@ 定向**：已打通。dafeiyu 传显示名 → 服务端用 helper 的 `group_members` 解析成 wxid；
   同名/查不到时回 `at_unresolved`，调用方退回普通文本（绝不猜人 @）。UIA 后端仍回

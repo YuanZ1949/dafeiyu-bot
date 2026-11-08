@@ -327,6 +327,10 @@ class WeChatConfig:
     bridge_port: int = 8790
     bridge_token: str = field(default="", repr=False)
     account_nickname: str = ""
+    # 机器人自己的微信 wxid（对应 helper 的 wechat_account / --account）。
+    # 空 = 不绑定：仅登录一个微信时 helper 能自动识别；同时登录多个账号
+    # 必须显式绑定，否则 hook 启动报「多个微信账号同时登录」。
+    account: str = ""
     poll_seconds: float = 8.0
     # 未读门控：先用侧边栏红点判断「有没有新消息」，只打开有未读的白名单群。
     # 免打扰会话不计红点，所以每 full_sweep_seconds 仍做一次全量轮询兜底。
@@ -1087,6 +1091,9 @@ def _bool(value: Any, field: str) -> bool:
 
 _NUMERIC_ID = re.compile(r"^[0-9]+$")
 _ID_PREFIXES = ("qq:", "wxg:")
+# 微信个人账号 id：自动生成的是 wxid_xxx，自定义微信号是字母开头的 6-20 位。
+# 这里只做「像不像一个账号」的粗校验，真正的账号归属由 helper 核对。
+_WECHAT_ACCOUNT = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{1,63}$")
 _QUIET_HOUR = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
 _HOOK_URL = re.compile(r"^https?://", re.IGNORECASE)
 
@@ -1151,6 +1158,31 @@ def parse_wechat_peer_ids(value: Any, field: str) -> frozenset[str]:
     return frozenset(ids)
 
 
+def normalize_wechat_account(value: Any, field: str = "gateway.wechat.account") -> str:
+    """校验并归一机器人微信账号（wxid）；空字符串表示「不绑定」。
+
+    只拒绝明显不是个人账号的目标（群、公众号、文件传输助手）以及带空白的
+    值；账号是否真的存在、是否就是机器人自己，由 helper 启动时核对。
+    """
+    if not isinstance(value, str):
+        raise ConfigError(f"{field} 必须是字符串")
+    account = value.strip()
+    if not account:
+        return ""
+    lowered = account.casefold()
+    if (
+        lowered == "filehelper"
+        or lowered.startswith("gh_")
+        or lowered.endswith("@chatroom")
+    ):
+        raise ConfigError(f"{field} 必须是个人微信账号 wxid，不能是群/公众号/文件传输助手")
+    if not _WECHAT_ACCOUNT.match(account):
+        raise ConfigError(
+            f"{field} 格式非法：只能是字母开头的 2-64 位字母、数字、下划线、点或短横线"
+        )
+    return account
+
+
 def _build_wechat(
     raw: Any,
     env: dict[str, str],
@@ -1170,6 +1202,7 @@ def _build_wechat(
         section = raw
 
     token = str(env.get("DAFEIYU_WECHAT_BRIDGE_TOKEN", "") or section.get("bridge_token") or "")
+    account = normalize_wechat_account(section.get("account", ""))
     host = str(section.get("bridge_host") or "127.0.0.1").strip()
     port = _int(section.get("bridge_port", 8790), "gateway.wechat.bridge_port")
     if not 0 < port < 65536:
@@ -1292,6 +1325,7 @@ def _build_wechat(
         bridge_port=port,
         bridge_token=token,
         account_nickname=str(section.get("account_nickname") or "").strip(),
+        account=account,
         poll_seconds=poll_seconds,
         unread_gate=_bool(
             section.get("unread_gate", True), "gateway.wechat.unread_gate"
@@ -1570,11 +1604,13 @@ def _apply_mind_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> Non
 
 
 def _apply_wechat_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> None:
-    """面板保存的私聊开关：只认四个键，其余静默忽略（与 mind 同风格）。
+    """面板保存的微信开关与账号：只认五个键，其余静默忽略（与 mind 同风格）。
 
     `private_enabled` / `private_reply` 必须是布尔值；`private_allow` /
-    `private_deny` 用 `parse_wechat_peer_ids` 校验。桥与 bot 每个轮询周期
-    经 `hotconfig` 热读这些键，其它 `gateway.wechat.*` 参数不允许在运行期被面板改。
+    `private_deny` 用 `parse_wechat_peer_ids` 校验；`account` 用
+    `normalize_wechat_account` 校验。桥与 bot 每个轮询周期经 `hotconfig`
+    热读四个私聊键；`account` 只在下次启动 hook 时生效，其它
+    `gateway.wechat.*` 参数不允许在运行期被面板改。
     """
     section = overrides.get("wechat")
     if section is None:
@@ -1582,6 +1618,10 @@ def _apply_wechat_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> N
     if not isinstance(section, dict):
         raise ConfigError("覆盖层的 wechat 必须是映射")
     target = _overlay_subtarget(raw, "gateway", "wechat")
+    if "account" in section:
+        target["account"] = normalize_wechat_account(
+            section["account"], "gateway.wechat.account"
+        )
     for name in ("private_enabled", "private_reply"):
         if name in section:
             target[name] = _overlay_bool(section[name], f"gateway.wechat.{name}")

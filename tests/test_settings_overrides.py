@@ -321,7 +321,7 @@ def test_overlay_wechat_private_lists_are_applied(tmp_path, monkeypatch):
 
 
 def test_overlay_wechat_ignores_keys_outside_whitelist(tmp_path, monkeypatch):
-    """覆盖层只认四个键：其它 gateway.wechat 参数仍由 config.yaml 管。"""
+    """覆盖层只认五个键：其它 gateway.wechat 参数仍由 config.yaml 管。"""
     config_file = tmp_path / "config-wechat.yaml"
     config_file.write_text(
         BASE_YAML + "gateway:\n  wechat:\n    outbound: uia\n    poll_seconds: 9\n",
@@ -366,4 +366,22 @@ def test_overlay_wechat_must_be_mapping(tmp_path, monkeypatch):
     write_overrides({"wechat": ["not", "a", "map"]}, path)
 
     with pytest.raises(config.ConfigError, match="wechat"):
+        config.load_settings(config_file=CONFIG_FIXTURE, env_file=ENV_FIXTURE)
+
+
+def test_overlay_wechat_account_is_applied(tmp_path, monkeypatch):
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides({"wechat": {"account": " wxid_abc123 "}}, path)
+
+    s = config.load_settings(config_file=CONFIG_FIXTURE, env_file=ENV_FIXTURE)
+
+    assert s.wechat.account == "wxid_abc123"
+    assert s.wechat.private_enabled is False
+
+
+def test_overlay_wechat_account_rejects_group_id(tmp_path, monkeypatch):
+    path = _override_path(tmp_path, monkeypatch)
+    write_overrides({"wechat": {"account": "12345@chatroom"}}, path)
+
+    with pytest.raises(config.ConfigError, match="gateway.wechat.account"):
         config.load_settings(config_file=CONFIG_FIXTURE, env_file=ENV_FIXTURE)
