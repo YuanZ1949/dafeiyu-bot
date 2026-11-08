@@ -780,6 +780,51 @@ bot 与 supervisor 会写同一文件，写入和轮转通过 `.audit.jsonl.lock
 ```
 offline 数据集非法时退出码 2；live 单条失败/超时记为 skipped，不影响整体退出码。
 
+每次运行都会把结果落盘，默认写 `data/evals/results/`（`--out-dir` 可改）。文件名是
+`<UTC ISO 去掉冒号>-<mode>.json`，例如 `2026-11-08T052311.123456+0000-live.json`；顶层固定六个键：
+
+| 键 | 内容 |
+| --- | --- |
+| `dataset` | 本次使用的数据集路径 |
+| `mode` | `offline` / `live` |
+| `model` | 实际模型名（offline 固定 `offline`） |
+| `generated_at` | UTC ISO 时间戳（带微秒） |
+| `summary` | `total` / `passed` / `failed` / `skipped` / `accuracy` |
+| `results` | 每条 case 的 `id` / `expect` / `got` / `status` / `reason` / `latency_ms` |
+
+`summary.accuracy` 的分母只算 `passed + failed`，没有判过的 case 时为 `null`。
+
+**回归门**：拿上一次的结果文件当基线，只拦「基线通过 → 现在失败」：
+
+```powershell
+.venv\Scripts\python scripts/eval_golden.py --mode live --baseline data/evals/results/<上次>-live.json --fail-on-regression
+```
+
+命中回归时退出码 1，stderr 打印被拦的 case id；没有回归、没给 `--baseline`、或只有新增/缺失
+case 都是 0。`skipped` 在基线和当前两边都剔除，只在报告里统计，永远不算回归也不算修复。
+`--baseline` 必须是本脚本落盘的结果文件（顶层有 `results` 列表）；给成 `cases` 形状的评测报告或
+坏 JSON 会直接退出 2。加 `--json` 还能拿到 `result_path`、`distribution`
+和 `baseline`（`new` / `missing` / `regressed` / `fixed` / `new_failures`）。
+
+**线上抽样**：从主库只读抽最近的聊天，产出可回放的 case：
+
+```powershell
+.venv\Scripts\python scripts/eval_sample.py --days 7 --per-chat 5
+```
+
+默认写 `data/evals/samples/<UTC 日期>.yaml`（`--out` 可改），可直接交给
+`dafeiyu.eval.loader.load_cases` 回放。采样**只读**，不会创建或迁移数据库；SQL 层过滤
+`is_bot = 1`，bot 自己的发言不会变成 case 里的 user 消息；`--db` 指定主库，
+`--chat-type group|private` 只采一类会话。库不存在、缺表或时间窗内没有人类消息时只打印原因
+并退出 0，不写文件；抽样不调用模型。
+
+面板的「评测」卡片（`GET /api/evals`）只读展示 `data/evals/results/` 里最近 10 次运行的文件名
+（含模式）、生成时间与通过/失败/跳过数量和准确率；目录不存在或文件坏掉时卡片只少几行，
+不报错，也没有删除、编辑或触发运行的接口。
+
+`data/evals/results/` 与 `data/evals/samples/` 都是生成物，已被 `.gitignore` 排除
+（`data/evals/` 下只保留 `golden_replies.json`），不要提交。
+
 ## 7. 常见故障
 
 | 现象 | 排查 |
