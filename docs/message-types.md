@@ -46,6 +46,19 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 
 入站表情的正文格式统一为 `[表情:<标识>]`：QQ `face` 用数字 id、`mface` 用摘要文本；微信优先用 `<emoji desc/attachedtext>`，为空时用 md5 前 8 位。标识只是让模型能区分「哪个表情」，真正的语义仍要靠贴纸图片本身（见下）。
 
+### 站内语音消息（出站 TTS）
+
+`speech.tts_enabled: true` 且装了可选依赖 `.[tts]`（edge-tts）时，模型回复里 `voice: true` 的单段回复会被合成为语音；**默认关闭**，不装依赖时永远只有文字。
+
+- **触达条件**：成型后的回复只有 1 段、没有 @ 目标、工作区打开（`workspace.dir` 非空）。多段回复或带 @ 的回复不转语音，照常发文字——语音段承载不了 @ 与多段语义。
+- **落盘**：`<workspace.dir>/replies/voice-<uuid>.mp3`；文件名不用 `message_id`（微信的 `epoch:seq` 含 `:`，在 Windows 上是非法文件名）。先写 `<name>.tmp` 再原子替换，失败时清理临时文件，不留半截 mp3。
+- **QQ 出站**：`build_onebot_segments` 把 `voice`/`record` 附件映射成 OneBot 的 `record` 段；语音段承载全部正文，发送成功就不再补发文字。
+- **微信出站**：桥适配器没有消息段能力，改走 `send_media(kind="voice", path=..., name=...)`；推送成功同样不再补发文字，桥明确回 `unsupported_media` 时退回文本。
+- **入站语音（STT）不变**：`speech.enabled` 的下载/解码/转写管线仍是原来的逻辑，见上文「入站媒体」；出站 TTS 与入站转写互不影响。
+- **失败降级**：依赖缺失、合成异常、30 秒超时、超过 `speech.tts_max_chars`、文件为空或超过 10 MiB、段/媒体发送失败——一律退回**纯文本**，不重试、不抛错。
+- **历史与 outbox**：机器人历史（`_store_bot_chunks`）和待发队列（`enqueue_outbox`）保存的是**原文**，不是空正文或语音路径，因此上下文连续、补发也仍是文字。
+
+注意：启用后回复文本会发往云端 TTS（edge-tts / 微软语音），这是它默认关闭的原因；没装可选依赖时不会合成，也不会假装合成成功。
 ### 入站媒体（群 → 本机）
 
 - QQ 图片：下载/复制到 `<workspace.dir>/images/`，文件名由时间戳 + 来源 md5 生成，不采信 URL 路径段；下载失败、超过大小上限、没有可用来源都保留 `[图片]` 占位。

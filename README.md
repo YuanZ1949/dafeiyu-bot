@@ -565,6 +565,35 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 
 封号、RPA 误操作、桌面客户端升级导致 UIA 失效——这些是桌面 RPA 接入的固有代价，**均由使用者自担**。
 
+## 3.6 语音回复（可选，默认关闭）
+
+**默认路径**：`speech.tts_enabled: false`，回复一律是文字，本节可以整个跳过。语音回复和微信通道、入站转写一样是 opt-in 能力，不装依赖、不开开关就不参与任何链路。
+
+### 安装与配置
+
+1. 安装可选依赖：`pip install -e ".[tts]"`。extra 只含 `edge-tts>=6.1`，**不在默认依赖里**；没装时不会合成，回复照常是文字。
+
+2. 在 `config.yaml` 的 `speech:` 下打开（四个键都在 `speech` 里，没有独立的 `tts:` 配置节）：
+
+   | 键 | 默认 | 说明 |
+   | --- | --- | --- |
+   | `speech.tts_enabled` | `false` | 总开关；关闭时不 import `edge-tts`、不落盘 |
+   | `speech.tts_voice` | `zh-CN-XiaoxiaoNeural` | edge-tts 云端音色名 |
+   | `speech.tts_rate` | `"+0%"` | 语速，按 edge-tts 的百分比写法（如 `"-10%"`） |
+   | `speech.tts_max_chars` | `200` | 超过这个字数的回复不合成，直接发文字 |
+
+3. 生效范围：只有**成型后单段**、**没有 @ 目标**、且工作区打开（`workspace.dir` 非空）的回复才会转语音；多段回复和带 @ 的回复照常发文字。语音文件落在 `<workspace.dir>/replies/voice-<uuid>.mp3`。
+
+> **隐私警告**：开启后，被合成的**回复文本会发送到云端 TTS 提供商（edge-tts / 微软语音服务）**。这正是它默认关闭的原因；介意就别开，其余数据的流向不受影响。
+
+### 降级行为
+
+回复**永远不会**因为语音失败而丢失：
+
+- 没装 `edge-tts`、合成报错、30 秒超时、文本超过 `speech.tts_max_chars`、输出目录不可写、产出文件为空或超过 10 MiB —— 一律**自动退回纯文本**；
+- 语音段 / 媒体发送失败同样退回原文，不重试；
+- 机器人自己存的历史与待发队列（outbox）保存的始终是**原文**，不是空正文或语音路径，所以后续上下文与补发都正常。
+
 ## 4. 用法
 
 群里：
