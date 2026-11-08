@@ -13,7 +13,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path, PurePosixPath
 from stat import S_ISREG
@@ -134,6 +134,10 @@ WORKSPACE_FILE_SUFFIXES = frozenset(
     }
 )
 MAX_WORKSPACE_FILE_BYTES = 20 * 1024 * 1024
+# 黄金集结果目录（与 scripts/eval_golden.py 的 DEFAULT_OUT_DIR 对齐）：只读趋势，
+# 面板最多看最近 10 次；不提供删除/编辑/运行接口。
+EVALS_RESULTS_DIR = INSTALL_ROOT / "data" / "evals" / "results"
+EVALS_TREND_LIMIT = 10
 _DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
 # 人设正文的唯一来源：provider_config 只替换前置区，正文原样搬运。
 AGENT_TEMPLATE_PATH = Path(__file__).resolve().parent / "brain" / "agent_template.md"
@@ -155,6 +159,73 @@ def _iso_ts(timestamp: Any) -> str | None:
         )
     except (TypeError, ValueError, OSError):
         return None
+
+
+def _eval_counts(summary: Any) -> dict[str, Any] | None:
+    """校验黄金集结果里的 ``summary``；字段类型不对就整个文件当坏数据跳过。"""
+    if not isinstance(summary, dict):
+        return None
+    counts: dict[str, Any] = {}
+    for key in ("total", "passed", "failed", "skipped"):
+        value = summary.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        counts[key] = value
+    accuracy = summary.get("accuracy")
+    if accuracy is not None and (
+        isinstance(accuracy, bool) or not isinstance(accuracy, (int, float))
+    ):
+        return None
+    counts["accuracy"] = float(accuracy) if accuracy is not None else None
+    return counts
+
+
+def _eval_sort_key(item: dict[str, Any]) -> tuple[float, str]:
+    """按 ``generated_at`` 排序；解析不了的时间退回字符串序，绝不抛异常。"""
+    raw = str(item.get("generated_at") or "")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return (0.0, raw)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (parsed.timestamp(), raw)
+
+
+def read_eval_results(directory: Path | None = None) -> dict[str, Any]:
+    """扫描黄金集结果目录，返回最近 ``EVALS_TREND_LIMIT`` 条摘要（只读）。
+
+    坏文件（读不出、不是 JSON 对象、缺 ``generated_at``、``summary`` 形状不对）
+    直接跳过；目录不存在只返回空列表，调用方永远拿到 ``{"items": [...]}``。
+    """
+    base = EVALS_RESULTS_DIR if directory is None else directory
+    try:
+        paths = sorted(base.glob("*.json"))
+    except OSError:
+        paths = []
+    items: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        generated_at = raw.get("generated_at")
+        if not isinstance(generated_at, str) or not generated_at.strip():
+            continue
+        counts = _eval_counts(raw.get("summary"))
+        if counts is None:
+            continue
+        items.append(
+            {
+                "name": path.name,
+                "generated_at": generated_at.strip(),
+                **counts,
+            }
+        )
+    items.sort(key=_eval_sort_key, reverse=True)
+    return {"items": items[:EVALS_TREND_LIMIT]}
 
 
 def _parse_impression_id(raw: str) -> tuple[int | None, web.Response | None]:
@@ -1533,6 +1604,10 @@ class BrainControl:
             raise SwitchError(502, f"连不上 LM Studio（{base}）") from exc
 
     # ---- dashboard 扩展：用量 / 搜索 / 导出 / 会话 / 配置 ----
+    def evals_snapshot(self) -> dict[str, Any]:
+        """黄金集只读趋势：最近 ``EVALS_TREND_LIMIT`` 次结果。"""
+        return read_eval_results()
+
     def usage_snapshot(self, days: int = 7) -> dict[str, Any]:
         days = max(1, min(90, int(days)))
         end = datetime.now(SHANGHAI).date()
@@ -2648,6 +2723,14 @@ def create_app(
                 {"error": f"读取用量失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def evals(_: web.Request) -> web.Response:
+        # 只读趋势：目录缺失/文件损坏都只返回空列表，绝不 500。
+        try:
+            return web.json_response(control.evals_snapshot())
+        except Exception as exc:  # noqa: BLE001 - 读文件失败不能把控制口打挂
+            log.warning("读取评测结果失败：%s", exc)
+            return web.json_response({"items": []})
+
     async def budget(request: web.Request) -> web.Response:
         chat_type, chat_id, error = _query_scope(request)
         if error is not None:
@@ -3116,6 +3199,7 @@ def create_app(
         delete_user_messages,
     )
     app.router.add_get("/api/usage", usage)
+    app.router.add_get("/api/evals", evals)
     app.router.add_get("/api/budget", budget)
     app.router.add_get("/api/decisions", decisions)
     app.router.add_get("/api/memory/search", search_messages)

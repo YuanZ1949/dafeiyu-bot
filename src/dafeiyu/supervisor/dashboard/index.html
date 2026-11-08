@@ -886,6 +886,14 @@
     </div>
   </section>
 
+  <section class="card span-full" id="evals-card">
+    <div class="row card-head">
+      <h2>黄金集趋势</h2>
+      <span class="kv" id="evals-hint">最近 10 次评测（只读）</span>
+    </div>
+    <div class="mem-list" id="evals-list"></div>
+  </section>
+
   <section class="card span-full">
     <div class="row card-head">
       <h2>记忆搜索</h2>
@@ -2986,6 +2994,32 @@ async function loadUsage() {
   }
 }
 
+function evalAccuracy(accuracy) {
+  // accuracy=None 表示一条都没判（例如 offline 全 skipped）：显示破折号，不谎报 0%。
+  if (accuracy === null || accuracy === undefined || accuracy === "") return "—";
+  const value = Number(accuracy);
+  if (!Number.isFinite(value)) return "—";
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+async function loadEvals() {
+  try {
+    const data = await api("/api/evals");
+    const items = data.items || [];
+    $("evals-hint").textContent = items.length
+      ? `最近一次 ${items[0].generated_at}（只读）`
+      : "最近 10 次评测（只读）";
+    $("evals-list").innerHTML = items.length
+      ? items.map((r) => `<div class="mem-item">
+          <div class="mem-meta">${escapeHtml(String(r.name || ""))} · ${escapeHtml(String(r.generated_at || "—"))}</div>
+          <div class="mem-text">共 ${Number(r.total) || 0} 条 · 通过 ${Number(r.passed) || 0} · 失败 ${Number(r.failed) || 0} · 跳过 ${Number(r.skipped) || 0} · 准确率 ${evalAccuracy(r.accuracy)}</div>
+        </div>`).join("")
+      : '<div class="mem-empty" id="evals-empty">还没有评测结果，先运行一次黄金集评测</div>';
+  } catch (err) {
+    $("evals-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
 function budgetRatio(used, limit) {
   const denominator = Number(limit) || 0;
   if (denominator <= 0) return null;
@@ -4303,6 +4337,7 @@ refreshAlerts();
 refreshBackups();
 loadMemory();
 loadUsage();
+loadEvals();
 loadBudget();
 loadSessions();
 loadConfig();

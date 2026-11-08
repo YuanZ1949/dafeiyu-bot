@@ -335,6 +335,25 @@ def test_sessions_auto_refresh_keeps_loaded_pages() -> None:
     assert "setInterval(loadSessions, 15000)" not in html
 
 
+def test_html_has_read_only_evals_card() -> None:
+    """黄金集趋势卡：只读、在用量卡之后、空态与准确率占位都要有。"""
+    html = read_html()
+    assert 'id="evals-card"' in html
+    assert html.index('id="evals-card"') > html.index('id="usage-bars"')
+    assert "/api/evals" in html
+    assert 'id="evals-list"' in html
+    assert "还没有评测结果" in html
+    assert "evals-empty" in html
+    assert "loadEvals();" in html
+
+    match = re.search(r"function evalAccuracy\(accuracy\) \{\n(.*?)\n\}", html, re.DOTALL)
+    assert match is not None, "evalAccuracy 必须仍是一段可直接断言的函数体"
+    body = match.group(1)
+    assert "—" in body
+    assert "accuracy === null" in body
+    assert "100" in body
+
+
 def test_login_html_is_mobile_friendly() -> None:
     login = HTML_PATH.with_name("login.html").read_text(encoding="utf-8")
     assert "viewport-fit=cover" in login
