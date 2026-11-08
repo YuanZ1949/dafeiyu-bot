@@ -14,6 +14,7 @@ brain 载荷零改动。
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
@@ -25,6 +26,7 @@ from pathlib import Path
 
 import httpx
 
+from . import imaging
 from .config import Settings
 from .models import Attachment, Message
 from .netssl import default_ssl_context
@@ -222,6 +224,14 @@ async def _materialize(
                 "图片写盘失败，保持占位：msg=%s", msg.message_id, exc_info=True
             )
             continue
+        if target.suffix.lower() != ".gif":
+            await asyncio.to_thread(
+                imaging.downscale, target, settings.images.max_edge
+            )
+        try:
+            size = target.stat().st_size
+        except OSError:
+            size = len(data)
         rel = target.as_posix()
         if _PLACEHOLDER in msg.content:
             template = (
@@ -240,7 +250,7 @@ async def _materialize(
                         source=value,
                         path=f"images/{target.name}",
                         name=target.name,
-                        size=len(data),
+                        size=size,
                     )
                 )
             # 追加附件失败不得影响图片物化本身。

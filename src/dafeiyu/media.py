@@ -18,9 +18,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
-import os
 import re
-import shutil
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
@@ -29,8 +27,9 @@ from pathlib import Path
 
 import httpx
 
-from . import speech
+from . import imaging, speech
 from .config import Settings
+from .imaging import locate as _locate
 from .models import Attachment, Message
 from .netssl import default_ssl_context
 
@@ -394,15 +393,6 @@ def _cleanup(directory: Path, retention_days: int) -> None:
 def _file_note(attachment: Attachment) -> str:
     name = attachment.name or Path(attachment.path).name
     return f"{_FILE_PREFIX} {name} ({attachment.path})"
-
-
-def _locate(program: str) -> str | None:
-    """定位外部程序：``DAFEIYU_FFMPEG`` 优先，其次 ``PATH``。"""
-    if program == "ffmpeg":
-        override = str(os.environ.get("DAFEIYU_FFMPEG") or "").strip()
-        if override:
-            return override
-    return shutil.which(program)
 
 
 def _probe_duration(ffmpeg: str, ffprobe: str | None, source: Path) -> float:
@@ -842,6 +832,14 @@ async def materialize_attachments(
                 updated.append(attachment)
                 continue
 
+            if target.suffix.lower() != ".gif":
+                await asyncio.to_thread(
+                    imaging.downscale, target, settings.images.max_edge
+                )
+            try:
+                size = target.stat().st_size
+            except OSError:
+                size = len(data)
             relative = _materialized_relative(target, root) or (f"images/{target.name}")
             msg.content = _annotate_first(
                 msg.content, _ANNOTATED.format(path=relative)
@@ -852,7 +850,7 @@ async def materialize_attachments(
                     source=attachment.source,
                     path=relative,
                     name=target.name,
-                    size=len(data),
+                    size=size,
                     duration=attachment.duration,
                 )
             )

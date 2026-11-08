@@ -15,6 +15,7 @@ from typing import cast
 import pytest
 
 import dafeiyu.media as media_module
+from dafeiyu import imaging
 from dafeiyu.config import Settings
 from dafeiyu.gateway.wechat_bridge.media.dat import decode_dat
 from dafeiyu.media import materialize_attachments
@@ -33,6 +34,7 @@ def make_settings(
     max_bytes: int = 1024 * 1024,
     retention_days: int = 0,
     images: bool = True,
+    max_edge: int = 0,
     speech: bool = False,
 ) -> Settings:
     return cast(
@@ -53,6 +55,7 @@ def make_settings(
                     max_bytes=max_bytes,
                     timeout_seconds=8.0,
                     retention_days=retention_days,
+                    max_edge=max_edge,
                 ),
                 speech=SimpleNamespace(
                     enabled=speech,
@@ -738,3 +741,54 @@ async def test_url_attachment_is_skipped_when_both_gates_off(
     assert count == 0
     assert message.content == "[语音]"
     assert not (tmp_path / "ws" / "voices").exists()
+
+
+# ------------------------------------------------------------- 图片降采样
+
+
+async def test_wechat_image_passes_max_edge_to_downscale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "a.png"
+    source.write_bytes(PNG)
+    calls: list[tuple[Path, int]] = []
+
+    def fake_downscale(path: Path, max_edge: int) -> bool:
+        calls.append((Path(path), max_edge))
+        Path(path).write_bytes(PNG[:8])
+        return True
+
+    monkeypatch.setattr(imaging, "downscale", fake_downscale)
+    settings = make_settings(tmp_path, max_edge=1280)
+    message = make_message(str(source))
+
+    count = await materialize_attachments(message, settings, decode=None)
+
+    assert count == 1
+    assert len(calls) == 1
+    path, max_edge = calls[0]
+    assert max_edge == 1280
+    assert path.parent == tmp_path / "ws" / "images"
+    # 降采样成功后 Attachment.size 取真实落盘大小。
+    assert message.attachments[0].size == len(PNG[:8])
+
+
+async def test_wechat_gif_does_not_call_downscale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "a.gif"
+    source.write_bytes(b"GIF89a" + b"0" * 64)
+    calls: list[tuple[Path, int]] = []
+
+    def fake_downscale(path: Path, max_edge: int) -> bool:
+        calls.append((Path(path), max_edge))
+        return False
+
+    monkeypatch.setattr(imaging, "downscale", fake_downscale)
+    settings = make_settings(tmp_path, max_edge=1280)
+    message = make_message(str(source))
+
+    count = await materialize_attachments(message, settings, decode=None)
+
+    assert count == 1
+    assert calls == []

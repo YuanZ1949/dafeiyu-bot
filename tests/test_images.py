@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from dafeiyu import imaging
 from dafeiyu.config import (
     BudgetConfig,
     ConfigError,
@@ -494,4 +495,53 @@ async def test_content_without_placeholder_adds_no_attachment(tmp_path):
     assert got == 1
     assert msg.content == "已经处理过"
     assert msg.attachments == []
+
+
+# ---------------------------------------------------------------- 降采样
+
+
+async def test_static_image_passes_max_edge_to_downscale(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def fake_downscale(path, max_edge):
+        calls.append((Path(path), max_edge))
+        Path(path).write_bytes(PNG[:8])
+        return True
+
+    monkeypatch.setattr(imaging, "downscale", fake_downscale)
+    msg = make_msg()
+    got = await materialize(
+        msg, make_settings(tmp_path, max_edge=1280), fetch=fake_fetch()[0]
+    )
+
+    assert got == 1
+    assert len(calls) == 1
+    path, max_edge = calls[0]
+    assert max_edge == 1280
+    assert path == images_dir(tmp_path) / msg.attachments[0].name
+    # 降采样成功后 Attachment.size 取真实落盘大小。
+    assert msg.attachments[0].size == len(PNG[:8])
+
+
+async def test_gif_does_not_call_downscale(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_downscale(path, max_edge):
+        calls.append((path, max_edge))
+        return False
+
+    monkeypatch.setattr(imaging, "downscale", fake_downscale)
+
+    async def fetch(url, timeout, max_bytes):
+        return b"GIF89a" + b"0" * 64
+
+    msg = make_msg()
+    got = await materialize(
+        msg, make_settings(tmp_path, max_edge=1280), fetch=fetch
+    )
+
+    assert got == 1
+    assert calls == []
 

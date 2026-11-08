@@ -42,6 +42,12 @@ def test_example_config_wechat_block_matches_defaults():
     assert wechat_raw["bridge_token"] == ""
 
 
+def test_example_config_images_max_edge(tmp_path, monkeypatch):
+    settings = _load_example(tmp_path, monkeypatch)
+
+    assert settings.images.max_edge == 1280
+
+
 def test_example_config_media_and_observer_default_off(tmp_path, monkeypatch):
     """新增的媒体/观察者开关在模板里必须显式关闭（软回滚前提）。"""
     settings = _load_example(tmp_path, monkeypatch)

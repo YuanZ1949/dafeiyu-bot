@@ -250,6 +250,8 @@ class ImagesConfig:
     max_bytes: int = 10 * 1024 * 1024
     timeout_seconds: float = 8.0
     retention_days: int = 7
+    #: 入站图片最长边上限；超过则用 ffmpeg 等比缩小。0 = 不降采样。
+    max_edge: int = 1280
 
 
 @dataclass(frozen=True)
@@ -871,6 +873,9 @@ def _build_images(raw: dict[str, Any]) -> ImagesConfig:
         timeout_seconds=timeout,
         retention_days=_non_negative_int(
             raw.get("retention_days"), "images.retention_days", 7
+        ),
+        max_edge=_non_negative_int(
+            raw.get("max_edge"), "images.max_edge", 1280
         ),
     )
 
