@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dafeiyu.brain.client import (
     OUTPUT_INSTRUCTION,
+    BrainReply,
     parse_at,
     parse_brain_reply,
     parse_reply_attachments,
@@ -212,6 +213,55 @@ def test_output_instruction_keeps_required_format_and_adds_optional_fields() -> 
     assert '"at":' in OUTPUT_INSTRUCTION
     assert '"attachments":' in OUTPUT_INSTRUCTION
     assert '"forward"' in OUTPUT_INSTRUCTION
+    assert '"voice"' in OUTPUT_INSTRUCTION
+    assert "默认 false" in OUTPUT_INSTRUCTION
+
+
+def test_voice_true_parsed() -> None:
+    reply = parse_brain_reply('{"speak": true, "reply": "x", "voice": true}')
+
+    assert reply.voice is True
+
+
+def test_voice_missing_defaults_to_false() -> None:
+    reply = parse_brain_reply('{"speak": true, "reply": "x"}')
+
+    assert reply.voice is False
+
+
+def test_voice_string_falsey_coerced_to_false() -> None:
+    for raw in ('"false"', '"0"', '"off"', '" FALSE "', '"no"', '""'):
+        reply = parse_brain_reply(
+            '{"speak": true, "reply": "x", "voice": ' + raw + "}"
+        )
+        assert reply.voice is False, raw
+
+
+def test_voice_string_truthy_and_real_bool_true() -> None:
+    assert parse_brain_reply('{"speak": true, "reply": "x", "voice": "true"}').voice is True
+    assert parse_brain_reply('{"speak": true, "reply": "x", "voice": true}').voice is True
+    assert (
+        parse_brain_reply('{"speak": true, "reply": "x", "voice": "yes"}').voice is True
+    )
+
+
+def test_voice_rejects_non_bool_truthy_objects() -> None:
+    for raw in ("1", "[]", '["x"]', '{"on": true}'):
+        reply = parse_brain_reply(
+            '{"speak": true, "reply": "x", "voice": ' + raw + "}"
+        )
+        assert reply.voice is False, raw
+
+
+def test_brain_reply_voice_defaults_and_positional_compat() -> None:
+    legacy = BrainReply(speak=True, reply="hi")
+    assert legacy.voice is False
+
+    positional = BrainReply(True, "hi", "为什么", 10, 5, False)
+    assert positional.voice is False
+    assert positional.reason == "为什么"
+    assert positional.prompt_tokens == 10
+    assert positional.completion_tokens == 5
 
 
 def test_forward_nodes_parsed_and_trimmed() -> None:
