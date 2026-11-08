@@ -265,7 +265,6 @@ def test_overlay_mind_observer_settings_are_applied(tmp_path, monkeypatch):
             "mind": {
                 "observer_enabled": True,
                 "observer_daily_calls": 12,
-                "observer_provider": "main",
                 "unknown": {"x": 1},
             }
         },
@@ -276,7 +275,6 @@ def test_overlay_mind_observer_settings_are_applied(tmp_path, monkeypatch):
 
     assert s.mind.observer_enabled is True
     assert s.mind.observer_daily_calls == 12
-    assert s.mind.observer_provider == "local"
     assert not hasattr(s.mind, "unknown")
 
 

@@ -375,10 +375,8 @@ mind:
   enabled: false
   state_enabled: true
   episodes_enabled: true
-  # Observer 需要调模型；默认只允许本地模型，不挤主链路免费额度。
+  # Observer/Reflector 统一走当前主脑；主脑需要具备 complete_detailed。
   observer_enabled: false
-  # local：只用 local_model 段配置的端点；main：跟随当前大脑。
-  observer_provider: local
   observer_interval_seconds: 600
   observer_min_messages: 8
   # 单群每天「观察 + 夜间自省」的总调用上限，与回复预算分开计。

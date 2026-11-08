@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 
 import pytest
@@ -268,7 +269,6 @@ def test_mind_section_parses_values() -> None:
         {
             "enabled": True,
             "observer_enabled": True,
-            "observer_provider": "main",
             "observer_interval_seconds": 300,
             "observer_min_messages": 5,
             "observer_daily_calls": 6,
@@ -277,17 +277,24 @@ def test_mind_section_parses_values() -> None:
     )
     assert mind.enabled is True
     assert mind.observer_enabled is True
-    assert mind.observer_provider == "main"
     assert mind.observer_interval_seconds == 300
     assert mind.observer_min_messages == 5
     assert mind.observer_daily_calls == 6
     assert mind.reflection_hour == 4
 
 
-@pytest.mark.parametrize("bad", [{"observer_provider": "cloud"}, {"reflection_hour": 24}])
-def test_mind_section_rejects_bad_values(bad) -> None:
+def test_mind_section_ignores_deprecated_observer_provider(caplog) -> None:
+    """旧配置的 observer_provider 不再生效，但要告警提醒删掉。"""
+    with caplog.at_level(logging.WARNING):
+        mind = _build_mind({"observer_provider": "local"})
+
+    assert mind == MindConfig()
+    assert "observer_provider" in caplog.text
+
+
+def test_mind_section_rejects_bad_values() -> None:
     with pytest.raises(ConfigError):
-        _build_mind(bad)
+        _build_mind({"reflection_hour": 24})
 
 
 def test_injection_mind_switches_follow_master_switch() -> None:

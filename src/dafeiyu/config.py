@@ -136,9 +136,8 @@ class MindConfig:
     enabled: bool = False
     state_enabled: bool = True
     episodes_enabled: bool = True
-    # Observer 需要能调模型；默认只允许本地模型（不挤主链路免费额度）。
+    # Observer/Reflector 需要能调模型；统一复用当前主脑（dashboard 切档后跟随）。
     observer_enabled: bool = False
-    observer_provider: str = "local"
     observer_interval_seconds: int = 600
     observer_min_messages: int = 8
     # 单群每天观察/自省总调用上限，与 reply 预算分开。
@@ -602,23 +601,6 @@ class Settings:
     social: SocialConfig = field(default_factory=SocialConfig)
 
 
-def observer_uses_local_model(settings: Settings) -> bool:
-    """Observer/Reflector 是否依赖本机 LM Studio 端点。
-
-    `mind.observer_provider=local` 时旁路不复用主脑，而是直连
-    `local_model.base_url`。启动时（要不要拉起/保留 LM Studio）与面板切脑时
-    （切走后能不能停掉端点）必须用同一份判断，否则旁路每轮都是 ConnectError。
-    """
-    mind = settings.mind
-    local = settings.local_model
-    return bool(
-        mind.enabled
-        and mind.observer_provider == "local"
-        and local.base_url.strip()
-        and local.model.strip()
-    )
-
-
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
     value = data.get(name)
     if not isinstance(value, dict):
@@ -949,9 +931,11 @@ def _build_mind(raw: dict[str, Any]) -> MindConfig:
     """解析可选的 ``mind:`` 段；缺段 = 全默认（enabled=false），老配置不受影响。"""
     if not isinstance(raw, dict):
         raise ConfigError("config.yaml 的 mind 必须是映射")
-    provider = str(raw.get("observer_provider", "local")).strip().lower()
-    if provider not in ("local", "main"):
-        raise ConfigError("mind.observer_provider 只能是 local 或 main")
+    if "observer_provider" in raw:
+        # 旧配置可能还留着这个键：统一走主脑后它不再有任何作用。
+        logger.warning(
+            "mind.observer_provider 已废弃并被忽略：Observer/Reflector 统一使用当前主脑"
+        )
     hour = _int(raw.get("reflection_hour", 5), "mind.reflection_hour")
     if not 0 <= hour <= 23:
         raise ConfigError("mind.reflection_hour 必须在 0-23 之间")
@@ -964,7 +948,6 @@ def _build_mind(raw: dict[str, Any]) -> MindConfig:
         observer_enabled=_bool(
             raw.get("observer_enabled", False), "mind.observer_enabled"
         ),
-        observer_provider=provider,
         observer_interval_seconds=_positive_int(
             raw.get("observer_interval_seconds"),
             "mind.observer_interval_seconds",

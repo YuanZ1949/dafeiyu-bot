@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .brain.client import BrainClient, BrainError
+from .brain.client import BrainError
 from .brain.factory import build_brain, current_provider, local_model_name
 from .brain.lmstudio import ensure_server, stop_server
 from .brain.opencode import resolve_opencode_bin
@@ -21,7 +21,6 @@ from .config import (
     ConfigError,
     Settings,
     load_settings,
-    observer_uses_local_model,
 )
 from .control import MemoryActions, start_control_server
 from .gateway.base import Adapter
@@ -106,45 +105,25 @@ def build_workers(
     outcome: OutcomeWorker | None = None
     mind = settings.mind
     if mind.enabled:
-        # spec §6.3：Observer 默认只用本地模型，别和主链路抢同一份免费额度。
-        mind_brain = brain
-        mind_getter = brain_getter
-        if mind.observer_provider == "local":
-            local = settings.local_model
-            if local.base_url and local.model:
-                mind_brain = BrainClient(
-                    api_key=local.api_key or "local",
-                    base_url=local.base_url,
-                    model=local.model,
-                    trust_env=False,
-                    max_tokens=local.max_tokens,
-                    timeout=local.timeout_seconds,
-                    reasoning_effort=local.reasoning_effort or None,
-                )
-                mind_getter = None
-            else:
-                log.warning(
-                    "mind.observer_provider=local 但 local_model 未配置，"
-                    "Observer/Reflector 已跳过"
-                )
-                mind_brain = None
-        if mind_brain is not None and hasattr(mind_brain, "complete_detailed"):
+        # 心智层旁路统一复用当前主脑：不再单独直连本地端点，dashboard 切档后
+        # 通过 brain_getter 立即跟随，避免两套脑各占一份额度、行为分叉。
+        if hasattr(brain, "complete_detailed"):
             if mind.observer_enabled:
                 # 独立退避：Observer 撞配额不能把主链路一起熔断。
                 observer = ObserverWorker(
                     store,
-                    mind_brain,
+                    brain,
                     mind,
                     backoff=FailureBackoff(persistence=store),
-                    brain_getter=mind_getter,
+                    brain_getter=brain_getter,
                 )
             reflector = ReflectorWorker(
                 store,
-                mind_brain,
+                brain,
                 mind,
                 workspace,
                 backoff=FailureBackoff(persistence=store),
-                brain_getter=mind_getter,
+                brain_getter=brain_getter,
             )
         # 结果打标是纯 SQL，与脑无关；心智层打开就算，重启也能继续对账。
         outcome = OutcomeWorker(store)
@@ -396,11 +375,6 @@ async def main() -> None:
                 settings.local_model,
                 local_model_name(settings, runtime),
             )
-        elif observer_uses_local_model(settings):
-            # 旁路（Observer/Reflector）直连本地端点，但主脑不是本地档：
-            # 不在这里拉起 LM Studio，旁路每轮观察都会 ConnectError，
-            # 心智层永远不会写库（表现为日志每 10 分钟一条「请求失败」）。
-            await ensure_server(settings.local_model, settings.local_model.model)
         elif settings.local_model.stop_when_unused:
             # 上次不是本地档：清掉历史上切走时残留的 LM Studio 进程。
             # 端点本来就不在时这里只探活一次，不会真调 lms。

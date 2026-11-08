@@ -481,8 +481,7 @@ mind:
   enabled: false                 # 默认关；灰度打开
   state_enabled: true
   episodes_enabled: true
-  observer_enabled: false        # 需要本地模型才开
-  observer_provider: local       # local | main（main 会吃免费额度，慎用）
+  observer_enabled: false        # 打开后走当前主脑
   observer_interval_seconds: 600
   observer_min_messages: 8
   observer_daily_calls: 24       # 单群每天观察/自省总调用上限，与 reply 预算分开

@@ -20,7 +20,6 @@ from dafeiyu.brain.client import BrainClient
 from dafeiyu.config import (
     GatewayConfig,
     load_settings,
-    observer_uses_local_model,
 )
 from dafeiyu.gateway.channels import qq_enabled_for
 from dafeiyu.gateway.wechat import WeChatAdapter
@@ -115,32 +114,37 @@ def test_worker_wiring_keeps_token_provider(tmp_path: Path) -> None:
         store.close()
 
 
-def test_observer_uses_local_model_requires_local_provider(tmp_path: Path) -> None:
-    """启动时要不要拉起/保留 LM Studio 全看这个判断，必须与 build_workers 一致。"""
+def test_mind_workers_reuse_main_brain_and_follow_switches(
+    tmp_path: Path,
+) -> None:
+    """Observer/Reflector 统一走主脑：构造用当前 brain，调用时经 getter 跟随切换。"""
     settings = make_settings(tmp_path)
-    # 默认 mind.enabled=false：本地端点与旁路无关。
-    assert observer_uses_local_model(settings) is False
+    store = make_store()
+    try:
+        brain = FakeCompleteBrain()
+        switched = FakeCompleteBrain()
 
-    enabled = replace(
-        settings,
-        mind=replace(settings.mind, enabled=True, observer_provider="local"),
-        local_model=replace(
-            settings.local_model, base_url="http://127.0.0.1:1234/v1", model="qwen/x"
-        ),
-    )
-    assert observer_uses_local_model(enabled) is True
+        def getter():
+            return switched
 
-    # 旁路复用主脑时不占用本地端点。
-    on_main = replace(
-        enabled, mind=replace(enabled.mind, observer_provider="main")
-    )
-    assert observer_uses_local_model(on_main) is False
+        mind_on = replace(
+            settings, mind=replace(settings.mind, enabled=True, observer_enabled=True)
+        )
 
-    # 端点/模型没配置时 build_workers 会跳过旁路，这里也必须返回 False。
-    unset = replace(
-        enabled, local_model=replace(enabled.local_model, model="")
-    )
-    assert observer_uses_local_model(unset) is False
+        workers = build_workers(
+            mind_on, store, brain, "opencode", brain_getter=getter
+        )
+
+        assert workers.observer is not None
+        assert workers.reflector is not None
+        # 构造时用主脑，而不是另建一个本地 BrainClient。
+        assert workers.observer.brain is brain
+        assert workers.reflector._brain is brain
+        # 面板换脑后的调用同样落在新主脑上。
+        assert workers.observer._current_brain() is switched
+        assert workers.reflector._current_brain() is switched
+    finally:
+        store.close()
 
 
 def test_build_brain_passes_memory_agent(tmp_path: Path) -> None:

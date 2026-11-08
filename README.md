@@ -162,7 +162,7 @@ Qwen3.5 默认会先输出一大段思考（`reasoning_content`），`max_tokens
 
 用面板切到 `local_model` 档时，若 1234 端口没起会自动用 `lms` CLI 拉起；切走后自动停止，释放显存/内存。不想让它自动停（比如还要用 LM Studio 干别的）就把 `config.yaml` 里的 `local_model.stop_when_unused` 设为 `false`。
 
-`mind.observer_provider: local`（默认）时，Observer/Reflector 旁路不占用主脑额度，而是直连这个本地端点。此时 bot 启动会按 `local_model.autostart` 自动拉起 LM Studio，切换主脑离开本地档也不会停掉它——否则每次观察都会因连接失败（`ConnectError`）而写不进记忆。想让旁路复用主脑，把它改成 `main`。
+心智层旁路（Observer/Reflector）与摘要、印象一样统一走当前主脑：面板切到哪一档就跟随哪一档，不再单独占用一个本地端点。因此只有主脑本身选 `local_model` 时才需要 LM Studio；主脑走 OpenCode 或 Token 时无需启动本机模型。
 
 ### QQ 协议端 NapCat（已内嵌到项目）
 
@@ -279,8 +279,7 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `mind.enabled` | `false` | 心智层总闸；关闭即回到旧行为（Observer/自省/关系卡/状态/立场注入全部不启用） |
 | `mind.state_enabled` | `true` | 总闸打开时是否注入 `bot_state`（在意的事 + 心情） |
 | `mind.episodes_enabled` | `true` | 总闸打开时是否启用 episode/open_loop 的观察与写入 |
-| `mind.observer_enabled` | `false` | 是否启用 Observer 旁路（需要能调模型） |
-| `mind.observer_provider` | `local` | Observer/Reflector 用哪个端点：`local` 只用本地模型，`main` 跟随当前大脑 |
+| `mind.observer_enabled` | `false` | 是否启用 Observer 旁路（需要主脑支持 `complete_detailed`） |
 | `mind.observer_interval_seconds` | `600` | Observer 扫描间隔 |
 | `mind.observer_min_messages` | `8` | 单群至少累积多少条新消息才观察一次 |
 | `mind.observer_daily_calls` | `24` | 单群每天「观察 + 自省」总调用上限，与回复预算分开 |

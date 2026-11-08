@@ -3434,7 +3434,7 @@ function renderMind(m) {
   $("mind-prerequisites").textContent =
     `前置条件：mind.enabled ${gate} · brain.complete_detailed ${brain} · 当前${m.effective ? "已生效" : "未生效"}`;
   $("mind-cost").textContent =
-    `群白名单 ${m.group_count} 个 · 观察者 ${m.observer_provider} · 每 ${m.observer_interval_seconds}s / 至少 ${m.observer_min_messages} 条新消息 · ${cost}`;
+    `群白名单 ${m.group_count} 个 · 观察者走当前主脑 · 每 ${m.observer_interval_seconds}s / 至少 ${m.observer_min_messages} 条新消息 · ${cost}`;
 }
 
 async function saveMind() {
