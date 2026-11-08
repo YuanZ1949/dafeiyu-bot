@@ -2411,11 +2411,19 @@ class Service:
         return await self._send_text(adapter, chat_type, chat_id, chunk, dedupe_key)
 
     def _safe_reply_attachments(
-        self, reply: BrainReply, chat_id: str
+        self, reply: BrainReply, chat_type: ChatType, chat_id: str
     ) -> tuple[Attachment, ...]:
         """解析模型附件；解析器自身出错也只丢附件，不影响文本。"""
         try:
-            return tuple(resolve_attachments(reply, self.settings))
+            return tuple(
+                resolve_attachments(
+                    reply,
+                    self.settings,
+                    store=self.store,
+                    chat_type=chat_type,
+                    chat_id=chat_id,
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - 文本优先
             log.warning("附件解析失败，本条只发文本 %s: %s", chat_id, exc)
             return ()
@@ -2747,7 +2755,7 @@ class Service:
             return []
         # 附件与 @ 只在守卫确认有内容要发之后才解析/上传：文本被整体丢弃时
         # 一个字节都不许发出去。
-        attachments = self._safe_reply_attachments(reply, chat_id)
+        attachments = self._safe_reply_attachments(reply, chat_type, chat_id)
         at_names = tuple(resolve_at_names(reply.at, batch))
         at_qq_ids = self._at_qq_ids(at_names, batch)
         # 语音只在「成型后的单段、无 @」时附加；失败一律退回纯文本。
@@ -3553,7 +3561,7 @@ class Service:
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
         # 与批次路径同序：先确认有内容，再解析附件/@。
-        attachments = self._safe_reply_attachments(reply, msg.chat_id)
+        attachments = self._safe_reply_attachments(reply, msg.chat_type, msg.chat_id)
         at_names = tuple(resolve_at_names(reply.at, [msg]))
         at_qq_ids = self._at_qq_ids(at_names, [msg])
         # 与批次路径同一 helper、同一启用条件（单段、无 @、TTS 开启）。
