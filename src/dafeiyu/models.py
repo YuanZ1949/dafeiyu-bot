@@ -50,6 +50,9 @@ class Attachment:
     #: 合并转发节点（仅出站协议使用），元素形如 ``{"name": "...", "content": "..."}``。
     #: 追加在末尾，旧的位置参数构造保持可用。
     nodes: tuple[dict[str, Any], ...] = ()
+    #: 同一媒体的备选本地路径（微信原图解不开时按顺序退回 ``_h`` / ``_t``）。
+    #: 其它通道不填，保持空元组。
+    fallbacks: tuple[str, ...] = ()
 
 
 @dataclass

@@ -42,7 +42,7 @@ from .aes import CipherError, aes_ecb_decrypt
 
 log = logging.getLogger(__name__)
 
-__all__ = ["decode_dat"]
+__all__ = ["decode_dat", "decode_dat_container"]
 
 #: 单字节 XOR 候选；只保留公开文档里最常见的三个值。
 _XOR_KEYS = (0x37, 0x38, 0x39)
@@ -180,3 +180,28 @@ def decode_dat(
             return decoded
     log.debug("无法识别的 .dat（%d 字节），保留占位", len(raw))
     return None
+
+
+def decode_dat_container(
+    data: bytes,
+    *,
+    aes_key: bytes | None = None,
+    xor_key: int | None = None,
+) -> bytes | None:
+    """V2 容器解密后的**原始明文**，不做「必须是可直读图片」的校验。
+
+    ``decode_dat`` 会拒绝 ``wxgf`` 原图（``read`` 打不开）；但 ``wxgf`` 里是
+    裸 HEVC，转成 PNG 后画质远高于 ``_t`` 缩略图。调用方拿到这里的明文后，
+    可交给 :func:`dafeiyu.gateway.wechat_bridge.media.emoticon.wxgf_to_image`
+    转码。非 V2 容器、缺密钥、结构不符时返回 ``None``，绝不抛异常。
+    """
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        return None
+    raw = bytes(data)
+    if not raw.startswith(_V2_SIGNATURE):
+        return None
+    try:
+        return _decode_v2(raw, aes_key, xor_key)
+    except Exception:  # 防御性兜底：解析层永远不向调用方抛异常
+        log.debug("V2 .dat 容器解密异常（%d 字节）", len(raw))
+        return None

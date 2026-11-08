@@ -19,6 +19,7 @@ from dafeiyu.gateway.wechat_bridge.media.emoticon import (
     is_emoticon_name,
     transcode,
     wxgf_hevc,
+    wxgf_to_image,
 )
 from dafeiyu.gateway.wechat_bridge.media.keygen import (
     derive_aes_key,
@@ -101,6 +102,11 @@ def test_decrypt_emoticon_rejects_non_wxgf_plaintext() -> None:
     encrypted = _encrypt(b"plain text payload" * 4)
 
     assert decrypt_emoticon(encrypted, KEY) is None
+
+
+def test_decrypt_emoticon_accepts_plain_png_cache() -> None:
+    """少量缓存文件解密后直接就是 PNG（本机实测约 1/8），不能按 wxgf 判死。"""
+    assert decrypt_emoticon(_encrypt(PNG), KEY) == PNG
 
 
 # ---------------------------------------------------------------- wxgf
@@ -214,3 +220,27 @@ def test_decode_emoticon_wrong_key_never_transcodes(
     monkeypatch.setattr(emoticon, "transcode", boom)
 
     assert decode_emoticon(_encrypt(_wxgf()), b"0" * 16) is None
+
+
+def test_decode_emoticon_returns_image_plaintext_without_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*_args, **_kwargs):
+        raise AssertionError("明文已是图片时不应调用 ffmpeg")
+
+    monkeypatch.setattr(emoticon, "transcode", boom)
+
+    assert decode_emoticon(_encrypt(PNG), KEY) == PNG
+    assert decode_emoticon(_encrypt(GIF), KEY) == GIF
+
+
+def test_wxgf_to_image_reuses_transcode(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[bytes] = []
+    monkeypatch.setattr(
+        emoticon, "transcode", lambda stream, **_kwargs: seen.append(stream) or PNG
+    )
+
+    assert wxgf_to_image(_wxgf()) == PNG
+    assert seen == [STREAM]
+    # 不是 wxgf 的载荷直接返回 None，不触发 ffmpeg。
+    assert wxgf_to_image(STREAM) is None

@@ -999,6 +999,25 @@ def _image_message(message_id: str = "m-img") -> Message:
     return msg
 
 
+def _sticker_message(message_id: str = "m-sticker") -> Message:
+    msg = make_msg("[表情:abc12345]", message_id=message_id)
+    msg.kind = "sticker"
+    msg.attachments = [
+        Attachment(kind="image", path="C:/wechat/cache/11/" + "a" * 32)
+    ]
+    return msg
+
+
+def test_queue_media_retry_accepts_sticker_placeholder(tmp_path) -> None:
+    """纯表情消息的正文是 `[表情:xxx]`，也要能进入密钥迟到的重试队列。"""
+    service, _store, _brain, _adapter = build(tmp_path)
+    sticker = _sticker_message()
+
+    service._queue_media_retry(sticker)
+
+    assert sticker.message_id in service._media_retry
+
+
 def _wire_resolver(service, key) -> None:
     service._media_resolver_ready = True
     service._media_resolver = _FakeResolver(key)

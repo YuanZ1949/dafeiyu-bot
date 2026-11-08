@@ -12,7 +12,7 @@ from dafeiyu.gateway.wechat_bridge.media.aes import (
     aes_ecb_decrypt,
     aes_ecb_encrypt,
 )
-from dafeiyu.gateway.wechat_bridge.media.dat import decode_dat
+from dafeiyu.gateway.wechat_bridge.media.dat import decode_dat, decode_dat_container
 
 SIGNATURE = b"\x07\x08V2\x08\x07"
 # 真实 V2 密钥是 md5(...).hexdigest()[:16] 的 16 个 ASCII 字节。
@@ -159,6 +159,33 @@ def test_wxgf_is_not_treated_as_readable_image() -> None:
     payload = _build_v2(head, b"", TAIL)
 
     assert decode_dat(payload, aes_key=AES_KEY, xor_key=XOR_KEY) is None
+
+
+def test_container_returns_wxgf_plaintext_for_transcoding() -> None:
+    """容器解码保留 ``wxgf`` 明文，供上层转成高分辨率 PNG。"""
+    head = b"wxgf" + bytes(28)
+    payload = _build_v2(head, b"", TAIL)
+
+    assert decode_dat_container(payload, aes_key=AES_KEY, xor_key=XOR_KEY) == (
+        head + TAIL
+    )
+    # 判据不变：decode_dat 仍拒绝 wxgf，避免把不可读容器物化进 workspace。
+    assert decode_dat(payload, aes_key=AES_KEY, xor_key=XOR_KEY) is None
+
+
+def test_container_requires_v2_and_keys() -> None:
+    payload = _build_v2(b"wxgf" + bytes(28), b"", TAIL)
+
+    assert decode_dat_container(b"\x89PNG\r\n\x1a\n" + bytes(16)) is None
+    assert decode_dat_container(payload) is None
+    assert decode_dat_container(payload, aes_key=AES_KEY) is None
+    assert decode_dat_container(payload, xor_key=XOR_KEY) is None
+    # 容器层不做「密钥对不对」的判定：错密钥解出的乱码由上层 wxgf/图片魔数
+    # 校验拦下（decode_dat 已覆盖）。这里只确认不抛异常。
+    assert decode_dat_container(
+        payload, aes_key=WRONG_KEY, xor_key=XOR_KEY
+    ) is not None
+    assert decode_dat(payload, aes_key=WRONG_KEY, xor_key=XOR_KEY) is None
 
 
 # ---------------------------------------------------------------- 旧格式回归

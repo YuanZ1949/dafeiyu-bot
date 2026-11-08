@@ -121,6 +121,9 @@ def downscale(path: Path, max_edge: int) -> bool:
             return False
 
         tmp = path.with_name(f"{path.stem}.tmp{path.suffix}")
+        # JPEG 二次编码会叠加有损压缩：mjpeg 默认量化偏保守，显式给 q=3。
+        # PNG/GIF/WEBP 走各自的默认参数，避免误传 qscale 改变编码语义。
+        quality = ["-q:v", "3"] if path.suffix.lower() in (".jpg", ".jpeg") else []
         completed = subprocess.run(
             [
                 ffmpeg,
@@ -134,6 +137,7 @@ def downscale(path: Path, max_edge: int) -> bool:
                 ),
                 "-frames:v",
                 "1",
+                *quality,
                 str(tmp),
             ],
             check=False,

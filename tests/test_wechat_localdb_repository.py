@@ -1035,10 +1035,10 @@ def test_resource_attach_discovers_image_and_sticker(tmp_path: Path) -> None:
     ).resolve()
 
 
-def test_resource_attach_prefers_readable_variant_over_original(
+def test_resource_attach_prefers_original_with_thumb_fallback(
     tmp_path: Path,
 ) -> None:
-    # 4.x 原图解密后是 wxgf（read 打不开）；有 `_t` 时优先 `_t`。
+    # 原图优先（解码层会把 wxgf 转成 PNG）；缩略图只作为解码失败时的候选。
     store, attach = build_attach_store(
         tmp_path,
         infos=[(101, 1, IMAGE_MD5)],
@@ -1049,12 +1049,15 @@ def test_resource_attach_prefers_readable_variant_over_original(
         },
     )
 
-    row = _media_by_text(store)["[图片]"]
+    media = _media_by_text(store)["[图片]"]["media"]
 
-    assert Path(row["media"]["path"]) == (attach / f"{IMAGE_MD5}_t.dat").resolve()
+    assert Path(media["path"]) == (attach / f"{IMAGE_MD5}.dat").resolve()
+    assert [Path(item) for item in media["fallbacks"]] == [
+        (attach / f"{IMAGE_MD5}_t.dat").resolve()
+    ]
 
 
-def test_resource_attach_prefers_high_variant(tmp_path: Path) -> None:
+def test_resource_attach_orders_fallbacks_high_then_thumb(tmp_path: Path) -> None:
     store, attach = build_attach_store(
         tmp_path,
         infos=[(101, 1, IMAGE_MD5)],
@@ -1066,9 +1069,13 @@ def test_resource_attach_prefers_high_variant(tmp_path: Path) -> None:
         },
     )
 
-    row = _media_by_text(store)["[图片]"]
+    media = _media_by_text(store)["[图片]"]["media"]
 
-    assert Path(row["media"]["path"]) == (attach / f"{IMAGE_MD5}_h.dat").resolve()
+    assert Path(media["path"]) == (attach / f"{IMAGE_MD5}.dat").resolve()
+    assert [Path(item) for item in media["fallbacks"]] == [
+        (attach / f"{IMAGE_MD5}_h.dat").resolve(),
+        (attach / f"{IMAGE_MD5}_t.dat").resolve(),
+    ]
 
 
 def test_resource_attach_falls_back_when_original_missing(tmp_path: Path) -> None:

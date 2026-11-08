@@ -130,12 +130,13 @@ _MEDIA_KIND_BY_TYPE: dict[int, str] = {3: "image", 34: "voice", 43: "video", 47:
 #: 已知的微信媒体索引库（仓库里没有可验证的 schema，按「存在才读」适配）。
 _MEDIA_REL = "message/message_resource.db"
 
-#: 变体优先级：`_h` > `_t` > 原图；磁盘上没有时才退到下一档。
+#: 变体优先级：原图 > `_h` > `_t`。
 #:
-#: 4.x 的原图（无后缀 `.dat`）解密后多是微信私有的 ``wxgf`` 容器，``read``
-#: 工具读不了；`_h` / `_t` 才是标准 JPEG/PNG。这里按「模型能不能真看到」
-#: 排序，而不是按分辨率排序。
-_VARIANT_ORDER: tuple[str, ...] = ("_h", "_t", "")
+#: 4.x 的原图（无后缀 `.dat`）解密后多是微信私有的 ``wxgf`` 容器，解码层会
+#: 把其中的 HEVC 转成高分辨率 PNG；只有转码失败（缺密钥/缺 ffmpeg）时才按
+#: 顺序退回 `_h` / `_t`。早期按「模型能不能直接打开」排序，把 180px 的 `_t`
+#: 排在最前，导致能拿到原图的消息也只有缩略图画质。
+_VARIANT_ORDER: tuple[str, ...] = ("", "_h", "_t")
 
 #: 从 `packed_info` protobuf blob 里捞 32 位 hex md5（前后不能再接 hex 字符）。
 _MD5_IN_BLOB_RE = re.compile(rb"(?<![0-9a-fA-F])[0-9a-fA-F]{32}(?![0-9a-fA-F])")
@@ -717,16 +718,20 @@ class LocalMessageStore:
                         continue
                     local_type = (types or {}).get(key)
                     if _MEDIA_KIND_BY_TYPE.get(local_type or 0) == "video":
-                        path = _video_file(root, username, digest)
+                        primary = _video_file(root, username, digest)
+                        paths = [primary] if primary is not None else []
                     else:
-                        path = _attach_file(base, digest)
-                    if path is not None:
+                        paths = _attach_files(base, digest)
+                    if paths:
                         found[key] = {
-                            "path": str(path),
-                            "name": path.name,
+                            "path": str(paths[0]),
+                            "name": paths[0].name,
                             "size": 0,
                             "duration": 0,
                         }
+                        if len(paths) > 1:
+                            # 原图解不开时按优先级退回 `_h` / `_t`。
+                            found[key]["fallbacks"] = [str(item) for item in paths[1:]]
                 return found
         except Exception as exc:  # noqa: BLE001 - 媒体发现永远不能打断消息读取
             log.debug("从 message_resource.db 推导媒体路径失败：%s", exc)
@@ -805,7 +810,11 @@ class LocalMessageStore:
     def _media_meta(
         self, local_type: int, raw: dict[str, Any] | None
     ) -> dict[str, Any] | None:
-        """把索引行落成文档化的 media dict；证明不了文件存在就返回 None。"""
+        """把索引行落成文档化的 media dict；证明不了文件存在就返回 None。
+
+        ``fallbacks`` 里的备选路径同样逐条校验（越界/缺失/超限一律丢弃），
+        只保留能安全读取的候选，顺序不变。
+        """
         kind = _MEDIA_KIND_BY_TYPE.get(local_type)
         if kind is None or not isinstance(raw, dict):
             return None
@@ -818,6 +827,38 @@ class LocalMessageStore:
             return None
         try:
             root_resolved = root.resolve()
+        except (OSError, ValueError) as exc:
+            log.debug("媒体根目录不可用：%s", exc)
+            return None
+        primary = self._checked_media_path(text, root_resolved, kind)
+        if primary is None:
+            return None
+        candidate, size = primary
+        name = str(raw.get("name") or "").strip() or candidate.name
+        meta: dict[str, Any] = {
+            "kind": kind,
+            "path": str(candidate),
+            "name": name,
+            "size": int(size),
+            "duration": _safe_int(raw.get("duration")),
+        }
+        fallbacks: list[str] = []
+        for item in raw.get("fallbacks") or ():
+            fallback = self._checked_media_path(str(item), root_resolved, kind)
+            if fallback is not None and fallback[0] != candidate:
+                fallbacks.append(str(fallback[0]))
+        if fallbacks:
+            meta["fallbacks"] = fallbacks
+        return meta
+
+    def _checked_media_path(
+        self, text: str, root_resolved: Path, kind: str
+    ) -> tuple[Path, int] | None:
+        """校验单个媒体候选：必须在 root 内、存在、大小可接受。"""
+        text = (text or "").strip()
+        if not text:
+            return None
+        try:
             candidate = Path(text)
             if not candidate.is_absolute():
                 candidate = root_resolved / candidate
@@ -835,14 +876,7 @@ class LocalMessageStore:
         if size <= 0 or size > self._media_limit(kind):
             log.debug("媒体文件大小不可接受（%s）：%d 字节", candidate.name, size)
             return None
-        name = str(raw.get("name") or "").strip() or candidate.name
-        return {
-            "kind": kind,
-            "path": str(candidate),
-            "name": name,
-            "size": int(size),
-            "duration": _safe_int(raw.get("duration")),
-        }
+        return candidate, size
 
     def _media_limit(self, kind: str) -> int:
         """按媒体类型返回大小上限：视频独立，图片/语音沿用配置值。"""
@@ -1166,12 +1200,13 @@ def _emoticon_file(root: Path, digest: str) -> Path | None:
     return None
 
 
-def _attach_file(base: Path, digest: str) -> Path | None:
-    """在 ``<base>/<YYYY-MM>/Img/`` 下按变体优先级找第一个真实文件。
+def _attach_files(base: Path, digest: str) -> list[Path]:
+    """按变体优先级返回**全部**存在的候选：原图 → ``_h`` → ``_t``。
 
-    优先级见 :data:`_VARIANT_ORDER`：可被 ``read`` 直接打开的 ``_h`` / ``_t``
-    排在微信私有的原图（``wxgf``）之前；磁盘上不存在才退到下一档。
+    每个变体只取排序后的第一个文件（同一 md5 理论上只有一个）。返回列表而
+    不是单个路径：原图可能是 ``wxgf``，解不开时要由下游按顺序退回。
     """
+    found: list[Path] = []
     for suffix in _VARIANT_ORDER:
         try:
             matches = sorted(base.glob(f"*/Img/{digest}{suffix}.dat"))
@@ -1181,10 +1216,17 @@ def _attach_file(base: Path, digest: str) -> Path | None:
         for match in matches:
             try:
                 if match.is_file():
-                    return match
+                    found.append(match)
+                    break
             except OSError as exc:
                 log.debug("检查 attach 文件失败：%s", exc)
-    return None
+    return found
+
+
+def _attach_file(base: Path, digest: str) -> Path | None:
+    """首选变体路径（原图优先）；只需要单路径的调用方使用。"""
+    files = _attach_files(base, digest)
+    return files[0] if files else None
 
 
 def _video_file(root: Path, username: str, digest: str) -> Path | None:

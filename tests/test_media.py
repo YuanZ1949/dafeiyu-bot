@@ -83,6 +83,7 @@ def make_message(
     name: str = "",
     source: str = "",
     duration: int = 0,
+    fallbacks: tuple[str, ...] = (),
 ) -> Message:
     return Message(
         chat_type=ChatType.GROUP,
@@ -94,7 +95,12 @@ def make_message(
         kind=kind,
         attachments=[
             Attachment(
-                kind=kind, path=path, name=name, source=source, duration=duration
+                kind=kind,
+                path=path,
+                name=name,
+                source=source,
+                duration=duration,
+                fallbacks=fallbacks,
             )
         ],
     )
@@ -202,6 +208,42 @@ async def test_decode_none_keeps_placeholder(tmp_path: Path) -> None:
     assert count == 0
     assert message.content == "[图片]"
     assert not (tmp_path / "ws" / "images").exists()
+
+
+async def test_undecodable_wechat_original_falls_back_to_thumb(
+    tmp_path: Path,
+) -> None:
+    """原图（wxgf）解不开时必须退回 `_t`，而不是只留占位。"""
+    original = tmp_path / "a.dat"
+    original.write_bytes(b"wxgf-original-undecodable")
+    thumb = tmp_path / "a_t.dat"
+    thumb.write_bytes(xor_png())
+    settings = make_settings(tmp_path)
+    message = make_message(str(original), fallbacks=(str(thumb),))
+
+    count = await materialize_attachments(message, settings, decode=decode_dat)
+
+    assert count == 1
+    stored = tmp_path / "ws" / message.attachments[0].path
+    assert stored.read_bytes() == PNG
+    assert message.attachments[0].path.endswith(".png")
+    assert "（图存 images/" in message.content
+
+
+async def test_decodable_original_wins_over_fallback(tmp_path: Path) -> None:
+    """原图能解时优先进原图（高分辨率），不碰备选缩略图。"""
+    original = tmp_path / "a.dat"
+    original.write_bytes(PNG)
+    fallback = tmp_path / "a_t.dat"
+    fallback.write_bytes(JPG)
+    settings = make_settings(tmp_path)
+    message = make_message(str(original), fallbacks=(str(fallback),))
+
+    count = await materialize_attachments(message, settings, decode=decode_dat)
+
+    assert count == 1
+    stored = tmp_path / "ws" / message.attachments[0].path
+    assert stored.read_bytes() == PNG
 
 
 async def test_over_max_bytes_keeps_placeholder(tmp_path: Path) -> None:

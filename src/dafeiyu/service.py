@@ -856,7 +856,10 @@ class Service:
         表情是 AES-CBC + ``wxgf``/HEVC，必须起 ffmpeg，所以放线程里跑。
         """
         try:
-            from .gateway.wechat_bridge.media.dat import decode_dat
+            from .gateway.wechat_bridge.media.dat import (
+                decode_dat,
+                decode_dat_container,
+            )
         except Exception:  # noqa: BLE001 - 模块缺失按原字节语义处理
             return None
         resolver = self._media_key_resolver()
@@ -870,6 +873,18 @@ class Service:
             decoded = decode_dat(data)
         if decoded is not None:
             return decoded
+        if key is not None:
+            # 4.x 原图解密后多是 wxgf 容器：read 打不开，但里面是裸 HEVC，
+            # 转成 PNG 的画质远高于 _t 缩略图。ffmpeg 必须离开事件循环。
+            plain = decode_dat_container(
+                data, aes_key=key.aes_key, xor_key=key.xor_key
+            )
+            if plain is not None:
+                from .gateway.wechat_bridge.media.emoticon import wxgf_to_image
+
+                image = await asyncio.to_thread(wxgf_to_image, plain)
+                if image is not None:
+                    return image
         return await self._decode_wechat_emoticon(data)
 
     async def _decode_wechat_emoticon(self, data: bytes) -> bytes | None:
@@ -922,8 +937,10 @@ class Service:
             log.debug("微信图片密钥扫描线程无法启动")
 
     def _queue_media_retry(self, msg: Message) -> None:
-        """图片没物化成功时登记一条待重试；没有图片的消息零开销。"""
-        if not msg.attachments or "[图片]" not in (msg.content or ""):
+        """图片/表情没物化成功时登记一条待重试；没有图片的消息零开销。"""
+        # 微信表情的占位是 `[表情:xxx]`，不能用 `[图片]` 做门：纯表情消息
+        # 在密钥迟到时同样需要重试，否则那张图永久丢失。
+        if not msg.attachments:
             return
         pending = [
             item

@@ -35,6 +35,7 @@ __all__ = [
     "decrypt_emoticon",
     "is_emoticon_name",
     "wxgf_hevc",
+    "wxgf_to_image",
 ]
 
 #: 表情缓存文件名：32 位十六进制 md5，无扩展名。
@@ -58,6 +59,7 @@ _PARAM_SET_TYPES = frozenset({32, 33, 34})
 _DEFAULT_TIMEOUT = 30.0
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+_JPEG_MAGIC = b"\xff\xd8\xff"
 _GIF_MAGIC = (b"GIF87a", b"GIF89a")
 
 #: Windows 上不要为每次转码弹出控制台窗口。
@@ -83,10 +85,11 @@ def decrypt_emoticon(
     raw: bytes | bytearray | memoryview,
     key: bytes | bytearray | memoryview,
 ) -> bytes | None:
-    """AES-128-CBC 解密表情缓存，返回 ``wxgf`` 明文；不像表情就返回 ``None``。
+    """AES-128-CBC 解密表情缓存，返回明文；不像表情就返回 ``None``。
 
-    表情没有可校验的头部，因此用「解密后必须以 ``wxgf`` 开头」作为唯一判据：
-    随机数据通过 CBC 解出这 4 个字节的概率可以忽略。
+    表情没有可校验的头部，因此用「解密后必须是 ``wxgf`` 容器、或本身就是
+    PNG/JPEG/GIF」作为判据：随机数据同时命中这些魔数的概率可以忽略。
+    少数缓存文件（本机实测约 1/8）存的直接是 PNG，以前被 ``wxgf`` 判据误杀。
     """
     if not isinstance(raw, (bytes, bytearray, memoryview)):
         return None
@@ -103,9 +106,9 @@ def decrypt_emoticon(
     except (CipherError, ValueError, TypeError):
         return None
     plain = _unpad_pkcs7(plain)
-    if not plain.startswith(_WXGF_MAGIC):
-        return None
-    return plain
+    if _looks_like_image(plain) or plain.startswith(_WXGF_MAGIC):
+        return plain
+    return None
 
 
 def _find_parameter_set(payload: bytes, limit: int) -> int:
@@ -193,7 +196,11 @@ def _frame_count(probe: str | None, source: Path, timeout: float) -> int:
 
 
 def _looks_like_image(data: bytes) -> bool:
-    return data.startswith(_PNG_MAGIC) or data.startswith(_GIF_MAGIC)
+    return (
+        data.startswith(_PNG_MAGIC)
+        or data.startswith(_JPEG_MAGIC)
+        or data.startswith(_GIF_MAGIC)
+    )
 
 
 def transcode(
@@ -248,6 +255,25 @@ def transcode(
     return data
 
 
+def wxgf_to_image(
+    payload: bytes,
+    *,
+    ffmpeg: str | None = None,
+    ffprobe: str | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> bytes | None:
+    """把 ``wxgf`` 明文里的 HEVC 流转成 PNG/GIF；不是 ``wxgf`` 返回 ``None``。
+
+    微信 4.x 的聊天图片**原图**解密后也是 ``wxgf`` 容器，因此这个函数同时
+    服务于图片原图与表情缓存。
+    """
+    stream = wxgf_hevc(payload)
+    if stream is None:
+        log.debug("wxgf 里没有找到 HEVC 起始码")
+        return None
+    return transcode(stream, ffmpeg=ffmpeg, ffprobe=ffprobe, timeout=timeout)
+
+
 def decode_emoticon(
     raw: bytes | bytearray | memoryview,
     key: bytes | bytearray | memoryview,
@@ -259,10 +285,9 @@ def decode_emoticon(
     """解密并转码一个表情缓存文件；任何失败都返回 ``None``。"""
     payload = decrypt_emoticon(raw, key)
     if payload is None:
-        log.debug("表情缓存解密失败或不是 wxgf，保留占位")
+        log.debug("表情缓存解密失败或不是 wxgf/图片，保留占位")
         return None
-    stream = wxgf_hevc(payload)
-    if stream is None:
-        log.debug("wxgf 里没有找到 HEVC 起始码，保留占位")
-        return None
-    return transcode(stream, ffmpeg=ffmpeg, ffprobe=ffprobe, timeout=timeout)
+    if _looks_like_image(payload):
+        # 少数缓存文件存的直接是 PNG/JPEG/GIF，无需 ffmpeg 二次转码。
+        return payload
+    return wxgf_to_image(payload, ffmpeg=ffmpeg, ffprobe=ffprobe, timeout=timeout)

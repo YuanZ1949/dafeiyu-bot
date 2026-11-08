@@ -116,6 +116,45 @@ def test_ffmpeg_failure_keeps_original_and_cleans_tmp(
     assert not list(tmp_path.glob("*.tmp.*"))
 
 
+def _capture_downscale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> list[list[str]]:
+    source = tmp_path / name
+    source.write_bytes(b"old")
+    calls: list[list[str]] = []
+
+    def fake_run(args, **_kwargs):
+        calls.append(list(args))
+        Path(args[-1]).write_bytes(b"new")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(imaging, "locate", lambda _program: "ffmpeg")
+    monkeypatch.setattr(imaging, "_locate_ffprobe", lambda _ffmpeg: "ffprobe")
+    monkeypatch.setattr(imaging, "probe_size", lambda _path, _probe: (4000, 3000))
+    monkeypatch.setattr(imaging.subprocess, "run", fake_run)
+
+    assert imaging.downscale(source, 1280) is True
+    return calls
+
+
+def test_jpeg_downscale_pins_quality(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """JPEG 二次编码必须显式给高质量，否则 1280px 也会肉眼发糊。"""
+    calls = _capture_downscale(tmp_path, monkeypatch, "a.jpg")
+
+    assert calls and "-q:v" in calls[0]
+    assert calls[0][calls[0].index("-q:v") + 1] == "3"
+
+
+def test_png_downscale_keeps_encoder_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _capture_downscale(tmp_path, monkeypatch, "a.png")
+
+    assert calls and "-q:v" not in calls[0]
+
+
 def test_empty_output_keeps_original(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

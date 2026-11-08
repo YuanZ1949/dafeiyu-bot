@@ -665,6 +665,34 @@ async def test_message_media_without_path_keeps_placeholder_attachment() -> None
     assert message.attachments[0].name == "[图片]"
 
 
+async def test_message_media_fallbacks_become_attachment_fallbacks() -> None:
+    """原图/`_h`/`_t` 候选必须原样带到附件上，物化层才能逐级回退。"""
+    envelope = message_envelope(
+        text="[图片]",
+        kind="image",
+        media={
+            "kind": "image",
+            "path": "C:/wx/orig.dat",
+            "name": "orig.dat",
+            "fallbacks": ["C:/wx/h.dat", "C:/wx/t.dat", 123, ""],
+        },
+    )
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.attachments[0].fallbacks == ("C:/wx/h.dat", "C:/wx/t.dat")
+
+
+async def test_message_media_fallbacks_defaults_to_empty() -> None:
+    envelope = message_envelope(
+        text="[图片]", kind="image", media={"kind": "image", "path": "C:/wx/a.dat"}
+    )
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.attachments[0].fallbacks == ()
+
+
 async def test_sticker_media_uses_media_kind_for_attachment() -> None:
     envelope = message_envelope(
         text="[表情:745c9c20]",

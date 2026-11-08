@@ -505,6 +505,7 @@ class WeChatAdapter:
                         name=name,
                         size=_int(media.get("size")),
                         duration=_int(media.get("duration")),
+                        fallbacks=_str_tuple(media.get("fallbacks")),
                     )
                 ]
         if kind != "text" and content:
@@ -822,6 +823,17 @@ def _int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _str_tuple(value: Any) -> tuple[str, ...]:
+    """把协议里的候选路径列表收敛成非空字符串元组；形状不符就当没有。"""
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(
+        text
+        for item in value
+        if isinstance(item, str) and (text := item.strip())
+    )
 
 
 def _float_or_none(value: Any) -> float | None:

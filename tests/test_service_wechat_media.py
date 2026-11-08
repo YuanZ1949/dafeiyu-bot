@@ -24,13 +24,17 @@ def _pkcs7_pad(data: bytes, block: int = 16) -> bytes:
 
 
 def _sample() -> bytes:
+    return _v2(HEAD)
+
+
+def _v2(head: bytes) -> bytes:
     header = (
         SIGNATURE
-        + len(HEAD).to_bytes(4, "little")
+        + len(head).to_bytes(4, "little")
         + len(TAIL).to_bytes(4, "little")
         + b"\x00"
     )
-    return header + aes_ecb_encrypt(AES_KEY, _pkcs7_pad(HEAD)) + bytes(
+    return header + aes_ecb_encrypt(AES_KEY, _pkcs7_pad(head)) + bytes(
         byte ^ XOR_KEY for byte in TAIL
     )
 
@@ -136,3 +140,46 @@ def test_emoticon_miss_kicks_prewarm() -> None:
 
     assert _decode(service, b"\x00" * 16) is None
     assert resolver.prewarmed.wait(2.0) is True
+
+
+def test_wxgf_original_is_transcoded_to_image(monkeypatch) -> None:
+    """原图容器解不开时不能只留占位：wxgf 里的 HEVC 要转成 PNG。"""
+    service = _service(StubResolver(MediaKey(AES_KEY, XOR_KEY)))
+    wxgf = b"wxgf" + bytes(28) + b"\x00\x00\x00\x01\x40\x01" + bytes(32)
+    seen: list[bytes] = []
+
+    def fake_to_image(payload: bytes, **_kwargs) -> bytes:
+        seen.append(payload)
+        return PNG
+
+    monkeypatch.setattr(
+        "dafeiyu.gateway.wechat_bridge.media.emoticon.wxgf_to_image",
+        fake_to_image,
+    )
+
+    assert _decode(service, _v2(wxgf)) == PNG
+    assert seen == [wxgf + TAIL]
+
+
+def test_non_wxgf_container_falls_back_to_emoticon_path(monkeypatch) -> None:
+    """容器不是 wxgf 时不要把随机明文当图片返回。"""
+    resolver = StubResolver(MediaKey(AES_KEY, XOR_KEY))
+    resolver.emoticon = b"0123456789abcdef"
+    service = _service(resolver)
+    calls: list[bytes] = []
+
+    def fake_to_image(payload: bytes, **_kwargs) -> None:
+        calls.append(payload)
+        return None
+
+    monkeypatch.setattr(
+        "dafeiyu.gateway.wechat_bridge.media.emoticon.wxgf_to_image",
+        fake_to_image,
+    )
+    monkeypatch.setattr(
+        "dafeiyu.gateway.wechat_bridge.media.emoticon.decode_emoticon",
+        lambda *_args, **_kwargs: None,
+    )
+
+    assert _decode(service, _v2(b"not-an-image" * 4)) is None
+    assert len(calls) == 1

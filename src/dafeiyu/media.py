@@ -611,6 +611,38 @@ async def _materialize_video(
     )
 
 
+async def _read_image_bytes(
+    path: Path,
+    decode: Decode | None,
+    path_max: int,
+) -> tuple[bytes, Path] | None:
+    """读取并（必要时）解码一个图片候选；不可用时返回 ``None``。
+
+    ``decode`` 只对微信 ``.dat`` 与 32 位 hex 表情缓存生效；解码失败返回
+    ``None``，调用方据此尝试下一个变体。``path_max <= 0`` 表示不限制大小。
+    """
+    try:
+        # 单次读取：不文件存在性预检，减少 TOCTOU 与多余系统调用。
+        data = await asyncio.to_thread(path.read_bytes)
+    except OSError:
+        return None
+    if decode is not None and (
+        path.suffix.lower() == ".dat" or _HEX32_NAME_RE.fullmatch(path.name)
+    ):
+        decoded = decode(data)
+        if inspect.isawaitable(decoded):
+            decoded = await decoded
+        if decoded is None:
+            return None
+        data = decoded
+    if not data:
+        return None
+    if path_max > 0 and len(data) > path_max:
+        log.info("附件大小不可接受（%d 字节，上限 %d）：%s", len(data), path_max, path)
+        return None
+    return data, path
+
+
 async def materialize_attachments(
     msg: Message,
     settings: Settings,
@@ -779,41 +811,24 @@ async def materialize_attachments(
                 updated.append(attachment)
                 continue
 
-            try:
-                # 单次读取：不文件存在性预检，减少 TOCTOU 与多余系统调用。
-                data = await asyncio.to_thread(source_path.read_bytes)
-            except OSError:
+            # 微信同一张图有多个变体（原图 / `_h` / `_t`）：原图是 `wxgf`
+            # 容器，解不开时按 `fallbacks` 顺序退回，避免只剩 180px 缩略图。
+            candidates = [source_path]
+            candidates.extend(
+                Path(item) for item in getattr(attachment, "fallbacks", ()) if item
+            )
+            picked: tuple[bytes, Path] | None = None
+            for candidate in candidates:
+                picked = await _read_image_bytes(candidate, decode, path_max)
+                if picked is not None:
+                    break
+            if picked is None:
                 log.info(
-                    "附件读取失败，保持占位：msg=%s kind=%s",
-                    msg.message_id,
-                    attachment.kind,
-                    exc_info=True,
+                    "附件读取或解码失败，保持占位：msg=%s", msg.message_id
                 )
                 updated.append(attachment)
                 continue
-
-            if decode is not None and (
-                source_path.suffix.lower() == ".dat"
-                or _HEX32_NAME_RE.fullmatch(source_path.name)
-            ):
-                decoded = decode(data)
-                if inspect.isawaitable(decoded):
-                    decoded = await decoded
-                data = decoded
-                if data is None:
-                    log.debug("附件解码失败，保持占位：msg=%s", msg.message_id)
-                    updated.append(attachment)
-                    continue
-
-            if not data or len(data) > path_max:
-                log.info(
-                    "附件大小不可接受（%d 字节，上限 %d），保持占位：msg=%s",
-                    len(data) if data else 0,
-                    path_max,
-                    msg.message_id,
-                )
-                updated.append(attachment)
-                continue
+            data, used_path = picked
 
             if not prepared:
                 # 目录与清理只在第一张真要落盘时才动，避免无图消息碰文件系统。
@@ -822,7 +837,7 @@ async def materialize_attachments(
                 retention_days = getattr(images_cfg, "retention_days", 0)
                 _cleanup(directory, retention_days)
                 prepared = True
-            target = _target(directory, source, data, source_path.suffix)
+            target = _target(directory, source, data, used_path.suffix)
             try:
                 await asyncio.to_thread(target.write_bytes, data)
             except OSError:
