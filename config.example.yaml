@@ -144,7 +144,7 @@ gateway:
       # 单张图片解密后的大小上限（字节）；超过就保留占位。
       max_bytes: 10485760
       # 空 = 自动探测 xwechat_files 目录；填了则只接受该根目录内的文件。
-      # storage_root: ""
+      storage_root: ""
 
 opencode:
   # 留空自动找 npm 全局安装的 opencode.exe
@@ -389,6 +389,13 @@ mind:
   inbound_media_reactions: false
   # 同一会话两次入站反应的最小间隔（秒）。
   inbound_media_reaction_cooldown_seconds: 600
+  # 承诺跟进（P3）：对「说过要做某事」且之后没再出现的会话主动追问一句；
+  # 代码默认关闭，开启后仍受静音/预算/每日上限与「创建后无新 bot 发言」门控。
+  proactive_followup: false
+  # 只跟进创建超过这么多小时的 promise。
+  followup_after_hours: 24
+  # 同一会话每日最多主动跟进几次（按上海日期计）。
+  followup_daily_cap: 3
 
 # 面板「聊天行为」卡片可实时改；这里的值只是默认值，面板改动写
 # data/settings.local.yaml，重启后仍然保留。
@@ -446,10 +453,19 @@ alerts:
     reply_error_window_seconds: 900
     reply_error_count: 3
     budget_warning: true
+    # 距上次成功备份超过这么多小时（或从未成功过）就告警「备份过期」；
+    # backup.enabled=false 的部署豁免。
+    backup_stale_hours: 25
+    # memory.pending_count（还没生成摘要的天数）达到该值就告警「记忆落后」；
+    # 额度熔断期间不报。
+    memory_gap_days: 2
 
 backup:
   enabled: true
   dir: data/backups
+  # 主备份成功后把 .db、同名 manifest 与 workspace zip 再复制一份到该目录；
+  # 空 = 关闭，与 dir 相同则跳过；镜像失败只记独立错误字段，不影响主备份。
+  mirror_dir: ""
   # scheduled 备份按天保留 N 份，另按周（周日 04:00 那批）保留 N 份。
   daily_keep: 7
   weekly_keep: 4

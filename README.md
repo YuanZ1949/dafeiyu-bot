@@ -231,7 +231,7 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `persona.os_probability` | `0.05` | 出现「内心 OS」的概率，`0` 关闭；三种 provider 模式都生效（opencode 模式按轮注入覆盖指令） |
 | `persona.repeat_guard` | `true` | 重复守卫：同一句话在最近 50 条自己的发言里出现过，就先去重复开头，再换一句中性短句，仍重复则这一片不发；不重调模型 |
 | `persona.opportunity_guard` | `true` | 机会检测（规则版）：纯热聊/纯表情批次不送模型，消息攒在待投队列，等点名或问句时一起进 prompt；待投接近 20 条时照旧送审 |
-| `persona.quote_reply` | `true` | 引用回复：被点名/被引用时把首片回复挂在原消息下；`false` 时完全走纯文本发送 |
+| `persona.quote_reply` | `true` | 引用回复：被点名/被引用时把首片回复挂在原消息下；`false` 时完全走纯文本发送。**只对 QQ 生效**：微信出站没有引用原语（桥只有 `send_text`/`send_at`/`send_media`），即使打开也只发纯文本，见 `docs/message-types.md` |
 | `persona.prompt_file` | `""` | 自定义人设文件路径；留空使用内置 `brain/persona.md`。改完重启生效 |
 | `triggers.cooldown_seconds` | `60` | 同一群两次**非提问**发言的最小间隔（明确提问、@/引用/叫名字不受限） |
 | `triggers.sample_rate` | `0.05` | 普通消息被纳入模型判断的采样率 |
@@ -302,6 +302,11 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `gateway.wechat.media.enabled` | `false` | 微信入站图片落盘总开关；关闭时只保留 `[图片]` 占位，不读任何本地文件 |
 | `gateway.wechat.media.max_bytes` | `10485760` | 微信入站图片解密后的单张大小上限（10 MiB）；超限保留占位 |
 | `gateway.wechat.media.storage_root` | `""` | 微信本地媒体根目录；空 = 自动探测 `xwechat_files`，只接受该目录内的文件 |
+| `backup.mirror_dir` | `""` | 备份镜像目录：主备份成功后把 `.db`、同名 manifest 和 workspace zip 再复制一份过去；空 = 关闭，与 `backup.dir` 相同则跳过。镜像失败只写独立的镜像错误字段，不影响主备份；相对路径按仓库根目录解析 |
+| `alerts.rules.backup_stale_hours` | `25` | 距上次成功备份超过这么多小时（或从未成功过）就报「备份过期」；`backup.enabled=false` 的部署豁免，不报 |
+| `alerts.rules.memory_gap_days` | `2` | `memory.pending_count`（还没生成摘要的天数）达到这个值就报「记忆落后」；额度熔断期间不报 |
+
+出站语音的 `speech.tts_enabled` / `speech.tts_voice` / `speech.tts_rate` / `speech.tts_max_chars` 四个键同属 `speech:` 段，见上文「3.6 语音回复」，**没有**独立的 `tts:` 配置节。`reminders` 只是 SQLite 里的表名（`/remind` 的存储，见 §4「用法」），**没有** `reminders:` 配置节。
 
 预算分四层：每群每日、全局每日、自然月、月度费用。所有 `0` 都表示「未启用/不限制」。
 `degrade` 会保留 @/引用/叫名字的回复，只停普通插话；`stop` 连点名也不回；`notify`
@@ -631,6 +636,8 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 | `/budget` `/预算` | 仅管理员 | 仅管理员 | 30 秒 | 全局/月度/本会话预算与费用估算 |
 | `/forget` | 仅管理员 | 所有人 | 无 | 清空当前会话全部记忆（消息、摘要、印象、用量与会话映射，不可撤销） |
 | `/remind` `/提醒` | 仅管理员 | 所有人 | 无 | 定时提醒，三种写法：`/remind <分钟> <内容>` 新建、`/remind list` 查看本会话最近提醒、`/remind cancel <id>` 取消自己创建的提醒；分钟为 1–10080 的整数，内容非空且 ≤200 字；到点由后台 worker 发送 |
+
+群聊专用的 `/shutup`（`/闭嘴`）与 `/wake`（`/醒来`）不在上表（私聊不可用），说明见前面的群内用法。
 
 `/remind` 与 `/forget` 一样是「群内仅管理员、私聊所有人」的非对称权限；提醒只在当前会话生效，
 取消也要求是创建者本人。提醒正文与状态存在 SQLite 的 `reminders` 表里（是**表名，不是配置节**），

@@ -1,6 +1,6 @@
 # 消息类型能力矩阵
 
-本文只描述**当前代码已经做到的事**。没做到的（视频完整转码（只抽帧看画面，见「入站媒体」）、微信 UI 剪贴板发图等）在矩阵里明确写「不支持」，不要按「以后会有」理解。
+本文只描述**当前代码已经做到的事**。没做到的（视频完整转码（只抽帧看画面，见「入站媒体」）、微信 UI 剪贴板发图、微信出站引用/合并转发等）在矩阵里明确写「不支持」，不要按「以后会有」理解。
 
 图例：
 
@@ -16,11 +16,12 @@
 | 文本 | 支持 | 支持 | 支持 | 支持（`send_text`） |
 | 图片 | 支持（`images.enabled` 时落盘并把路径写进正文；失败保留 `[图片]`） | 支持（`gateway.wechat.media.enabled` 时解密落盘给路径；否则占位） | 支持（`send_segments` 的 image 段） | 支持（hook 后端经 `send_media`；UIA 后端恒 `unsupported_media`，回落文本） |
 | 语音 | 支持（`speech.enabled` 且 URL 下载由 `images.enabled` 门控时落盘 `voices/` 并转写，正文变 `[语音]（转写：…）`；依赖缺失、超时、解码失败保留 `[语音]` 占位） | 支持（`speech.enabled` 与 `gateway.wechat.media.enabled` 都打开时读取本地文件落盘并转写；否则占位） | 支持（`send_segments` 的 record 段，kind 为 `record`/`voice`） | 支持（hook 后端 `send_media` kind=voice；UIA 不支持） |
-| 视频 | 支持（`images.enabled` 时下载 URL 原文件到 `videos/`，`annotate` 为真时用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`gateway.wechat.media.enabled` 时复制原文件到 `videos/`，并用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`send_segments` 的 video 段，路径同样受 `replies/` 与后缀白名单约束） | 支持（hook 后端 `send_media` kind=video；UIA 不支持） |
-| 文件 | 只记录元数据（正文 `[文件] 名字`，记录名字/大小，不下载） | 占位（按 link/占位处理，不下载） | 支持（`upload_file`，模型附件 `kind=file`） | 支持（hook 后端 `send_media` kind=file；UIA 不支持） |
+| 视频 | 支持（`images.enabled` 时下载 URL 原文件到 `videos/`，`annotate` 为真时用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`gateway.wechat.media.enabled` 时复制原文件到 `videos/`，并用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`send_segments` 的 video 段，路径同样受 `replies/` 与后缀白名单约束） | 不支持（hook 的 `send_media` 只认 image/file/voice/sticker，`kind=video` 明确回 `unsupported_media`；UIA 也不支持。附件不发出，正文照发） |
+| 文件 | 只记录元数据（正文 `[文件] 名字`，记录名字/大小，不下载） | 占位（按 link/占位处理，不下载） | 支持（`upload_file`，模型附件 `kind=file`） | 不支持（模型附件 `kind=file` 只走 QQ 的 `upload_file`；微信适配器没有该接口，附件被跳过、正文照发。hook 的 `/send_media` 虽有 `kind=file` 路由，主链路不会调用） |
 | 表情 / 贴纸 | 占位但带标识（`face` → `[表情:<id>]`，`mface` → `[表情:<摘要>]`，缺失时回退 `[表情]`；同时记录 sticker 名字/id） | 占位但带标识（`[表情:<desc>]`，无名字用 `[表情:<md5 前 8>]`，解析失败回退 `[表情]`）；贴纸图片在 `gateway.wechat.media.enabled` 时按图片落盘，模型可 `read` 查看 | 支持（模型附件 `type=sticker`：纯数字 `name` 出 `face` 段，其它文本出 `mface` 摘要段） | 支持（hook 后端 `send_media` kind=sticker；UIA 不支持） |
 | @ | 支持（正文保留 `@名字`，并标记 `at_bot`） | 支持（正文保留原文，并标记 `at_bot`） | 支持（at 段；名字必须在本批次在场成员里，最多 3 个） | 支持（hook 后端 `send_at`；UIA 返回 `unsupported_at`，回落纯文本） |
-| 合并转发 | 支持（递归渲染成「昵称: 内容」文本，深度/节点数有上限，超限占位） | 不支持（本地库没有对应 kind；appmsg 归到 quote/link） | 支持（模型附件 `type=forward`，`nodes` 最多 5 条、单条 200 字；失败降级为一行占位文本） | 不支持 |
+| 合并转发 | 支持（递归渲染成「昵称: 内容」文本，深度/节点数有上限，超限占位） | 不支持（本地库没有对应 kind；appmsg 归到 quote/link） | 支持（模型附件 `type=forward`，`nodes` 最多 5 条、单条 200 字；失败降级为一行占位文本） | 不支持（无转发发送原语；附件降级为正文末尾一行 `[合并转发 N 条]`，见下文） |
+| 引用回复（quote） | 支持（`reply` 段解析出 `reply_to_message_id` / `reply_to_user_id`，`reply_to_bot` 参与点名判定） | 支持（`kind=quote`，引用块渲染成 `reply_to_text` / `reply_to_author`） | 支持（`persona.quote_reply` 为真时首片带 `quote_id`，走 `send_segments`） | 不支持（桥只有 `send_text` / `send_at` / `send_media`，没有引用原语；回落纯文本，需在正文复述，见下文） |
 | 戳一戳 / 进退群 / 禁言 | 支持解析（`NoticeEvent`，只记日志，不触发模型回复） | 不支持 | 不支持 | 不支持 |
 | 卡片 / 链接 | 支持（json/xml 卡片渲染成文本摘要） | 支持（appmsg 的标题渲染为 link；引用消息渲染为 quote） | 不支持 | 不支持 |
 | 位置 | 支持（渲染 `[位置] 标题` 摘要） | 占位（正文 `[位置]`） | 不支持 | 不支持 |
@@ -45,6 +46,31 @@
 QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。表情用 `{"type": "sticker", "name": "..."}`：`name` 为 1–6 位非 0 数字时出 `face` 段，其它文本出 `mface` 摘要段；只校验名字非空，不读文件、不受 `replies/` 白名单限制。微信侧：UIA 传输对任何媒体都返回 `unsupported_media`，客户端不重试、不回落，调用方继续发文本；不做剪贴板发图。
 
 入站表情的正文格式统一为 `[表情:<标识>]`：QQ `face` 用数字 id、`mface` 用摘要文本；微信优先用 `<emoji desc/attachedtext>`，为空时用 md5 前 8 位。标识只是让模型能区分「哪个表情」，真正的语义仍要靠贴纸图片本身（见下）。
+
+### 微信出站：引用与合并转发（不支持）
+
+微信通道**没有**「引用某条消息」和「合并转发」的出站原语，这不是配置开关的问题：
+
+- 桥的**发送类**指令白名单只有 `send_text` / `send_at` / `send_media`（`src/dafeiyu/gateway/wechat_bridge/server.py` 的 `_KNOWN_ACTIONS` 还含 `probe` / `stop` / `resume` / `ack` / `hello` 等协议动作）；hook 后端的 HTTP 路由也只有 `/send_text`、`/send_at`、`/send_media`（`scripts/wechat_hook_server.py`），其它路径直接 404。
+- helper 仓（默认 `C:\MyFile\AICoding\helper`，可用 `WECHAT_HELPER_ROOT` 覆盖）的 `helper/native/*.h` 只有图片/文件/语音/表情的发送头（`image_send.h`、`file_send.h`、`voice_send.h`、`emoticon_send.h`），没有 quote/forward 发送头；`wxbot_framework/forwarded.py` 与 `forwarded_receiver.py` 只解析**入站**的合并转发（type 49 / `app_type=19`），不提供发送能力。
+- 客户端侧同样没有：`gateway/wechat.py` 只实现 `send` / `send_at` / `send_media`，没有 `send_segments`、`send_forward`、`upload_file`。
+
+具体表现：
+
+- **引用回复**：`persona.quote_reply` 只在适配器提供 `send_segments` 时才会把 `quote_id` 传下去（`Service._send_chunk`）。微信适配器没有这个能力，所以即使 `quote_reply: true` 也只发纯文本；要「引用」某句话，只能在正文里复述（例如「你刚才说的 X……」）。
+- **合并转发**：模型的 `{"type": "forward", "nodes": [...]}` 附件先走 `Service._send_chunk` 的转发分支；微信适配器没有 `send_forward`，于是降级为正文末尾一行 `[合并转发 N 条]`，其余文字照发。只有 QQ 适配器实现了 `send_group_forward_msg` / `send_private_forward_msg`。
+- **微信入站引用仍然可用**：桥把引用块解析成 `reply_to_text` / `reply_to_author`（消息 `kind=quote`），模型能看到被引用内容，只是回复时无法挂回原消息。
+
+#### 为什么不能拿 `message_id` 去引用：`epoch:seq` 合成值
+
+微信桌面端不暴露稳定的消息 id。`src/dafeiyu/gateway/wechat_bridge/align.py` 的做法是顺序对齐后本地编号：
+
+- 每轮读会话最近的 `K = 50` 条 `(nickname, text)`，用「上次窗口的后缀 = 本次窗口的前缀」做重叠匹配；只有重叠之后的新条目才编号。
+- `seq` 从上次的编号继续（`+1, +2 …`），`message_id = f"{session_epoch}:{seq}"`（`align.py` 的 `_build_message`，约 246 行）。`session_epoch` 是随机的 31 位 int，只在一段连续对齐内唯一；对齐失败（`overlap_low` / `window_empty`）会换新 epoch、`seq` 归零，并额外发一条 `resync` 事件。
+- 因此这个 id 是**本地合成值**：可以当数据库主键、去重键、会话内 `reply_to_message_id` 的匹配依据，但它不是微信的消息句柄，**不能**交给微信去引用/转发；跨 `resync` 也不保证稳定。同一个 `message_id` 只在「同一 epoch + 同一会话」内有效。
+- 副作用：文件名不能直接用 `message_id`（含 `:`，Windows 非法），所以 TTS 落盘用 `voice-<uuid>.mp3`。
+
+替代做法：把要引用的内容当作文本复述给模型/群友；需要「转发」时用多段文字或 `[合并转发 N 条]` 占位说明。不要声称微信侧真的发出了引用或转发卡片。
 
 ### 站内语音消息（出站 TTS）
 
