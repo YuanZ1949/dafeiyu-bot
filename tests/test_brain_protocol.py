@@ -48,7 +48,7 @@ def test_more_than_two_attachments_truncated() -> None:
     assert [a.path for a in reply.attachments] == ["replies/a.png", "replies/b.pdf"]
 
 
-def test_sticker_uses_name_and_ignores_path() -> None:
+def test_sticker_keeps_name_and_path() -> None:
     parsed = parse_reply_attachments(
         [
             {"type": "sticker", "name": "178", "path": "replies/x.webp"},
@@ -57,21 +57,37 @@ def test_sticker_uses_name_and_ignores_path() -> None:
     )
 
     assert [(a.kind, a.name, a.path) for a in parsed] == [
-        ("sticker", "178", ""),
+        ("sticker", "178", "replies/x.webp"),
         ("sticker", "摸鱼", ""),
     ]
 
 
-def test_sticker_without_name_dropped() -> None:
+def test_sticker_path_only_accepted_and_both_empty_dropped() -> None:
     parsed = parse_reply_attachments(
         [
+            {"type": "sticker", "path": "replies/x.gif"},
             {"type": "sticker"},
             {"type": "sticker", "name": "   "},
+            {"type": "sticker", "path": "   "},
             {"type": "sticker", "name": "1"},
         ]
     )
 
-    assert [a.name for a in parsed] == ["1"]
+    assert [(a.name, a.path) for a in parsed] == [
+        ("", "replies/x.gif"),
+        ("1", ""),
+    ]
+
+
+def test_sticker_bad_path_treated_as_missing_path() -> None:
+    parsed = parse_reply_attachments(
+        [
+            {"type": "sticker", "name": "178", "path": 123},
+            {"type": "sticker", "name": "178", "path": "r" * 201},
+        ]
+    )
+
+    assert [a.path for a in parsed] == ["", ""]
 
 
 def test_reply_array_is_preserved_as_parts() -> None:

@@ -28,6 +28,7 @@ from dafeiyu.config import (
     TriggerConfig,
     WorkspaceConfig,
 )
+from dafeiyu.memory.store import Store
 from dafeiyu.models import Attachment, ChatType, Message
 from dafeiyu.reply_media import (
     MAX_ATTACHMENT_BYTES,
@@ -387,6 +388,109 @@ def test_sticker_without_name_dropped(tmp_path: Path) -> None:
     )
 
     assert resolved == []
+
+
+def test_sticker_with_replies_path_resolves(tmp_path: Path) -> None:
+    (tmp_path / "replies").mkdir()
+    (tmp_path / "replies" / "x.gif").write_bytes(PNG_BYTES)
+
+    resolved = resolve_attachments(
+        make_reply(Attachment(kind="sticker", name="", path="replies/x.gif")),
+        make_settings(tmp_path),
+    )
+
+    assert len(resolved) == 1
+    item = resolved[0]
+    assert item.kind == "sticker"
+    # path-only 贴纸不得用文件名回填 name：否则 QQ 会发出带文件名的 mface。
+    assert item.name == ""
+    assert item.path == (tmp_path / "replies" / "x.gif").resolve().as_posix()
+    assert item.size == len(PNG_BYTES)
+
+
+def test_sticker_with_owned_images_path_resolves(tmp_path: Path) -> None:
+    (tmp_path / "replies").mkdir()
+    (tmp_path / "images").mkdir()
+    (tmp_path / "images" / "owned.gif").write_bytes(PNG_BYTES)
+    store = Store(":memory:")
+    store.init_schema()
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id="qq:1001",
+            user_id="qq:3001",
+            nickname="阿明",
+            content="这图不错 [图片]（图存 images/owned.gif，可用 read 查看）",
+            message_id="m1",
+            timestamp=1_000,
+        )
+    )
+
+    resolved = resolve_attachments(
+        make_reply(Attachment(kind="sticker", name="摸鱼", path="images/owned.gif")),
+        make_settings(tmp_path),
+        store=store,
+        chat_type=ChatType.GROUP,
+        chat_id="qq:1001",
+    )
+
+    assert [(item.kind, item.name) for item in resolved] == [("sticker", "摸鱼")]
+    assert resolved[0].path == (tmp_path / "images" / "owned.gif").resolve().as_posix()
+
+
+def test_sticker_with_unowned_images_path_falls_back_to_name(tmp_path: Path) -> None:
+    (tmp_path / "replies").mkdir()
+    (tmp_path / "images").mkdir()
+    (tmp_path / "images" / "other.gif").write_bytes(PNG_BYTES)
+    store = Store(":memory:")
+    store.init_schema()
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id="qq:2002",
+            user_id="qq:3001",
+            nickname="阿明",
+            content="这图不错 [图片]（图存 images/other.gif）",
+            message_id="m1",
+            timestamp=1_000,
+        )
+    )
+
+    resolved = resolve_attachments(
+        make_reply(Attachment(kind="sticker", name="摸鱼", path="images/other.gif")),
+        make_settings(tmp_path),
+        store=store,
+        chat_type=ChatType.GROUP,
+        chat_id="qq:1001",
+    )
+
+    # 归属不成立：退化为 name-only 贴纸，path 清空。
+    assert [(item.kind, item.name, item.path) for item in resolved] == [
+        ("sticker", "摸鱼", "")
+    ]
+
+
+def test_sticker_with_invalid_name_and_path_dropped(tmp_path: Path) -> None:
+    (tmp_path / "replies").mkdir()
+
+    resolved = resolve_attachments(
+        make_reply(Attachment(kind="sticker", path="replies/missing.gif")),
+        make_settings(tmp_path),
+    )
+
+    assert resolved == []
+
+
+def test_sticker_path_survives_disabled_workspace_with_name(tmp_path: Path) -> None:
+    settings = replace(make_settings(tmp_path), workspace=WorkspaceConfig(dir=""))
+    resolved = resolve_attachments(
+        make_reply(Attachment(kind="sticker", name="178", path="replies/x.gif")),
+        settings,
+    )
+
+    assert [(item.kind, item.name, item.path) for item in resolved] == [
+        ("sticker", "178", "")
+    ]
 
 
 def test_forward_resolves_without_workspace_and_keeps_nodes(tmp_path: Path) -> None:

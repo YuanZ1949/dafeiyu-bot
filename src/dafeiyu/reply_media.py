@@ -54,9 +54,15 @@ def _shape_reject_reason(raw: str) -> str | None:
 
 
 def _build_attachment(candidate: Any, target: Path, size: int) -> Attachment:
-    """校验全部通过后的 Attachment 组装：kind 归一，source 清空。"""
-    name = str(getattr(candidate, "name", "") or "") or target.name
+    """校验全部通过后的 Attachment 组装：kind 归一，source 清空。
+
+    sticker 的空 name 保持为空：path-only 贴纸在 QQ 侧发不出 face/mface
+    时应直接跳过，而不是把 GIF 文件名伪装成表情摘要（mface）。
+    """
     kind = str(getattr(candidate, "kind", "") or "").strip().lower() or "file"
+    name = str(getattr(candidate, "name", "") or "")
+    if not name and kind != "sticker":
+        name = target.name
     try:
         duration = int(getattr(candidate, "duration", 0) or 0)
     except (TypeError, ValueError):
@@ -176,7 +182,8 @@ def resolve_attachments(
     普通文件；``images/<name>`` 还必须出现在本会话最近消息正文里
     （提供 store/chat_type/chat_id 三者才做归属校验，缺一即拒绝）。
     工作区关闭、路径越界、文件缺失等一律留痕后跳过，绝不抛错。
-    ``sticker`` 不读文件（表情没有本地路径），只校验非空 name 后原样透传。
+    ``sticker`` 无 path 时只校验非空 name 后原样透传；带 path 的贴纸走
+    与图片相同的媒体解析，被拒但有 name 时回退为 name-only 贴纸。
     """
     candidates: tuple[Attachment, ...] = reply.attachments
     if not candidates:
@@ -188,44 +195,59 @@ def resolve_attachments(
     resolved: list[Attachment] = []
     for candidate in candidates:
         kind = str(getattr(candidate, "kind", "") or "").strip().lower()
+        raw = str(getattr(candidate, "path", "") or "")
+        fallback_name = ""
         if kind == "sticker":
-            name = str(getattr(candidate, "name", "") or "").strip()
-            if not name:
-                log.info("忽略空 name 的表情附件")
+            fallback_name = str(getattr(candidate, "name", "") or "").strip()
+            if not raw.strip():
+                # 无 path 的贴纸保持原行为：只按 name 透传（face/mface）。
+                if not fallback_name:
+                    log.info("忽略空 name 的表情附件")
+                    continue
+                resolved.append(
+                    Attachment(kind="sticker", name=fallback_name[:_MAX_NAME_CHARS])
+                )
                 continue
-            resolved.append(Attachment(kind="sticker", name=name[:_MAX_NAME_CHARS]))
-            continue
-        if kind == "forward":
+            # 有 path 的贴纸落到下方通用媒体解析；被拒时按 name 兜底。
+        elif kind == "forward":
             forward = _forward_attachment(candidate)
             if forward is None:
                 log.info("忽略没有有效节点的合并转发附件")
                 continue
             resolved.append(forward)
             continue
-        raw = str(getattr(candidate, "path", "") or "")
-        if not raw.strip():
+        elif not raw.strip():
             # 形残但无害：空路径不配 warning，info 留痕即可。
             log.info("忽略空路径的模型附件 kind=%r", getattr(candidate, "kind", "") or "")
             continue
         if root is None or base is None or images is None:
             log.warning("工作区未启用，拒绝模型附件 path=%r", raw)
-            continue
-        # 允许的根目录：replies 恒允许；images 仅当会话归属成立时放行。
-        allowed: dict[str, Path] = {REPLIES_DIRNAME: base}
-        if _lead_dirname(raw) == IMAGES_DIRNAME:
-            rel = PurePosixPath(raw.replace("\\", "/")).as_posix()
-            if not _images_owned(rel, settings, store, chat_type, chat_id):
-                log.warning("拒绝模型附件（images 未获本会话归属）path=%r", raw)
-                continue
-            allowed[IMAGES_DIRNAME] = images
-        try:
-            item = _resolve_one(candidate, raw, root, allowed)
-        except (OSError, ValueError) as exc:
-            # stat/resolve 撞上损坏的软链、权限、非法字符：按拒绝处理。
-            log.warning("拒绝模型附件（解析出错：%s）path=%r", exc, raw)
-            continue
+            item = None
+        else:
+            # 允许的根目录：replies 恒允许；images 仅当会话归属成立时放行。
+            allowed: dict[str, Path] = {REPLIES_DIRNAME: base}
+            if _lead_dirname(raw) == IMAGES_DIRNAME:
+                rel = PurePosixPath(raw.replace("\\", "/")).as_posix()
+                if not _images_owned(rel, settings, store, chat_type, chat_id):
+                    log.warning("拒绝模型附件（images 未获本会话归属）path=%r", raw)
+                    allowed = {}
+                else:
+                    allowed[IMAGES_DIRNAME] = images
+            if not allowed:
+                item = None
+            else:
+                try:
+                    item = _resolve_one(candidate, raw, root, allowed)
+                except (OSError, ValueError) as exc:
+                    # stat/resolve 撞上损坏的软链、权限、非法字符：按拒绝处理。
+                    log.warning("拒绝模型附件（解析出错：%s）path=%r", exc, raw)
+                    item = None
         if item is not None:
             resolved.append(item)
+        elif kind == "sticker" and fallback_name:
+            # 贴纸文件被拒（越界/不在白名单/超限等）仍有 name 兜底：
+            # QQ 发 face/mface，不至于整条丢表情。
+            resolved.append(Attachment(kind="sticker", name=fallback_name[:_MAX_NAME_CHARS]))
     return resolved
 
 

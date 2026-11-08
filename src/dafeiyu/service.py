@@ -2350,21 +2350,31 @@ class Service:
             if callable(push_media):
                 media_ok = True
                 for item in media:
+                    is_sticker = str(item.kind or "").strip().lower() == "sticker"
                     if not item.path:
+                        if is_sticker:
+                            log.info("贴纸没有本地 GIF，跳过实图发送 %s", chat_id)
                         continue
-                    try:
-                        pushed = await push_media(
-                            chat_type, chat_id, item.kind, item.path, item.name
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:  # noqa: BLE001 - 附件是加分项
-                        log.info("媒体发送失败（继续发文本）%s: %s", chat_id, exc)
-                        media_ok = False
-                        continue
-                    # 桥把 unsupported_media 折成 False：明确失败时也要回退文本。
-                    if pushed is False:
-                        media_ok = False
+                    # 贴纸先按原 kind 推真实 GIF；被桥拒绝（hook_rejected 的
+                    # 非 GIF / 超限 GIF，或断连 GatewayError）时降级为图片再试。
+                    kinds = ("sticker", "image") if is_sticker else (item.kind,)
+                    for attempt in kinds:
+                        try:
+                            pushed = await push_media(
+                                chat_type, chat_id, attempt, item.path, item.name
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:  # noqa: BLE001 - 附件是加分项
+                            log.info("媒体发送失败（继续发文本）%s: %s", chat_id, exc)
+                            pushed = False
+                        if pushed is not False:
+                            break
+                        if attempt == kinds[-1]:
+                            # 桥把 unsupported_media 折成 False：明确失败时也要回退文本。
+                            media_ok = False
+                        else:
+                            log.info("贴纸推送被拒，降级为图片发送 %s", chat_id)
                 media = ()
                 # 语音段已经承载全部正文：媒体推送全部成功就不再补发文字。
                 if voice_only and media_ok:

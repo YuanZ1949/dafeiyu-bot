@@ -170,10 +170,24 @@ def parse_reply_attachments(raw: object) -> tuple[Attachment, ...]:
             continue
         name = str(entry.get("name") or "").strip()
         if kind == "sticker":
-            # 表情不读文件：name 是 face id 或 mface 摘要，path 直接忽略。
-            if not name:
+            # 表情不读文件：name 是 face id 或 mface 摘要。微信贴纸可另带
+            # path 指向真实 GIF（replies/ 或本会话收到过的 images/），白名单
+            # 校验由 reply_media 负责；name 与 path 至少一个非空才保留。
+            sticker_path = ""
+            raw_path = entry.get("path")
+            if isinstance(raw_path, str):
+                raw_path = raw_path.strip()
+                if raw_path and len(raw_path) <= MAX_ATTACHMENT_PATH:
+                    sticker_path = raw_path
+            if not name and not sticker_path:
                 continue
-            parsed.append(Attachment(kind="sticker", name=name[:MAX_ATTACHMENT_NAME]))
+            parsed.append(
+                Attachment(
+                    kind="sticker",
+                    name=name[:MAX_ATTACHMENT_NAME],
+                    path=sticker_path,
+                )
+            )
             continue
         if kind == "forward":
             nodes = _parse_forward_nodes(entry.get("nodes"))
