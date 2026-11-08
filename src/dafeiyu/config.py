@@ -270,6 +270,11 @@ class SpeechConfig:
     initial_prompt: str = "以下是普通话的句子，请用简体中文转写。"
     #: 空 = 不设置 HF_ENDPOINT（直连 huggingface.co）；国内建议填镜像。
     hf_endpoint: str = ""
+    #: 出站语音合成（edge-tts）。默认关闭：启用后回复文本会发往云端 TTS。
+    tts_enabled: bool = False
+    tts_voice: str = "zh-CN-XiaoxiaoNeural"
+    tts_rate: str = "+0%"
+    tts_max_chars: int = 200
 
 
 @dataclass(frozen=True)
@@ -905,6 +910,12 @@ def _build_speech(raw: dict[str, Any]) -> SpeechConfig:
             "以下是普通话的句子，请用简体中文转写。",
         ),
         hf_endpoint=_speech_text(raw, "hf_endpoint", ""),
+        tts_enabled=_bool(raw.get("tts_enabled", False), "speech.tts_enabled"),
+        tts_voice=_speech_text(raw, "tts_voice", "zh-CN-XiaoxiaoNeural"),
+        tts_rate=_speech_text(raw, "tts_rate", "+0%"),
+        tts_max_chars=_positive_int(
+            raw.get("tts_max_chars"), "speech.tts_max_chars", 200
+        ),
     )
 
 

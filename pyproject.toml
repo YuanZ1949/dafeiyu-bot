@@ -40,6 +40,11 @@ stt = [
     "faster-whisper>=1.1",
     "silk-python>=0.2.9",
 ]
+# 出站语音合成（speech.tts_enabled）。可选：不装时语音回复自动退回纯文本。
+# edge-tts 会把待合成文本发往微软云端，默认关闭（见 config.example.yaml）。
+tts = [
+    "edge-tts>=6.1",
+]
 
 [project.scripts]
 dafeiyu = "dafeiyu.cli:main"

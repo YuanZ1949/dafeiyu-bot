@@ -311,6 +311,16 @@ speech:
   # HuggingFace 镜像：本机直连 huggingface.co 会超时，国内建议填镜像。
   # 留空 = 不设置 HF_ENDPOINT（直连）。
   hf_endpoint: "https://hf-mirror.com"
+  # 出站语音合成（edge-tts，可选：pip install -e ".[tts]"）。默认关闭。
+  # 注意：启用后，回复文本会被发送到云端 TTS 提供商（edge-tts / 微软语音）。
+  # 未安装可选依赖或合成失败时自动退回纯文本。
+  tts_enabled: false
+  # 云端音色；中文女声默认 zh-CN-XiaoxiaoNeural。
+  tts_voice: "zh-CN-XiaoxiaoNeural"
+  # 语速，按 edge-tts 的百分比写法（如 "+0%" / "-10%"）。
+  tts_rate: "+0%"
+  # 超过该字数的文本不合成（直接发纯文本）。
+  tts_max_chars: 200
 
 memory:
   window_size: 20
