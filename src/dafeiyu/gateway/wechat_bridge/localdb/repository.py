@@ -100,6 +100,16 @@ _HEX32_RE = re.compile(r"[0-9a-f]{32}")
 #: appmsg 的引用回复类型。
 _APPMSG_QUOTE = 57
 
+#: 视频号分享 XML 的正则兜底（ElementTree 解析失败时用）。
+_FINDER_NICK_RE = re.compile(r"<nickname[^>]*>(.*?)</nickname>", re.DOTALL)
+_FINDER_DESC_RE = re.compile(r"<desc[^>]*>(.*?)</desc>", re.DOTALL)
+_FINDER_DURATION_RE = re.compile(
+    r"<videoPlayDuration[^>]*>\s*(\d+)\s*</videoPlayDuration>", re.DOTALL
+)
+_FINDER_MEDIA_COUNT_RE = re.compile(
+    r"<mediaCount[^>]*>\s*(\d+)\s*</mediaCount>", re.DOTALL
+)
+
 #: 只认 `message/message_<数字>.db`；`message_fts.db` / `message_resource.db` /
 #: `biz_message_0.db` / `*.kvdb` 因此天然被排除。
 _MESSAGE_REL_RE = re.compile(r"^message/message_(\d+)\.db$")
@@ -1008,8 +1018,73 @@ def _render_appmsg(body: str) -> tuple[str, str, str, str]:
     if appmsg_type == str(_APPMSG_QUOTE):
         # 引用回复仍属于 appmsg；kind 用 quote 让下游能区分普通链接。
         return "quote", title, refer_content, refer_author
+    finder = _finder_share(body)
+    if finder is not None:
+        # 视频号的 <title> 是「当前版本不支持展示该内容」这类模板文案，真正
+        # 内容在 <finderFeed> 里；kind 仍按链接归类（无附件、无媒体下载）。
+        return "link", finder, "", ""
     # 解析失败/没有 title 就是空文本：宁可这条气泡没有正文，也不伪造 "[链接]"。
     return "link", title, "", ""
+
+
+def _finder_share(body: str) -> str | None:
+    """把视频号分享渲染成一行可读文本；不是视频号分享返回 ``None``。
+
+    真实结构（4.x 本地库实测）::
+
+        <appmsg><type>51</type>
+          <title>当前版本不支持展示该内容，请升级到最新版本。</title>
+          <finderFeed>
+            <nickname>…</nickname><desc>…#话题#…</desc>
+            <mediaCount>1</mediaCount>
+            <mediaList><media><mediaType>4</mediaType>
+              <videoPlayDuration>12</videoPlayDuration></media></mediaList>
+          </finderFeed>
+        </appmsg>
+
+    只做文本可读化：``<media><url>`` 是带 token 的临时直链、封面也只有 200px
+    级，下载它们既不稳定也没有画质收益，因此视频本体/封面一律不取。
+    """
+    if "<finderFeed" not in body:
+        return None
+    root = _parse_xml(body)
+    if root is None:
+        nickname = _regex_text(_FINDER_NICK_RE, body)
+        desc = _regex_text(_FINDER_DESC_RE, body)
+        duration = _regex_int(_FINDER_DURATION_RE, body)
+        media_count = _regex_int(_FINDER_MEDIA_COUNT_RE, body)
+    else:
+        nickname = _node_text(root, ".//finderFeed/nickname")
+        desc = _node_text(root, ".//finderFeed/desc")
+        duration = max(
+            (
+                _safe_int(node.text)
+                for node in root.iterfind(
+                    ".//finderFeed/mediaList/media/videoPlayDuration"
+                )
+            ),
+            default=0,
+        )
+        media_count = _safe_int(_node_text(root, ".//finderFeed/mediaCount"))
+    nickname = re.sub(r"\s+", " ", nickname).strip()
+    desc = re.sub(r"\s+", " ", desc).strip()
+    if not nickname and not desc:
+        return None
+    head = f"[视频号] {nickname}：{desc}" if nickname and desc else ""
+    if not head:
+        head = f"[视频号] {nickname or desc}"
+    if duration > 0:
+        return f"{head}（视频时长 {duration} 秒）"
+    if media_count > 1:
+        return f"{head}（共 {media_count} 张图）"
+    return head
+
+
+def _regex_int(pattern: re.Pattern[str], text: str) -> int:
+    match = pattern.search(text or "")
+    if match is None:
+        return 0
+    return _safe_int(match.group(1))
 
 
 def _appmsg_fields(body: str) -> tuple[str, str, str, str]:

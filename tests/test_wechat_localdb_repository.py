@@ -484,6 +484,63 @@ def test_appmsg_link_uses_title(tmp_path: Path) -> None:
     assert entry["reply_author"] == ""
 
 
+def test_finder_share_renders_readable_text(tmp_path: Path) -> None:
+    """视频号分享的 <title> 是模板文案，正文要取 <finderFeed> 的昵称/描述。"""
+    xml = (
+        "<msg><appmsg><title>当前版本不支持展示该内容，请升级到最新版本。</title>"
+        "<type>51</type>"
+        "<url>https://support.weixin.qq.com/security/readtemplate?t=x</url>"
+        "<finderFeed><objectId>15044584478132013339</objectId>"
+        "<feedType>4</feedType><nickname>阿猫的春天</nickname>"
+        "<desc>今天的晚霞 #随手拍#\n第二行</desc><mediaCount>1</mediaCount>"
+        "<mediaList><media><mediaType>4</mediaType>"
+        "<videoPlayDuration>12</videoPlayDuration></media></mediaList>"
+        "</finderFeed></appmsg></msg>"
+    )
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, f"wxid_a:\n{xml}", local_type=49)
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["kind"] == "link"
+    assert entry["text"] == (
+        "[视频号] 阿猫的春天：今天的晚霞 #随手拍# 第二行（视频时长 12 秒）"
+    )
+
+
+def test_finder_share_image_album_counts_media(tmp_path: Path) -> None:
+    xml = (
+        "<msg><appmsg><title>模板文案</title><type>51</type>"
+        "<finderFeed><nickname>阿猫</nickname><desc>九宫格</desc>"
+        "<mediaCount>9</mediaCount><mediaList><media><mediaType>2</mediaType>"
+        "</media></mediaList></finderFeed></appmsg></msg>"
+    )
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, f"wxid_a:\n{xml}", local_type=49)
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["text"] == "[视频号] 阿猫：九宫格（共 9 张图）"
+
+
+def test_finder_share_broken_xml_falls_back_to_regex(tmp_path: Path) -> None:
+    # 未转义的 "&" 会让 ElementTree 解析失败，正则仍应取出关键字段。
+    xml = (
+        "<msg><appmsg><title>模板文案</title><type>51</type>"
+        "<finderFeed><nickname>阿猫</nickname><desc>晚霞 & 夜景</desc>"
+    )
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, f"wxid_a:\n{xml}", local_type=49)
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["kind"] == "link"
+    assert entry["text"] == "[视频号] 阿猫：晚霞 & 夜景"
+
+
 def test_quote_message_exposes_refer_fields(tmp_path: Path) -> None:
     xml = (
         "<msg><appmsg><title>我的回复</title><type>57</type>"

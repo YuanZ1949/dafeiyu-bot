@@ -23,7 +23,7 @@
 | 合并转发 | 支持（递归渲染成「昵称: 内容」文本，深度/节点数有上限，超限占位） | 不支持（本地库没有对应 kind；appmsg 归到 quote/link） | 支持（模型附件 `type=forward`，`nodes` 最多 5 条、单条 200 字；失败降级为一行占位文本） | 不支持（无转发发送原语；附件降级为正文末尾一行 `[合并转发 N 条]`，见下文） |
 | 引用回复（quote） | 支持（`reply` 段解析出 `reply_to_message_id` / `reply_to_user_id`，`reply_to_bot` 参与点名判定） | 支持（`kind=quote`，引用块渲染成 `reply_to_text` / `reply_to_author`） | 支持（`persona.quote_reply` 为真时首片带 `quote_id`，走 `send_segments`） | 不支持（桥只有 `send_text` / `send_at` / `send_media`，没有引用原语；回落纯文本，需在正文复述，见下文） |
 | 戳一戳 / 进退群 / 禁言 | 支持解析（`NoticeEvent`，只记日志，不触发模型回复） | 不支持 | 不支持 | 不支持 |
-| 卡片 / 链接 | 支持（json/xml 卡片渲染成文本摘要） | 支持（appmsg 的标题渲染为 link；引用消息渲染为 quote） | 不支持 | 不支持 |
+| 卡片 / 链接 | 支持（json/xml 卡片渲染成文本摘要） | 支持（appmsg 的标题渲染为 link；视频号分享（`<finderFeed>`）渲染 `[视频号] 昵称：描述`，不下载视频/封面；引用消息渲染为 quote） | 不支持 | 不支持 |
 | 位置 | 支持（渲染 `[位置] 标题` 摘要） | 占位（正文 `[位置]`） | 不支持 | 不支持 |
 
 补充：
@@ -100,6 +100,7 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
   - **`.dat` 解码**：支持旧的单字节 XOR（`0x37/0x38/0x39`）与 4.x 的 V2 容器（`07 08 56 32 08 07` + `aes_size`/`xor_size` + `[AES-128-ECB 头][明文 middle][XOR 尾]`）。V2 的 AES key 由 `cfgDword` 派生（`md5(str(cfgDword) + wxid)[:16]`，`xor_key = cfgDword & 0xFF`）：`media/keygen.py` 先从 V2 文件尾反推 XOR key，再只读扫描 `Weixin.exe` 内存里低字节相同的对齐 u32，用强图片头 + 完整解码双重校验；结果缓存在 `data/wechat-bridge/localdb/media_key.json`，微信换 key 后缓存会自动失效重扫。服务启动时后台预热，单条消息未命中时把扫描丢到后台线程，事件环从不做内存扫描。扫描失败只保留 `[图片]` 占位。V2 容器解出的明文若是微信私有 `wxgf`（原图），不直接落盘，而是交给 `emoticon.wxgf_to_image` 把其中的 HEVC 转成 PNG（`asyncio.to_thread`，事件环不阻塞）；转码失败才退回 `_h` / `_t`。
   - **贴纸缓存解码**：type 47 的贴纸不在 `msg/attach` 里，而是按消息 XML 的 `<emoji md5="...">` 到 `<storage_root>/cache/<YYYY-MM>/Emoticon/<md5[:2]>/<md5>` 找。文件是裸 AES-128-CBC（`IV == key`、整文件单流、PKCS7、无文件头），key 由同一个 `cfgDword` 派生：`md5(f"{cfgDword}{wxid}EMOTICON").digest()[:16]`——注意与图片 `.dat` 的 ASCII-hex key 不同。明文是 `wxgf` 容器：固定 13 字节头（魔数/版本/宽高/帧数）之后还有一段长度随版本变化的附加数据（v0x12 为 9 字节，v0x13/v0x14 可达 1KB 且含假起始码），真正的 HEVC 流从第一个参数集 NAL（`00 00 00 01 40 01`）开始；由外部 `ffmpeg` 转成 PNG（多帧转 GIF）。`ffmpeg` 优先取环境变量 `DAFEIYU_FFMPEG`，否则查 `PATH`；缺失时保留 `[表情]` 占位，不影响入站。转码在 `asyncio.to_thread` 里执行，事件环不阻塞。少量缓存文件解密后**直接就是 PNG/JPEG/GIF**（非 `wxgf`），这类载荷原样使用、不再过 ffmpeg；密钥迟到时只要消息带附件就会登记重试，纯表情消息同样能补上图片。
   - **无新增依赖**：AES 是仓库内纯 Python 实现（`media/aes.py`），不需要 `cryptography`/`Crypto`。
+  - **视频号分享**：appmsg `type 51` 的 `<title>` 是「当前版本不支持展示该内容，请升级到最新版本。」这类模板文案，真正内容在 `<finderFeed>`（`nickname` / `desc` / `mediaCount` / `mediaList/media/videoPlayDuration`）。渲染成一行 `[视频号] 昵称：描述（视频时长 N 秒）`（图集用「共 N 张图」），`kind` 仍是 `link`。`<media><url>` 是带 token 的临时直链、封面也只有 200px 级，因此**不下载**视频本体和封面；XML 解析失败时用正则兜底取昵称/描述。
 - 入站图片降采样（QQ / 微信入站共通，`imaging.py`）：落盘前用 ffprobe 探测最长边，超过 `images.max_edge`（默认 **1280**）时用 ffmpeg 等比缩小并更新 `Attachment.size`；`0` = 不降采样。JPEG 二次编码显式用 `-q:v 3`（mjpeg 默认量化偏保守，1280px 也会肉眼发糊），PNG/GIF 走各自默认参数。GIF 不处理（`-frames:v 1` 会把动画压成单帧，保留动画）；缺 ffmpeg/ffprobe、探测失败或 ffmpeg 出错时保留原图，不影响消息本身。是否抽/缩在行内静默降级，不产生额外错误。
 - 微信/QQ 共用的图片目录按 `images.retention_days` 惰性清理：`> 0` 时在每次物化前删掉超期文件，`0` = 不清理。
 - 微信文件：只追加一条 `[文件] 名字 (路径)` 注记，不复制、不读取内容。
