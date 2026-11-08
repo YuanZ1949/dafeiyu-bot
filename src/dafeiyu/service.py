@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
 
 from .behavior import BehaviorSettings
 from .brain.client import BrainError, BrainReply
@@ -48,10 +49,17 @@ from .moment import (
     reopened_by_question,
     requests_continuation,
 )
-from .reply_media import build_onebot_segments, resolve_at_names, resolve_attachments
+from .reply_media import (
+    MAX_ATTACHMENT_BYTES,
+    REPLIES_DIRNAME,
+    build_onebot_segments,
+    resolve_at_names,
+    resolve_attachments,
+)
 from .router import Router, now_shanghai
 from .sender import shape_reply, shape_reply_parts
 from .social import PokeReactor
+from .tts import synthesize
 from .workers.failure import (
     QUOTA_KEY,
     is_agent_missing_error,
@@ -2266,6 +2274,7 @@ class Service:
         at_qq_ids: tuple[str, ...] = (),
         at_names: tuple[str, ...] = (),
         dedupe_key: str | None = None,
+        voice_only: bool = False,
     ) -> str | None:
         """发一片回复；有附件/@/引用时升级为消息段，失败退回纯文本。
 
@@ -2274,8 +2283,12 @@ class Service:
         撤回）或本地文件上传失败时一律降级为纯文本，且不重试。
         dedupe_key 是这一片的去重键（仅纯文本路径生效）——桥把「发送成功但
         回执丢失」的重复请求合流掉。
+        voice_only 表示这一片的正文已合成为语音：段/媒体发送成功就不再补发
+        文字；任何失败都退回原文（见 todo 27）。@ 与语音不能共存，带 @ 时
+        自动退回正常文字路径。
         """
         adapter = self._adapter_for(chat_id)
+        voice_only = bool(voice_only and not at_names and not at_qq_ids)
 
         # 合并转发：OneBot 独立接口；适配器不支持/调用失败时降级成一行文本提示，
         # 不把异常抛回上层（转发始终是加法项）。
@@ -2335,18 +2348,27 @@ class Service:
                 getattr(adapter, "send_media", None),
             )
             if callable(push_media):
+                media_ok = True
                 for item in media:
                     if not item.path:
                         continue
                     try:
-                        await push_media(
+                        pushed = await push_media(
                             chat_type, chat_id, item.kind, item.path, item.name
                         )
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:  # noqa: BLE001 - 附件是加分项
                         log.info("媒体发送失败（继续发文本）%s: %s", chat_id, exc)
+                        media_ok = False
+                        continue
+                    # 桥把 unsupported_media 折成 False：明确失败时也要回退文本。
+                    if pushed is False:
+                        media_ok = False
                 media = ()
+                # 语音段已经承载全部正文：媒体推送全部成功就不再补发文字。
+                if voice_only and media_ok:
+                    return None
 
         if quote_id or at_qq_ids or media:
             sender = cast(
@@ -2359,7 +2381,7 @@ class Service:
                         chat_type,
                         chat_id,
                         build_onebot_segments(
-                            chunk,
+                            "" if voice_only else chunk,
                             quote_id=quote_id,
                             at_qq_ids=at_qq_ids,
                             attachments=media,
@@ -2397,6 +2419,74 @@ class Service:
         except Exception as exc:  # noqa: BLE001 - 文本优先
             log.warning("附件解析失败，本条只发文本 %s: %s", chat_id, exc)
             return ()
+
+    @staticmethod
+    def _discard_voice(path: Path) -> None:
+        """清理半成品语音文件；删不掉也不抛。"""
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            log.debug("清理语音文件失败：%s", path, exc_info=True)
+
+    async def _voice_attachment(
+        self,
+        reply: BrainReply,
+        chat_id: str,
+        chunks: list[str],
+        at_names: tuple[str, ...],
+    ) -> Attachment | None:
+        """把单段回复合成为语音附件；任何前置条件不满足都返回 None（纯文本）。
+
+        只在「成型后的单段回复且没有 @ 目标」时启用：语音段承载不了 @ 与多段
+        语义（用 chunks 判定而不是 reply.parts，守卫可能已改过分片数）。
+        文件名一律 ``voice-<uuid>.mp3``：绝不用 message_id——微信的
+        ``epoch:seq`` 含 ``:``，是 Windows 非法文件名。合成失败/超限只退回
+        文本，不抛异常。
+        """
+        if not reply.voice:
+            return None
+        if not self.settings.speech.tts_enabled:
+            return None
+        if not self.settings.workspace.enabled:
+            return None
+        if len(chunks) != 1 or at_names:
+            return None
+        text = chunks[0].strip()
+        if not text:
+            return None
+
+        root = Path(self.settings.workspace.dir) / REPLIES_DIRNAME
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning("语音输出目录不可写，本条只发文本 %s: %s", chat_id, exc)
+            return None
+
+        path = root / f"voice-{uuid4().hex}.mp3"
+        try:
+            ok = await synthesize(text, path, self.settings.speech)
+        except Exception as exc:  # noqa: BLE001 - 语音是加法项，失败退回文本
+            log.warning("语音合成异常，本条只发文本 %s: %s", chat_id, exc)
+            ok = False
+        if not ok:
+            self._discard_voice(path)
+            return None
+
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            log.warning("语音文件不可读，本条只发文本 %s: %s", chat_id, exc)
+            self._discard_voice(path)
+            return None
+        if size <= 0 or size > MAX_ATTACHMENT_BYTES:
+            log.warning(
+                "语音文件大小越界（%d 字节），本条只发文本 %s", size, chat_id
+            )
+            self._discard_voice(path)
+            return None
+        return Attachment(
+            kind="voice", path=path.as_posix(), name=path.name, size=size
+        )
 
     @staticmethod
     def _at_qq_ids(
@@ -2660,6 +2750,11 @@ class Service:
         attachments = self._safe_reply_attachments(reply, chat_id)
         at_names = tuple(resolve_at_names(reply.at, batch))
         at_qq_ids = self._at_qq_ids(at_names, batch)
+        # 语音只在「成型后的单段、无 @」时附加；失败一律退回纯文本。
+        voice = await self._voice_attachment(reply, chat_id, chunks, at_names)
+        voice_only = voice is not None
+        if voice is not None:
+            attachments = attachments + (voice,)
         sent: list[tuple[str, str | None]] = []
         defer = 0
         delay = float(getattr(self.settings.persona, "segment_delay_seconds", 0.0))
@@ -2685,6 +2780,7 @@ class Service:
                     # 稳定去重键：同一逻辑分片（批锚点 + 片序号）首发与
                     # outbox 补发共用，桥据此合流回执丢失导致的重复发送。
                     dedupe_key=f"reply:{chat_id}:{batch[-1].message_id}:{index}",
+                    voice_only=voice_only and index == 0,
                 )
             except asyncio.CancelledError:
                 raise
@@ -3460,6 +3556,11 @@ class Service:
         attachments = self._safe_reply_attachments(reply, msg.chat_id)
         at_names = tuple(resolve_at_names(reply.at, [msg]))
         at_qq_ids = self._at_qq_ids(at_names, [msg])
+        # 与批次路径同一 helper、同一启用条件（单段、无 @、TTS 开启）。
+        voice = await self._voice_attachment(reply, msg.chat_id, chunks, at_names)
+        voice_only = voice is not None
+        if voice is not None:
+            attachments = attachments + (voice,)
 
         sent: list[tuple[str, str | None]] = []
         defer = 0
@@ -3482,6 +3583,7 @@ class Service:
                     at_qq_ids=at_qq_ids if index == 0 else (),
                     at_names=at_names if index == 0 else (),
                     dedupe_key=f"reply:{msg.chat_id}:{msg.message_id}:{index}",
+                    voice_only=voice_only and index == 0,
                 )
             except asyncio.CancelledError:
                 raise
