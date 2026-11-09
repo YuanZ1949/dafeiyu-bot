@@ -46,6 +46,11 @@ logging:
 ENV = "BOT_QQ=10001\nDEEPSEEK_API_KEY=sk-test\n"
 
 
+@pytest.fixture(autouse=True)
+def _fake_napcat(fake_napcat):
+    """本模块用例只验证 spec 的构造结果，不该依赖开发机装没装 NapCat。"""
+
+
 def build(tmp_path: Path, env: str = ENV):
     config = tmp_path / "config.yaml"
     config.write_text(BASE, encoding="utf-8")

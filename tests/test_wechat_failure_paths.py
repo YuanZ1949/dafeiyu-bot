@@ -549,7 +549,7 @@ class _FakeBrain:
 
 
 def test_build_specs_qq_only_returns_three_processes_and_no_wechat_adapter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_napcat: Path
 ) -> None:
     # 闸门 ⑦：微信关闭 → 桥不登记、WeChatAdapter 不构造、channel_status 仅 qq。
     config = tmp_path / "config.yaml"

@@ -17,6 +17,21 @@ def _isolate_local_overrides(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(config_module, "OVERRIDES_PATH", missing)
 
 
+# `build_specs()` 要求 `vendor/napcat/node.exe` 存在，而 vendor 目录是**本机安装状态**
+# （.gitignore 里，CI 干净 workspace 一定没有）。不隔离的话，同一份测试在开发机绿、
+# 在 CI 红 14 个。需要「没装 NapCat」语义的用例自行 monkeypatch NAPCAT_DIR 覆盖。
+@pytest.fixture
+def fake_napcat(tmp_path, monkeypatch):
+    from dafeiyu.supervisor import main as supervisor_main
+
+    node_dir = tmp_path / "fake-napcat"
+    node_dir.mkdir()
+    (node_dir / "node.exe").write_bytes(b"")
+    (node_dir / "index.js").write_text("// stub\n", encoding="utf-8")
+    monkeypatch.setattr(supervisor_main, "NAPCAT_DIR", node_dir)
+    return node_dir
+
+
 TEST_CONFIG_YAML = """\
 persona:
   name: 溟月
