@@ -113,14 +113,15 @@ gateway:
     send_verify_timeout_seconds: 8.0
     send_verify_interval_seconds: 0.5
     # 防封限速：相邻两次发送的最小间隔 / 每小时上限 / 每天上限；
-    # 三者均可设为 0 = 不限制；quiet_hours 起止相同 = 关闭静默时段。
-    send_min_interval_seconds: 20.0
-    send_max_per_hour: 20
-    send_max_per_day: 60
+    # 三者均可设为 0 = 不限制。默认 0（与 QQ 一致），但整条通道去节流后
+    # 微信账号有风控/封号风险，请自行评估后再放开。
+    send_min_interval_seconds: 0.0
+    send_max_per_hour: 0
+    send_max_per_day: 0
     # 静默时段 [start, end]，HH:MM，起止相同 = 不静默。
-    # 不写这一项 = 继承 triggers.quiet_hours（推荐只在一处配置，
-    # 否则 triggers 放行、这里默认拦下，消息会静默发不出去）。
-    quiet_hours: ["23:30", "08:00"]
+    # 不写这一项 = 00:00-00:00（不静默）；triggers.quiet_hours 只控制
+    # 要不要回复，不影响这里能不能发。
+    quiet_hours: ["00:00", "00:00"]
     # 模拟打字的延迟区间（秒）。
     typing_delay_seconds: [0.6, 1.2]
     # true：回执必须在本地库观察到这条消息；观察不到时标记

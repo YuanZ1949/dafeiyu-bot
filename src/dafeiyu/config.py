@@ -368,10 +368,10 @@ class WeChatConfig:
     send_verify: bool = True
     send_verify_timeout_seconds: float = 8.0
     send_verify_interval_seconds: float = 0.5
-    send_min_interval_seconds: float = 20.0
-    send_max_per_hour: int = 20
-    send_max_per_day: int = 60
-    quiet_hours: tuple[str, str] = ("23:30", "08:00")
+    send_min_interval_seconds: float = 0.0
+    send_max_per_hour: int = 0
+    send_max_per_day: int = 0
+    quiet_hours: tuple[str, str] = ("00:00", "00:00")
     typing_delay_seconds: tuple[float, float] = (0.6, 1.2)
     # 严格回执：true 时未在本地库观察到发送结果会标记 `receipt_unverified`
     # （仍 ok=True，避免客户端换 id 重发造成重复消息）；false 时只写日志，
@@ -1371,13 +1371,13 @@ def _build_wechat(
     raw: Any,
     env: dict[str, str],
     *,
-    default_quiet_hours: tuple[str, str] = ("23:30", "08:00"),
+    default_quiet_hours: tuple[str, str] = ("00:00", "00:00"),
 ) -> WeChatConfig:
     """解析 `gateway.wechat`；就绪度缺失只告警，不在加载阶段拒绝。
 
-    `quiet_hours` 未显式配置时用 `default_quiet_hours`（加载器传
-    `triggers.quiet_hours`）：夜间静默只留一个开关，避免出现
-    「triggers 关了静默、发送端还有一份默认 23:30-08:00」互相打架。
+    `quiet_hours` 未显式配置时用 `default_quiet_hours`（默认起止相同 =
+    不静默）。发送端的静默时段与 `triggers.quiet_hours` 解耦：后者只控制
+    「要不要回复」，不再影响这条通道能不能发。
     """
     section: dict[str, Any] = {}
     if raw is not None:
@@ -1401,7 +1401,7 @@ def _build_wechat(
     if full_sweep <= 0:
         raise ConfigError("gateway.wechat.full_sweep_seconds 必须大于 0")
     send_interval = _float(
-        section.get("send_min_interval_seconds", 20.0),
+        section.get("send_min_interval_seconds", 0.0),
         "gateway.wechat.send_min_interval_seconds",
     )
     if send_interval < 0:
@@ -1516,12 +1516,12 @@ def _build_wechat(
         ),
         full_sweep_seconds=full_sweep,
         send_min_interval_seconds=send_interval,
-        # 0 = 不限制（发送端 _rate_available 已按 >0 判断）；默认值保持不变。
+        # 0 = 不限制（发送端 _rate_available 已按 >0 判断）；默认不限制。
         send_max_per_hour=_non_negative_int(
-            section.get("send_max_per_hour"), "gateway.wechat.send_max_per_hour", 20
+            section.get("send_max_per_hour"), "gateway.wechat.send_max_per_hour", 0
         ),
         send_max_per_day=_non_negative_int(
-            section.get("send_max_per_day"), "gateway.wechat.send_max_per_day", 60
+            section.get("send_max_per_day"), "gateway.wechat.send_max_per_day", 0
         ),
         quiet_hours=(quiet[0], quiet[1]),
         typing_delay_seconds=(low, high),
@@ -1926,11 +1926,9 @@ def load_settings(
     if gateway_provider not in ("qq", "wechat", "both"):
         raise ConfigError("gateway.provider 只能是 qq、wechat 或 both")
     triggers = _build_triggers(_section(raw, "triggers"))
-    wechat = _build_wechat(
-        gateway_raw.get("wechat"),
-        env,
-        default_quiet_hours=triggers.quiet_hours,
-    )
+    # 发送端静默与 triggers.quiet_hours 解耦：后者只管「要不要回复」，
+    # 不再作为 gateway.wechat.quiet_hours 的默认值。
+    wechat = _build_wechat(gateway_raw.get("wechat"), env)
     mirror = _build_mirror(
         raw.get("mirror"),
         gateway_provider,
