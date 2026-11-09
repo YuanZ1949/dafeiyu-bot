@@ -82,6 +82,9 @@ class Message:
     reply_to_author: str | None = None
     # @所有人：不是点名，但时间线要能看出这是广播。
     at_all: bool = False
+    # 跨群镜像写入的行：以 is_bot=1 落库，但不进目标群提示词、不参与
+    # 「上一条是不是 bot 提问」判定；仅保留在回声种子里。
+    mirror: bool = False
 
     def to_prompt_line(self) -> str:
         return f"{self.nickname}: {self.content}"

@@ -7,7 +7,15 @@ from dafeiyu.models import ChatType, Message
 
 
 class GatewayError(Exception):
-    """IM 网关不可用、调用失败或超时。"""
+    """IM 网关不可用、调用失败或超时。
+
+    ``error_code`` 是桥/网关给出的可分类失败原因（如 ``not_connected``、
+    ``rate_limited``、``timeout``）；调用方据此决定是否重试。为空表示未分类。
+    """
+
+    def __init__(self, message: str = "", *, error_code: str = "") -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 class Adapter(Protocol):

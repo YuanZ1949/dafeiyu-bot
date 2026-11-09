@@ -730,12 +730,15 @@ class WeChatAdapter:
     ) -> tuple[bool, str | None]:
         """所有出站动作的唯一实现：连接/桌面闸门/回执/回声表只此一份。"""
         if not self.connected:
-            raise GatewayError("微信桥未连接")
+            raise GatewayError("微信桥未连接", error_code="not_connected")
         if self._desktop != "interactive" and self._desktop_required():
-            raise GatewayError(f"微信桌面不可交互：{self._desktop}")
+            raise GatewayError(
+                f"微信桌面不可交互：{self._desktop}",
+                error_code="desktop_not_interactive",
+            )
         ws = self._ws
         if ws is None:
-            raise GatewayError("微信桥未连接")
+            raise GatewayError("微信桥未连接", error_code="not_connected")
 
         command_id = uuid.uuid4().hex
         future: asyncio.Future[dict[str, Any]] = (
@@ -753,10 +756,10 @@ class WeChatAdapter:
             receipt = await asyncio.wait_for(future, _SEND_TIMEOUT)
         except TimeoutError as exc:
             self._record_receipt("failed")
-            raise GatewayError("微信发送等待回执超时") from exc
+            raise GatewayError("微信发送等待回执超时", error_code="timeout") from exc
         except ConnectionClosed as exc:
             self._record_receipt("failed")
-            raise GatewayError("微信桥连接已断开") from exc
+            raise GatewayError("微信桥连接已断开", error_code="not_connected") from exc
         except GatewayError:
             # 断线/停机时由 _fail_pending 注入 future：同样是一次没有回执的
             # 发送失败，按 failed 计数后原样抛出。
@@ -779,7 +782,9 @@ class WeChatAdapter:
                 )
                 return False, None
             self._record_receipt("failed")
-            raise GatewayError(f"微信发送失败：{error_code or delivered}")
+            raise GatewayError(
+                f"微信发送失败：{error_code or delivered}", error_code=error_code
+            )
 
         if delivered == "observed":
             self._record_receipt("observed")

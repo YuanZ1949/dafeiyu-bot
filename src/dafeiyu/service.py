@@ -746,6 +746,7 @@ class Service:
             msg.chat_id,
             2,
             upto_message_id=msg.message_id,
+            include_mirror=False,
         )
         for index, row in enumerate(rows):
             if row.message_id == msg.message_id:
@@ -3475,6 +3476,7 @@ class Service:
             chat_id,
             window + len(messages),
             upto_message_id=messages[0].message_id,
+            include_mirror=False,
         )
         history: list[dict[str, str]] = []
         for message in rows:

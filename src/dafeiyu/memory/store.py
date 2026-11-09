@@ -117,6 +117,8 @@ CREATE TABLE IF NOT EXISTS messages (
     reply_to_user_id TEXT,
     -- 非空 = 已被撤回；原文保留但不再进入 prompt。
     recalled_at TEXT,
+    -- 跨群镜像行：is_bot=1 但排除在目标群提示词与「上一条」判定之外。
+    mirror INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (chat_type, chat_id, message_id)
 );
@@ -472,6 +474,7 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         "reply_to_message_id": "TEXT",
         "reply_to_user_id": "TEXT",
         "recalled_at": "TEXT",
+        "mirror": "INTEGER NOT NULL DEFAULT 0",
     },
     "brain_sessions": {
         "created_at": "TEXT",
@@ -1127,8 +1130,9 @@ class Store:
             """
             INSERT OR IGNORE INTO messages
                 (chat_type, chat_id, message_id, user_id, nickname, content, is_bot,
-                 timestamp, at_bot, reply_to_bot, reply_to_message_id, reply_to_user_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 timestamp, at_bot, reply_to_bot, reply_to_message_id, reply_to_user_id,
+                 mirror)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 m.chat_type.value,
@@ -1143,10 +1147,27 @@ class Store:
                 int(m.reply_to_bot),
                 m.reply_to_message_id,
                 m.reply_to_user_id,
+                int(m.mirror),
             ),
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def message_exists(
+        self, chat_type: ChatType, chat_id: str, message_id: str
+    ) -> bool:
+        """该会话里是否已有这条 message_id（走 UNIQUE 索引，供入站幂等用）。"""
+        if not message_id:
+            return False
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM messages
+            WHERE chat_type = ? AND chat_id = ? AND message_id = ?
+            LIMIT 1
+            """,
+            (chat_type.value, chat_id, message_id),
+        ).fetchone()
+        return row is not None
 
     def is_bot_message(
         self, chat_type: ChatType, chat_id: str, message_id: str
@@ -1173,13 +1194,20 @@ class Store:
         chat_id: str,
         limit: int,
         upto_message_id: str | None = None,
+        *,
+        include_mirror: bool = True,
     ) -> list[Message]:
-        """取最近 limit 条消息；传入 upto_message_id 时只取该消息（含）之前的。"""
+        """取最近 limit 条消息；传入 upto_message_id 时只取该消息（含）之前的。
+
+        ``include_mirror=False`` 在 SQL 层排除镜像行（不是多取再跳过），
+        保证提示词历史与「紧挨着的前一条」都拿到正确窗口。
+        """
+        mirror_clause = "" if include_mirror else " AND mirror = 0"
         if upto_message_id is None:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM messages
-                WHERE chat_type = ? AND chat_id = ?
+                WHERE chat_type = ? AND chat_id = ?{mirror_clause}
                 ORDER BY id DESC LIMIT ?
                 """,
                 (chat_type.value, chat_id, limit),
@@ -1194,12 +1222,17 @@ class Store:
             (chat_type.value, chat_id, upto_message_id),
         ).fetchone()
         if anchor is None:
-            return self.recent_messages(chat_type, chat_id, limit)
+            return self.recent_messages(
+                chat_type,
+                chat_id,
+                limit,
+                include_mirror=include_mirror,
+            )
 
         rows = self._conn.execute(
-            """
+            f"""
             SELECT * FROM messages
-            WHERE chat_type = ? AND chat_id = ? AND id <= ?
+            WHERE chat_type = ? AND chat_id = ? AND id <= ?{mirror_clause}
             ORDER BY id DESC LIMIT ?
             """,
             (chat_type.value, chat_id, int(anchor["id"]), limit),
@@ -1240,7 +1273,7 @@ class Store:
         rows = self._conn.execute(
             """
             SELECT * FROM messages
-            WHERE chat_type = ? AND chat_id = ? AND is_bot = 1
+            WHERE chat_type = ? AND chat_id = ? AND is_bot = 1 AND mirror = 0
             ORDER BY id DESC LIMIT ?
             """,
             (chat_type.value, chat_id, safe),
@@ -2186,6 +2219,7 @@ class Store:
             reply_to_user_id=r["reply_to_user_id"],
             timestamp=r["timestamp"],
             recalled_at=r["recalled_at"],
+            mirror=bool(r["mirror"]),
         )
 
     # ---- OpenCode session mapping ---------------------------------
