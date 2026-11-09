@@ -17,12 +17,12 @@
 | 图片 | 支持（`images.enabled` 时落盘并把路径写进正文；失败保留 `[图片]`） | 支持（`gateway.wechat.media.enabled` 时解密落盘给路径；否则占位） | 支持（`send_segments` 的 image 段） | 支持（hook 后端经 `send_media`；UIA 后端对 image 同样恒 `unsupported_media`，正文照发） |
 | 语音 | 支持（`speech.enabled` 且 URL 下载由 `images.enabled` 门控时落盘 `voices/` 并转写，正文变 `[语音]（转写：…）`；依赖缺失、超时、解码失败保留 `[语音]` 占位） | 支持（`speech.enabled` 与 `gateway.wechat.media.enabled` 都打开时读取本地文件落盘并转写；否则占位） | 支持（`send_segments` 的 record 段，kind 为 `record`/`voice`） | 支持（hook 后端 `send_media` kind=voice；UIA 不支持） |
 | 视频 | 支持（`images.enabled` 时下载 URL 原文件到 `videos/`，`annotate` 为真时用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`gateway.wechat.media.enabled` 时复制原文件到 `videos/`，并用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`send_segments` 的 video 段，路径同样受 `replies/` 与后缀白名单约束） | 不支持（hook 的 `send_media` 只认 image/file/voice/sticker，`kind=video` 明确回 `unsupported_media`；UIA 也不支持。附件不发出，正文照发） |
-| 文件 | 只记录元数据（正文 `[文件] 名字`，记录名字/大小，不下载） | 占位（按 link/占位处理，不下载） | 支持（`upload_file`，模型附件 `kind=file`） | 不支持（模型附件 `kind=file` 只走 QQ 的 `upload_file`；微信适配器没有该接口，附件被跳过、正文照发。hook 的 `/send_media` 虽有 `kind=file` 路由，主链路不会调用） |
+| 文件 | 只记录元数据（正文 `[文件] 名字`，记录名字/大小，不下载） | 占位（按 link/占位处理，不下载） | 支持（`upload_file`，模型附件 `kind=file`） | 支持（hook 后端：模型附件 `kind=file` 经 `upload_file` → `send_media` 的 `kind=file`；桥回 `unsupported_media` 时附件跳过、正文照发。UIA 后端仍不支持） |
 | 表情 / 贴纸 | 占位但带标识（`face` 在 QQ 内置表情表内时显示名称 `[表情:<名称>]`，表外保留数字 id `[表情:<数字 id>]`；`mface` → `[表情:<摘要>]`，缺失时回退 `[表情]`；同时记录 sticker 名字/id） | 占位但带标识（`[表情:<desc>]`，无名字用 `[表情:<md5 前 8>]`，解析失败回退 `[表情]`）；贴纸图片在 `gateway.wechat.media.enabled` 时按图片落盘，模型可 `read` 查看 | 支持（模型附件 `type=sticker`：`name` 可用**名称**（按内置表情表反查，如 `微笑`）或**数字 id**（1–6 位非 0）出 `face` 段；两者都未命中的文本出 `mface` 摘要段，mface 只有 summary，属 best-effort——缺 url/key/emoji_id 字段） | 支持（hook 后端 `send_media` kind=sticker：`path` 必须指向真实 GIF（GIF 头校验、≤1 MiB、≤1024px），非 GIF/超限被 hook 侧回 `hook_rejected` 时自动降级为图片再发；无 `path` 跳过实图发送、正文照发；`send_emoticon`）。UIA 后端不支持任何媒体 |
 | @ | 支持（正文保留 `@名字`，并标记 `at_bot`） | 支持（正文保留原文，并标记 `at_bot`） | 支持（at 段；名字必须在本批次在场成员里，最多 3 个） | 支持（hook 后端 `send_at`；UIA 返回 `unsupported_at`，回落纯文本） |
-| 合并转发 | 支持（递归渲染成「昵称: 内容」文本，深度/节点数有上限，超限占位） | 不支持（本地库没有对应 kind；appmsg 归到 quote/link） | 支持（模型附件 `type=forward`，`nodes` 最多 5 条、单条 200 字；失败降级为一行占位文本） | 不支持（无转发发送原语；附件降级为正文末尾一行 `[合并转发 N 条]`，见下文） |
+| 合并转发 | 支持（递归渲染成「昵称: 内容」文本，深度/节点数有上限，超限占位） | 占位（appmsg `type 19` 渲染为 `[合并转发] <title>`，无标题时仅 `[合并转发]`；不展开聊天记录，`kind` 仍是 `link`） | 支持（模型附件 `type=forward`，`nodes` 最多 5 条、单条 200 字；失败降级为一行占位文本） | 不支持（无转发发送原语；附件降级为正文末尾一行 `[合并转发 N 条]`，见下文） |
 | 引用回复（quote） | 支持（`reply` 段解析出 `reply_to_message_id` / `reply_to_user_id`，`reply_to_bot` 参与点名判定） | 支持（`kind=quote`，引用块渲染成 `reply_to_text` / `reply_to_author`） | 支持（`persona.quote_reply` 为真时首片带 `quote_id`，走 `send_segments`） | 不支持（桥只有 `send_text` / `send_at` / `send_media`，没有引用原语；回落纯文本，需在正文复述，见下文） |
-| 戳一戳 / 进退群 / 禁言 | 支持解析（`NoticeEvent`，只记日志，不触发模型回复） | 不支持 | 不支持 | 不支持 |
+| 戳一戳 / 进退群 / 禁言 | 支持解析（`NoticeEvent`）：戳一戳回固定短句、进退群可发欢迎语，都不走模型；禁言只记日志 | 不支持 | 不支持 | 不支持 |
 | 卡片 / 链接 | 支持（json/xml 卡片渲染成文本摘要） | 支持（appmsg 的标题渲染为 link；视频号分享（`<finderFeed>`）渲染 `[视频号] 昵称：描述`，不下载视频/封面；引用消息渲染为 quote） | 不支持 | 不支持 |
 | 位置 | 支持（渲染 `[位置] 标题` 摘要） | 占位（正文 `[位置]`） | 不支持 | 不支持 |
 
@@ -48,7 +48,7 @@
 - 工作区关闭、目标缺失、解析失败一律跳过并留 warning，绝不抛错，也不读取/发送模型给的任意路径。
 
 QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。表情用 `{"type": "sticker", "name": "...", "path": "可选"}`：`name` 为 1–6 位非 0 数字或内置表情名称（如 微笑）时出 `face` 段，其它文本出 `mface` 摘要段（mface 只有 summary，best-effort，没有 url/key/emoji_id）；只校验名字非空。带 `path` 的贴纸先走与图片相同的路径白名单（`replies/` 或已归属的 `images/`，GIF/大小限制由 hook 侧校验，非 GIF/超限降级为图片）；`path` 合法但 `name` 为空的贴纸不发 QQ 表情段（不拿文件名伪装 mface）。
-微信侧分两种后端：**hook** 后端走 `send_media`，支持贴纸（要求 `path` 指向真实 GIF）与图片；**UIA** 后端对**所有媒体**（图片/语音/视频/文件/贴纸）都明确返回 `unsupported_media`（`gateway/wechat_bridge/sender.py`），没有 sticker→image 这类降级链，客户端不重试，调用方继续发文本；不做剪贴板发图。
+微信侧分两种后端：**hook** 后端走 `send_media`，支持图片/语音/文件/贴纸（贴纸要求 `path` 指向真实 GIF）；**UIA** 后端对**所有媒体**（图片/语音/视频/文件/贴纸）都明确返回 `unsupported_media`（`gateway/wechat_bridge/sender.py`），没有 sticker→image 这类降级链，客户端不重试，调用方继续发文本；不做剪贴板发图。
 
 入站表情的正文格式统一为 `[表情:<标识>]`：QQ `face` 在内置表情表内用显示名称、表外保留数字 id，`mface` 用摘要文本；微信优先用 `<emoji desc/attachedtext>`，为空时用 md5 前 8 位。标识只是让模型能区分「哪个表情」，真正的语义仍要靠贴纸图片本身（见下）。
 
@@ -58,7 +58,7 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 
 - 桥的**发送类**指令白名单只有 `send_text` / `send_at` / `send_media`（`src/dafeiyu/gateway/wechat_bridge/server.py` 的 `_KNOWN_ACTIONS` 还含 `probe` / `stop` / `resume` / `ack` / `hello` 等协议动作）；hook 后端的 HTTP 路由也只有 `/send_text`、`/send_at`、`/send_media`（`scripts/wechat_hook_server.py`），其它路径直接 404。
 - helper 仓（默认 `C:\MyFile\AICoding\helper`，可用 `WECHAT_HELPER_ROOT` 覆盖）的 `helper/native/*.h` 只有图片/文件/语音/表情的发送头（`image_send.h`、`file_send.h`、`voice_send.h`、`emoticon_send.h`），没有 quote/forward 发送头；`wxbot_framework/forwarded.py` 与 `forwarded_receiver.py` 只解析**入站**的合并转发（type 49 / `app_type=19`），不提供发送能力。
-- 客户端侧同样没有：`gateway/wechat.py` 只实现 `send` / `send_at` / `send_media`，没有 `send_segments`、`send_forward`、`upload_file`。
+- 客户端侧同样没有：`gateway/wechat.py` 只实现 `send` / `send_at` / `send_media`，没有 `send_segments`、`send_forward`；`upload_file` 只是 `send_media(kind="file")` 的薄封装，不提供引用/转发原语。
 
 具体表现：
 
@@ -104,6 +104,7 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 - 入站图片降采样（QQ / 微信入站共通，`imaging.py`）：落盘前用 ffprobe 探测最长边，超过 `images.max_edge`（默认 **1280**）时用 ffmpeg 等比缩小并更新 `Attachment.size`；`0` = 不降采样。JPEG 二次编码显式用 `-q:v 3`（mjpeg 默认量化偏保守，1280px 也会肉眼发糊），PNG/GIF 走各自默认参数。GIF 不处理（`-frames:v 1` 会把动画压成单帧，保留动画）；缺 ffmpeg/ffprobe、探测失败或 ffmpeg 出错时保留原图，不影响消息本身。是否抽/缩在行内静默降级，不产生额外错误。
 - 微信/QQ 共用的图片目录按 `images.retention_days` 惰性清理：`> 0` 时在每次物化前删掉超期文件，`0` = 不清理。
 - 微信文件：只追加一条 `[文件] 名字 (路径)` 注记，不复制、不读取内容。
+- **微信合并转发**：appmsg `type 19` 正文渲染为 `[合并转发] <title>`（无标题时仅 `[合并转发]`），不展开聊天记录；`kind` 仍是 `link`，XML 解析失败也不抛异常。
 - **语音转写**：`speech.enabled: true` 时，语音先落盘到 `<workspace.dir>/voices/` 再转写。SILK（QQ `record`）由 `pysilk` 解码成裸 PCM 再交给 ffmpeg；其它格式直接交给 ffmpeg；最后进本地 faster-whisper（默认 `base`、`int8`、`vad_filter=True`，可用 `initial_prompt` 引导简体）。转写失败只保留 `[语音]`，不影响同一条消息的其它段。`speech.enabled: false` 时完全不处理：不下载、不落盘、不改正文。
 - 视频不完整转码，只复制原文件并按固定百分比抽帧（见上）。转写依赖是可选的 `.[stt]` extra（faster-whisper + silk-python）；不装也能启动，只是语音保持占位。
 
