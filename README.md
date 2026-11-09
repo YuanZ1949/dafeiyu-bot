@@ -576,6 +576,10 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 
 封号、RPA 误操作、桌面客户端升级导致 UIA 失效——这些是桌面 RPA 接入的固有代价，**均由使用者自担**。
 
+### 跨群镜像（可选，默认关闭）
+
+可以把一个 QQ 群和一个微信群的发言双向转发：一边群里的发言与机器人回复会出现在另一边。**默认关闭**；在 `config.yaml` 的 `mirror:` 段设 `enabled: true` 并填恰好一对群 ID（`mirror.pairs`，QQ 群带 `qq:` 前缀、微信群带 `wxg:` 前缀）即可启用，启动时会校验 `gateway.provider: both` 等前置条件。方向能力矩阵、占位与去重语义见 [docs/message-types.md 的「跨群镜像」](docs/message-types.md#跨群镜像)。
+
 ## 3.6 语音回复（可选，默认关闭）
 
 **默认路径**：`speech.tts_enabled: false`，回复一律是文字，本节可以整个跳过。语音回复和微信通道、入站转写一样是 opt-in 能力，不装依赖、不开开关就不参与任何链路。

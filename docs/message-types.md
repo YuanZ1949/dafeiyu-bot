@@ -124,3 +124,84 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 - `speech.max_bytes`：单条语音文件大小上限，默认 `20971520`（20 MiB）。
 - `speech.initial_prompt`：引导模型输出简体中文的提示；留空 = 不传。
 - `speech.hf_endpoint`：HuggingFace 镜像地址；国内直连 `huggingface.co` 会超时，建议填 `https://hf-mirror.com`。
+
+## 跨群镜像
+
+`mirror` 配置段（默认关闭）把**恰好一对**群——一个 QQ 群和一个微信群——的发言双向转发：人类消息渲染成 `昵称：内容`，机器人回复原样出现，媒体尽力真发、发不了给可读占位。本节只写镜像自身的行为；单一通道内的收发能力见上文「能力矩阵」，这里不重复。
+
+镜像只搬运群消息：私聊与机器人自己的入站消息（`is_bot`）不参与。启用后启动时会按配置推导每个方向的能力矩阵打印到日志（`mirror capability qq->wechat …` / `mirror capability wechat->qq …`），只读配置、不做网络探测；能力不足只警告，不拒绝启动。
+
+### 方向矩阵
+
+整个机制是**尽力而为**：前置条件满足就真发，不满足就降级为可读占位，不报错、不中断原消息处理。
+
+| kind | QQ → 微信 | 微信 → QQ |
+| --- | --- | --- |
+| text | 总是转发 | 总是转发 |
+| image | `outbound: hook`（或 `auto` 且已配置 hook 地址）+ `images.enabled` + `workspace.enabled` 都满足时经 hook `send_media` 真发；否则 `[图片]` 占位 | `local_db_enabled` + `media.enabled` 都满足时按 QQ 图片段真发；否则 `[图片]` 占位 |
+| voice / record | 在图片条件上**另需 `speech.enabled`**（QQ 语音的 URL 下载在语音管线内，关闭时不下载）；满足时 `send_media kind=voice` 真发，否则 `[语音]` 占位 | `local_db_enabled` + `media.enabled` 满足时按 QQ 语音段真发（文件来自微信本地库，不需要 `speech.enabled`）；否则 `[语音]` 占位 |
+| video | 微信 hook 没有视频发送原语（`kind=video` 明确回 `unsupported_media`），**恒为 `[视频]` 占位**；URL 下载不受 `speech.enabled` 门控，但物化了也发不出去 | `local_db_enabled` + `media.enabled` 满足时按 QQ 视频段真发；否则 `[视频]` 占位 |
+| file | 需要 `outbound: hook`；QQ 人类入站的文件消息本身没有文件内容（见上文矩阵「只记录元数据」），通常只有 `[文件 名字]` 说明行 | `local_db_enabled` + `media.enabled` 满足且解析出本机可读文件时走 `upload_file`；否则 `[文件 名字]` 占位 |
+| sticker | 入站 `face`/`mface` 表情没有可发送的媒体内容，**恒为 `[表情]` 占位**；机器人主动发送的带路径贴纸附件会经 `send_media kind=sticker` 发送，被 hook 拒收时降级当图片再试一次 | 贴纸图片按图片链路处理（落盘后附件 `kind` 为 `image`）；发不出去时与图片一样只留占位说明行 |
+| 合并转发 | 只发一行 `[合并转发 N 条]` 占位，不搬节点 | 同左（微信入站的合并转发本就只渲染 `[合并转发] <标题>`，见上文） |
+
+微信侧媒体文件来自本地库发现的 `.dat`/缓存文件：**必须解码成功才会发送**；解不开（缺密钥、扫描失败、转码失败）就把附件路径清空、只发占位，绝不把原始 `.dat` 字节交给目标通道。
+
+### 能力前置条件
+
+- **QQ → 微信媒体需要 `gateway.wechat.outbound: hook`**（或 `auto` 且已配置 hook 地址）。**UIA 出站只可靠发送文本**：UIA 后端对所有媒体都明确返回 `unsupported_media`（`gateway/wechat_bridge/sender.py`，见上文「安全边界」），这种配置下镜像只会发占位文本。
+- **微信 → QQ 媒体需要 `gateway.wechat.local_db_enabled: true` + `gateway.wechat.media.enabled: true`**；任一关闭，微信侧媒体只能是占位。
+- QQ 入站的 URL 媒体物化需要 `images.enabled: true` + `workspace.enabled: true`（即 `workspace.dir` 非空）；**语音/record 的 URL 物化另需 `speech.enabled: true`**，关闭时只发 `[语音]` 占位；video 的 URL 下载不受 `speech.enabled` 门控。
+- 微信 `.dat` 必须解码成功才发送，解不开只发占位（见上）。
+
+### 占位规则
+
+- 占位文本固定为：`[图片]`、`[语音]`、`[视频]`、`[文件 名字]`、`[表情]`、`[合并转发 N 条]`。
+- 人类发言渲染为 `昵称：内容`（全角冒号）；机器人发言不带前缀、原样出现。
+- 纯媒体消息（没有可转发的正文）只发一条占位说明行；有正文时占位附在正文后面。
+- 长文本复用发送器的 `_split`（500 字、按句界）切分，不做 markdown 清洗。
+
+### 不搬运的内容
+
+- **@ 与引用（reply）段丢弃**：跨平台后 @ 关系不成立；`send_at` 触发的发送也按纯文本镜像。
+- **合并转发只发占位**：不搬任何节点内容。
+- **撤回不镜像**：一边撤回，另一边保留原样。
+- **启动后不回填历史**：只镜像启用之后新发生的消息。
+
+### 队列 / 顺序 / 去重
+
+- 入队发生在 `Service.handle` 的**第一个 await 之前**（同步入队不可变快照），因此镜像顺序与消息到达顺序一致，「文字 + 图片」连发不会乱序；媒体下载只发生在队列 worker 里。
+- 每方向一条独立队列（容量 **1000**），各一个 worker 串行发送；单方向突发 30 条文本的端到端延迟预算 ≤ 3 分钟。
+- 积压超过 **5 分钟**（300 秒）的条目出队时直接丢弃（计入 `expired`），断桥恢复后不会补发一批过期消息。
+- 入站按 `(chat_id, message_id)` 做 10 分钟内存窗口幂等；进程重启后桥重投的帧由 `message_exists` 查库兜住，**不会重复镜像**。
+- 出站回显指纹是一次性、**10 秒** TTL，且只消费「发送者 = 本通道 bot 账号」的入站消息；人类在 10 秒内说了相同的话**不会**被吞。
+
+### 存储隔离
+
+镜像发出的消息在目标群按 `is_bot=1` + `mirror=1` 落库：
+
+- 只进入微信桥的**回声种子**查询（`recent_bot_messages`），重启后回声仍自洽；
+- **不进入提示词上下文**：`_history_before` 在 SQL 层排除 `mirror=1`；
+- **不被当作「bot 的上一句」**：`_previous_message` 在 SQL 层排除（`include_mirror=False`）；`recent_bot_messages_in`（重复守卫用）同样排除。
+- 已知口径：镜像行**会计入活跃度统计**（按 `messages` 表统计的消息量等数字包含镜像行），这是明确接受的取舍，不做排除。
+
+### 文件与部署约束
+
+- 镜像发送用的是**本机可读路径**：NapCat、微信桥、hook 服务必须与 bot 同机部署，不做跨机器文件传输。
+- 附件路径按 `workspace.dir` 解析（相对路径不许带 `..`，`resolve()` 后不得逃出 workspace）；**`workspace.dir` 必须配置**，留空时路径解析一律失败、只发占位，不会回退到启动目录。
+- 改 `mirror` 配置（或微信限速四项）后，必须**同时重启 bot 与微信桥**才生效；桥进程只在启动时读一次配置。
+
+### 启用方式
+
+引用 `config.example.yaml` 的 `mirror` 段（键名与注释以该文件为准）：
+
+```yaml
+mirror:
+  enabled: false                # 改 true 启用
+  pairs:
+    - qq: "qq:123456789"        # QQ 群号，带 qq: 前缀
+      wechat: "wxg:0d5c1f2a3b4c" # 微信会话别名（桥本地铸造），带 wxg: 前缀
+```
+
+- `pairs` 只接受**恰好一对**；`enabled: false` 时 `pairs` 被忽略，可先填好备用。
+- `enabled: true` 时启动即校验，不满足直接报错拒绝启动：`gateway.provider: both`、`gateway.wechat.enabled: true`、微信四项已去节流（`send_min_interval_seconds` / `send_max_per_hour` / `send_max_per_day` 全 `0`，`quiet_hours` 起止相同）。
