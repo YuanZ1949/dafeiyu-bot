@@ -1,0 +1,133 @@
+name: CI
+
+# 跑在 Windows 自托管 Gitea runner 的 host 模式上。
+# 原因：本仓库大量测试依赖 PowerShell / 计划任务 / Windows 文件 ACL / Windows 路径，
+# Linux 容器会把它们跳过或跑出失真结果（见 docs/gitea-ci.md）。
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新提交取消旧流水线，避免 runner 被历史提交占满。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (Windows host)
+    # 对应 runner 注册时声明的 label：windows-latest:host
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      # Windows 默认用 cp936 打开文件；项目测试会写中文，统一按 UTF-8 处理。
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Checkout
+        uses: builtin:checkout
+        with:
+          fetch-depth: 1
+
+      - name: Report toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "runner OS : $env:RUNNER_OS"
+          Write-Host "workspace : $env:GITHUB_WORKSPACE"
+          git --version
+          Write-Host "pwsh      : $($PSVersionTable.PSVersion)"
+          if (Get-Command py -ErrorAction SilentlyContinue) {
+            py -0p
+          } else {
+            Write-Host 'py launcher not found'
+          }
+
+      - name: Create CI virtualenv
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 本地 `gitea-runner exec` 会复用仓库目录，先清掉上次的 venv。
+          # Gitea 的真实 workspace 每次都是干净的，这一步只是无害的幂等保护。
+          if (Test-Path -LiteralPath .ci-venv) {
+            Remove-Item -LiteralPath .ci-venv -Recurse -Force
+          }
+
+          # 找一个 >= 3.11 的基础解释器：优先 py launcher（可指定版本），
+          # 其次 PATH 上的 python / python3。
+          $exe = $null
+          $argList = @()
+          if (Get-Command py -ErrorAction SilentlyContinue) {
+            foreach ($ver in @('-3.13', '-3.12', '-3.11')) {
+              & py $ver -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                $exe = (Get-Command py).Source
+                $argList = @($ver)
+                break
+              }
+            }
+          }
+          if (-not $exe) {
+            foreach ($name in @('python', 'python3')) {
+              $cmd = Get-Command $name -ErrorAction SilentlyContinue
+              if (-not $cmd) { continue }
+              & $cmd.Source -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                $exe = $cmd.Source
+                break
+              }
+            }
+          }
+          if (-not $exe) {
+            throw 'Python >= 3.11 not found. Install Python 3.11+ on the runner and make py/python available on PATH.'
+          }
+
+          Write-Host ("base python: {0} {1}" -f $exe, ($argList -join ' '))
+          & $exe @argList -m venv .ci-venv
+          if ($LASTEXITCODE -ne 0) { throw 'failed to create .ci-venv' }
+
+          & .\.ci-venv\Scripts\python.exe -c "import sys; print('CI Python', sys.version)"
+
+      - name: Install project and test dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\.ci-venv\Scripts\python.exe -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
+          # wechat extra 里有 tests/test_wechat_localdb_repository.py 硬依赖的 zstandard。
+          & .\.ci-venv\Scripts\python.exe -m pip install -e ".[dev,wechat]"
+          if ($LASTEXITCODE -ne 0) { throw 'pip install -e .[dev,wechat] failed' }
+          # 只补 silk-python（import 名 pysilk）：tests/test_speech.py 的
+          # test_real_silk_roundtrip 会真的编解码一遍，没有它整条用例 skip。
+          # 不装 stt extra：faster-whisper 会拖进 torch 级别的体积，CI 不需要。
+          & .\.ci-venv\Scripts\python.exe -m pip install "silk-python>=0.2.9"
+          if ($LASTEXITCODE -ne 0) { throw 'pip install silk-python failed' }
+
+      - name: Byte-compile sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\.ci-venv\Scripts\python.exe -m compileall -q src
+          if ($LASTEXITCODE -ne 0) { throw 'compileall failed' }
+
+      - name: Run pytest
+        shell: pwsh
+        run: |
+          & .\.ci-venv\Scripts\python.exe -m pytest -q --junitxml=junit.xml
+          exit $LASTEXITCODE
+
+      # v5.4.1 的 runner 只内置了 builtin:checkout（内置 upload-artifact 尚未发布），
+      # 所以不依赖外部 action，也不上传 artifact：失败时直接把 JUnit 打到 job 日志里。
+      - name: Show JUnit summary on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath junit.xml) {
+            Write-Host '--- junit.xml (first 300 lines) ---'
+            Get-Content -LiteralPath junit.xml -TotalCount 300
+          } else {
+            Write-Host 'junit.xml not found'
+          }

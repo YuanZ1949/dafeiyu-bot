@@ -1,4 +1,6 @@
 .venv/
+.ci-venv/
+junit.xml
 __pycache__/
 *.pyc
 .env
