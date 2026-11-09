@@ -11,15 +11,23 @@ import contextlib
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, Sequence
 
+from . import images, media
 from .config import Settings
 from .memory.store import Store
 from .models import Attachment, ChatType, Message, Segment
+from .reply_media import build_onebot_segments
 from .sender import MAX_CHUNK, _split
 
 log = logging.getLogger(__name__)
+
+#: 微信 ``.dat`` 解码器：与 ``Service.handle`` 注入的是同一个函数。
+DecodeFn = Callable[[bytes], Awaitable[bytes | None]]
+#: 下载函数：签名与 ``media.FetchFn`` / ``images.FetchFn`` 一致，可注入。
+FetchFn = Callable[[str, float, int], Awaitable[bytes]]
 
 #: 每方向队列容量：突发 30 条远达不到，溢出只可能是长期卡死。
 QUEUE_MAXSIZE = 1000
@@ -323,18 +331,32 @@ class MirroredAdapter:
 
 
 class MirrorRouter:
-    """一对群的双向镜像：两条独立队列 + 两个 worker。"""
+    """一对群的双向镜像：两条独立队列 + 两个 worker。
+
+    ``decode`` / ``fetch`` 是 worker 内媒体物化的可选协作钩子：
+
+    - ``decode`` 用于微信 ``.dat`` 解码，与 ``Service.handle`` 必须同一个实现；
+      T5 在 ``Service`` 构造完成后设置 ``router.decode = service._decode_wechat_dat``；
+    - ``fetch`` 可注入下载函数（测试或替换 httpx 默认实现）；``None`` 时由
+      ``images`` / ``media`` 模块使用各自默认实现。
+    """
 
     def __init__(
         self,
         settings: Settings,
         store: Store,
         adapters: Mapping[str, Any],
+        *,
+        decode: DecodeFn | None = None,
+        fetch: FetchFn | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         #: 只持有内层 adapter：镜像自身的发送永远不经过代理，闭环防回环。
         self.adapters: Mapping[str, Any] = dict(adapters)
+        #: 微信 .dat 解码器与下载函数（见类 docstring）；T5 会覆写 decode。
+        self.decode: DecodeFn | None = decode
+        self.fetch: FetchFn | None = fetch
         pairs = tuple(settings.mirror.pairs) if settings.mirror.enabled else ()
         if len(pairs) == 1:
             self._qq_chat = pairs[0].qq
@@ -515,9 +537,234 @@ class MirrorRouter:
             log.warning("镜像目标通道没有 adapter，降级跳过：%s", target_channel)
             return
 
-        for index, text in enumerate(self._render(item)):
-            ok, message_id = await self._send_text(adapter, item.target_chat_id, text)
+        # 物化只发生在 worker：observe_inbound 仍是同步快照。
+        attachments = await self._materialized_attachments(item)
+        lines = self._render(item)
+        if target_channel == "qq":
+            await self._deliver_qq(item, adapter, lines, attachments)
+        else:
+            await self._deliver_wechat(item, adapter, lines, attachments)
+
+    # ------------------------------------------------------------ 物化
+    async def _materialized_attachments(self, item: MirrorItem) -> list[Attachment]:
+        """按来源通道物化媒体，返回可直接交给目标通道的附件列表。
+
+        任何失败都只记日志并保留原附件（占位路径照常发送），绝不抛异常。
+        """
+        raw = list(item.attachments)
+        try:
+            if item.source_channel == "wechat":
+                message = self._relay_message(item, raw, item.segments)
+                materialized = await media.materialize_relay_attachments(
+                    message,
+                    self.settings,
+                    fetch=self.fetch,
+                    decode=self.decode,
+                )
+                return list(materialized.attachments)
+            return await self._materialize_qq(item, raw)
+        except Exception:  # noqa: BLE001 - 物化失败不得影响占位发送
+            log.warning(
+                "镜像媒体物化失败，按占位发送：msg=%s",
+                item.source_message_id,
+                exc_info=True,
+            )
+            return raw
+
+    async def _materialize_qq(
+        self, item: MirrorItem, raw: list[Attachment]
+    ) -> list[Attachment]:
+        """QQ 源：只补缺失本地文件，已有可读路径原样复用。"""
+        readable = [
+            media.resolve_media_path(self.settings, attachment) is not None
+            for attachment in raw
+        ]
+        merged = list(raw)
+
+        image_positions = [
+            index
+            for index, attachment in enumerate(raw)
+            if _media_kind(attachment.kind) == "image"
+        ]
+        missing_images = [
+            index for index in image_positions if not readable[index]
+        ]
+        if missing_images:
+            # 图片段与 image 附件同序；只把缺失本地文件的段交给 relay。
+            image_segments = [seg for seg in item.segments if seg.type == "image"]
+            selected = [
+                image_segments[position]
+                for position, index in enumerate(image_positions)
+                if not readable[index] and position < len(image_segments)
+            ]
+            if selected:
+                message = self._relay_message(item, [], selected)
+                produced = await images.materialize_relay(
+                    message, self.settings, fetch=self.fetch
+                )
+                for index, attachment in zip(missing_images, produced):
+                    merged[index] = attachment
+
+        missing_others = [
+            (index, attachment)
+            for index, attachment in enumerate(raw)
+            if not readable[index] and _media_kind(attachment.kind) != "image"
+        ]
+        if missing_others:
+            message = self._relay_message(
+                item, [attachment for _, attachment in missing_others], ()
+            )
+            materialized = await media.materialize_relay_attachments(
+                message, self.settings, fetch=self.fetch, decode=None
+            )
+            # 语音/视频会换成本地名；按 (kind, source) 回填，顺序保持不变。
+            buckets: dict[tuple[str, str], list[Attachment]] = {}
+            for attachment in materialized.attachments:
+                key = (_media_kind(attachment.kind), attachment.source)
+                buckets.setdefault(key, []).append(attachment)
+            for index, attachment in missing_others:
+                key = (_media_kind(attachment.kind), attachment.source)
+                bucket = buckets.get(key)
+                if bucket:
+                    merged[index] = bucket.pop(0)
+        return merged
+
+    @staticmethod
+    def _relay_message(
+        item: MirrorItem,
+        attachments: Sequence[Attachment],
+        segments: Sequence[Segment],
+    ) -> Message:
+        """构造只给物化 helper 用的轻量消息：不共享调用方的 content/附件列表。"""
+        return Message(
+            chat_type=ChatType.GROUP,
+            chat_id=item.source_chat_id,
+            user_id="",
+            nickname=item.nickname,
+            content="\n".join(item.text_lines),
+            message_id=item.source_message_id,
+            segments=[
+                Segment(type=segment.type, data=dict(segment.data))
+                for segment in segments
+            ],
+            attachments=list(attachments),
+            is_bot=item.is_bot,
+            kind=item.kind,
+        )
+
+    # ------------------------------------------------------------ 目标 QQ
+    async def _deliver_qq(
+        self,
+        item: MirrorItem,
+        adapter: Any,
+        lines: list[str],
+        attachments: Sequence[Attachment],
+    ) -> None:
+        segment_attachments: list[Attachment] = []
+        files: list[Attachment] = []
+        for attachment in attachments:
+            kind = _media_kind(attachment.kind)
+            if kind not in ("image", "voice", "video", "file", "sticker"):
+                continue
+            resolved = media.resolve_media_path(self.settings, attachment)
+            if resolved is None:
+                continue
+            prepared = replace(attachment, path=str(resolved))
+            if kind == "file":
+                files.append(prepared)
+            else:
+                segment_attachments.append(prepared)
+
+        if segment_attachments and callable(
+            getattr(adapter, "send_segments", None)
+        ):
+            explanation = "".join(lines)
+            segments = build_onebot_segments(
+                explanation, attachments=segment_attachments
+            )
+            ok, result = await self._send_with_retry(
+                adapter,
+                lambda: adapter.send_segments(
+                    ChatType.GROUP, item.target_chat_id, segments
+                ),
+                "消息段发送",
+                item.target_chat_id,
+            )
             if not ok:
+                self._counters["dropped"] += 1
+                return
+            self._counters["sent"] += 1
+            message_id = result if isinstance(result, str) else None
+            self._register_fingerprints(item.target_chat_id, explanation, ())
+            try:
+                self._store_line(item, adapter, explanation, message_id, 0)
+            except Exception:  # noqa: BLE001 - 落库失败不阻断文件上传
+                log.exception("镜像消息落库失败：%s", item.target_chat_id)
+        elif not await self._send_lines(item, adapter, lines):
+            return
+
+        for attachment in files:
+            await self._send_with_retry(
+                adapter,
+                lambda a=attachment: adapter.upload_file(
+                    ChatType.GROUP,
+                    item.target_chat_id,
+                    a.path,
+                    name=a.name,
+                ),
+                "文件上传",
+                item.target_chat_id,
+            )
+
+    # ------------------------------------------------------------ 目标微信
+    async def _deliver_wechat(
+        self,
+        item: MirrorItem,
+        adapter: Any,
+        lines: list[str],
+        attachments: Sequence[Attachment],
+    ) -> None:
+        if not lines:
+            return
+        if not await self._send_lines(item, adapter, lines):
+            return
+
+        for attachment in attachments:
+            kind = _media_kind(attachment.kind)
+            if kind not in ("image", "voice", "file", "sticker"):
+                # video / forward：hook 不支持，说明行里的占位就是全部。
+                continue
+            resolved = media.resolve_media_path(self.settings, attachment)
+            if resolved is None:
+                continue
+            path = str(resolved)
+            name = attachment.name or ""
+            if kind == "sticker":
+                ok = await self._send_media(
+                    adapter, item.target_chat_id, "sticker", path, name
+                )
+                if not ok:
+                    # 微信 hook 的 sticker 可能不被接受：降级当图片再试一次。
+                    await self._send_media(
+                        adapter, item.target_chat_id, "image", path, name
+                    )
+                continue
+            await self._send_media(
+                adapter, item.target_chat_id, kind, path, name
+            )
+
+    async def _send_lines(
+        self, item: MirrorItem, adapter: Any, lines: Sequence[str]
+    ) -> bool:
+        """逐片发送说明行；全部成功才返回 True（失败计入 dropped 并跳过媒体）。"""
+        all_ok = True
+        for index, text in enumerate(lines):
+            ok, message_id = await self._send_text(
+                adapter, item.target_chat_id, text
+            )
+            if not ok:
+                self._counters["dropped"] += 1
+                all_ok = False
                 continue
             self._counters["sent"] += 1
             self._register_fingerprints(item.target_chat_id, text, ())
@@ -525,32 +772,84 @@ class MirrorRouter:
                 self._store_line(item, adapter, text, message_id, index)
             except Exception:  # noqa: BLE001 - 落库失败不阻断后续分片
                 log.exception("镜像消息落库失败：%s", item.target_chat_id)
+        return all_ok
+
+    async def _send_media(
+        self,
+        adapter: Any,
+        chat_id: str,
+        kind: str,
+        path: str,
+        name: str,
+    ) -> bool:
+        if not callable(getattr(adapter, "send_media", None)):
+            return False
+        ok, result = await self._send_with_retry(
+            adapter,
+            lambda: adapter.send_media(
+                ChatType.GROUP, chat_id, kind, path, name=name
+            ),
+            "媒体发送",
+            chat_id,
+        )
+        if not ok:
+            return False
+        if result is False:
+            # 桥明确说不支持：不重试，也不补第二条占位。
+            log.info("镜像媒体被目标通道拒绝（不重试，保留占位）：%s kind=%s", chat_id, kind)
+            return False
+        return True
 
     async def _send_text(
         self, adapter: Any, chat_id: str, text: str
     ) -> tuple[bool, str | None]:
+        ok, result = await self._send_with_retry(
+            adapter,
+            lambda: adapter.send(ChatType.GROUP, chat_id, text),
+            "发送",
+            chat_id,
+        )
+        if not ok:
+            return False, None
+        return True, result if isinstance(result, str) else None
+
+    async def _send_with_retry(
+        self,
+        adapter: Any,
+        action: Callable[[], Awaitable[Any]],
+        label: str,
+        chat_id: str,
+    ) -> tuple[bool, Any]:
+        """所有出站动作共用的超时/重试/终态分类（与 T3 文本发送一致）。"""
         attempt = 0
         while True:
             try:
-                result = await asyncio.wait_for(
-                    adapter.send(ChatType.GROUP, chat_id, text),
-                    SEND_TIMEOUT,
-                )
+                result = await asyncio.wait_for(action(), SEND_TIMEOUT)
                 return True, result
             except asyncio.CancelledError:
                 raise
             except TimeoutError:
                 self._counters["degraded"] += 1
                 self._last_error = "timeout"
-                log.warning("镜像发送超时（结果未知，不重试）：%s", chat_id)
+                log.warning("镜像%s超时（结果未知，不重试）：%s", label, chat_id)
                 return False, None
             except Exception as exc:  # noqa: BLE001 - 按错误码分类
                 code = self._error_code(exc, adapter)
+                if code == "unsupported_media":
+                    log.info(
+                        "镜像目标不支持该媒体（不重试）：%s %s", chat_id, exc
+                    )
+                    return False, None
                 if code == "not_connected" and attempt < len(RETRY_BACKOFF_SECONDS):
                     delay = RETRY_BACKOFF_SECONDS[attempt]
                     attempt += 1
                     self._counters["retries"] += 1
-                    log.info("镜像目标未连接，%.0fs 后第 %d 次重试：%s", delay, attempt, chat_id)
+                    log.info(
+                        "镜像目标未连接，%.0fs 后第 %d 次重试：%s",
+                        delay,
+                        attempt,
+                        chat_id,
+                    )
                     await asyncio.sleep(delay)
                     continue
                 self._counters["degraded"] += 1
@@ -560,7 +859,11 @@ class MirrorRouter:
                         "镜像发送被限速：微信桥仍在限速，修改配置后需同时重启 bot 与桥"
                     )
                 log.warning(
-                    "镜像发送失败（终态 %s）：%s %s", code or "-", chat_id, exc
+                    "镜像%s失败（终态 %s）：%s %s",
+                    label,
+                    code or "-",
+                    chat_id,
+                    exc,
                 )
                 return False, None
 

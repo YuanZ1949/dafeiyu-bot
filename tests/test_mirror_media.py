@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -19,10 +21,25 @@ from typing import cast
 import pytest
 
 import dafeiyu.media as media_module
-from dafeiyu.config import Settings
+from dafeiyu.config import (
+    BudgetConfig,
+    GroupsConfig,
+    ImagesConfig,
+    LoggingConfig,
+    MemoryConfig,
+    MirrorConfig,
+    MirrorPairConfig,
+    PersonaConfig,
+    Settings,
+    TriggerConfig,
+    WorkspaceConfig,
+)
 from dafeiyu.images import materialize_relay
 from dafeiyu.media import materialize_relay_attachments, resolve_media_path
+from dafeiyu.memory.store import Store
+from dafeiyu.mirror import FetchFn, MirrorItem, MirrorRouter
 from dafeiyu.models import Attachment, ChatType, Message, Segment
+from tests.fakes import FakeChannelAdapter
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 64
 SILK = b"#!SILK_V3" + b"0" * 64
@@ -385,3 +402,305 @@ async def test_images_materialize_relay_disabled_returns_empty(
     assert await materialize_relay(msg, settings, fetch=boom) == []
     assert msg.content == "[图片]"
     assert not (tmp_path / "ws").exists()
+
+
+# ------------------------------------------------- T7：出站媒体投递与占位降级
+
+QQ_CHAT = "qq:1001"
+WXG_CHAT = "wxg:group"
+
+
+def make_router_settings(tmp_path: Path) -> Settings:
+    """MirrorRouter 实际读取的真实 Settings（含 persona/mirror/workspace）。"""
+    base = Settings(
+        api_key="sk-test",
+        base_url="https://api.deepseek.com",
+        model="deepseek-chat",
+        bot_qq=999,
+        ws_host="127.0.0.1",
+        ws_port=8080,
+        ws_token="",
+        db_path=":memory:",
+        persona=PersonaConfig("溟月", ("溟月",), 120, 300, 0.05),
+        triggers=TriggerConfig(60, 0.0, ("01:00", "07:00"), ("怎么",)),
+        groups=GroupsConfig(frozenset(), frozenset(), frozenset({"qq:2002"})),
+        budget=BudgetConfig(200, 300000),
+        memory=MemoryConfig(20, 5, 20),
+        logging=LoggingConfig("INFO", "logs"),
+        mirror=MirrorConfig(
+            enabled=True,
+            pairs=(MirrorPairConfig(qq=QQ_CHAT, wechat=WXG_CHAT),),
+        ),
+    )
+    return replace(
+        base,
+        workspace=WorkspaceConfig(dir=str(tmp_path / "ws")),
+        images=ImagesConfig(enabled=True),
+    )
+
+
+def make_router(
+    tmp_path: Path,
+    *,
+    qq: FakeChannelAdapter | None = None,
+    wechat: FakeChannelAdapter | None = None,
+    fetch: FetchFn | None = None,
+) -> tuple[MirrorRouter, Store]:
+    store = Store(tmp_path / "mirror.db")
+    store.init_schema()
+    adapters = {
+        "qq": qq or FakeChannelAdapter(bot_id="qq:999", segments=True),
+        "wechat": wechat or FakeChannelAdapter(bot_id="wxg:self", media=True),
+    }
+    return (
+        MirrorRouter(
+            make_router_settings(tmp_path),
+            store,
+            adapters,
+            fetch=fetch,
+        ),
+        store,
+    )
+
+
+def place(tmp_path: Path, relative: str, data: bytes = PNG) -> Path:
+    target = tmp_path / "ws" / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    return target
+
+
+def make_item(
+    *,
+    source_channel: str,
+    attachments: tuple[Attachment, ...] = (),
+    segments: tuple[Segment, ...] = (),
+    text_lines: tuple[str, ...] = (),
+    is_bot: bool = False,
+    kind: str = "text",
+    nickname: str = "阿鱼",
+) -> MirrorItem:
+    return MirrorItem(
+        source_chat_id=QQ_CHAT if source_channel == "qq" else WXG_CHAT,
+        target_chat_id=WXG_CHAT if source_channel == "qq" else QQ_CHAT,
+        source_message_id="m1",
+        nickname=nickname,
+        is_bot=is_bot,
+        text_lines=text_lines,
+        attachments=attachments,
+        segments=segments,
+        source_channel=source_channel,
+        created_at=time.time(),
+        kind=kind,
+    )
+
+
+def record_order(adapter: FakeChannelAdapter) -> list[str]:
+    """包装实例方法，记录实际调用顺序（不改变 FakeChannelAdapter 行为）。"""
+    events: list[str] = []
+    for name in ("send", "send_segments", "send_media", "upload_file"):
+        method = getattr(adapter, name, None)
+        if not callable(method):
+            continue
+
+        async def wrapper(*args: object, _m=method, _n=name, **kwargs: object):
+            events.append(_n)
+            return await _m(*args, **kwargs)
+
+        setattr(adapter, name, wrapper)
+    return events
+
+
+def mirror_rows(store: Store, chat_id: str) -> list[str]:
+    rows = store._conn.execute(
+        "SELECT content FROM messages WHERE chat_id = ? AND mirror = 1", (chat_id,)
+    ).fetchall()
+    return [row["content"] for row in rows]
+
+
+async def test_outbound_text_still_uses_inner_send(tmp_path: Path) -> None:
+    router, _store = make_router(tmp_path)
+    qq = cast(FakeChannelAdapter, router.adapters["qq"])
+
+    await router._deliver(make_item(source_channel="wechat", text_lines=("你好",)))
+
+    assert qq.sent == [(ChatType.GROUP, QQ_CHAT, "阿鱼：你好")]
+    assert qq.segments == []
+    assert router.stats()["sent"] == 1
+
+
+async def test_outbound_pure_media_sends_placeholder_then_media(
+    tmp_path: Path,
+) -> None:
+    router, _store = make_router(tmp_path)
+    wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
+    events = record_order(wechat)
+    place(tmp_path, "images/x.png")
+
+    await router._deliver(
+        make_item(
+            source_channel="qq",
+            attachments=(Attachment(kind="image", path="images/x.png", name="x.png"),),
+        )
+    )
+
+    assert events[:2] == ["send", "send_media"]
+    assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[图片]"]
+    assert len(wechat.media) == 1
+    assert wechat.media[0][2:] == (
+        "image",
+        str((tmp_path / "ws" / "images" / "x.png").resolve()),
+        "x.png",
+    )
+
+
+async def test_outbound_placeholder_human_has_nickname_and_bot_not(
+    tmp_path: Path,
+) -> None:
+    router, _store = make_router(tmp_path)
+    wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
+    place(tmp_path, "images/x.png")
+    attachment = Attachment(kind="image", path="images/x.png", name="x.png")
+
+    await router._deliver(
+        make_item(source_channel="qq", attachments=(attachment,), is_bot=False)
+    )
+    await router._deliver(
+        make_item(source_channel="qq", attachments=(attachment,), is_bot=True)
+    )
+
+    assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[图片]", "[图片]"]
+
+
+async def test_video_wechat_sends_only_placeholder(tmp_path: Path) -> None:
+    router, _store = make_router(tmp_path)
+    wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
+    place(tmp_path, "videos/v.mp4", MP4)
+
+    await router._deliver(
+        make_item(
+            source_channel="qq",
+            attachments=(
+                Attachment(kind="video", path="videos/v.mp4", name="v.mp4"),
+            ),
+        )
+    )
+
+    assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[视频]"]
+    assert wechat.media == []
+    assert router.stats()["sent"] == 1
+
+
+async def test_qq_to_wechat_image_uses_resolved_absolute_path_once(
+    tmp_path: Path,
+) -> None:
+    router, store = make_router(tmp_path)
+    wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
+    path = place(tmp_path, "images/x.png")
+
+    await router._deliver(
+        make_item(
+            source_channel="qq",
+            attachments=(Attachment(kind="image", path="images/x.png", name="x.png"),),
+        )
+    )
+
+    assert len(wechat.media) == 1
+    _ct, _cid, kind, sent_path, name = wechat.media[0]
+    assert kind == "image"
+    assert sent_path == str(path.resolve())
+    assert name == "x.png"
+    assert mirror_rows(store, WXG_CHAT) == ["阿鱼：[图片]"]
+    assert router.stats()["sent"] == 1
+
+
+async def test_wechat_to_qq_image_builds_image_segment(tmp_path: Path) -> None:
+    router, store = make_router(tmp_path)
+    qq = cast(FakeChannelAdapter, router.adapters["qq"])
+    path = place(tmp_path, "images/x.png")
+
+    await router._deliver(
+        make_item(
+            source_channel="wechat",
+            kind="image",
+            attachments=(
+                Attachment(kind="image", path=str(path), name="x.png"),
+            ),
+        )
+    )
+
+    assert qq.sent == []
+    assert len(qq.segments) == 1
+    _ct, _cid, segments = qq.segments[0]
+    image_segments = [seg for seg in segments if seg.get("type") == "image"]
+    assert image_segments == [{"type": "image", "data": {"file": str(path.resolve())}}]
+    text_segments = [seg for seg in segments if seg.get("type") == "text"]
+    assert text_segments == [{"type": "text", "data": {"text": "阿鱼：[图片]"}}]
+    assert mirror_rows(store, QQ_CHAT) == ["阿鱼：[图片]"]
+
+
+async def test_unsupported_media_sends_single_placeholder(tmp_path: Path) -> None:
+    router, _store = make_router(
+        tmp_path, wechat=FakeChannelAdapter(bot_id="wxg:self", media=True, media_ok=False)
+    )
+    wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
+    place(tmp_path, "images/x.png")
+
+    await router._deliver(
+        make_item(
+            source_channel="qq",
+            attachments=(Attachment(kind="image", path="images/x.png", name="x.png"),),
+        )
+    )
+
+    assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[图片]"]
+    assert len(wechat.media) == 1
+    assert router.stats()["sent"] == 1
+
+
+async def test_missing_file_sends_placeholder_only(tmp_path: Path) -> None:
+    router, _store = make_router(tmp_path)
+    wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
+
+    await router._deliver(
+        make_item(
+            source_channel="qq",
+            attachments=(
+                Attachment(kind="image", path="images/missing.png", name="missing.png"),
+            ),
+        )
+    )
+
+    assert wechat.media == []
+    assert len(wechat.sent) == 1
+    text = wechat.sent[0][2]
+    assert "[图片]" in text
+    assert "missing.png" not in text
+    assert "images/" not in text
+
+
+async def test_sticker_fallback_sends_sticker_then_image(tmp_path: Path) -> None:
+    router, _store = make_router(tmp_path)
+    wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
+    place(tmp_path, "images/s.png")
+    kinds: list[str] = []
+
+    async def fake_send_media(
+        _chat_type: ChatType, _chat_id: str, kind: str, _path: str, name: str = ""
+    ) -> bool:
+        kinds.append(kind)
+        return kind == "image"
+
+    router.adapters["wechat"].send_media = fake_send_media
+
+    await router._deliver(
+        make_item(
+            source_channel="qq",
+            attachments=(Attachment(kind="sticker", path="images/s.png", name="123"),),
+        )
+    )
+
+    assert kinds == ["sticker", "image"]
+    assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[表情]"]
+    assert router.stats()["sent"] == 1
+
