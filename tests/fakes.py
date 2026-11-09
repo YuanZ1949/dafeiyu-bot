@@ -39,6 +39,8 @@ class FakeChannelAdapter:
         self.chat_id = chat_id
         self.connected = True
         self.degraded = False
+        #: 与真实 adapter 一致的显式能力探测；缺失时上层按默认 False 处理。
+        self.supports_dedupe_key = False
         self.last_event_at: float | None = None
         self.last_disconnect_at: float | None = None
         self.last_send_at: float | None = None

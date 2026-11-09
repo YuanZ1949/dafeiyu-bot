@@ -12,7 +12,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from .config import Settings
 from .memory.store import Store
@@ -103,11 +103,223 @@ def _media_kind(kind: str) -> str:
     return normalized or str(kind or "").strip().lower()
 
 
-class MirroredAdapter:
-    """T4 的出站代理占位：本任务不实现，先固定构造签名避免接口漂移。"""
+#: 只为内层真实存在的方法生成包装，能力探测语义才不会被代理伪造。
+_PROXIED_METHODS = (
+    "send",
+    "send_segments",
+    "send_media",
+    "upload_file",
+    "send_forward",
+    "send_at",
+)
 
-    def __init__(self, inner: object, router: MirrorRouter) -> None:
-        raise NotImplementedError("MirroredAdapter 由 T4 实现")
+#: OneBot 段类型里需要转成附件的媒体集合。
+_ATTACHMENT_SEGMENTS = frozenset(
+    {"image", "file", "record", "voice", "video", "sticker"}
+)
+#: 纯表情段：没有可发送的媒体，只在正文补占位。
+_STICKER_SEGMENTS = frozenset({"face", "mface"})
+
+
+class OutboundObserver(Protocol):
+    """`MirrorRouter` 的最小出站观察接口：测试可注入轻量替身。"""
+
+    def observe_outbound(
+        self,
+        *,
+        target_chat_id: str,
+        text: str = "",
+        message_id: str | None = None,
+        attachments: Sequence[Attachment] = (),
+        segments: Sequence[Segment] = (),
+        kind: str = "text",
+        nickname: str = "",
+    ) -> None: ...
+
+
+class MirroredAdapter:
+    """出站代理：把内层 adapter 的每次成功发送旁路给 `MirrorRouter`。
+
+    只为内层真实存在的方法在实例上绑定包装，因此
+    `callable(getattr(proxy, "send_media", None))` 与内层保持一致；
+    其余属性（含生命周期/事件注册）一律 `__getattr__` 委托。
+    """
+
+    _inner: Any
+    _router: OutboundObserver | None
+
+    def __init__(self, inner: object, router: OutboundObserver | None) -> None:
+        self._inner = inner
+        self._router = router
+        for name in _PROXIED_METHODS:
+            if callable(getattr(inner, name, None)):
+                object.__setattr__(self, name, getattr(self, f"_proxy_{name}"))
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            inner = object.__getattribute__(self, "_inner")
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(inner, name)
+
+    # ------------------------------------------------------------ 观察旁路
+    def _observe(self, **payload: Any) -> None:
+        router = self._router
+        if router is None:
+            return
+        router.observe_outbound(**payload)
+
+    # ------------------------------------------------------------ 文本
+    async def _proxy_send(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        text: str,
+        **kwargs: Any,
+    ) -> Any:
+        result = await self._inner.send(chat_type, chat_id, text, **kwargs)
+        self._observe(
+            target_chat_id=chat_id,
+            text=text,
+            message_id=result if isinstance(result, str) else None,
+        )
+        return result
+
+    # ------------------------------------------------------------ 消息段
+    async def _proxy_send_segments(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        segments: Sequence[Mapping[str, Any]],
+        **kwargs: Any,
+    ) -> Any:
+        result = await self._inner.send_segments(chat_type, chat_id, segments, **kwargs)
+        body, attachments = self._rebuild_segments(segments)
+        # T3 的 QQ 分支：有附件且无 text 段时正文为空，所以正文必须显式回传。
+        synthetic = (
+            (Segment(type="text", data={"text": body}),) if body else ()
+        )
+        self._observe(
+            target_chat_id=chat_id,
+            text=body,
+            message_id=result if isinstance(result, str) else None,
+            attachments=attachments,
+            segments=synthetic,
+            kind="text",
+        )
+        return result
+
+    @staticmethod
+    def _rebuild_segments(
+        segments: Sequence[Mapping[str, Any]],
+    ) -> tuple[str, tuple[Attachment, ...]]:
+        body: list[str] = []
+        attachments: list[Attachment] = []
+        for raw in segments:
+            if not isinstance(raw, dict):
+                continue
+            seg_type = str(raw.get("type") or "")
+            data = raw.get("data")
+            payload: Mapping[str, Any] = data if isinstance(data, dict) else {}
+            if seg_type == "text":
+                body.append(str(payload.get("text") or ""))
+            elif seg_type in _STICKER_SEGMENTS:
+                body.append("[表情]")
+            elif seg_type in _ATTACHMENT_SEGMENTS:
+                attachments.append(
+                    Attachment(
+                        kind=seg_type,
+                        source=str(payload.get("url") or ""),
+                        path=str(payload.get("file") or payload.get("path") or ""),
+                        name=str(payload.get("name") or ""),
+                    )
+                )
+            # at/reply 及未知段：跨平台不搬运，直接丢弃。
+        return "".join(body), tuple(attachments)
+
+    # ------------------------------------------------------------ 媒体
+    async def _proxy_send_media(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        kind: str,
+        path: str,
+        name: str = "",
+        **kwargs: Any,
+    ) -> Any:
+        result = await self._inner.send_media(
+            chat_type, chat_id, kind, path, name=name, **kwargs
+        )
+        if result is True:
+            self._observe(
+                target_chat_id=chat_id,
+                attachments=[Attachment(kind=kind, path=path, name=name)],
+                kind=kind,
+            )
+        return result
+
+    async def _proxy_upload_file(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        path: str,
+        name: str = "",
+        **kwargs: Any,
+    ) -> Any:
+        inner = self._inner
+        if callable(getattr(inner, "send_media", None)):
+            # 微信 upload_file 在 unsupported_media 时静默返回 None，无法判定；
+            # 直接走 send_media 拿到布尔结果，仅 True 才入队。
+            result = await inner.send_media(chat_type, chat_id, "file", path, name=name)
+            if result is True:
+                self._observe(
+                    target_chat_id=chat_id,
+                    attachments=[Attachment(kind="file", path=path, name=name)],
+                    kind="file",
+                )
+            return result
+        result = await inner.upload_file(
+            chat_type, chat_id, path, name=name, **kwargs
+        )
+        self._observe(
+            target_chat_id=chat_id,
+            attachments=[Attachment(kind="file", path=path, name=name)],
+            kind="file",
+        )
+        return result
+
+    # ------------------------------------------------------------ 转发/@
+    async def _proxy_send_forward(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        nodes: Sequence[Mapping[str, Any]],
+        **kwargs: Any,
+    ) -> Any:
+        result = await self._inner.send_forward(
+            chat_type, chat_id, nodes, **kwargs
+        )
+        self._observe(
+            target_chat_id=chat_id,
+            text=f"[合并转发 {max(1, len(nodes))} 条]",
+            kind="forward",
+        )
+        return result
+
+    async def _proxy_send_at(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        text: str,
+        at: Sequence[str],
+        **kwargs: Any,
+    ) -> Any:
+        result = await self._inner.send_at(
+            chat_type, chat_id, text, at, **kwargs
+        )
+        # @ 关系不跨平台，按纯文本镜像。
+        self._observe(target_chat_id=chat_id, text=text)
+        return result
 
 
 class MirrorRouter:
