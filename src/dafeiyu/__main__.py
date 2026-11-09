@@ -29,6 +29,7 @@ from .gateway.qq import QQAdapter
 from .gateway.wechat import WeChatAdapter
 from .memory.store import Store
 from .memory.workspace import Workspace
+from .mirror import MirrorRouter, MirroredAdapter
 from .models import ChatType
 from .router import Router
 from .runtime import load_runtime
@@ -414,7 +415,18 @@ async def main() -> None:
             server_url=effective_server_url,
         )
 
-        adapters = build_adapters(settings)
+        # 出站代理靠 __getattr__ 鸭子类型委托 Adapter；本地映射先放宽到 Any，
+        # 运行时 Service/control 仍按通道拿到完整代理。
+        adapters: dict[str, Any] = build_adapters(settings)
+        mirror_router: MirrorRouter | None = None
+        if settings.mirror.enabled:
+            # router 只持有内层 adapter；Service 与 control 口拿到的是出站代理，
+            # 否则镜像自身的发送会再次被观察，形成无限回环。
+            mirror_router = MirrorRouter(settings, store, adapters)
+            proxies: dict[str, Any] = {}
+            for name, inner in adapters.items():
+                proxies[name] = MirroredAdapter(inner, mirror_router)
+            adapters = proxies
         router = Router(settings, store)
         workspace = None
         if settings.workspace.enabled:
@@ -439,6 +451,7 @@ async def main() -> None:
             workspace=workspace,
             injection=settings.injection,
             audit=audit,
+            mirror=mirror_router,
         )
 
         # 旁路要在 service 建好之后接，brain_getter 才能在 dashboard 换脑时跟上。

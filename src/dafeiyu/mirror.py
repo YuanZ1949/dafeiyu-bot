@@ -386,9 +386,21 @@ class MirrorRouter:
         if self._tasks:
             return
         for channel in ("qq", "wechat"):
-            self._tasks.append(
-                asyncio.create_task(self._worker(channel), name=f"mirror-{channel}")
+            task = asyncio.create_task(
+                self._worker(channel), name=f"mirror-{channel}"
             )
+            task.add_done_callback(self._on_worker_done)
+            self._tasks.append(task)
+
+    def _on_worker_done(self, task: "asyncio.Task[None]") -> None:
+        """异常退出要让统计与日志看得见；正常结束/cancel 保持安静。"""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        self._last_error = f"worker_exit:{type(exc).__name__}:{exc}"
+        log.error("镜像 worker 异常退出：%s", task.get_name(), exc_info=exc)
 
     async def stop(self) -> None:
         tasks, self._tasks = self._tasks, []
@@ -401,7 +413,9 @@ class MirrorRouter:
             with contextlib.suppress(asyncio.QueueFull):
                 queue.put_nowait(_STOP)
         for task in tasks:
-            with contextlib.suppress(asyncio.CancelledError):
+            # 已崩溃的 worker 由 done-callback 记录；这里不能让 await 把异常
+            # 再抛给 Service.stop，否则停机流程会被一个 worker 故障打断。
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
     def stats(self) -> dict[str, int | str]:

@@ -69,6 +69,7 @@ from .workers.failure import (
 from .workers.summary import summarize_for_rotation
 
 if TYPE_CHECKING:
+    from .mirror import MirrorRouter
     from .supervisor.audit import AuditLog
 
 log = logging.getLogger(__name__)
@@ -385,6 +386,7 @@ class Service:
         audit: AuditLog | None = None,
         sleep=None,
         poke_reactor: PokeReactor | None = None,
+        mirror: MirrorRouter | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -398,6 +400,10 @@ class Service:
         self.workspace = workspace
         self.injection = injection
         self.audit = audit
+        self.mirror = mirror
+        if mirror is not None:
+            # 微信源的 .dat 解码必须与 handle 用同一实现，镜像才能解出可发送的图片。
+            mirror.decode = self._decode_wechat_dat
         self._sleep = sleep or asyncio.sleep
         self.commands = CommandRegistry()
         self._command_clock: Callable[[], float] = time.monotonic
@@ -507,6 +513,8 @@ class Service:
                 seed(self._wechat_echo_seed)
         for adapter in self.adapters.values():
             await adapter.start()
+        if self.mirror is not None:
+            self.mirror.start()
         self._start_keepalive()
         self._start_outbox()
 
@@ -529,6 +537,10 @@ class Service:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
             self._scheduler_task = None
+        # mirror 必须晚于 outbox/keepalive/scheduler 停、早于 adapter 停：
+        # 先停下会继续消费队列的 worker，避免它们向已断开的通道发送。
+        if self.mirror is not None:
+            await self.mirror.stop()
         for adapter in self.adapters.values():
             await adapter.stop()
         closer = getattr(self.brain, "aclose", None)
@@ -1004,6 +1016,13 @@ class Service:
                 log.info("图片重试物化成功：%s（%d 张）", message.message_id, done)
 
     async def handle(self, msg: Message) -> None:
+        # 入队必须在第一个 await 之前：qq.py 每条消息一个独立 task，
+        # 先同步发布才能保证到达顺序与队列顺序一致。
+        if not msg.is_bot and self.mirror is not None:
+            try:
+                self.mirror.observe_inbound(msg)
+            except Exception:  # noqa: BLE001 - 镜像异常绝不能影响 materialize/入库/命令
+                log.warning("镜像入队失败：%s", msg.message_id, exc_info=True)
         annotate = self._tools_enabled()
         # 图片物化必须在入库前：content 字符串是图片路径到达大脑的唯一载体。
         # materialize 内部永不抛异常，失败保持 [图片] 占位。
