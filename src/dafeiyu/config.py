@@ -563,6 +563,22 @@ class AuditConfig:
 
 
 @dataclass(frozen=True)
+class MirrorPairConfig:
+    """一对需要双向镜像的群：QQ 群 id 与微信会话 alias。"""
+
+    qq: str
+    wechat: str
+
+
+@dataclass(frozen=True)
+class MirrorConfig:
+    """跨群镜像开关。默认关闭；启用时必须恰好一对群且微信通道已去节流。"""
+
+    enabled: bool = False
+    pairs: tuple[MirrorPairConfig, ...] = ()
+
+
+@dataclass(frozen=True)
 class Settings:
     api_key: str
     base_url: str
@@ -599,6 +615,8 @@ class Settings:
     mind: MindConfig = field(default_factory=MindConfig)
     # 社交动作（戳一戳/进群欢迎）：确定性的短句与模板，默认全关。
     social: SocialConfig = field(default_factory=SocialConfig)
+    # 跨群镜像（QQ ↔ 微信群）：默认关闭。追加在最后，保持位置参数兼容。
+    mirror: MirrorConfig = field(default_factory=MirrorConfig)
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -1008,6 +1026,172 @@ def _build_social(raw: dict[str, Any]) -> SocialConfig:
             raw.get("join_welcome_daily_cap"), "social.join_welcome_daily_cap", 10
         ),
     )
+
+
+def _build_mirror(
+    raw_mirror: object,
+    raw_gateway_provider: str,
+    raw_wechat_enabled: bool,
+    wechat: WeChatConfig,
+) -> MirrorConfig:
+    """解析 `mirror` 段；关闭时不校验 pairs，启用时做启动期硬校验。
+
+    校验必须拿到降级前的 `gateway.provider` 与 `gateway.wechat.enabled`：
+    启用镜像却只有 QQ 通道时，晚到的 downgrade 会把 provider 改成 qq，
+    这里就无法报出「需要 both」。
+    """
+    if raw_mirror is None:
+        return MirrorConfig()
+    if not isinstance(raw_mirror, dict):
+        raise ConfigError("config.yaml 的 mirror 必须是映射")
+
+    enabled = _bool(raw_mirror.get("enabled", False), "mirror.enabled")
+    if not enabled:
+        return MirrorConfig()
+
+    raw_pairs = raw_mirror.get("pairs")
+    if not isinstance(raw_pairs, list):
+        raise ConfigError("mirror.pairs 必须是列表")
+    if len(raw_pairs) != 1:
+        raise ConfigError("mirror.pairs 必须恰好包含一对群（qq/wechat）")
+
+    item = raw_pairs[0]
+    if not isinstance(item, dict):
+        raise ConfigError("mirror.pairs[0] 必须是包含 qq/wechat 的映射")
+    unknown = sorted((str(key) for key in item if key not in ("qq", "wechat")))
+    if unknown:
+        raise ConfigError(f"mirror.pairs[0] 包含未知键：{', '.join(unknown)}")
+
+    raw_qq = item.get("qq")
+    if not isinstance(raw_qq, str):
+        raise ConfigError("mirror.pairs[0].qq 必须是 qq: 前缀的字符串")
+    qq = raw_qq.strip()
+    if not qq.casefold().startswith("qq:"):
+        raise ConfigError("mirror.pairs[0].qq 必须以 qq: 开头")
+    qq_id = qq[3:].strip()
+    if not qq_id:
+        raise ConfigError("mirror.pairs[0].qq 缺少冒号后的群号")
+
+    raw_wechat = item.get("wechat")
+    if not isinstance(raw_wechat, str):
+        raise ConfigError("mirror.pairs[0].wechat 必须是 wxg: 前缀的字符串")
+    wechat_id = raw_wechat.strip()
+    if not wechat_id.casefold().startswith("wxg:"):
+        raise ConfigError("mirror.pairs[0].wechat 必须以 wxg: 开头")
+    alias = wechat_id[4:].strip()
+    if not alias:
+        raise ConfigError("mirror.pairs[0].wechat 缺少冒号后的 alias")
+
+    # 先报微信通道本身缺失，再报 provider：两者的修复动作不同，先报更直接的那个。
+    if not raw_wechat_enabled:
+        raise ConfigError("mirror.enabled=true 要求 gateway.wechat.enabled=true")
+    if raw_gateway_provider != "both":
+        raise ConfigError("mirror.enabled=true 要求 gateway.provider=both")
+
+    detail = (
+        f"send_min_interval_seconds={wechat.send_min_interval_seconds}（目标 0）、"
+        f"send_max_per_hour={wechat.send_max_per_hour}（目标 0）、"
+        f"send_max_per_day={wechat.send_max_per_day}（目标 0）、"
+        f"quiet_hours={wechat.quiet_hours}（目标起止相同）"
+    )
+    if (
+        wechat.send_min_interval_seconds != 0
+        or wechat.send_max_per_hour != 0
+        or wechat.send_max_per_day != 0
+        or wechat.quiet_hours[0] != wechat.quiet_hours[1]
+    ):
+        raise ConfigError(
+            "mirror.enabled=true 要求微信通道已去节流（gateway.wechat）：" + detail
+        )
+
+    pair = MirrorPairConfig(
+        qq=f"qq:{qq_id.casefold()}",
+        wechat=f"wxg:{alias.casefold()}",
+    )
+    return MirrorConfig(enabled=True, pairs=(pair,))
+
+
+def _mirror_capability(on: bool, reasons: list[str]) -> str:
+    return "on" if on else f"off({','.join(reasons)})"
+
+
+def _mirror_file_capability(on: bool, reasons: list[str]) -> str:
+    note = "qq-human-inbound-file-no-content"
+    if on:
+        return f"on({note})"
+    return f"off({','.join([*reasons, note])})"
+
+
+def _log_mirror_capabilities(
+    mirror: MirrorConfig,
+    wechat: WeChatConfig,
+    images: ImagesConfig,
+    workspace: WorkspaceConfig,
+    speech: SpeechConfig,
+) -> None:
+    """打印每个方向的能力矩阵；只由配置推导，不做任何网络/桥探测。"""
+    if not mirror.enabled:
+        return
+
+    outbound_reason = ""
+    if wechat.outbound == "uia":
+        outbound_reason = "outbound=uia"
+    elif (
+        wechat.outbound == "auto"
+        and not wechat.hook_url
+        and not wechat.hook_media_url
+    ):
+        outbound_reason = "outbound=auto"
+
+    inbound_reason = "" if images.enabled and workspace.enabled else "images/workspace"
+    qq_media_reasons = [reason for reason in (outbound_reason, inbound_reason) if reason]
+
+    image_reasons = list(qq_media_reasons)
+    voice_reasons = list(qq_media_reasons)
+    if not speech.enabled:
+        voice_reasons.append("speech")
+
+    sticker_reasons = ["no-content"]
+    if outbound_reason:
+        sticker_reasons.insert(0, outbound_reason)
+
+    qq_to_wechat = [
+        ("text", "on"),
+        ("image", _mirror_capability(not image_reasons, image_reasons)),
+        ("voice", _mirror_capability(not voice_reasons, voice_reasons)),
+        ("video", "off(wechat-hook-no-video)"),
+        (
+            "file",
+            _mirror_file_capability(not outbound_reason, qq_media_reasons),
+        ),
+        ("sticker", _mirror_capability(False, sticker_reasons)),
+        ("forward", "on"),
+    ]
+
+    wechat_media_reason = (
+        [] if wechat.local_db_enabled and wechat.media.enabled else ["localdb/media"]
+    )
+    wechat_to_qq = [
+        ("text", "on"),
+        ("image", _mirror_capability(not wechat_media_reason, wechat_media_reason)),
+        ("voice", _mirror_capability(not wechat_media_reason, wechat_media_reason)),
+        ("video", _mirror_capability(not wechat_media_reason, wechat_media_reason)),
+        ("file", _mirror_capability(not wechat_media_reason, wechat_media_reason)),
+        ("forward", "on"),
+    ]
+
+    for direction, capabilities in (
+        ("qq->wechat", qq_to_wechat),
+        ("wechat->qq", wechat_to_qq),
+    ):
+        for name, state in capabilities:
+            if state.startswith("off("):
+                logger.warning("mirror capability %s %s=%s", direction, name, state)
+        logger.info(
+            "mirror capability %s %s",
+            direction,
+            " ".join(f"{name}={state}" for name, state in capabilities),
+        )
 
 
 def _build_injection(
@@ -1747,6 +1931,12 @@ def load_settings(
         env,
         default_quiet_hours=triggers.quiet_hours,
     )
+    mirror = _build_mirror(
+        raw.get("mirror"),
+        gateway_provider,
+        wechat.enabled,
+        wechat,
+    )
     if gateway_provider in ("wechat", "both") and not wechat.enabled:
         logger.warning(
             "gateway.provider=%s 但 gateway.wechat.enabled=false，降级为 qq",
@@ -1971,6 +2161,11 @@ def load_settings(
             "缺少 BOT_QQ：请在 .env 里填写机器人 QQ 号（BOT_QQ=123456789）"
         )
 
+    workspace = _build_workspace(workspace_raw)
+    images = _build_images(raw.get("images") or {})
+    speech = _build_speech(raw.get("speech") or {})
+    _log_mirror_capabilities(mirror, wechat, images, workspace, speech)
+
     try:
         behavior = parse_behavior(raw.get("behavior") or {})
     except BehaviorError as exc:
@@ -2020,9 +2215,9 @@ def load_settings(
             ),
         ),
         injection=_build_injection(workspace_raw, memory_raw, mind),
-        workspace=_build_workspace(workspace_raw),
-        images=_build_images(raw.get("images") or {}),
-        speech=_build_speech(raw.get("speech") or {}),
+        workspace=workspace,
+        images=images,
+        speech=speech,
         logging=LoggingConfig(
             level=str(logging_raw.get("level", "INFO")),
             dir=str(logging_raw.get("dir", "logs")),
@@ -2079,4 +2274,5 @@ def load_settings(
         behavior=behavior,
         mind=mind,
         social=_build_social(raw.get("social") or {}),
+        mirror=mirror,
     )
