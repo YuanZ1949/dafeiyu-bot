@@ -242,12 +242,15 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0].rstrip("/")
         if path == "/probe":
+            self._drain_body()
             self._reply(200, {"ok": True, **self.backend.health()})
             return
         if path not in ("/send_text", "/send_at", "/send_media"):
+            self._drain_body()
             self._reply(404, {"ok": False, "sent": False, "error_code": "not_found"})
             return
         if not self._authorized():
+            self._drain_body()
             self._reply(401, {"ok": False, "sent": False, "error_code": "unauthorized"})
             return
         body = self._read_json()
@@ -276,6 +279,35 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         header = self.headers.get("Authorization", "")
         return header == f"Bearer {self.token}"
+
+    def _drain_body(self) -> None:
+        """提前回错误响应前把请求体读掉，保持长连接干净。
+
+        ``protocol_version`` 是 HTTP/1.1，处理器返回后还会在同一个 socket 上
+        读下一个请求行；没读走的 body 会被当作请求行解析，把后续请求错配成
+        400。带未读数据关闭连接时 Windows 还会发 RST，客户端表现为
+        ``ConnectionAbortedError: WinError 10053``。
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.close_connection = True
+            return
+        if length <= 0:
+            return
+        if length > MAX_BODY:
+            # 标记关闭：超大 body 不值得读完，只能放弃这条连接。
+            self.close_connection = True
+            return
+        remaining = length
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 64 * 1024))
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+        except OSError:
+            self.close_connection = True
 
     def _read_json(self) -> Any | None:
         try:

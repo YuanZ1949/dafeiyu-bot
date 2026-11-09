@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import json
 import sys
@@ -202,6 +203,86 @@ def test_unknown_path_is_404_not_crash():
         server.server_close()
     assert status == 404
     assert body["ok"] is False
+
+
+def _open_conn(base: str) -> http.client.HTTPConnection:
+    host, _, port = base.removeprefix("http://").partition(":")
+    return http.client.HTTPConnection(host, int(port), timeout=5)
+
+
+def test_rejected_post_drains_body_and_keeps_connection_usable():
+    """404 也要读掉请求体，否则同一个长连接会被污染。
+
+    ``protocol_version`` 是 HTTP/1.1，处理器返回后还会在同一 socket 上继续读
+    下一个请求行；没读走的 body 会被当成请求行解析，把后续请求错配成 400。
+    Windows 上关闭带未读数据的连接还会发 RST，客户端表现为
+    ``ConnectionAbortedError: WinError 10053``（CI 里真实出现过）。
+    """
+    backend = FakeBackend()
+    server, base = _serve(backend)
+    conn = _open_conn(base)
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    try:
+        conn.request(
+            "POST",
+            "/nope",
+            body=json.dumps({"chatroom": "filehelper", "text": "hi"}),
+            headers=headers,
+        )
+        rejected = conn.getresponse()
+        rejected.read()
+        assert rejected.status == 404
+
+        conn.request(
+            "POST",
+            "/send_text",
+            body=json.dumps({"chatroom": "filehelper", "text": "ok"}),
+            headers=headers,
+        )
+        accepted = conn.getresponse()
+        payload = json.loads(accepted.read().decode("utf-8"))
+    finally:
+        conn.close()
+        server.shutdown()
+        server.server_close()
+    assert accepted.status == 200
+    assert payload["ok"] is True
+    assert backend.calls == [("text", "filehelper", "ok")]
+
+
+def test_unauthorized_post_drains_body_and_keeps_connection_usable():
+    """401 同样在鉴权失败时提前回包，必须先把 body 读掉。"""
+    backend = FakeBackend()
+    server, base = _serve(backend, token="s3cret")
+    conn = _open_conn(base)
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    try:
+        conn.request(
+            "POST",
+            "/send_text",
+            body=json.dumps({"chatroom": "filehelper", "text": "hi"}),
+            headers=headers,
+        )
+        denied = conn.getresponse()
+        denied.read()
+        assert denied.status == 401
+
+        headers["Authorization"] = "Bearer s3cret"
+        conn.request(
+            "POST",
+            "/send_text",
+            body=json.dumps({"chatroom": "filehelper", "text": "ok"}),
+            headers=headers,
+        )
+        accepted = conn.getresponse()
+        payload = json.loads(accepted.read().decode("utf-8"))
+    finally:
+        conn.close()
+        server.shutdown()
+        server.server_close()
+    assert accepted.status == 200
+    assert payload["ok"] is True
+    assert backend.calls == [("text", "filehelper", "ok")]
 
 
 def test_invalid_json_does_not_raise():
