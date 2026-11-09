@@ -154,7 +154,7 @@ C:\gitea-runner\gitea-runner.exe exec -W .gitea/workflows/ci.yml -j test -i -sel
 | `tests/test_wechat_localdb_repository.py` import 失败 | 没装 `wechat` extra（缺 `zstandard`）。workflow 已装 `.[dev,wechat]`，本地复现别漏。 |
 | 服务模式 `sc.exe start` 失败 | 看 `C:\gitea-runner\gitea-runner.log`；若是权限/工具缺失，改用 `-Autostart Task`。 |
 | 想重新注册 | 先停掉任务/服务，再 `-Force`。`sc.exe delete gitea-runner` 可删服务；计划任务用 `Unregister-ScheduledTask -TaskName gitea-runner`。 |
-| 本地 `exec` 里出现零星失败（套接字/端口类） | 同一 workspace 上同时跑了两个 pytest（例如上一次 `exec` 被中断后子进程没退）。`test_wechat_hook_server` 之类会抢端口。先 `Get-CimInstance Win32_Process -Filter "Name='python.exe'"` 清掉残留 pytest 再重跑。 |
+| 零星套接字/端口类失败（`ConnectionAbortedError: WinError 10053`、`test_wechat_hook_server` 偶发 404/超时） | 这台机器既是 runner 又是开发机：host 模式 job 和本机 pytest 同时跑时，两边都会起临时端口服务；Windows 的 `SO_REUSEADDR` 允许两个监听套接字抢同一端口，连接落到另一进程的服务器上，那个测试一收尾就是 RST。**CI 在跑时不要在本机跑全量 pytest**；先 `Get-CimInstance Win32_Process -Filter "Name='python.exe'"` 清掉残留进程，再重跑 run 或 `workflow_dispatch`。 |
 | `open config file ... config.yaml: The system cannot find the file specified` | `--config` 指向了不存在的文件。当前脚本会先生成最小配置；若手工注册，先写 `config.yaml` 再注册。 |
 | 本地 `exec` 里 `test_config*` / `test_dashboard_auth_config` 报「DID NOT RAISE」「assert '3351825424' == '10001'」 | exec 把仓库 `.env` 读进了 job 环境。加 `--env-file <空文件>` 重跑（见上文）。 |
 | `NapCat 未安装：<workspace>\vendor\napcat\node.exe 不存在` | 干净 checkout 没有 `vendor/`。测试已用 `fake_napcat` fixture 隔离；若你新写的测试直接调 `build_specs`，记得也加这个 fixture。 |
