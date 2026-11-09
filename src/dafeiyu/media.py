@@ -22,6 +22,7 @@ import re
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -30,7 +31,7 @@ import httpx
 from . import imaging, speech
 from .config import Settings
 from .imaging import locate as _locate
-from .models import Attachment, Message
+from .models import Attachment, Message, Segment
 from .netssl import default_ssl_context
 
 log = logging.getLogger(__name__)
@@ -880,3 +881,127 @@ async def materialize_attachments(
             exc_info=True,
         )
         return 0
+
+
+# --------------------------------------------------------- 跨群镜像：路径与物化
+
+
+def _workspace_root(settings: Settings) -> Path | None:
+    """从配置取 workspace 根目录；未配置时返回 ``None``（绝不回退 cwd）。"""
+    workspace = getattr(settings, "workspace", None)
+    raw = str(getattr(workspace, "dir", "") or "").strip()
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def resolve_media_path(settings: Settings, attachment: Attachment) -> Path | None:
+    """把附件路径解析成真实可读的绝对文件；不可用时返回 ``None``。
+
+    这是跨群镜像发送前的唯一路径校验点（GAP-15/GAP-22）：
+
+    - 空路径、或未配置 ``workspace.dir`` 一律 ``None``（绝不拼成 cwd）；
+    - 相对路径先拒绝含 ``..`` 的段，再拼到 workspace 下，``resolve()`` 后
+      必须仍在 workspace 内；
+    - 绝对路径 ``resolve()`` 后要求是普通文件且非空；
+    - 目录、缺失文件、空文件、逃逸一律 ``None``。
+    """
+    raw = (attachment.path or "").strip()
+    if not raw:
+        return None
+    root = _workspace_root(settings)
+    if root is None:
+        return None
+
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return None
+    else:
+        if ".." in candidate.parts:
+            return None
+        try:
+            resolved = (root / candidate).resolve()
+            root_resolved = root.resolve()
+        except OSError:
+            return None
+        if not resolved.is_relative_to(root_resolved):
+            return None
+
+    try:
+        if not resolved.is_file() or resolved.stat().st_size <= 0:
+            return None
+    except OSError:
+        return None
+    return resolved
+
+
+def _clone_message(msg: Message) -> Message:
+    """复制一份可安全改写的 ``Message``：content/segments/attachments 都不共享。"""
+    return replace(
+        msg,
+        segments=[
+            Segment(type=segment.type, data=dict(segment.data))
+            for segment in msg.segments
+        ],
+        attachments=list(msg.attachments),
+    )
+
+
+def _without_raw_dat(attachments: list[Attachment]) -> list[Attachment]:
+    """清空仍指向 ``.dat`` 的附件路径：解不开的微信原始文件绝不能发出去。"""
+    cleaned: list[Attachment] = []
+    for attachment in attachments:
+        if attachment.path and Path(attachment.path).suffix.lower() == ".dat":
+            cleaned.append(
+                replace(attachment, path="", size=0, fallbacks=())
+            )
+        else:
+            cleaned.append(attachment)
+    return cleaned
+
+
+async def materialize_relay_attachments(
+    msg: Message,
+    settings: Settings,
+    *,
+    fetch: FetchFn | None = None,
+    decode: Decode | None = None,
+) -> Message:
+    """镜像转发前物化附件，在副本上操作，绝不修改调用方的 ``Message``。
+
+    复用 :func:`materialize_attachments` 的下载/解码/落盘逻辑：
+
+    - URL 来源的图片/语音/视频依赖 ``images.enabled`` + ``workspace.enabled``
+      （语音/``record`` 另受 ``speech.enabled`` 门控，视频不受）；
+    - 微信本地 ``.dat`` 走与 ``Service.handle`` 相同的 ``decode``，解不开就把
+      路径清空，由出站侧发占位，绝不把原始 ``.dat`` 交给目标通道；
+    - 任何失败只记日志并保留原附件，绝不抛异常。
+    """
+    copy = _clone_message(msg)
+    try:
+        workspace = getattr(settings, "workspace", None)
+        if not getattr(workspace, "enabled", False):
+            return copy
+        if _workspace_root(settings) is None:
+            return copy
+        await materialize_attachments(
+            copy,
+            settings,
+            decode=decode,
+            annotate=False,
+            fetch=fetch or _default_fetch,
+        )
+        # 物化会向副本 content 追加注记；镜像只需要附件，恢复原文避免噪音。
+        copy.content = msg.content
+        copy.attachments = _without_raw_dat(copy.attachments)
+        return copy
+    except Exception:
+        log.warning(
+            "镜像附件物化失败，保持原样：msg=%s", msg.message_id, exc_info=True
+        )
+        copy.content = msg.content
+        copy.attachments = _without_raw_dat(copy.attachments)
+        return copy

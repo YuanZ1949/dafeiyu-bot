@@ -260,3 +260,101 @@ async def _materialize(
     if done:
         log.debug("图片物化完成：%s → %d 张", msg.message_id, done)
     return done
+
+
+async def materialize_relay(
+    msg: Message,
+    settings: Settings,
+    *,
+    fetch: FetchFn | None = None,
+) -> list[Attachment]:
+    """跨群镜像专用图片物化：落盘并返回附件，**不修改 msg.content**。
+
+    普通入站路径由 ``annotate`` 决定是否下载（大脑没有 read 工具时跳过）；
+    镜像需要真实文件才能真转发，所以这里绕过 ``annotate`` 门控，但仍然要求
+    ``images.enabled`` + ``workspace.enabled``。复用 ``_source``/``_obtain``/
+    ``_target``/``_cleanup``，永不抛异常。
+    """
+    try:
+        return await _materialize_relay(
+            msg, settings, fetch=fetch or _default_fetch
+        )
+    except Exception:
+        log.warning("镜像图片物化失败，回退占位：%s", msg.message_id, exc_info=True)
+        return []
+
+
+async def _materialize_relay(
+    msg: Message,
+    settings: Settings,
+    *,
+    fetch: FetchFn,
+) -> list[Attachment]:
+    if not settings.images.enabled or not settings.workspace.enabled:
+        return []
+    image_segs = [s for s in msg.segments if s.type == "image"]
+    if not image_segs:
+        return []
+
+    directory = Path(settings.workspace.dir) / "images"
+    prepared = False
+    produced: list[Attachment] = []
+
+    for seg in image_segs:
+        if not isinstance(seg.data, dict):
+            continue
+        kind, value = _source(seg.data)
+        if not kind:
+            log.info(
+                "镜像图片无可用来源（NapCat 未给 url/file/base64）：msg=%s",
+                msg.message_id,
+            )
+            continue
+        try:
+            data = await _obtain(kind, value, settings=settings, fetch=fetch)
+        except Exception:
+            log.info(
+                "镜像图片获取失败，保持占位：msg=%s kind=%s",
+                msg.message_id,
+                kind,
+                exc_info=True,
+            )
+            continue
+        if not prepared:
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                log.info(
+                    "镜像图片目录创建失败：msg=%s", msg.message_id, exc_info=True
+                )
+                return produced
+            _cleanup(directory, settings.images.retention_days)
+            prepared = True
+        target = _target(directory, kind, value, data)
+        try:
+            target.write_bytes(data)
+        except OSError:
+            log.info(
+                "镜像图片写盘失败，保持占位：msg=%s", msg.message_id, exc_info=True
+            )
+            continue
+        if target.suffix.lower() != ".gif":
+            await asyncio.to_thread(
+                imaging.downscale, target, settings.images.max_edge
+            )
+        try:
+            size = target.stat().st_size
+        except OSError:
+            size = len(data)
+        produced.append(
+            Attachment(
+                kind="image",
+                source=value,
+                path=f"images/{target.name}",
+                name=target.name,
+                size=size,
+            )
+        )
+    if produced:
+        log.debug("镜像图片物化完成：%s → %d 张", msg.message_id, len(produced))
+    return produced
