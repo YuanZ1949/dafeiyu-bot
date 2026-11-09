@@ -29,7 +29,7 @@
 | W1 | P0-5 文档一致性 + P0-6 ruff | 文档修正、`[tool.ruff]`、CI lint 步骤 | W0 | S/M |
 | W2 | P0-3 摘要回补 + P0-4 R14 | 记忆正确性、配置收尾 | 无 | S/M |
 | W3 | P0-2 basedpyright 基线 | 148 → 0 error，CI 加类型门槛 | W1（ruff 先立） | L |
-| W4 | P1-1 微信出站文件 | 小而完整的功能闭环 | 无 | S |
+| W4 | P1-1 微信出站文件 | 小而完整的功能闭环（已完成） | 无 | S |
 | W5 | P2-1 面板 E2E + P2-2 R7 + P2-4 覆盖率 | 工程质量 | W0/W3 | M |
 | W6 | P3 运维项 | 安装器/告警/文档 | 按需 | M |
 
@@ -249,7 +249,9 @@ Job succeeded  (EXEC_EXIT_CODE=0)
 
 ## 3. P1：能力补齐
 
-### P1-1 微信出站发文件（建议先做，闭环最小）
+### P1-1 微信出站发文件（已完成：走 `upload_file` → `send_media(kind=file)`）
+
+> 状态：**已完成**（2026-11-09）。`WeChatAdapter.upload_file` 直接复用 `send_media(chat_type, chat_id, "file", path, name=name)`；桥回 `unsupported_media` 时返回 `None`、不抛错，其它失败仍抛 `GatewayError`，由 `Service._send_chunk` 记日志后继续发文本。`service.py` 分支结构未改动。
 
 **目标**：模型附件 `kind=file` 在微信侧真正发出去，而不是被静默跳过。
 
@@ -263,15 +265,13 @@ Job succeeded  (EXEC_EXIT_CODE=0)
 
 1. `src/dafeiyu/gateway/wechat.py` 给 `WeChatAdapter` 加：
    ```python
-   async def upload_file(self, chat_type, chat_id, path, name="") -> None:
-       ok = await self.send_media(chat_type, chat_id, "file", path, name)
-       if not ok:
-           raise GatewayError("微信桥不支持文件发送")
+   async def upload_file(self, chat_type, chat_id, path, *, name="") -> None:
+       await self.send_media(chat_type, chat_id, "file", path, name=name)
    ```
-   （具体签名对齐 `QQAdapter.upload_file`，让 `service._send_chunk` 无需改动。）
-2. 失败语义：`send_media` 返回 False（`unsupported_media`）时抛 `GatewayError`，由 `_send_chunk` 捕获并继续发文本——保持「附件是加分项」。
+   （签名对齐 `QQAdapter.upload_file`，`service._send_chunk` 无需改动；`unsupported_media` 时 `send_media` 返回 False，`upload_file` 不抛错。）
+2. 失败语义：`send_media` 返回 False（`unsupported_media`）时 `upload_file` 不抛错，由 `_send_chunk` 继续发文本；其它发送失败仍抛 `GatewayError`，同样被 `_send_chunk` 捕获——保持「附件是加分项」。
 3. 测试：
-   - `tests/test_wechat_adapter.py`：断言 `upload_file` 发出 `action=send_media, kind=file`；unsupported 时抛错。
+   - `tests/test_wechat_adapter.py`：断言 `upload_file` 发出 `action=send_media, kind=file`；unsupported 时返回 `None` 且不抛。
    - `tests/test_service_wechat_media.py`：文件附件走 `upload_file`，失败时正文照发。
 4. 文档：`docs/message-types.md` 文件行「微信出站」改为支持（hook 后端；UIA 仍不支持）。
 

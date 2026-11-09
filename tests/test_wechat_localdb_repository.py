@@ -541,6 +541,35 @@ def test_finder_share_broken_xml_falls_back_to_regex(tmp_path: Path) -> None:
     assert entry["text"] == "[视频号] 阿猫：晚霞 & 夜景"
 
 
+def test_appmsg_forward_renders_merged_forward_marker(tmp_path: Path) -> None:
+    """合并转发（appmsg type 19）不能只显示标题，要让模型看出是聊天记录。"""
+    xml = (
+        "<msg><appmsg><title>群聊的聊天记录</title><type>19</type>"
+        "<recorditem>聊天记录正文</recorditem></appmsg></msg>"
+    )
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, f"wxid_a:\n{xml}", local_type=49)
+    )
+
+    entry = store.recent(ref)[0]
+
+    # kind 不新增取值：时间线与附件语义保持 link。
+    assert entry["kind"] == "link"
+    assert entry["text"] == "[合并转发] 群聊的聊天记录"
+
+
+def test_appmsg_forward_without_title_degrades_to_marker(tmp_path: Path) -> None:
+    store, ref = _store_with_single_message(
+        tmp_path,
+        text_row(3, "wxid_a:\n<msg><appmsg><type>19</type></appmsg></msg>", local_type=49),
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["kind"] == "link"
+    assert entry["text"] == "[合并转发]"
+
+
 def test_quote_message_exposes_refer_fields(tmp_path: Path) -> None:
     xml = (
         "<msg><appmsg><title>我的回复</title><type>57</type>"

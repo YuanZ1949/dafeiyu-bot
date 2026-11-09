@@ -6,8 +6,10 @@ import asyncio
 import threading
 from types import SimpleNamespace
 
+from dafeiyu.gateway.base import GatewayError
 from dafeiyu.gateway.wechat_bridge.media.aes import aes_ecb_encrypt
 from dafeiyu.gateway.wechat_bridge.media.keygen import MediaKey
+from dafeiyu.models import Attachment, ChatType
 from dafeiyu.service import Service
 
 SIGNATURE = b"\x07\x08V2\x08\x07"
@@ -183,3 +185,68 @@ def test_non_wxgf_container_falls_back_to_emoticon_path(monkeypatch) -> None:
 
     assert _decode(service, _v2(b"not-an-image" * 4)) is None
     assert len(calls) == 1
+
+
+# ---- 出站文件：微信没有消息段，走 upload_file -> send_media(kind=file) -------
+class _WeChatFileAdapter:
+    """微信风格的假适配器：无 send_segments，有 upload_file。"""
+
+    bot_id = "wxg:999"
+
+    def __init__(self, upload_error: Exception | None = None) -> None:
+        self.sent: list[tuple[ChatType, str, str]] = []
+        self.uploads: list[tuple[ChatType, str, str, str]] = []
+        self._upload_error = upload_error
+
+    async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str | None:
+        self.sent.append((chat_type, chat_id, text))
+        return "plain"
+
+    async def upload_file(
+        self, chat_type: ChatType, chat_id: str, path: str, *, name: str = ""
+    ) -> None:
+        if self._upload_error is not None:
+            raise self._upload_error
+        self.uploads.append((chat_type, chat_id, path, name))
+
+
+def _wechat_service(adapter: _WeChatFileAdapter) -> Service:
+    service = object.__new__(Service)
+    setattr(service, "adapters", {"wechat": adapter})
+    return service
+
+
+async def test_wechat_file_attachment_calls_upload_file() -> None:
+    adapter = _WeChatFileAdapter()
+    service = _wechat_service(adapter)
+
+    result = await service._send_chunk(
+        ChatType.GROUP,
+        "wxg:abc123",
+        "文件在这",
+        attachments=(
+            Attachment(kind="file", path="C:/ws/replies/a.pdf", name="报表.pdf"),
+        ),
+    )
+
+    assert result == "plain"
+    assert adapter.uploads == [
+        (ChatType.GROUP, "wxg:abc123", "C:/ws/replies/a.pdf", "报表.pdf")
+    ]
+    assert adapter.sent == [(ChatType.GROUP, "wxg:abc123", "文件在这")]
+
+
+async def test_wechat_upload_failure_still_sends_text() -> None:
+    adapter = _WeChatFileAdapter(upload_error=GatewayError("微信文件发送失败"))
+    service = _wechat_service(adapter)
+
+    result = await service._send_chunk(
+        ChatType.GROUP,
+        "wxg:abc123",
+        "文件在这",
+        attachments=(Attachment(kind="file", path="C:/ws/replies/a.pdf"),),
+    )
+
+    assert result == "plain"
+    assert adapter.uploads == []
+    assert adapter.sent == [(ChatType.GROUP, "wxg:abc123", "文件在这")]

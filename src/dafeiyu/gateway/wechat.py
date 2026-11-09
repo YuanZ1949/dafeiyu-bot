@@ -708,6 +708,18 @@ class WeChatAdapter:
         )
         return ok
 
+    async def upload_file(
+        self, chat_type: ChatType, chat_id: str, path: str, *, name: str = ""
+    ) -> None:
+        """把本地文件交给桥：复用 `send_media(kind="file")`，不新增协议。
+
+        桥明确回 `unsupported_media`（UIA 后端或旧版 hook）时 `send_media`
+        返回 False，这里不抛错——附件是加分项，`Service._send_chunk` 只记
+        日志，正文照发。其它失败仍由 `_send_action` 抛 `GatewayError`，
+        同样由调用方降级为纯文本。
+        """
+        await self.send_media(chat_type, chat_id, "file", path, name=name)
+
     async def _send_action(
         self,
         action: str,

@@ -629,6 +629,48 @@ async def test_send_media_other_failure_raises() -> None:
             )
 
 
+# ---- todo：文件附件复用 send_media(kind=file) -------------------------------
+async def test_upload_file_reuses_send_media_with_kind_file() -> None:
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        result = await adapter.upload_file(
+            ChatType.GROUP, GROUP_CHAT, "C:/ws/replies/a.pdf", name="报表.pdf"
+        )
+
+        assert result is None
+        assert len(send_frames(bridge)) == 1
+        frame = send_frames(bridge)[0]
+        assert frame["action"] == "send_media"
+        assert frame["params"] == {
+            "chat_id": GROUP_CHAT,
+            "kind": "file",
+            "path": "C:/ws/replies/a.pdf",
+            "name": "报表.pdf",
+        }
+        assert len(adapter._sent_echo) == 0
+
+
+async def test_upload_file_unsupported_returns_none_without_raising() -> None:
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        bridge.receipt = {
+            "ok": False,
+            "error_code": "unsupported_media",
+            "delivered": "failed",
+        }
+
+        result = await adapter.upload_file(
+            ChatType.PRIVATE, "wxg:private1", "C:/ws/replies/a.pdf"
+        )
+
+        assert result is None
+        assert len(send_frames(bridge)) == 1
+        frame = send_frames(bridge)[0]
+        assert frame["action"] == "send_media"
+        assert frame["params"]["kind"] == "file"
+        assert frame["params"]["name"] == ""
+        # 明确不支持不算一次投递尝试，回执统计不动。
+        assert adapter.receipt_stats()["total"] == 0
+
+
 # ---- todo 12: 本地库媒体 -> Attachment.path --------------------------------
 async def test_message_media_dict_becomes_attachment_with_path() -> None:
     envelope = message_envelope(
