@@ -152,6 +152,23 @@ gateway:
       # 空 = 自动探测 xwechat_files 目录；填了则只接受该根目录内的文件。
       storage_root: ""
 
+# 跨群镜像（QQ ↔ 微信群）：把一对群的发言双向转发，默认关闭。
+# pairs 只接受恰好一对；qq 填 QQ 群号、wechat 填 `wxg:别名`（桥本地铸造的会话
+# id），两边都要带前缀。enabled: false 时下面的 pairs 会被忽略，可先填好备用。
+# 启用（enabled: true）时启动即校验，不满足直接报错拒绝启动：
+# gateway.provider 必须是 both、gateway.wechat.enabled=true、
+# 微信四项已去节流（send_min_interval_seconds / send_max_per_hour /
+# send_max_per_day 全 0，quiet_hours 起止相同——即上面微信段的当前值）。
+# 媒体是尽力转发：QQ→微信需要 gateway.wechat.outbound: hook；
+# 微信→QQ 需要 gateway.wechat.local_db_enabled + gateway.wechat.media.enabled；
+# 能力不足时降级为 [图片] 之类的占位文本，不报错。
+# 改这里的配置（或改微信四项）后，必须同时重启 bot 与微信桥才生效。
+mirror:
+  enabled: false
+  pairs:
+    - qq: "qq:123456789"
+      wechat: "wxg:0d5c1f2a3b4c"
+
 opencode:
   # 留空自动找 npm 全局安装的 opencode.exe
   bin: ""
