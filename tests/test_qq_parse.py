@@ -14,7 +14,11 @@ from fixtures.onebot_events import (
     xml_card,
 )
 
-from dafeiyu.gateway.qq import _attachments_from_segments, parse_event
+from dafeiyu.gateway.qq import (
+    _attachments_from_segments,
+    _pending_forward_ids,
+    parse_event,
+)
 from dafeiyu.models import ChatType, Message, NoticeEvent
 
 BOT_QQ = 10001
@@ -340,6 +344,44 @@ def test_forward_id_only_falls_back() -> None:
     m = parse_event(group_event(segments=[forward(forward_id="abc123")]), bot_qq=BOT_QQ)
     assert m is not None
     assert m.content == "[合并转发]"
+
+
+def test_pending_forward_ids_finds_only_id_segments() -> None:
+    inline = forward(forward_node("甲", [text("内联")]))
+    event = group_event(
+        segments=[
+            text("看这个"),
+            inline,
+            forward(forward_id="abc123"),
+        ]
+    )
+    assert _pending_forward_ids(event) == ["abc123"]
+
+
+def test_pending_forward_ids_ignores_other_shapes() -> None:
+    inline = forward(forward_node("甲", [text("内联")]))
+    assert _pending_forward_ids(group_event(segments=[inline])) == []
+    assert _pending_forward_ids(group_event(segments=[text("hi")])) == []
+    assert _pending_forward_ids({"post_type": "notice"}) == []
+    assert _pending_forward_ids({"message": "plain text"}) == []
+    # 有 content 键但为空列表、且没有 id：仍没有可拉取项。
+    assert (
+        _pending_forward_ids(
+            {"message": [{"type": "forward", "data": {"content": []}}]}
+        )
+        == []
+    )
+
+
+def test_pending_forward_ids_dedupes_and_limits_to_one() -> None:
+    event = group_event(
+        segments=[
+            forward(forward_id="dup"),
+            forward(forward_id="dup"),
+            forward(forward_id="other"),
+        ]
+    )
+    assert _pending_forward_ids(event) == ["dup"]
 
 
 def test_forward_empty_content_falls_back() -> None:

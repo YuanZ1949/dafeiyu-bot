@@ -633,3 +633,203 @@ async def test_maybe_emoji_reaction_respects_config(monkeypatch) -> None:
     )
     await service._maybe_emoji_reaction(ChatType.GROUP, "qq:123", "88")
     assert calls == [(ChatType.GROUP, "qq:123", "88", "128")]
+
+
+# --- 只带 id 的合并转发：主动拉取节点 ---
+
+FORWARD_EVENT = {
+    "post_type": "message",
+    "message_type": "group",
+    "group_id": 1,
+    "user_id": 2,
+    "message_id": 100,
+    "sender": {"nickname": "阿明", "card": ""},
+    "message": [{"type": "forward", "data": {"id": "fwd-1"}}],
+    "time": 0,
+    "self_id": 10000,
+}
+
+FORWARD_MESSAGES = [
+    {"sender": {"nickname": "甲"}, "time": 0, "message": [{"type": "text", "data": {"text": "第一句"}}]},
+    {"sender": {"nickname": "乙"}, "time": 0, "message": [{"type": "text", "data": {"text": "第二句"}}]},
+]
+
+
+async def test_forward_id_only_is_fetched_and_dispatched() -> None:
+    """只带 id 的合并转发：先发 get_forward_msg，再把节点渲染进 content。"""
+    adapter = make_adapter()
+    adapter.bot_message_ids.append("9")
+    done = asyncio.get_running_loop().create_future()
+
+    async def handler(message):
+        if not done.done():
+            done.set_result(message)
+
+    adapter.on_message(handler)
+    await adapter.start()
+    try:
+        event = dict(FORWARD_EVENT)
+        event["message"] = [
+            {"type": "reply", "data": {"id": "9"}},
+            {"type": "forward", "data": {"id": "fwd-1"}},
+            {"type": "text", "data": {"text": "看这个"}},
+        ]
+        uri = f"ws://127.0.0.1:{adapter.port}"
+        async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
+            await ws.send(json.dumps(event))
+            raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
+            assert raw["action"] == "get_forward_msg"
+            assert raw["params"] == {"id": "fwd-1"}
+            await ws.send(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "retcode": 0,
+                        "data": {"messages": FORWARD_MESSAGES},
+                        "echo": raw["echo"],
+                    }
+                )
+            )
+            message = await asyncio.wait_for(done, 2)
+            assert "[聊天记录]" in message.content
+            assert "甲: 第一句" in message.content
+            assert "乙: 第二句" in message.content
+            assert "看这个" in message.content
+            # 既有字段不受补拉影响。
+            assert message.reply_to_bot is True
+            assert message.reply_to_message_id == "9"
+    finally:
+        await adapter.stop()
+
+
+async def test_forward_fetch_error_keeps_placeholder() -> None:
+    """get_forward_msg 返回 retcode 错误：handler 仍被调用一次，内容保持占位。"""
+    adapter = make_adapter()
+    done = asyncio.get_running_loop().create_future()
+    calls: list[object] = []
+
+    async def handler(message):
+        calls.append(message)
+        if not done.done():
+            done.set_result(message)
+
+    adapter.on_message(handler)
+    await adapter.start()
+    try:
+        uri = f"ws://127.0.0.1:{adapter.port}"
+        async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
+            await ws.send(json.dumps(FORWARD_EVENT))
+            raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
+            assert raw["action"] == "get_forward_msg"
+            await ws.send(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "retcode": 1200,
+                        "data": None,
+                        "echo": raw["echo"],
+                    }
+                )
+            )
+            message = await asyncio.wait_for(done, 2)
+            assert message.content == "[合并转发]"
+            assert len(calls) == 1
+    finally:
+        await adapter.stop()
+
+
+async def test_forward_fetch_timeout_keeps_placeholder() -> None:
+    """拉取超时：只降级成占位，handler 仍被调用。"""
+    adapter = make_adapter(send_timeout=0.05)
+    done = asyncio.get_running_loop().create_future()
+
+    async def handler(message):
+        if not done.done():
+            done.set_result(message)
+
+    adapter.on_message(handler)
+    await adapter.start()
+    try:
+        uri = f"ws://127.0.0.1:{adapter.port}"
+        async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
+            await ws.send(json.dumps(FORWARD_EVENT))
+            raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
+            assert raw["action"] == "get_forward_msg"
+            # 故意不回包，等 send_timeout 到期。
+            message = await asyncio.wait_for(done, 2)
+            assert message.content == "[合并转发]"
+    finally:
+        await adapter.stop()
+
+
+async def test_forward_with_content_is_not_fetched() -> None:
+    """带内联节点的转发直接渲染，不触发额外请求。"""
+    adapter = make_adapter()
+    done = asyncio.get_running_loop().create_future()
+
+    async def handler(message):
+        if not done.done():
+            done.set_result(message)
+
+    adapter.on_message(handler)
+    await adapter.start()
+    try:
+        event: dict[str, Any] = dict(FORWARD_EVENT)
+        event["message"] = [
+            {
+                "type": "forward",
+                "data": {"content": FORWARD_MESSAGES},
+            }
+        ]
+        uri = f"ws://127.0.0.1:{adapter.port}"
+        async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
+            await ws.send(json.dumps(event))
+            message = await asyncio.wait_for(done, 2)
+            assert "甲: 第一句" in message.content
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(ws.recv(), 0.2)
+    finally:
+        await adapter.stop()
+
+
+async def test_nested_id_only_forward_is_not_fetched_recursively() -> None:
+    """拉回来的节点里再有 only-id 转发时只保留占位，不再发请求。"""
+    adapter = make_adapter()
+    done = asyncio.get_running_loop().create_future()
+
+    async def handler(message):
+        if not done.done():
+            done.set_result(message)
+
+    adapter.on_message(handler)
+    await adapter.start()
+    try:
+        nested = [
+            {
+                "sender": {"nickname": "甲"},
+                "time": 0,
+                "message": [{"type": "forward", "data": {"id": "inner"}}],
+            }
+        ]
+        uri = f"ws://127.0.0.1:{adapter.port}"
+        async with websockets.connect(uri, additional_headers={"Authorization": "Bearer secret"}) as ws:
+            await ws.send(json.dumps(FORWARD_EVENT))
+            raw = json.loads(await asyncio.wait_for(ws.recv(), 2))
+            assert raw["params"] == {"id": "fwd-1"}
+            await ws.send(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "retcode": 0,
+                        "data": {"messages": nested},
+                        "echo": raw["echo"],
+                    }
+                )
+            )
+            message = await asyncio.wait_for(done, 2)
+            assert "[聊天记录]" in message.content
+            assert "甲: [合并转发]" in message.content
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(ws.recv(), 0.2)
+    finally:
+        await adapter.stop()

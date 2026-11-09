@@ -52,6 +52,8 @@ _FORWARD_FALLBACK = "[合并转发]"
 _FORWARD_MAX_DEPTH = 2
 _FORWARD_MAX_NODES = 10
 _FORWARD_NODE_CLIP = 60
+# 一条事件最多主动拉取 1 个合并转发，避免放大网络请求。
+_FORWARD_FETCH_LIMIT = 1
 _ATTACHMENT_NAME_CLIP = 60
 
 
@@ -196,6 +198,37 @@ def _render_rich_segment(seg_type: str, data: dict[str, Any]) -> str:
         body = _clip_first(data.get("content") or data.get("text"), 200)
         return f"[Markdown] {body}".rstrip()
     return ""
+
+
+def _pending_forward_ids(event: dict[str, Any]) -> list[str]:
+    """找出需要主动拉取的合并转发段 id（只有 id、没有内联节点）。
+
+    一条消息里最多取 1 个，避免一次事件触发过多网络请求；已带非空
+    ``content`` 的段（能直接渲染）与其它段类型一律忽略。
+    """
+    raw_message = event.get("message")
+    if not isinstance(raw_message, list):
+        return []
+    ids: list[str] = []
+    for item in raw_message:
+        if not isinstance(item, dict) or item.get("type") != "forward":
+            continue
+        data = item.get("data")
+        if not isinstance(data, dict):
+            continue
+        content = data.get("content")
+        if isinstance(content, list) and content:
+            continue
+        forward_id = data.get("id")
+        if not isinstance(forward_id, str) or not forward_id.strip():
+            continue
+        forward_id = forward_id.strip()
+        if forward_id in ids:
+            continue
+        ids.append(forward_id)
+        if len(ids) >= _FORWARD_FETCH_LIMIT:
+            break
+    return ids
 
 
 def _render_forward(
@@ -788,38 +821,17 @@ class QQAdapter:
             return
 
         if "post_type" in data:
-            event = parse_event(data, self._bot_qq, self.bot_message_ids)
-            if event is None:
-                return
-            if isinstance(event, NoticeEvent):
-                logger.info(
-                    "QQ notice %s %s/%s user=%s operator=%s sub=%s duration=%s",
-                    event.kind,
-                    event.chat_type.value,
-                    event.chat_id,
-                    event.user_id,
-                    event.operator_id,
-                    event.sub_type,
-                    event.duration,
+            # 只有 id 的合并转发需要回包拉取节点；接收循环不能在这里 await
+            # 网络请求（会等不到 echo 而卡死），必须另起 task。
+            pending_forward_ids = _pending_forward_ids(data)
+            if pending_forward_ids:
+                task = asyncio.create_task(
+                    self._resolve_forwards_and_dispatch(data, pending_forward_ids)
                 )
-                # 未注册处理器时只记日志（安全默认）；注册后交给 Service 分发。
-                if self._notice_handler is None:
-                    return
-                task = asyncio.create_task(self._run_notice(event))
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
                 return
-            self.last_event_at = time.time()
-            if isinstance(event, RecallEvent):
-                if self._recall_handler is None:
-                    return
-                task = asyncio.create_task(self._run_recall(event))
-            else:
-                if self._handler is None:
-                    return
-                task = asyncio.create_task(self._run_handler(event))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            self._dispatch_event(data)
             return
 
         echo = data.get("echo")
@@ -838,6 +850,85 @@ class QQAdapter:
             return
         result = data.get("data")
         future.set_result(result if isinstance(result, dict) else {})
+
+    def _dispatch_event(self, data: dict[str, Any]) -> None:
+        """解析并派发一条事件；普通路径与转发补拉路径共用。"""
+        event = parse_event(data, self._bot_qq, self.bot_message_ids)
+        if event is None:
+            return
+        if isinstance(event, NoticeEvent):
+            logger.info(
+                "QQ notice %s %s/%s user=%s operator=%s sub=%s duration=%s",
+                event.kind,
+                event.chat_type.value,
+                event.chat_id,
+                event.user_id,
+                event.operator_id,
+                event.sub_type,
+                event.duration,
+            )
+            # 未注册处理器时只记日志（安全默认）；注册后交给 Service 分发。
+            if self._notice_handler is None:
+                return
+            task = asyncio.create_task(self._run_notice(event))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+            return
+        self.last_event_at = time.time()
+        if isinstance(event, RecallEvent):
+            if self._recall_handler is None:
+                return
+            task = asyncio.create_task(self._run_recall(event))
+        else:
+            if self._handler is None:
+                return
+            task = asyncio.create_task(self._run_handler(event))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _resolve_forwards_and_dispatch(
+        self, data: dict[str, Any], forward_ids: list[str]
+    ) -> None:
+        """为只带 id 的合并转发补拉节点，然后按普通事件派发。
+
+        任何失败都只降级成原有的 ``[合并转发]`` 占位，不影响消息进入模型
+        链路；只展开收到的那一层，不递归拉取嵌套转发。
+        """
+        for forward_id in forward_ids:
+            try:
+                result = await self.call_action("get_forward_msg", {"id": forward_id})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 拉取失败必须保持占位
+                logger.warning("合并转发拉取失败 id=%s：%s", forward_id, exc)
+                continue
+            messages = result.get("messages")
+            if not isinstance(messages, list):
+                logger.warning("合并转发拉取结果缺少 messages id=%s", forward_id)
+                continue
+            self._apply_forward_content(data, forward_id, messages)
+        self._dispatch_event(data)
+
+    @staticmethod
+    def _apply_forward_content(
+        data: dict[str, Any], forward_id: str, messages: list[Any]
+    ) -> None:
+        """把拉回来的节点写回原始段；只匹配同一层的顶层段。"""
+        raw_message = data.get("message")
+        if not isinstance(raw_message, list):
+            return
+        for item in raw_message:
+            if not isinstance(item, dict) or item.get("type") != "forward":
+                continue
+            segment_data = item.get("data")
+            if not isinstance(segment_data, dict):
+                continue
+            if str(segment_data.get("id") or "").strip() != forward_id:
+                continue
+            existing = segment_data.get("content")
+            if isinstance(existing, list) and existing:
+                continue
+            segment_data["content"] = messages
 
     async def _run_handler(self, event: Message) -> None:
         assert self._handler is not None
