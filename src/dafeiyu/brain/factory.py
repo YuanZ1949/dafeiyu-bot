@@ -8,6 +8,7 @@ from ..runtime import RuntimeState
 from .client import BrainClient
 from .opencode import OpenCodeBrain, resolve_opencode_bin
 from .opencode_http import DEFAULT_MEMORY_AGENT, DENY_ALL_PERMISSIONS, OpenCodeHttpBrain
+from .runtime_config import server_env
 
 MODES: tuple[tuple[str, str], ...] = (
     ("local_model", "本地模型"),
@@ -109,6 +110,9 @@ def build_brain(
             project_dir=settings.opencode.project_dir,
             timeout=settings.opencode.timeout_seconds,
             server_url=server_url or settings.opencode.server_url,
+            # CLI 也是 opencode 进程：不带上隔离 env 的话，`opencode run` 会
+            # 加载用户全局配置 / 插件 / MCP，config_home 等于白设。
+            env=server_env(settings.opencode.config_home) or {},
         )
     if provider == "token":
         if not settings.api_key:

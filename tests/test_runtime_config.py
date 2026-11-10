@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -159,12 +160,22 @@ def test_ensure_resolves_relative_to_cwd(
 # ---- 环境变量 -------------------------------------------------------------
 
 
-def test_server_env_empty_means_inherit() -> None:
+def test_server_env_empty_means_inherit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 不读真实凭据：空 config_home 会直接返回 None，但仍按约定关掉来源。
+    monkeypatch.setattr(
+        "dafeiyu.brain.runtime_config._global_auth_file", lambda: None
+    )
     assert server_env("") is None
     assert server_env("   ") is None
 
 
-def test_server_env_points_xdg_config_home(tmp_path: Path) -> None:
+def test_server_env_points_xdg_config_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 凭据复制另有测试；这里不碰用户主目录里的 auth.json。
+    monkeypatch.setattr(
+        "dafeiyu.brain.runtime_config._global_auth_file", lambda: None
+    )
     env = server_env(tmp_path / "cfg")
 
     root = (tmp_path / "cfg").resolve()
@@ -173,6 +184,9 @@ def test_server_env_points_xdg_config_home(tmp_path: Path) -> None:
         # 实测：OPENCODE_CONFIG 的优先级高于 XDG_CONFIG_HOME，只改 XDG 的话
         # 全局 opencode.jsonc 仍会被读进来（全局插件照常加载）。
         "OPENCODE_CONFIG": str(root / "opencode" / "opencode.jsonc"),
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_STATE_HOME": str(root / "state"),
+        "XDG_CACHE_HOME": str(root / "cache"),
     }
     assert (root / "opencode" / "opencode.jsonc").is_file()
 
@@ -183,13 +197,21 @@ def test_server_env_wraps_oserror(
     def boom(_path: object) -> Path:
         raise OSError("拒绝访问")
 
+    monkeypatch.setattr(
+        "dafeiyu.brain.runtime_config._global_auth_file", lambda: None
+    )
     monkeypatch.setattr("dafeiyu.brain.runtime_config.ensure_isolated_config", boom)
 
     with pytest.raises(ConfigError, match="opencode.config_home"):
         server_env(tmp_path / "cfg")
 
 
-def test_server_build_env_carries_xdg_config_home(tmp_path: Path) -> None:
+def test_server_build_env_carries_xdg_config_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "dafeiyu.brain.runtime_config._global_auth_file", lambda: None
+    )
     env = server_env(tmp_path / "cfg") or {}
     server = OpenCodeServer(
         "opencode.exe",
@@ -201,6 +223,99 @@ def test_server_build_env_carries_xdg_config_home(tmp_path: Path) -> None:
     built = server._build_env()
     assert built["XDG_CONFIG_HOME"] == env["XDG_CONFIG_HOME"]
     assert built["OPENCODE_CONFIG"] == env["OPENCODE_CONFIG"]
+
+
+# ---- 凭据复制 ----
+
+
+def test_server_env_seeds_isolated_auth_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "global" / "opencode" / "auth.json"
+    source.parent.mkdir(parents=True)
+    raw = b'{"opencode": {"type": "api", "key": "test-key"}}'
+    source.write_bytes(raw)
+    monkeypatch.setattr(
+        "dafeiyu.brain.runtime_config._global_auth_file", lambda: source
+    )
+
+    server_env(tmp_path / "cfg")
+
+    target = (tmp_path / "cfg").resolve() / "data" / "opencode" / "auth.json"
+    assert target.read_bytes() == raw
+
+
+def test_server_env_does_not_overwrite_isolated_auth_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "global" / "opencode" / "auth.json"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b'{"opencode": {"key": "old"}}')
+    refreshed = b'{"opencode": {"key": "refreshed"}}'
+    target = (tmp_path / "cfg").resolve() / "data" / "opencode" / "auth.json"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(refreshed)
+    monkeypatch.setattr(
+        "dafeiyu.brain.runtime_config._global_auth_file", lambda: source
+    )
+
+    server_env(tmp_path / "cfg")
+
+    # 隔离目录里的凭据可能已被刷新，绝不能被全局旧文件覆盖。
+    assert target.read_bytes() == refreshed
+
+
+def test_server_env_without_global_auth_file_creates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "dafeiyu.brain.runtime_config._global_auth_file", lambda: None
+    )
+
+    env = server_env(tmp_path / "cfg")
+
+    assert env is not None
+    target = (tmp_path / "cfg").resolve() / "data" / "opencode" / "auth.json"
+    assert not target.exists()
+
+
+def test_server_env_warns_when_auth_copy_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source = tmp_path / "global" / "opencode" / "auth.json"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"{}")
+
+    def boom(_source: object, _target: object) -> None:
+        raise OSError("拒绝访问")
+
+    monkeypatch.setattr(
+        "dafeiyu.brain.runtime_config._global_auth_file", lambda: source
+    )
+    monkeypatch.setattr("dafeiyu.brain.runtime_config.shutil.copy2", boom)
+
+    with caplog.at_level("WARNING", logger="dafeiyu.brain.runtime_config"):
+        env = server_env(tmp_path / "cfg")
+
+    # 复制失败不阻断启动：env 照常返回，只留一条 warning。
+    root = (tmp_path / "cfg").resolve()
+    assert env == {
+        "XDG_CONFIG_HOME": str(root),
+        "OPENCODE_CONFIG": str(root / "opencode" / "opencode.jsonc"),
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_STATE_HOME": str(root / "state"),
+        "XDG_CACHE_HOME": str(root / "cache"),
+    }
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "dafeiyu.brain.runtime_config"
+        and record.levelno == logging.WARNING
+    ]
+    assert warnings
+    assert "凭据复制失败" in warnings[-1].getMessage()
 
 
 # ---- 配置解析 -------------------------------------------------------------

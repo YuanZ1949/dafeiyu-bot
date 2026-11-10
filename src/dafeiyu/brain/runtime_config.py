@@ -1,12 +1,22 @@
-"""bot 专用 opencode 配置目录（Task 13.1）。
+"""bot 专用 opencode 运行时目录（Task 13.1）。
 
 把 bot 的 serve 子进程指向独立的 ``XDG_CONFIG_HOME`` 后，它不再加载用户全局的
 agents / plugins / mcp：全局插件注册的外来 agent、全局 MCP 子进程、全局 provider
 默认值都进不来。两个 agent 文件在仓库 ``.opencode/agents/`` 下，按 project 发现，
 不受影响。
 
-凭据不在配置目录：opencode 的 ``auth.json`` 在 data 目录
-（``~/.local/share/opencode``），所以隔离配置不需要复制或搬移任何凭据。
+配置之外的运行时状态也一并隔离：``XDG_DATA_HOME`` / ``XDG_STATE_HOME`` /
+``XDG_CACHE_HOME`` 全部指向 ``config_home`` 下的兄弟目录，所以日志、快照、
+tool-output、模型缓存都留在项目目录里，不会和用户主 opencode 共用同一份
+数据目录（共用快照桶时两个 serve 会竞争同一批 git 仓库）。
+
+凭据单独处理：opencode 的 ``auth.json`` 也在 data 目录
+（``~/.local/share/opencode/auth.json``）。隔离 data 目录后它不会自动出现，
+所以首次启动时从全局 data 目录复制一份到隔离目录，让隔离目录自带一份凭据；
+此后两边各写各的，互不影响。v2 已经把凭据迁进 sqlite 的 ``credential`` 表
+（即 ``OPENCODE_DB`` 那个库），``auth.json`` 仍是旧版导入源、也有 provider
+（如 gitlab）直接读它。本仓库的两种档位都不依赖它：免费档匿名可用，自备
+Key 档用 ``data/secrets/provider.key``。
 
 ``config_home`` 留空（默认）= 沿用启动环境的配置，即软回滚。
 """
@@ -15,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -106,11 +117,20 @@ def ensure_isolated_config(config_home: str | Path) -> Path:
 
 
 def server_env(config_home: str | Path | None) -> dict[str, str] | None:
-    """给 ``OpenCodeServer`` 的 env；留空返回 None（沿用启动环境）。
+    """给 ``OpenCodeServer`` / CLI 子进程的 env；留空返回 None（沿用启动环境）。
 
-    两个变量都要给：实测 ``OPENCODE_CONFIG`` 的优先级高于 ``XDG_CONFIG_HOME``，
-    只改后者的话，父进程环境里带过来的全局 opencode.jsonc 仍会被读进来，
-    全局插件（以及它们注册的外来 agent）照常加载。
+    ``OPENCODE_CONFIG`` 必须给：实测它的优先级高于 ``XDG_CONFIG_HOME``，只改
+    后者的话，父进程环境里带过来的全局 opencode.jsonc 仍会被读进来，全局
+    插件（以及它们注册的外来 agent）照常加载。
+
+    三个 XDG 目录也一起指向隔离根（默认 ``<config_home>/{data,state,cache}``）：
+    opencode 的日志、快照、tool-output、模型缓存因此都落在项目目录里。全部
+    放在 ``config_home`` 之下而不是它的父目录，是为了 ``config_home`` 被配成
+    任意值（含 ``.``）时都不会把状态写到项目外面。
+
+    首次运行会把全局 data 目录里的 ``auth.json`` 复制进隔离 data 目录，让
+    隔离目录自带一份凭据（v2 的凭据在 sqlite 里，这里是兼容旧导入源与直读
+    ``auth.json`` 的 provider）；复制失败只告警，不阻断启动。
     """
 
     raw = str(config_home or "").strip()
@@ -120,7 +140,58 @@ def server_env(config_home: str | Path | None) -> dict[str, str] | None:
         root = ensure_isolated_config(raw)
     except OSError as exc:
         raise ConfigError(f"opencode.config_home 无法创建：{raw}（{exc}）") from exc
+    data_home = root / "data"
+    _seed_isolated_auth(data_home)
     return {
         "XDG_CONFIG_HOME": str(root),
         "OPENCODE_CONFIG": str(root / "opencode" / "opencode.jsonc"),
+        "XDG_DATA_HOME": str(data_home),
+        "XDG_STATE_HOME": str(root / "state"),
+        "XDG_CACHE_HOME": str(root / "cache"),
     }
+
+
+def _global_auth_file() -> Path | None:
+    """定位用户主 opencode 的 ``auth.json``；找不到返回 None。
+
+    先看 ``XDG_DATA_HOME``（Linux 惯例，Windows 上的 opencode 也认），再试
+    默认路径与 Windows 的 LOCALAPPDATA / APPDATA，取第一个真实存在的文件。
+    """
+
+    candidates: list[Path] = []
+    raw = os.environ.get("XDG_DATA_HOME", "").strip()
+    if raw:
+        candidates.append(Path(raw).expanduser() / "opencode" / "auth.json")
+    candidates.append(Path.home() / ".local" / "share" / "opencode" / "auth.json")
+    for name in ("LOCALAPPDATA", "APPDATA"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            candidates.append(Path(value) / "opencode" / "auth.json")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _seed_isolated_auth(data_home: Path) -> None:
+    """把全局凭据复制进隔离 data 目录（仅当目标不存在）。
+
+    只在缺失时复制：隔离目录里的 ``auth.json`` 可能已被刷新过，不能拿全局的
+    旧文件覆盖。复制失败只告警——key / local 档不依赖它，不该因此起不来。
+    """
+
+    target = data_home / "opencode" / "auth.json"
+    if target.exists():
+        return
+    source = _global_auth_file()
+    if source is None:
+        return
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    except OSError:
+        log.warning(
+            "opencode 隔离凭据复制失败（免费档可能不可用）：%s", source, exc_info=True
+        )
+        return
+    log.info("已复制全局 opencode 凭据到隔离目录（仅首次）：%s", target)

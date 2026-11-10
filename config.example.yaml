@@ -173,6 +173,8 @@ opencode:
   # 留空自动找 npm 全局安装的 opencode.exe
   bin: ""
   agent: deepseek-qq
+  # 钉死工作目录：session 的 location 与 CLI 的 cwd 都用它，从任何目录启动都不会
+  # 让大脑跑到项目外。建议填绝对路径（相对路径按启动目录解析）。留空 = 用当前目录。
   project_dir: ""
   # 联网 + 工具调用（webfetch / 读写工作区）会拉长单轮时间。
   timeout_seconds: 240
@@ -188,8 +190,10 @@ opencode:
   host: 127.0.0.1
   port: 24310
   startup_timeout_seconds: 30
-  # bot 专用 opencode 配置目录：隔离全局插件 / MCP / 外来 agent。
+  # bot 专用 opencode 运行时目录：隔离全局插件 / MCP / 外来 agent，并把
+  # log / snapshot / cache 一起放进这里（XDG_DATA_HOME / STATE / CACHE）。
   # 留空 = 沿用启动环境的配置（软回滚）；相对路径按启动目录解析。
+  # 凭据（auth.json）首次启动时从全局 data 目录复制一份到隔离目录，之后各写各的。
   config_home: data/opencode-runtime/config
 
 # NapCat 快登失败时的密码回退（可选）。凭据不要写在这里。
