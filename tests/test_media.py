@@ -599,6 +599,65 @@ async def test_video_second_call_is_idempotent(
     assert content.count("（已抽帧") == 1
 
 
+# ------------------------------------------------------------- GIF 动图抽帧
+def patch_gif_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fail: bool = False,
+) -> list[int]:
+    """替换 media 模块的 GIF 抽帧入口，返回被请求的帧序号。"""
+    calls: list[int] = []
+
+    def fake_frame(ffmpeg: str, source: Path, target: Path, index: int) -> bool:
+        calls.append(index)
+        if fail:
+            return False
+        Path(target).write_bytes(JPG)
+        return True
+
+    monkeypatch.setattr(media_module, "_locate", lambda name: name)
+    monkeypatch.setattr(media_module, "_extract_gif_frame", fake_frame)
+    return calls
+
+
+async def test_gif_frames_are_extracted_and_annotated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """动图首帧常是空白：抽第 0/8/24 帧，模型才看得见动图内容。"""
+    source = tmp_path / "a.gif"
+    source.write_bytes(b"GIF89a" + b"0" * 64)
+    calls = patch_gif_ffmpeg(monkeypatch)
+    settings = make_settings(tmp_path)
+    message = make_message(str(source))
+
+    count = await materialize_attachments(message, settings, decode=None)
+
+    assert count == 1
+    assert calls == [0, 8, 24]
+    frames = sorted((tmp_path / "ws" / "images").glob("gif-*-*.jpg"))
+    assert len(frames) == 3
+    assert all(frame.read_bytes() == JPG for frame in frames)
+    assert "（动图，已抽帧 images/gif-" in message.content
+    assert "、images/gif-" in message.content
+    assert "原文件 images/" in message.content
+
+
+async def test_gif_frame_failure_keeps_original_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "a.gif"
+    source.write_bytes(b"GIF89a" + b"0" * 64)
+    calls = patch_gif_ffmpeg(monkeypatch, fail=True)
+    settings = make_settings(tmp_path)
+    message = make_message(str(source))
+
+    await materialize_attachments(message, settings, decode=None)
+
+    assert calls == [0, 8, 24]
+    assert "（动图，已抽帧" not in message.content
+    assert message.content.startswith("[图片]（图存 images/")
+
+
 # --------------------------------------------------------------- 语音转写
 SILK = b"#!SILK_V3" + b"0" * 64
 
@@ -827,6 +886,8 @@ async def test_wechat_gif_does_not_call_downscale(
         return False
 
     monkeypatch.setattr(imaging, "downscale", fake_downscale)
+    # 不依赖本机 ffmpeg：这里只关心 GIF 不走降采样。
+    monkeypatch.setattr(media_module, "_locate", lambda _name: None)
     settings = make_settings(tmp_path, max_edge=1280)
     message = make_message(str(source))
 

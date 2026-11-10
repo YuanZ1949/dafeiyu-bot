@@ -374,6 +374,29 @@ class AlertManager:
                 f"{rules.reply_error_window_seconds} 秒内 {recent_errors} 次错误",
             )
 
+        # 旁路任务（摘要/印象/观察/反思）失败：不影响回复，但记忆会静默落后。
+        # 数据来自 control.health_snapshot 的 memory_failures（进程内计数）。
+        failures = bot.get("memory_failures") or {}
+        if not isinstance(failures, dict):
+            failures = {}
+        try:
+            recent_failures = int(failures.get("recent_count") or 0)
+            failure_window = int(
+                failures.get("window_seconds") or rules.memory_error_window_seconds
+            )
+        except (TypeError, ValueError):
+            recent_failures = 0
+            failure_window = rules.memory_error_window_seconds
+        if recent_failures >= rules.memory_error_count and not quota_active:
+            labels = failures.get("labels") or []
+            label_text = "、".join(str(item) for item in labels if str(item).strip())
+            detail = f"{failure_window} 秒内 {recent_failures} 次旁路任务失败"
+            if label_text:
+                detail += f"（{label_text}）"
+            conditions["memory_errors"] = Condition(
+                True, "warning", "记忆任务失败偏多", detail
+            )
+
         disk = snapshot.get("disk") or {}
         if not isinstance(disk, dict):
             disk = {}

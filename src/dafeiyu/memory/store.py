@@ -1929,12 +1929,18 @@ class Store:
         origin_message_id: str = "",
         dedupe_key: str = "",
         now: float | None = None,
+        next_attempt_at: float | None = None,
     ) -> int:
-        """把没发出去的一条分片排进待发队列；返回行 id（0 = 空文本，未入队）。"""
+        """把没发出去的一条分片排进待发队列；返回行 id（0 = 空文本，未入队）。
+
+        ``next_attempt_at`` 用于已知要等一阵子的失败（例如桥回 ``rate_limited``）：
+        直接排到指定时刻，避免每 15 秒撞一次限流。
+        """
         body = str(text or "")
         if not body.strip():
             return 0
         stamp = time.time() if now is None else float(now)
+        retry_at = stamp if next_attempt_at is None else max(stamp, float(next_attempt_at))
         cur = self._conn.execute(
             """
             INSERT INTO pending_outbox
@@ -1949,7 +1955,7 @@ class Store:
                 str(dedupe_key or ""),
                 str(origin_message_id or ""),
                 stamp,
-                stamp,
+                retry_at,
             ),
         )
         self._conn.commit()
@@ -1961,7 +1967,7 @@ class Store:
         rows = self._conn.execute(
             """
             SELECT id, chat_type, chat_id, text, dedupe_key, origin_message_id,
-                   attempts, enqueued_at
+                   attempts, enqueued_at, last_error
             FROM pending_outbox
             WHERE next_attempt_at <= ?
             ORDER BY id
@@ -1988,15 +1994,32 @@ class Store:
         self._conn.execute("DELETE FROM pending_outbox WHERE id = ?", (int(row_id),))
         self._conn.commit()
 
-    def defer_outbox(self, row_id: int, *, error: str, next_attempt_at: float) -> int:
-        """记一次失败并推迟；返回累计尝试次数。"""
+    def defer_outbox(
+        self,
+        row_id: int,
+        *,
+        error: str,
+        next_attempt_at: float,
+        bump_attempts: bool = True,
+    ) -> int:
+        """记一次失败并推迟；返回累计尝试次数。
+
+        ``bump_attempts=False`` 用于「不是真的失败，只是要等窗口」的情况
+        （桥回 ``rate_limited``）：不能因为它耗掉重试次数，否则一整晚的限流
+        会把消息直接推到上限丢掉。
+        """
         self._conn.execute(
             """
             UPDATE pending_outbox
-            SET attempts = attempts + 1, last_error = ?, next_attempt_at = ?
+            SET attempts = attempts + ?, last_error = ?, next_attempt_at = ?
             WHERE id = ?
             """,
-            (str(error or "")[:300], float(next_attempt_at), int(row_id)),
+            (
+                1 if bump_attempts else 0,
+                str(error or "")[:300],
+                float(next_attempt_at),
+                int(row_id),
+            ),
         )
         self._conn.commit()
         row = self._conn.execute(

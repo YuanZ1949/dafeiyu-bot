@@ -224,7 +224,7 @@ class SessionAligner:
 
     def _build_message(self, entry: Entry) -> dict[str, Any]:
         self._seq += 1
-        at_bot, at_all = self._detect_at(entry.text)
+        at_bot, at_all, at_others = self._detect_at(entry.text)
         reply_to_bot, reply_to_text = self._detect_reply(entry)
         return {
             "v": 1,
@@ -239,6 +239,7 @@ class SessionAligner:
             "kind": entry.kind,
             "at_bot": at_bot,
             "at_all": at_all,
+            "at_others": at_others,
             "reply_to_bot": reply_to_bot,
             "reply_to_text": reply_to_text,
             "reply_to_author": entry.reply_author or None,
@@ -270,10 +271,14 @@ class SessionAligner:
             self._user_aliases[name] = cached
         return f"wxg:{cached}"
 
-    def _detect_at(self, text: str) -> tuple[bool, bool]:
-        """返回 (at_bot, at_all)。@所有人 永远不算点名机器人。"""
+    def _detect_at(self, text: str) -> tuple[bool, bool, bool]:
+        """返回 (at_bot, at_all, at_others)。@所有人 永远不算点名机器人。
+
+        ``at_others`` 是「@ 了别的群友」：屏幕上只能看到渲染后的文本，所以
+        用「@ 后面那串昵称是否等于本账号的任一身份」来判断；不等就是别人。
+        """
         if any(token in text for token in AT_ALL_TOKENS):
-            return False, True
+            return False, True, False
         if not self.self_nicknames:
             if not self._warned_no_nickname:
                 self._warned_no_nickname = True
@@ -281,8 +286,9 @@ class SessionAligner:
                     "account_nickname 为空：会话 %s 的 @ 判定一律 False（拒绝把任何 @ 当点名）",
                     self.chat_id,
                 )
-            return False, False
-        return any(_mentions(text, name) for name in self.self_nicknames), False
+            return False, False, _other_mention(text, ())
+        at_bot = any(_mentions(text, name) for name in self.self_nicknames)
+        return at_bot, False, _other_mention(text, self.self_nicknames)
 
     def _detect_reply(self, entry: Entry) -> tuple[bool, str | None]:
         """引用块作者 == 本账号昵称才算「回复机器人」。
@@ -398,6 +404,33 @@ def _mentions(text: str, nickname: str) -> bool:
         if end == len(text) or not _is_name_char(text[end]):
             return True
         start = text.find(needle, start + 1)
+    return False
+
+
+#: `@所有人` / `@全体成员` 里被 @ 的那串字；不算「@ 了别的群友」。
+_AT_ALL_NAMES = ("所有人", "全体成员")
+
+
+def _mention_names(text: str) -> list[str]:
+    """把文本里所有 ``@昵称`` 的昵称抠出来（渲染后文本的唯一可靠来源）。"""
+    names: list[str] = []
+    index = text.find("@")
+    while index != -1:
+        end = index + 1
+        while end < len(text) and _is_name_char(text[end]):
+            end += 1
+        if end > index + 1:
+            names.append(text[index + 1 : end])
+        index = text.find("@", index + 1)
+    return names
+
+
+def _other_mention(text: str, self_nicknames: tuple[str, ...]) -> bool:
+    """是否 @ 了别的群友：@所有人 不算，@本账号任一身份也不算。"""
+    for name in _mention_names(text):
+        if name in _AT_ALL_NAMES or name in self_nicknames:
+            continue
+        return True
     return False
 
 

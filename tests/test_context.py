@@ -1,4 +1,6 @@
 
+import time
+
 import pytest
 
 from dafeiyu.config import InjectionConfig
@@ -90,7 +92,7 @@ def test_impressions_dropped_after_window_shrinks(store: Store) -> None:
     bundle = build_context(store, GROUP, CHAT, 20, 5, "系统", "2026-10-24")
     assert len(bundle.messages) == 1
     assert "群友印象" not in bundle.system
-    assert "昨日摘要" not in bundle.system
+    assert "近期摘要" not in bundle.system
 
 
 def test_summary_used_when_budget_allows(store: Store) -> None:
@@ -157,7 +159,9 @@ def _seed_episode(
             importance=importance,
             mood=mood,
             phase=phase,
-            started_at=100,
+            # 用「刚开不久」的时间：超过 1 小时的 episode 会带年龄标签、多占预算，
+            # 预算相关用例不需要这层噪音（年龄标签另有专门用例）。
+            started_at=int(time.time()),
         )
     )
 

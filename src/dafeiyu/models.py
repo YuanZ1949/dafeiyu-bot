@@ -82,6 +82,9 @@ class Message:
     reply_to_author: str | None = None
     # @所有人：不是点名，但时间线要能看出这是广播。
     at_all: bool = False
+    # @ 的是别的群友：这句在叫别人，不是叫 bot。和 at_all 一样只在内存里，
+    # 不落库；下一次从库里回读时会丢失这个标记（只影响旧消息的展示）。
+    at_others: bool = False
     # 跨群镜像写入的行：以 is_bot=1 落库，但不进目标群提示词、不参与
     # 「上一条是不是 bot 提问」判定；仅保留在回声种子里。
     mirror: bool = False

@@ -17,6 +17,7 @@ from dafeiyu.config import (
     Settings,
     TriggerConfig,
 )
+from dafeiyu.gateway.base import GatewayError
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router
@@ -52,9 +53,12 @@ class FlakyAdapter:
     def __init__(self) -> None:
         self.sent: list[tuple[ChatType, str, str]] = []
         self.fail = False
+        self.rate_limited = False
         self.connected = True
 
     async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str:
+        if self.rate_limited:
+            raise GatewayError("桥返回限流", error_code="rate_limited")
         if self.fail:
             raise RuntimeError("微信桥已断开")
         self.sent.append((chat_type, chat_id, text))
@@ -169,6 +173,81 @@ async def test_outbox_store_defers_and_orders(tmp_path: Path) -> None:
     store.drop_outbox(first)
     assert [row["id"] for row in store.due_outbox(now=250.0)] == [second]
     assert store.outbox_size() == 1
+
+
+# ---------------------------------------------------------------- 限流（429/rate_limited）
+async def test_rate_limited_first_send_waits_for_next_hour(tmp_path: Path) -> None:
+    """桥回 rate_limited：不是丢消息，也不是 15 秒撞一次墙，而是排到下一整点。"""
+    service, store, adapter = build(tmp_path)
+    adapter.rate_limited = True
+    now = time.time()
+    next_hour = (int(now) // 3600 + 1) * 3600
+
+    sent = await service._send_batch_reply(
+        [make_msg()], BrainReply(True, "答案在这里。", "test", 0, 0),
+        ChatType.GROUP, CHAT,
+    )
+
+    assert sent == []
+    # 现在还没到点：不能马上重试。
+    assert store.due_outbox(now=now + 1) == []
+    rows = store.due_outbox(now=next_hour + 1)
+    assert [row["text"] for row in rows] == ["答案在这里。"]
+
+
+async def test_flush_rate_limited_does_not_burn_attempts(tmp_path: Path) -> None:
+    service, store, adapter = build(tmp_path)
+    now = time.time()
+    row_id = store.enqueue_outbox(ChatType.GROUP, CHAT, "等限流解除", now=now)
+    adapter.rate_limited = True
+
+    assert await service._flush_outbox() == 0
+
+    rows = store.due_outbox(now=time.time() + 1)
+    assert rows == [], "限流后要等下一整点，不能马上再试"
+    later = store.due_outbox(now=(int(time.time()) // 3600 + 1) * 3600 + 1)
+    assert [row["id"] for row in later] == [row_id]
+    assert later[0]["attempts"] == 0
+    assert later[0]["last_error"] == "rate_limited"
+
+
+async def test_rate_limited_row_survives_past_normal_max_age(tmp_path: Path) -> None:
+    """限流可能持续一整晚：这类行给 26 小时保鲜期，普通失败仍是 6 小时。"""
+    store = Store(str(tmp_path / "age.db"))
+    store.init_schema()
+    adapter = FlakyAdapter()
+    adapter.connected = False
+    settings = make_settings()
+    router = Router(settings, store, clock=lambda: NOON)
+    service = Service(
+        settings, store, object(), {"qq": adapter}, router, "你是溟月"
+    )
+    old = time.time() - 20 * 3600
+
+    normal = store.enqueue_outbox(ChatType.GROUP, CHAT, "普通失败", now=old)
+    limited = store.enqueue_outbox(ChatType.GROUP, CHAT, "限流失败", now=old)
+    store.defer_outbox(normal, error="RuntimeError: boom", next_attempt_at=old)
+    store.defer_outbox(limited, error="rate_limited", next_attempt_at=old)
+
+    await service._flush_outbox()
+
+    remaining = [row["id"] for row in store.due_outbox(now=time.time())]
+    assert remaining == [limited]
+    assert normal not in remaining
+
+
+def test_defer_outbox_can_skip_attempt_bump(tmp_path: Path) -> None:
+    store = Store(str(tmp_path / "bump.db"))
+    store.init_schema()
+    row = store.enqueue_outbox(ChatType.GROUP, CHAT, "x", now=100.0)
+
+    assert (
+        store.defer_outbox(
+            row, error="rate_limited", next_attempt_at=200.0, bump_attempts=False
+        )
+        == 0
+    )
+    assert store.defer_outbox(row, error="boom", next_attempt_at=300.0) == 1
 
 
 async def test_blank_text_is_not_queued(tmp_path: Path) -> None:

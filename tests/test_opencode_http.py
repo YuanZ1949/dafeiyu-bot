@@ -47,6 +47,7 @@ class FakeServer:
         error: dict | None = None,
         round_system: str | None = None,
         round_extra: dict[str, Any] | None = None,
+        finish: str = "",
     ) -> None:
         self.answer = answer
         self.complete = complete
@@ -59,6 +60,8 @@ class FakeServer:
         # 本轮窗口里额外出现的消息：模拟 opencode 自己写的 system 提示 / 外来注入。
         self.round_system = round_system
         self.round_extra = round_extra
+        # assistant 的 finish 标记（stop / length / aborted…）：为空表示不带。
+        self.finish = finish
         self.pending_steps = list(self.steps[1:]) if self.steps else []
         self.known = {"ses_old"}
         self.messages: dict[str, list[dict]] = {"ses_old": []}
@@ -232,6 +235,8 @@ class FakeServer:
                 if self.error is not None:
                     entry["finish"] = "error"
                     entry["error"] = self.error
+                elif self.finish:
+                    entry["finish"] = self.finish
                 self.messages[sid].append(entry)
             else:
                 self._append_step(sid, self.steps[0])

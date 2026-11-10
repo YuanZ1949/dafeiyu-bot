@@ -52,6 +52,19 @@ _ALIAS_BOUNDARY = frozenset(
 )
 
 
+def _age_text(seconds: int) -> str:
+    """「多久以前」的人话：分钟 / 小时 / 天，供局势提示使用。"""
+    if seconds >= 86400:
+        days, rest = divmod(seconds, 86400)
+        hours = rest // 3600
+        return f"{days} 天" + (f" {hours} 小时" if hours else "")
+    if seconds >= 3600:
+        hours, rest = divmod(seconds, 3600)
+        minutes = rest // 60
+        return f"{hours} 小时" + (f" {minutes} 分钟" if minutes else "")
+    return f"{max(1, seconds // 60)} 分钟"
+
+
 def _alias_is_vocative(text: str, alias: str) -> bool:
     """判断别名在文本里是「在叫它」还是「只是提到它」。"""
     needle = alias.casefold()
@@ -415,20 +428,20 @@ class Router:
         if not self.is_thread_closed(chat_type, chat_id, now):
             return ""
         st = self._state(chat_type, chat_id)
-        minutes = (
-            int((now - st.last_bot_spoke).total_seconds() // 60)
+        seconds = (
+            int((now - st.last_bot_spoke).total_seconds())
             if st.last_bot_spoke is not None
             else 0
         )
         if st.ambient_streak > 0:
             situation = f"你最近在这里连着主动说了 {st.ambient_streak} 条，"
-            if minutes >= 1:
-                situation += f"最后一条在约 {minutes} 分钟前，"
+            if seconds >= 60:
+                situation += f"最后一条在约 {_age_text(seconds)}前，"
             situation += "之后暂时没人接话。"
         else:
             situation = (
-                f"你上一条发言在约 {minutes} 分钟前，之后暂时没人接话。"
-                if minutes >= 1
+                f"你上一条发言在约 {_age_text(seconds)}前，之后暂时没人接话。"
+                if seconds >= 60
                 else "你刚说过一轮，之后暂时没人接话。"
             )
         return (

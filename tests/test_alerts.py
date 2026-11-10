@@ -808,6 +808,60 @@ async def test_backup_and_memory_rules_silent_when_healthy(tmp_path: Path) -> No
     assert channel.sent == []
 
 
+async def test_memory_errors_fire_for_repeated_bypass_failures(tmp_path: Path) -> None:
+    """摘要/印象/观察反复失败：回复照常，但记忆在静默落后，必须告警。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["bot"]["memory_failures"] = {
+        "recent_count": 3,
+        "window_seconds": 1800,
+        "labels": ["摘要: ConnectError", "印象: BrainError"],
+    }
+
+    await mgr.evaluate(snapshot)
+
+    assert [item.rule for item, _event in channel.sent] == ["memory_errors"]
+    detail = channel.sent[0][0].detail
+    assert "1800 秒内 3 次" in detail
+    assert "摘要: ConnectError" in detail
+
+
+async def test_memory_errors_silent_below_threshold(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["bot"]["memory_failures"] = {
+        "recent_count": 2,
+        "window_seconds": 1800,
+        "labels": ["摘要: ConnectError"],
+    }
+
+    await mgr.evaluate(snapshot)
+
+    assert channel.sent == []
+
+
+async def test_memory_errors_silent_while_quota_paused(tmp_path: Path) -> None:
+    """额度熔断本来就会让旁路失败，不该在已知原因上再叠一条。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["bot"]["quota"]["paused_until"] = clock.now + 60
+    snapshot["bot"]["memory_failures"] = {
+        "recent_count": 5,
+        "window_seconds": 1800,
+        "labels": ["摘要: BrainError"],
+    }
+
+    await mgr.evaluate(snapshot)
+
+    assert "memory_errors" not in {item.rule for item, _event in channel.sent}
+
+
 async def test_backup_stale_exempt_when_backups_disabled(tmp_path: Path) -> None:
     """关闭备份的部署不该永远挂一条「备份过期」。"""
     clock = Clock()

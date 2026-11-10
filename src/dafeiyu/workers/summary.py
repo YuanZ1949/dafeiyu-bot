@@ -10,6 +10,7 @@ from typing import Any
 from dafeiyu.brain.client import BrainError
 from dafeiyu.brain.tokens import estimate_tokens, resolve_usage
 from dafeiyu.memory.store import Store
+from dafeiyu.memory.summary_text import clean_summary, clip_summary
 from dafeiyu.models import ChatType, Message, channel_of
 from dafeiyu.timeutil import SHANGHAI, now_shanghai
 
@@ -72,10 +73,6 @@ WEEKLY_SYSTEM = """你是群聊记录整理助手。下面是某个群一周的�
 # （如 provider.timeout）说明上游已明确失败，重试只会重复撞墙，交给退避。
 TIMEOUT_HINT = "OpenCode 超时"
 
-# 截断摘要时优先落在句末，避免把最后一句话切成半句。
-_CLIP_BOUNDARIES = "。！？；!?;\n"
-
-
 def _summary_budget(message_count: int) -> int:
     """按当天全部消息数给摘要字数：≤30 条 150 字，31–200 条 200 字，更多 300 字。"""
     if message_count <= QUIET_DAY_MESSAGES:
@@ -86,16 +83,8 @@ def _summary_budget(message_count: int) -> int:
 
 
 def _clip_summary(text: str, limit: int = MAX_SUMMARY_CHARS) -> str:
-    """收敛模型输出：优先在句末标点处断开，找不到合适断点才硬截断并加省略号。"""
-    body = (text or "").strip()
-    if len(body) <= limit:
-        return body
-    window = body[:limit]
-    cut = max(window.rfind(ch) for ch in _CLIP_BOUNDARIES)
-    # 断点太靠前（不足一半）说明第一句本身很短，截到那里会丢掉大部分内容，此时宁可硬截断。
-    if cut + 1 >= limit // 2:
-        return window[: cut + 1].rstrip()
-    return window[: limit - 1].rstrip() + "…"
+    """收敛模型输出：先清 agent 元文本，再按句末断点截断并补「…」。"""
+    return clip_summary(clean_summary(text), limit)
 
 
 def _day_bounds(date: str) -> tuple[int, int]:

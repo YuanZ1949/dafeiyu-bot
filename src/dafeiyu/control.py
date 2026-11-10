@@ -1050,6 +1050,21 @@ class BrainControl:
                                 )
                         channels[str(name)] = entry
 
+        memory_failures: dict[str, Any] = {
+            "recent_count": 0,
+            "window_seconds": 0,
+            "labels": [],
+        }
+        failure_stats = getattr(self.service, "memory_failure_stats", None)
+        if callable(failure_stats):
+            try:
+                raw_failures = failure_stats()
+            except Exception as exc:  # noqa: BLE001 - 探活不能因旁路计数失败而 500
+                log.warning("读取旁路失败计数失败：%s", exc)
+            else:
+                if isinstance(raw_failures, dict):
+                    memory_failures = raw_failures
+
         return {
             "ok": ok,
             "generated_at": generated_at,
@@ -1087,6 +1102,9 @@ class BrainControl:
             "free_reason": state["free_reason"],
             "memory": memory,
             "errors": errors,
+            # 旁路任务（摘要/印象/观察/反思）的失败计数：只给告警看趋势，
+            # 不含正文。与 errors（回复链路的 decision 错误）分开。
+            "memory_failures": memory_failures,
         }
 
     def budget_snapshot(self, chat_type: ChatType, chat_id: str) -> dict[str, Any]:

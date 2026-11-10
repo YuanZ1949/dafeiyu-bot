@@ -211,6 +211,31 @@ async def test_complete_returns_raw_content_without_json_instruction(client) -> 
 
 
 @respx.mock
+async def test_complete_rejects_length_truncated_output(client) -> None:
+    """旁路任务拿到半截文本就是脏数据：宁可失败重试，也不落库。"""
+    client, _ = client
+    respx.post(URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": "摘要写到一半"},
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            },
+        )
+    )
+
+    with pytest.raises(BrainError):
+        await client.complete_detailed(
+            "你是整理器", [{"role": "user", "content": "x"}], max_tokens=600
+        )
+
+
+@respx.mock
 async def test_429_error_carries_status(client) -> None:
     """限流判定不能只靠文案：BrainError 得把 HTTP 状态码带出来。"""
     client, _ = client

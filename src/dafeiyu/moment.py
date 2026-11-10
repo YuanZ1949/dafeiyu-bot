@@ -264,6 +264,9 @@ def answers_bot_question(
     """
     if previous is None or not previous.is_bot or current.is_bot:
         return False
+    # 这句在 @ 别人（或 @所有人）：它在叫别人，不是在接 bot 的话。
+    if current.at_others or current.at_all:
+        return False
     if (
         max_gap_seconds
         and current.timestamp

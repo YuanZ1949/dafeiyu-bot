@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import pytest
 from test_opencode_http import FakeServer, make_brain
 
+from dafeiyu.brain.client import BrainError
 from dafeiyu.brain.opencode_http import OpenCodeHttpBrain
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType
@@ -71,6 +72,20 @@ async def test_delete_failure_does_not_break_complete(fake_404_delete: Fake) -> 
 
     assert text
     assert ("DELETE", "/api/session/ses_new") in fake_404_delete.server.calls
+
+
+@pytest.mark.parametrize("finish", ["length", "aborted", "content_filter"])
+async def test_complete_detailed_rejects_truncated_finish(
+    store: Store, finish: str
+) -> None:
+    """半截摘要会以「已完成的事实」进上下文：检测到截断必须抛错重试。"""
+    server = FakeServer(finish=finish)
+    brain = make_brain(store, server)
+    try:
+        with pytest.raises(BrainError):
+            await brain.complete_detailed("s", [{"role": "user", "content": "x"}])
+    finally:
+        await brain.aclose()
 
 
 async def test_forget_deletes_remote_session(fake: Fake) -> None:

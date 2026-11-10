@@ -30,6 +30,44 @@ class MemoryPaused(Exception):
     """配额熔断生效中：手动触发也不要再撞墙。"""
 
 
+#: 旁路任务（摘要/印象/观察/反思）最近的失败事件：只留内存，供健康快照告警。
+#: 不进库、不带消息正文——它只回答「最近失败得是不是太频繁」。
+_FAILURE_EVENTS: list[tuple[float, str]] = []
+_FAILURE_RETENTION_SECONDS = 24 * 3600
+
+
+def note_memory_failure(label: str, exc: BaseException) -> None:
+    """记一次旁路任务失败（时间 + 标签），供告警读最近窗口的计数。"""
+    now = time.time()
+    _FAILURE_EVENTS.append((now, f"{label}: {type(exc).__name__}"))
+    cutoff = now - _FAILURE_RETENTION_SECONDS
+    while _FAILURE_EVENTS and _FAILURE_EVENTS[0][0] < cutoff:
+        _FAILURE_EVENTS.pop(0)
+
+
+def recent_failure_count(window_seconds: float = 1800.0) -> int:
+    """最近 ``window_seconds`` 内旁路失败的次数。"""
+    cutoff = time.time() - float(window_seconds)
+    return sum(1 for stamp, _label in _FAILURE_EVENTS if stamp >= cutoff)
+
+
+def recent_failure_labels(limit: int = 3) -> list[str]:
+    """最近几次失败的标签（去重、最多 ``limit`` 条），用于告警详情。"""
+    labels: list[str] = []
+    for _stamp, label in reversed(_FAILURE_EVENTS):
+        if label in labels:
+            continue
+        labels.append(label)
+        if len(labels) >= limit:
+            break
+    return labels
+
+
+def reset_memory_failures() -> None:
+    """清空失败事件（测试与面板手动复位用）。"""
+    _FAILURE_EVENTS.clear()
+
+
 def log_memory_failure(
     logger: logging.Logger,
     label: str,
@@ -43,6 +81,7 @@ def log_memory_failure(
     避免每轮刷整段 traceback 把真正的 bug 埋掉；其它异常按内部错误记全栈。
     必须在 except 块内调用，logger.exception 依赖当前异常上下文。
     """
+    note_memory_failure(label, exc)
     if isinstance(exc, BrainError):
         logger.warning(
             "%s失败（外部）：%s/%s %s", label, chat_type.value, chat_id, exc

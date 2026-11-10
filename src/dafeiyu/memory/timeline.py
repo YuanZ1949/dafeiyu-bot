@@ -16,12 +16,35 @@ from dafeiyu.timeutil import SHANGHAI
 TIMELINE_LIMIT = 20
 TIMELINE_HINT = (
     "以上是自你上次开口以来的新消息，按时间顺序排列。"
-    "通读整段再决定要不要开口：被 @ 或引用必须回；"
+    "通读整段再决定要不要开口：@了你或引用回复你才必须回；"
+    "如果 @ 的是别的群友（行尾标了「@了别的群友」），那是在叫别人，别抢答；"
     "其余情况只在你对整段讨论有自己的看法时才开口，回就回你的观点，不是逐条应答。"
 )
 BATCH_HEADER = "—— 以下是自你上次开口以来的新消息 ——"
 CONTINUATION_HEADER = "【接续】"
 EMPTY_CONTENT = "（无文字内容）"
+
+#: 两条消息间隔超过这么久，提示模型「中间空了一段」，别把旧话题硬接过来。
+PAUSE_NOTICE_SECONDS = 30 * 60
+PAUSE_LINE_TEMPLATE = (
+    "【停顿 {duration}】上一条消息到现在隔了这么久，中间群里没有新消息。"
+    "上一段话题可能已经过去，也可能还连着：先看这批消息是不是接着同一件事说，"
+    "别把旧话题硬接过来。"
+)
+GAP_LINE_TEMPLATE = "（这里隔了 {duration}没有消息）"
+
+
+def gap_text(seconds: float) -> str:
+    """把秒数写成「N 分钟 / N 小时 / N 天」，用于停顿提示。"""
+    total = int(max(0.0, seconds))
+    if total < 3600:
+        return f"{max(1, total // 60)} 分钟"
+    if total < 86400:
+        hours, minutes = divmod(total // 60, 60)
+        return f"{hours} 小时" + (f" {minutes} 分钟" if minutes else "")
+    days, rest = divmod(total, 86400)
+    hours = rest // 3600
+    return f"{days} 天" + (f" {hours} 小时" if hours else "")
 
 
 def time_label(timestamp: int) -> str:
@@ -75,6 +98,8 @@ def format_message_line(
     marks: list[str] = []
     if msg.at_all:
         marks.append("（@所有人）")
+    if msg.at_others:
+        marks.append("（@了别的群友）")
     if msg.reply_to_bot or msg.reply_to_text or msg.reply_to_author:
         quote = _quote_mark(msg, reply_names)
         if quote:
@@ -128,6 +153,7 @@ def build_batch_prompt(
     omitted: int = 0,
     reply_names: dict[str, str] | None = None,
     mention_ids: frozenset[str] | None = None,
+    gap_seconds: float = 0.0,
 ) -> str:
     """批次 prompt：注入段 →（接续）→ 新消息时间线。
 
@@ -136,19 +162,36 @@ def build_batch_prompt(
     模型才知道哪几句是对它说的、是 @ 还是引用回复。
     单条路径复用同一构建器，omitted 是更早未展开的消息数（由 pending 查询给出）。
     reply_names 是「被回复消息 id → 昵称」，用来渲染群友之间的「（回复 X）」。
+    gap_seconds 是这一批第一条消息与上一批之间的空档：够长就明确提示「停顿」，
+    让模型重新判断旧话题是否已经过去，而不是顺着很久以前的话头接。
     """
     parts: list[str] = []
     if injection.strip():
         parts.append(injection.strip())
     if continuation:
         parts.append(f"{CONTINUATION_HEADER}\n{continuation}")
+    if gap_seconds >= PAUSE_NOTICE_SECONDS:
+        parts.append(PAUSE_LINE_TEMPLATE.format(duration=gap_text(gap_seconds)))
 
     if messages:
         lines: list[str] = []
         if omitted:
             lines.append(f"（更早还有 {omitted} 条消息未展开）")
         lines.append(BATCH_HEADER)
+        previous_ts = 0
         for msg in messages:
+            if (
+                previous_ts
+                and msg.timestamp
+                and msg.timestamp - previous_ts >= PAUSE_NOTICE_SECONDS
+            ):
+                lines.append(
+                    GAP_LINE_TEMPLATE.format(
+                        duration=gap_text(msg.timestamp - previous_ts)
+                    )
+                )
+            if msg.timestamp:
+                previous_ts = msg.timestamp
             current = msg if (msg.at_bot or msg.reply_to_bot) else None
             lines.append(
                 format_message_line(

@@ -510,6 +510,8 @@ def parse_event(
     if isinstance(raw_message, str):
         content = raw_message.strip()
         at_bot = False
+        at_all = False
+        at_others = False
     elif isinstance(raw_message, list):
         content, segments, reply_id, reply_qq, attachments = _render_segments(
             raw_message, bot_qq=bot_qq
@@ -517,9 +519,22 @@ def parse_event(
         at_bot = any(
             seg.type == "at" and str(seg.data.get("qq", "")) == str(bot_qq) for seg in segments
         )
+        at_all = any(
+            seg.type == "at" and str(seg.data.get("qq", "")).strip() == "all"
+            for seg in segments
+        )
+        # @ 了别的群友不是点名 bot：时间线要标出来，避免抢答。
+        # @全体成员 归 at_all，也不算「@了别的群友」。
+        at_others = any(
+            seg.type == "at"
+            and str(seg.data.get("qq", "")).strip() not in ("", "all", str(bot_qq))
+            for seg in segments
+        )
     else:
         content = ""
         at_bot = False
+        at_all = False
+        at_others = False
 
     reply_to_bot = (
         reply_id is not None and reply_id in {str(i) for i in bot_message_ids}
@@ -536,6 +551,8 @@ def parse_event(
         # 两边都是带前缀的字符串；留成 int == str 会恒为 False（回声过滤失效）。
         is_bot=user_id == _qq_id(bot_qq),
         at_bot=at_bot,
+        at_all=at_all,
+        at_others=at_others,
         reply_to_bot=reply_to_bot,
         reply_to_message_id=reply_id or None,
         reply_to_user_id=_qq_id(reply_qq) if reply_qq else None,

@@ -524,6 +524,9 @@ class AlertRulesConfig:
     backup_stale_hours: int = 25
     # 记忆摘要缺口达到这么多天（pending_count）就告警；额度熔断时豁免。
     memory_gap_days: int = 2
+    # 旁路任务（摘要/印象/观察/反思）在窗口内失败这么多次就告警；额度熔断时豁免。
+    memory_error_count: int = 3
+    memory_error_window_seconds: int = 1800
 
 
 @dataclass(frozen=True)
@@ -813,6 +816,16 @@ def _build_alerts(raw: dict[str, Any]) -> AlertsConfig:
         ),
         memory_gap_days=_positive_int(
             rules_raw.get("memory_gap_days"), "alerts.rules.memory_gap_days", 2
+        ),
+        memory_error_count=_positive_int(
+            rules_raw.get("memory_error_count"),
+            "alerts.rules.memory_error_count",
+            3,
+        ),
+        memory_error_window_seconds=_positive_int(
+            rules_raw.get("memory_error_window_seconds"),
+            "alerts.rules.memory_error_window_seconds",
+            1800,
         ),
     )
     return AlertsConfig(

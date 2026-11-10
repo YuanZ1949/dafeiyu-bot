@@ -24,6 +24,8 @@ def make_msg(
     nickname: str = "阿猫",
     user_id: int = 1,
     at_bot: bool = False,
+    at_all: bool = False,
+    at_others: bool = False,
     reply_to_bot: bool = False,
     reply_to_message_id: str | None = None,
 ) -> Message:
@@ -37,6 +39,8 @@ def make_msg(
         is_bot=is_bot,
         timestamp=timestamp,
         at_bot=at_bot,
+        at_all=at_all,
+        at_others=at_others,
         reply_to_bot=reply_to_bot,
         reply_to_message_id=reply_to_message_id,
     )
@@ -141,6 +145,16 @@ def test_answers_bot_question_only_for_direct_short_reply() -> None:
         timestamp=1005,
     )
     assert answers_bot_question(long, bot) is False
+
+
+def test_at_others_is_not_an_implicit_answer() -> None:
+    """紧跟在 bot 提问后面、却在 @ 别人：那是在叫别人，不是回答我。"""
+    bot = make_msg("你用的什么卡？", is_bot=True, timestamp=1000, nickname="溟月")
+    user = make_msg("4060", timestamp=1005, at_others=True)
+
+    assert answers_bot_question(user, bot) is False
+    # 广播同理：@所有人 不是对着我说话。
+    assert answers_bot_question(make_msg("4060", timestamp=1005, at_all=True), bot) is False
 
 
 def test_requests_continuation_recognizes_short_followups() -> None:

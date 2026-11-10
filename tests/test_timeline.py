@@ -40,6 +40,7 @@ def make_msg(
     reply_to_text: str | None = None,
     reply_to_author: str | None = None,
     at_all: bool = False,
+    at_others: bool = False,
     is_bot: bool = False,
 ) -> Message:
     return Message(
@@ -55,6 +56,7 @@ def make_msg(
         reply_to_text=reply_to_text,
         reply_to_author=reply_to_author,
         at_all=at_all,
+        at_others=at_others,
         is_bot=is_bot,
         timestamp=timestamp,
     )
@@ -203,6 +205,55 @@ def test_at_all_is_rendered() -> None:
     line = format_message_line(make_msg("@所有人 开会了", "m1", at_all=True))
     assert line.endswith("（@所有人）")
     assert "（@了你）" not in line
+
+
+def test_at_others_is_rendered() -> None:
+    line = format_message_line(make_msg("@群友 你看这个", "m1", at_others=True))
+    assert line.endswith("（@了别的群友）")
+    assert "（@了你）" not in line
+
+
+def test_batch_prompt_marks_long_pause_before_batch() -> None:
+    from dafeiyu.memory.timeline import build_batch_prompt
+
+    prompt = build_batch_prompt(
+        [make_msg("新话题", "m2", timestamp=at(21, 30))],
+        "",
+        gap_seconds=2 * 3600,
+    )
+
+    assert "【停顿 2 小时】" in prompt
+    assert "别把旧话题硬接过来" in prompt
+
+
+def test_batch_prompt_marks_pause_between_messages() -> None:
+    from dafeiyu.memory.timeline import build_batch_prompt
+
+    prompt = build_batch_prompt(
+        [
+            make_msg("旧的", "m1", timestamp=at(18, 0)),
+            make_msg("隔了很久才回", "m2", timestamp=at(19, 30)),
+        ],
+        "",
+    )
+
+    assert "（这里隔了 1 小时 30 分钟没有消息）" in prompt
+
+
+def test_batch_prompt_skips_short_gap_notice() -> None:
+    from dafeiyu.memory.timeline import build_batch_prompt
+
+    prompt = build_batch_prompt(
+        [
+            make_msg("一", "m1", timestamp=at(18, 0)),
+            make_msg("二", "m2", timestamp=at(18, 5)),
+        ],
+        "",
+        gap_seconds=300,
+    )
+
+    assert "【停顿" not in prompt
+    assert "这里隔了" not in prompt
 
 
 def test_bot_own_line_uses_second_person() -> None:

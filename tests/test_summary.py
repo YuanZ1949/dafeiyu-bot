@@ -91,7 +91,8 @@ async def test_summarize_cuts_at_last_sentence_boundary():
 
     text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
-    assert text == kept
+    # 截断必须留痕：按句末断开也要补「…」，模型/人才能看出后面还有内容。
+    assert text == kept + "…"
 
 
 @pytest.mark.asyncio
@@ -103,7 +104,7 @@ async def test_summarize_cuts_at_newline_boundary():
 
     text = await summarize_chat(store, brain, ChatType.GROUP, "qq:9001", YESTERDAY)
 
-    assert text == kept
+    assert text == kept + "…"
 
 
 @pytest.mark.asyncio
@@ -147,7 +148,7 @@ async def test_rotation_summary_cuts_at_sentence_boundary():
 
     text = await summarize_for_rotation(brain, store, ChatType.GROUP, "qq:9001", messages)
 
-    assert text == kept
+    assert text == kept + "…"
 
 
 @pytest.mark.asyncio

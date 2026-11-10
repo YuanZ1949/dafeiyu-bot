@@ -208,7 +208,7 @@ async def test_e2e_batch_reaches_model_and_sends(tmp_path):
     assert prompt.index("【长期记忆】") < prompt.index(
         "—— 以下是自你上次开口以来的新消息 ——"
     )
-    assert "【昨日摘要】" in prompt and "昨天聊了鱼缸" in prompt
+    assert "【近期摘要】" in prompt and "昨天聊了鱼缸" in prompt
     assert "【群友印象】" in prompt and "阿鱼：爱养鱼" in prompt
     assert "（@了你）" in prompt
     for text in ("今天水草长得不错", "鱼缸该换水了", "@溟月 你看这缸水草"):

@@ -486,7 +486,7 @@ async def test_prompt_contains_all_segments_and_timeline(tmp_path):
     assert prompt.index("【长期记忆】") < prompt.index(
         "—— 以下是自你上次开口以来的新消息 ——"
     )
-    assert "【昨日摘要】" in prompt and "昨天聊了鱼缸" in prompt
+    assert "【近期摘要】" in prompt and "昨天聊了鱼缸" in prompt
     assert "【群友印象】" in prompt and "阿鱼：爱养鱼" in prompt
     assert "第一批第二条" in prompt
 

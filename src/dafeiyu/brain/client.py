@@ -530,7 +530,10 @@ class BrainClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        content, prompt_tokens, completion_tokens, _ = await self._call(payload)
+        content, prompt_tokens, completion_tokens, finish_reason = await self._call(payload)
+        if finish_reason == "length":
+            # 半截文本对旁路任务是脏数据：宁可失败重试，也不落库。
+            raise BrainError("DeepSeek 补全被截断（finish_reason=length）")
         return _strip_fence(content), prompt_tokens, completion_tokens
 
     async def _call(self, payload: dict) -> tuple[str, int, int, str]:

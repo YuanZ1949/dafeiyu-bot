@@ -522,6 +522,80 @@ async def _extract_video_frames(
     return frames
 
 
+#: GIF 抽帧序号：第 0 帧经常是空白/纯色（微信动图实测），所以中段也取一张。
+_GIF_FRAME_INDICES = (0, 8, 24)
+
+
+def _extract_gif_frame(ffmpeg: str, source: Path, target: Path, index: int) -> bool:
+    """用 ffmpeg 的 select 滤镜取 GIF 第 ``index`` 帧；失败返回 False。"""
+    args = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-vf",
+        f"select=eq(n\\,{index})",
+        "-vsync",
+        "0",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        str(target),
+    ]
+    try:
+        completed = subprocess.run(
+            args,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=_VIDEO_TIMEOUT,
+            creationflags=_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("GIF 抽帧失败：%s", exc)
+        return False
+    if completed.returncode != 0:
+        log.debug("GIF 抽帧失败（exit=%s）", completed.returncode)
+        return False
+    try:
+        return target.is_file() and target.stat().st_size > 0
+    except OSError:
+        return False
+
+
+async def _extract_gif_frames(
+    root: Path, source: Path, digest: str
+) -> list[str]:
+    """把 GIF 的几帧抽成 jpg 存进 ``images/``，返回 workspace 相对路径。
+
+    ffmpeg 缺失、单帧失败都只跳过；绝不抛异常。第一帧是空白时，后面几帧
+    仍然能让模型看到动图内容。
+    """
+    ffmpeg = _locate("ffmpeg")
+    if not ffmpeg:
+        log.debug("ffmpeg 不可用，GIF 只保留原文件")
+        return []
+    directory = root / "images"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        log.info("GIF 抽帧目录创建失败：%s", directory, exc_info=True)
+        return []
+    frames: list[str] = []
+    for order, index in enumerate(_GIF_FRAME_INDICES, start=1):
+        target = directory / f"gif-{digest}-{order}.jpg"
+        ok = await asyncio.to_thread(
+            _extract_gif_frame, ffmpeg, source, target, index
+        )
+        if ok:
+            frames.append(f"images/{target.name}")
+    return frames
+
+
 async def _materialize_video(
     msg: Message,
     attachment: Attachment,
@@ -857,9 +931,27 @@ async def materialize_attachments(
             except OSError:
                 size = len(data)
             relative = _materialized_relative(target, root) or (f"images/{target.name}")
-            msg.content = _annotate_first(
-                msg.content, _ANNOTATED.format(path=relative)
-            )
+            if target.suffix.lower() == ".gif":
+                # 动图首帧常是空白（微信动图实测）：抽几帧 jpg 再给模型看。
+                frames = (
+                    await _extract_gif_frames(root, target, target.stem)
+                    if annotate
+                    else []
+                )
+                if frames:
+                    msg.content = _annotate_first(
+                        msg.content,
+                        f"[图片]（动图，已抽帧 {'、'.join(frames)}，"
+                        f"可用 read 查看；原文件 {relative}）",
+                    )
+                else:
+                    msg.content = _annotate_first(
+                        msg.content, _ANNOTATED.format(path=relative)
+                    )
+            else:
+                msg.content = _annotate_first(
+                    msg.content, _ANNOTATED.format(path=relative)
+                )
             updated.append(
                 Attachment(
                     kind=attachment.kind,

@@ -541,6 +541,7 @@ class WeChatAdapter:
             message_id=message_id,
             at_bot=bool(envelope.get("at_bot", False)),
             at_all=bool(envelope.get("at_all", False)),
+            at_others=bool(envelope.get("at_others", False)),
             reply_to_bot=bool(envelope.get("reply_to_bot", False)),
             reply_to_text=(
                 str(envelope["reply_to_text"])

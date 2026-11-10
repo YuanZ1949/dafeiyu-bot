@@ -134,6 +134,13 @@ class RoundResult:
     completion_tokens: int
     since: float
     until: float
+    #: 本轮最后一条 assistant 的 finish 标记（stop / length / aborted /
+    #: content_filter / error…）。补全类调用据此判断「是不是写一半被截断」。
+    finish: str = ""
+
+
+#: 一次性补全遇到这些 finish 说明内容没写完：宁可失败重试，也不写半截摘要。
+TRUNCATED_FINISHES = frozenset({"length", "aborted", "content_filter"})
 
 
 def _as_int(value: Any) -> int:
@@ -254,6 +261,11 @@ class OpenCodeHttpBrain:
         )
         try:
             result = await self._ask(session_id, text)
+            if result.finish in TRUNCATED_FINISHES:
+                # 半截摘要比没有摘要更糟：它会以「已完成的事实」进下一轮上下文。
+                raise BrainError(
+                    f"OpenCode 补全被截断（finish={result.finish}），本次结果丢弃"
+                )
             return (result.text, result.prompt_tokens, result.completion_tokens)
         finally:
             try:
@@ -502,6 +514,7 @@ class OpenCodeHttpBrain:
                         completion_tokens=completion_tokens,
                         since=since,
                         until=max((_created(m) for m in messages), default=since),
+                        finish=self._round_finish(messages),
                     )
             if time.monotonic() >= deadline:
                 raise BrainError(
@@ -524,6 +537,15 @@ class OpenCodeHttpBrain:
             m.get("type") == "assistant" and _join_text(m).strip()
             for m in messages
         )
+
+    @staticmethod
+    def _round_finish(messages: list[dict[str, Any]]) -> str:
+        """本轮最后一条 assistant 的 finish 标记；拿不到返回空串。"""
+        for message in reversed(messages):
+            if message.get("type") != "assistant":
+                continue
+            return str(message.get("finish") or "")
+        return ""
 
     @staticmethod
     def _round_error(messages: list[dict[str, Any]]) -> BrainError | None:

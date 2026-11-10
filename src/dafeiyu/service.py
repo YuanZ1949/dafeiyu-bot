@@ -65,6 +65,8 @@ from .workers.failure import (
     is_agent_missing_error,
     is_quota_error,
     is_rate_limit_error,
+    recent_failure_count,
+    recent_failure_labels,
 )
 from .workers.summary import summarize_for_rotation
 
@@ -156,6 +158,10 @@ _REMIND_STATUS_LABELS = {"pending": "待发", "sent": "已发", "canceled": "已
 OUTBOX_RETRY_SECONDS = 15.0
 OUTBOX_MAX_ATTEMPTS = 8
 OUTBOX_MAX_AGE_SECONDS = 6 * 3600
+# 桥回 rate_limited：不是内容/网络错误，等它说的窗口过去就能发。给一天保鲜期，
+# 并推迟到下一个整点再试，避免每 15 秒撞墙、把重试次数耗光后丢消息。
+RATE_LIMITED_CODE = "rate_limited"
+RATE_LIMITED_MAX_AGE_SECONDS = 26 * 3600
 # 轮换摘要的输入窗口（spec §9.2：最近 40 条）。
 ROTATION_WINDOW = 40
 # 微信图片密钥就绪等待：重启后缓存命中/内存扫描通常几秒内完成，留 20 秒余量。
@@ -598,6 +604,28 @@ class Service:
             return {"enabled": False}
         return self.keepalive.status()
 
+    def memory_failure_stats(self) -> dict[str, Any]:
+        """旁路任务（摘要/印象/观察/反思）最近的失败计数，供健康快照告警。
+
+        只暴露计数与标签，不含消息正文或昵称。
+        """
+        try:
+            window = int(
+                getattr(
+                    self.settings.alerts.rules,
+                    "memory_error_window_seconds",
+                    1800,
+                )
+            )
+        except (AttributeError, TypeError, ValueError):
+            window = 1800
+        window = max(60, window)
+        return {
+            "recent_count": recent_failure_count(window),
+            "window_seconds": window,
+            "labels": recent_failure_labels(),
+        }
+
     # -------------------------------------------------------------- 待发队列
     def _start_outbox(self) -> None:
         if self._outbox_task is not None:
@@ -618,6 +646,19 @@ class Service:
             except Exception:
                 log.exception("待发队列冲刷失败")
 
+    @staticmethod
+    def _is_rate_limited(exc: BaseException) -> bool:
+        """桥/网关是否明确回了限流：只有这一类值得「等到下一整点」。"""
+        return str(getattr(exc, "error_code", "") or "") == RATE_LIMITED_CODE
+
+    @staticmethod
+    def _next_hour(now: float) -> float:
+        return float((int(now) // 3600 + 1) * 3600)
+
+    @staticmethod
+    def _outbox_rate_limited(row: dict[str, Any]) -> bool:
+        return str(row.get("last_error") or "").startswith(RATE_LIMITED_CODE)
+
     async def _flush_outbox(self) -> int:
         """补发到期的行；返回成功条数（测试直接调它，不用等定时器）。"""
         now = time.time()
@@ -637,7 +678,12 @@ class Service:
             if lock is not None and lock.locked():
                 continue
             age = now - float(row["enqueued_at"] or 0.0)
-            if age > OUTBOX_MAX_AGE_SECONDS:
+            max_age = (
+                RATE_LIMITED_MAX_AGE_SECONDS
+                if self._outbox_rate_limited(row)
+                else OUTBOX_MAX_AGE_SECONDS
+            )
+            if age > max_age:
                 log.warning(
                     "待发消息超过 %.0f 分钟，丢弃 %s: %s",
                     age / 60,
@@ -662,6 +708,16 @@ class Service:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - 失败只退避，不丢队列
+                if self._is_rate_limited(exc):
+                    # 限流不是失败：不耗重试次数，直接排到下一个整点。
+                    self.store.defer_outbox(
+                        row_id,
+                        error=RATE_LIMITED_CODE,
+                        next_attempt_at=self._next_hour(now),
+                        bump_attempts=False,
+                    )
+                    log.warning("补发被限流，推迟到下一整点 %s: %s", chat_id, exc)
+                    continue
                 attempts = self.store.defer_outbox(
                     row_id,
                     error=f"{type(exc).__name__}: {exc}",
@@ -723,9 +779,18 @@ class Service:
             raise
         except Exception as exc:  # noqa: BLE001 - 失败转队列，不打断主流程
             log.warning("发送失败，转入待发队列 %s/%s: %s", chat_id, origin or "-", exc)
-            self.store.enqueue_outbox(
-                chat_type, chat_id, text, origin_message_id=origin
-            )
+            if self._is_rate_limited(exc):
+                self.store.enqueue_outbox(
+                    chat_type,
+                    chat_id,
+                    text,
+                    origin_message_id=origin,
+                    next_attempt_at=self._next_hour(time.time()),
+                )
+            else:
+                self.store.enqueue_outbox(
+                    chat_type, chat_id, text, origin_message_id=origin
+                )
             return False
         return True
 
@@ -2843,14 +2908,34 @@ class Service:
                 log.warning("发送失败 %s/%s: %s", chat_id, batch[-1].message_id, exc)
                 # 失败这条和后面所有分片一起进待发队列：通道恢复后补发，
                 # 不让这段回复永久丢失。
+                # 若是桥明确回的限流，推迟到下一个整点再补，而不是每 15 秒撞墙。
+                retry_at = (
+                    self._next_hour(time.time())
+                    if self._is_rate_limited(exc)
+                    else None
+                )
                 for offset, rest in enumerate(chunks[index:]):
-                    if self.store.enqueue_outbox(
-                        chat_type,
-                        chat_id,
-                        rest,
-                        origin_message_id=batch[-1].message_id,
-                        dedupe_key=f"reply:{chat_id}:{batch[-1].message_id}:{index + offset}",
-                    ):
+                    dedupe_key = (
+                        f"reply:{chat_id}:{batch[-1].message_id}:{index + offset}"
+                    )
+                    if retry_at is not None:
+                        queued = self.store.enqueue_outbox(
+                            chat_type,
+                            chat_id,
+                            rest,
+                            origin_message_id=batch[-1].message_id,
+                            dedupe_key=dedupe_key,
+                            next_attempt_at=retry_at,
+                        )
+                    else:
+                        queued = self.store.enqueue_outbox(
+                            chat_type,
+                            chat_id,
+                            rest,
+                            origin_message_id=batch[-1].message_id,
+                            dedupe_key=dedupe_key,
+                        )
+                    if queued:
                         defer += 1
                 break
             sent.append((chunk, message_id))
@@ -3331,6 +3416,21 @@ class Service:
                 f"{injection}\n\n{mention_hint}" if injection.strip() else mention_hint
             )
 
+        # @ 了别的群友：这句在叫别人，别把它当点名自己。
+        other_at = any(
+            m.at_others and not m.at_bot and not m.reply_to_bot for m in messages
+        )
+        if other_at:
+            other_at_hint = (
+                "本批有消息 @ 的是别的群友（行尾标了「@了别的群友」），不是叫你："
+                "别抢答，除非它另外明确叫了你，或者你确实有非接不可的话。"
+            )
+            injection = (
+                f"{injection}\n\n{other_at_hint}"
+                if injection.strip()
+                else other_at_hint
+            )
+
         reply_ids = [
             m.reply_to_message_id for m in messages if m.reply_to_message_id
         ]
@@ -3346,7 +3446,18 @@ class Service:
             omitted=omitted,
             reply_names=reply_names,
             mention_ids=mention_ids,
+            gap_seconds=self._batch_gap_seconds(messages),
         )
+
+    def _batch_gap_seconds(self, messages: list[Message]) -> float:
+        """这一批第一条消息与它前面那条之间的空档秒数；查不到就返回 0。"""
+        first = next((m for m in messages if m.timestamp), None)
+        if first is None:
+            return 0.0
+        previous = self._previous_message(first)
+        if previous is None or not previous.timestamp:
+            return 0.0
+        return float(max(0, first.timestamp - previous.timestamp))
 
     def _pending_loop_hint(self, chat_type: ChatType, chat_id: str) -> str:
         """最近一件「没下文的事」，只截 40 字给提示层用。

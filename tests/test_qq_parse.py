@@ -57,7 +57,33 @@ def test_at_other_is_rendered_as_group_member() -> None:
     m = parse_event(group_event(segments=[at(20002), text("看这个")]), bot_qq=BOT_QQ)
     assert m is not None
     assert m.at_bot is False
+    assert m.at_others is True
     assert m.content == "@群友 看这个"
+
+
+def test_at_all_is_not_at_others() -> None:
+    m = parse_event(group_event(segments=[at("all"), text("开会了")]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.at_all is True
+    assert m.at_others is False
+
+
+def test_at_bot_is_not_at_others() -> None:
+    m = parse_event(group_event(segments=[at(BOT_QQ), text("你好")]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.at_bot is True
+    assert m.at_others is False
+
+
+def test_at_other_and_bot_keeps_both_flags() -> None:
+    """同时 @ 别人和 @ 你：两个标记都要留，模型才知道这句也点了我。"""
+    m = parse_event(
+        group_event(segments=[at(20002), at(BOT_QQ), text("你俩看看")]),
+        bot_qq=BOT_QQ,
+    )
+    assert m is not None
+    assert m.at_bot is True
+    assert m.at_others is True
 
 
 def test_reply_to_bot_sets_flag() -> None:

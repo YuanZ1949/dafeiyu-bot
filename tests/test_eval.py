@@ -147,7 +147,7 @@ def test_prompt_is_deterministic_and_injects_context():
     first = build_prompt(case)
     assert first == build_prompt(case)
     assert "【群友印象】\n阿强：喜欢猫" in first
-    assert "【昨日摘要】\n昨天聊了鱼" in first
+    assert "【近期摘要】\n昨天聊了鱼" in first
     assert "接着刚才的话题" in first
     assert "群友" in first and "在吗" in first
 

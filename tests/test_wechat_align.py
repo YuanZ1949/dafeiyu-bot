@@ -262,6 +262,37 @@ def test_at_bot_matches_exact_nickname() -> None:
 
     assert [e["at_bot"] for e in result.messages] == [True, True, False, False]
     assert all(e["at_all"] is False for e in result.messages)
+    # `@小助手2` 是另一个昵称：不算叫本鱼，但要标成「@了别的群友」。
+    assert [e["at_others"] for e in result.messages] == [False, False, True, False]
+
+
+def test_at_other_member_sets_at_others() -> None:
+    """@ 的是别的群友：不是叫机器人，但要让模型看出来。"""
+    aligner = make_aligner()
+    aligner.poll([msg("阿猫", "开场")])
+
+    result = aligner.poll(
+        [
+            msg("阿猫", "开场"),
+            msg("阿猫", "@阿狗 你看这个"),
+            msg("阿猫", f"@阿狗\u2005@{ACCOUNT} 你俩都看"),
+        ]
+    )
+
+    other, both = result.messages
+    assert (other["at_bot"], other["at_others"]) == (False, True)
+    assert (both["at_bot"], both["at_others"]) == (True, True)
+
+
+def test_at_all_is_not_at_others() -> None:
+    aligner = make_aligner()
+    aligner.poll([msg("阿猫", "开场")])
+
+    result = aligner.poll([msg("阿猫", "开场"), msg("阿猫", "@所有人 开会了")])
+
+    event = result.messages[0]
+    assert event["at_all"] is True
+    assert event["at_others"] is False
 
 
 def test_at_all_is_not_at_bot() -> None:

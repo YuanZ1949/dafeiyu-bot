@@ -95,6 +95,9 @@ def make_msg(
     chat_type: ChatType = ChatType.GROUP,
     chat_id: str = GROUP,
     message_id: str = "m1",
+    at_others: bool = False,
+    at_bot: bool = False,
+    timestamp: int | None = None,
 ) -> Message:
     return Message(
         chat_type=chat_type,
@@ -105,7 +108,9 @@ def make_msg(
         message_id=message_id,
         segments=[],
         is_bot=False,
-        timestamp=int(NOW.timestamp()),
+        timestamp=int(NOW.timestamp()) if timestamp is None else timestamp,
+        at_others=at_others,
+        at_bot=at_bot,
     )
 
 
@@ -214,3 +219,43 @@ def test_prompt_fails_open_when_mind_lookups_raise(tmp_path, monkeypatch) -> Non
     assert PENDING_SENTENCE not in prompt
     assert NEGATIVE_HEADER not in prompt
     assert "在吗" in prompt
+
+
+def test_prompt_warns_when_message_at_someone_else(tmp_path) -> None:
+    """@ 别人不是叫本鱼：批次提示要让模型先看清对象。"""
+    service, _store = build(tmp_path)
+
+    prompt = service._build_prompt(
+        ChatType.GROUP,
+        GROUP,
+        [make_msg("@阿狗 你看这个", at_others=True)],
+        now=NOW,
+    )
+
+    assert "本批有消息 @ 的是别的群友" in prompt
+    assert "（@了别的群友）" in prompt
+
+
+def test_prompt_skips_other_at_hint_when_bot_is_also_mentioned(tmp_path) -> None:
+    service, _store = build(tmp_path)
+
+    prompt = service._build_prompt(
+        ChatType.GROUP,
+        GROUP,
+        [make_msg("@阿狗 @溟月 你俩看看", at_others=True, at_bot=True)],
+        now=NOW,
+    )
+
+    assert "本批有消息 @ 的是别的群友" not in prompt
+
+
+def test_prompt_marks_long_pause_before_batch(tmp_path) -> None:
+    service, store = build(tmp_path)
+    previous = make_msg("两小时前的话题", message_id="m0", timestamp=int(NOW.timestamp()) - 7200)
+    current = make_msg("现在说的新事", message_id="m1")
+    store.add_message(previous)
+    store.add_message(current)
+
+    prompt = service._build_prompt(ChatType.GROUP, GROUP, [current], now=NOW)
+
+    assert "【停顿 2 小时】" in prompt
