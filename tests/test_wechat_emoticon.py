@@ -174,6 +174,51 @@ def test_transcode_multi_frame_outputs_gif(monkeypatch: pytest.MonkeyPatch) -> N
     assert "-frames:v" not in args
 
 
+def test_transcode_two_frames_outputs_best_still_png(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """微信原图实测 2 帧且首帧纯白：只出 PNG，并挑体积最大的一帧。"""
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], timeout: float) -> SimpleNamespace:
+        calls.append(args)
+        target = Path(args[-1])
+        # 第二帧更大 = 细节更多；静图判定应选它。
+        target.write_bytes(PNG if target.name == "still-0.png" else PNG + b"x" * 32)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(emoticon, "_locate", lambda name: name)
+    monkeypatch.setattr(emoticon, "_run", fake_run)
+    monkeypatch.setattr(emoticon, "_frame_count", lambda *_a, **_k: 2)
+
+    assert transcode(STREAM) == PNG + b"x" * 32
+    assert [Path(args[-1]).name for args in calls] == [
+        "still-0.png",
+        "still-1.png",
+    ]
+    assert all("-frames:v" in args for args in calls)
+
+
+def test_transcode_still_forces_single_png(monkeypatch: pytest.MonkeyPatch) -> None:
+    """图片原图显式 ``still=True``：即使多帧也只输出一张 PNG。"""
+    captured: dict[str, object] = {}
+
+    def fake_run(args: list[str], timeout: float) -> SimpleNamespace:
+        captured["args"] = args
+        Path(args[-1]).write_bytes(PNG)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(emoticon, "_locate", lambda name: name)
+    monkeypatch.setattr(emoticon, "_run", fake_run)
+    monkeypatch.setattr(emoticon, "_frame_count", lambda *_a, **_k: 9)
+
+    assert transcode(STREAM, still=True) == PNG
+    args = captured["args"]
+    assert isinstance(args, list)
+    assert str(args[-1]).endswith("out.png")
+    assert "-loop" not in args
+
+
 def test_transcode_without_ffmpeg_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(emoticon, "_locate", lambda _name: None)
 

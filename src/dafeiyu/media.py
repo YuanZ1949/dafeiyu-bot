@@ -5,7 +5,8 @@
 
 设计约束（与 ``images.py`` 相同的退化原则，但职责不同）：
 
-- 只处理**已有本地路径**的附件；不下载、不访问网络；
+- 带本地路径的附件按原逻辑复制/解码；只有 URL 的附件（QQ 语音/视频、
+  微信表情 `cdnurl`）先下载再处理；
 - 只有 ``kind == "image"`` 会复制/解码；``kind == "file"`` 只追加文本注记；
 - ``.dat`` 由调用方注入的 ``decode`` 还原，返回 ``None`` 就保留占位；
 - 快路径（开关关闭 / 没有带路径的附件）零文件系统调用；
@@ -227,7 +228,7 @@ def _has_media_source(attachment: Attachment) -> bool:
     """带本地路径的附件，或只有 http(s) 来源的语音/视频（QQ）。"""
     if attachment.path:
         return True
-    if attachment.kind not in ("voice", "record", "video"):
+    if attachment.kind not in ("voice", "record", "video", "image"):
         return False
     return bool(_HTTP_RE.match((attachment.source or "").strip()))
 
@@ -270,6 +271,34 @@ async def _download_video(
         log.info("视频临时文件写盘失败：%s", source, exc_info=True)
         return None
     return target
+
+
+async def _download_image(
+    source: str,
+    *,
+    settings: Settings,
+    fetch: FetchFn,
+    limit: int,
+) -> bytes | None:
+    """下载 URL 图片（微信表情 cdnurl）；失败/超限返回 ``None``。"""
+    images_cfg = getattr(settings, "images", None)
+    timeout = float(getattr(images_cfg, "timeout_seconds", 10.0) or 10.0)
+    if limit <= 0:
+        limit = _MAX_VIDEO_BYTES
+    try:
+        data = await fetch(source, timeout, limit)
+    except Exception:
+        log.info("图片下载失败，保持占位：%s", source, exc_info=True)
+        return None
+    if not data or len(data) > limit:
+        log.info(
+            "图片大小不可接受（%d 字节，上限 %d），保持占位：%s",
+            len(data) if data else 0,
+            limit,
+            source,
+        )
+        return None
+    return data
 
 
 async def _materialize_voice(
@@ -525,6 +554,64 @@ async def _extract_video_frames(
 #: GIF 抽帧序号：第 0 帧经常是空白/纯色（微信动图实测），所以中段也取一张。
 _GIF_FRAME_INDICES = (0, 8, 24)
 
+#: 帧数不超过这个值就按静图处理：微信原图实测 2 帧且首帧纯白。
+_STILL_GIF_FRAMES = 2
+
+#: 静图判定时最多尝试的帧数（2 帧容器两帧都转，取体积最大者）。
+_MAX_STILL_GIF_SAMPLES = 2
+
+
+def _gif_frame_count(data: bytes) -> int:
+    """本地数 GIF 图像帧数（不依赖 ffmpeg）；非 GIF 或坏数据返回 0。
+
+    只做块结构遍历：扩展块按子块跳过，图像描述符计一帧。帧数未知时返回 0，
+    调用方沿用旧的 ``0/8/24`` 抽帧策略。
+    """
+    if len(data) < 13 or data[:6] not in (b"GIF87a", b"GIF89a"):
+        return 0
+
+    def skip_blocks(pos: int) -> int:
+        while pos < len(data):
+            length = data[pos]
+            pos += 1
+            if length == 0:
+                return pos
+            pos += length
+        return len(data)
+
+    pos = 13
+    flags = data[10]
+    if flags & 0x80:
+        pos += 3 * (2 ** ((flags & 0x07) + 1))
+    count = 0
+    while pos < len(data):
+        marker = data[pos]
+        if marker == 0x3B:  # trailer
+            break
+        if marker == 0x2C:  # image descriptor
+            if pos + 10 > len(data):
+                break
+            packed = data[pos + 9]
+            pos += 10
+            if packed & 0x80:
+                pos += 3 * (2 ** ((packed & 0x07) + 1))
+            pos = skip_blocks(pos + 1)  # 跳过 LZW 最小码长 + 子块
+            count += 1
+        elif marker == 0x21:  # 扩展块
+            pos = skip_blocks(pos + 2)
+        else:
+            break
+    return count
+
+
+def _gif_frame_indices(count: int) -> tuple[int, ...]:
+    """按真实帧数给出抽帧序号；未知（0）时沿用旧策略。"""
+    if count <= 0:
+        return _GIF_FRAME_INDICES
+    if count <= _STILL_GIF_FRAMES:
+        return tuple(range(min(count, _MAX_STILL_GIF_SAMPLES)))
+    return _GIF_FRAME_INDICES
+
 
 def _extract_gif_frame(ffmpeg: str, source: Path, target: Path, index: int) -> bool:
     """用 ffmpeg 的 select 滤镜取 GIF 第 ``index`` 帧；失败返回 False。"""
@@ -568,12 +655,13 @@ def _extract_gif_frame(ffmpeg: str, source: Path, target: Path, index: int) -> b
 
 
 async def _extract_gif_frames(
-    root: Path, source: Path, digest: str
+    root: Path, source: Path, digest: str, *, count: int = 0
 ) -> list[str]:
     """把 GIF 的几帧抽成 jpg 存进 ``images/``，返回 workspace 相对路径。
 
     ffmpeg 缺失、单帧失败都只跳过；绝不抛异常。第一帧是空白时，后面几帧
-    仍然能让模型看到动图内容。
+    仍然能让模型看到动图内容。``count`` 是本地数出的真实帧数：``<= 2`` 视为
+    静图，只在候选帧里保留体积最大的一张（细节最多），其余删掉。
     """
     ffmpeg = _locate("ffmpeg")
     if not ffmpeg:
@@ -585,15 +673,42 @@ async def _extract_gif_frames(
     except OSError:
         log.info("GIF 抽帧目录创建失败：%s", directory, exc_info=True)
         return []
-    frames: list[str] = []
-    for order, index in enumerate(_GIF_FRAME_INDICES, start=1):
+    frames: list[tuple[int, Path]] = []
+    for order, index in enumerate(_gif_frame_indices(count), start=1):
         target = directory / f"gif-{digest}-{order}.jpg"
         ok = await asyncio.to_thread(
             _extract_gif_frame, ffmpeg, source, target, index
         )
         if ok:
-            frames.append(f"images/{target.name}")
-    return frames
+            frames.append((order, target))
+    if 0 < count <= _STILL_GIF_FRAMES:
+        frames = _keep_best_frame(frames)
+    return [f"images/{target.name}" for _order, target in frames]
+
+
+def _keep_best_frame(frames: list[tuple[int, Path]]) -> list[tuple[int, Path]]:
+    """静图候选里只留体积最大的一帧，其余删盘；失败时保守保留全部。"""
+    if len(frames) <= 1:
+        return frames
+    best: tuple[int, Path] | None = None
+    best_size = -1
+    for item in frames:
+        try:
+            size = item[1].stat().st_size
+        except OSError:
+            size = -1
+        if size > best_size:
+            best, best_size = item, size
+    if best is None:
+        return frames
+    for item in frames:
+        if item is best:
+            continue
+        try:
+            item[1].unlink(missing_ok=True)
+        except OSError:
+            log.debug("清理多余 GIF 帧失败：%s", item[1], exc_info=True)
+    return [best]
 
 
 async def _materialize_video(
@@ -729,7 +844,8 @@ async def materialize_attachments(
     """把附件物化进 workspace，返回成功写盘的图片数量。
 
     - 带本地路径的附件（微信）仍由 ``wechat.media.enabled`` 门控；
-    - 只有 http(s) 来源的附件（QQ 语音/视频）由 ``images.enabled`` 门控；
+    - 只有 http(s) 来源的附件（QQ 语音/视频、微信表情）由 ``images.enabled``
+      门控；
     - 语音（``voice`` / ``record``）落盘到 ``voices/`` 并转写；
     - 视频（``kind == "video"``）复制原文件到 ``videos/``，``annotate`` 为真
       时用 ffmpeg 抽帧到 ``images/``；URL 来源先下载到临时文件。
@@ -882,28 +998,63 @@ async def materialize_attachments(
                     updated.append(attachment)
                 continue
 
-            if attachment.kind != "image" or source_path is None:
+            if attachment.kind != "image":
                 updated.append(attachment)
                 continue
 
-            # 微信同一张图有多个变体（原图 / `_h` / `_t`）：原图是 `wxgf`
-            # 容器，解不开时按 `fallbacks` 顺序退回，避免只剩 180px 缩略图。
-            candidates = [source_path]
-            candidates.extend(
-                Path(item) for item in getattr(attachment, "fallbacks", ()) if item
-            )
-            picked: tuple[bytes, Path] | None = None
-            for candidate in candidates:
-                picked = await _read_image_bytes(candidate, decode, path_max)
-                if picked is not None:
-                    break
-            if picked is None:
-                log.info(
-                    "附件读取或解码失败，保持占位：msg=%s", msg.message_id
+            if source_path is not None:
+                # 微信同一张图有多个变体（原图 / `_h` / `_t`）：原图是 `wxgf`
+                # 容器，解不开时按 `fallbacks` 顺序退回，避免只剩 180px 缩略图。
+                candidates = [source_path]
+                candidates.extend(
+                    Path(item)
+                    for item in getattr(attachment, "fallbacks", ())
+                    if item
                 )
+                picked: tuple[bytes, Path] | None = None
+                for candidate in candidates:
+                    picked = await _read_image_bytes(candidate, decode, path_max)
+                    if picked is not None:
+                        break
+                if picked is None:
+                    log.info(
+                        "附件读取或解码失败，保持占位：msg=%s", msg.message_id
+                    )
+                    updated.append(attachment)
+                    continue
+                data, suffix = picked[0], picked[1].suffix
+            elif is_url:
+                # 微信表情只有 cdnurl（本地缓存未命中）：直接下载，先按魔数
+                # 认图片；认不出再交给 decode（.dat 加密容器）尝试。
+                fetched = await _download_image(
+                    source,
+                    settings=settings,
+                    fetch=fetch_fn,
+                    limit=url_max or _MAX_VIDEO_BYTES,
+                )
+                if fetched is None:
+                    updated.append(attachment)
+                    continue
+                data = fetched
+                suffix = _sniff_ext(data)
+                if not suffix and decode is not None:
+                    decoded = decode(data)
+                    if inspect.isawaitable(decoded):
+                        decoded = await decoded
+                    if decoded:
+                        decoded_ext = _sniff_ext(decoded)
+                        if decoded_ext:
+                            data, suffix = decoded, decoded_ext
+                if not suffix:
+                    log.info(
+                        "URL 附件不是可识别图片，保持占位：msg=%s",
+                        msg.message_id,
+                    )
+                    updated.append(attachment)
+                    continue
+            else:
                 updated.append(attachment)
                 continue
-            data, used_path = picked
 
             if not prepared:
                 # 目录与清理只在第一张真要落盘时才动，避免无图消息碰文件系统。
@@ -912,7 +1063,7 @@ async def materialize_attachments(
                 retention_days = getattr(images_cfg, "retention_days", 0)
                 _cleanup(directory, retention_days)
                 prepared = True
-            target = _target(directory, source, data, used_path.suffix)
+            target = _target(directory, source, data, suffix)
             try:
                 await asyncio.to_thread(target.write_bytes, data)
             except OSError:
@@ -933,12 +1084,23 @@ async def materialize_attachments(
             relative = _materialized_relative(target, root) or (f"images/{target.name}")
             if target.suffix.lower() == ".gif":
                 # 动图首帧常是空白（微信动图实测）：抽几帧 jpg 再给模型看。
+                # 先本地数帧：<= 2 帧是「伪动图」（静态图被容器封装成两帧），
+                # 只保留最佳帧，注记也不写「动图」，免得模型以为画面会动。
+                gif_count = _gif_frame_count(data)
                 frames = (
-                    await _extract_gif_frames(root, target, target.stem)
+                    await _extract_gif_frames(
+                        root, target, target.stem, count=gif_count
+                    )
                     if annotate
                     else []
                 )
-                if frames:
+                if frames and 0 < gif_count <= _STILL_GIF_FRAMES:
+                    msg.content = _annotate_first(
+                        msg.content,
+                        f"[图片]（图存 {frames[0]}，可用 read 查看；"
+                        f"原文件 {relative}）",
+                    )
+                elif frames:
                     msg.content = _annotate_first(
                         msg.content,
                         f"[图片]（动图，已抽帧 {'、'.join(frames)}，"

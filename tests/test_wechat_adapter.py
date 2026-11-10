@@ -765,6 +765,30 @@ async def test_sticker_media_without_path_falls_back_to_sticker() -> None:
     assert message.attachments[0].name == "[表情:745c9c20]"
 
 
+async def test_sticker_media_url_becomes_url_attachment() -> None:
+    """缓存未命中时桥会带 cdnurl：附件用 source 保存 URL，供物化层下载。"""
+    envelope = message_envelope(
+        text="[表情:放肆]",
+        kind="sticker",
+        media={
+            "kind": "image",
+            "url": "http://vweixinf.tc.qq.com/110/20401/stodownload?m=abc",
+            "name": "abc.gif",
+        },
+    )
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert len(message.attachments) == 1
+    attachment = message.attachments[0]
+    assert attachment.kind == "image"
+    assert attachment.path == ""
+    assert attachment.source == (
+        "http://vweixinf.tc.qq.com/110/20401/stodownload?m=abc"
+    )
+    assert attachment.name == "abc.gif"
+
+
 async def test_message_media_non_dict_is_ignored() -> None:
     envelope = message_envelope(text="[图片]", kind="image", media="oops")
     message = WeChatAdapter(make_config(1))._parse_message(envelope)

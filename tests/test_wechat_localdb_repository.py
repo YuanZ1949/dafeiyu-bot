@@ -624,6 +624,22 @@ def test_emoji_uses_readable_desc(tmp_path: Path) -> None:
     assert entry["text"] == "[表情:捂脸]"
 
 
+def test_emoji_decodes_base64_protobuf_desc(tmp_path: Path) -> None:
+    """商店表情的 desc 是 base64 protobuf；不能把 base64 当名字截断成乱码。"""
+    xml = (
+        '<msg><emoji md5="745c9c20deadbeef" '
+        'desc="ChEKB2RlZmF1bHQSBuaUvuiChg==" attachedtext="" /></msg>'
+    )
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, f"wxid_a:\n{xml}", local_type=47)
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["kind"] == "sticker"
+    assert entry["text"] == "[表情:放肆]"
+
+
 def test_emoji_broken_xml_degrades_to_placeholder(tmp_path: Path) -> None:
     store, ref = _store_with_single_message(
         tmp_path, text_row(3, 'wxid_a:\n<msg><emoji md5="745c9c20"', local_type=47)
@@ -1442,6 +1458,46 @@ def test_emoticon_cache_missing_file_keeps_placeholder(tmp_path: Path) -> None:
     row = store.recent(ref, 5)[0]
 
     assert "media" not in row
+
+
+def test_emoticon_cache_missing_file_uses_cdnurl(tmp_path: Path) -> None:
+    """缓存未命中但 XML 有 cdnurl：把 URL 交给物化层下载，而不是只剩 md5。"""
+    url = "http://vweixinf.tc.qq.com/110/20401/stodownload?m=abc&amp;filekey=1"
+    content = (
+        f'<msg><emoji md5="{EMOTICON_MD5}" type="2" cdnurl="{url}" /></msg>'
+    )
+    store, _ = build_emoticon_store(
+        tmp_path, with_file=False, content=content
+    )
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+
+    row = store.recent(ref, 5)[0]
+
+    assert row["media"]["kind"] == "image"
+    assert row["media"]["url"] == (
+        "http://vweixinf.tc.qq.com/110/20401/stodownload?m=abc&filekey=1"
+    )
+    assert row["media"]["name"] == f"{EMOTICON_MD5}.gif"
+    assert row["media"]["size"] == 0
+
+
+def test_emoticon_foreign_cdnurl_is_rejected(tmp_path: Path) -> None:
+    """cdnurl 来自消息 XML，只能接受腾讯 CDN；其它域名按未缓存处理。"""
+    content = (
+        f'<msg><emoji md5="{EMOTICON_MD5}" type="2" '
+        'cdnurl="http://evil.example/x.gif" /></msg>'
+    )
+    store, _ = build_emoticon_store(
+        tmp_path, with_file=False, content=content
+    )
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+
+    row = store.recent(ref, 5)[0]
+
+    assert "media" not in row
+    assert row["text"].endswith("（未缓存）")
 
 
 def test_emoticon_without_md5_keeps_placeholder(tmp_path: Path) -> None:

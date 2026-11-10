@@ -143,16 +143,23 @@ def _render_face(data: dict[str, Any]) -> str:
     """face 段：表内 id 渲染名称，表外数字保留 id；缺失或非数字回退占位。"""
     face_id = str(data.get("id") or "").strip()
     if not face_id.isdigit():
+        logger.info("QQ 表情段缺少数字 id：%r", data)
         return _PLACEHOLDERS["face"]
     name = face_name(int(face_id))
-    return f"[表情:{name}]" if name else f"[表情:{face_id}]"
+    if name:
+        return f"[表情:{name}]"
+    logger.info("QQ 表情表未收录：id=%s data=%r", face_id, data)
+    return f"[表情:{face_id}]"
 
 
 def _render_mface(data: dict[str, Any]) -> str:
     """mface 段：用商店表情的 summary 区分；去换行并截断，空则回退占位。"""
     summary = " ".join(str(data.get("summary") or "").split())
     summary = _clip(summary, 20)
-    return f"[表情:{summary}]" if summary else _PLACEHOLDERS["mface"]
+    if summary:
+        return f"[表情:{summary}]"
+    logger.info("QQ 商店表情无 summary：%r", data)
+    return _PLACEHOLDERS["mface"]
 
 
 def _render_at(data: dict[str, Any], bot_qq: int) -> str:

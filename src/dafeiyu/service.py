@@ -960,7 +960,9 @@ class Service:
             if plain is not None:
                 from .gateway.wechat_bridge.media.emoticon import wxgf_to_image
 
-                image = await asyncio.to_thread(wxgf_to_image, plain)
+                image = await asyncio.to_thread(
+                    wxgf_to_image, plain, still=True
+                )
                 if image is not None:
                     return image
         return await self._decode_wechat_emoticon(data)

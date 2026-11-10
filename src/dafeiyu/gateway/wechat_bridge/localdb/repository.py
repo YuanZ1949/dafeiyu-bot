@@ -21,6 +21,7 @@ fail-open 是本模块的第一原则：镜像缺失、表缺失、schema 不符
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import importlib
@@ -33,7 +34,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 #: 可选依赖：没装时压缩消息退化成空文本，不影响其余行。用 importlib 而非静态
 #: import，避免「可选依赖不在类型检查器解释器里」变成硬错误。
@@ -96,6 +97,18 @@ _EMOJI_NAME_ATTRS = ("desc", "attachedtext")
 #: 表情 XML 的 md5 属性（缓存文件名与它一致）；XML 解析失败时用正则兜底。
 _EMOJI_MD5_RE = re.compile(r'<emoji[^>]*\bmd5="([0-9a-fA-F]{32})"')
 _HEX32_RE = re.compile(r"[0-9a-f]{32}")
+
+#: 表情 XML 的 cdnurl（明文 http，可直接 GET）；XML 解析失败时用正则兜底。
+_EMOJI_CDN_URL_RE = re.compile(r'<emoji[^>]*\bcdnurl\s*=\s*"([^"]+)"')
+
+#: 只允许腾讯 CDN：cdnurl 来自消息 XML，不能把任意 URL 丢给下载器。
+_EMOJI_CDN_HOSTS = (".tc.qq.com", ".qpic.cn")
+
+#: 表情 desc/attachedtext 可能是 base64 protobuf（商店表情），需解码取名。
+_EMOJI_BASE64_RE = re.compile(r"[A-Za-z0-9+/]{8,}={0,2}")
+
+#: protobuf 里可读的中文名：只取 CJK 字符段，跳过长度/控制字段。
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 
 #: appmsg 的引用回复类型。
 _APPMSG_QUOTE = 57
@@ -491,18 +504,26 @@ class LocalMessageStore:
                 # 但仍不把它当显示名「猜」——它就是 wxid 本身。
                 nickname = prefix_username
 
-        return {
+        media = self._media_meta(local_type, media_raw)
+        entry: dict[str, Any] = {
             "nickname": nickname,
             "text": text,
             "kind": kind,
             "reply_to": reply_to,
             "reply_author": reply_author,
             "ts": _safe_int(row[3]),
-        } | (
-            {"media": media}
-            if (media := self._media_meta(local_type, media_raw)) is not None
-            else {}
-        )
+        }
+        if media is not None:
+            entry["media"] = media
+        elif (
+            local_type == 47
+            and self._media_enabled
+            and _emoji_md5(body)
+        ):
+            # 缓存与 cdnurl 都拿不到：明确告诉模型「没图」，否则它会对着
+            # md5/商店 id 编造画面。
+            entry["text"] = f"{text}（未缓存）"
+        return entry
 
     def _decode_content(self, value: Any, content_type: int) -> str:
         """按 ``WCDB_CT_message_content`` 解正文；任何失败都退化成空串。"""
@@ -831,6 +852,20 @@ class LocalMessageStore:
         kind = _MEDIA_KIND_BY_TYPE.get(local_type)
         if kind is None or not isinstance(raw, dict):
             return None
+        url = str(raw.get("url") or "").strip()
+        if url and not str(raw.get("path") or "").strip():
+            # URL 型媒体（表情 cdnurl）：没有本地文件可校验，只校验域名，
+            # 真正的下载/大小限制由物化层负责。
+            if kind != "image" or not _emoji_url_allowed(url):
+                log.debug("媒体 url 不可信，跳过：%s", url)
+                return None
+            return {
+                "kind": kind,
+                "url": url,
+                "name": str(raw.get("name") or "").strip() or "sticker.gif",
+                "size": 0,
+                "duration": 0,
+            }
         text = str(raw.get("path") or "").strip()
         if not text:
             return None
@@ -898,21 +933,34 @@ class LocalMessageStore:
         return self._media_max_bytes
 
     def _emoticon_media(self, body: str) -> dict[str, Any] | None:
-        """从表情 XML 的 md5 找到 ``cache/<YYYY-MM>/Emoticon/...`` 缓存文件。
+        """从表情 XML 找缓存文件；缓存缺失时退回 ``cdnurl``（腾讯 CDN）。
 
-        只返回候选路径；文件存在性/大小/越界校验仍交给 :meth:`_media_meta`。
+        只返回候选路径/URL；文件存在性、大小、越界与域名校验仍交给
+        :meth:`_media_meta`。
         """
         digest = _emoji_md5(body)
         if not digest:
             return None
         root = self._media_root()
-        if root is None:
-            return None
-        path = _emoticon_file(root, digest)
-        if path is None:
-            log.debug("表情缓存文件缺失：%s", digest)
-            return None
-        return {"path": str(path), "name": path.name, "size": 0, "duration": 0}
+        if root is not None:
+            path = _emoticon_file(root, digest)
+            if path is not None:
+                return {
+                    "path": str(path),
+                    "name": path.name,
+                    "size": 0,
+                    "duration": 0,
+                }
+            log.debug("表情缓存文件缺失：%s，尝试 cdnurl", digest)
+        url = _emoji_cdn_url(body)
+        if url:
+            return {
+                "url": url,
+                "name": _emoji_url_name(body, digest, url),
+                "size": 0,
+                "duration": 0,
+            }
+        return None
 
     def _media_root(self) -> Path | None:
         if self._media_storage_root:
@@ -1002,14 +1050,11 @@ def _render_emoji(body: str) -> str:
         return placeholder
     name = ""
     for attr in _EMOJI_NAME_ATTRS:
-        name = str(node.get(attr) or "").strip()
+        name = _emoji_display_name(node.get(attr))
         if name:
             break
     if name:
-        # 去换行并截断，避免占位把单行正文撑破。
-        name = re.sub(r"\s+", " ", name).strip()[:20]
-        if name:
-            return f"[表情:{name}]"
+        return f"[表情:{name}]"
     md5 = str(node.get("md5") or "").strip()
     if md5:
         return f"[表情:{md5[:8]}]"
@@ -1262,6 +1307,70 @@ def _emoji_md5(body: str) -> str:
                 return value
     match = _EMOJI_MD5_RE.search(body or "")
     return match.group(1).lower() if match is not None else ""
+
+
+def _emoji_display_name(value: Any) -> str:
+    """把 desc/attachedtext 落成可读名：base64 protobuf 取中文，其它原样截断。"""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    if len(text) >= 8 and _EMOJI_BASE64_RE.fullmatch(text):
+        padded = text + "=" * (-len(text) % 4)
+        try:
+            raw = base64.b64decode(padded, validate=True)
+        except ValueError:
+            raw = b""
+        if raw:
+            match = _CJK_RE.search(raw.decode("utf-8", "ignore"))
+            if match is not None:
+                return match.group(0)[:20]
+            if b"default" in raw or b"sticker" in raw:
+                return "商店表情"
+    return text[:20]
+
+
+def _emoji_cdn_url(body: str) -> str:
+    """从表情 XML 取可信的 ``cdnurl``；缺失或域名不符返回空串。"""
+    url = ""
+    root = _parse_xml(body)
+    if root is not None:
+        node = root.find(".//emoji")
+        if node is not None:
+            url = str(node.get("cdnurl") or "").strip()
+    if not url:
+        match = _EMOJI_CDN_URL_RE.search(body or "")
+        if match is not None:
+            url = html.unescape(match.group(1)).strip()
+    return url if _emoji_url_allowed(url) else ""
+
+
+def _emoji_url_allowed(url: str) -> bool:
+    """cdnurl 只允许腾讯 CDN；协议/域名不符一律拒绝。"""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https"):
+        return False
+    host = (parts.hostname or "").lower()
+    if not host:
+        return False
+    return any(
+        host == item[1:] or host.endswith(item) for item in _EMOJI_CDN_HOSTS
+    )
+
+
+def _emoji_url_name(body: str, digest: str, url: str) -> str:
+    """URL 表情的落盘名：静态贴纸给 ``.png``，其余按 ``.gif``。"""
+    static = False
+    root = _parse_xml(body)
+    if root is not None:
+        node = root.find(".//emoji")
+        if node is not None:
+            static = str(node.get("type") or "").strip() == "1"
+    if ".png" in url.lower():
+        static = True
+    return f"{digest}{'.png' if static else '.gif'}"
 
 
 def _emoticon_file(root: Path, digest: str) -> Path | None:

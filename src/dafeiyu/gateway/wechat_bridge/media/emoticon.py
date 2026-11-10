@@ -14,6 +14,10 @@
 
 HEVC 需要外部 ``ffmpeg``：优先环境变量 ``DAFEIYU_FFMPEG``，否则查 ``PATH``。
 缺失时安全降级（表情仍然是占位），不影响入站。多帧贴纸转 GIF，单帧转 PNG。
+
+实测微信 4.x 的「原图」``wxgf`` 常是 2 帧、首帧几近纯白且总时长 0.06s——那是
+静态照片的容器封装，不是动图。因此帧数 ``<= 2`` 一律按静图处理：逐帧转 PNG，
+取**体积最大**的一帧（细节最多），避免把照片判成动图后只抽到白帧。
 """
 
 from __future__ import annotations
@@ -57,6 +61,9 @@ _PARAM_SET_TYPES = frozenset({32, 33, 34})
 #: 单次转码的墙钟上限：贴纸很小，超时说明 ffmpeg 卡住了。本机最重的
 #: 96 帧贴纸暖机约 3s，但首次冷启动被杀软扫描时实测到 19.98s，因此留到 30s。
 _DEFAULT_TIMEOUT = 30.0
+
+#: 帧数不超过这个值就按静图处理：微信原图的 2 帧 ``wxgf`` 实测首帧纯白。
+_STILL_FRAME_LIMIT = 2
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _JPEG_MAGIC = b"\xff\xd8\xff"
@@ -209,8 +216,13 @@ def transcode(
     ffmpeg: str | None = None,
     ffprobe: str | None = None,
     timeout: float = _DEFAULT_TIMEOUT,
+    still: bool = False,
 ) -> bytes | None:
-    """把裸 HEVC 流转成 ``read`` 能打开的图片字节；失败返回 ``None``。"""
+    """把裸 HEVC 流转成 ``read`` 能打开的图片字节；失败返回 ``None``。
+
+    ``still=True`` 时强制输出静图（微信图片原图）；否则只有帧数 > 2 才转 GIF。
+    帧数 ``<= 2`` 无论是否 ``still`` 都只输出最佳单帧 PNG。
+    """
     binary = ffmpeg or _locate("ffmpeg")
     if not binary:
         log.debug("ffmpeg 不可用，表情保留占位")
@@ -220,32 +232,14 @@ def transcode(
         with tempfile.TemporaryDirectory(prefix="dafeiyu-emo-") as tmp:
             source = Path(tmp) / "in.hevc"
             source.write_bytes(stream)
-            animated = _frame_count(probe, source, timeout) > 1
-            target = Path(tmp) / ("out.gif" if animated else "out.png")
-            args = [
-                binary,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "hevc",
-                "-i",
-                str(source),
-            ]
+            frames = _frame_count(probe, source, timeout)
+            animated = not still and frames > _STILL_FRAME_LIMIT
             if animated:
-                args += ["-loop", "0"]
+                data = _transcode_animated(binary, source, Path(tmp), timeout)
             else:
-                # 不加 ``-update 1`` 时 image2 会按序列模式报错。
-                args += ["-frames:v", "1", "-update", "1"]
-            args.append(str(target))
-            completed = _run(args, timeout)
-            if completed.returncode != 0:
-                log.debug(
-                    "ffmpeg 转码表情失败（exit=%s）", completed.returncode
-                )
+                data = _transcode_still(binary, source, Path(tmp), timeout, frames)
+            if data is None:
                 return None
-            data = target.read_bytes()
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         log.debug("表情转码失败：%s", exc)
         return None
@@ -255,23 +249,109 @@ def transcode(
     return data
 
 
+def _transcode_animated(
+    binary: str, source: Path, directory: Path, timeout: float
+) -> bytes | None:
+    """多帧贴纸转 GIF（保留动画）。"""
+    target = directory / "out.gif"
+    args = [
+        binary,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "hevc",
+        "-i",
+        str(source),
+        "-loop",
+        "0",
+        str(target),
+    ]
+    completed = _run(args, timeout)
+    if completed.returncode != 0:
+        log.debug("ffmpeg 转码动图失败（exit=%s）", completed.returncode)
+        return None
+    return target.read_bytes()
+
+
+def _transcode_still(
+    binary: str,
+    source: Path,
+    directory: Path,
+    timeout: float,
+    frames: int,
+) -> bytes | None:
+    """把 HEVC 转成单帧 PNG；两帧容器取体积最大的一帧（细节最多）。
+
+    实测微信原图的 2 帧里首帧常是纯白，体积最大的那帧才是真正的画面。
+    """
+    limit = frames if 0 < frames <= _STILL_FRAME_LIMIT else 1
+    best: bytes | None = None
+    for index in range(limit):
+        # 单帧保持 ``out.png``：旧调用方/测试按这个文件名断言。
+        name = "out.png" if limit == 1 else f"still-{index}.png"
+        target = directory / name
+        args = [
+            binary,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "hevc",
+            "-i",
+            str(source),
+            "-vf",
+            f"select=eq(n\\,{index})",
+            "-vsync",
+            "0",
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            str(target),
+        ]
+        completed = _run(args, timeout)
+        if completed.returncode != 0:
+            log.debug(
+                "ffmpeg 转码静图失败（frame=%d exit=%s）",
+                index,
+                completed.returncode,
+            )
+            continue
+        try:
+            data = target.read_bytes()
+        except OSError:
+            continue
+        if not _looks_like_image(data):
+            continue
+        if best is None or len(data) > len(best):
+            best = data
+    return best
+
+
 def wxgf_to_image(
     payload: bytes,
     *,
     ffmpeg: str | None = None,
     ffprobe: str | None = None,
     timeout: float = _DEFAULT_TIMEOUT,
+    still: bool = False,
 ) -> bytes | None:
     """把 ``wxgf`` 明文里的 HEVC 流转成 PNG/GIF；不是 ``wxgf`` 返回 ``None``。
 
     微信 4.x 的聊天图片**原图**解密后也是 ``wxgf`` 容器，因此这个函数同时
-    服务于图片原图与表情缓存。
+    服务于图片原图与表情缓存。图片原图传 ``still=True``：真实照片的容器
+    常带 2 帧，按动图处理只会抽到纯白首帧。
     """
     stream = wxgf_hevc(payload)
     if stream is None:
         log.debug("wxgf 里没有找到 HEVC 起始码")
         return None
-    return transcode(stream, ffmpeg=ffmpeg, ffprobe=ffprobe, timeout=timeout)
+    return transcode(
+        stream, ffmpeg=ffmpeg, ffprobe=ffprobe, timeout=timeout, still=still
+    )
 
 
 def decode_emoticon(

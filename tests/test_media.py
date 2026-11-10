@@ -642,6 +642,81 @@ async def test_gif_frames_are_extracted_and_annotated(
     assert "原文件 images/" in message.content
 
 
+def _tiny_gif(frames: int) -> bytes:
+    """合成只含 ``frames`` 个图像描述符的 GIF（只需要块结构，不需要能解码）。"""
+    data = b"GIF89a" + b"\x01\x00\x01\x00\x00\x00\x00"
+    for _ in range(frames):
+        data += b"\x2c" + b"\x00" * 8 + b"\x00"
+        data += b"\x02" + b"\x02\x44\x01" + b"\x00"
+    return data + b"\x3b"
+
+
+async def test_two_frame_gif_is_treated_as_still(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2 帧 GIF 是静态图的容器封装：只留最佳帧，注记不写「动图」。"""
+    source = tmp_path / "a.gif"
+    source.write_bytes(_tiny_gif(2))
+    calls: list[int] = []
+
+    def fake_frame(ffmpeg: str, source: Path, target: Path, index: int) -> bool:
+        calls.append(index)
+        Path(target).write_bytes(JPG + b"x" * (index * 10))
+        return True
+
+    monkeypatch.setattr(media_module, "_locate", lambda name: name)
+    monkeypatch.setattr(media_module, "_extract_gif_frame", fake_frame)
+    settings = make_settings(tmp_path)
+    message = make_message(str(source))
+
+    count = await materialize_attachments(message, settings, decode=None)
+
+    assert count == 1
+    assert calls == [0, 1]
+    frames = sorted((tmp_path / "ws" / "images").glob("gif-*-*.jpg"))
+    assert len(frames) == 1
+    assert frames[0].read_bytes() == JPG + b"x" * 10
+    assert "（图存 images/gif-" in message.content
+    assert "动图" not in message.content
+
+
+async def test_url_image_is_downloaded_and_annotated(tmp_path: Path) -> None:
+    """微信表情只有 cdnurl：下载后按魔数落盘并注记。"""
+    seen: list[tuple[str, float, int]] = []
+
+    async def fetch(url: str, timeout: float, max_bytes: int) -> bytes:
+        seen.append((url, timeout, max_bytes))
+        return PNG
+
+    settings = make_settings(tmp_path)
+    message = make_message(
+        "", source="https://vweixinf.tc.qq.com/110/20401/stodownload?m=abc"
+    )
+
+    count = await materialize_attachments(message, settings, fetch=fetch)
+
+    assert count == 1
+    assert seen and seen[0][0] == message.attachments[0].source
+    assert message.attachments[0].path.startswith("images/")
+    assert (tmp_path / "ws" / message.attachments[0].path).read_bytes() == PNG
+    assert message.content.startswith("[图片]（图存 images/")
+
+
+async def test_url_image_that_is_not_an_image_keeps_placeholder(
+    tmp_path: Path,
+) -> None:
+    async def fetch(url: str, timeout: float, max_bytes: int) -> bytes:
+        return b"not an image"
+
+    settings = make_settings(tmp_path)
+    message = make_message("", source="https://vweixinf.tc.qq.com/110/x")
+
+    count = await materialize_attachments(message, settings, fetch=fetch)
+
+    assert count == 0
+    assert message.content == "[图片]"
+
+
 async def test_gif_frame_failure_keeps_original_note(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

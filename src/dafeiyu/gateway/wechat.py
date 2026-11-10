@@ -486,7 +486,8 @@ class WeChatAdapter:
         media = envelope.get("media")
         if isinstance(media, dict):
             path = str(media.get("path") or "").strip()
-            if path:
+            url = str(media.get("url") or "").strip()
+            if path or url:
                 name = str(media.get("name") or "").strip()
                 if not name:
                     name = content[:60] or path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
@@ -502,6 +503,7 @@ class WeChatAdapter:
                     Attachment(
                         kind=attachment_kind,
                         path=path,
+                        source=url if url and not path else "",
                         name=name,
                         size=_int(media.get("size")),
                         duration=_int(media.get("duration")),
