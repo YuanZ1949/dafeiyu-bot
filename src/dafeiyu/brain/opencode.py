@@ -186,6 +186,12 @@ class OpenCodeBrain:
         command = [self.bin, "run"]
         if self.server_url:
             command += ["--server", self.server_url]
+        else:
+            # opencode v2 CLI 默认走「后台服务」（`serve --service`，固定端口）；
+            # 那个服务被同机任何一次 opencode 调用共享，且只继承首个调用者的
+            # 环境。不隔离就会与主 opencode 的服务撞端口，或直接连上别人的
+            # 服务，隔离配置等于白设。`--standalone` 让每次调用用私有 server。
+            command += ["--standalone"]
         command += [
             "--agent",
             self.agent,

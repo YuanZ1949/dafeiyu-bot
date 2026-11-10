@@ -61,6 +61,7 @@ def test_build_command_contains_agent_and_session(store: Store) -> None:
     assert brain._build_command("你好", "ses_1") == [
         "C:/opencode.exe",
         "run",
+        "--standalone",
         "--agent",
         "fish",
         "--format",
@@ -93,6 +94,7 @@ def test_build_command_contains_server(store: Store) -> None:
         "ses_1",
         "你好",
     ]
+    assert "--standalone" not in brain._build_command("你好", "ses_1")
 
 
 async def test_reply_creates_then_reuses_session(store: Store) -> None:
