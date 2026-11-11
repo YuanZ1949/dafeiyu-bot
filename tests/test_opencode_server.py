@@ -220,3 +220,48 @@ async def test_start_reports_missing_bin_as_brain_error(monkeypatch, tmp_path):
     with pytest.raises(BrainError, match="opencode"):
         await server.start()
 
+
+class PendingStream(FakeStream):
+    """readline() 永不返回：模拟 serve 还没吐 EOF 的管道。"""
+
+    def __init__(self) -> None:
+        super().__init__([])
+
+    async def readline(self) -> bytes:
+        await asyncio.Event().wait()
+        return b""
+
+
+async def test_cancel_during_wait_ready_stops_process(monkeypatch, tmp_path):
+    """启动被取消时（不是异常）也必须收回子进程与读管道任务。"""
+    proc = StreamingProc(PendingStream(), PendingStream())
+
+    async def fake_exec(*args, **kwargs):
+        return proc
+
+    async def probe():
+        await asyncio.Event().wait()
+        return True
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    server = OpenCodeServer(
+        "opencode.exe", str(tmp_path), "data/bot.db", startup_timeout=30.0
+    )
+    monkeypatch.setattr(server, "_probe", probe)
+    monkeypatch.setattr(server, "_port_in_use", lambda: False)
+
+    task = asyncio.create_task(server.start())
+    await asyncio.sleep(0.05)
+    assert server.is_running is True
+    assert server.drain_tasks != []
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert proc.terminated is True
+    assert proc.returncode is not None
+    assert server._proc is None
+    assert server.is_running is False
+    assert server.drain_tasks == []
+

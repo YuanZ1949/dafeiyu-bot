@@ -48,6 +48,7 @@ class FakeServer:
         round_system: str | None = None,
         round_extra: dict[str, Any] | None = None,
         finish: str = "",
+        wait_404: bool = False,
     ) -> None:
         self.answer = answer
         self.complete = complete
@@ -62,6 +63,8 @@ class FakeServer:
         self.round_extra = round_extra
         # assistant 的 finish 标记（stop / length / aborted…）：为空表示不带。
         self.finish = finish
+        # 旧版服务端没有 /wait 这个实验端点：让它整条 404。
+        self.wait_404 = wait_404
         self.pending_steps = list(self.steps[1:]) if self.steps else []
         self.known = {"ses_old"}
         self.messages: dict[str, list[dict]] = {"ses_old": []}
@@ -200,6 +203,8 @@ class FakeServer:
             and parts[4] == "wait"
         ):
             wait_sid = parts[3]
+            if self.wait_404:
+                return httpx.Response(404, json={"message": "not found"})
             if wait_sid in self.missing or wait_sid not in self.known:
                 return httpx.Response(404, json={"message": "SessionNotFound"})
             if self.pending_steps:
@@ -313,6 +318,78 @@ async def test_reply_rebuilds_after_unknown_session(store: Store) -> None:
     assert store.get_opencode_session(ChatType.PRIVATE, 42) == "ses_new"
 
 
+# ---- 404 分类：session 不存在 / 端点不存在 ------------------------------
+
+
+def _creations(server: FakeServer) -> int:
+    return sum(1 for call in server.calls if call == ("POST", "/api/session"))
+
+
+async def test_wait_404_does_not_rebuild_session(store: Store) -> None:
+    """/wait 端点 404（旧版服务端没有它）不能被当成 session 失效。"""
+    server = FakeServer(wait_404=True)
+    brain = make_brain(store, server)
+
+    with pytest.raises(BrainError) as excinfo:
+        await brain.reply(ChatType.PRIVATE, "42", "在吗")
+    await brain.aclose()
+
+    message = str(excinfo.value)
+    assert "wait" in message
+    assert "404" in message
+    assert excinfo.value.status == 404
+    # 只新建了一次：没有因为 /wait 的 404 触发「清映射 + 重建再发一遍」。
+    assert _creations(server) == 1
+    assert sum(
+        1 for _method, path in server.calls if path.endswith("/prompt")
+    ) == 1
+
+    # 已有映射时也不清：会话本身是好的，坏的只是 wait 端点。
+    store.set_opencode_session(ChatType.PRIVATE, "7", "ses_old")
+    other = FakeServer(wait_404=True)
+    brain2 = make_brain(store, other)
+    with pytest.raises(BrainError):
+        await brain2.reply(ChatType.PRIVATE, "7", "在吗")
+    await brain2.aclose()
+
+    assert _creations(other) == 0
+    assert store.get_opencode_session(ChatType.PRIVATE, "7") == "ses_old"
+
+
+async def test_session_404_rebuilds_once(store: Store) -> None:
+    """session messages 404 → 重建一次；重建后仍 404 → 报出端点，不再循环。"""
+    store.set_opencode_session(ChatType.PRIVATE, "42", "ses_gone")
+    server = FakeServer()
+    server.missing.update({"ses_gone", "ses_new"})
+    brain = make_brain(store, server)
+
+    with pytest.raises(BrainError) as excinfo:
+        await brain.reply(ChatType.PRIVATE, "42", "在吗")
+    await brain.aclose()
+
+    message = str(excinfo.value)
+    assert "404" in message
+    assert "/api/session/" in message
+    # 只重建了一次，第二次 404 直接上报。
+    assert _creations(server) == 1
+
+
+# ---- 失败轮次：新建的 session 要删掉 ------------------------------------
+
+
+async def test_failed_new_session_is_deleted(store: Store) -> None:
+    server = FakeServer(complete=False)
+    brain = make_brain(store, server, timeout=0.05)
+
+    with pytest.raises(BrainError, match="超时"):
+        await brain.reply(ChatType.PRIVATE, "42", "在吗")
+    await brain.aclose()
+
+    deletes = [call for call in server.calls if call == ("DELETE", "/api/session/ses_new")]
+    assert len(deletes) == 1
+    assert store.get_opencode_session(ChatType.PRIVATE, "42") is None
+
+
 # ---- 审计：良性 system 不算注入，未知类型仍然算 -------------------------
 
 
@@ -384,6 +461,28 @@ async def test_unknown_message_type_still_clears_session(
     assert reply.reply == "在群聊卖萌"
     assert store.get_opencode_session(ChatType.PRIVATE, "42") is None
     assert "msg_syn" in caplog.text
+
+
+async def test_audit_failure_keeps_reply(
+    store: Store,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """审计只是旁路：消息接口抖一下，已拿到的回复不能丢。"""
+
+    async def boom(*args: Any, **kwargs: Any) -> list[str]:
+        raise RuntimeError("message endpoint blip")
+
+    server = FakeServer()
+    brain = make_brain(store, server)
+    monkeypatch.setattr(brain, "_audit_round", boom)
+
+    with caplog.at_level("WARNING"):
+        reply = await brain.reply(ChatType.PRIVATE, "42", "在吗")
+    await brain.aclose()
+
+    assert reply.reply == "在群聊卖萌"
+    assert any("审计" in record.getMessage() for record in caplog.records)
 
 
 # ---- 新 session 第一轮：重放本地最近对话 --------------------------------
@@ -653,6 +752,21 @@ def test_parse_logs_warning_when_falling_back(
 
     assert reply.reply == FALLBACK_REPLY
     assert any("降级" in rec.getMessage() for rec in caplog.records)
+
+
+async def test_truncated_json_uses_fallback(
+    store: Store, caplog: pytest.LogCaptureFixture
+) -> None:
+    """finish=length 且 JSON 残缺：走 parse_brain_reply 的截断兜底，别发半截协议。"""
+    server = FakeServer(answer='{"speak": true, "reply": "abc', finish="length")
+    brain = make_brain(store, server)
+
+    with caplog.at_level("WARNING"):
+        reply = await brain.reply(ChatType.PRIVATE, "42", "在吗")
+    await brain.aclose()
+
+    assert reply.reply == FALLBACK_REPLY
+    assert any("finish_reason=length" in rec.getMessage() for rec in caplog.records)
 
 
 def test_parse_clean_json_does_not_warn(caplog: pytest.LogCaptureFixture) -> None:

@@ -225,13 +225,20 @@ class OpenCodeBrain:
                 proc.communicate(), timeout=self.timeout
             )
         except TimeoutError as exc:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            with contextlib.suppress(ProcessLookupError):
-                await proc.wait()
             raise BrainError(
                 f"OpenCode 超时（{self.timeout:.0f} 秒），本条放弃"
             ) from exc
+        finally:
+            # 超时 / 取消 / 其它异常都可能走到这里：进程只要还活着就必须收掉，
+            # 否则 CLI 会变成孤儿继续跑、管道也不关。清理失败一律吞掉，
+            # 不能覆盖正在上抛的原始异常。
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(
+                        asyncio.wait_for(proc.wait(), timeout=5)
+                    )
 
         stdout = stdout_b.decode("utf-8", errors="replace")
         stderr = stderr_b.decode("utf-8", errors="replace")

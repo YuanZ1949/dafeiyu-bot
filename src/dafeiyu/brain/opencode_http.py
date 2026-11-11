@@ -62,7 +62,24 @@ NEW_SESSION_PREFIX = (
 
 
 class _UnknownSession(Exception):
-    """服务端说这个 session 不存在（被删或换了库）。"""
+    """服务端说这个 session 不存在（被删或换了库）。
+
+    带上端点和状态码：重建之后的失败要能说清是哪一步 404，否则真实原因
+    （比如端点不存在）会被「session 已失效」的笼统文案掩盖。
+    """
+
+    def __init__(self, path: str = "", status: int = 404) -> None:
+        self.path: str = path
+        self.status: int = status
+        super().__init__(f"HTTP {status} {path or '未知端点'}: session 不存在")
+
+
+def _response_path(response: httpx.Response) -> str:
+    """响应所属的端点路径；手工构造的 Response 没有 request，返回空串。"""
+    try:
+        return response.request.url.path
+    except (RuntimeError, AttributeError):
+        return ""
 
 
 def _join_text(message: dict[str, Any]) -> str:
@@ -316,26 +333,55 @@ class OpenCodeHttpBrain:
 
         session_id = self.store.get_opencode_session(chat_type, chat_id)
         for attempt in (0, 1):
+            # 本轮是不是新建 session：失败时要把它删掉，别在服务端留垃圾，
+            # 也免得下一轮把带半截上下文的会话接回来。
+            created = session_id is None
             turn_prompt = prompt
-            if not session_id:
+            if created:
                 # 新 session 的第一轮：把本地最近对话垫在前面，别让模型裸开。
                 history = self._new_session_history(chat_type, chat_id)
                 if history:
                     turn_prompt = f"{NEW_SESSION_PREFIX}\n{history}\n\n{prompt}"
+            sid = session_id or ""
             try:
                 sid = session_id or await self._create_session()
                 result = await self._ask(sid, turn_prompt, on_tool=on_tool)
-            except _UnknownSession:
-                # session 被删或数据库重置：清映射，新开一个再试一次。
-                self.store.clear_opencode_session(chat_type, chat_id)
-                session_id = None
-                if attempt:
-                    raise BrainError("OpenCode session 已失效，重建后仍失败") from None
-                continue
+            except _UnknownSession as exc:
+                # 只有「沿用的旧 session 已失效」才值得清映射重建一次：新建的
+                # session 一上来就 404，说明问题不在过期，重建只会再骗一次。
+                if not created and attempt == 0:
+                    log.warning(
+                        "OpenCode session %s 返回 404（%s），清映射后重建一次",
+                        sid,
+                        exc.path or "未知端点",
+                    )
+                    self.store.clear_opencode_session(chat_type, chat_id)
+                    session_id = None
+                    continue
+                endpoint = exc.path or "未知端点"
+                detail = (
+                    f"新建 session 后立即 404（{endpoint}）"
+                    if created
+                    else f"重建 session 后仍 404（{endpoint}）"
+                )
+                log.warning("OpenCode session 调用 404：%s", detail)
+                raise BrainError(
+                    f"OpenCode session 调用失败：{detail}", status=exc.status
+                ) from None
+            except Exception:
+                # 失败轮次不能把刚建出来的 session 留在服务端。
+                if created and sid:
+                    await self._delete_session(sid)
+                raise
             self.store.set_opencode_session(chat_type, chat_id, sid)
             if not result.text.strip():
                 raise BrainError("OpenCode 没有返回文本")
-            foreign = await self._audit_round(sid, result.since, result.until)
+            try:
+                foreign = await self._audit_round(sid, result.since, result.until)
+            except Exception:
+                # 审计只是旁路：消息接口抖一下不能把已经拿到的回复丢掉。
+                log.warning("审计本轮消息失败，忽略：%s", sid, exc_info=True)
+                foreign = []
             if foreign:
                 # 不 raise：这一轮的回复已经拿到了，先把答案给用户，
                 # 再把这个被污染的 session 丢掉，下一轮重新开一个。
@@ -415,7 +461,18 @@ class OpenCodeHttpBrain:
 
         self.store.clear_opencode_session(chat_type, chat_id)
         sid = await self._create_session()
-        result = await self._ask(sid, body, on_tool=on_tool)
+        try:
+            result = await self._ask(sid, body, on_tool=on_tool)
+        except _UnknownSession as exc:
+            # reply_fresh 永远新建：这里 404 说明端点/服务端有问题，不是过期。
+            raise BrainError(
+                f"OpenCode 新建 session 后立即 404（{exc.path or '未知端点'}），不再重建",
+                status=exc.status,
+            ) from None
+        except Exception:
+            # 失败轮次不保留这个白建的 session。
+            await self._delete_session(sid)
+            raise
         self.store.set_opencode_session(chat_type, chat_id, sid)
         if not result.text.strip():
             raise BrainError("OpenCode 没有返回文本")
@@ -433,8 +490,20 @@ class OpenCodeHttpBrain:
             result.text,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            # 不传这个，parse_brain_reply 的 length 截断兜底永远不生效：
+            # 半截 JSON 会被当成「非 JSON 返回」直接发到群里。
+            finish_reason=result.finish,
         )
         return replace(reply, estimated=True) if estimated else reply
+
+    async def _delete_session(self, session_id: str) -> None:
+        """删远端 session；失败只记日志，绝不掩盖调用方正在抛的原始异常。"""
+        try:
+            await self._request("DELETE", f"/api/session/{session_id}")
+        except _UnknownSession:
+            pass  # 远端已经没有了，等于删成功
+        except Exception:
+            log.warning("删除 opencode 会话失败：%s", session_id, exc_info=True)
 
     async def _create_session(
         self,
@@ -452,7 +521,9 @@ class OpenCodeHttpBrain:
             body["permissions"] = effective
         if self.project_dir:
             body["location"] = {"directory": self.project_dir}
-        payload = await self._request("POST", "/api/session", body=body)
+        payload = await self._request(
+            "POST", "/api/session", body=body, not_found_is_session=False
+        )
         data = payload.get("data") or {}
         sid = data.get("id") if isinstance(data, dict) else None
         if not isinstance(sid, str) or not sid:
@@ -620,6 +691,14 @@ class OpenCodeHttpBrain:
             raise BrainError(
                 f"OpenCode 服务不可达：{exc.__class__.__name__}"
             ) from exc
+        if response.status_code == 404:
+            # /wait 是实验接口，旧版服务端根本没有它：这里的 404 与 session
+            # 无关，若按 _UnknownSession 处理会白白重建会话再跑一遍模型。
+            raise BrainError(
+                "OpenCode 服务端不支持 wait 接口（404 "
+                f"{_response_path(response)}），请升级 opencode 或改用轮询",
+                status=404,
+            )
         self._check_response(response)
         return response.status_code == 204
 
@@ -641,7 +720,9 @@ class OpenCodeHttpBrain:
         return [item for item in data if isinstance(item, dict)]
 
     @staticmethod
-    def _check_response(response: httpx.Response) -> None:
+    def _check_response(
+        response: httpx.Response, *, not_found_is_session: bool = True
+    ) -> None:
         if response.status_code in (401, 403):
             raise BrainError(
                 "OpenCode 服务拒绝认证：检查 opencode.server_password"
@@ -649,7 +730,13 @@ class OpenCodeHttpBrain:
                 status=response.status_code,
             )
         if response.status_code == 404:
-            raise _UnknownSession()
+            path = _response_path(response)
+            if not_found_is_session:
+                raise _UnknownSession(path, response.status_code)
+            raise BrainError(
+                f"OpenCode 端点不存在（404 {path or '未知端点'}）",
+                status=response.status_code,
+            )
         if response.status_code >= 400:
             detail = response.text.strip().replace("\n", " ")[:200]
             raise BrainError(
@@ -664,6 +751,7 @@ class OpenCodeHttpBrain:
         *,
         body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        not_found_is_session: bool = True,
     ) -> dict[str, Any]:
         try:
             response = await self._client.request(
@@ -673,7 +761,11 @@ class OpenCodeHttpBrain:
             raise BrainError(
                 f"OpenCode 服务不可达：{exc.__class__.__name__}"
             ) from exc
-        self._check_response(response)
+        # 404 的语义按调用点区分：session 子资源才有「session 不存在」这层意思，
+        # 新建/实验性端点 404 是端点本身不在。
+        self._check_response(
+            response, not_found_is_session=not_found_is_session
+        )
         # 204 / 空 body 是正常响应（DELETE /api/session 就是 204）：没有正文
         # 不代表出错，按空对象处理，否则「彻底删除会话」永远失败。
         if response.status_code == 204 or not response.content:

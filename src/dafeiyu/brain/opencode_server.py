@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import socket
@@ -156,8 +157,12 @@ class OpenCodeServer:
                 self._drain_tasks.append(asyncio.create_task(self._drain(stream)))
         try:
             await self._wait_ready()
-        except Exception:
-            await self.stop()
+        except BaseException:
+            # 取消（CancelledError 是 BaseException）同样要收进程，否则
+            # serve 会占着端口活下来。stop() 用 shield 保护：外层再被取消
+            # 也不能半途打断清理。
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.shield(self.stop())
             raise
 
     async def _wait_ready(self) -> None:

@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -184,3 +185,47 @@ async def test_forget_clears_session(store: Store) -> None:
     brain = OpenCodeBrain("opencode.exe", store)
     await brain.forget(ChatType.GROUP, 7)
     assert store.get_opencode_session(ChatType.GROUP, 7) is None
+
+
+class NeverExitingProc:
+    """communicate() 永不返回的假进程：只有被 kill 才会结束。"""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.killed = False
+        self._exited = asyncio.Event()
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        await self._exited.wait()
+        return b"", b""
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self._exited.set()
+
+    async def wait(self) -> int:
+        await self._exited.wait()
+        return self.returncode if self.returncode is not None else 0
+
+
+async def test_cancelled_run_kills_process(monkeypatch, store: Store) -> None:
+    """取消（而不是超时）也必须杀掉 CLI 子进程，否则会留下孤儿。"""
+    proc = NeverExitingProc()
+
+    async def fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    brain = OpenCodeBrain("opencode.exe", store, timeout=60.0)
+
+    task = asyncio.create_task(brain._run("在吗", None))
+    await asyncio.sleep(0.05)
+    assert proc.killed is False
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert proc.killed is True
+    assert proc.returncode is not None
