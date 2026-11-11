@@ -216,6 +216,46 @@ def _wechat_service(adapter: _WeChatFileAdapter) -> Service:
     return service
 
 
+# ---- channel_status：只有微信形态补 desktop_required，QQ 键集合不变 --------
+class _DesktopAdapter(_WeChatFileAdapter):
+    """微信形态的假适配器：带 desktop / desktop_required。"""
+
+    def __init__(self, *, required: bool = False) -> None:
+        super().__init__()
+        self.desktop = True
+        self.desktop_required = required
+
+
+class _PlainQQAdapter:
+    """QQ 形态的假适配器：既没有 desktop 也没有 desktop_required。"""
+
+
+def _adapters_service(adapters: dict[str, object]) -> Service:
+    """沿用 ``_wechat_service`` 的组装方式，只注入 adapters。"""
+    service = object.__new__(Service)
+    setattr(service, "adapters", adapters)
+    return service
+
+
+def test_status_exposes_desktop_required_for_wechat_only() -> None:
+    service = _adapters_service({"wechat": _DesktopAdapter(), "qq": _PlainQQAdapter()})
+
+    status = service.channel_status()
+
+    assert status["wechat"]["desktop"] is True
+    assert status["wechat"]["desktop_required"] is False
+    assert set(status["qq"]) == {
+        "connected",
+        "degraded",
+        "last_event_at",
+        "last_disconnect_at",
+        "last_send_at",
+    }
+    # uia 后端的适配器要如实透出 True，不能写死 False。
+    uia = _adapters_service({"wechat": _DesktopAdapter(required=True)})
+    assert uia.channel_status()["wechat"]["desktop_required"] is True
+
+
 async def test_wechat_file_attachment_calls_upload_file() -> None:
     adapter = _WeChatFileAdapter()
     service = _wechat_service(adapter)

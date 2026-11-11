@@ -294,7 +294,13 @@ class AlertManager:
             if not isinstance(wechat, dict):
                 wechat = {}
             bridge_down = bridge_status != "running"
-            desktop_locked = wechat.get("desktop") == "locked"
+            # 只有出站真的依赖可交互桌面（outbound=uia）时，锁屏才意味着发不出去。
+            # outbound=hook 走 hook 注入，锁屏不影响发送；旧版 bot 快照没有
+            # desktop_required 键，此时按 True 处理以保持原有行为。
+            desktop_locked = (
+                wechat.get("desktop") == "locked"
+                and wechat.get("desktop_required", True) is not False
+            )
             disconnected = wechat.get("connected") is False
             logged_out = wechat.get("logged_in") is False
             if bridge_down or desktop_locked or disconnected or logged_out:

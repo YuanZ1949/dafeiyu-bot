@@ -480,6 +480,11 @@ class Service:
                 status[channel]["logged_in"] = adapter.logged_in
             if hasattr(adapter, "desktop"):
                 status[channel]["desktop"] = adapter.desktop
+                # 桌面锁定是否真的影响出站：hook/auto 后端为 False，只有 uia 为 True。
+                if hasattr(adapter, "desktop_required"):
+                    status[channel]["desktop_required"] = bool(
+                        getattr(adapter, "desktop_required")
+                    )
             # 降级原因（如 hook 模式本地库不可用）：有才补，空串不带键，
             # 保持 QQ 通道与旧快照的字段形状不变。
             health_reason = getattr(adapter, "health_reason", "")

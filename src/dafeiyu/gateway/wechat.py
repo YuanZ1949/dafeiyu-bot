@@ -133,6 +133,15 @@ class WeChatAdapter:
         return self._desktop
 
     @property
+    def desktop_required(self) -> bool:
+        """桌面锁定是否真的会让出站失败：只有 uia 后端为 True。
+
+        健康快照里带上它，supervisor 才能区分「锁屏导致发不出去」与
+        「hook 后端 + 锁屏」这种不影响发送的误报。
+        """
+        return self._desktop_required()
+
+    @property
     def connected(self) -> bool:
         if not self._socket_open or not self._health_connected:
             return False

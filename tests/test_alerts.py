@@ -351,6 +351,59 @@ async def test_wechat_down_detail_matches_failure_mode(
     assert "napcat" not in incident.detail.casefold()
 
 
+async def test_wechat_down_ignores_desktop_lock_in_hook_mode(
+    tmp_path: Path,
+) -> None:
+    """outbound=hook 不依赖可交互桌面：锁屏不该被当成微信不可用。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = wechat_snapshot(
+        wechat={
+            "connected": True,
+            "logged_in": True,
+            "desktop": "locked",
+            "desktop_required": False,
+        }
+    )
+
+    await mgr.evaluate(snapshot)
+    clock.advance(181)
+    await mgr.evaluate(snapshot)
+
+    assert all(incident.rule != "wechat_down" for incident, _event in channel.sent)
+    assert mgr.summary()["firing"] == 0
+
+
+async def test_wechat_down_fires_on_desktop_lock_in_uia_mode(
+    tmp_path: Path,
+) -> None:
+    """outbound=uia 依赖可交互桌面：锁屏依然要告警。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = wechat_snapshot(
+        wechat={
+            "connected": True,
+            "logged_in": True,
+            "desktop": "locked",
+            "desktop_required": True,
+        }
+    )
+
+    await mgr.evaluate(snapshot)
+    clock.advance(181)
+    await mgr.evaluate(snapshot)
+
+    fired = [
+        incident
+        for incident, event in channel.sent
+        if incident.rule == "wechat_down" and event == "firing"
+    ]
+    assert len(fired) == 1
+    assert fired[0].severity == "critical"
+
+
 async def test_wechat_down_skipped_when_bridge_disabled(tmp_path: Path) -> None:
     clock = Clock()
     channel = FakeChannel()
