@@ -134,11 +134,29 @@ class Supervisor:
 
     # ---- lifecycle -------------------------------------------------
     async def start(self, name: str) -> None:
+        """人工启动（面板 / CLI / 开机 start_all）：清零崩溃计数。
+
+        「清计数」只属于人工启动：看门狗与自愈的重启走 `_start(manual=False)`，
+        否则崩溃循环每被自动拉起一次就把 `failures` 清零，永远到不了阈值。
+        """
+        await self._start(name, manual=True)
+
+    async def _start(self, name: str, *, manual: bool) -> None:
         state = self._state(name)
         if state.status == EXTERNAL:
             return
         if state.proc is not None and state.proc.returncode is None:
+            # 上一个进程还活着时再拉一个只会抢端口 / 登录态，直接拒绝。
+            self.logs.write(
+                name,
+                f"上一个进程仍在运行（pid={state.proc.pid}），请先停止",
+            )
             return
+        if manual:
+            # 崩溃循环把 failures 顶过 max_failures 后状态是 failed，此时人工
+            # 启动若不清零，下一次崩溃会被立刻判「连续失败」，自愈永久失效。
+            state.failures = 0
+            state.restart_count = 0
         state.manual_stop = False
         state.status = STARTING
         spec = state.spec
@@ -163,7 +181,7 @@ class Supervisor:
         state.proc = proc
         state.started_at = time.monotonic()
         self.logs.write(name, f"已启动 pid={proc.pid}")
-        # 自动重启时这个 start() 就跑在 _watch 自己里面：此时 watcher 就是当前
+        # 自动重启时这个 _start() 就跑在 _watch 自己里面：此时 watcher 就是当前
         # 任务，取消它等于把自己打断，状态会永远停在 starting，新进程也没有
         # 看门狗（后续崩溃再没人拉起）。只有「换掉另一个还活着的看门狗」才取消。
         if (
@@ -178,7 +196,7 @@ class Supervisor:
             if stream is not None
         ]
         if (spec.ready_url or spec.ready_probe) and not await self._wait_ready(state):
-            await self._terminate(state)
+            _ = await self._terminate(state)
             state.status = FAILED
             timeout = self._ready_timeout(state)
             raise RuntimeError(f"{name} 未在 {timeout:.0f}s 内就绪")
@@ -266,7 +284,8 @@ class Supervisor:
             state.status = STOPPED
             return
         try:
-            await self.start(state.name)
+            # 自动重启：不能清零 failures（否则崩溃循环变成无限重启风暴）。
+            await self._start(state.name, manual=False)
         # 自动重启失败标记 FAILED 并写日志，不能让看门狗线程退出。
         except Exception as exc:  # noqa: BLE001
             state.status = FAILED
@@ -279,28 +298,50 @@ class Supervisor:
         state.manual_stop = True
         state.status = STOPPING
         self.logs.write(name, "正在停止…")
-        if state.proc is not None and state.proc.returncode is None:
-            await self._terminate(state)
-        state.proc = None
+        cleaned = (
+            True
+            if state.proc is None or state.proc.returncode is not None
+            else await self._terminate(state)
+        )
+        # drain 只是管道读端：进程没死时取消它最多让残留进程写满管道卡住，
+        # 不会让它变得更难杀，但继续留着会永久占着 supervisor 的管道和任务。
         await self._cancel_drains(state)
+        if not cleaned:
+            # 进程还活着：保留 proc（status/pid 仍可观测），别谎报 stopped。
+            pid = state.proc.pid if state.proc is not None else None
+            state.status = FAILED
+            self.logs.write(name, f"停止失败，仍有残留（pid={pid}）")
+            return
+        state.proc = None
         state.status = STOPPED
         self.logs.write(name, "已停止")
 
-    async def _terminate(self, state: ProcState) -> None:
+    async def _terminate(self, state: ProcState) -> bool:
+        """先优雅终止、再清进程树；返回是否确认已清理干净（无残留）。"""
         proc = state.proc
         if proc is None or proc.returncode is not None:
-            return
+            # 调用时已经退出：不 taskkill（pid 可能已被系统复用）。
+            return True
         pid = proc.pid
         with contextlib.suppress(OSError):
             proc.terminate()
         try:
             await asyncio.wait_for(proc.wait(), timeout=STOP_TIMEOUT)
-            return
         except TimeoutError:
             self.logs.write(
                 state.name,
                 f"{STOP_TIMEOUT:.0f}s 内未退出（pid={pid}），强制结束进程树",
             )
+        else:
+            # 主进程退干净不代表没有残留：NapCat 的 worker 在后台继续占着
+            # QQ 登录态，所以照样清一次进程树，并用它的结果判定是否真停了。
+            if await _kill_tree(pid):
+                return True
+            self.logs.write(
+                state.name,
+                f"主进程已退出，但子进程未能清理（pid={pid}），可能仍有残留",
+            )
+            return False
         # 第一次 taskkill 失败常见于 NapCat：它的 worker 正在自己收尾，
         # 这时 /F 会拿到 EPERM。隔一秒再试一次，别让残留进程占着 QQ 登录态。
         for attempt in (1, 2):
@@ -308,13 +349,14 @@ class Supervisor:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(proc.wait(), timeout=KILL_WAIT_TIMEOUT)
             if proc.returncode is not None:
-                return
+                return True
             if attempt == 1:
                 await asyncio.sleep(1.0)
         self.logs.write(
             state.name,
             f"强制结束失败（pid={pid}），残留进程可能占着端口或 QQ 登录态",
         )
+        return False
 
     async def restart(self, name: str) -> None:
         await self.stop(name)
@@ -405,7 +447,8 @@ class Supervisor:
             state.proc = None
             await self._cancel_drains(state)
             state.status = STOPPED
-            await self.start(name)
+            # 自愈也是自动路径：保留失败计数，避免「命中一次模式」就白送一次配额。
+            await self._start(name, manual=False)
         except Exception as exc:  # noqa: BLE001 - 自愈失败要写日志，不能吞掉
             state.status = FAILED
             self.logs.write(name, f"自愈失败：{exc.__class__.__name__}: {exc}")
@@ -578,12 +621,19 @@ def _find_listener_pid(port: int) -> int | None:
 
 
 async def _kill_tree(pid: int) -> bool:
-    """强制结束进程树；返回 taskkill 是否成功（失败由调用方决定要不要再试）。"""
+    """强制结束进程树；返回是否确认已清理干净（没有残留）。
+
+    「进程/子进程本来就不存在」是正常情况：taskkill 找不到目标会返回非 0
+    （128），调用方不该把它当失败——进程已经退了，任务已经达成。
+    只有 taskkill 失败而进程仍然活着，才算真的没清掉。
+    """
     if os.name != "nt":
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, 9)
             return True
         return False
+    if not pid_alive(pid):
+        return True
     try:
         proc = await asyncio.create_subprocess_exec(
             "taskkill", "/PID", str(pid), "/T", "/F",
@@ -593,4 +643,6 @@ async def _kill_tree(pid: int) -> bool:
         await proc.wait()
     except OSError:
         return False
-    return proc.returncode == 0
+    if proc.returncode == 0:
+        return True
+    return not pid_alive(pid)

@@ -242,7 +242,10 @@ async def test_stop_prefers_graceful_shutdown(tmp_path):
 
     try:
         result = await stop_mod.stop_supervisor(
-            port=8787, pid_path=path, shutdown_fn=fake_shutdown
+            port=8787,
+            pid_path=path,
+            shutdown_fn=fake_shutdown,
+            cmdline_fn=lambda pid: f"{sys.executable} -m dafeiyu.supervisor",
         )
     finally:
         _wait_dead(proc)
@@ -253,26 +256,127 @@ async def test_stop_prefers_graceful_shutdown(tmp_path):
     assert not path.exists()
 
 
-async def test_stop_forces_when_shutdown_unavailable(tmp_path):
+async def test_stop_forces_when_shutdown_unavailable(tmp_path, monkeypatch):
     proc = _spawn_sleeper()
     path = tmp_path / "supervisor.pid"
     path.write_text(str(proc.pid), encoding="utf-8")
+    calls = {"force": 0}
 
     async def no_shutdown(host, port, *, username, password):
         return False
 
+    def fake_force_kill(pid):
+        calls["force"] += 1
+        proc.terminate()
+        return True
+
+    monkeypatch.setattr(stop_mod, "_force_kill", fake_force_kill)
     started = time.monotonic()
     try:
         result = await stop_mod.stop_supervisor(
-            port=8787, pid_path=path, shutdown_fn=no_shutdown, timeout=10.0
+            port=8787,
+            pid_path=path,
+            shutdown_fn=no_shutdown,
+            cmdline_fn=lambda pid: f"{sys.executable} -m dafeiyu.supervisor",
+            timeout=10.0,
         )
     finally:
         _wait_dead(proc)
 
     assert result.status == "stopped"
     assert result.method == "forced"
+    assert calls["force"] == 1
     assert time.monotonic() - started < 15
     assert not path.exists()
+
+
+async def test_stale_pid_with_foreign_command_is_not_killed(tmp_path, monkeypatch):
+    """pid 文件里的 pid 活着但不是 supervisor（pid 被复用）：不关停、不强杀。"""
+    path = tmp_path / "supervisor.pid"
+    path.write_text(str(os.getpid()), encoding="utf-8")
+    calls = {"shutdown": 0, "force": 0}
+
+    async def fake_shutdown(host, port, *, username, password):
+        calls["shutdown"] += 1
+        return True
+
+    def fake_force_kill(pid):
+        calls["force"] += 1
+        return True
+
+    monkeypatch.setattr(stop_mod, "_force_kill", fake_force_kill)
+    result = await stop_mod.stop_supervisor(
+        port=8787,
+        pid_path=path,
+        shutdown_fn=fake_shutdown,
+        port_finder=lambda port: None,
+        cmdline_fn=lambda pid: r"C:\Windows\system32\notepad.exe",
+    )
+
+    assert result.status == "not_running"
+    assert result.stale is True
+    assert result.pid == os.getpid()
+    assert calls == {"shutdown": 0, "force": 0}
+    assert not path.exists()
+
+
+async def test_unreadable_command_line_is_not_killed(tmp_path, monkeypatch):
+    """取不到命令行时保守处理：视为未确认，不关停、不强杀。"""
+    path = tmp_path / "supervisor.pid"
+    path.write_text(str(os.getpid()), encoding="utf-8")
+    calls = {"shutdown": 0, "force": 0}
+
+    async def fake_shutdown(host, port, *, username, password):
+        calls["shutdown"] += 1
+        return True
+
+    def fake_force_kill(pid):
+        calls["force"] += 1
+        return True
+
+    monkeypatch.setattr(stop_mod, "_force_kill", fake_force_kill)
+    result = await stop_mod.stop_supervisor(
+        port=8787,
+        pid_path=path,
+        shutdown_fn=fake_shutdown,
+        port_finder=lambda port: None,
+        cmdline_fn=lambda pid: None,
+    )
+
+    assert result.status == "not_running"
+    assert result.stale is True
+    assert calls == {"shutdown": 0, "force": 0}
+    assert not path.exists()
+
+
+async def test_force_kill_failure_reports_failed(tmp_path, monkeypatch):
+    """taskkill 失败时不能报 stopped（即便进程看起来已经退出）。"""
+    path = tmp_path / "supervisor.pid"
+    path.write_text(str(os.getpid()), encoding="utf-8")
+
+    async def no_shutdown(host, port, *, username, password):
+        return False
+
+    def failing_force_kill(pid):
+        return False
+
+    async def dead_anyway(pid, timeout, poll_seconds):
+        return True
+
+    monkeypatch.setattr(stop_mod, "_force_kill", failing_force_kill)
+    monkeypatch.setattr(stop_mod, "_wait_dead", dead_anyway)
+    result = await stop_mod.stop_supervisor(
+        port=8787,
+        pid_path=path,
+        shutdown_fn=no_shutdown,
+        cmdline_fn=lambda pid: f"{sys.executable} -m dafeiyu.supervisor",
+        timeout=1.0,
+    )
+
+    assert result.status == "failed"
+    assert result.method is None
+    assert result.pid == os.getpid()
+    assert path.exists()
 
 
 async def test_signal_stop_writes_supervisor_stop_audit(tmp_path):

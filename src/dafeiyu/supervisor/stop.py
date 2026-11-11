@@ -130,9 +130,14 @@ CmdlineFn = Callable[[int], str | None]
 
 
 def _process_command_line(pid: int) -> str | None:
-    """查询进程命令行；非 Windows 或查询失败时返回 None（按不匹配处理）。"""
+    """查询进程命令行；查询失败时返回 None（按不匹配处理）。"""
     if os.name != "nt":
-        return None
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return None
+        text = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+        return text or None
     command = (
         f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}").CommandLine'
     )
@@ -157,6 +162,20 @@ def _process_command_line(pid: int) -> str | None:
 def _looks_like_supervisor(command_line: str) -> bool:
     lowered = command_line.lower()
     return "dafeiyu" in lowered and "supervisor" in lowered
+
+
+def _confirmed_supervisor(pid: int, cmdline_fn: CmdlineFn) -> bool:
+    """pid 的命令行确实是 supervisor 才返回 True。
+
+    取不到命令行（空/异常）时按「无法确认」处理：宁可不动，也不误杀（B3-1）。
+    """
+    try:
+        command_line = cmdline_fn(pid)
+    except Exception:  # noqa: BLE001 - 查不到就当未确认
+        return False
+    if not command_line:
+        return False
+    return _looks_like_supervisor(command_line)
 
 
 def _supervisor_pid_on_port(
@@ -231,6 +250,16 @@ async def stop_supervisor(
             return StopResult(status="not_running", pid=recorded_pid, stale=stale)
         pid = fallback
         stale = True
+    elif not _confirmed_supervisor(pid, cmdline_fn):
+        # pid 文件里的 pid 还活着，但命令行不是 supervisor（pid 被系统复用）：
+        # 绝不能对它 taskkill，只清理失效的 pid 文件（B3-1）。
+        _unlink(pid_path)
+        return StopResult(
+            status="not_running",
+            pid=pid,
+            stale=True,
+            port_busy=_port_occupied(port, port_finder),
+        )
 
     method: str | None = None
     graceful = await shutdown_fn(
@@ -239,8 +268,8 @@ async def stop_supervisor(
     if graceful and await _wait_dead(pid, timeout, poll_seconds):
         method = "shutdown"
     elif force:
-        _force_kill(pid)
-        if await _wait_dead(pid, min(timeout, 10.0), poll_seconds):
+        killed = _force_kill(pid)
+        if killed and await _wait_dead(pid, min(timeout, 10.0), poll_seconds):
             method = "forced"
 
     if method is None:
@@ -259,18 +288,24 @@ async def _wait_dead(pid: int, timeout: float, poll_seconds: float) -> bool:
         await asyncio.sleep(poll_seconds)
 
 
-def _force_kill(pid: int) -> None:
+def _force_kill(pid: int) -> bool:
+    """强制结束进程树；返回命令是否成功（成功才允许报「已停止」）。"""
     if os.name == "nt":
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            subprocess.run(
+        try:
+            proc = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
                 check=False,
                 **hidden_kwargs(),
             )
-        return
-    with contextlib.suppress(ProcessLookupError, PermissionError):
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.returncode == 0
+    try:
         os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
 
 
 def _unlink(path: Path) -> None:

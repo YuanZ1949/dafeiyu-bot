@@ -15,6 +15,7 @@ from dafeiyu.supervisor.manager import (
     READY,
     STARTING,
     STOPPED,
+    STOPPING,
     ProcSpec,
     Supervisor,
     port_owner,
@@ -216,7 +217,9 @@ class _StubbornProc:
         self.returncode = -9
 
 
-def _stubborn_state(supervisor: Supervisor, proc: _StubbornProc):
+def _stubborn_state(
+    supervisor: Supervisor, proc: _StubbornProc | _CooperativeProc
+):
     from dafeiyu.supervisor.manager import ProcState
 
     state = ProcState("napcat", ProcSpec("napcat", [sys.executable, "-c", SLEEPER]))
@@ -274,6 +277,157 @@ async def test_terminate_logs_残留进程_when_kill_keeps_failing(
 
     logs = hub.tail("napcat")
     assert any("强制结束失败（pid=4321）" in line for line in logs)
+
+
+class _CooperativeProc:
+    """优雅退出的子进程：terminate() 立刻生效（主进程干净退出，worker 可能残留）。"""
+
+    def __init__(self, pid: int = 4321) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+        self.terminated = False
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = 0
+
+    async def wait(self) -> int:
+        while self.returncode is None:
+            await asyncio.sleep(0.01)
+        return self.returncode
+
+
+async def test_terminate_kills_tree_even_if_parent_exits_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """主进程退得快不代表干净：NapCat 的 worker 会留下，必须照样清一次进程树。"""
+    import dafeiyu.supervisor.manager as manager_mod
+
+    supervisor, hub = make_supervisor(tmp_path, {})
+    proc = _CooperativeProc()
+    state = _stubborn_state(supervisor, proc)
+    killed: list[int] = []
+
+    async def fake_kill_tree(pid: int) -> bool:
+        killed.append(pid)
+        return True
+
+    monkeypatch.setattr(manager_mod, "_kill_tree", fake_kill_tree)
+    assert await supervisor._terminate(state) is True
+
+    assert killed == [4321]
+    assert not any("强制结束失败" in line for line in hub.tail("napcat"))
+
+
+async def test_stop_marks_failed_when_kill_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """强杀也失败时不能谎报 stopped：保留 proc，状态记 failed 让上层看得见。"""
+    import dafeiyu.supervisor.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "STOP_TIMEOUT", 0.01)
+    monkeypatch.setattr(manager_mod, "KILL_WAIT_TIMEOUT", 0.01)
+    supervisor, hub = make_supervisor(tmp_path, {})
+    proc = _StubbornProc()
+    state = _stubborn_state(supervisor, proc)
+
+    async def fake_kill_tree(pid: int) -> bool:
+        return False
+
+    monkeypatch.setattr(manager_mod, "_kill_tree", fake_kill_tree)
+    await supervisor.stop("napcat")
+
+    assert state.status == FAILED
+    assert state.proc is proc
+    logs = hub.tail("napcat")
+    assert any("停止失败，仍有残留（pid=4321）" in line for line in logs)
+    assert not any("已停止" in line for line in logs)
+
+
+async def test_start_refuses_when_previous_pid_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """上一个进程没死（例如 stop 失败）时拒绝启动，绝不并存两个实例。"""
+    supervisor, hub = make_supervisor(
+        tmp_path, {"napcat": ProcSpec("napcat", [sys.executable, "-c", SLEEPER])}
+    )
+    proc = _CooperativeProc()
+    proc.returncode = None
+    state = supervisor.states["napcat"]
+    state.proc = proc
+    state.status = STOPPING
+
+    await supervisor.start("napcat")
+
+    assert state.proc is proc
+    assert state.status == STOPPING
+    logs = hub.tail("napcat")
+    assert any("上一个进程仍在运行（pid=4321），请先停止" in line for line in logs)
+
+
+async def test_manual_start_resets_failure_counter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """崩溃循环后人工启动：失败计数清零，下一次崩溃还能继续自愈。"""
+    import dafeiyu.supervisor.manager as manager_mod
+
+    async def fake_kill_tree(pid: int) -> bool:
+        return True
+
+    monkeypatch.setattr(manager_mod, "_kill_tree", fake_kill_tree)
+    specs = {"sleeper": ProcSpec("sleeper", [sys.executable, "-u", "-c", SLEEPER])}
+    supervisor, _ = make_supervisor(tmp_path, specs)
+    state = supervisor.states["sleeper"]
+    state.failures = 5
+    state.restart_count = 4
+    state.status = FAILED
+    try:
+        await supervisor.start("sleeper")
+        assert state.failures == 0
+        assert state.restart_count == 0
+        assert state.status == READY
+    finally:
+        await supervisor.stop("sleeper")
+
+
+async def test_auto_restart_does_not_reset_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """看门狗自动重启不清零计数，否则崩溃循环会变成无限重启风暴。"""
+    import dafeiyu.supervisor.manager as manager_mod
+
+    async def fake_kill_tree(pid: int) -> bool:
+        return True
+
+    monkeypatch.setattr(manager_mod, "_kill_tree", fake_kill_tree)
+    marker = tmp_path / "crashed-once"
+    script = (
+        "import os, sys, time\n"
+        f"marker = {str(marker)!r}\n"
+        "if not os.path.exists(marker):\n"
+        "    open(marker, 'w').close()\n"
+        "    time.sleep(0.2)\n"
+        "    sys.exit(3)\n"
+        "print('ready-line', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    specs = {
+        "flaky": ProcSpec(
+            "flaky",
+            [sys.executable, "-u", "-c", script],
+            ready_probe=lambda: True,
+        )
+    }
+    supervisor, hub = make_supervisor(tmp_path, specs)
+    await supervisor.start("flaky")
+    try:
+        await wait_for_log_line(hub, "flaky", "ready-line", timeout=8.0)
+        state = supervisor.states["flaky"]
+        context = f"failures={state.failures} restart_count={state.restart_count}"
+        assert state.restart_count == 1, context
+        assert state.failures == 1, f"自动重启把失败计数清零了：{context}"
+    finally:
+        await supervisor.stop("flaky")
 
 
 def test_port_owner_returns_none_for_free_port() -> None:
