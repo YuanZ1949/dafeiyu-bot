@@ -230,7 +230,8 @@ def shape_reply(
     total = max(1, hard_total)
     if len(body) > total:
         body = _truncate(body, total)
-    return _split_message(body, max(1, hard_part))
+    chunks = _split_message(body, max(1, hard_part))
+    return _merge_to_cap(chunks, MAX_PARTS, max(1, hard_part))
 
 
 def shape_reply_parts(

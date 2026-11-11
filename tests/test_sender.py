@@ -49,6 +49,28 @@ def test_model_newlines_become_message_boundaries() -> None:
     assert shape_reply(first + "\n" + second) == [first, second]
 
 
+def test_newline_heavy_string_reply_capped_at_max_parts() -> None:
+    """换行多的字符串回复也必须守在 MAX_PARTS 以内，不能炸成几十条群消息。"""
+    text = "\n".join(f"第{i}句很短。" for i in range(30))
+    chunks = shape_reply(text)
+    assert len(chunks) <= MAX_PARTS
+    assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
+
+
+def test_long_string_reply_still_splits_by_paragraph() -> None:
+    """不到上限时按原文换行分段，不能被过度合并成 1 条。"""
+    text = (
+        "第一段讲结论，这个方案今天就能上线。\n"
+        "\n"
+        "第二段讲原因，开关没打开而且网络不稳。\n"
+        "\n"
+        "第三段讲后续，明天再补一次回归测试。"
+    )
+    chunks = shape_reply(text)
+    assert len(chunks) == 3
+    assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
+
+
 def test_code_fence_is_not_split_across_messages() -> None:
     text = (
         "先看这段：\n"
