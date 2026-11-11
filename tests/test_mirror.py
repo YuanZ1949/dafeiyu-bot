@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
 from pathlib import Path
 from typing import Any
@@ -217,6 +218,42 @@ async def test_two_directions_do_not_block_each_other(tmp_path: Path) -> None:
         await wait_until(lambda: len(fast.sent) == 1)
         assert slow.sent == []
         await wait_until(lambda: len(slow.sent) == 1)
+    finally:
+        await router.stop()
+
+
+# ---------------------------------------------------------------- 多对路由
+async def test_multiple_pairs_route_to_their_own_target(tmp_path: Path) -> None:
+    settings = dataclasses.replace(
+        make_settings(),
+        mirror=MirrorConfig(
+            enabled=True,
+            pairs=(
+                MirrorPairConfig(qq="qq:1001", wechat="wxg:group"),
+                MirrorPairConfig(qq="qq:2002", wechat="wxg:other"),
+            ),
+        ),
+    )
+    store = Store(tmp_path / "mirror.db")
+    store.init_schema()
+    adapters = {
+        "qq": Recorder("qq:999"),
+        "wechat": Recorder("wxg:self"),
+    }
+    router = MirrorRouter(settings, store, adapters)
+    router.start()
+    try:
+        router.observe_inbound(make_msg("qq:1001", "一对", message_id="m1"))
+        router.observe_inbound(make_msg("qq:2002", "二对", message_id="m2"))
+        await wait_until(lambda: router.stats()["sent"] == 2)
+        assert adapters["qq"].sent == []
+        assert set(adapters["wechat"].sent) == {
+            ("wxg:group", "阿鱼：一对"),
+            ("wxg:other", "阿鱼：二对"),
+        }
+        assert router._direction("qq:1001") == ("qq", "wxg:group")
+        assert router._direction("wxg:other") == ("wechat", "qq:2002")
+        assert router._direction("qq:999999") is None
     finally:
         await router.stop()
 

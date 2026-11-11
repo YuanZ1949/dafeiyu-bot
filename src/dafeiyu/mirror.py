@@ -331,7 +331,11 @@ class MirroredAdapter:
 
 
 class MirrorRouter:
-    """一对群的双向镜像：两条独立队列 + 两个 worker。
+    """多对群的双向镜像：每个方向一条共用队列 + 一个 worker。
+
+    多对时按群精确匹配路由，每个群只属于一对、各对之间不交叉。同一方向
+    的多对共用一条队列是有意为之（保持队列/worker 结构与既有测试不变）：
+    发送按条目自带的 ``target_chat_id`` 分流，代价是同一方向上不同对串行。
 
     ``decode`` / ``fetch`` 是 worker 内媒体物化的可选协作钩子：
 
@@ -358,12 +362,11 @@ class MirrorRouter:
         self.decode: DecodeFn | None = decode
         self.fetch: FetchFn | None = fetch
         pairs = tuple(settings.mirror.pairs) if settings.mirror.enabled else ()
-        if len(pairs) == 1:
-            self._qq_chat = pairs[0].qq
-            self._wechat_chat = pairs[0].wechat
-        else:
-            self._qq_chat = ""
-            self._wechat_chat = ""
+        #: chat_id → (来源通道, 目标群)；多对时每对独立匹配，群之间不交叉。
+        self._routes: dict[str, tuple[str, str]] = {}
+        for pair in pairs:
+            self._routes[pair.qq] = ("qq", pair.wechat)
+            self._routes[pair.wechat] = ("wechat", pair.qq)
         self._queues: dict[str, asyncio.Queue[MirrorItem | _Stop]] = {
             "qq": asyncio.Queue(maxsize=QUEUE_MAXSIZE),
             "wechat": asyncio.Queue(maxsize=QUEUE_MAXSIZE),
@@ -381,7 +384,7 @@ class MirrorRouter:
     # ------------------------------------------------------------ 生命周期
     def start(self) -> None:
         """创建两个方向的 worker；未配置配对时不启动任何任务。"""
-        if not self._qq_chat or not self._wechat_chat:
+        if not self._routes:
             return
         if self._tasks:
             return
@@ -1020,11 +1023,7 @@ class MirrorRouter:
 
     # ------------------------------------------------------------ 去重/指纹
     def _direction(self, chat_id: str) -> tuple[str, str] | None:
-        if chat_id == self._qq_chat:
-            return "qq", self._wechat_chat
-        if chat_id == self._wechat_chat:
-            return "wechat", self._qq_chat
-        return None
+        return self._routes.get(chat_id)
 
     def _seen_before(self, key: tuple[str, str], now: float) -> bool:
         if key in self._seen:

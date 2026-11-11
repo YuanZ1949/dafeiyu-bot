@@ -119,6 +119,34 @@ def test_valid_pair_and_capability_matrix(tmp_path: Path, caplog) -> None:
     assert "image=off(localdb/media)" in text
 
 
+def test_multiple_pairs_accepted(tmp_path: Path, caplog) -> None:
+    caplog.set_level(logging.INFO)
+    settings = _load(
+        tmp_path,
+        _gateway_yaml(
+            "mirror:\n  enabled: true\n  pairs:\n"
+            '    - qq: "qq:123456"\n      wechat: "wxg:abc123"\n'
+            '    - qq: "qq:654321"\n      wechat: "wxg:Def456"\n'
+        ),
+    )
+
+    assert settings.mirror.enabled is True
+    assert len(settings.mirror.pairs) == 2
+    assert (settings.mirror.pairs[0].qq, settings.mirror.pairs[0].wechat) == (
+        "qq:123456",
+        "wxg:abc123",
+    )
+    assert (settings.mirror.pairs[1].qq, settings.mirror.pairs[1].wechat) == (
+        "qq:654321",
+        "wxg:def456",
+    )
+
+    text = caplog.text
+    assert "mirror capability qq->wechat" in text
+    assert "mirror capability wechat->qq" in text
+    assert "text=on" in text
+
+
 @pytest.mark.parametrize(
     ("mirror_block", "match"),
     [
@@ -126,7 +154,13 @@ def test_valid_pair_and_capability_matrix(tmp_path: Path, caplog) -> None:
         (
             "mirror:\n  enabled: true\n  pairs:\n"
             '    - qq: "qq:1"\n      wechat: "wxg:a"\n'
-            '    - qq: "qq:2"\n      wechat: "wxg:b"\n',
+            '    - qq: "qq:1"\n      wechat: "wxg:b"\n',
+            "mirror.pairs",
+        ),
+        (
+            "mirror:\n  enabled: true\n  pairs:\n"
+            '    - qq: "qq:1"\n      wechat: "wxg:a"\n'
+            '    - qq: "qq:2"\n      wechat: "wxg:a"\n',
             "mirror.pairs",
         ),
         (

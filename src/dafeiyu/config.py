@@ -1049,6 +1049,7 @@ def _build_mirror(
 ) -> MirrorConfig:
     """解析 `mirror` 段；关闭时不校验 pairs，启用时做启动期硬校验。
 
+    `pairs` 至少一对、可配多对；同一个群（归一化后）不能出现在两对里。
     校验必须拿到降级前的 `gateway.provider` 与 `gateway.wechat.enabled`：
     启用镜像却只有 QQ 通道时，晚到的 downgrade 会把 provider 改成 qq，
     这里就无法报出「需要 both」。
@@ -1065,35 +1066,47 @@ def _build_mirror(
     raw_pairs = raw_mirror.get("pairs")
     if not isinstance(raw_pairs, list):
         raise ConfigError("mirror.pairs 必须是列表")
-    if len(raw_pairs) != 1:
-        raise ConfigError("mirror.pairs 必须恰好包含一对群（qq/wechat）")
+    if not raw_pairs:
+        raise ConfigError("mirror.pairs 不能为空")
 
-    item = raw_pairs[0]
-    if not isinstance(item, dict):
-        raise ConfigError("mirror.pairs[0] 必须是包含 qq/wechat 的映射")
-    unknown = sorted((str(key) for key in item if key not in ("qq", "wechat")))
-    if unknown:
-        raise ConfigError(f"mirror.pairs[0] 包含未知键：{', '.join(unknown)}")
+    pairs: list[MirrorPairConfig] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw_pairs):
+        if not isinstance(item, dict):
+            raise ConfigError(f"mirror.pairs[{index}] 必须是包含 qq/wechat 的映射")
+        unknown = sorted((str(key) for key in item if key not in ("qq", "wechat")))
+        if unknown:
+            raise ConfigError(f"mirror.pairs[{index}] 包含未知键：{', '.join(unknown)}")
 
-    raw_qq = item.get("qq")
-    if not isinstance(raw_qq, str):
-        raise ConfigError("mirror.pairs[0].qq 必须是 qq: 前缀的字符串")
-    qq = raw_qq.strip()
-    if not qq.casefold().startswith("qq:"):
-        raise ConfigError("mirror.pairs[0].qq 必须以 qq: 开头")
-    qq_id = qq[3:].strip()
-    if not qq_id:
-        raise ConfigError("mirror.pairs[0].qq 缺少冒号后的群号")
+        raw_qq = item.get("qq")
+        if not isinstance(raw_qq, str):
+            raise ConfigError(f"mirror.pairs[{index}].qq 必须是 qq: 前缀的字符串")
+        qq = raw_qq.strip()
+        if not qq.casefold().startswith("qq:"):
+            raise ConfigError(f"mirror.pairs[{index}].qq 必须以 qq: 开头")
+        qq_id = qq[3:].strip()
+        if not qq_id:
+            raise ConfigError(f"mirror.pairs[{index}].qq 缺少冒号后的群号")
 
-    raw_wechat = item.get("wechat")
-    if not isinstance(raw_wechat, str):
-        raise ConfigError("mirror.pairs[0].wechat 必须是 wxg: 前缀的字符串")
-    wechat_id = raw_wechat.strip()
-    if not wechat_id.casefold().startswith("wxg:"):
-        raise ConfigError("mirror.pairs[0].wechat 必须以 wxg: 开头")
-    alias = wechat_id[4:].strip()
-    if not alias:
-        raise ConfigError("mirror.pairs[0].wechat 缺少冒号后的 alias")
+        raw_wechat = item.get("wechat")
+        if not isinstance(raw_wechat, str):
+            raise ConfigError(f"mirror.pairs[{index}].wechat 必须是 wxg: 前缀的字符串")
+        wechat_id = raw_wechat.strip()
+        if not wechat_id.casefold().startswith("wxg:"):
+            raise ConfigError(f"mirror.pairs[{index}].wechat 必须以 wxg: 开头")
+        alias = wechat_id[4:].strip()
+        if not alias:
+            raise ConfigError(f"mirror.pairs[{index}].wechat 缺少冒号后的 alias")
+
+        pair = MirrorPairConfig(
+            qq=f"qq:{qq_id.casefold()}",
+            wechat=f"wxg:{alias.casefold()}",
+        )
+        for chat_id in (pair.qq, pair.wechat):
+            if chat_id in seen:
+                raise ConfigError(f"mirror.pairs 中群重复：{chat_id}")
+            seen.add(chat_id)
+        pairs.append(pair)
 
     # 先报微信通道本身缺失，再报 provider：两者的修复动作不同，先报更直接的那个。
     if not raw_wechat_enabled:
@@ -1117,11 +1130,7 @@ def _build_mirror(
             "mirror.enabled=true 要求微信通道已去节流（gateway.wechat）：" + detail
         )
 
-    pair = MirrorPairConfig(
-        qq=f"qq:{qq_id.casefold()}",
-        wechat=f"wxg:{alias.casefold()}",
-    )
-    return MirrorConfig(enabled=True, pairs=(pair,))
+    return MirrorConfig(enabled=True, pairs=tuple(pairs))
 
 
 def _mirror_capability(on: bool, reasons: list[str]) -> str:

@@ -1,4 +1,4 @@
-"""config.example.yaml 的 mirror 段回归：示例默认关闭、形状不漂移、两项 pairs 报错。"""
+"""config.example.yaml 的 mirror 段回归：示例默认关闭、形状不漂移、群重复报错。"""
 
 import dataclasses
 import re
@@ -50,11 +50,11 @@ def test_example_mirror_block_present_and_disabled():
     assert raw["mirror"]["enabled"] is False
 
 
-def test_mirror_example_two_pairs_config_error(tmp_path, monkeypatch):
-    """开启镜像却给了两对群：load_settings 必须直接 ConfigError。
+def test_mirror_example_duplicate_group_config_error(tmp_path, monkeypatch):
+    """开启镜像且同一个群出现在两对里：load_settings 必须直接 ConfigError。
 
-    内联构造 YAML（不手改示例文件）；除 pairs 数量外其余前置条件全部满足，
-    保证报错来自「恰好一对」这条校验本身。
+    内联构造 YAML（不手改示例文件）；除 pairs 的群重复外其余前置条件全部
+    满足，保证报错来自「群不能重复」这条校验本身。
     """
     monkeypatch.chdir(tmp_path)
     config = tmp_path / "config.yaml"
@@ -77,12 +77,12 @@ mirror:
     - qq: "qq:10001"
       wechat: "wxg:alias_a"
     - qq: "qq:10002"
-      wechat: "wxg:alias_b"
+      wechat: "wxg:alias_a"
 """,
         encoding="utf-8",
     )
     env_file = tmp_path / ".env"
     env_file.write_text("BOT_QQ=10001\n", encoding="utf-8")
 
-    with pytest.raises(ConfigError, match="一对群"):
+    with pytest.raises(ConfigError, match="mirror.pairs 中群重复"):
         load_settings(env_file=env_file, config_file=config)
