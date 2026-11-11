@@ -45,6 +45,10 @@ SEND_TIMEOUT = 30.0
 HOOK_RETRY_CODES = frozenset({"hook_not_ready", "hook_unavailable"})
 #: 引用提示最多带多少字原文：跨平台只保留可读线索，不整段搬运。
 REPLY_HINT_MAX = 40
+#: 合并转发展开上限：与 QQ 网关一致，避免长记录刷屏。
+FORWARD_MAX_NODES = 10
+#: 合并转发单条节点的正文截断（与网关的 _FORWARD_NODE_CLIP 对齐）。
+FORWARD_NODE_CLIP = 60
 #: 重试退避秒数（总尝试次数 = 1 + 3）。
 RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 
@@ -141,6 +145,89 @@ def _reply_hint(msg: Message) -> str:
     if msg.reply_to_message_id or any(seg.type == "reply" for seg in msg.segments):
         return "[回复]"
     return ""
+
+
+def _clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _forward_nodes(payload: Any) -> list[Any]:
+    """取合并转发节点：入站段是 ``{content|messages: [...]}``，出站直接是列表。"""
+    if isinstance(payload, dict):
+        for key in ("content", "messages"):
+            nodes = payload.get(key)
+            if isinstance(nodes, list) and nodes:
+                return nodes
+        return []
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def _forward_node_fields(node: Any) -> tuple[str, Any]:
+    """取节点的（发送者, 正文）：兼容入站 sender/message 与出站 node.data 两种形状。"""
+    if not isinstance(node, dict):
+        return "", None
+    data = node.get("data")
+    if isinstance(data, dict):
+        name = str(data.get("name") or data.get("nickname") or "").strip()
+        body = data.get("content")
+        if body is None:
+            body = data.get("message")
+        if name or body is not None:
+            return name, body
+    sender = node.get("sender")
+    if isinstance(sender, dict):
+        name = str(sender.get("nickname") or sender.get("user_id") or "").strip()
+    else:
+        name = str(node.get("nickname") or node.get("user_id") or "").strip()
+    return name, node.get("message")
+
+
+def _forward_node_text(message: Any) -> str:
+    """把节点的 message（字符串或 OneBot 段列表）压成一行可读文本。"""
+    if isinstance(message, str):
+        return message.strip()
+    if not isinstance(message, list):
+        return ""
+    parts: list[str] = []
+    for raw in message:
+        if not isinstance(raw, dict):
+            continue
+        seg_type = str(raw.get("type") or "")
+        payload = raw.get("data")
+        data = payload if isinstance(payload, dict) else {}
+        if seg_type == "text":
+            parts.append(str(data.get("text") or ""))
+        elif seg_type == "at":
+            parts.append(_render_at(data))
+        elif seg_type in _STICKER_SEGMENTS:
+            parts.append("[表情]")
+        elif seg_type in _ATTACHMENT_SEGMENTS:
+            kind = _media_kind(seg_type)
+            parts.append(_PLACEHOLDERS.get(kind, f"[{kind}]"))
+        elif seg_type in ("node", "forward"):
+            parts.append("[合并转发]")
+    return "".join(parts).strip()
+
+
+def _render_forward(payload: Any) -> str:
+    """把合并转发节点渲染成 ``[聊天记录]`` + 每行 ``昵称: 内容``；无节点返回空串。"""
+    nodes = _forward_nodes(payload)
+    if not nodes:
+        return ""
+    lines: list[str] = []
+    for node in nodes[:FORWARD_MAX_NODES]:
+        name, message = _forward_node_fields(node)
+        body = _forward_node_text(message)
+        if not body:
+            continue
+        lines.append(f"{name or '群友'}: {_clip(body, FORWARD_NODE_CLIP)}")
+    if not lines:
+        return ""
+    return "[聊天记录]\n" + "\n".join(lines)
 
 
 def _media_kind(kind: str) -> str:
@@ -348,9 +435,11 @@ class MirroredAdapter:
         result = await self._inner.send_forward(
             chat_type, chat_id, nodes, **kwargs
         )
+        # 节点结构对面不认识，把内容搬成文本；没有可用节点才退回条数占位。
+        text = _render_forward(list(nodes)) or f"[合并转发 {max(1, len(nodes))} 条]"
         self._observe(
             target_chat_id=chat_id,
-            text=f"[合并转发 {max(1, len(nodes))} 条]",
+            text=text,
             kind="forward",
         )
         return result
@@ -991,7 +1080,7 @@ class MirrorRouter:
 
     # ------------------------------------------------------------ 渲染
     def _render(self, item: MirrorItem) -> list[str]:
-        placeholders = [self._placeholder(entry) for entry in self._media_entries(item)]
+        placeholders = self._placeholders(item)
         text = self._plain_text(item)
         if not text:
             body = " ".join(placeholders)
@@ -1030,6 +1119,9 @@ class MirrorRouter:
                     )
             if parts:
                 return "".join(parts).strip()
+            # 合并转发的正文由 `_render_forward` 逐节点渲染，别再重复 text_lines 摘要。
+            if any(_media_kind(seg.type) == "forward" for seg in item.segments):
+                return ""
             # 纯媒体：正文里的 [图片] 只是占位，媒体由 attachments/segments 渲染。
             if item.attachments:
                 return ""
@@ -1038,6 +1130,27 @@ class MirrorRouter:
         if item.kind != "text":
             return ""
         return "\n".join(item.text_lines).strip()
+
+    def _placeholders(self, item: MirrorItem) -> list[str]:
+        """媒体占位；合并转发优先用节点内容替换 ``[合并转发 N 条]``。"""
+        entries = self._media_entries(item)
+        blocks = [
+            _render_forward(seg.data)
+            for seg in item.segments
+            if _media_kind(seg.type) == "forward"
+        ]
+        out: list[str] = []
+        cursor = 0
+        for entry in entries:
+            if entry[0] != "forward":
+                out.append(self._placeholder(entry))
+                continue
+            block = blocks[cursor] if cursor < len(blocks) else ""
+            cursor += 1
+            out.append(block or self._placeholder(entry))
+        # attachments 路径不会产出 forward 条目：剩余块补到末尾，别把内容丢了。
+        out.extend(block for block in blocks[cursor:] if block)
+        return out
 
     def _media_entries(self, item: MirrorItem) -> list[tuple[str, str, int]]:
         if item.source_channel == "wechat":

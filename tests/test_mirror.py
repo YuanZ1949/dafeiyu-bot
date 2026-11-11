@@ -325,6 +325,111 @@ def test_render_wechat_quote_hint_from_envelope(tmp_path: Path) -> None:
     assert render(router, message) == ["阿鱼：[回复 老王：今天加班] 好"]
 
 
+# ---------------------------------------------------------------- 合并转发
+def test_render_forward_uses_nodes_instead_of_count(tmp_path: Path) -> None:
+    """能拿到节点时搬「谁说了什么」，不再只在正文后追加 [合并转发 N 条]。"""
+    router, _store, _adapters = make_router(tmp_path)
+    message = make_msg(
+        QQ,
+        "[聊天记录]\n小明: 明天十点开会\n小红: 收到",
+        segments=[
+            Segment(
+                "forward",
+                {
+                    "id": "f1",
+                    "content": [
+                        {
+                            "sender": {"nickname": "小明"},
+                            "message": [
+                                {"type": "text", "data": {"text": "明天十点开会"}}
+                            ],
+                        },
+                        {
+                            "sender": {"nickname": "小红"},
+                            "message": [{"type": "text", "data": {"text": "收到"}}],
+                        },
+                    ],
+                },
+            )
+        ],
+    )
+    expected = "阿鱼：[聊天记录]\n小明: 明天十点开会\n小红: 收到"
+    assert render(router, message) == [expected]
+
+
+def test_render_forward_without_nodes_keeps_count(tmp_path: Path) -> None:
+    """拉不到节点（只有 id）时退回条数占位，且不与文本摘要重复。"""
+    router, _store, _adapters = make_router(tmp_path)
+    message = make_msg(
+        QQ,
+        "[合并转发]",
+        segments=[Segment("forward", {"id": "f1"})],
+    )
+    assert render(router, message) == ["阿鱼：[合并转发 1 条]"]
+
+
+def test_render_forward_node_media_clip_and_sender_fallback(tmp_path: Path) -> None:
+    """节点内媒体降级成占位、缺 sender 用群友、长正文截断。"""
+    router, _store, _adapters = make_router(tmp_path)
+    long_text = "字" * (mirror_module.FORWARD_NODE_CLIP + 10)
+    nodes = [
+        {
+            "message": [
+                {"type": "at", "data": {"qq": "all"}},
+                {"type": "text", "data": {"text": "看这个"}},
+                {"type": "image", "data": {"url": "http://x/a.png"}},
+            ]
+        },
+        {"sender": {"user_id": "42"}, "message": long_text},
+        {"sender": {"nickname": "小明"}, "message": "短"},
+    ]
+    message = make_msg(
+        QQ,
+        "[聊天记录]",
+        segments=[Segment("forward", {"content": nodes})],
+    )
+    rendered = render(router, message)[0]
+    assert "阿鱼：[聊天记录]\n群友: @全体成员 看这个[图片]" in rendered
+    assert "\n42: 字" in rendered
+    assert "…" in rendered
+    assert rendered.endswith("\n小明: 短")
+
+
+def test_render_forward_caps_node_count(tmp_path: Path) -> None:
+    router, _store, _adapters = make_router(tmp_path)
+    nodes = [
+        {"sender": {"nickname": f"群友{i}"}, "message": f"消息{i}"}
+        for i in range(mirror_module.FORWARD_MAX_NODES + 2)
+    ]
+    message = make_msg(
+        QQ,
+        "[聊天记录]",
+        segments=[Segment("forward", {"content": nodes})],
+    )
+    rendered = render(router, message)[0]
+    last = mirror_module.FORWARD_MAX_NODES - 1
+    assert f"群友{last}: 消息{last}" in rendered
+    assert f"群友{mirror_module.FORWARD_MAX_NODES}: " not in rendered
+
+
+def test_render_forward_with_attachment_keeps_forward_content(tmp_path: Path) -> None:
+    """图片附件与合并转发同时出现：附件走占位，转发内容补在后面不丢。"""
+    router, _store, _adapters = make_router(tmp_path)
+    message = make_msg(
+        QQ,
+        "[图片]",
+        segments=[
+            Segment("image", {"url": "http://x/a.png"}),
+            Segment(
+                "forward",
+                {"content": [{"sender": {"nickname": "小明"}, "message": "在吗"}]},
+            ),
+        ],
+        attachments=[Attachment(kind="image", source="http://x/a.png")],
+    )
+    assert render(router, message) == ["阿鱼：[图片] [聊天记录]\n小明: 在吗"]
+
+
 def test_render_long_text_uses_sender_split(tmp_path: Path) -> None:
     router, _store, _adapters = make_router(tmp_path)
     chunks = render(router, make_msg(QQ, "字" * 1200))

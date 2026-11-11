@@ -386,10 +386,16 @@ async def test_proxy_send_at_error_propagates_without_enqueue() -> None:
     assert router.calls == []
 
 
-async def test_proxy_send_forward_mirrors_node_count() -> None:
-    """合并转发不搬节点结构，只回传「N 条」占位并标成 forward。"""
+async def test_proxy_send_forward_mirrors_node_content() -> None:
+    """合并转发不搬节点结构，但把「谁说了什么」搬成文本，并标成 forward。"""
     nodes = [
-        {"type": "node", "data": {"name": "a", "content": "hi"}},
+        {
+            "type": "node",
+            "data": {
+                "name": "a",
+                "content": [{"type": "text", "data": {"text": "hi"}}],
+            },
+        },
         {"type": "node", "data": {"name": "b", "content": "yo"}},
     ]
     inner = AtForwardSender()
@@ -404,9 +410,20 @@ async def test_proxy_send_forward_mirrors_node_count() -> None:
     assert len(router.calls) == 1
     call = router.calls[0]
     assert call["target_chat_id"] == WXG
-    assert call["text"] == "[合并转发 2 条]"
+    assert call["text"] == "[聊天记录]\na: hi\nb: yo"
     assert call["kind"] == "forward"
     assert call["attachments"] == []
+
+
+async def test_proxy_send_forward_without_readable_nodes_keeps_count() -> None:
+    """节点里没有可读正文时仍回传「N 条」占位，不丢事件。"""
+    router = RecordingRouter()
+    proxy = MirroredAdapter(AtForwardSender(), router)
+
+    await proxy.send_forward(ChatType.GROUP, WXG, [{"type": "node", "data": {}}])
+
+    assert router.calls[0]["text"] == "[合并转发 1 条]"
+    assert router.calls[0]["kind"] == "forward"
 
 
 async def test_proxy_send_forward_error_propagates_without_enqueue() -> None:
