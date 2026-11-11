@@ -758,3 +758,90 @@ async def test_sticker_fallback_sends_sticker_then_image(tmp_path: Path) -> None
     assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[表情]"]
     assert router.stats()["sent"] == 1
 
+
+class UploadRecorder(FakeChannelAdapter):
+    """QQ 形态、额外提供 upload_file（NapCat 真实有此接口）。"""
+
+    def __init__(self) -> None:
+        super().__init__(bot_id="qq:999", segments=True)
+        self.files: list[tuple[ChatType, str, str, str]] = []
+
+    async def upload_file(
+        self, chat_type: ChatType, chat_id: str, path: str, *, name: str = ""
+    ) -> None:
+        self.files.append((chat_type, chat_id, path, name))
+
+
+async def test_wechat_to_qq_voice_builds_record_segment(tmp_path: Path) -> None:
+    """微信语音落到 QQ 是 record 段，说明行仍保留可读占位。"""
+    router, store = make_router(tmp_path)
+    qq = cast(FakeChannelAdapter, router.adapters["qq"])
+    path = place(tmp_path, "voices/v.slk", SILK)
+
+    await router._deliver(
+        make_item(
+            source_channel="wechat",
+            kind="voice",
+            attachments=(
+                Attachment(kind="voice", path=str(path), name="v.slk"),
+            ),
+        )
+    )
+
+    assert qq.sent == []
+    _ct, _cid, segments = qq.segments[0]
+    assert [seg for seg in segments if seg.get("type") == "record"] == [
+        {"type": "record", "data": {"file": str(path.resolve())}}
+    ]
+    assert [seg for seg in segments if seg.get("type") == "text"] == [
+        {"type": "text", "data": {"text": "阿鱼：[语音]"}}
+    ]
+    assert mirror_rows(store, QQ_CHAT) == ["阿鱼：[语音]"]
+
+
+async def test_wechat_to_qq_video_builds_video_segment(tmp_path: Path) -> None:
+    """微信→QQ 的视频不被 wechat-hook 限制：照常走 video 段。"""
+    router, _store = make_router(tmp_path)
+    qq = cast(FakeChannelAdapter, router.adapters["qq"])
+    path = place(tmp_path, "videos/v.mp4", MP4)
+
+    await router._deliver(
+        make_item(
+            source_channel="wechat",
+            kind="video",
+            attachments=(
+                Attachment(kind="video", path=str(path), name="v.mp4"),
+            ),
+        )
+    )
+
+    _ct, _cid, segments = qq.segments[0]
+    assert [seg for seg in segments if seg.get("type") == "video"] == [
+        {"type": "video", "data": {"file": str(path.resolve())}}
+    ]
+    texts = [seg["data"]["text"] for seg in segments if seg.get("type") == "text"]
+    assert "阿鱼：[视频]" in texts
+
+
+async def test_wechat_to_qq_file_uses_upload_file(tmp_path: Path) -> None:
+    """文件不塞消息段（NapCat 不收），走 upload_file 并保留文件名。"""
+    qq = UploadRecorder()
+    router, store = make_router(tmp_path, qq=qq)
+    path = place(tmp_path, "files/doc.pdf", b"%PDF-1.4")
+
+    await router._deliver(
+        make_item(
+            source_channel="wechat",
+            kind="file",
+            attachments=(
+                Attachment(kind="file", path=str(path), name="doc.pdf"),
+            ),
+        )
+    )
+
+    assert qq.files == [(ChatType.GROUP, QQ_CHAT, str(path.resolve()), "doc.pdf")]
+    assert [text for _ct, _cid, text in qq.sent] == ["阿鱼：[文件] doc.pdf"]
+    assert qq.segments == []
+    assert mirror_rows(store, QQ_CHAT) == ["阿鱼：[文件] doc.pdf"]
+
+

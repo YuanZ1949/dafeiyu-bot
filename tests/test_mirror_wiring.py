@@ -132,6 +132,43 @@ class WeChatishAdapter:
         self.file_calls.append((chat_type, chat_id, path, name))
 
 
+class AtForwardSender:
+    """记录 send_at / send_forward 的内层 adapter（QQ 形态）。"""
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.bot_id = "qq:999"
+        self.connected = True
+        self.degraded = False
+        self.error = error
+        self.at_calls: list[tuple[ChatType, str, str, list[str]]] = []
+        self.forward_calls: list[tuple[ChatType, str, list[dict[str, Any]]]] = []
+
+    async def send_at(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        text: str,
+        at: Sequence[str],
+        **kwargs: Any,
+    ) -> Any:
+        self.at_calls.append((chat_type, chat_id, text, list(at)))
+        if self.error is not None:
+            raise self.error
+        return "m-at"
+
+    async def send_forward(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        nodes: Sequence[dict[str, Any]],
+        **kwargs: Any,
+    ) -> Any:
+        self.forward_calls.append((chat_type, chat_id, list(nodes)))
+        if self.error is not None:
+            raise self.error
+        return "m-fwd"
+
+
 def make_settings() -> Settings:
     return Settings(
         api_key="sk-test",
@@ -314,6 +351,68 @@ async def test_proxy_media_upload_file_false_does_not_enqueue() -> None:
     result = await proxy.upload_file(ChatType.GROUP, WXG, "/tmp/doc.pdf")
 
     assert result is False
+    assert router.calls == []
+
+
+# --------------------------------------------------------------- @ / 转发
+async def test_proxy_send_at_mirrors_text_only() -> None:
+    """@ 关系不跨平台：只镜像正文，at 列表不泄漏给观察者。"""
+    inner = AtForwardSender()
+    router = RecordingRouter()
+    proxy = MirroredAdapter(inner, router)
+
+    result = await proxy.send_at(ChatType.GROUP, WXG, "看这个", ["123", "456"])
+
+    assert result == "m-at"
+    assert inner.at_calls == [(ChatType.GROUP, WXG, "看这个", ["123", "456"])]
+    assert len(router.calls) == 1
+    call = router.calls[0]
+    assert call["target_chat_id"] == WXG
+    assert call["text"] == "看这个"
+    assert call["attachments"] == []
+    assert call["kind"] == "text"
+
+
+async def test_proxy_send_at_error_propagates_without_enqueue() -> None:
+    router = RecordingRouter()
+    proxy = MirroredAdapter(AtForwardSender(error=GatewayError("boom")), router)
+
+    with pytest.raises(GatewayError):
+        await proxy.send_at(ChatType.GROUP, WXG, "看这个", ["123"])
+
+    assert router.calls == []
+
+
+async def test_proxy_send_forward_mirrors_node_count() -> None:
+    """合并转发不搬节点结构，只回传「N 条」占位并标成 forward。"""
+    nodes = [
+        {"type": "node", "data": {"name": "a", "content": "hi"}},
+        {"type": "node", "data": {"name": "b", "content": "yo"}},
+    ]
+    inner = AtForwardSender()
+    router = RecordingRouter()
+    proxy = MirroredAdapter(inner, router)
+
+    result = await proxy.send_forward(ChatType.GROUP, WXG, nodes)
+
+    assert result == "m-fwd"
+    assert len(inner.forward_calls) == 1
+    assert inner.forward_calls[0][2] == nodes
+    assert len(router.calls) == 1
+    call = router.calls[0]
+    assert call["target_chat_id"] == WXG
+    assert call["text"] == "[合并转发 2 条]"
+    assert call["kind"] == "forward"
+    assert call["attachments"] == []
+
+
+async def test_proxy_send_forward_error_propagates_without_enqueue() -> None:
+    router = RecordingRouter()
+    proxy = MirroredAdapter(AtForwardSender(error=GatewayError("boom")), router)
+
+    with pytest.raises(GatewayError):
+        await proxy.send_forward(ChatType.GROUP, WXG, [{"type": "node"}])
+
     assert router.calls == []
 
 

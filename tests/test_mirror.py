@@ -689,3 +689,16 @@ def test_message_exists_blocks_redelivered_frame(tmp_path: Path) -> None:
     router.observe_inbound(message)
     assert router.stats()["deduped"] == 1
     assert router._queues == {}
+
+
+def test_private_chat_is_never_mirrored(tmp_path: Path) -> None:
+    """私聊不互通：只有群消息进入镜像，即使 chat_id 恰好在配对里也不发。"""
+    router, _store, _adapters = make_router(tmp_path)
+    private = dataclasses.replace(
+        make_msg(QQ, "悄悄话", message_id="p1"), chat_type=ChatType.PRIVATE
+    )
+    router.observe_inbound(private)
+
+    assert router._queues == {}
+    assert router.stats()["sent"] == 0
+    assert router.stats()["deduped"] == 0
