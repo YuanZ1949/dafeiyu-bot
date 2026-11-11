@@ -567,8 +567,13 @@ class BackupManager:
 
     def status(self) -> dict[str, Any]:
         manifests = self.list()
+        # 进程重启后内存态清零，若不回退到磁盘证据，告警会把「昨天刚备份过」
+        # 读成「从未成功备份过」。list() 已按 created_at 倒序，取第一条即可。
+        last_success = self._last_success_at
+        if manifests and (not last_success or manifests[0].created_at > last_success):
+            last_success = manifests[0].created_at
         return {
-            "last_success_at": self._last_success_at,
+            "last_success_at": last_success,
             "last_error_at": self._last_error_at,
             "last_error": self._last_error,
             "count": len(manifests),

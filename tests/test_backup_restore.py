@@ -193,6 +193,22 @@ async def test_status_reports_last_success(tmp_path: Path) -> None:
     assert manager.last_scheduled_date() is None
 
 
+async def test_status_recovers_last_success_after_restart(tmp_path: Path) -> None:
+    db = tmp_path / "dafeiyu.db"
+    make_db(db).close()
+    backups = tmp_path / "backups"
+    clock = FakeClock()
+    first = BackupManager(db, backups, clock=clock)
+    manifest = await first.create("scheduled")
+
+    # 模拟 supervisor 重启：新实例内存态为空，但磁盘上有成功备份。
+    restarted = BackupManager(db, backups, clock=clock)
+    status = restarted.status()
+
+    assert status["count"] == 1
+    assert status["last_success_at"] == manifest.created_at
+
+
 def test_validate_rejects_newer_schema(tmp_path: Path) -> None:
     db = tmp_path / "future.db"
     make_db(db).close()
