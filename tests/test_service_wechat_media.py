@@ -187,6 +187,31 @@ def test_non_wxgf_container_falls_back_to_emoticon_path(monkeypatch) -> None:
     assert len(calls) == 1
 
 
+def test_wechat_dat_decode_runs_off_event_loop(monkeypatch) -> None:
+    """``decode_dat`` 会整文件逐字节 XOR：必须在事件循环外的线程里跑。"""
+    service = _service(None)
+    decode_threads: list[int] = []
+
+    def fake_decode_dat(data: bytes, **_kwargs) -> bytes | None:
+        decode_threads.append(threading.get_ident())
+        return None
+
+    # _decode_wechat_dat 内部是局部 import，patch 模块属性即可生效。
+    monkeypatch.setattr(
+        "dafeiyu.gateway.wechat_bridge.media.dat.decode_dat", fake_decode_dat
+    )
+
+    loop_threads: list[int] = []
+
+    async def run() -> bytes | None:
+        loop_threads.append(threading.get_ident())
+        return await service._decode_wechat_dat(b"\x00" * 16)
+
+    assert asyncio.run(run()) is None
+    assert len(decode_threads) == 1
+    assert decode_threads[0] != loop_threads[0]
+
+
 # ---- 出站文件：微信没有消息段，走 upload_file -> send_media(kind=file) -------
 class _WeChatFileAdapter:
     """微信风格的假适配器：无 send_segments，有 upload_file。"""

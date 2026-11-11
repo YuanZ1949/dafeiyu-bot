@@ -26,6 +26,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import httpx
 
@@ -811,6 +812,15 @@ async def _read_image_bytes(
     ``decode`` 只对微信 ``.dat`` 与 32 位 hex 表情缓存生效；解码失败返回
     ``None``，调用方据此尝试下一个变体。``path_max <= 0`` 表示不限制大小。
     """
+    # 先 stat 判上限（O(1)）：微信 .dat 解码是纯 Python 逐字节运算，几 MB
+    # 就能卡住事件循环；超限文件连读都不该读。
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    if path_max > 0 and size > path_max:
+        log.info("附件大小不可接受（%d 字节，上限 %d）：%s", size, path_max, path)
+        return None
     try:
         # 单次读取：不文件存在性预检，减少 TOCTOU 与多余系统调用。
         data = await asyncio.to_thread(path.read_bytes)
@@ -819,7 +829,14 @@ async def _read_image_bytes(
     if decode is not None and (
         path.suffix.lower() == ".dat" or _HEX32_NAME_RE.fullmatch(path.name)
     ):
-        decoded = decode(data)
+        # 同步解码器（纯 Python XOR/AES）必须离开事件循环线程；异步解码器
+        # 直接在循环上 await。``iscoroutinefunction`` 认不出部分可调用对象时
+        # 走线程分支也安全：调用只创建协程对象，随后仍由当前循环 await。
+        decoded: bytes | None | Awaitable[bytes | None]
+        if inspect.iscoroutinefunction(decode):
+            decoded = cast("bytes | None", await decode(data))
+        else:
+            decoded = await asyncio.to_thread(decode, data)
         if inspect.isawaitable(decoded):
             decoded = await decoded
         if decoded is None:

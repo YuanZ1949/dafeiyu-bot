@@ -934,9 +934,9 @@ class Service:
     async def _decode_wechat_dat(self, data: bytes) -> bytes | None:
         """``materialize_attachments`` 用的 ``decode``：只解已能证明是图片的。
 
-        先按图片 ``.dat`` 处理（V2 需要 AES key，命中本进程缓存就同步解；
-        没命中先按旧格式尝试，同时把扫描丢到后台线程）。失败再试表情缓存：
-        表情是 AES-CBC + ``wxgf``/HEVC，必须起 ffmpeg，所以放线程里跑。
+        先按图片 ``.dat`` 处理（V2 需要 AES key，命中本进程缓存就直接解，纯同步
+        解码放线程里跑；没命中先按旧格式尝试，同时把扫描丢到后台线程）。失败再试
+        表情缓存：表情是 AES-CBC + ``wxgf``/HEVC，必须起 ffmpeg，所以也放线程里跑。
         """
         try:
             from .gateway.wechat_bridge.media.dat import (
@@ -947,20 +947,22 @@ class Service:
             return None
         resolver = self._media_key_resolver()
         if resolver is None:
-            return decode_dat(data)
+            return await asyncio.to_thread(decode_dat, data)
         key = resolver.cached(data)
         if key is not None:
-            decoded = decode_dat(data, aes_key=key.aes_key, xor_key=key.xor_key)
+            decoded = await asyncio.to_thread(
+                decode_dat, data, aes_key=key.aes_key, xor_key=key.xor_key
+            )
         else:
             self._kick_media_key_scan(data)
-            decoded = decode_dat(data)
+            decoded = await asyncio.to_thread(decode_dat, data)
         if decoded is not None:
             return decoded
         if key is not None:
             # 4.x 原图解密后多是 wxgf 容器：read 打不开，但里面是裸 HEVC，
             # 转成 PNG 的画质远高于 _t 缩略图。ffmpeg 必须离开事件循环。
-            plain = decode_dat_container(
-                data, aes_key=key.aes_key, xor_key=key.xor_key
+            plain = await asyncio.to_thread(
+                decode_dat_container, data, aes_key=key.aes_key, xor_key=key.xor_key
             )
             if plain is not None:
                 from .gateway.wechat_bridge.media.emoticon import wxgf_to_image

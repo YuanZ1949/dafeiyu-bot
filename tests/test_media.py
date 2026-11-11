@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -256,6 +257,48 @@ async def test_over_max_bytes_keeps_placeholder(tmp_path: Path) -> None:
     assert count == 0
     assert message.content == "[图片]"
     assert not (tmp_path / "ws" / "images").exists()
+
+
+async def test_dat_decode_skipped_when_file_exceeds_limit(
+    tmp_path: Path,
+) -> None:
+    """超限的 .dat 在解码前就按 stat 拒绝：不能白跑整文件 XOR/AES。"""
+    source = write_dat(tmp_path)
+    settings = make_settings(tmp_path, max_bytes=8)
+    message = make_message(str(source))
+    calls: list[bytes] = []
+
+    def decode(data: bytes) -> bytes:
+        calls.append(data)
+        return PNG
+
+    count = await materialize_attachments(message, settings, decode=decode)
+
+    assert calls == []
+    assert count == 0
+    assert message.content == "[图片]"
+    assert not (tmp_path / "ws" / "images").exists()
+
+
+async def test_dat_decode_runs_off_event_loop(tmp_path: Path) -> None:
+    """同步解码器（微信 .dat 的纯 Python 实现）不能占用事件循环线程。"""
+    source = write_dat(tmp_path)
+    settings = make_settings(tmp_path)
+    message = make_message(str(source))
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+
+    def decode(_data: bytes) -> bytes:
+        seen.append(threading.get_ident())
+        return PNG
+
+    count = await materialize_attachments(message, settings, decode=decode)
+
+    assert count == 1
+    assert seen, "decode 未被调用"
+    assert seen[0] != loop_thread, "同步解码仍在事件循环线程上执行"
+    stored = tmp_path / "ws" / message.attachments[0].path
+    assert stored.read_bytes() == PNG
 
 
 async def test_file_attachment_only_gets_note_once(
