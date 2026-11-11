@@ -1020,11 +1020,16 @@ class BrainControl:
                             ),
                             "last_send_at": _iso_ts(item.get("last_send_at")),
                         }
-                        # 微信适配器额外暴露登录态与桌面状态；QQ 没有这两个属性，
-                        # 只按状态字典里真实存在的键补，避免凭空造字段。
-                        for extra in ("logged_in", "desktop"):
+                        # 微信适配器额外暴露登录态与桌面状态（含「桌面锁定是否
+                        # 真会拦发送」）；QQ 没有这些属性，只按状态字典里真实存在
+                        # 的键补，避免凭空造字段。
+                        for extra in ("logged_in", "desktop", "desktop_required"):
                             if extra in item:
-                                entry[extra] = item[extra]
+                                if extra == "desktop_required":
+                                    # 告警规则按布尔值判断，这里强制收敛为 bool。
+                                    entry[extra] = bool(item[extra])
+                                else:
+                                    entry[extra] = item[extra]
                         reason = item.get("reason")
                         if isinstance(reason, str) and reason.strip():
                             entry["reason"] = reason.strip()

@@ -168,6 +168,28 @@ def test_health_snapshot_reports_per_channel_state(tmp_path: Path) -> None:
     assert channels["wechat"]["desktop"] == "locked"
 
 
+def test_health_snapshot_passes_desktop_required(tmp_path: Path) -> None:
+    control, _adapter, _store, _app = make_control(tmp_path)
+    control.service.channel_status = lambda: {
+        "qq": {"connected": True, "degraded": False},
+        "wechat": {
+            "connected": True,
+            "degraded": False,
+            "logged_in": True,
+            "desktop": "locked",
+            "desktop_required": False,
+        },
+    }
+
+    snapshot = control.health_snapshot()
+
+    channels = snapshot["channels"]
+    # 告警规则依赖该键区分「outbound=hook 时桌面锁定不算微信不可用」。
+    assert channels["wechat"]["desktop_required"] is False
+    # QQ 通道没有该键时不得凭空造字段。
+    assert "desktop_required" not in channels["qq"]
+
+
 def test_health_snapshot_passes_wechat_receipt_counts(tmp_path: Path) -> None:
     control, _adapter, _store, _app = make_control(tmp_path)
     receipts = {
