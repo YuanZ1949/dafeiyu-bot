@@ -162,8 +162,13 @@ class NapCatLogin:
             value = _unreachable("NapCat WebUI 响应超时")
         except aiohttp.ClientError as exc:
             value = _unreachable(f"NapCat WebUI 不可达：{exc.__class__.__name__}")
+        except _Unauthorized:
+            # 重登后仍被拒（口令/账号被改）：降级而不是让 /api/status 500。
+            value = _unreachable("NapCat 认证失败（口令被拒）")
         except (ValueError, KeyError) as exc:
             value = _unreachable(f"NapCat WebUI 返回异常：{exc}")
+        except Exception as exc:  # noqa: BLE001 - 任何探测异常都不该带崩面板
+            value = _unreachable(f"NapCat WebUI 返回异常：{exc.__class__.__name__}")
         value["configured"] = True
         self._cached = value
         self._fetched_at = now
@@ -210,6 +215,8 @@ class NapCatLogin:
 
     async def _post(self, path: str, payload: dict[str, Any]) -> Any:
         response = await self._request(path, payload, credential=self._credential)
+        if not isinstance(response, dict):
+            raise ValueError("NapCat 返回非对象")
         if response.get("code") not in (0, "0", None):
             message = str(response.get("message") or "")
             if message == "Unauthorized":

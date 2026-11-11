@@ -108,6 +108,34 @@ def _eprint(message: str) -> None:
         print(message, file=sys.stderr)
 
 
+def _probe_host(host: str) -> str:
+    """把监听地址归一化成可被本机访问的探针主机。"""
+    value = (host or "").strip()
+    if value in {"", "0.0.0.0", "::", "*"}:
+        return "127.0.0.1"
+    if ":" in value and not value.startswith("["):
+        return f"[{value}]"  # IPv6 字面量
+    return value
+
+
+def _report_dashboard_password(
+    logs: LogHub, password: str, *, existed: bool, path: Path
+) -> None:
+    """只记录口令来源路径。
+
+    LogHub 会进环形缓冲、落 ``data/logs/supervisor.log`` 并推给 SSE 订阅者，
+    把口令原文写进去等于把面板准入凭据复制到长期可读的地方。
+    """
+    if not password:
+        return
+    if existed:
+        logs.write("supervisor", f"面板口令读取自 {path}")
+    elif path.exists():
+        logs.write("supervisor", f"面板口令已生成，见 {path}（可用 .env 覆盖）")
+    else:
+        logs.write("supervisor", f"面板口令已生成，但写盘失败（仅本次生效），见 {path}")
+
+
 def find_napcat_pid(directory: Path = NAPCAT_DIR) -> int | None:
     """NapCat 是 node.exe，用命令行是否包含安装目录来认，端口认不出来。"""
     pids = find_napcat_pids(directory)
@@ -239,7 +267,7 @@ def build_specs(settings: Settings, token: str) -> dict[str, ProcSpec]:
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUNBUFFERED": "1",
         },
-        ready_url=f"http://127.0.0.1:{control_port}/api/health",
+        ready_url=f"http://{_probe_host(control_host)}:{control_port}/api/health",
         creationflags=CREATE_NO_WINDOW,
     )
     # 插入顺序即启动顺序（Supervisor.start_all 按 dict 顺序）：桥必须排在 bot
@@ -610,19 +638,12 @@ async def run() -> int:
                 ),
             ),
         )
-        if password_file_existed:
-            logs.write("supervisor", f"面板口令读取自 {DASHBOARD_PASSWORD_PATH}")
-        elif DASHBOARD_PASSWORD_PATH.exists():
-            logs.write(
-                "supervisor",
-                f"面板口令已生成：{dashboard_password}"
-                f"（存于 {DASHBOARD_PASSWORD_PATH}，可用 .env 覆盖）",
-            )
-        else:
-            logs.write(
-                "supervisor",
-                f"面板口令已生成：{dashboard_password}（写盘失败，仅本次生效）",
-            )
+        _report_dashboard_password(
+            logs,
+            dashboard_password,
+            existed=password_file_existed,
+            path=DASHBOARD_PASSWORD_PATH,
+        )
 
     try:
         specs = build_specs(settings, holder.value)

@@ -5,6 +5,7 @@ import contextlib
 import logging
 import os
 import shutil
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -14,6 +15,39 @@ from .audit import AuditLog
 from .backup import BackupError, BackupManager, validate_database
 
 log = logging.getLogger(__name__)
+
+
+def _same_volume(path: Path, other: Path) -> bool:
+    """两个路径是否在同一卷（Windows 盘符 / POSIX 同一挂载点）。"""
+    return (
+        os.path.splitdrive(os.path.abspath(path))[0].lower()
+        == os.path.splitdrive(os.path.abspath(other))[0].lower()
+    )
+
+
+def _stage_for_replace(upload: Path, db_path: Path) -> Path:
+    """把待替换文件安置到目标库所在卷，返回之后交给 ``os.replace`` 的路径。
+
+    上传临时文件默认落在系统临时盘：仓库在别的盘时 ``os.replace`` 会抛
+    ``WinError 17``（跨卷），而此时 bot 已停、WAL/SHM 已删，只能回滚（B3-9）。
+    所以跨卷时先复制到目标目录下的临时文件；复制成功也顺便证明目标可写，
+    这就是「确认可替换」。
+    """
+    upload = Path(upload)
+    db_path = Path(db_path)
+    if _same_volume(upload, db_path):
+        return upload
+    fd, staged_name = tempfile.mkstemp(
+        prefix="dafeiyu-restore-staged-", suffix=".db", dir=db_path.parent
+    )
+    os.close(fd)
+    staged = Path(staged_name)
+    try:
+        shutil.copyfile(upload, staged)
+    except OSError:
+        staged.unlink(missing_ok=True)
+        raise
+    return staged
 
 
 class RestoreError(Exception):
@@ -194,8 +228,21 @@ class RestoreService:
             await self.supervisor.start(self.bot_name)
 
     def _replace(self, upload: Path) -> None:
-        self._remove_sidecars()
-        os.replace(upload, self.db_path)
+        upload = Path(upload)
+        # 先确保临时文件已在目标卷就位（跨卷时复制），再删 WAL/SHM：
+        # 避免「sidecar 删了但 replace 失败」（B3-9）。
+        staged = _stage_for_replace(upload, self.db_path)
+        try:
+            self._remove_sidecars()
+            os.replace(staged, self.db_path)
+        except OSError:
+            if staged != upload:
+                with contextlib.suppress(OSError):
+                    staged.unlink(missing_ok=True)
+            raise
+        if staged != upload:
+            with contextlib.suppress(OSError):
+                upload.unlink(missing_ok=True)
 
     def _remove_sidecars(self) -> None:
         for suffix in ("-wal", "-shm"):

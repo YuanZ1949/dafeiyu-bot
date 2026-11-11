@@ -46,6 +46,10 @@ REQUIRED_COLUMNS = {
 REASONS = ("scheduled", "manual", "pre-restore")
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
+#: 配额回收的硬下限：即使超出配额，也至少保留最近 N 份备份。
+#: 数值沿用改造前 ``len(remaining) > 3`` 的口径，不引入新的数字。
+MIN_KEEP = 3
+
 #: 工作区快照的硬上限：超过就不打 zip / 拒绝恢复（R20）。
 #: 没有上限时，工作区膨胀会拖慢备份，也给了 zip 炸弹一个入口。
 MAX_WORKSPACE_FILES = 20000
@@ -505,7 +509,18 @@ class BackupManager:
             self.audit.write("backup.delete", target=manifest.filename)
 
     def prune(self) -> list[str]:
-        manifests = self.list()
+        """按保留策略回收备份，返回被删除的备份 ID 列表。
+
+        分两个阶段，候选集合与总量口径始终一致（``list()``，新 -> 旧）：
+
+        1. ``scheduled`` 保留策略：最近 ``daily_keep`` 份 + 最近 ``weekly_keep``
+           个周日的备份，其余 scheduled 删除；manual/pre-restore 不参与。
+        2. 总量配额：候选是**全部**备份，从最旧往新回收，直到
+           ``sum(size_bytes) <= max_total_bytes``。硬性保护最近 ``MIN_KEEP``
+           份，以及最旧的 1 份 pre-restore（恢复前状态的最后一道保险；
+           当前恢复正在用的那份是刚创建的最新备份，已被 ``MIN_KEEP`` 覆盖）。
+        """
+        manifests = self.list()  # 新 -> 旧
         scheduled = [item for item in manifests if item.reason == "scheduled"]
         keep: set[str] = set()
 
@@ -521,15 +536,27 @@ class BackupManager:
                 self._remove(item)
                 removed.append(item.id)
 
-        remaining = [
-            item for item in self.list() if item.reason == "scheduled"
-        ]
-        total = sum(item.size_bytes for item in self.list())
-        while total > self.max_total_bytes and len(remaining) > 3:
-            oldest = remaining.pop()
-            total -= oldest.size_bytes
-            self._remove(oldest)
-            removed.append(oldest.id)
+        remaining = self.list()  # 新 -> 旧；total 与候选集同源
+        total = sum(item.size_bytes for item in remaining)
+        if total <= self.max_total_bytes:
+            return removed
+
+        protected = {item.id for item in remaining[:MIN_KEEP]}
+        oldest_pre_restore = next(
+            (item for item in reversed(remaining) if item.reason == "pre-restore"),
+            None,
+        )
+        if oldest_pre_restore is not None:
+            protected.add(oldest_pre_restore.id)
+
+        for item in reversed(remaining):
+            if total <= self.max_total_bytes:
+                break
+            if item.id in protected:
+                continue
+            self._remove(item)
+            total -= item.size_bytes
+            removed.append(item.id)
         return removed
 
     def _remove(self, manifest: BackupManifest) -> None:
