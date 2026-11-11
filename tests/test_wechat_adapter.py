@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import time
+from collections.abc import Callable
 from typing import Self
 
 import pytest
@@ -412,9 +413,12 @@ async def test_echo_of_sent_text_is_dropped_and_resync_clears() -> None:
         adapter.on_message(on_message)
         await adapter.send(ChatType.GROUP, GROUP_CHAT, "机器人回复")
 
-        # 桥漏标 is_bot 时，同 chat + 同文本 + 窗口内也不许二次入库。
+        # 桥漏标 is_bot 时，发送者仍能判定为 bot 自己（wxg:self）+ 同文本
+        # ⇒ 不许多次入库。
         await bridge.push(
-            message_envelope(text="机器人回复", message_id=f"{EPOCH}:2")
+            message_envelope(
+                text="机器人回复", message_id=f"{EPOCH}:2", user_id="wxg:self"
+            )
         )
         await asyncio.sleep(0.15)
         assert received == []
@@ -422,7 +426,10 @@ async def test_echo_of_sent_text_is_dropped_and_resync_clears() -> None:
         # 同文本、不同 chat 不是回声。
         await bridge.push(
             message_envelope(
-                text="机器人回复", message_id=f"{EPOCH}:3", chat_id="wxg:other"
+                text="机器人回复",
+                message_id=f"{EPOCH}:3",
+                chat_id="wxg:other",
+                user_id="wxg:self",
             )
         )
         await wait_for(lambda: received)
@@ -1111,3 +1118,152 @@ async def test_reconnect_sends_hello_once_per_connection_last_seq_grows() -> Non
         await wait_for(lambda: hellos() == [0, 9])
         await adapter.stop()
         assert adapter._last_inbound_seq == 9
+
+
+# ------------------------------------------------- 回声过滤 / 重连退避（B1-3、B1-5）
+async def test_echo_filter_keeps_user_repeat_of_bot_text() -> None:
+    """用户复读 bot 刚说过的话：不是回声，必须进 handler。
+
+    旧实现按「同群 + 同文本 + 120s」判定，会把这类真实消息静默吞掉
+    （还回 ack，桥认为已送达）。
+    """
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        received: list[Message] = []
+
+        async def on_message(message: Message) -> None:
+            received.append(message)
+
+        adapter.on_message(on_message)
+        await adapter.send(ChatType.GROUP, GROUP_CHAT, "好")
+
+        await bridge.push(
+            message_envelope(text="好", user_id="wxg:user1", message_id="3:5", seq=6)
+        )
+        await wait_for(lambda: received)
+        assert received[0].content == "好"
+
+
+async def test_echo_filter_drops_own_message_by_receipt_id() -> None:
+    """入站 message_id 命中刚收到的回执 id ⇒ 是回声，丢弃并 ack。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        received: list[Message] = []
+
+        async def on_message(message: Message) -> None:
+            received.append(message)
+
+        adapter.on_message(on_message)
+        sent_id = await adapter.send(ChatType.GROUP, GROUP_CHAT, "机器人回复")
+        assert sent_id == "3:99"
+
+        await bridge.push(
+            message_envelope(text="机器人回复", message_id="3:99", seq=11)
+        )
+        await wait_for(
+            lambda: any(
+                command.get("action") == "ack"
+                and command.get("params") == {"seq": 11}
+                for command in bridge.commands
+            )
+        )
+        assert received == []
+
+
+async def test_echo_filter_drops_self_sender_with_matching_text() -> None:
+    """没有回执 id 时，发送者就是 bot 自己（wxg:self）+ 同文本 ⇒ 仍是回声。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        received: list[Message] = []
+
+        async def on_message(message: Message) -> None:
+            received.append(message)
+
+        adapter.on_message(on_message)
+        await adapter.send(ChatType.GROUP, GROUP_CHAT, "在的")
+
+        await bridge.push(
+            message_envelope(
+                text="在的",
+                user_id="wxg:self",
+                nickname="小助手",
+                message_id="3:6",
+                seq=12,
+            )
+        )
+        await wait_for(
+            lambda: any(
+                command.get("action") == "ack"
+                and command.get("params") == {"seq": 12}
+                for command in bridge.commands
+            )
+        )
+        assert received == []
+
+
+class _FakeAsyncio:
+    """只替换 ``_run_forever`` 用到的那两个名字，避免污染真 asyncio。"""
+
+    CancelledError = asyncio.CancelledError
+
+    def __init__(self, delays: list[float], stop_after: int) -> None:
+        self.delays = delays
+        self.stop_after = stop_after
+        self.on_stop: Callable[[], None] | None = None
+
+    async def sleep(self, delay: float) -> None:
+        self.delays.append(delay)
+        if self.on_stop is not None and len(self.delays) >= self.stop_after:
+            self.on_stop()
+
+
+class _FakeTime:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+async def test_reconnect_backoff_not_reset_on_instant_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """桥「干净断开」且连接存活不足阈值 ⇒ 退避递增，不能回到 1 秒热重连。"""
+    adapter = WeChatAdapter(make_config(1))
+    delays: list[float] = []
+
+    async def instant_connect() -> None:
+        return None
+
+    fake_loop = _FakeAsyncio(delays, stop_after=3)
+    fake_loop.on_stop = lambda: setattr(adapter, "_stopping", True)
+    monkeypatch.setattr(adapter, "_connect_once", instant_connect)
+    monkeypatch.setattr(wechat_module, "asyncio", fake_loop)
+
+    await adapter._run_forever()
+
+    assert delays == [1, 2, 4]
+
+
+async def test_reconnect_backoff_resets_after_stable_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """连接稳定存活超过阈值 ⇒ 下一次断开重新从 1s 起，而不是继续当前档位。"""
+    adapter = WeChatAdapter(make_config(1))
+    delays: list[float] = []
+    clock = _FakeTime()
+    calls = 0
+
+    async def first_stable_then_instant() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            clock.now += 31.0
+
+    fake_loop = _FakeAsyncio(delays, stop_after=2)
+    fake_loop.on_stop = lambda: setattr(adapter, "_stopping", True)
+    monkeypatch.setattr(adapter, "_connect_once", first_stable_then_instant)
+    monkeypatch.setattr(wechat_module, "asyncio", fake_loop)
+    monkeypatch.setattr(wechat_module, "time", clock)
+
+    await adapter._run_forever()
+
+    # 第一轮稳定（31s）⇒ 退避清零 ⇒ 1s；第二轮秒断 ⇒ 保持递增 ⇒ 2s。
+    assert delays == [1, 2]

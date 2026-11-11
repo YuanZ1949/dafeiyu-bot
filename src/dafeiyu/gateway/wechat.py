@@ -8,7 +8,8 @@
 - 发送走 `send_text` 指令 + 同 `id` 回执（照抄 OneBot 的 echo/pending 模式）；
 - 入站可靠投递（P3-10/P3-11）：连接建立发一次 `hello`（带内存 `_last_inbound_seq`），
   handler 成功消化 message/recall 后回 `ack`（带 `seq`），桥据此做有界重投；
-- 三层回声过滤：`is_bot:true`、本地 (chat, text, 时间窗)、`resync` 清空。
+- 三层回声过滤：`is_bot:true`、本地 (chat, 发送回执 message_id / bot 自身 user_id)、
+  `resync` 清空；身份无法判定时才退到极短窗口的纯文本比对。
 
 本模块**不允许** import pyweixin / pywinauto / pyautogui：微信桥的桌面依赖
 只存在于 `gateway/wechat_bridge/`，这里必须能在没装桥依赖的机器上导入。
@@ -70,6 +71,12 @@ _MESSAGE_KINDS = frozenset(
 )
 _DESKTOPS = ("interactive", "locked", "no_wechat")
 _SENT_ECHO_MAX = 200
+#: 身份未知（入站没有 user_id）时允许的纯文本回声匹配窗口：必须远小于
+#: ``echo_window_seconds``，否则用户复读 bot 的话会被静默吞掉。
+_ECHO_FALLBACK_SECONDS = 3.0
+#: 连接存活超过这个时长才认为"稳定"，允许清零重连退避；桥正常关闭时
+#: ``_connect_once`` 是正常返回，不能据此把退避打回 1 秒。
+_STABLE_CONNECTION_SECONDS = 30.0
 
 
 class WeChatAdapter:
@@ -92,7 +99,10 @@ class WeChatAdapter:
         # 的 acquire 是 FIFO，任务创建顺序即到达顺序。
         self._chat_locks: dict[tuple[ChatType, str], asyncio.Lock] = {}
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
-        self._sent_echo: deque[tuple[str, str, float]] = deque(maxlen=_SENT_ECHO_MAX)
+        # (chat_id, text, 单调时钟时刻, 发送回执的 message_id)
+        self._sent_echo: deque[tuple[str, str, float, str]] = deque(
+            maxlen=_SENT_ECHO_MAX
+        )
         self._echo_seed: Callable[[], Sequence[tuple[str, str, int]]] | None = None
         # 入站 message/recall 的高水位（内存，P3-10）：只在收到更高 seq 时前进，
         # 重连时通过 hello 报给桥，换回断线期间未确认的帧。
@@ -280,9 +290,19 @@ class WeChatAdapter:
     async def _run_forever(self) -> None:
         delay_index = 0
         while not self._stopping:
+            started = time.monotonic()
             try:
                 await self._connect_once()
-                delay_index = 0
+                # 服务端正常关闭时 ``_connect_once`` 是**正常返回**而不是抛错，
+                # 所以不能无条件清零：只有连接稳定存活过阈值才重置退避，
+                # 否则"连上就被踢"会退化成 1 秒一次的热重连。
+                if time.monotonic() - started >= _STABLE_CONNECTION_SECONDS:
+                    delay_index = 0
+                else:
+                    logger.warning(
+                        "微信桥连接存活不足 %.0fs，保持退避",
+                        _STABLE_CONNECTION_SECONDS,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - 断线是常态，退避重连
@@ -353,7 +373,12 @@ class WeChatAdapter:
         kind = envelope.get("type")
         if kind == "message" and self._handler is not None:
             message = self._parse_message(envelope)
-            if message is None or self._is_echo(message.chat_id, message.content):
+            if message is None or self._is_echo(
+                message.chat_id,
+                message.content,
+                user_id=message.user_id,
+                message_id=message.message_id,
+            ):
                 return False
             self.last_event_at = time.time()
             self._spawn_inbound(
@@ -427,7 +452,12 @@ class WeChatAdapter:
                 # 坏帧当场消化（永远不会再进 handler）：ack 掉避免缓冲虚高。
                 await self._send_ack(seq)
                 return
-            if self._is_echo(message.chat_id, message.content):
+            if self._is_echo(
+                message.chat_id,
+                message.content,
+                user_id=message.user_id,
+                message_id=message.message_id,
+            ):
                 logger.debug("回声过滤命中 %s", message.message_id)
                 await self._send_ack(seq)
                 return
@@ -481,7 +511,9 @@ class WeChatAdapter:
                     age = max(0.0, now_real - float(ts))
                     if age > self._config.echo_window_seconds:
                         continue
-                    self._sent_echo.append((str(chat_id), str(text), now_mono - age))
+                    self._sent_echo.append(
+                        (str(chat_id), str(text), now_mono - age, "")
+                    )
             return
         if "id" in envelope:
             self._dispatch_receipt(envelope)
@@ -660,15 +692,56 @@ class WeChatAdapter:
         except Exception as exc:
             logger.debug("微信桥 ack 发送失败 seq=%s：%s", seq, exc)
 
-    def _is_echo(self, chat_id: str, text: str) -> bool:
-        """第二层回声过滤：同 chat + 同文本 + 在窗口内。"""
+    def _self_user_ids(self) -> set[str]:
+        """可判定为 bot 自身的 user_id 集合。
+
+        桥的 ``is_bot`` 只按昵称判断，漏标时仍会以普通 ``user_id`` 进来；
+        协议里 bot 的稳定身份是 ``wxg:self``，配置里的微信号也一起认。
+        """
+        ids = {self.bot_id}
+        account = str(getattr(self._config, "account", "") or "").strip()
+        if account:
+            ids.add(account)
+        return ids
+
+    def _is_echo(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        user_id: str = "",
+        message_id: str = "",
+    ) -> bool:
+        """第二层回声过滤：只丢「可证明是 bot 自己发的」消息。
+
+        判据按证据强度递减：
+        1. 入站 ``message_id`` 命中刚发送回执里的 message_id（强证据）；
+        2. 发送者就是 bot 自己（``wxg:self`` / 配置微信号），且窗口内文本相同；
+        3. 身份未知（``user_id`` 为空）时，只保留极短窗口的文本兜底。
+
+        真实用户复读 bot 刚说过的话（``user_id`` 明确且不是自己）**不再**被
+        丢弃——旧实现按 120 秒纯文本匹配，会把「好」「在的」这类回复静默吞掉。
+        """
         now = time.monotonic()
         window = self._config.echo_window_seconds
         while self._sent_echo and now - self._sent_echo[0][2] > window:
             self._sent_echo.popleft()
+        wanted = message_id.strip()
+        if wanted:
+            for cid, _text, _at, sent_id in self._sent_echo:
+                if cid == chat_id and sent_id and sent_id == wanted:
+                    return True
+        if user_id:
+            if user_id not in self._self_user_ids():
+                return False
+            return any(
+                cid == chat_id and sent_text == text
+                for cid, sent_text, _at, _mid in self._sent_echo
+            )
+        cutoff = now - _ECHO_FALLBACK_SECONDS
         return any(
-            cid == chat_id and sent_text == text
-            for cid, sent_text, _at in self._sent_echo
+            cid == chat_id and sent_text == text and at >= cutoff
+            for cid, sent_text, at, _mid in self._sent_echo
         )
 
     # ----------------------------------------------------------------- 发送
@@ -811,7 +884,7 @@ class WeChatAdapter:
         if echo_text is not None:
             # 成功（typed/observed）才记回声表；媒体没有可匹配文本，不记。
             self._sent_echo.append(
-                (str(params["chat_id"]), echo_text, time.monotonic())
+                (str(params["chat_id"]), echo_text, time.monotonic(), value or "")
             )
             if delivered == "observed":
                 logger.info("微信消息已送达 %s msg_id=%s", params["chat_id"], value)

@@ -219,10 +219,10 @@ async def test_resync_rebuilds_echo_from_messages_not_delivered_messages(
     assert len(adapter._sent_echo) == 2
     # 队首必须是最旧的一条：_is_echo 只从队首按窗口 popleft，顺序错了
     # 过期条目就永远清不掉，旧回复会被误判成回声。
-    echo_times = [at for _cid, _text, at in adapter._sent_echo]
+    echo_times = [at for _cid, _text, at, _mid in adapter._sent_echo]
     assert echo_times == sorted(echo_times)
     # 匹配键是 (chat_id, text)：过期的第三条与入站的 is_bot=0 行都不许进来。
-    assert {(cid, text) for cid, text, _at in adapter._sent_echo} == {
+    assert {(cid, text) for cid, text, _at, _mid in adapter._sent_echo} == {
         ("wxg:aaa", "第一条回复"),
         ("wxg:bbb", "第二条回复"),
     }
@@ -320,7 +320,7 @@ async def test_service_wires_echo_seed_from_messages_window(tmp_path: Path) -> N
 async def test_resync_without_seed_clears_echo_only() -> None:
     # 闸门 ⑤（旧行为锁定）：没挂 seed 的适配器 resync 只清空回声表。
     adapter = WeChatAdapter(make_wx_config())
-    adapter._sent_echo.append(("wxg:g1", "旧回复", time.monotonic()))
+    adapter._sent_echo.append(("wxg:g1", "旧回复", time.monotonic(), ""))
     fake_ws = FakeWs()
     adapter._ws = fake_ws
 
