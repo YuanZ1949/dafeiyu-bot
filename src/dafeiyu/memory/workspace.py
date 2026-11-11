@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -73,7 +75,8 @@ class Workspace:
         path = Path(path)
         if not path.exists():
             return ""
-        lines = path.read_text(encoding="utf-8").splitlines()
+        # read_text 严格解码：文件混入坏字节会炸掉整条注入链路，与 enforce_limit 的容错口径不一致。
+        lines = path.read_bytes().decode("utf-8", errors="replace").splitlines()
         if not lines:
             return ""
         title, body = lines[0], lines[1:]
@@ -189,6 +192,18 @@ class Workspace:
                     kept.append(part)
             break
 
-        # 用 write_bytes 而不是 write_text：Windows 会把 \n 翻成 \r\n，字节预算会多出 6 个字节。
-        path.write_bytes((head + "\n".join(reversed(kept))).encode("utf-8"))
+        # 以二进制写临时文件再原子替换，而不是 write_bytes 整文件重写：二进制写
+        # 避免 Windows 把 \n 翻成 \r\n 撑大字节预算；os.replace 保证进程中途崩溃
+        # 也不会留下半截的原文件。
+        payload = (head + "\n".join(reversed(kept))).encode("utf-8")
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
         return True

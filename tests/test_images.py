@@ -28,7 +28,7 @@ from dafeiyu.config import (
     WorkspaceConfig,
     _build_images,
 )
-from dafeiyu.images import materialize
+from dafeiyu.images import _sniff_ext, materialize
 from dafeiyu.memory.store import Store
 from dafeiyu.memory.workspace import Workspace
 from dafeiyu.models import ChatType, Message, Segment
@@ -88,6 +88,19 @@ def fake_fetch(data: bytes = PNG, fail: bool = False):
 
 def images_dir(tmp_path) -> Path:
     return tmp_path / "ws" / "images"
+
+
+# ---------------------------------------------------------------- 魔数嗅探
+
+
+def test_sniff_ext_detects_webp():
+    data = b"RIFF" + (36).to_bytes(4, "little") + b"WEBP" + b"VP8 " + b"0" * 24
+    assert _sniff_ext(data) == ".webp"
+
+
+def test_sniff_ext_ignores_non_webp_riff():
+    data = b"RIFF" + (36).to_bytes(4, "little") + b"WAVE" + b"0" * 24
+    assert _sniff_ext(data) == ""
 
 
 # ---------------------------------------------------------------- 快路径/开关

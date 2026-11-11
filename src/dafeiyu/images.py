@@ -73,6 +73,8 @@ def _sniff_ext(data: bytes) -> str:
     for magic, ext in _MAGIC:
         if data.startswith(magic):
             return ext
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
     return ""
 
 

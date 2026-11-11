@@ -64,3 +64,15 @@ def test_clip_summary_short_text_is_untouched() -> None:
 
 def test_clip_summary_zero_limit_returns_empty() -> None:
     assert clip_summary("x" * 10, 0) == ""
+
+
+def test_clip_summary_never_exceeds_limit() -> None:
+    """断点正好落在 limit-1 时也不能超出预算；三条路径都要守住 limit。"""
+    cases = [
+        ("123456789。" + "尾巴", 10),  # 句号正好在第 10 位，截断后不能再加出第 11 字
+        ("很长的一句话。", 1),  # limit=1
+        ("鱼" * 20, 5),  # 无标点，硬截断
+    ]
+
+    for text, limit in cases:
+        assert len(clip_summary(text, limit)) <= limit

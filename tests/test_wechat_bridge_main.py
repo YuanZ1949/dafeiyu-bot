@@ -1419,7 +1419,7 @@ async def test_ack_trims_unacked_and_persists(tmp_path: Path) -> None:
             assert server._inbound_seq == 2
 
             state = json.loads((tmp_path / "state.json").read_text("utf-8"))
-            assert state == {"seq": 2, "acked": 2, "frames": []}
+            assert state == {"seq": 2, "acked": 2, "gap_from": None, "frames": []}
     finally:
         await asyncio.wait_for(server.stop(), STEP)
 
@@ -1586,7 +1586,12 @@ async def test_inbound_state_never_regresses_across_restart(tmp_path: Path) -> N
     finally:
         await asyncio.wait_for(server.stop(), STEP)
 
-    assert json.loads(path.read_text("utf-8")) == {"seq": 2, "acked": 2, "frames": []}
+    assert json.loads(path.read_text("utf-8")) == {
+        "seq": 2,
+        "acked": 2,
+        "gap_from": None,
+        "frames": [],
+    }
 
     server2 = BridgeServer(state_path=path)
     assert server2._inbound_seq == 2
@@ -1780,6 +1785,55 @@ async def test_restore_skips_bad_frame_entries(
     assert last_frame["seq"] == 5, "缺 seq 的帧回填顶层 seq"
     assert caplog.text.count("非法条目") == 1, "坏条目只汇总告警一次，不刷屏"
     await _stopped(server)
+
+
+async def test_unacked_overflow_records_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """缓冲写满再入帧：被挤掉的最旧 seq 记入 gap_from、告警、随水位落盘。
+
+    用 monkeypatch 把 UNACKED_MAX 临时改小（deque maxlen 在 __init__ 读取），
+    避免构造 200 条 envelope；被挤掉的帧重启后不再重投，必须留下账目。
+    """
+    monkeypatch.setattr(bridge_server, "UNACKED_MAX", 3)
+    path = tmp_path / "state.json"
+    server = BridgeServer(state_path=path)
+    try:
+        for i in range(1, 4):
+            server._stamp_inbound({}, _bridge_msg(f"m{i}"))
+        assert [seq for seq, _ in server._unacked] == [1, 2, 3]
+        assert server._inbound_gap_from is None
+
+        with caplog.at_level("WARNING", logger="dafeiyu.gateway.wechat_bridge.server"):
+            server._stamp_inbound({}, _bridge_msg("m4"))
+        assert server._inbound_gap_from == 1, "首次溢出记下被挤掉的最旧 seq"
+        assert [seq for seq, _ in server._unacked] == [2, 3, 4]
+        assert "挤掉" in caplog.text and "seq=1" in caplog.text
+        # 再溢出：保留最早的 gap_from，不被后续覆盖。
+        server._stamp_inbound({}, _bridge_msg("m5"))
+        assert server._inbound_gap_from == 1
+
+        state = json.loads(path.read_text("utf-8"))
+        assert state["gap_from"] == 1
+        assert [item["seq"] for item in state["frames"]] == [3, 4, 5]
+    finally:
+        await _stopped(server)
+
+    server2 = BridgeServer(state_path=path)
+    assert server2._inbound_gap_from == 1, "gap_from 随水位恢复"
+    await _stopped(server2)
+
+    # gap_from <= acked = 已被 ack 追平，视为已恢复：置 None，不再报丢帧。
+    path2 = tmp_path / "state2.json"
+    path2.write_text(
+        json.dumps({"seq": 4, "acked": 4, "gap_from": 2, "frames": []}),
+        encoding="utf-8",
+    )
+    server3 = BridgeServer(state_path=path2)
+    assert server3._inbound_gap_from is None
+    await _stopped(server3)
 
 
 async def test_no_state_path_means_no_persistence(

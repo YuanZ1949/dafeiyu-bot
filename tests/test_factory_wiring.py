@@ -179,7 +179,7 @@ async def test_memory_workers_follow_brain_switch(tmp_path: Path) -> None:
     store = make_store()
     try:
         store.add_message(
-            Message(ChatType.GROUP, 20001, 1, "鱼片", "周末去钓鱼吗", "m1")
+            Message(ChatType.GROUP, 20001, "qq:1", "鱼片", "周末去钓鱼吗", "m1")
         )
         old = RecordingBrain()
         new = RecordingBrain(

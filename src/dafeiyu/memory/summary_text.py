@@ -108,5 +108,5 @@ def clip_summary(text: str, limit: int) -> str:
     # 断点太靠前（不足一半）说明第一句本身很短，截到那里会丢掉大部分内容，
     # 此时宁可硬截断。
     if cut + 1 >= limit // 2:
-        return window[: cut + 1].rstrip() + "…"
+        return window[: min(cut + 1, limit - 1)].rstrip() + "…"
     return window[: limit - 1].rstrip() + "…"

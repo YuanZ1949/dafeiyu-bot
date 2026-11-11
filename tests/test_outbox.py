@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -345,6 +346,34 @@ async def test_first_send_failure_enqueues_and_flush_reuses_dedupe_key(
     # 首次失败的那一次调用也被记录：首发与补发是同一个 key。
     assert adapter.sent_keys == [expected_key, expected_key]
     assert adapter.sent == [(CHAT, "答案在这里。")]
+
+
+async def test_outbox_send_uses_dedupe_key(tmp_path: Path) -> None:
+    """承诺补话首发也带稳定 dedupe_key：桥「已发出且回执丢失」时可去重。
+
+    key 由 origin + text 决定，与时间/调用次数无关；同一 origin + text
+    连续两次入队得到同一个 key，桥侧才能合流。
+    """
+    store = Store(str(tmp_path / "obk.db"))
+    store.init_schema()
+    adapter = DedupeRecordingAdapter()
+    service = build_with_adapter(tmp_path, store, adapter)
+    adapter.fail = True  # 模拟「可能已发出但回执丢了」
+    text = "这条补话可能已经到了"
+    expected_digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+    expected_key = f"outbox:m9:{expected_digest}"
+
+    assert await service._send_outbox(ChatType.GROUP, CHAT, text, origin="m9") is False
+
+    rows = store.due_outbox(now=time.time() + 1)
+    assert rows and rows[0]["dedupe_key"] == expected_key
+    # 首发也走了 dedupe 感知路径：失败的这次调用同样带上了 key。
+    assert adapter.sent_keys == [expected_key]
+
+    # 同一 origin + text 再来一次：入队的是同一个 key。
+    assert await service._send_outbox(ChatType.GROUP, CHAT, text, origin="m9") is False
+    rows = store.due_outbox(now=time.time() + 1)
+    assert [row["dedupe_key"] for row in rows] == [expected_key, expected_key]
 
 
 async def test_flush_without_dedupe_key_still_sends_plain(tmp_path: Path) -> None:

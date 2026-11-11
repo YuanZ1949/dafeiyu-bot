@@ -239,6 +239,60 @@ async def test_materialize_undecodable_dat_has_no_readable_path(
     assert msg.content == "[图片]"
 
 
+async def test_relay_clears_dat_when_workspace_disabled(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, workspace=False)
+    source = tmp_path / "msg.dat"
+    source.write_bytes(b"raw-wechat-dat")
+    attachment = Attachment(
+        kind="image",
+        path=str(source),
+        size=14,
+        fallbacks=("/x_h.png",),
+    )
+    msg = make_message([attachment], content="[图片]", chat_id="wxg:g1")
+
+    result = await materialize_relay_attachments(
+        msg, settings, decode=lambda _data: None
+    )
+
+    # workspace 关闭不等于放行：原始 .dat 路径必须被清空，由出站侧发占位。
+    assert result is not msg
+    assert result.attachments[0].path == ""
+    assert result.attachments[0].size == 0
+    assert result.attachments[0].fallbacks == ()
+    # 调用方消息零改动。
+    assert msg.attachments[0].path == str(source)
+    assert msg.attachments[0].size == 14
+    assert msg.attachments[0].fallbacks == ("/x_h.png",)
+
+
+async def test_relay_clears_dat_when_workspace_root_missing(tmp_path: Path) -> None:
+    # workspace.enabled=True 但 dir 为空：_workspace_root 返回 None 的真实配置态。
+    settings = make_settings(tmp_path, workspace_dir="")
+    source = tmp_path / "msg.dat"
+    source.write_bytes(b"raw-wechat-dat")
+    attachment = Attachment(
+        kind="image",
+        path=str(source),
+        size=14,
+        fallbacks=("/x_h.png",),
+    )
+    msg = make_message([attachment], content="[图片]", chat_id="wxg:g1")
+
+    result = await materialize_relay_attachments(
+        msg, settings, decode=lambda _data: None
+    )
+
+    assert result is not msg
+    assert result.attachments[0].path == ""
+    assert result.attachments[0].size == 0
+    assert result.attachments[0].fallbacks == ()
+    # 调用方消息零改动。
+    assert msg.attachments[0].path == str(source)
+    assert msg.attachments[0].size == 14
+    assert msg.attachments[0].fallbacks == ("/x_h.png",)
+
+
 async def test_no_content_mutation_on_relay_materialization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

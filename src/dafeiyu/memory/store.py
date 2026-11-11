@@ -3462,6 +3462,7 @@ class Store:
              AND r.chat_id = m.chat_id
              AND r.bot_message_id = m.message_id
             WHERE m.is_bot = 1 AND m.timestamp > 0 AND m.timestamp <= ?
+              AND m.mirror = 0
               AND r.id IS NULL
             ORDER BY m.id ASC
             LIMIT ?
@@ -4571,6 +4572,23 @@ class Store:
         self._conn.execute(
             "DELETE FROM mind_state WHERE key = ?",
             (self.reflector_key(chat_type, chat_id),),
+        )
+        # observer 的 episode 起点标记（workers/observer.py 同一拼法）。
+        self._conn.execute(
+            "DELETE FROM mind_state WHERE key = ?",
+            (f"observer/episode/{chat_type.value}/{chat_id}",),
+        )
+        # followup 按天一个键，只能前缀匹配；chat_id 里可能有 % 和 _，
+        # 必须转义 SQL 通配符，否则 LIKE 会误删别的会话的键。
+        prefix = (
+            f"followup/{chat_type.value}/{chat_id}/"
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        self._conn.execute(
+            "DELETE FROM mind_state WHERE key LIKE ? ESCAPE '\\'",
+            (prefix + "%",),
         )
         self._conn.commit()
 

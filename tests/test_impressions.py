@@ -97,6 +97,32 @@ async def test_invalid_items_are_skipped(store: Store) -> None:
     assert store.list_impressions(CHAT, CHAT_ID, topk=10) == []
 
 
+async def test_impression_rejects_unknown_user(store: Store) -> None:
+    """模型编造本批不存在的 user_id 时，该条印象不落库、不计入 added。"""
+    chat_id = "qq:90001"
+    brain = FakeBrain(json.dumps([
+        {"user_id": "qq:123", "kind": "fact", "content": "住在杭州", "confidence": 0.8},
+        {"user_id": "qq:999", "kind": "fact", "content": "捏造发言人的印象", "confidence": 0.9},
+    ]))
+    worker = ImpressionWorker(store, brain, every=1)
+    store.add_message(
+        Message(
+            chat_type=CHAT,
+            chat_id=chat_id,
+            user_id="qq:123",
+            nickname="鱼片",
+            content="消息 1",
+            message_id="m1",
+        )
+    )
+
+    assert await worker.maybe_extract(CHAT, chat_id) == 1
+
+    impressions = store.list_impressions(CHAT, chat_id, topk=10)
+    assert [im.content for im in impressions] == ["住在杭州"]
+    assert all(im.subject_user_id != "qq:999" for im in impressions)
+
+
 async def test_duplicate_extraction_does_not_duplicate_rows(store: Store) -> None:
     brain = FakeBrain(json.dumps([{"user_id": "qq:123", "kind": "nickname", "content": "外号叫鱼片", "confidence": 0.8}]))
     worker = ImpressionWorker(store, brain, every=1)
@@ -410,6 +436,7 @@ async def test_batch_of_impressions_inserts_all_rows(store: Store) -> None:
         )
     )
     worker = ImpressionWorker(store, brain, every=20)
+    store.add_message(make_message(0, user_id="qq:456"))
     for i in range(20):
         store.add_message(make_message(i))
     assert await worker.maybe_extract(CHAT, CHAT_ID) == 3

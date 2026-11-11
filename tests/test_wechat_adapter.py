@@ -1267,3 +1267,39 @@ async def test_reconnect_backoff_resets_after_stable_connection(
 
     # 第一轮稳定（31s）⇒ 退避清零 ⇒ 1s；第二轮秒断 ⇒ 保持递增 ⇒ 2s。
     assert delays == [1, 2]
+
+
+async def test_chat_locks_do_not_grow_unbounded() -> None:
+    """入站任务全部结束后，每 chat 的锁应被回收，而不是只增不减。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        received: list[str] = []
+
+        async def on_message(message: Message) -> None:
+            received.append(message.content)
+            # 慢 handler：让后续消息真正在同一把锁上排队。
+            await asyncio.sleep(0.005)
+
+        adapter.on_message(on_message)
+
+        # 50 个不同 chat：每个都会新建一把锁，处理完应全部回收。
+        for i in range(50):
+            await bridge.push(
+                message_envelope(
+                    chat_id=f"wxg:chat{i}",
+                    text=f"c{i}",
+                    message_id=f"{EPOCH}:{i}",
+                )
+            )
+        await wait_for(lambda: len(received) == 50)
+        await wait_for(lambda: not adapter._inbound_tasks)
+        assert len(adapter._chat_locks) == 0
+        assert not adapter._chat_waiters
+
+        # 顺序语义没坏：同一 chat 连发 3 条，处理顺序 == 发送顺序。
+        received.clear()
+        for i in range(3):
+            await bridge.push(
+                message_envelope(text=f"m{i}", message_id=f"{EPOCH}:s{i}")
+            )
+        await wait_for(lambda: len(received) == 3)
+        assert received == ["m0", "m1", "m2"]

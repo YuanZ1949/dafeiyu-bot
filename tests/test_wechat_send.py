@@ -246,6 +246,19 @@ def test_rate_limit_emits_on_alert_callback(tmp_path: Path) -> None:
     assert alerts and alerts[0][0] == "rate_limited"
 
 
+def test_alerts_are_bounded(harness) -> None:
+    """告警容器有界：只保留最近 256 条，健康快照口径不变。"""
+    h = harness()
+
+    for i in range(300):
+        h.sender._alert(f"code_{i}", {"i": i})
+
+    assert len(h.sender.alerts) == 256
+    assert h.sender.alerts[-1][1]["i"] == 299
+    assert h.sender.alerts[0][1]["i"] == 44
+    assert h.sender.health_snapshot()["alerts"] == 256
+
+
 # --------------------------------------------------------------------- 闸门
 def test_kill_switch_never_touches_driver_and_reports_disconnected(
     harness, tmp_path: Path

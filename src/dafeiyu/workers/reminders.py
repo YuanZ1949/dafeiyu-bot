@@ -4,6 +4,8 @@
 真正投递时走 ``Service._send_outbox``——它失败会把文本放进 ``pending_outbox``
 由 outbox 负责重试，因此提醒行无论投递成功与否都必须在 ``finally`` 里标记
 ``sent``；否则下一轮会再发一次，变成 at-least-once。
+例外：任务被取消（``CancelledError``）时从未真正投递，不标记、保持 ``pending``
+由下一轮重投。
 """
 
 from __future__ import annotations
@@ -51,6 +53,7 @@ async def _deliver_one(service: Service, row: dict[str, Any]) -> bool:
     text = f"提醒：{row['content']}"
     error: str | None = None
     sent = False
+    cancelled = False
     try:
         ok = await service._send_outbox(
             chat_type, chat_id, text, origin=f"reminder:{reminder_id}"
@@ -60,13 +63,16 @@ async def _deliver_one(service: Service, row: dict[str, Any]) -> bool:
             # _send_outbox 已经把文本放进 pending_outbox（除非 enqueue 自己炸了）。
             error = "send_failed: queued in outbox"
     except asyncio.CancelledError:
+        # 停机/取消时从未真正投递：保持 pending，下一轮重投；不落 sent。
+        cancelled = True
         raise
     except Exception as exc:  # noqa: BLE001 - 任何失败都只记在行上，不重试
         error = f"{type(exc).__name__}: {exc}"[:300]
         logger.warning("提醒 %s 投递异常: %s", reminder_id, exc)
     finally:
-        # at-most-once：不管成功、失败还是 enqueue 抛异常，都立即终态。
-        service.store.mark_reminder_sent(reminder_id, last_error=error)
+        if not cancelled:
+            # at-most-once：不管成功、失败还是 enqueue 抛异常，都立即终态。
+            service.store.mark_reminder_sent(reminder_id, last_error=error)
     return sent
 
 

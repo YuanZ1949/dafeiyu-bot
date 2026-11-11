@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import threading
@@ -19,7 +20,7 @@ import dafeiyu.media as media_module
 from dafeiyu import imaging
 from dafeiyu.config import Settings
 from dafeiyu.gateway.wechat_bridge.media.dat import decode_dat
-from dafeiyu.media import materialize_attachments
+from dafeiyu.media import _download_video, materialize_attachments
 from dafeiyu.models import Attachment, ChatType, Message
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 64
@@ -937,6 +938,34 @@ async def test_video_url_is_downloaded_and_framed(
     assert "原文件 videos/" in message.content
     # 临时下载文件必须清理干净。
     assert list((tmp_path / "ws" / "videos").glob(".incoming-*")) == []
+
+
+async def test_download_video_temp_paths_are_unique(tmp_path: Path) -> None:
+    """同一个 URL 并发下载两次，各写各的临时文件，互不覆盖。"""
+    url = "https://example.com/clip.mp4"
+    payload = b"\x00\x00\x00\x18ftypmp42" + b"video-bytes" * 8
+
+    async def fake_fetch(
+        _source: str, _timeout: float, max_bytes: int
+    ) -> bytes:
+        assert max_bytes >= len(payload)
+        return payload
+
+    settings = make_settings(tmp_path, media=False, images=True)
+    root = tmp_path / "ws"
+
+    first, second = await asyncio.gather(
+        _download_video(url, root=root, settings=settings, fetch=fake_fetch),
+        _download_video(url, root=root, settings=settings, fetch=fake_fetch),
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first != second
+    assert first.exists()
+    assert second.exists()
+    assert first.read_bytes() == payload
+    assert second.read_bytes() == payload
 
 
 async def test_url_attachment_is_skipped_when_both_gates_off(

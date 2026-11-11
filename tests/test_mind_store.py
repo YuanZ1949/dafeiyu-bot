@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -205,6 +206,26 @@ def test_pending_outcome_skips_fresh_and_already_tagged(store: Store) -> None:
     pending = store.bot_messages_pending_outcome(until_ts=4000)
 
     assert [m.message_id for m in pending] == []
+
+
+def test_pending_outcome_excludes_mirror(store: Store) -> None:
+    store.add_message(
+        msg(user_id="qq:999", is_bot=True, message_id="b1", timestamp=1000)
+    )
+    # 同一条回复在另一通道的镜像副本：不算独立发言，不该重复进待结算候选。
+    store.add_message(
+        replace(
+            msg(user_id="qq:999", is_bot=True, message_id="b1", timestamp=1000),
+            chat_id="wechat:1",
+            mirror=True,
+        )
+    )
+
+    pending = store.bot_messages_pending_outcome(until_ts=4000)
+
+    assert [(m.chat_id, m.message_id, m.mirror) for m in pending] == [
+        ("qq:1", "b1", False)
+    ]
 
 
 def test_upsert_outcome_is_idempotent(store: Store) -> None:

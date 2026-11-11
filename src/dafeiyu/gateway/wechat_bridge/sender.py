@@ -26,6 +26,7 @@ import random
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -702,7 +703,7 @@ class Sender:
         self._day_key: int | None = None
         self._hour_count = 0
         self._day_count = 0
-        self.alerts: list[tuple[str, dict[str, Any]]] = []
+        self.alerts: deque[tuple[str, dict[str, Any]]] = deque(maxlen=256)
 
         # hook 后端不需要 UIA：不要为了「固定 GlobalConfig」去 import pyweixin。
         if getattr(self._transport, "requires_desktop", False) or getattr(

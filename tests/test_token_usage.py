@@ -80,7 +80,8 @@ async def test_summary_records_estimated_usage() -> None:
 @pytest.mark.asyncio
 async def test_impression_records_estimated_usage() -> None:
     store = make_store()
-    store.add_message(Message(ChatType.GROUP, 1, 1, "鱼片", "我喜欢钓鱼", "m1"))
+    # user_id 与真实适配器一致带通道前缀：印象抽取只接受本批发言人。
+    store.add_message(Message(ChatType.GROUP, 1, "qq:1", "鱼片", "我喜欢钓鱼", "m1"))
     brain = ZeroUsageBrain(
         '[{"user_id": "qq:1", "kind": "preference", "content": "喜欢钓鱼", "confidence": 0.9}]'
     )

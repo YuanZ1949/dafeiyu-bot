@@ -160,7 +160,7 @@ class ImpressionWorker:
             return 0
 
         lines = "\n".join(f"{m.user_id}|{m.nickname}: {m.content}" for m in messages)
-        latest_by_user: dict[int, Message] = {}
+        latest_by_user: dict[str, Message] = {}
         for message in messages:
             if not message.is_bot:
                 latest_by_user[message.user_id] = message
@@ -207,6 +207,15 @@ class ImpressionWorker:
             if parsed is None:
                 continue
             user_id, kind, content, confidence = parsed
+            if user_id not in latest_by_user:
+                # 模型可能编出本批不存在的 user_id；没有 source 主语就不落库。
+                log.debug(
+                    "印象抽取跳过未知发言人 user_id=%s chat=%s:%s",
+                    user_id,
+                    chat_type,
+                    chat_id,
+                )
+                continue
             key = (user_id, kind, content)
             if key not in existing:
                 existing.add(key)

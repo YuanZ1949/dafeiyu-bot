@@ -31,7 +31,7 @@ from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType
 from dafeiyu.router import Router
 from dafeiyu.service import Service
-from dafeiyu.workers.reminders import deliver_due_reminders, reminder_loop
+from dafeiyu.workers.reminders import _deliver_one, deliver_due_reminders, reminder_loop
 
 GROUP = ChatType.GROUP
 CHAT = "qq:1001"
@@ -241,6 +241,34 @@ async def test_enqueue_outbox_raising_still_marks_sent(
     assert row["status"] == "sent"
     assert row["last_error"] is not None
     assert "enqueue boom" in row["last_error"]
+
+
+async def test_cancelled_reminder_stays_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """停机取消：CancelledError 不落 sent，提醒保持 pending 等下一轮重投。"""
+    service, adapter, _brain, store = build_service(tmp_path)
+    reminder_id = add_due(store)
+    marks: list[int] = []
+    real_mark = store.mark_reminder_sent
+
+    def spy_mark(reminder_id: int, last_error: str | None = None) -> bool:
+        marks.append(reminder_id)
+        return bool(real_mark(reminder_id, last_error=last_error))
+
+    async def cancelled(*args: Any, **kwargs: Any) -> bool:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(service, "_send_outbox", cancelled)
+    monkeypatch.setattr(store, "mark_reminder_sent", spy_mark)
+    row = next(r for r in store.due_reminders(time.time()) if r["id"] == reminder_id)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _deliver_one(service, row)
+
+    assert marks == []
+    assert adapter.sent == []
+    assert reminder_status(store, reminder_id)["status"] == "pending"
 
 
 async def test_loop_exits_within_one_interval(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import logging
 import re
@@ -778,8 +779,15 @@ class Service:
 
         用于「已经给过承诺」的补话：桥断了也不能让用户等到天荒地老。
         """
+        # 稳定 key：同一 origin + 同一段文本永远同一个 key（sha1 摘要，
+        # 不用 hash()——它每次进程启动都变），首发与补发才能合流去重。
+        dedupe_key = (
+            f"outbox:{origin or chat_id}:"
+            f"{hashlib.sha1(text.encode('utf-8')).hexdigest()[:16]}"
+        )
+        adapter = self._adapter_for(chat_id)
         try:
-            await self._adapter_for(chat_id).send(chat_type, chat_id, text)
+            await self._send_text(adapter, chat_type, chat_id, text, dedupe_key)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - 失败转队列，不打断主流程
@@ -790,11 +798,16 @@ class Service:
                     chat_id,
                     text,
                     origin_message_id=origin,
+                    dedupe_key=dedupe_key,
                     next_attempt_at=self._next_hour(time.time()),
                 )
             else:
                 self.store.enqueue_outbox(
-                    chat_type, chat_id, text, origin_message_id=origin
+                    chat_type,
+                    chat_id,
+                    text,
+                    origin_message_id=origin,
+                    dedupe_key=dedupe_key,
                 )
             return False
         return True

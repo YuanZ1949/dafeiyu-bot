@@ -192,3 +192,29 @@ def test_forget_all_clears_shared_facts(store: Store) -> None:
 
     row = store._conn.execute("SELECT 1 FROM shared_facts").fetchone()
     assert row is None
+
+
+# ---- forget_chat 清 mind_state 的 observer/followup 键 -----------------------
+
+
+def _mind_keys(chat_id: str) -> list[str]:
+    """与 workers 里 mind_state 三类键的同构写法（reflector/observer/followup）。"""
+    return [
+        f"reflector/{GROUP.value}/{chat_id}",
+        f"observer/episode/{GROUP.value}/{chat_id}",
+        f"followup/{GROUP.value}/{chat_id}/2026-01-01",
+    ]
+
+
+def test_forget_clears_observer_and_followup_keys(store: Store) -> None:
+    tricky = "qq:%_1"  # chat_id 里的 SQL 通配符：LIKE 不转义会误删别的会话
+    for chat_id in (tricky, "qq:2"):
+        for key in _mind_keys(chat_id):
+            store.set_mind_state(key, "x")
+
+    store.forget_chat(GROUP, tricky)
+
+    for key in _mind_keys(tricky):
+        assert store.get_mind_state(key, "MISSING") == "MISSING", key
+    for key in _mind_keys("qq:2"):
+        assert store.get_mind_state(key) == "x", key

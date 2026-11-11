@@ -207,6 +207,8 @@ class BridgeServer:
         self._inbound_seq: int = 0
         self._inbound_acked: int = 0
         self._unacked: deque[tuple[int, dict[str, Any]]] = deque(maxlen=UNACKED_MAX)
+        # 首次缓冲溢出时被挤掉的最旧 seq（None = 没有丢帧）；随水位落盘。
+        self._inbound_gap_from: int | None = None
         # 每个连接已发事件帧 seq 的有界历史：广播 pending 重试与 hello 重投
         # 在此汇合，同一帧对同一连接绝不出两遍。
         self._conn_seq_hist: dict[ServerConnection, deque[int]] = {}
@@ -371,6 +373,18 @@ class BridgeServer:
         self._inbound_seq += 1
         frame["seq"] = self._inbound_seq
         envelope["seq"] = self._inbound_seq
+        if len(self._unacked) >= UNACKED_MAX:
+            # deque(maxlen) 会静默挤掉最旧的未确认帧：记下账目并告警，
+            # 否则桥和 bot 都不知道丢了什么、这些消息再也不会重投。
+            dropped = self._unacked[0][0]
+            if self._inbound_gap_from is None:
+                self._inbound_gap_from = dropped
+            logger.warning(
+                "微信桥未确认帧缓冲已满（%d），挤掉最旧帧 seq=%d，当前 inbound_seq=%d；该帧不会再重投",
+                UNACKED_MAX,
+                dropped,
+                self._inbound_seq,
+            )
         self._unacked.append((self._inbound_seq, envelope))
         # 未确认帧随水位一起落盘：硬杀进程后仍能靠 hello 重投把它补出去。
         # 缓冲上限 200 条，文件很小；失败只记 debug，不影响发帧。
@@ -390,7 +404,17 @@ class BridgeServer:
                 if seq >= 0 and 0 <= acked <= seq:
                     self._inbound_seq = seq
                     self._inbound_acked = acked
+                    # 只有正整数才恢复；坏值保持 None，不带进运行状态。
+                    gap = raw.get("gap_from")
+                    if type(gap) is int and gap > 0:
+                        self._inbound_gap_from = gap
                     self._restore_unacked(raw.get("frames"), seq, acked)
+                    # 已 ack 追平的 gap 视为已恢复（ack 后丢帧已无意义）。
+                    if (
+                        self._inbound_gap_from is not None
+                        and self._inbound_gap_from <= self._inbound_acked
+                    ):
+                        self._inbound_gap_from = None
                     return
         except Exception as exc:  # noqa: BLE001 - 水位只影响重投，不许影响启动
             logger.warning("微信桥入站水位文件损坏，按 0 处理：%s", exc)
@@ -458,6 +482,7 @@ class BridgeServer:
             payload = {
                 "seq": self._inbound_seq,
                 "acked": self._inbound_acked,
+                "gap_from": self._inbound_gap_from,
                 # 已 ack 的帧不在缓冲里，这里只写窗口内的未确认帧（升序）。
                 "frames": [
                     {"seq": seq, "frame": envelope}

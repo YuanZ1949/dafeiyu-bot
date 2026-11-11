@@ -27,6 +27,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 import httpx
 
@@ -262,11 +263,12 @@ async def _download_video(
         or _ext_from_url(source, _VIDEO_URL_SUFFIXES)
         or ".mp4"
     )
+    # 随机后缀保证同一 URL 并发下载时各占一个临时文件，互不覆盖。
     digest = hashlib.md5(source.encode("utf-8", "ignore")).hexdigest()[:8]
     directory = root / "videos"
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        target = directory / f".incoming-{digest}{ext}"
+        target = directory / f".incoming-{digest}-{uuid4().hex[:8]}{ext}"
         await asyncio.to_thread(target.write_bytes, data)
     except OSError:
         log.info("视频临时文件写盘失败：%s", source, exc_info=True)
@@ -1255,8 +1257,10 @@ async def materialize_relay_attachments(
     try:
         workspace = getattr(settings, "workspace", None)
         if not getattr(workspace, "enabled", False):
+            copy.attachments = _without_raw_dat(copy.attachments)
             return copy
         if _workspace_root(settings) is None:
+            copy.attachments = _without_raw_dat(copy.attachments)
             return copy
         await materialize_attachments(
             copy,

@@ -98,6 +98,9 @@ class WeChatAdapter:
         # 每 (chat_type, chat_id) 一把锁保证单聊内按到达顺序串行；asyncio.Lock
         # 的 acquire 是 FIFO，任务创建顺序即到达顺序。
         self._chat_locks: dict[tuple[ChatType, str], asyncio.Lock] = {}
+        # 每 key 当前处于排队/执行中的入站任务数：归零且锁空闲时回收锁，
+        # 避免长驻进程里 _chat_locks 只增不减。
+        self._chat_waiters: dict[tuple[ChatType, str], int] = {}
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         # (chat_id, text, 单调时钟时刻, 发送回执的 message_id)
         self._sent_echo: deque[tuple[str, str, float, str]] = deque(
@@ -401,18 +404,34 @@ class WeChatAdapter:
         if lock is None:
             lock = asyncio.Lock()
             self._chat_locks[key] = lock
+        self._chat_waiters[key] = self._chat_waiters.get(key, 0) + 1
         task = asyncio.create_task(
-            self._run_inbound(lock, envelope), name="wechat-inbound"
+            self._run_inbound(key, lock, envelope), name="wechat-inbound"
         )
         self._inbound_tasks.add(task)
         task.add_done_callback(self._on_inbound_done)
 
     async def _run_inbound(
-        self, lock: asyncio.Lock, envelope: dict[str, Any]
+        self,
+        key: tuple[ChatType, str],
+        lock: asyncio.Lock,
+        envelope: dict[str, Any],
     ) -> None:
-        # 同一 chat 拿同一把锁 → 到达顺序即处理顺序；不同 chat 各自的锁互不阻塞。
-        async with lock:
-            await self.dispatch_envelope(envelope)
+        try:
+            # 同一 chat 拿同一把锁 → 到达顺序即处理顺序；不同 chat 各自的锁互不阻塞。
+            async with lock:
+                await self.dispatch_envelope(envelope)
+        finally:
+            # 递减与回收之间没有 await：事件循环单线程下这段是原子的。
+            remaining = self._chat_waiters.get(key, 0) - 1
+            if remaining > 0:
+                self._chat_waiters[key] = remaining
+            elif remaining == 0:
+                self._chat_waiters.pop(key, None)
+                # 只回收当初这把锁：期间若被重建过（身份不同）则不动；
+                # 锁仍被持有时也不回收，避免删掉正在执行的任务的锁。
+                if self._chat_locks.get(key) is lock and not lock.locked():
+                    del self._chat_locks[key]
 
     def _on_inbound_done(self, task: asyncio.Task[None]) -> None:
         self._inbound_tasks.discard(task)
