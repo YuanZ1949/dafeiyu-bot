@@ -1117,6 +1117,10 @@
     </div>
     <datalist id="mirror-qq-options"></datalist>
     <datalist id="mirror-wechat-options"></datalist>
+    <div class="kv" style="margin-top:12px">运行状态（本次进程内累计，不含消息正文）</div>
+    <div class="kv" id="mirror-stats">运行状态：—</div>
+    <div class="kv" id="mirror-capabilities" style="margin-top:6px">能力矩阵：—</div>
+    <div class="kv" id="mirror-failures" style="margin-top:6px">最近失败：—</div>
     <div class="kv" style="margin-top:8px">改动写入 data/settings.local.yaml 并热更新路由，不用重启；镜像原先未启用时，首次开启需重启 bot 才会建立转发。机器人自己的回复不回灌到对端。</div>
   </section>
 
@@ -3575,6 +3579,35 @@ function renderMirror(data) {
   $("mirror-wechat-options").innerHTML = (data.wechat_groups || [])
     .map((item) => `<option value="${escapeHtml(`wxg:${item.alias}`)}">${escapeHtml(item.display_name || "")}</option>`)
     .join("");
+  renderMirrorStats(data);
+}
+
+function renderMirrorStats(data) {
+  const stats = data.stats;
+  const statsEl = $("mirror-stats");
+  const capEl = $("mirror-capabilities");
+  const failEl = $("mirror-failures");
+  const caps = data.capabilities || {};
+  const capText = Object.entries(caps)
+    .map(([direction, items]) => `${direction} ${(items || []).map((item) => `${item.kind}=${item.state}`).join(" ")}`)
+    .join("；");
+  capEl.textContent = `能力矩阵：${capText || "—"}`;
+  if (!stats) {
+    statsEl.textContent = data.enabled
+      ? "运行状态：尚未建立转发（镜像原先未启用，重启 bot 后生效）"
+      : "运行状态：未启用";
+    failEl.textContent = "最近失败：—";
+    return;
+  }
+  const backlog = Object.entries(stats.queues || {})
+    .filter(([, depth]) => depth > 0)
+    .map(([target, depth]) => `${target} ${depth}`)
+    .join("，");
+  statsEl.textContent = `运行状态：已发 ${stats.sent ?? 0} · 降级 ${stats.degraded ?? 0} · 丢弃 ${stats.dropped ?? 0} · 过期 ${stats.expired ?? 0} · 去重 ${stats.deduped ?? 0} · 重试 ${stats.retries ?? 0} · 积压 ${stats.queued ?? 0}${backlog ? `（${backlog}）` : ""}`;
+  const failures = stats.recent_failures || [];
+  failEl.textContent = failures.length
+    ? `最近失败：${failures.slice(0, 5).map((item) => [item.at, item.direction, item.target, item.kind, item.code].filter(Boolean).join(" ")).join("；")}`
+    : "最近失败：无";
 }
 
 function collectMirrorPairs() {

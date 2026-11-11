@@ -1207,17 +1207,13 @@ def _mirror_file_capability(on: bool, reasons: list[str]) -> str:
     return f"off({','.join([*reasons, note])})"
 
 
-def _log_mirror_capabilities(
-    mirror: MirrorConfig,
+def _compute_mirror_capabilities(
     wechat: WeChatConfig,
     images: ImagesConfig,
     workspace: WorkspaceConfig,
     speech: SpeechConfig,
-) -> None:
+) -> dict[str, list[tuple[str, str]]]:
     """打印每个方向的能力矩阵；只由配置推导，不做任何网络/桥探测。"""
-    if not mirror.enabled:
-        return
-
     outbound_reason = ""
     if wechat.outbound == "uia":
         outbound_reason = "outbound=uia"
@@ -1244,7 +1240,12 @@ def _log_mirror_capabilities(
         ("text", "on"),
         ("image", _mirror_capability(not image_reasons, image_reasons)),
         ("voice", _mirror_capability(not voice_reasons, voice_reasons)),
-        ("video", "off(wechat-hook-no-video)"),
+        (
+            "video",
+            "on(video-as-file)"
+            if not qq_media_reasons
+            else f"off({','.join([*qq_media_reasons, 'video-as-file'])})",
+        ),
         (
             "file",
             _mirror_file_capability(not outbound_reason, qq_media_reasons),
@@ -1264,11 +1265,30 @@ def _log_mirror_capabilities(
         ("file", _mirror_capability(not wechat_media_reason, wechat_media_reason)),
         ("forward", "on"),
     ]
+    return {"qq->wechat": qq_to_wechat, "wechat->qq": wechat_to_qq}
 
-    for direction, capabilities in (
-        ("qq->wechat", qq_to_wechat),
-        ("wechat->qq", wechat_to_qq),
-    ):
+
+def mirror_capabilities(
+    settings: Settings,
+) -> dict[str, list[tuple[str, str]]]:
+    """面板用：按当前配置推导的能力矩阵（与启动日志同源）。"""
+    return _compute_mirror_capabilities(
+        settings.wechat, settings.images, settings.workspace, settings.speech
+    )
+
+
+def _log_mirror_capabilities(
+    mirror: MirrorConfig,
+    wechat: WeChatConfig,
+    images: ImagesConfig,
+    workspace: WorkspaceConfig,
+    speech: SpeechConfig,
+) -> None:
+    if not mirror.enabled:
+        return
+    for direction, capabilities in _compute_mirror_capabilities(
+        wechat, images, workspace, speech
+    ).items():
         for name, state in capabilities:
             if state.startswith("off("):
                 logger.warning("mirror capability %s %s=%s", direction, name, state)

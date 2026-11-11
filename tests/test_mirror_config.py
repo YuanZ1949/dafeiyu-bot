@@ -122,8 +122,30 @@ def test_valid_pair_and_capability_matrix(tmp_path: Path, caplog) -> None:
     assert "text=on" in text
     # 默认 uia + 未开本地库：媒体能力必须降级，不能因为配置合法就报 on。
     assert "image=off(outbound=uia)" in text
-    assert "video=off(wechat-hook-no-video)" in text
+    assert "video=off(outbound=uia,video-as-file)" in text
     assert "image=off(localdb/media)" in text
+
+
+def test_video_degrades_to_file_when_hook_outbound(tmp_path: Path, caplog) -> None:
+    """hook 没有视频原语，但能发文件：能力矩阵要显示 video-as-file，而不是恒 off。"""
+    caplog.set_level(logging.INFO)
+    extra = (
+        "gateway:\n"
+        "  provider: both\n"
+        "  wechat:\n"
+        "    enabled: true\n"
+        "    outbound: hook\n"
+        "    send_min_interval_seconds: 0\n"
+        "    send_max_per_hour: 0\n"
+        "    send_max_per_day: 0\n"
+        '    quiet_hours: ["00:00", "00:00"]\n' + VALID_MIRROR
+    )
+    settings = _load(tmp_path, extra)
+
+    assert settings.mirror.enabled is True
+    text = caplog.text
+    assert "video=on(video-as-file)" in text
+    assert "image=on" in text
 
 
 def test_multiple_pairs_accepted(tmp_path: Path, caplog) -> None:

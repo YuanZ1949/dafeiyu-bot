@@ -915,6 +915,93 @@ async def test_memory_errors_silent_while_quota_paused(tmp_path: Path) -> None:
     assert "memory_errors" not in {item.rule for item, _event in channel.sent}
 
 
+async def test_mirror_errors_fire_for_repeated_failures(tmp_path: Path) -> None:
+    """镜像转发静默失败必须告警：5 分钟内 3 次就算异常。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["bot"]["mirror"] = {
+        "enabled": True,
+        "router": True,
+        "failures_5m": 3,
+        "queued": 0,
+        "last_error": "hook_not_ready",
+    }
+
+    await mgr.evaluate(snapshot)
+
+    assert [item.rule for item, _event in channel.sent] == ["mirror_errors"]
+    detail = channel.sent[0][0].detail
+    assert "3 次转发失败" in detail
+    assert "hook_not_ready" in detail
+
+
+async def test_mirror_errors_fire_for_backlog(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["bot"]["mirror"] = {
+        "enabled": True,
+        "router": True,
+        "failures_5m": 0,
+        "queued": 200,
+        "last_error": "",
+    }
+
+    await mgr.evaluate(snapshot)
+
+    assert [item.rule for item, _event in channel.sent] == ["mirror_errors"]
+    assert "积压 200 条" in channel.sent[0][0].detail
+
+
+async def test_mirror_errors_fire_when_router_missing(tmp_path: Path) -> None:
+    """面板打开镜像但启动时没建 router：只能靠告警提醒重启。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["bot"]["mirror"] = {
+        "enabled": True,
+        "router": False,
+        "failures_5m": 0,
+        "queued": 0,
+    }
+
+    await mgr.evaluate(snapshot)
+
+    assert [item.rule for item, _event in channel.sent] == ["mirror_errors"]
+    assert "重启 bot" in channel.sent[0][0].detail
+
+
+async def test_mirror_errors_silent_when_disabled_or_below_threshold(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    disabled = base_snapshot()
+    disabled["bot"]["mirror"] = {
+        "enabled": False,
+        "router": False,
+        "failures_5m": 10,
+        "queued": 500,
+    }
+    healthy = base_snapshot()
+    healthy["bot"]["mirror"] = {
+        "enabled": True,
+        "router": True,
+        "failures_5m": 2,
+        "queued": 199,
+    }
+
+    await mgr.evaluate(disabled)
+    await mgr.evaluate(healthy)
+
+    assert channel.sent == []
+
+
 async def test_backup_stale_exempt_when_backups_disabled(tmp_path: Path) -> None:
     """关闭备份的部署不该永远挂一条「备份过期」。"""
     clock = Clock()

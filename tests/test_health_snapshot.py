@@ -80,6 +80,57 @@ def make_control(tmp_path: Path, admins: frozenset[int] = frozenset(), token: st
     return control, adapter, store, create_app(control, token)
 
 
+def test_health_snapshot_reports_mirror_runtime(tmp_path: Path) -> None:
+    """镜像计数进健康快照：告警靠它判断是否静默丢消息。"""
+
+    class StatsRouter:
+        def __init__(self, settings) -> None:
+            self.settings = settings
+
+        def stats(self):
+            return {
+                "sent": 2,
+                "queued": 4,
+                "dropped": 1,
+                "degraded": 0,
+                "failures_5m": 2,
+                "last_error": "hook_unknown",
+            }
+
+    control, _adapter, _store, _app = make_control(tmp_path)
+    control.settings = replace(
+        control.settings,
+        mirror=replace(control.settings.mirror, enabled=True),
+    )
+    control.service.mirror = StatsRouter(control.settings)
+
+    snapshot = control.health_snapshot()
+
+    assert snapshot["mirror"] == {
+        "enabled": True,
+        "router": True,
+        "queued": 4,
+        "dropped": 1,
+        "degraded": 0,
+        "failures_5m": 2,
+        "last_error": "hook_unknown",
+    }
+
+
+def test_health_snapshot_mirror_disabled_when_router_missing(tmp_path: Path) -> None:
+    control, _adapter, _store, _app = make_control(tmp_path)
+    control.settings = replace(
+        control.settings,
+        mirror=replace(control.settings.mirror, enabled=True),
+    )
+
+    snapshot = control.health_snapshot()
+
+    assert snapshot["mirror"]["enabled"] is True
+    assert snapshot["mirror"]["router"] is False
+    assert snapshot["mirror"]["queued"] == 0
+
+
 def test_health_snapshot_shape_and_no_secrets(tmp_path: Path) -> None:
     control, adapter, store, _app = make_control(tmp_path)
     store.add_message(

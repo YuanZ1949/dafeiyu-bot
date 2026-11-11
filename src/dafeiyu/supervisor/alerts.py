@@ -24,6 +24,10 @@ RESOLVED_RETENTION_SECONDS = 24 * 3600
 RESTART_WINDOW_SECONDS = 600
 RESTART_BURST_COUNT = 3
 DISK_REPEAT_SECONDS = 12 * 3600
+#: 跨群镜像的失败阈值：5 分钟内 3 次失败就算异常（单次网络抖动不报警）。
+MIRROR_FAILURE_COUNT = 3
+#: 单个目标群积压到这个数说明已卡死（队列上限 1000）。
+MIRROR_BACKLOG_LIMIT = 200
 
 
 @dataclass
@@ -402,6 +406,32 @@ class AlertManager:
             conditions["memory_errors"] = Condition(
                 True, "warning", "记忆任务失败偏多", detail
             )
+
+        # 跨群镜像：hook 未就绪/重试耗尽时消息会静默丢，必须进告警。
+        mirror = bot.get("mirror") or {}
+        if not isinstance(mirror, dict):
+            mirror = {}
+        if mirror.get("enabled"):
+            try:
+                mirror_failures = int(mirror.get("failures_5m") or 0)
+                mirror_backlog = int(mirror.get("queued") or 0)
+            except (TypeError, ValueError):
+                mirror_failures = 0
+                mirror_backlog = 0
+            parts: list[str] = []
+            if mirror.get("router") is False:
+                parts.append("镜像已启用但未建立转发路由（需重启 bot）")
+            if mirror_failures >= MIRROR_FAILURE_COUNT:
+                parts.append(f"5 分钟内 {mirror_failures} 次转发失败")
+            if mirror_backlog >= MIRROR_BACKLOG_LIMIT:
+                parts.append(f"待发消息积压 {mirror_backlog} 条")
+            if parts:
+                last_error = str(mirror.get("last_error") or "").strip()
+                if last_error:
+                    parts.append(f"最近错误码：{last_error}")
+                conditions["mirror_errors"] = Condition(
+                    True, "warning", "群互通转发异常", "；".join(parts)
+                )
 
         disk = snapshot.get("disk") or {}
         if not isinstance(disk, dict):

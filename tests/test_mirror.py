@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ import dafeiyu.mirror as mirror_module
 from dafeiyu.config import (
     BudgetConfig,
     GroupsConfig,
+    ImagesConfig,
     LoggingConfig,
     MemoryConfig,
     MirrorConfig,
@@ -21,6 +23,7 @@ from dafeiyu.config import (
     PersonaConfig,
     Settings,
     TriggerConfig,
+    WorkspaceConfig,
 )
 from dafeiyu.gateway.base import GatewayError
 from dafeiyu.memory.store import Store
@@ -785,6 +788,103 @@ async def test_hook_unknown_without_not_sent_is_terminal(
     assert router.stats()["retries"] == 0
     assert router.stats()["sent"] == 0
     assert router.stats()["last_error"] == "hook_unknown"
+
+
+async def test_stats_reports_queue_depth_workers_and_recent_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """面板/告警共用 stats：积压、worker、最近失败（不含正文）。"""
+    monkeypatch.setattr(mirror_module, "RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    failing = Recorder(
+        "wxg:self",
+        fail=lambda: GatewayError("boom", error_code="hook_unknown"),
+    )
+    router, _store, _adapters = make_router(tmp_path, wechat=failing)
+    router.start()
+    try:
+        router.observe_inbound(
+            make_msg(QQ, "结果不明", user_id="qq:2002", message_id="q1")
+        )
+        await wait_until(lambda: router.stats()["degraded"] == 1)
+        stats = router.stats()
+    finally:
+        await router.stop()
+
+    assert stats["queues"][WXG] == 0
+    assert stats["queues"][QQ] == 0
+    assert stats["workers"] == sorted([QQ, WXG])
+    assert stats["failures_5m"] == 1
+    failure = stats["recent_failures"][0]
+    assert failure["code"] == "hook_unknown"
+    assert failure["direction"] == "qq->wechat"
+    assert failure["target"] == WXG
+    assert failure["kind"] == "发送"
+    # 失败记录只有错误码与目标，不携带消息正文。
+    assert "结果不明" not in json.dumps(stats, ensure_ascii=False)
+
+
+class MediaRecorder(Recorder):
+    """在 Recorder 上补 send_media：记录 (kind, path, name)。"""
+
+    def __init__(self, bot_id: str, *, accept: bool = True) -> None:
+        super().__init__(bot_id)
+        self.media: list[tuple[str, str, str]] = []
+        self.accept = accept
+
+    async def send_media(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        kind: str,
+        path: str,
+        *,
+        name: str = "",
+    ) -> bool:
+        self.calls += 1
+        if not self.accept:
+            return False
+        self.media.append((kind, path, name))
+        return True
+
+
+async def test_qq_video_reaches_wechat_as_file(tmp_path: Path) -> None:
+    """微信 hook 没有视频原语：物化成功的 mp4 按文件发，而不是只留占位。"""
+    ws = tmp_path / "ws"
+    (ws / "videos").mkdir(parents=True)
+    clip = ws / "videos" / "clip.mp4"
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    settings = dataclasses.replace(
+        make_settings(),
+        workspace=WorkspaceConfig(dir=str(ws)),
+        images=ImagesConfig(enabled=True),
+    )
+    store = Store(tmp_path / "mirror.db")
+    store.init_schema()
+    wechat = MediaRecorder("wxg:self")
+    router = MirrorRouter(
+        settings, store, {"qq": Recorder("qq:999"), "wechat": wechat}
+    )
+    router.start()
+    try:
+        router.observe_inbound(
+            make_msg(
+                QQ,
+                "",
+                message_id="q1",
+                kind="video",
+                attachments=[
+                    Attachment(kind="video", path=str(clip), name="clip.mp4")
+                ],
+            )
+        )
+        await wait_until(lambda: wechat.media)
+    finally:
+        await router.stop()
+
+    assert wechat.sent[0][1] == "阿鱼：[视频]"
+    assert wechat.media[0][0] == "file"
+    assert wechat.media[0][1].endswith("clip.mp4")
+    assert wechat.media[0][2] == "clip.mp4"
 
 
 async def test_timeout_sends_once_and_does_not_retry(

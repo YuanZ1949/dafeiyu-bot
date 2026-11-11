@@ -128,7 +128,7 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 
 ## 跨群镜像
 
-`mirror` 配置段（默认关闭）把**至少一对、可配多对**群——每个 QQ 群对应一个微信群——的发言双向转发：人类消息渲染成 `昵称：内容`，机器人回复原样出现，媒体尽力真发、发不了给可读占位。多对时每个群只属于一对，镜像按群精确匹配；同一方向的多对共用一条队列，发送按目标群分流。本节只写镜像自身的行为；单一通道内的收发能力见上文「能力矩阵」，这里不重复。
+`mirror` 配置段（默认关闭）把**至少一对、可配多对**群——每个 QQ 群对应一个微信群——的发言双向转发：人类消息渲染成 `昵称：内容`，机器人回复原样出现，媒体尽力真发、发不了给可读占位。多对时每个群只属于一对，镜像按群精确匹配；每个**目标群**一条独立队列与 worker，一对发送卡住不拖累其它对。面板「群互通（镜像）」卡片可改配对、开关与按平台昵称（写入 `data/settings.local.yaml` 后热更新路由）；运行计数、队列积压、最近失败与能力矩阵也在同一张卡片展示。本节只写镜像自身的行为；单一通道内的收发能力见上文「能力矩阵」，这里不重复。
 
 镜像只搬运群消息：私聊与机器人自己的入站消息（`is_bot`）不参与。启用后启动时会按配置推导每个方向的能力矩阵打印到日志（`mirror capability qq->wechat …` / `mirror capability wechat->qq …`），只读配置、不做网络探测；能力不足只警告，不拒绝启动。
 
@@ -141,7 +141,7 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 | text | 总是转发 | 总是转发 |
 | image | `outbound: hook`（或 `auto` 且已配置 hook 地址）+ `images.enabled` + `workspace.enabled` 都满足时经 hook `send_media` 真发；否则 `[图片]` 占位 | `local_db_enabled` + `media.enabled` 都满足时按 QQ 图片段真发；否则 `[图片]` 占位 |
 | voice / record | 在图片条件上**另需 `speech.enabled`**（QQ 语音的 URL 下载在语音管线内，关闭时不下载）；满足时 `send_media kind=voice` 真发，否则 `[语音]` 占位 | `local_db_enabled` + `media.enabled` 满足时按 QQ 语音段真发（文件来自微信本地库，不需要 `speech.enabled`）；否则 `[语音]` 占位 |
-| video | 微信 hook 没有视频发送原语（`kind=video` 明确回 `unsupported_media`），**恒为 `[视频]` 占位**；URL 下载不受 `speech.enabled` 门控，但物化了也发不出去 | `local_db_enabled` + `media.enabled` 满足时按 QQ 视频段真发；否则 `[视频]` 占位 |
+| video | 微信 hook 没有视频发送原语（`kind=video` 明确回 `unsupported_media`）；物化成功时把 mp4 原文件按 `kind=file` 发送（对端可下载/播放），被 hook 拒收或未物化时 `[视频]` 占位 | `local_db_enabled` + `media.enabled` 满足时按 QQ 视频段真发；否则 `[视频]` 占位 |
 | file | 需要 `outbound: hook`；QQ 人类入站的文件消息本身没有文件内容（见上文矩阵「只记录元数据」），通常只有 `[文件 名字]` 说明行 | `local_db_enabled` + `media.enabled` 满足且解析出本机可读文件时走 `upload_file`；否则 `[文件 名字]` 占位 |
 | sticker | 入站 `face`/`mface` 表情没有可发送的媒体内容，**恒为 `[表情]` 占位**；机器人主动发送的带路径贴纸附件会经 `send_media kind=sticker` 发送，被 hook 拒收时降级当图片再试一次 | 贴纸图片按图片链路处理（落盘后附件 `kind` 为 `image`）；发不出去时与图片一样只留占位说明行 |
 | 合并转发 | 能拉到节点时渲染 `[聊天记录]` + 每行 `昵称: 内容`（最多 10 条、单条截断 60 字），拉不到节点才退回 `[合并转发 N 条]` | 同左（微信入站的合并转发本就只渲染 `[合并转发] <标题>`，见上文） |
@@ -177,6 +177,12 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 - 入站按 `(chat_id, message_id)` 做 10 分钟内存窗口幂等；进程重启后桥重投的帧由 `message_exists` 查库兜住，**不会重复镜像**。
 - 出站回显指纹是一次性、**10 秒** TTL，且只消费「发送者 = 本通道 bot 账号」的入站消息；人类在 10 秒内说了相同的话**不会**被吞。
 
+### 观测与告警
+
+- `GET /api/mirror` 与面板「群互通（镜像）」卡片除配置外还返回 `stats`：本进程累计的 `sent` / `degraded` / `dropped` / `expired` / `deduped` / `retries`、每个目标群的队列深度 `queues`、worker 列表，以及最近 20 条失败（时间 / 方向 / 目标 / 动作 / 错误码，**不含正文与昵称**）。
+- 同一次响应里的 `capabilities` 是按当前配置推导的方向矩阵（与启动日志 `mirror capability …` 同源，只读配置、不探测网络）；`off(...)` 的类型在镜像里只会发可读占位。
+- 健康快照（`/api/health/detail`）的 `mirror` 段给 supervisor 告警用：`enabled` / `router` / `queued` / `dropped` / `degraded` / `failures_5m` / `last_error`。镜像启用时，5 分钟内 ≥3 次转发失败、单个目标积压 ≥200 条、或「已启用但没有路由（需重启 bot）」会触发 `mirror_errors` 告警（warning），避免「一边发了、另一边没到」再次静默。
+
 ### 存储隔离
 
 镜像发出的消息在目标群按 `is_bot=1` + `mirror=1` 落库：
@@ -190,7 +196,7 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 
 - 镜像发送用的是**本机可读路径**：NapCat、微信桥、hook 服务必须与 bot 同机部署，不做跨机器文件传输。
 - 附件路径按 `workspace.dir` 解析（相对路径不许带 `..`，`resolve()` 后不得逃出 workspace）；**`workspace.dir` 必须配置**，留空时路径解析一律失败、只发占位，不会回退到启动目录。
-- 改 `mirror` 配置（或微信限速四项）后，必须**同时重启 bot 与微信桥**才生效；桥进程只在启动时读一次配置。
+- 改 `mirror.pairs` / `enabled` / `nicknames` 有三条路径：面板保存（写 `data/settings.local.yaml` 并 `MirrorRouter.set_config()` 热更新路由，**不用重启**；镜像原先未启用时首次开启仍需重启 bot）、直接改 `config.yaml`（需重启 bot），或改微信限速四项（需重启微信桥——桥只在启动时读一次配置）。
 
 ### 启用方式
 

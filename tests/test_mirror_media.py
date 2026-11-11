@@ -626,10 +626,11 @@ async def test_outbound_placeholder_human_has_nickname_and_bot_not(
     assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[图片]", "[图片]"]
 
 
-async def test_video_wechat_sends_only_placeholder(tmp_path: Path) -> None:
+async def test_video_wechat_degrades_to_file(tmp_path: Path) -> None:
+    """微信 hook 没有视频原语：物化成功的 mp4 按文件发，正文仍保留 [视频] 占位。"""
     router, _store = make_router(tmp_path)
     wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
-    place(tmp_path, "videos/v.mp4", MP4)
+    path = place(tmp_path, "videos/v.mp4", MP4)
 
     await router._deliver(
         make_item(
@@ -641,7 +642,10 @@ async def test_video_wechat_sends_only_placeholder(tmp_path: Path) -> None:
     )
 
     assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[视频]"]
-    assert wechat.media == []
+    _ct, _cid, kind, sent_path, name = wechat.media[0]
+    assert kind == "file"
+    assert sent_path == str(path.resolve())
+    assert name == "v.mp4"
     assert router.stats()["sent"] == 1
 
 

@@ -1458,6 +1458,53 @@ async def test_mirror_get_defaults_off_and_lists_choices(
     assert payload["gateway"] == {"provider": "qq", "wechat_enabled": False}
 
 
+async def test_mirror_get_includes_runtime_stats_and_capabilities(
+    tmp_path: Path, fake_wechat_groups
+) -> None:
+    """面板要能看到积压/失败与能力矩阵，而不只是配置。"""
+
+    class StatsMirrorRouter(FakeMirrorRouter):
+        def stats(self):
+            return {
+                "sent": 3,
+                "degraded": 1,
+                "dropped": 0,
+                "expired": 0,
+                "deduped": 2,
+                "retries": 1,
+                "last_error": "hook_not_ready",
+                "queued": 1,
+                "queues": {"wxg:a": 1},
+                "workers": ["wxg:a"],
+                "failures_5m": 1,
+                "recent_failures": [
+                    {
+                        "at": 1_700_000_000.0,
+                        "direction": "qq->wechat",
+                        "target": "wxg:a",
+                        "kind": "发送",
+                        "code": "hook_not_ready",
+                        "detail": "",
+                    }
+                ],
+            }
+
+    control, service, app = make_control(tmp_path)
+    service.mirror = StatsMirrorRouter(control.settings)
+    async with running(app) as client:
+        resp = await client.get("/api/mirror")
+        payload = await resp.json()
+
+    assert resp.status == 200
+    stats = payload["stats"]
+    assert stats["sent"] == 3
+    assert stats["queued"] == 1
+    assert stats["failures_5m"] == 1
+    assert stats["recent_failures"][0]["at"].endswith("+08:00")
+    assert stats["recent_failures"][0]["code"] == "hook_not_ready"
+    assert {"kind": "text", "state": "on"} in payload["capabilities"]["qq->wechat"]
+
+
 async def test_mirror_put_enable_requires_both_channels(
     tmp_path: Path, monkeypatch, fake_wechat_groups
 ) -> None:

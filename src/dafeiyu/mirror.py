@@ -11,6 +11,7 @@ import contextlib
 import logging
 import time
 import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, Sequence
@@ -51,6 +52,10 @@ FORWARD_MAX_NODES = 10
 FORWARD_NODE_CLIP = 60
 #: 重试退避秒数（总尝试次数 = 1 + 3）。
 RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+#: 最近失败环形缓冲长度：面板只展示最近这些条，够定位问题又不涨内存。
+FAILURE_RING_MAX = 20
+#: 健康快照里「最近失败」的统计窗口（秒），与告警规则保持同一口径。
+FAILURE_WINDOW_SECONDS = 300.0
 
 _COUNTER_NAMES = ("sent", "degraded", "dropped", "expired", "deduped", "retries")
 
@@ -509,6 +514,10 @@ class MirrorRouter:
         self._media_echo: dict[tuple[str, str, str, int], float] = {}
         self._counters: dict[str, int] = {name: 0 for name in _COUNTER_NAMES}
         self._last_error = ""
+        #: 最近失败（时间升序）供面板/告警定位：只存错误码与目标，不含正文。
+        self._recent_failures: deque[dict[str, Any]] = deque(
+            maxlen=FAILURE_RING_MAX
+        )
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -560,6 +569,9 @@ class MirrorRouter:
         if exc is None:
             return
         self._last_error = f"worker_exit:{type(exc).__name__}:{exc}"
+        self._record_failure(
+            "", "worker", f"worker_exit:{type(exc).__name__}", str(exc)
+        )
         log.error("镜像 worker 异常退出：%s", task.get_name(), exc_info=exc)
 
     async def stop(self) -> None:
@@ -598,10 +610,49 @@ class MirrorRouter:
         elif self._tasks or self._queues:
             await self.stop()
 
-    def stats(self) -> dict[str, int | str]:
-        result: dict[str, int | str] = dict(self._counters)
-        result["last_error"] = self._last_error
-        return result
+    def stats(self) -> dict[str, Any]:
+        """运行状态：计数、队列积压、worker 与最近失败（面板/告警共用）。"""
+        now = time.time()
+        return {
+            **self._counters,
+            "last_error": self._last_error,
+            "queued": sum(queue.qsize() for queue in self._queues.values()),
+            "queues": {
+                name: queue.qsize() for name, queue in self._queues.items()
+            },
+            "workers": sorted(self._tasks),
+            "recent_failures": [
+                dict(item) for item in reversed(self._recent_failures)
+            ],
+            "failures_5m": sum(
+                1
+                for item in self._recent_failures
+                if now - float(item["at"]) <= FAILURE_WINDOW_SECONDS
+            ),
+        }
+
+    def _record_failure(
+        self, chat_id: str, label: str, code: str, detail: str = ""
+    ) -> None:
+        """记一条最近失败：只有错误码/目标/动作，不含消息正文或昵称。"""
+        target = str(chat_id or "")
+        if target.startswith("wxg:"):
+            direction = "qq->wechat"
+        elif target.startswith("qq:"):
+            direction = "wechat->qq"
+        else:
+            direction = ""
+        self._last_error = code
+        self._recent_failures.append(
+            {
+                "at": time.time(),
+                "direction": direction,
+                "target": target,
+                "kind": label,
+                "code": code,
+                "detail": detail[:200],
+            }
+        )
 
     # ------------------------------------------------------------ 入站观察
     def observe_inbound(self, msg: Message) -> None:
@@ -926,14 +977,20 @@ class MirrorRouter:
 
         for attachment in attachments:
             kind = _media_kind(attachment.kind)
-            if kind not in ("image", "voice", "file", "sticker"):
-                # video / forward：hook 不支持，说明行里的占位就是全部。
+            if kind not in ("image", "voice", "file", "sticker", "video"):
                 continue
             resolved = media.resolve_media_path(self.settings, attachment)
             if resolved is None:
                 continue
             path = str(resolved)
             name = attachment.name or ""
+            if kind == "video":
+                # 微信 hook 没有视频原语：把原文件当「文件」发，至少能看能下载；
+                # hook 拒收/超限时不再重试，说明行里的 [视频] 占位就是全部。
+                await self._send_media(
+                    adapter, item.target_chat_id, "file", path, name
+                )
+                continue
             if kind == "sticker":
                 ok = await self._send_media(
                     adapter, item.target_chat_id, "sticker", path, name
@@ -1025,7 +1082,7 @@ class MirrorRouter:
                 raise
             except TimeoutError:
                 self._counters["degraded"] += 1
-                self._last_error = "timeout"
+                self._record_failure(chat_id, label, "timeout")
                 log.warning("镜像%s超时（结果未知，不重试）：%s", label, chat_id)
                 return False, None
             except Exception as exc:  # noqa: BLE001 - 按错误码分类
@@ -1054,7 +1111,9 @@ class MirrorRouter:
                         await asyncio.sleep(delay)
                         continue
                 self._counters["degraded"] += 1
-                self._last_error = code or str(exc)
+                self._record_failure(
+                    chat_id, label, code or "error", str(exc)
+                )
                 if code == "rate_limited":
                     log.warning(
                         "镜像发送被限速：微信桥仍在限速，修改配置后需同时重启 bot 与桥"

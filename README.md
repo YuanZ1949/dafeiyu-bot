@@ -578,7 +578,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 
 ### 跨群镜像（可选，默认关闭）
 
-可以把一个 QQ 群和一个微信群的发言双向转发：一边群里的发言与机器人回复会出现在另一边。**默认关闭**；在 `config.yaml` 的 `mirror:` 段设 `enabled: true` 并填至少一对、可配多对群 ID（`mirror.pairs`，QQ 群带 `qq:` 前缀、微信群带 `wxg:` 前缀，同一个群不能重复出现）即可启用，启动时会校验 `gateway.provider: both` 等前置条件。方向能力矩阵、占位与去重语义见 [docs/message-types.md 的「跨群镜像」](docs/message-types.md#跨群镜像)。
+可以把一个 QQ 群和一个微信群的发言双向转发：一边群里的发言与机器人回复会出现在另一边。**默认关闭**；在面板「群互通（镜像）」保存，或直接改 `config.yaml` 的 `mirror:` 段设 `enabled: true` 并填至少一对、可配多对群 ID（`mirror.pairs`，QQ 群带 `qq:` 前缀、微信群带 `wxg:` 前缀，同一个群不能重复出现）即可启用，启动时会校验 `gateway.provider: both` 等前置条件。每个目标群一条独立队列，一对卡住不影响其它对；面板还能按平台（`qq:…` / `wxg:…`）给指定用户配镜像昵称，并展示运行计数、队列积压、最近失败与按配置推导的能力矩阵。方向能力矩阵、占位与去重语义见 [docs/message-types.md 的「跨群镜像」](docs/message-types.md#跨群镜像)。
 
 ## 3.6 语音回复（可选，默认关闭）
 
@@ -757,7 +757,9 @@ Bot 控制口（8788）与 OneBot 反向 WS（8080）仍只监听本机。**
 `alerts.webhook.url`（`format`: generic / ntfy / wecom / dingtalk）和 `alerts.qq_admin`
 （通过 bot 私聊管理员；`bot_down` 不会走这条通道）。规则阈值在 `alerts.rules`：
 进程掉线分别等待 120/180/120 秒，磁盘低于 10%，回复错误 15 分钟内 3 次，额度熔断，
-以及备份失败。同一告警默认 6 小时重复一次（预算预警为 24 小时），恢复需要连续两次巡检确认；单轮超过 5 条会合并
+以及备份失败。镜像启用时，5 分钟内转发失败 ≥3 次、单个目标群积压 ≥200 条，或
+「已启用但没有转发路由（需重启 bot）」也会报一条 `mirror_errors`（阈值固定，不走配置）。
+同一告警默认 6 小时重复一次（预算预警为 24 小时），恢复需要连续两次巡检确认；单轮超过 5 条会合并
 成一条 `alert_flood`。状态存 `data/alert-state.json`，删掉它等于清空未恢复事件。
 面板「测试告警」只发送一条 `test` 消息，不写入 firing 状态。
 

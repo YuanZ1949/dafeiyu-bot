@@ -51,6 +51,7 @@ from .config import (
     MirrorConfig,
     MindConfig,
     Settings,
+    mirror_capabilities,
     normalize_wechat_account,
     parse_group_ids,
     parse_mirror_nicknames,
@@ -168,6 +169,29 @@ def _iso_ts(timestamp: Any) -> str | None:
         )
     except (TypeError, ValueError, OSError):
         return None
+
+
+def _mirror_runtime_stats(router: Any) -> dict[str, Any]:
+    """读镜像运行状态；没有 router / 读取失败都返回空字典，探活不能 500。"""
+    getter = getattr(router, "stats", None)
+    if not callable(getter):
+        return {}
+    try:
+        raw = getter()
+    except Exception as exc:  # noqa: BLE001 - 旁路统计失败只降级为空
+        log.warning("读取镜像运行状态失败：%s", exc)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    result = dict(raw)
+    failures = raw.get("recent_failures")
+    if isinstance(failures, list):
+        result["recent_failures"] = [
+            {**item, "at": _iso_ts(item.get("at"))}
+            for item in failures
+            if isinstance(item, dict)
+        ]
+    return result
 
 
 def _eval_counts(summary: Any) -> dict[str, Any] | None:
@@ -1098,6 +1122,26 @@ class BrainControl:
                 if isinstance(raw_failures, dict):
                     memory_failures = raw_failures
 
+        # 跨群镜像：只给计数与错误码，不含消息正文/昵称；供告警判断静默丢消息。
+        mirror_router = getattr(self.service, "mirror", None)
+        mirror_stats = _mirror_runtime_stats(mirror_router)
+
+        def _mirror_int(key: str) -> int:
+            try:
+                return int(mirror_stats.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        mirror_health: dict[str, Any] = {
+            "enabled": bool(self._mirror().enabled),
+            "router": mirror_router is not None,
+            "queued": _mirror_int("queued"),
+            "dropped": _mirror_int("dropped"),
+            "degraded": _mirror_int("degraded"),
+            "failures_5m": _mirror_int("failures_5m"),
+            "last_error": str(mirror_stats.get("last_error") or ""),
+        }
+
         return {
             "ok": ok,
             "generated_at": generated_at,
@@ -1138,6 +1182,7 @@ class BrainControl:
             # 旁路任务（摘要/印象/观察/反思）的失败计数：只给告警看趋势，
             # 不含正文。与 errors（回复链路的 decision 错误）分开。
             "memory_failures": memory_failures,
+            "mirror": mirror_health,
         }
 
     def budget_snapshot(self, chat_type: ChatType, chat_id: str) -> dict[str, Any]:
@@ -1998,6 +2043,8 @@ class BrainControl:
     def mirror_snapshot(self) -> dict[str, Any]:
         """面板展示用：配对、昵称映射、可选群（QQ 已知群 + 微信 group）。"""
         mirror = self._mirror()
+        router = getattr(self.service, "mirror", None)
+        stats = _mirror_runtime_stats(router)
         return {
             "enabled": mirror.enabled,
             "pairs": [{"qq": item.qq, "wechat": item.wechat} for item in mirror.pairs],
@@ -2009,6 +2056,15 @@ class BrainControl:
             "gateway": {
                 "provider": self.settings.gateway.provider,
                 "wechat_enabled": bool(self.settings.wechat.enabled),
+            },
+            # 运行状态：计数、每目标队列积压、最近失败（不含消息正文）。
+            "stats": stats or None,
+            # 与启动日志同源的配置推导结果：面板直接告诉用户哪些类型只会来占位。
+            "capabilities": {
+                direction: [
+                    {"kind": name, "state": state} for name, state in items
+                ]
+                for direction, items in mirror_capabilities(self.settings).items()
             },
         }
 
