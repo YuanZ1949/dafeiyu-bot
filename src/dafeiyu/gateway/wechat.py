@@ -834,15 +834,20 @@ class WeChatAdapter:
     ) -> tuple[bool, str | None]:
         """所有出站动作的唯一实现：连接/桌面闸门/回执/回声表只此一份。"""
         if not self.connected:
-            raise GatewayError("微信桥未连接", error_code="not_connected")
+            raise GatewayError(
+                "微信桥未连接", error_code="not_connected", not_sent=True
+            )
         if self._desktop != "interactive" and self._desktop_required():
             raise GatewayError(
                 f"微信桌面不可交互：{self._desktop}",
                 error_code="desktop_not_interactive",
+                not_sent=True,
             )
         ws = self._ws
         if ws is None:
-            raise GatewayError("微信桥未连接", error_code="not_connected")
+            raise GatewayError(
+                "微信桥未连接", error_code="not_connected", not_sent=True
+            )
 
         command_id = uuid.uuid4().hex
         future: asyncio.Future[dict[str, Any]] = (
@@ -887,7 +892,9 @@ class WeChatAdapter:
                 return False, None
             self._record_receipt("failed")
             raise GatewayError(
-                f"微信发送失败：{error_code or delivered}", error_code=error_code
+                f"微信发送失败：{error_code or delivered}",
+                error_code=error_code,
+                not_sent=bool(receipt.get("not_sent", False)),
             )
 
         if delivered == "observed":

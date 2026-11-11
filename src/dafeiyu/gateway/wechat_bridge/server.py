@@ -93,7 +93,7 @@ _CLOSE_CODE_GOING_AWAY = 1001
 #: 异步指令处理器：拿到 (action, params, command_id)，回一条回执字段表（可省缺省）。
 CommandHandler = Callable[[str, dict[str, Any], str], Awaitable[dict[str, Any] | None]]
 
-_RESULT_KEYS = ("ok", "error_code", "delivered", "message_id")
+_RESULT_KEYS = ("ok", "error_code", "delivered", "message_id", "not_sent")
 
 #: 共享执行的结局：(handler 回执字段表|None, 失败码|None)。error 非 None 表示
 #: 执行抛异常/超时——失败结局绝不缓存，后续同 key 请求重新执行。
@@ -130,6 +130,9 @@ def _receipt(
         "error_code": error_code,
         "delivered": delivered or ("observed" if ok else "failed"),
         "message_id": message_id,
+        # 可选扩展字段：传输层能否证明「没发出去」。旧桥不回该键时按 False
+        # 处理，客户端行为与加字段前完全一致（保守、不重试）。
+        "not_sent": False,
     }
 
 

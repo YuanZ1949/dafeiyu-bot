@@ -336,6 +336,58 @@ async def test_not_connected_retries_three_times_then_terminal(
     assert router.stats()["sent"] == 0
 
 
+async def test_hook_not_ready_is_retried_until_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mirror_module, "RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    remaining = {"failures": 2}
+
+    def fail() -> GatewayError | None:
+        if remaining["failures"] <= 0:
+            return None
+        remaining["failures"] -= 1
+        return GatewayError(
+            "hook not ready", error_code="hook_not_ready", not_sent=True
+        )
+
+    flaky = Recorder("wxg:self", fail=fail)
+    router, _store, _adapters = make_router(tmp_path, wechat=flaky)
+    router.start()
+    try:
+        router.observe_inbound(
+            make_msg(QQ, "未就绪", user_id="qq:2002", message_id="q1")
+        )
+        await wait_until(lambda: router.stats()["sent"] == 1)
+    finally:
+        await router.stop()
+    assert flaky.calls == 3
+    assert router.stats()["retries"] == 2
+    assert router.stats()["degraded"] == 0
+
+
+async def test_hook_unknown_without_not_sent_is_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mirror_module, "RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    failing = Recorder(
+        "wxg:self",
+        fail=lambda: GatewayError("boom", error_code="hook_unknown"),
+    )
+    router, _store, _adapters = make_router(tmp_path, wechat=failing)
+    router.start()
+    try:
+        router.observe_inbound(
+            make_msg(QQ, "结果不明", user_id="qq:2002", message_id="q1")
+        )
+        await wait_until(lambda: router.stats()["degraded"] == 1)
+    finally:
+        await router.stop()
+    assert failing.calls == 1
+    assert router.stats()["retries"] == 0
+    assert router.stats()["sent"] == 0
+    assert router.stats()["last_error"] == "hook_unknown"
+
+
 async def test_timeout_sends_once_and_does_not_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

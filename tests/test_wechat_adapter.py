@@ -270,6 +270,37 @@ async def test_failed_receipt_raises_and_records_no_liveness() -> None:
             assert len(adapter._sent_echo) == 0
 
 
+async def test_failed_receipt_carries_not_sent_flag() -> None:
+    """hook 明确回 sent:false 时，回执的 not_sent 必须传到 GatewayError。"""
+    async with FakeBridge() as bridge:
+        bridge.receipt = {
+            "ok": False,
+            "error_code": "hook_not_ready",
+            "delivered": "failed",
+            "message_id": None,
+            "not_sent": True,
+        }
+        async with running(bridge) as adapter:
+            with pytest.raises(GatewayError, match="hook_not_ready") as excinfo:
+                await adapter.send(ChatType.GROUP, GROUP_CHAT, "hook 未就绪")
+            assert excinfo.value.not_sent is True
+
+
+async def test_failed_receipt_without_not_sent_defaults_to_false() -> None:
+    """结果不明（回执不带 not_sent）绝不能标成 not_sent，否则会诱发重复发送。"""
+    async with FakeBridge() as bridge:
+        bridge.receipt = {
+            "ok": False,
+            "error_code": "hook_unknown",
+            "delivered": "failed",
+            "message_id": None,
+        }
+        async with running(bridge) as adapter:
+            with pytest.raises(GatewayError, match="hook_unknown") as excinfo:
+                await adapter.send(ChatType.GROUP, GROUP_CHAT, "结果不明")
+            assert excinfo.value.not_sent is False
+
+
 async def test_typed_receipt_returns_id_and_warns(caplog) -> None:
     async with FakeBridge() as bridge:
         bridge.receipt = {"delivered": "typed"}

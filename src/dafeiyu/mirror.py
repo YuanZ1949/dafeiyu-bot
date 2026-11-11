@@ -39,7 +39,11 @@ FINGERPRINT_TTL = 10.0
 ITEM_MAX_AGE = 300.0
 #: 单条发送超时（秒）：超时视为结果未知，不重试，避免重复。
 SEND_TIMEOUT = 30.0
-#: 只对 not_connected 重试；这是三次重试的退避秒数（总尝试次数 = 1 + 3）。
+#: 只有「可证明未发送」的暂时性失败才重试：not_connected（通道断开）以及
+#: hook_not_ready / hook_unavailable（hook 原生桥未就绪、hook_url 未配置）。
+#: hook_unknown（超时 / HTTP 错误 / 连接中途断开）结果不明，绝不重试。
+HOOK_RETRY_CODES = frozenset({"hook_not_ready", "hook_unavailable"})
+#: 重试退避秒数（总尝试次数 = 1 + 3）。
 RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 
 _COUNTER_NAMES = ("sent", "degraded", "dropped", "expired", "deduped", "retries")
@@ -857,18 +861,24 @@ class MirrorRouter:
                         "镜像目标不支持该媒体（不重试）：%s %s", chat_id, exc
                     )
                     return False, None
-                if code == "not_connected" and attempt < len(RETRY_BACKOFF_SECONDS):
-                    delay = RETRY_BACKOFF_SECONDS[attempt]
-                    attempt += 1
-                    self._counters["retries"] += 1
-                    log.info(
-                        "镜像目标未连接，%.0fs 后第 %d 次重试：%s",
-                        delay,
-                        attempt,
-                        chat_id,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
+                if code == "not_connected" or (
+                    code in HOOK_RETRY_CODES
+                    and bool(getattr(exc, "not_sent", False))
+                ):
+                    if attempt < len(RETRY_BACKOFF_SECONDS):
+                        delay = RETRY_BACKOFF_SECONDS[attempt]
+                        attempt += 1
+                        self._counters["retries"] += 1
+                        log.info(
+                            "镜像目标暂不可用（%s，可证明未发送），"
+                            "%.0fs 后第 %d 次重试：%s",
+                            code,
+                            delay,
+                            attempt,
+                            chat_id,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
                 self._counters["degraded"] += 1
                 self._last_error = code or str(exc)
                 if code == "rate_limited":

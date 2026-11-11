@@ -413,6 +413,7 @@ def test_receipt_mapping_preserves_delivery_state() -> None:
         "error_code": None,
         "delivered": "observed",
         "message_id": "7:1",
+        "not_sent": False,
     }
 
     # 已经打进输入框、只是回轮询没看到气泡：按 typed 成功回执，避免重复发送。
@@ -424,6 +425,7 @@ def test_receipt_mapping_preserves_delivery_state() -> None:
         "error_code": "not_observed",
         "delivered": "typed",
         "message_id": None,
+        "not_sent": False,
     }
 
     unresolved = bridge_main._receipt_from_result(
@@ -437,6 +439,21 @@ def test_receipt_mapping_preserves_delivery_state() -> None:
     )
     assert limited["ok"] is False
     assert limited["error_code"] == "rate_limited"
+
+
+def test_receipt_mapping_carries_not_sent_flag() -> None:
+    """hook 未就绪时回执必须带 not_sent，bot 才能安全重试；结果不明必须留 False。"""
+    unready = bridge_main._receipt_from_result(
+        SendResult(False, "hook_not_ready", "failed", not_sent=True)
+    )
+    assert unready["ok"] is False
+    assert unready["error_code"] == "hook_not_ready"
+    assert unready["not_sent"] is True
+
+    unknown = bridge_main._receipt_from_result(
+        SendResult(False, "hook_unknown", "failed")
+    )
+    assert unknown["not_sent"] is False
 
 
 # --------------------------------------------------------------- (3) 服务器超时

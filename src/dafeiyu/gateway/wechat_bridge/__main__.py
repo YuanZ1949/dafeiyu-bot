@@ -375,7 +375,7 @@ def _resolve_chat_name(poller: Any, chat_id: str) -> str:
 
 
 def _receipt_from_result(result: Any) -> dict[str, Any]:
-    """`SendResult` -> 协议回执（§4 的四个字段）。"""
+    """`SendResult` -> 协议回执（§4 的四个必选字段 + 可选 `not_sent`）。"""
     ok = bool(getattr(result, "ok", False))
     code = getattr(result, "error_code", None)
     delivered = str(getattr(result, "delivered", "failed") or "failed")
@@ -386,6 +386,7 @@ def _receipt_from_result(result: Any) -> dict[str, Any]:
             "error_code": None,
             "delivered": delivered,
             "message_id": message_id,
+            "not_sent": False,
         }
     # 已打进输入框但回轮询没看到气泡：send_text 已经成功，按 typed 回执，
     # 映射成失败会诱发客户端换 id 重发（协议 §7.6）。
@@ -395,6 +396,7 @@ def _receipt_from_result(result: Any) -> dict[str, Any]:
             "error_code": "not_observed",
             "delivered": "typed",
             "message_id": None,
+            "not_sent": False,
         }
     if code in ("not_friend", "chat_not_found"):
         code = "chat_name_unresolved"
@@ -403,6 +405,8 @@ def _receipt_from_result(result: Any) -> dict[str, Any]:
         "error_code": code or "send_failed",
         "delivered": "failed",
         "message_id": None,
+        # 只有传输层能证明「没发出去」时才为 True；结果不明一律 False。
+        "not_sent": bool(getattr(result, "not_sent", False)),
     }
 
 
