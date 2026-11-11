@@ -48,13 +48,21 @@ from .config import (
     OVERRIDES_PATH,
     ConfigError,
     GroupsConfig,
+    MirrorConfig,
     MindConfig,
     Settings,
     normalize_wechat_account,
     parse_group_ids,
+    parse_mirror_nicknames,
+    parse_mirror_pairs,
     parse_wechat_peer_ids,
 )
 from .gateway.base import GatewayError
+from .gateway.wechat_bridge.identity import (
+    IdentityError,
+    PeerRegistry,
+    default_peers_path,
+)
 from .hotconfig import WeChatRuntime, WeChatRuntimeView
 from .ids import normalize_chat_id
 from .memory.store import MAX_MEMORY_PAGE, MAX_TIMELINE_PAGE, PendingSummary, Store
@@ -665,6 +673,26 @@ def _impression_json(impression: Any) -> dict[str, Any]:
         "source_excerpt": impression.source_excerpt,
         "updated_at": impression.updated_at,
     }
+
+
+def _wechat_group_choices() -> list[dict[str, str]]:
+    """面板下拉用：微信桥登记过的存活群（alias ↔ 显示名）。
+
+    peers.json 是微信侧别名的唯一真源；读失败只让下拉为空，不影响保存。
+    """
+    try:
+        registry = PeerRegistry(default_peers_path())
+        peers = registry.all_peers()
+    except (IdentityError, OSError):
+        log.warning("读取微信群列表失败（面板下拉为空）", exc_info=True)
+        return []
+    groups = [
+        {"alias": peer.alias, "display_name": peer.display_name}
+        for peer in peers
+        if peer.kind == "group" and peer.live
+    ]
+    groups.sort(key=lambda item: item["display_name"])
+    return groups
 
 
 class BrainControl:
@@ -1958,6 +1986,91 @@ class BrainControl:
             self.settings = replace(self.settings, groups=groups)
         return self.groups_snapshot()
 
+    def _mirror(self) -> MirrorConfig:
+        """当前生效的镜像配置：优先路由持有的设置，兜底启动配置。"""
+        router = getattr(self.service, "mirror", None)
+        router_settings = getattr(router, "settings", None)
+        mirror = getattr(router_settings, "mirror", None)
+        if isinstance(mirror, MirrorConfig):
+            return mirror
+        return self.settings.mirror
+
+    def mirror_snapshot(self) -> dict[str, Any]:
+        """面板展示用：配对、昵称映射、可选群（QQ 已知群 + 微信 group）。"""
+        mirror = self._mirror()
+        return {
+            "enabled": mirror.enabled,
+            "pairs": [{"qq": item.qq, "wechat": item.wechat} for item in mirror.pairs],
+            "nicknames": [
+                {"user_id": key, "name": name} for key, name in mirror.nicknames
+            ],
+            "known": self.groups_snapshot()["known"],
+            "wechat_groups": _wechat_group_choices(),
+            "gateway": {
+                "provider": self.settings.gateway.provider,
+                "wechat_enabled": bool(self.settings.wechat.enabled),
+            },
+        }
+
+    async def save_mirror(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """校验 → 落覆盖层 → 热更新路由/昵称；任一步失败都不改线上。"""
+        if not isinstance(payload, dict):
+            raise ConfigError("请求体必须是对象")
+        if "pairs" not in payload:
+            raise ConfigError("缺少 mirror.pairs")
+        enabled = payload.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigError("mirror.enabled 必须是布尔值")
+        raw_pairs = payload["pairs"]
+        # 关闭镜像时允许空配对（面板「全部删除」），启用时至少一对。
+        pairs = (
+            ()
+            if raw_pairs == [] and not enabled
+            else parse_mirror_pairs(raw_pairs)
+        )
+        nicknames = parse_mirror_nicknames(payload.get("nicknames"))
+        if enabled:
+            if not self.settings.wechat.enabled:
+                raise ConfigError("启用镜像要求 gateway.wechat.enabled=true")
+            if self.settings.gateway.provider != "both":
+                raise ConfigError("启用镜像要求 gateway.provider=both")
+        mirror = MirrorConfig(
+            enabled=enabled,
+            pairs=pairs,
+            nicknames=nicknames,
+        )
+        try:
+            existing = read_overrides(OVERRIDES_PATH)
+        except OverrideError as exc:
+            raise OverrideError(str(exc)) from exc
+        section = existing.get("mirror")
+        section = dict(section) if isinstance(section, dict) else {}
+        section.update(
+            {
+                "enabled": enabled,
+                "pairs": [
+                    {"qq": item.qq, "wechat": item.wechat} for item in pairs
+                ],
+                "nicknames": dict(nicknames),
+            }
+        )
+        existing["mirror"] = section
+        write_overrides(existing, OVERRIDES_PATH)
+
+        self.settings = replace(self.settings, mirror=mirror)
+        router = getattr(self.service, "mirror", None)
+        setter = getattr(router, "set_config", None)
+        if callable(setter):
+            maybe_awaitable = setter(self.settings)
+            if inspect.isawaitable(maybe_awaitable):
+                await maybe_awaitable
+        snapshot = self.mirror_snapshot()
+        # 启动时镜像关闭 → 没有 router，热更新无从谈起，只能提示重启。
+        snapshot["restart_required"] = router is None and enabled
+        if snapshot["restart_required"]:
+            snapshot["message"] = "配置已保存；镜像原先未启用，重启 bot 后生效"
+        return snapshot
+
     def private_chats_snapshot(self) -> dict[str, Any]:
         """微信好友私聊只读列表；标题失败只回落 chat_id，不影响其它会话。"""
 
@@ -3113,6 +3226,41 @@ def create_app(
                 {"error": f"保存群白名单失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def get_mirror(_: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.mirror_snapshot())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取镜像配对失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取镜像配对失败：{exc.__class__.__name__}"},
+                status=500,
+            )
+
+    async def put_mirror(request: web.Request) -> web.Response:
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        try:
+            return web.json_response(await control.save_mirror(payload))
+        except ConfigError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except OverrideError as exc:
+            return web.json_response(
+                {"error": f"覆盖层读写失败：{exc}"}, status=500
+            )
+        except OSError as exc:
+            return web.json_response(
+                {"error": f"覆盖层写入失败：{exc.__class__.__name__}"}, status=500
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("保存镜像配对失败：%s", exc)
+            return web.json_response(
+                {"error": f"保存镜像配对失败：{exc.__class__.__name__}"},
+                status=500,
+            )
+
     async def get_private_chats(_: web.Request) -> web.Response:
         try:
             return web.json_response(control.private_chats_snapshot())
@@ -3307,6 +3455,8 @@ def create_app(
     app.router.add_put("/api/behavior", put_behavior)
     app.router.add_get("/api/groups", get_groups)
     app.router.add_put("/api/groups", put_groups)
+    app.router.add_get("/api/mirror", get_mirror)
+    app.router.add_put("/api/mirror", put_mirror)
     app.router.add_get("/api/private/chats", get_private_chats)
     app.router.add_get("/api/private/settings", get_private_settings)
     app.router.add_put("/api/private/settings", put_private_settings)

@@ -194,6 +194,43 @@ def test_render_file_keeps_name_and_forward_count(tmp_path: Path) -> None:
     assert render(router, forward_msg) == ["阿鱼：[合并转发 2 条]"]
 
 
+# ---------------------------------------------------------------- 昵称映射
+def _router_with_nicknames(
+    tmp_path: Path, nicknames: tuple[tuple[str, str], ...]
+) -> MirrorRouter:
+    settings = dataclasses.replace(
+        make_settings(),
+        mirror=MirrorConfig(
+            enabled=True,
+            pairs=(MirrorPairConfig(qq=QQ, wechat=WXG),),
+            nicknames=nicknames,
+        ),
+    )
+    store = Store(tmp_path / "mirror.db")
+    store.init_schema()
+    return MirrorRouter(
+        settings,
+        store,
+        {"qq": Recorder("qq:999"), "wechat": Recorder("wxg:self")},
+    )
+
+
+def test_nickname_override_replaces_display_name(tmp_path: Path) -> None:
+    router = _router_with_nicknames(tmp_path, (("qq:2002", "老鱼"),))
+    assert render(router, make_msg(QQ, "你好")) == ["老鱼：你好"]
+
+
+def test_nickname_override_is_scoped_by_platform(tmp_path: Path) -> None:
+    """同一个裸 id 在两个平台是两个人：只配了微信侧就不能改 QQ 的显示名。"""
+    router = _router_with_nicknames(tmp_path, (("wxg:2002", "微信老鱼"),))
+    assert render(router, make_msg(QQ, "你好")) == ["阿鱼：你好"]
+
+
+def test_nickname_override_ignored_for_unknown_user(tmp_path: Path) -> None:
+    router = _router_with_nicknames(tmp_path, (("qq:9999", "别人"),))
+    assert render(router, make_msg(QQ, "你好")) == ["阿鱼：你好"]
+
+
 def test_render_long_text_uses_sender_split(tmp_path: Path) -> None:
     router, _store, _adapters = make_router(tmp_path)
     chunks = render(router, make_msg(QQ, "字" * 1200))
@@ -256,6 +293,63 @@ async def test_multiple_pairs_route_to_their_own_target(tmp_path: Path) -> None:
         assert router._direction("qq:999999") is None
     finally:
         await router.stop()
+
+
+# ------------------------------------------------------------ 热更新
+async def test_set_config_swaps_routes_and_nicknames(tmp_path: Path) -> None:
+    """面板保存后不重启：旧群不再转发，新群按新目标与新昵称发送。"""
+    router, _store, adapters = make_router(tmp_path)
+    router.start()
+    try:
+        assert router._direction(QQ) == ("qq", WXG)
+        settings = dataclasses.replace(
+            make_settings(),
+            mirror=MirrorConfig(
+                enabled=True,
+                pairs=(MirrorPairConfig(qq="qq:2001", wechat="wxg:other"),),
+                nicknames=(("qq:3003", "新昵称"),),
+            ),
+        )
+        await router.set_config(settings)
+
+        assert router._direction(QQ) is None
+        assert router._direction("qq:2001") == ("qq", "wxg:other")
+        router.observe_inbound(
+            make_msg("qq:2001", "换群", user_id="qq:3003", message_id="m1")
+        )
+        await wait_until(lambda: adapters["wechat"].sent)
+        assert adapters["wechat"].sent == [("wxg:other", "新昵称：换群")]
+        # 队列按通道常驻，换对不重建 worker，在途条目照常发完。
+        assert len(router._tasks) == 2
+    finally:
+        await router.stop()
+
+
+async def test_set_config_starts_and_stops_workers(tmp_path: Path) -> None:
+    store = Store(tmp_path / "mirror.db")
+    store.init_schema()
+    adapters = {"qq": Recorder("qq:999"), "wechat": Recorder("wxg:self")}
+    router = MirrorRouter(
+        dataclasses.replace(make_settings(), mirror=MirrorConfig()),
+        store,
+        adapters,
+    )
+    assert router._tasks == []
+    assert router._direction(QQ) is None
+
+    enabled = dataclasses.replace(
+        make_settings(),
+        mirror=MirrorConfig(
+            enabled=True, pairs=(MirrorPairConfig(qq=QQ, wechat=WXG),)
+        ),
+    )
+    await router.set_config(enabled)
+    assert len(router._tasks) == 2
+    assert router._direction(QQ) == ("qq", WXG)
+
+    await router.set_config(dataclasses.replace(make_settings(), mirror=MirrorConfig()))
+    assert router._tasks == []
+    assert router._direction(QQ) is None
 
 
 # ---------------------------------------------------------------- 落库

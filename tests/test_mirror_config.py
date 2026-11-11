@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from dafeiyu.config import ConfigError, MirrorConfig, load_settings
+import dafeiyu.config as config_module
+from dafeiyu.config import (
+    ConfigError,
+    MirrorConfig,
+    MirrorPairConfig,
+    load_settings,
+    parse_mirror_nicknames,
+)
 
 BASE_YAML = """\
 persona:
@@ -233,4 +240,130 @@ def test_invalid_still_quiet_hours(tmp_path: Path) -> None:
         _load(
             tmp_path,
             _gateway_yaml(VALID_MIRROR, quiet='["23:30", "08:00"]'),
+        )
+
+
+# ------------------------------------------------------------ 昵称映射
+def test_nicknames_parsed_and_normalized(tmp_path: Path) -> None:
+    settings = _load(
+        tmp_path,
+        _gateway_yaml(
+            VALID_MIRROR
+            + "  nicknames:\n"
+            '    "QQ:2002": " 老鱼 "\n'
+            '    "wxg:AbC": 小鱼\n'
+        ),
+    )
+    assert settings.mirror.nicknames == (("qq:2002", "老鱼"), ("wxg:abc", "小鱼"))
+
+
+def test_nicknames_absent_is_empty(tmp_path: Path) -> None:
+    settings = _load(tmp_path, _gateway_yaml(VALID_MIRROR))
+    assert settings.mirror.nicknames == ()
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        (["qq:2002"], "必须是映射"),
+        ({"2002": "老鱼"}, "qq: 或 wxg:"),
+        ({"qq:": "老鱼"}, "缺少冒号"),
+        ({"qq:2002": ""}, "不能为空"),
+        ({"qq:2002": "   "}, "不能为空"),
+        ({"qq:2002": "鱼" * 33}, "32"),
+        ({"qq:2002": 5}, "必须是字符串"),
+    ],
+)
+def test_invalid_nicknames(raw: object, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        parse_mirror_nicknames(raw)
+
+
+def test_duplicate_nickname_key_after_normalization() -> None:
+    with pytest.raises(ConfigError, match="用户重复"):
+        parse_mirror_nicknames({"QQ:2002": "老鱼", "qq:2002": "小鱼"})
+
+
+# ------------------------------------------------------------ 关闭态保留
+def test_disabled_mirror_keeps_valid_pairs_for_panel(tmp_path: Path) -> None:
+    """关闭只是不转发；面板再打开时不该让用户从头重填。"""
+    settings = _load(
+        tmp_path,
+        _gateway_yaml(
+            "mirror:\n  enabled: false\n  pairs:\n"
+            '    - qq: "qq:123456"\n      wechat: "wxg:abc123"\n'
+            "  nicknames:\n"
+            '    "qq:2002": 老鱼\n'
+        ),
+    )
+    assert settings.mirror.enabled is False
+    assert settings.mirror.pairs == (
+        MirrorPairConfig(qq="qq:123456", wechat="wxg:abc123"),
+    )
+    assert settings.mirror.nicknames == (("qq:2002", "老鱼"),)
+
+
+# ------------------------------------------------------------ 覆盖层
+def test_override_layer_replaces_pairs_and_nicknames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    overrides = tmp_path / "settings.local.yaml"
+    overrides.write_text(
+        "mirror:\n"
+        "  enabled: true\n"
+        "  pairs:\n"
+        '    - qq: "qq:777"\n'
+        '      wechat: "wxg:override"\n'
+        "  nicknames:\n"
+        '    "qq:777": 老鱼\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "OVERRIDES_PATH", overrides)
+
+    settings = _load(tmp_path, _gateway_yaml(VALID_MIRROR))
+
+    assert settings.mirror.pairs == (
+        MirrorPairConfig(qq="qq:777", wechat="wxg:override"),
+    )
+    assert settings.mirror.nicknames == (("qq:777", "老鱼"),)
+
+
+def test_override_layer_can_enable_mirror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """面板开启镜像只需写覆盖层：config.yaml 保持关闭，启动后照样生效。"""
+    overrides = tmp_path / "settings.local.yaml"
+    overrides.write_text(
+        "mirror:\n"
+        "  enabled: true\n"
+        "  pairs:\n"
+        '    - qq: "qq:777"\n'
+        '      wechat: "wxg:override"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "OVERRIDES_PATH", overrides)
+
+    settings = _load(tmp_path, _gateway_yaml("mirror:\n  enabled: false\n"))
+
+    assert settings.mirror.enabled is True
+    assert settings.mirror.pairs == (
+        MirrorPairConfig(qq="qq:777", wechat="wxg:override"),
+    )
+
+
+def test_override_layer_enable_still_requires_wechat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    overrides = tmp_path / "settings.local.yaml"
+    overrides.write_text(
+        "mirror:\n  enabled: true\n  pairs:\n"
+        '    - qq: "qq:777"\n      wechat: "wxg:override"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "OVERRIDES_PATH", overrides)
+
+    with pytest.raises(ConfigError, match="gateway.wechat.enabled"):
+        _load(
+            tmp_path,
+            _gateway_yaml("mirror:\n  enabled: false\n", wechat_enabled=False),
         )

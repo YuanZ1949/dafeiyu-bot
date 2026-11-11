@@ -575,10 +575,15 @@ class MirrorPairConfig:
 
 @dataclass(frozen=True)
 class MirrorConfig:
-    """跨群镜像开关。默认关闭；启用时必须恰好一对群且微信通道已去节流。"""
+    """跨群镜像开关；启用时至少一对群，且微信通道已去节流。
+
+    ``nicknames`` 是「镜像渲染时替换显示名」的映射：键为带平台前缀的
+    user id（``qq:123`` / ``wxg:abc``），值为昵称。空则用消息自带昵称。
+    """
 
     enabled: bool = False
     pairs: tuple[MirrorPairConfig, ...] = ()
+    nicknames: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1041,29 +1046,8 @@ def _build_social(raw: dict[str, Any]) -> SocialConfig:
     )
 
 
-def _build_mirror(
-    raw_mirror: object,
-    raw_gateway_provider: str,
-    raw_wechat_enabled: bool,
-    wechat: WeChatConfig,
-) -> MirrorConfig:
-    """解析 `mirror` 段；关闭时不校验 pairs，启用时做启动期硬校验。
-
-    `pairs` 至少一对、可配多对；同一个群（归一化后）不能出现在两对里。
-    校验必须拿到降级前的 `gateway.provider` 与 `gateway.wechat.enabled`：
-    启用镜像却只有 QQ 通道时，晚到的 downgrade 会把 provider 改成 qq，
-    这里就无法报出「需要 both」。
-    """
-    if raw_mirror is None:
-        return MirrorConfig()
-    if not isinstance(raw_mirror, dict):
-        raise ConfigError("config.yaml 的 mirror 必须是映射")
-
-    enabled = _bool(raw_mirror.get("enabled", False), "mirror.enabled")
-    if not enabled:
-        return MirrorConfig()
-
-    raw_pairs = raw_mirror.get("pairs")
+def parse_mirror_pairs(raw_pairs: object) -> tuple[MirrorPairConfig, ...]:
+    """校验并归一化 `mirror.pairs`（面板与 config.yaml 共用同一套规则）。"""
     if not isinstance(raw_pairs, list):
         raise ConfigError("mirror.pairs 必须是列表")
     if not raw_pairs:
@@ -1107,6 +1091,85 @@ def _build_mirror(
                 raise ConfigError(f"mirror.pairs 中群重复：{chat_id}")
             seen.add(chat_id)
         pairs.append(pair)
+    return tuple(pairs)
+
+
+def parse_mirror_nicknames(raw: object) -> tuple[tuple[str, str], ...]:
+    """校验并归一化 `mirror.nicknames`：键必须带 `qq:` / `wxg:` 平台前缀。
+
+    键用完整 user id 而不是「平台 + 裸 id」两段式，是因为消息里的
+    `user_id` 本来就带前缀，渲染时一次查表即可，平台也不会配错。
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        raise ConfigError("mirror.nicknames 必须是映射（user_id: 昵称）")
+
+    result: dict[str, str] = {}
+    for raw_key, raw_name in raw.items():
+        if not isinstance(raw_key, str):
+            raise ConfigError("mirror.nicknames 的键必须是 qq: / wxg: 前缀的字符串")
+        key = raw_key.strip()
+        lowered = key.casefold()
+        if lowered.startswith("qq:"):
+            bare = key[3:].strip()
+            if not bare:
+                raise ConfigError(f"mirror.nicknames 的键缺少冒号后的用户 id：{key}")
+            normalized = f"qq:{bare.casefold()}"
+        elif lowered.startswith("wxg:"):
+            bare = key[4:].strip()
+            if not bare:
+                raise ConfigError(f"mirror.nicknames 的键缺少冒号后的用户 id：{key}")
+            normalized = f"wxg:{bare.casefold()}"
+        else:
+            raise ConfigError(
+                f"mirror.nicknames 的键必须以 qq: 或 wxg: 开头：{key}"
+            )
+        if not isinstance(raw_name, str):
+            raise ConfigError(f"mirror.nicknames[{normalized}] 必须是字符串")
+        name = raw_name.strip()
+        if not name:
+            raise ConfigError(f"mirror.nicknames[{normalized}] 不能为空")
+        if len(name) > 32:
+            raise ConfigError(f"mirror.nicknames[{normalized}] 最长 32 个字符")
+        if normalized in result:
+            raise ConfigError(f"mirror.nicknames 中用户重复：{normalized}")
+        result[normalized] = name
+    return tuple(sorted(result.items()))
+
+
+def _build_mirror(
+    raw_mirror: object,
+    raw_gateway_provider: str,
+    raw_wechat_enabled: bool,
+    wechat: WeChatConfig,
+) -> MirrorConfig:
+    """解析 `mirror` 段；关闭时不校验 pairs，启用时做启动期硬校验。
+
+    `pairs` 至少一对、可配多对；同一个群（归一化后）不能出现在两对里。
+    校验必须拿到降级前的 `gateway.provider` 与 `gateway.wechat.enabled`：
+    启用镜像却只有 QQ 通道时，晚到的 downgrade 会把 provider 改成 qq，
+    这里就无法报出「需要 both」。
+    """
+    if raw_mirror is None:
+        return MirrorConfig()
+    if not isinstance(raw_mirror, dict):
+        raise ConfigError("config.yaml 的 mirror 必须是映射")
+
+    enabled = _bool(raw_mirror.get("enabled", False), "mirror.enabled")
+    if not enabled:
+        # 关闭时不校验（写坏了也不能拦住启动），但能解析出来的配对/昵称照旧保留：
+        # 面板重新打开卡片时不用从头再填，运行期仍按 enabled 忽略（MirrorRouter
+        # 只在启用时建路由）。解析失败就当没配，绝不因此拒绝启动。
+        try:
+            pairs = parse_mirror_pairs(raw_mirror.get("pairs"))
+            nicknames = parse_mirror_nicknames(raw_mirror.get("nicknames"))
+        except ConfigError:
+            return MirrorConfig()
+        return MirrorConfig(enabled=False, pairs=pairs, nicknames=nicknames)
+
+    pairs = parse_mirror_pairs(raw_mirror.get("pairs"))
+    nicknames = parse_mirror_nicknames(raw_mirror.get("nicknames"))
 
     # 先报微信通道本身缺失，再报 provider：两者的修复动作不同，先报更直接的那个。
     if not raw_wechat_enabled:
@@ -1130,7 +1193,7 @@ def _build_mirror(
             "mirror.enabled=true 要求微信通道已去节流（gateway.wechat）：" + detail
         )
 
-    return MirrorConfig(enabled=True, pairs=tuple(pairs))
+    return MirrorConfig(enabled=True, pairs=pairs, nicknames=nicknames)
 
 
 def _mirror_capability(on: bool, reasons: list[str]) -> str:
@@ -1792,6 +1855,23 @@ def _apply_groups_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> N
     _overlay_target(raw, "groups")["whitelist"] = section["whitelist"]
 
 
+def _apply_mirror_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """面板保存的镜像配对/昵称：只覆盖 enabled/pairs/nicknames。
+
+    覆盖层由面板生成，键集合收敛在这三个；其余键仍以 config.yaml 为准，
+    免得面板把未来新增的字段悄悄抹掉。
+    """
+    section = overrides.get("mirror")
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        raise ConfigError("覆盖层的 mirror 必须是映射")
+    target = _overlay_target(raw, "mirror")
+    for name in ("enabled", "pairs", "nicknames"):
+        if name in section:
+            target[name] = section[name]
+
+
 def _apply_mind_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> None:
     """面板保存的观察者开关：只认两个白名单键，其余静默忽略。
 
@@ -1847,6 +1927,7 @@ def _apply_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> bool:
     _apply_groups_overrides(raw, overrides)
     _apply_mind_overrides(raw, overrides)
     _apply_wechat_overrides(raw, overrides)
+    _apply_mirror_overrides(raw, overrides)
     brain_override = overrides.get("brain")
     if brain_override is None:
         return False

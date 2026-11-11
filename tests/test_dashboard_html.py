@@ -354,6 +354,22 @@ def test_html_has_read_only_evals_card() -> None:
     assert "100" in body
 
 
+def test_html_has_mirror_config_card() -> None:
+    """群互通卡片：配对 + 昵称两组输入、下拉数据源与读写接口都要接上。"""
+    html = read_html()
+    assert 'id="mirror-pairs"' in html
+    assert 'id="mirror-nicknames"' in html
+    assert 'id="btn-add-mirror-pair"' in html
+    assert 'id="btn-add-mirror-nickname"' in html
+    assert 'id="mirror-qq-options"' in html
+    assert 'id="mirror-wechat-options"' in html
+    assert "/api/mirror" in html
+    assert "loadMirror();" in html
+    assert "saveMirror" in html
+    # 昵称键必须带平台前缀：面板提示与后端校验口径一致。
+    assert "qq:123456 / wxg:abc123" in html
+
+
 def test_login_html_is_mobile_friendly() -> None:
     login = HTML_PATH.with_name("login.html").read_text(encoding="utf-8")
     assert "viewport-fit=cover" in login

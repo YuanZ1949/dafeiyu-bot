@@ -169,6 +169,10 @@ mirror:
   pairs:
     - qq: "qq:123456789"
       wechat: "wxg:0d5c1f2a3b4c"
+  # 可选：按平台给特定用户配镜像显示昵称（键必须带 qq: / wxg: 前缀）。
+  # 也可以在面板「群互通（镜像）」卡片里改，面板的改动落在 data/settings.local.yaml。
+  # nicknames:
+  #   "qq:123456789": 老鱼
 
 opencode:
   # 留空自动找 npm 全局安装的 opencode.exe

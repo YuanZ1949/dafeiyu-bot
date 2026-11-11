@@ -1096,6 +1096,32 @@
 
   <section class="card">
     <div class="row card-head">
+      <h2>群互通（镜像）</h2>
+      <span class="kv" id="mirror-hint">加载中…</span>
+      <span class="spacer"></span>
+      <button class="btn" id="btn-refresh-mirror">刷新</button>
+      <button class="btn primary" id="btn-save-mirror">保存</button>
+    </div>
+    <div class="debug-form">
+      <label class="debug-wide"><input type="checkbox" id="mirror-enabled" /> 启用双向镜像（QQ 群 ⇄ 微信群）</label>
+    </div>
+    <div class="kv" style="margin-top:8px">配对（左 QQ 群，右 微信群，都要带前缀；同一个群只能出现在一对里）</div>
+    <div id="mirror-pairs"></div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn" id="btn-add-mirror-pair" type="button">+ 新增一对</button>
+    </div>
+    <div class="kv" style="margin-top:12px">昵称（按平台指定：转发时用这里的昵称代替原昵称；键形如 qq:123456 / wxg:abc123）</div>
+    <div id="mirror-nicknames"></div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn" id="btn-add-mirror-nickname" type="button">+ 新增昵称</button>
+    </div>
+    <datalist id="mirror-qq-options"></datalist>
+    <datalist id="mirror-wechat-options"></datalist>
+    <div class="kv" style="margin-top:8px">改动写入 data/settings.local.yaml 并热更新路由，不用重启；镜像原先未启用时，首次开启需重启 bot 才会建立转发。机器人自己的回复不回灌到对端。</div>
+  </section>
+
+  <section class="card">
+    <div class="row card-head">
       <h2>微信私聊</h2>
       <span class="kv" id="private-chats-hint">加载中…</span>
       <span class="spacer"></span>
@@ -3507,6 +3533,121 @@ async function saveGroups() {
   }
 }
 
+function appendMirrorPairRow(pair = {}) {
+  const row = document.createElement("div");
+  row.className = "row";
+  row.style.marginTop = "6px";
+  row.innerHTML = `
+    <input data-mirror-qq list="mirror-qq-options" placeholder="qq:123456" value="${escapeHtml(pair.qq || "")}" style="flex:1 1 180px" />
+    <span class="kv">⇄</span>
+    <input data-mirror-wechat list="mirror-wechat-options" placeholder="wxg:abc123" value="${escapeHtml(pair.wechat || "")}" style="flex:1 1 180px" />
+    <button class="btn danger" type="button" data-mirror-remove="pair">删除</button>`;
+  row.querySelector("button").addEventListener("click", () => row.remove());
+  $("mirror-pairs").append(row);
+}
+
+function appendMirrorNicknameRow(item = {}) {
+  const row = document.createElement("div");
+  row.className = "row";
+  row.style.marginTop = "6px";
+  row.innerHTML = `
+    <input data-mirror-user placeholder="qq:123456 / wxg:abc123" value="${escapeHtml(item.user_id || "")}" style="flex:1 1 180px" />
+    <input data-mirror-name placeholder="昵称" value="${escapeHtml(item.name || "")}" style="flex:0 1 160px" />
+    <button class="btn danger" type="button" data-mirror-remove="nickname">删除</button>`;
+  row.querySelector("button").addEventListener("click", () => row.remove());
+  $("mirror-nicknames").append(row);
+}
+
+function renderMirror(data) {
+  $("mirror-enabled").checked = Boolean(data.enabled);
+  const pairs = data.pairs || [];
+  $("mirror-pairs").innerHTML = "";
+  (pairs.length ? pairs : [{}]).forEach((pair) => appendMirrorPairRow(pair));
+  const nicknames = data.nicknames || [];
+  $("mirror-nicknames").innerHTML = "";
+  (nicknames.length ? nicknames : [{}]).forEach((item) => appendMirrorNicknameRow(item));
+  // QQ 侧下拉只放已知的 QQ 群；微信侧以 peers.json 的 alias 为唯一真源。
+  const qqOptions = (data.known || []).filter((item) =>
+    String(item.chat_id || "").startsWith("qq:"));
+  $("mirror-qq-options").innerHTML = qqOptions
+    .map((item) => `<option value="${escapeHtml(item.chat_id)}">${escapeHtml(item.title || "")}</option>`)
+    .join("");
+  $("mirror-wechat-options").innerHTML = (data.wechat_groups || [])
+    .map((item) => `<option value="${escapeHtml(`wxg:${item.alias}`)}">${escapeHtml(item.display_name || "")}</option>`)
+    .join("");
+}
+
+function collectMirrorPairs() {
+  const pairs = [];
+  for (const input of $("mirror-pairs").querySelectorAll("[data-mirror-qq]")) {
+    const row = input.closest(".row");
+    const qq = input.value.trim();
+    const wechat = row.querySelector("[data-mirror-wechat]").value.trim();
+    if (!qq && !wechat) continue;
+    pairs.push({ qq, wechat });
+  }
+  return pairs;
+}
+
+function collectMirrorNicknames() {
+  const nicknames = {};
+  for (const input of $("mirror-nicknames").querySelectorAll("[data-mirror-user]")) {
+    const row = input.closest(".row");
+    const key = input.value.trim();
+    const name = row.querySelector("[data-mirror-name]").value.trim();
+    if (!key && !name) continue;
+    if (!key || !name) throw new Error("昵称映射的 user id 与昵称都要填");
+    nicknames[key] = name;
+  }
+  return nicknames;
+}
+
+function mirrorHint(data) {
+  if (data.restart_required) return data.message || "配置已保存，重启 bot 后生效";
+  if (!data.enabled) return "未启用";
+  const pairs = (data.pairs || []).length;
+  const nicknames = (data.nicknames || []).length;
+  return `已启用 · ${pairs} 对 · 昵称 ${nicknames} 个`;
+}
+
+async function loadMirror() {
+  try {
+    const data = await api("/api/mirror");
+    renderMirror(data);
+    $("mirror-hint").textContent = mirrorHint(data);
+  } catch (err) {
+    $("mirror-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
+async function saveMirror() {
+  let nicknames;
+  try {
+    nicknames = collectMirrorNicknames();
+  } catch (err) {
+    $("mirror-hint").textContent = err.message;
+    toast(err.message, true);
+    return;
+  }
+  const payload = {
+    enabled: $("mirror-enabled").checked,
+    pairs: collectMirrorPairs(),
+    nicknames,
+  };
+  try {
+    const data = await api("/api/mirror", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    renderMirror(data);
+    $("mirror-hint").textContent = mirrorHint(data);
+    toast(data.restart_required ? "配置已保存，重启 bot 后生效" : "群互通配置已更新");
+  } catch (err) {
+    $("mirror-hint").textContent = `保存失败：${err.message}`;
+    toast(`保存失败：${err.message}`, true);
+  }
+}
+
 
 // 只读列表接口 /api/private/chats 仍保留；本卡改用 /api/private/settings 一次取回开关与好友列表。
 async function loadPrivateChats() {
@@ -4309,6 +4450,10 @@ $("private-chats-body").addEventListener("click", (ev) => {
   editPrivatePeer(button.dataset.chatId, button.dataset.privateAction);
 });
 $("btn-save-groups").addEventListener("click", (ev) => withBusy(ev.currentTarget, saveGroups));
+$("btn-refresh-mirror").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadMirror));
+$("btn-save-mirror").addEventListener("click", (ev) => withBusy(ev.currentTarget, saveMirror));
+$("btn-add-mirror-pair").addEventListener("click", () => appendMirrorPairRow({}));
+$("btn-add-mirror-nickname").addEventListener("click", () => appendMirrorNicknameRow({}));
 $("btn-refresh-mind").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadMind));
 $("btn-save-mind").addEventListener("click", (ev) => withBusy(ev.currentTarget, saveMind));
 $("groups-known").addEventListener("click", (ev) => {
@@ -4393,6 +4538,7 @@ loadConfig();
 loadBehavior();
 loadMind();
 loadGroups();
+loadMirror();
 loadPrivateChats();
 loadWechatAccount();
 setInterval(refresh, 5000);
@@ -4417,6 +4563,7 @@ document.addEventListener("visibilitychange", () => {
   // 回到前台也不要把用户已经翻过的会话列表打回第一页。
   if (sessionsOffset <= SESSIONS_PAGE) loadSessions();
   loadGroups();
+  loadMirror();
 });
 })();
 </script>

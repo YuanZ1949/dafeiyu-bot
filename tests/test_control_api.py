@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -18,7 +19,7 @@ from dafeiyu import control as control_module
 from dafeiyu.behavior import BehaviorSettings
 from dafeiyu.brain.client import BrainClient
 from dafeiyu.brain.factory import mode_status
-from dafeiyu.config import GroupsConfig, load_settings
+from dafeiyu.config import GroupsConfig, MirrorPairConfig, load_settings
 from dafeiyu.control import BrainControl, MemoryActions, create_app
 from dafeiyu.hotconfig import WeChatRuntime, WeChatRuntimeView
 from dafeiyu.memory.store import MAX_MEMORY_PAGE, Store
@@ -44,6 +45,7 @@ class FakeService:
         self.impressions = None
         self.behavior = BehaviorSettings()
         self.groups = GroupsConfig(frozenset(), frozenset(), frozenset())
+        self.mirror: Any = None
 
     def set_brain(self, brain):
         previous = self.brain
@@ -1405,6 +1407,164 @@ async def test_groups_snapshot_resolves_wxg_title_for_panel(tmp_path: Path) -> N
 
     assert payload["known"][0]["channel"] == "wxg"
     assert payload["known"][0]["title"] == "锦绣壹号9#1101"
+
+
+@pytest.fixture
+def fake_wechat_groups(monkeypatch):
+    """面板下拉读 peers.json（部署状态）；测试里固定成一份可断言的数据。"""
+    monkeypatch.setattr(
+        control_module,
+        "_wechat_group_choices",
+        lambda: [{"alias": "abc123", "display_name": "我们一起搞事情吖"}],
+    )
+
+
+class FakeMirrorRouter:
+    def __init__(self, settings) -> None:
+        self.settings = settings
+        self.calls = 0
+
+    async def set_config(self, settings) -> None:
+        self.settings = settings
+        self.calls += 1
+
+
+def _mirror_ready(control: BrainControl):
+    """把控制面设置改成「允许开启镜像」：both + 微信通道启用。"""
+    return replace(
+        control.settings,
+        gateway=replace(control.settings.gateway, provider="both"),
+        wechat=replace(control.settings.wechat, enabled=True),
+    )
+
+
+async def test_mirror_get_defaults_off_and_lists_choices(
+    tmp_path: Path, fake_wechat_groups
+) -> None:
+    control, _, app = make_control(tmp_path)
+    _seed_group_chat(control.store, "qq:1001", "g1")
+    async with running(app) as client:
+        resp = await client.get("/api/mirror")
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload["enabled"] is False
+    assert payload["pairs"] == []
+    assert payload["nicknames"] == []
+    assert [item["chat_id"] for item in payload["known"]] == ["qq:1001"]
+    assert payload["wechat_groups"] == [
+        {"alias": "abc123", "display_name": "我们一起搞事情吖"}
+    ]
+    assert payload["gateway"] == {"provider": "qq", "wechat_enabled": False}
+
+
+async def test_mirror_put_enable_requires_both_channels(
+    tmp_path: Path, monkeypatch, fake_wechat_groups
+) -> None:
+    """校验失败不能落半份覆盖层：否则下次启动会带着一半配置报错。"""
+    overrides = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_module, "OVERRIDES_PATH", overrides)
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.put(
+            "/api/mirror",
+            json={
+                "enabled": True,
+                "pairs": [{"qq": "qq:1", "wechat": "wxg:a"}],
+            },
+        )
+        payload = await resp.json()
+
+    assert resp.status == 400
+    assert "gateway" in payload["error"]
+    assert not overrides.exists()
+
+
+async def test_mirror_put_disabled_persists_and_normalizes(
+    tmp_path: Path, monkeypatch, fake_wechat_groups
+) -> None:
+    overrides = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_module, "OVERRIDES_PATH", overrides)
+    _, _, app = make_control(tmp_path)
+    async with running(app) as client:
+        resp = await client.put(
+            "/api/mirror",
+            json={
+                "enabled": False,
+                "pairs": [{"qq": "QQ:1001", "wechat": "WXG:Group"}],
+                "nicknames": {"QQ:2002": " 老鱼 "},
+            },
+        )
+        saved = await resp.json()
+
+    assert resp.status == 200
+    assert saved["enabled"] is False
+    assert saved["pairs"] == [{"qq": "qq:1001", "wechat": "wxg:group"}]
+    assert saved["nicknames"] == [{"user_id": "qq:2002", "name": "老鱼"}]
+    assert saved["restart_required"] is False
+    assert read_overrides(overrides)["mirror"] == {
+        "enabled": False,
+        "pairs": [{"qq": "qq:1001", "wechat": "wxg:group"}],
+        "nicknames": {"qq:2002": "老鱼"},
+    }
+
+
+async def test_mirror_put_hot_updates_router(
+    tmp_path: Path, monkeypatch, fake_wechat_groups
+) -> None:
+    overrides = tmp_path / "settings.local.yaml"
+    monkeypatch.setattr(control_module, "OVERRIDES_PATH", overrides)
+    control, service, app = make_control(tmp_path)
+    control.settings = _mirror_ready(control)
+    router = FakeMirrorRouter(control.settings)
+    service.mirror = router
+
+    async with running(app) as client:
+        resp = await client.put(
+            "/api/mirror",
+            json={
+                "enabled": True,
+                "pairs": [{"qq": "qq:1001", "wechat": "wxg:group"}],
+                "nicknames": {"qq:2002": "老鱼"},
+            },
+        )
+        saved = await resp.json()
+
+    assert resp.status == 200
+    assert router.calls == 1
+    assert router.settings.mirror.enabled is True
+    assert router.settings.mirror.pairs == (
+        MirrorPairConfig(qq="qq:1001", wechat="wxg:group"),
+    )
+    assert saved["restart_required"] is False
+    assert saved["enabled"] is True
+    assert saved["pairs"] == [{"qq": "qq:1001", "wechat": "wxg:group"}]
+    assert saved["nicknames"] == [{"user_id": "qq:2002", "name": "老鱼"}]
+
+
+async def test_mirror_put_enable_without_router_asks_restart(
+    tmp_path: Path, monkeypatch, fake_wechat_groups
+) -> None:
+    """启动时镜像关着就没有 router，热更新无从谈起，只能提示重启。"""
+    monkeypatch.setattr(
+        control_module, "OVERRIDES_PATH", tmp_path / "settings.local.yaml"
+    )
+    control, _, app = make_control(tmp_path)
+    control.settings = _mirror_ready(control)
+
+    async with running(app) as client:
+        resp = await client.put(
+            "/api/mirror",
+            json={
+                "enabled": True,
+                "pairs": [{"qq": "qq:1001", "wechat": "wxg:group"}],
+            },
+        )
+        saved = await resp.json()
+
+    assert resp.status == 200
+    assert saved["restart_required"] is True
+    assert "重启" in saved["message"]
 
 
 def _seed_private_chat(

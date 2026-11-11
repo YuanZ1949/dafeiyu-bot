@@ -784,6 +784,16 @@ def create_app(
         code, data = await bot_call("PUT", "/api/groups", payload)
         return web.json_response(data, status=code)
 
+    async def mirror(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/mirror")
+
+    async def save_mirror(request: web.Request) -> web.Response:
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call("PUT", "/api/mirror", payload)
+        return web.json_response(data, status=code)
+
     async def wechat_stop(_: web.Request) -> web.Response:
         code, data = await bot_call("POST", "/api/channels/wechat/stop", {})
         return web.json_response(data, status=code)
@@ -1263,6 +1273,8 @@ def create_app(
     app.router.add_put("/api/behavior", save_behavior)
     app.router.add_get("/api/groups", groups)
     app.router.add_put("/api/groups", save_groups)
+    app.router.add_get("/api/mirror", mirror)
+    app.router.add_put("/api/mirror", save_mirror)
     app.router.add_get("/api/private/chats", private_chats)
     app.router.add_get("/api/private/settings", private_settings)
     app.router.add_put("/api/private/settings", save_private_settings)

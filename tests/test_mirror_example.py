@@ -24,11 +24,12 @@ def _load_example(tmp_path: Path, monkeypatch):
 
 
 def test_mirror_example_default_disabled(tmp_path, monkeypatch):
-    """示例镜像默认关闭；enabled=false 时 pairs 被忽略，解析成空 MirrorConfig。"""
+    """示例镜像默认关闭；关闭不校验但保留可解析的配对，面板可一键重新开启。"""
     settings = _load_example(tmp_path, monkeypatch)
 
     assert settings.mirror.enabled is False
-    assert settings.mirror.pairs == ()
+    assert len(settings.mirror.pairs) == 1
+    assert settings.mirror.pairs[0].qq.startswith("qq:")
 
 
 def test_example_wechat_keys_match_dataclass():

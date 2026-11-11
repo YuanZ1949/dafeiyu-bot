@@ -92,6 +92,8 @@ class MirrorItem:
     created_at: float
     # QQ 的 kind 恒为 text；微信才用它区分媒体，故随快照一起保存。
     kind: str = "text"
+    #: 发送者 user id（带平台前缀），面板昵称映射按它查表。
+    user_id: str = ""
 
 
 def _normalize(text: str) -> str:
@@ -371,6 +373,8 @@ class MirrorRouter:
         for pair in pairs:
             self._routes[pair.qq] = ("qq", pair.wechat)
             self._routes[pair.wechat] = ("wechat", pair.qq)
+        #: user_id → 面板指定的镜像显示昵称；缺省时用消息自带昵称。
+        self._nicknames: dict[str, str] = dict(settings.mirror.nicknames)
         self._queues: dict[str, asyncio.Queue[MirrorItem | _Stop]] = {
             "qq": asyncio.Queue(maxsize=QUEUE_MAXSIZE),
             "wechat": asyncio.Queue(maxsize=QUEUE_MAXSIZE),
@@ -424,6 +428,25 @@ class MirrorRouter:
             # 再抛给 Service.stop，否则停机流程会被一个 worker 故障打断。
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+
+    async def set_config(self, settings: Settings) -> None:
+        """面板保存后热更新路由与昵称，不重启进程。
+
+        队列与 worker 按通道常驻：路由从 0 变多时启动 worker，从多变 0 时
+        停掉；已有 worker 只更新查表，在途条目照常发完。
+        """
+        self.settings = settings
+        pairs = tuple(settings.mirror.pairs) if settings.mirror.enabled else ()
+        routes: dict[str, tuple[str, str]] = {}
+        for pair in pairs:
+            routes[pair.qq] = ("qq", pair.wechat)
+            routes[pair.wechat] = ("wechat", pair.qq)
+        self._routes = routes
+        self._nicknames = dict(settings.mirror.nicknames)
+        if routes and not self._tasks:
+            self.start()
+        elif not routes and self._tasks:
+            await self.stop()
 
     def stats(self) -> dict[str, int | str]:
         result: dict[str, int | str] = dict(self._counters)
@@ -916,9 +939,14 @@ class MirrorRouter:
             body = f"{text} {' '.join(placeholders)}"
         else:
             body = text
-        prefix = "" if item.is_bot else f"{item.nickname}："
+        prefix = "" if item.is_bot else f"{self._display_nickname(item)}："
         full = f"{prefix}{body}" if prefix else body
         return _split(full, MAX_CHUNK) if full.strip() else []
+
+    def _display_nickname(self, item: MirrorItem) -> str:
+        """面板按平台给特定用户配的昵称优先，其次消息自带昵称。"""
+        override = self._nicknames.get(item.user_id)
+        return override or item.nickname
 
     def _plain_text(self, item: MirrorItem) -> str:
         if item.source_channel == "qq":
@@ -1115,6 +1143,7 @@ class MirrorRouter:
             source_channel=source_channel,
             created_at=time.time(),
             kind=msg.kind,
+            user_id=msg.user_id,
         )
 
     def _enqueue(self, source_channel: str, item: MirrorItem) -> None:
