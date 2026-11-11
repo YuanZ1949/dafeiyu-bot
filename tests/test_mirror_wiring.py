@@ -261,7 +261,8 @@ async def test_proxy_segments_text_and_image_preserve_text(tmp_path: Path) -> No
     assert item.text_lines == ("看这个",)
 
 
-async def test_proxy_segments_drops_at_and_reply_and_uses_segment_model() -> None:
+async def test_proxy_segments_degrades_at_and_reply_to_text() -> None:
+    """引用/@ 跨平台没有对应关系：降级成文本线索，不再整段丢弃。"""
     inner = FakeChannelAdapter(segments=True)
     router = RecordingRouter()
     proxy = MirroredAdapter(inner, router)
@@ -270,9 +271,9 @@ async def test_proxy_segments_drops_at_and_reply_and_uses_segment_model() -> Non
         ChatType.GROUP,
         QQ,
         [
-            {"type": "text", "data": {"text": "你好"}},
-            {"type": "at", "data": {"qq": "123"}},
             {"type": "reply", "data": {"id": "9"}},
+            {"type": "at", "data": {"qq": "123"}},
+            {"type": "text", "data": {"text": "你好"}},
             {"type": "image", "data": {"url": "http://x/a.png", "name": "a.png"}},
             {"type": "face", "data": {"id": "1"}},
         ],
@@ -280,12 +281,14 @@ async def test_proxy_segments_drops_at_and_reply_and_uses_segment_model() -> Non
 
     assert len(router.calls) == 1
     call = router.calls[0]
-    assert call["text"] == "你好[表情]"
+    assert call["text"] == "[回复] @群友 你好[表情]"
     assert call["kind"] == "text"
     assert [att.kind for att in call["attachments"]] == ["image"]
     assert call["attachments"][0].source == "http://x/a.png"
     assert all(isinstance(seg, Segment) for seg in call["segments"])
-    assert list(call["segments"]) == [Segment(type="text", data={"text": "你好[表情]"})]
+    assert list(call["segments"]) == [
+        Segment(type="text", data={"text": "[回复] @群友 你好[表情]"})
+    ]
 
 
 # --------------------------------------------------------------- 媒体

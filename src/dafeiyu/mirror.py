@@ -43,6 +43,8 @@ SEND_TIMEOUT = 30.0
 #: hook_not_ready / hook_unavailable（hook 原生桥未就绪、hook_url 未配置）。
 #: hook_unknown（超时 / HTTP 错误 / 连接中途断开）结果不明，绝不重试。
 HOOK_RETRY_CODES = frozenset({"hook_not_ready", "hook_unavailable"})
+#: 引用提示最多带多少字原文：跨平台只保留可读线索，不整段搬运。
+REPLY_HINT_MAX = 40
 #: 重试退避秒数（总尝试次数 = 1 + 3）。
 RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 
@@ -94,6 +96,8 @@ class MirrorItem:
     kind: str = "text"
     #: 发送者 user id（带平台前缀），面板昵称映射按它查表。
     user_id: str = ""
+    #: 引用降级成的一行文本（``[回复 某人：原文]``）；空表示没有引用。
+    reply_hint: str = ""
 
 
 def _normalize(text: str) -> str:
@@ -110,6 +114,33 @@ def _bare_id(value: str) -> str:
 
 def _copy_segments(segments: Sequence[Segment]) -> tuple[Segment, ...]:
     return tuple(Segment(type=seg.type, data=dict(seg.data)) for seg in segments)
+
+
+def _render_at(data: Mapping[str, Any], bot_qq: str = "", bot_name: str = "") -> str:
+    """@ 段降级成文本：全体成员 / 被 @ 的人（有昵称用昵称，否则统一 @群友）。"""
+    target = str(data.get("qq") or "").strip()
+    if target == "all":
+        return "@全体成员 "
+    name = str(data.get("name") or "").strip()
+    if name:
+        return f"@{name} "
+    if bot_qq and target == bot_qq:
+        return f"@{bot_name or '你'} "
+    return "@群友 "
+
+
+def _reply_hint(msg: Message) -> str:
+    """引用降级成一行文本：能拿到原文就带上，只有 id 就只留标记。"""
+    text = _normalize(msg.reply_to_text or "")
+    author = _normalize(msg.reply_to_author or "")
+    if text:
+        if len(text) > REPLY_HINT_MAX:
+            text = f"{text[:REPLY_HINT_MAX]}…"
+        body = f"{author}：{text}" if author else text
+        return f"[回复 {body}]"
+    if msg.reply_to_message_id or any(seg.type == "reply" for seg in msg.segments):
+        return "[回复]"
+    return ""
 
 
 def _media_kind(kind: str) -> str:
@@ -237,6 +268,10 @@ class MirroredAdapter:
             payload: Mapping[str, Any] = data if isinstance(data, dict) else {}
             if seg_type == "text":
                 body.append(str(payload.get("text") or ""))
+            elif seg_type == "at":
+                body.append(_render_at(payload))
+            elif seg_type == "reply":
+                body.append("[回复] ")
             elif seg_type in _STICKER_SEGMENTS:
                 body.append("[表情]")
             elif seg_type in _ATTACHMENT_SEGMENTS:
@@ -248,7 +283,7 @@ class MirroredAdapter:
                         name=str(payload.get("name") or ""),
                     )
                 )
-            # at/reply 及未知段：跨平台不搬运，直接丢弃。
+            # 其余未知段：跨平台不搬运，直接丢弃。
         return "".join(body), tuple(attachments)
 
     # ------------------------------------------------------------ 媒体
@@ -959,13 +994,16 @@ class MirrorRouter:
         placeholders = [self._placeholder(entry) for entry in self._media_entries(item)]
         text = self._plain_text(item)
         if not text:
-            if not placeholders:
-                return []
             body = " ".join(placeholders)
         elif placeholders:
             body = f"{text} {' '.join(placeholders)}"
         else:
             body = text
+        # 引用只作为一行前缀线索：对面没有引用关系，原文不能整段搬。
+        if item.reply_hint:
+            body = f"{item.reply_hint} {body}" if body else item.reply_hint
+        if not body.strip():
+            return []
         prefix = "" if item.is_bot else f"{self._display_nickname(item)}："
         full = f"{prefix}{body}" if prefix else body
         return _split(full, MAX_CHUNK) if full.strip() else []
@@ -977,13 +1015,21 @@ class MirrorRouter:
 
     def _plain_text(self, item: MirrorItem) -> str:
         if item.source_channel == "qq":
-            texts = [
-                str(seg.data.get("text") or "")
-                for seg in item.segments
-                if seg.type == "text"
-            ]
-            if texts:
-                return "".join(texts).strip()
+            # @ 在对面没有对应关系，降级成文本保留「这句话在叫谁」。
+            parts: list[str] = []
+            for seg in item.segments:
+                if seg.type == "text":
+                    parts.append(str(seg.data.get("text") or ""))
+                elif seg.type == "at":
+                    parts.append(
+                        _render_at(
+                            seg.data,
+                            str(self.settings.bot_qq),
+                            self.settings.persona.name,
+                        )
+                    )
+            if parts:
+                return "".join(parts).strip()
             # 纯媒体：正文里的 [图片] 只是占位，媒体由 attachments/segments 渲染。
             if item.attachments:
                 return ""
@@ -1025,7 +1071,8 @@ class MirrorRouter:
             return entries
         for seg in item.segments:
             kind = _media_kind(seg.type)
-            if not kind or kind == "text":
+            # at/reply 已由 `_plain_text` / `reply_hint` 降级成正文线索，不再占位。
+            if not kind or kind in ("text", "at", "reply"):
                 continue
             entries.append((kind, self._segment_name(seg), self._forward_count(seg)))
         return entries
@@ -1171,6 +1218,7 @@ class MirrorRouter:
             created_at=time.time(),
             kind=msg.kind,
             user_id=msg.user_id,
+            reply_hint=_reply_hint(msg),
         )
 
     def _enqueue(self, item: MirrorItem) -> None:

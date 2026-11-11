@@ -231,6 +231,100 @@ def test_nickname_override_ignored_for_unknown_user(tmp_path: Path) -> None:
     assert render(router, make_msg(QQ, "你好")) == ["阿鱼：你好"]
 
 
+# ---------------------------------------------------------------- 引用/@
+def test_render_at_degrades_to_text(tmp_path: Path) -> None:
+    """@ 段不再被丢掉：被 @ 的是 bot 就用本体名，其余统一 @群友。"""
+    router, _store, _adapters = make_router(tmp_path)
+    to_bot = make_msg(
+        QQ,
+        "@溟月 看这个",
+        segments=[
+            Segment("at", {"qq": "999"}),
+            Segment("text", {"text": "看这个"}),
+        ],
+    )
+    assert render(router, to_bot) == ["阿鱼：@溟月 看这个"]
+
+    to_other = make_msg(
+        QQ,
+        "@群友 看这个",
+        segments=[
+            Segment("at", {"qq": "2002"}),
+            Segment("text", {"text": "看这个"}),
+        ],
+    )
+    assert render(router, to_other) == ["阿鱼：@群友 看这个"]
+
+    to_all = make_msg(
+        QQ,
+        "@全体成员 看这个",
+        segments=[
+            Segment("at", {"qq": "all"}),
+            Segment("text", {"text": "看这个"}),
+        ],
+    )
+    assert render(router, to_all) == ["阿鱼：@全体成员 看这个"]
+
+
+def test_render_at_only_media_keeps_at(tmp_path: Path) -> None:
+    """只有 @ + 图片时也不能把 @ 吞掉（以前会只剩 [图片]）。"""
+    router, _store, _adapters = make_router(tmp_path)
+    message = make_msg(
+        QQ,
+        "@群友 [图片]",
+        segments=[
+            Segment("at", {"qq": "2002"}),
+            Segment("image", {"url": "http://x/a.png"}),
+        ],
+        attachments=[Attachment(kind="image", source="http://x/a.png")],
+    )
+    assert render(router, message) == ["阿鱼：@群友 [图片]"]
+
+
+def test_render_quoted_text_becomes_hint(tmp_path: Path) -> None:
+    """能拿到引用原文时带上一行提示，但截断到 REPLY_HINT_MAX。"""
+    router, _store, _adapters = make_router(tmp_path)
+    message = dataclasses.replace(
+        make_msg(QQ, "同意"),
+        reply_to_text="明天十点开会",
+        reply_to_author="小明",
+    )
+    assert render(router, message) == ["阿鱼：[回复 小明：明天十点开会] 同意"]
+
+    long_quote = dataclasses.replace(
+        make_msg(QQ, "同意"),
+        reply_to_text="字" * (mirror_module.REPLY_HINT_MAX + 20),
+    )
+    rendered = render(router, long_quote)
+    assert rendered[0].startswith("阿鱼：[回复 字")
+    assert "…]" in rendered[0]
+
+
+def test_render_reply_without_text_keeps_marker(tmp_path: Path) -> None:
+    """QQ 引用只有 id 拿不到原文：至少留一个 [回复] 标记。"""
+    router, _store, _adapters = make_router(tmp_path)
+    message = make_msg(
+        QQ,
+        "同意",
+        segments=[
+            Segment("reply", {"id": "42"}),
+            Segment("text", {"text": "同意"}),
+        ],
+    )
+    assert render(router, message) == ["阿鱼：[回复] 同意"]
+
+
+def test_render_wechat_quote_hint_from_envelope(tmp_path: Path) -> None:
+    """微信侧的引用由桥带出原文，镜像到 QQ 时同样降级成一行。"""
+    router, _store, _adapters = make_router(tmp_path)
+    message = dataclasses.replace(
+        make_msg(WXG, "好", user_id="wxg:human", message_id="w1"),
+        reply_to_text="今天加班",
+        reply_to_author="老王",
+    )
+    assert render(router, message) == ["阿鱼：[回复 老王：今天加班] 好"]
+
+
 def test_render_long_text_uses_sender_split(tmp_path: Path) -> None:
     router, _store, _adapters = make_router(tmp_path)
     chunks = render(router, make_msg(QQ, "字" * 1200))
