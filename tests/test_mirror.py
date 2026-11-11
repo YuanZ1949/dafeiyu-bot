@@ -259,6 +259,85 @@ async def test_two_directions_do_not_block_each_other(tmp_path: Path) -> None:
         await router.stop()
 
 
+class GatedRecorder(Recorder):
+    """指定目标群的发送先卡在 gate 上，用来验证其它对不被拖住。"""
+
+    def __init__(self, bot_id: str, gate: asyncio.Event, blocked: str) -> None:
+        super().__init__(bot_id)
+        self.gate = gate
+        self.blocked = blocked
+
+    async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str:
+        if chat_id == self.blocked:
+            await self.gate.wait()
+        return await super().send(chat_type, chat_id, text)
+
+
+def _two_pair_router(
+    tmp_path: Path,
+    *,
+    wechat: Recorder | None = None,
+) -> tuple[MirrorRouter, dict[str, Recorder]]:
+    """两对 (qq:1001 ⇄ wxg:a) 与 (qq:2002 ⇄ wxg:b)，QQ 侧共用一个 adapter。"""
+    settings = dataclasses.replace(
+        make_settings(),
+        mirror=MirrorConfig(
+            enabled=True,
+            pairs=(
+                MirrorPairConfig(qq="qq:1001", wechat="wxg:a"),
+                MirrorPairConfig(qq="qq:2002", wechat="wxg:b"),
+            ),
+        ),
+    )
+    store = Store(tmp_path / "mirror.db")
+    store.init_schema()
+    adapters = {
+        "qq": Recorder("qq:999"),
+        "wechat": wechat or Recorder("wxg:self"),
+    }
+    return MirrorRouter(settings, store, adapters), adapters
+
+
+async def test_same_direction_pairs_do_not_block_each_other(tmp_path: Path) -> None:
+    """同一个方向（QQ→微信）上，一对卡住不能拖住另一对。"""
+    gate = asyncio.Event()
+    wechat = GatedRecorder("wxg:self", gate, "wxg:a")
+    router, _adapters = _two_pair_router(tmp_path, wechat=wechat)
+    router.start()
+    try:
+        router.observe_inbound(make_msg("qq:1001", "卡住", message_id="a1"))
+        router.observe_inbound(make_msg("qq:2002", "顺路", message_id="b1"))
+        await wait_until(lambda: ("wxg:b", "阿鱼：顺路") in wechat.sent)
+        # 卡住的那一对还没发出去，另一对已经送达。
+        assert wechat.sent == [("wxg:b", "阿鱼：顺路")]
+    finally:
+        gate.set()
+        await router.stop()
+
+
+async def test_queue_full_on_one_pair_does_not_drop_other_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """队列按目标群拆：灌满一对只丢自己的，另一对照常排队并送达。"""
+    monkeypatch.setattr(mirror_module, "QUEUE_MAXSIZE", 1)
+    router, adapters = _two_pair_router(tmp_path)
+    # 不 start：队列只进不出，便于把一对灌满。
+    router.observe_inbound(make_msg("qq:1001", "一", message_id="a1"))
+    router.observe_inbound(make_msg("qq:1001", "二", message_id="a2"))
+    router.observe_inbound(make_msg("qq:2002", "三", message_id="b1"))
+    assert router.stats()["dropped"] == 1
+
+    router.start()
+    try:
+        await wait_until(lambda: len(adapters["wechat"].sent) == 2)
+    finally:
+        await router.stop()
+    assert set(adapters["wechat"].sent) == {
+        ("wxg:a", "阿鱼：一"),
+        ("wxg:b", "阿鱼：三"),
+    }
+
+
 # ---------------------------------------------------------------- 多对路由
 async def test_multiple_pairs_route_to_their_own_target(tmp_path: Path) -> None:
     settings = dataclasses.replace(
@@ -319,8 +398,8 @@ async def test_set_config_swaps_routes_and_nicknames(tmp_path: Path) -> None:
         )
         await wait_until(lambda: adapters["wechat"].sent)
         assert adapters["wechat"].sent == [("wxg:other", "新昵称：换群")]
-        # 队列按通道常驻，换对不重建 worker，在途条目照常发完。
-        assert len(router._tasks) == 2
+        # worker 与目标群一一对应：旧对收摊、新对起两个，总数仍是 2。
+        assert set(router._tasks) == {"qq:2001", "wxg:other"}
     finally:
         await router.stop()
 
@@ -334,7 +413,7 @@ async def test_set_config_starts_and_stops_workers(tmp_path: Path) -> None:
         store,
         adapters,
     )
-    assert router._tasks == []
+    assert router._tasks == {}
     assert router._direction(QQ) is None
 
     enabled = dataclasses.replace(
@@ -348,8 +427,35 @@ async def test_set_config_starts_and_stops_workers(tmp_path: Path) -> None:
     assert router._direction(QQ) == ("qq", WXG)
 
     await router.set_config(dataclasses.replace(make_settings(), mirror=MirrorConfig()))
-    assert router._tasks == []
+    assert router._tasks == {}
     assert router._direction(QQ) is None
+
+
+async def test_set_config_retires_only_removed_pair_workers(tmp_path: Path) -> None:
+    """面板删掉一对：只收摊那一对的 worker，另一对照常转发。"""
+    router, adapters = _two_pair_router(tmp_path)
+    router.start()
+    try:
+        assert set(router._tasks) == {"qq:1001", "wxg:a", "qq:2002", "wxg:b"}
+        remaining = dataclasses.replace(
+            make_settings(),
+            mirror=MirrorConfig(
+                enabled=True,
+                pairs=(MirrorPairConfig(qq="qq:2002", wechat="wxg:b"),),
+            ),
+        )
+        await router.set_config(remaining)
+
+        assert set(router._tasks) == {"qq:2002", "wxg:b"}
+        assert set(router._queues) == {"qq:2002", "wxg:b"}
+        # 被删掉的对立即不再转发；留下的对不受影响。
+        router.observe_inbound(make_msg("qq:1001", "旧对", message_id="old"))
+        router.observe_inbound(make_msg("qq:2002", "新对", message_id="new"))
+        await wait_until(lambda: adapters["wechat"].sent)
+        await asyncio.sleep(0.05)
+        assert adapters["wechat"].sent == [("wxg:b", "阿鱼：新对")]
+    finally:
+        await router.stop()
 
 
 # ---------------------------------------------------------------- 落库
@@ -504,7 +610,7 @@ def test_overflow_drops_newest_and_counts(tmp_path: Path) -> None:
         router.observe_inbound(
             make_msg(QQ, f"m{index}", user_id="qq:2002", message_id=f"q{index}")
         )
-    assert router._queues["qq"].qsize() == mirror_module.QUEUE_MAXSIZE
+    assert router._queues[WXG].qsize() == mirror_module.QUEUE_MAXSIZE
     assert router.stats()["dropped"] == 1
 
 
@@ -540,14 +646,14 @@ def test_human_duplicate_not_swallowed_but_own_echo_consumed(tmp_path: Path) -> 
 
     human = make_msg(WXG, "hello", user_id="wxg:human", message_id="w1")
     router.observe_inbound(human)
-    assert router._queues["wechat"].qsize() == 1
+    assert router._queues[QQ].qsize() == 1
     assert router.stats()["deduped"] == 0
 
     # 人类消息没有消费指纹；本账号回显在 10s 内仍然被吞掉。
     router._register_fingerprints(WXG, "hello", ())
     echo = make_msg(WXG, "hello", user_id="wxg:self", message_id="w2")
     router.observe_inbound(echo)
-    assert router._queues["wechat"].qsize() == 1
+    assert router._queues[QQ].qsize() == 1
     assert router.stats()["deduped"] == 1
 
 
@@ -556,7 +662,6 @@ async def test_expired_item_counts_and_is_not_sent(tmp_path: Path) -> None:
     router.start()
     try:
         router._enqueue(
-            "qq",
             MirrorItem(
                 source_chat_id=QQ,
                 target_chat_id=WXG,
@@ -583,4 +688,4 @@ def test_message_exists_blocks_redelivered_frame(tmp_path: Path) -> None:
     store.add_message(message)
     router.observe_inbound(message)
     assert router.stats()["deduped"] == 1
-    assert router._queues["qq"].qsize() == 0
+    assert router._queues == {}

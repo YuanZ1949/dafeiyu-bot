@@ -217,7 +217,7 @@ async def test_proxy_segments_text_and_image_preserve_text(tmp_path: Path) -> No
         ],
     )
 
-    item = router._queues["qq"].get_nowait()
+    item = router._queues[WXG].get_nowait()
     assert isinstance(item, MirrorItem)
     # T3 的 QQ 渲染：有附件时正文只认 text 段，必须显式回传才不丢字。
     assert router._render(item) == ["看这个 [图片]"]
@@ -706,7 +706,7 @@ async def test_service_lifecycle_start_order_and_stop_order(tmp_path: Path) -> N
 class CrashingRouter(MirrorRouter):
     """首个迭代就崩溃的 worker，用来验证 done-callback 的可观测性。"""
 
-    async def _worker(self, source_channel: str) -> None:
+    async def _worker(self, queue: asyncio.Queue[Any]) -> None:
         raise RuntimeError("worker boom")
 
 
@@ -726,7 +726,7 @@ async def test_mirror_worker_exit_surfaces_and_stops(tmp_path: Path, caplog) -> 
             assert "镜像 worker 异常退出" in caplog.text
             # 已崩溃的 worker 不能让 stop 把异常再抛出来。
             await router.stop()
-        assert router._tasks == []
+        assert router._tasks == {}
     finally:
         store.close()
 

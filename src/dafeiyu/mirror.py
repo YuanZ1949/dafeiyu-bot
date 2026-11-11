@@ -29,7 +29,7 @@ DecodeFn = Callable[[bytes], Awaitable[bytes | None]]
 #: 下载函数：签名与 ``media.FetchFn`` / ``images.FetchFn`` 一致，可注入。
 FetchFn = Callable[[str, float, int], Awaitable[bytes]]
 
-#: 每方向队列容量：突发 30 条远达不到，溢出只可能是长期卡死。
+#: 每个目标群队列容量：突发 30 条远达不到，溢出只可能是该群长期卡死。
 QUEUE_MAXSIZE = 1000
 #: 入站内存幂等窗口（秒）：覆盖桥重投，重启后的重投由 message_exists 兜住。
 IDEMPOTENCY_TTL = 600.0
@@ -337,11 +337,10 @@ class MirroredAdapter:
 
 
 class MirrorRouter:
-    """多对群的双向镜像：每个方向一条共用队列 + 一个 worker。
+    """多对群的双向镜像：每个目标群一条队列 + 一个 worker。
 
-    多对时按群精确匹配路由，每个群只属于一对、各对之间不交叉。同一方向
-    的多对共用一条队列是有意为之（保持队列/worker 结构与既有测试不变）：
-    发送按条目自带的 ``target_chat_id`` 分流，代价是同一方向上不同对串行。
+    多对时按群精确匹配路由，每个群只属于一对。队列按**目标群**（而不是
+    来源通道）拆分：一对的微信发送卡住时，同方向其它对照常转发。
 
     ``decode`` / ``fetch`` 是 worker 内媒体物化的可选协作钩子：
 
@@ -375,11 +374,9 @@ class MirrorRouter:
             self._routes[pair.wechat] = ("wechat", pair.qq)
         #: user_id → 面板指定的镜像显示昵称；缺省时用消息自带昵称。
         self._nicknames: dict[str, str] = dict(settings.mirror.nicknames)
-        self._queues: dict[str, asyncio.Queue[MirrorItem | _Stop]] = {
-            "qq": asyncio.Queue(maxsize=QUEUE_MAXSIZE),
-            "wechat": asyncio.Queue(maxsize=QUEUE_MAXSIZE),
-        }
-        self._tasks: list[asyncio.Task[None]] = []
+        self._queues: dict[str, asyncio.Queue[MirrorItem | _Stop]] = {}
+        #: 目标群 → worker；键与 ``_queues`` 保持一致，便于按对启停。
+        self._tasks: dict[str, asyncio.Task[None]] = {}
         #: (source_chat_id, source_message_id) → 首次观察时间。
         self._seen: dict[tuple[str, str], float] = {}
         #: (chat_id, 归一化文本) → 过期时间；一次性、10s。
@@ -391,17 +388,45 @@ class MirrorRouter:
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> None:
-        """创建两个方向的 worker；未配置配对时不启动任何任务。"""
+        """按当前路由给每个目标群起 worker；未配置配对时什么都不启动。"""
         if not self._routes:
             return
-        if self._tasks:
-            return
-        for channel in ("qq", "wechat"):
+        self._sync_workers()
+
+    def _sync_workers(self) -> None:
+        """让 worker/队列集合与当前路由一致：新目标起 worker，删掉的目标收摊。"""
+        targets = {target for _, target in self._routes.values()}
+        for target in [name for name in self._tasks if name not in targets]:
+            self._retire_worker(target)
+        for target in targets:
+            if target in self._tasks:
+                continue
+            queue = self._queue_for(target)
             task = asyncio.create_task(
-                self._worker(channel), name=f"mirror-{channel}"
+                self._worker(queue), name=f"mirror-{target}"
             )
             task.add_done_callback(self._on_worker_done)
-            self._tasks.append(task)
+            self._tasks[target] = task
+
+    def _retire_worker(self, target_chat_id: str) -> None:
+        """配对被删掉：取消它的 worker 并丢弃队列里没发完的条目。"""
+        task = self._tasks.pop(target_chat_id, None)
+        queue = self._queues.pop(target_chat_id, None)
+        if task is not None:
+            task.cancel()
+        if queue is not None:
+            # 兜底：cancel 偶发不唤醒等待 queue.get() 的任务时，用哨兵把它叫醒。
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(_STOP)
+
+    def _queue_for(
+        self, target_chat_id: str
+    ) -> asyncio.Queue[MirrorItem | _Stop]:
+        queue = self._queues.get(target_chat_id)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+            self._queues[target_chat_id] = queue
+        return queue
 
     def _on_worker_done(self, task: "asyncio.Task[None]") -> None:
         """异常退出要让统计与日志看得见；正常结束/cancel 保持安静。"""
@@ -414,16 +439,17 @@ class MirrorRouter:
         log.error("镜像 worker 异常退出：%s", task.get_name(), exc_info=exc)
 
     async def stop(self) -> None:
-        tasks, self._tasks = self._tasks, []
+        tasks, self._tasks = self._tasks, {}
+        queues, self._queues = self._queues, {}
         if not tasks:
             return
-        for task in tasks:
+        for task in tasks.values():
             task.cancel()
         # 兜底：cancel 偶发不唤醒等待 queue.get() 的任务时，用哨兵把它叫醒。
-        for queue in self._queues.values():
+        for queue in queues.values():
             with contextlib.suppress(asyncio.QueueFull):
                 queue.put_nowait(_STOP)
-        for task in tasks:
+        for task in tasks.values():
             # 已崩溃的 worker 由 done-callback 记录；这里不能让 await 把异常
             # 再抛给 Service.stop，否则停机流程会被一个 worker 故障打断。
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -432,8 +458,8 @@ class MirrorRouter:
     async def set_config(self, settings: Settings) -> None:
         """面板保存后热更新路由与昵称，不重启进程。
 
-        队列与 worker 按通道常驻：路由从 0 变多时启动 worker，从多变 0 时
-        停掉；已有 worker 只更新查表，在途条目照常发完。
+        队列与 worker 按目标群对齐路由：新对补 worker，删掉的对收摊，
+        还在用的对只更新查表，在途条目照常发完。
         """
         self.settings = settings
         pairs = tuple(settings.mirror.pairs) if settings.mirror.enabled else ()
@@ -443,9 +469,9 @@ class MirrorRouter:
             routes[pair.wechat] = ("wechat", pair.qq)
         self._routes = routes
         self._nicknames = dict(settings.mirror.nicknames)
-        if routes and not self._tasks:
-            self.start()
-        elif not routes and self._tasks:
+        if routes:
+            self._sync_workers()
+        elif self._tasks or self._queues:
             await self.stop()
 
     def stats(self) -> dict[str, int | str]:
@@ -484,7 +510,7 @@ class MirrorRouter:
             self._counters["deduped"] += 1
             return
         item = self._snapshot(msg, target_chat_id, source_channel)
-        self._enqueue(source_channel, item)
+        self._enqueue(item)
 
     # ------------------------------------------------------------ 出站观察
     def observe_outbound(
@@ -545,11 +571,12 @@ class MirrorRouter:
         )
         # 先把「本账号刚发的内容」记成一次性指纹，回显帧 10s 内命中即丢弃。
         self._register_fingerprints(target_chat_id, text, attachments)
-        self._enqueue(source_channel, item)
+        self._enqueue(item)
 
     # ------------------------------------------------------------ worker
-    async def _worker(self, source_channel: str) -> None:
-        queue = self._queues[source_channel]
+    async def _worker(
+        self, queue: asyncio.Queue[MirrorItem | _Stop]
+    ) -> None:
         while True:
             try:
                 item = await queue.get()
@@ -1146,8 +1173,8 @@ class MirrorRouter:
             user_id=msg.user_id,
         )
 
-    def _enqueue(self, source_channel: str, item: MirrorItem) -> None:
-        queue = self._queues[source_channel]
+    def _enqueue(self, item: MirrorItem) -> None:
+        queue = self._queue_for(item.target_chat_id)
         try:
             queue.put_nowait(item)
         except asyncio.QueueFull:
