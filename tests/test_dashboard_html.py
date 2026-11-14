@@ -854,3 +854,36 @@ def test_html_decision_checkpoints_cover_hold_lifecycle() -> None:
         assert label in block
     # 攒着筛选的语义不变：到期放行仍是 held outcome。
     assert 'held: { label: "攒着", cls: "held" }' in html
+
+
+def test_html_global_search_covers_three_sources() -> None:
+    """顶栏一个搜索框同时搜会话 / 消息 / 决策，且只复用已有端点。"""
+    html = read_html()
+    assert 'id="global-search"' in html
+    assert 'id="search-panel"' in html
+    assert "function runGlobalSearch(" in html
+    match = re.search(r"async function runGlobalSearch\((.*?)\n\}", html, re.DOTALL)
+    assert match is not None, "runGlobalSearch 必须是一段可直接断言的函数体"
+    body = match.group(1)
+    # 三个端点各出现一次：多写一处就是重复请求。
+    assert body.count("/api/sessions") == 1
+    assert body.count("/api/memory/search?q=") == 1
+    assert body.count("/api/decisions") == 1
+    # 防抖常量与分组上限都在。
+    assert "SEARCH_DEBOUNCE_MS = 200" in html
+    assert "SEARCH_WINDOW = 200" in html
+    assert "SEARCH_GROUP_LIMIT = 20" in html
+    # 三个分组容器都要有，结果不能挤在一个无标题的列表里。
+    for group in ("sessions", "messages", "decisions"):
+        assert f'data-group="{group}"' in html
+
+
+def test_html_global_search_says_it_is_windowed_not_full_db() -> None:
+    """文案必须如实写「最近 200 条」，不能把窗口内过滤说成全库检索。"""
+    html = read_html()
+    assert "只检索最近" in html
+    assert "最近 200 条" in html
+    # 输入框 / 面板交互：Esc 收起、空关键词不发请求、点面板外收起。
+    assert 'ev.key !== "Escape"' in html
+    assert "if (!q) {" in html
+    assert "panel.contains(ev.target)" in html

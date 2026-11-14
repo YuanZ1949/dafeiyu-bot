@@ -620,6 +620,20 @@
   .delete-user-form { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
   .cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px 20px; }
   .cfg-grid b { color: var(--text); font-weight: 600; }
+  /* 顶栏全局搜索：结果面板浮在顶栏下方，点面板外或按 Esc 收起。 */
+  #global-search { width: min(320px, 26vw); }
+  #search-panel {
+    position: fixed; z-index: 25; top: calc(var(--header-h, 56px) + 10px); right: 16px;
+    width: min(560px, 94vw); max-height: 62vh; overflow: auto;
+    display: grid; gap: 10px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--card-radius);
+    padding: 12px; box-shadow: 0 16px 48px var(--drawer-shadow);
+  }
+  #search-panel[hidden] { display: none; }
+  .search-group { display: grid; gap: 6px; }
+  .search-group h3 { margin: 0; font-size: var(--fs-sm); color: var(--muted); font-weight: 600; }
+  .search-group .mem-list { max-height: none; }
+  .search-group .mem-item { cursor: pointer; }
   /* 手机端：窄屏单列、控件铺满、触控目标加大；桌面布局不受影响。 */
   @media (max-width: 720px) {
     /* 按钮换行后顶栏会占掉小半个屏幕，手机上让它随页面滚走。 */
@@ -632,6 +646,9 @@
     .card { padding: 12px; border-radius: 8px; }
     /* 手机上顶栏本来就随页面滚走，分区导航直接吸顶，不留 --header-h 的空隙。 */
     .pane-nav { top: 0; padding: 8px 10px; }
+    /* 顶栏换行后搜索框铺满一行，结果面板贴住屏幕两侧。 */
+    #global-search { width: 100%; }
+    #search-panel { top: 8px; left: 8px; right: 8px; width: auto; max-height: 70vh; }
     .pane { scroll-margin-top: 52px; }
     /* 这三处 minmax 的下限大于窄屏可用宽度，必须显式收成单列，否则会横向溢出。 */
     .grid-2, .grid-3, .mem-grid { grid-template-columns: 1fr; }
@@ -670,6 +687,7 @@
   <h1>大肥鱼控制台</h1>
   <span id="hub-state" class="pill"><span class="dot"></span><span>连接中…</span></span>
   <span class="spacer"></span>
+  <input id="global-search" type="search" placeholder="搜索会话 / 消息 / 决策" autocomplete="off" aria-label="搜索会话、消息与决策" />
   <button class="btn" data-act="start" data-target="all">全部启动</button>
   <button class="btn" data-act="restart" data-target="all">全部重启</button>
   <button class="btn danger" data-act="stop" data-target="all">全部停止</button>
@@ -691,6 +709,22 @@
   <button type="button" class="btn" data-pane="pane-config">配置</button>
   <button type="button" class="btn" data-pane="pane-logs">日志</button>
 </nav>
+
+<div id="search-panel" hidden aria-label="全局搜索结果">
+  <div class="kv" id="search-note">会话与决策只检索最近 200 条；消息按关键词检索。Esc 关闭。</div>
+  <div class="search-group" data-group="sessions">
+    <h3>会话</h3>
+    <div class="mem-list list-h-sm" id="search-sessions"></div>
+  </div>
+  <div class="search-group" data-group="messages">
+    <h3>消息</h3>
+    <div class="mem-list list-h-sm" id="search-messages"></div>
+  </div>
+  <div class="search-group" data-group="decisions">
+    <h3>决策</h3>
+    <div class="mem-list list-h-sm" id="search-decisions"></div>
+  </div>
+</div>
 
 <main>
   <section class="pane" id="pane-overview">
@@ -3495,6 +3529,90 @@ async function searchMessages(append) {
   }
 }
 
+// ---- 顶栏全局搜索：三个已有数据源，在浏览器端按关键词过滤 ----
+// 语义限定：/api/sessions 与 /api/decisions 都没有关键词参数，只取最近 200 条后本地过滤；
+// 只有 /api/memory/search 支持服务端 q。所以文案写「最近 200 条」，不吹成全库检索。
+const SEARCH_DEBOUNCE_MS = 200;
+const SEARCH_WINDOW = 200;
+const SEARCH_GROUP_LIMIT = 20;
+let globalSearchTimer = null;
+let globalSearchSeq = 0;
+
+function searchHit(text, needle) {
+  return String(text == null ? "" : text).toLowerCase().includes(needle);
+}
+
+// 一组结果：最多 20 条，超出只报剩余数字，不把整包响应塞进 DOM。
+function renderSearchGroup(boxId, rows, hits, emptyText) {
+  const box = $(boxId);
+  box.replaceChildren();
+  if (!hits) {
+    box.innerHTML = `<div class="mem-empty">${emptyText}</div>`;
+    return;
+  }
+  rows.forEach((row) => box.appendChild(row));
+  if (hits > rows.length) {
+    const more = document.createElement("div");
+    more.className = "mem-empty";
+    more.textContent = `还有 ${hits - rows.length} 条，缩小关键词再看`;
+    box.appendChild(more);
+  }
+}
+
+async function runGlobalSearch(rawQuery) {
+  const panel = $("search-panel");
+  const q = String(rawQuery == null ? "" : rawQuery).trim();
+  if (!q) {
+    panel.hidden = true;
+    return;
+  }
+  const seq = ++globalSearchSeq;
+  const needle = q.toLowerCase();
+  try {
+    const [sessions, messages, decisions] = await Promise.all([
+      api(`/api/sessions?limit=${SEARCH_WINDOW}&offset=0`),
+      api(`/api/memory/search?q=${encodeURIComponent(q)}`),
+      api(`/api/decisions?limit=${SEARCH_WINDOW}`),
+    ]);
+    // 后来的输入已经发起：这一趟的结果必须丢掉，否则会把新结果盖回旧的。
+    if (seq !== globalSearchSeq) return;
+    const sessionHits = (sessions.items || []).filter(
+      (s) => searchHit(s.chat_label, needle) || searchHit(s.chat_id, needle)
+    );
+    const messageHits = (messages.items || []).filter(
+      (m) => searchHit(m.content, needle) || searchHit(m.snippet, needle)
+    );
+    const decisionHits = (decisions.items || []).filter(
+      (d) => searchHit(d.reason, needle) || searchHit(d.reply_preview, needle) || searchHit(d.chat_id, needle)
+    );
+    const sessionRows = sessionHits.slice(0, SEARCH_GROUP_LIMIT).map((s) => {
+      const row = memItem(`${chatLabel(s.chat_type, s.chat_id)} · 消息 ${s.message_count}`, s.chat_id);
+      row.addEventListener("click", () => openTimeline(s));
+      return row;
+    });
+    const messageRows = messageHits.slice(0, SEARCH_GROUP_LIMIT).map((m) =>
+      memItem(
+        `${chatLabel(m.chat_type, m.chat_id)} · ${m.at || "—"} · ${m.is_bot ? "大肥鱼" : m.nickname || "未知"}`,
+        m.snippet || m.content || ""
+      )
+    );
+    const decisionRows = decisionHits.slice(0, SEARCH_GROUP_LIMIT).map((d) =>
+      memItem(`${chatLabel(d.chat_type, d.chat_id)} · ${decisionOutcome(d.outcome).label}`, decisionSummary(d))
+    );
+    renderSearchGroup("search-sessions", sessionRows, sessionHits.length, "没有匹配的会话");
+    renderSearchGroup("search-messages", messageRows, messageHits.length, "没有匹配的消息");
+    renderSearchGroup("search-decisions", decisionRows, decisionHits.length, "没有匹配的决策");
+    $("search-note").textContent =
+      `命中 会话 ${sessionHits.length} · 消息 ${messageHits.length} · 决策 ${decisionHits.length}` +
+      ` · 会话与决策只检索最近 ${SEARCH_WINDOW} 条 · Esc 关闭`;
+    panel.hidden = false;
+  } catch (err) {
+    if (seq !== globalSearchSeq) return;
+    $("search-note").textContent = `搜索失败：${err.message}`;
+    panel.hidden = false;
+  }
+}
+
 async function loadSessions(append = false) {
   if (document.hidden) return; // 后台标签不刷新，回到前台由 visibilitychange 触发
   try {
@@ -4832,6 +4950,27 @@ $("search-q").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter") searchMessages(false);
 });
 $("btn-search-more").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => searchMessages(true)));
+$("global-search").addEventListener("input", (ev) => {
+  const value = ev.currentTarget.value;
+  clearTimeout(globalSearchTimer);
+  if (!value.trim()) {
+    $("search-panel").hidden = true;
+    return;
+  }
+  globalSearchTimer = setTimeout(() => runGlobalSearch(value), SEARCH_DEBOUNCE_MS);
+});
+$("global-search").addEventListener("keydown", (ev) => {
+  if (ev.key !== "Escape") return;
+  ev.currentTarget.value = "";
+  $("search-panel").hidden = true;
+});
+// 点面板与输入框以外的地方收起结果；面板内部的点击（例如打开时间线）不收起。
+document.addEventListener("click", (ev) => {
+  const panel = $("search-panel");
+  if (panel.hidden) return;
+  if (panel.contains(ev.target) || $("global-search").contains(ev.target)) return;
+  panel.hidden = true;
+});
 $("btn-sessions-more").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadSessions(true)));
 $("btn-refresh-sessions").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadSessions()));
 $("btn-refresh-holds").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadHolds()));
