@@ -14,8 +14,10 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -54,7 +56,7 @@ def store(tmp_path: Path):
     s.close()
 
 
-def loop_rows(store: Store) -> list:
+def loop_rows(store: Store) -> list[sqlite3.Row]:
     return store._conn.execute(
         "SELECT * FROM open_loops ORDER BY id"
     ).fetchall()
@@ -239,7 +241,7 @@ def test_expire_open_loops_once_sweeps_all_chats(store: Store) -> None:
 
 # ---- (f) 「你问我」闭环 ------------------------------------------------------
 
-SERVICE_SETTINGS = {
+SERVICE_SETTINGS: dict[str, Any] = {
     "api_key": "sk-test",
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-chat",
@@ -266,6 +268,12 @@ class FakeAdapter:
 
     def on_message(self, handler) -> None:
         self.handler = handler
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
 
     async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str:
         self.sent.append((chat_type, chat_id, text))
@@ -392,3 +400,4 @@ async def test_non_question_loops_are_not_closed_by_reply(
     ).fetchone()
     assert row is not None
     assert row["status"] == "open"
+

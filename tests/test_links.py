@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -55,9 +56,11 @@ def make_resolver(
     tmp_path: Path,
     responder: Callable[[httpx.Request], httpx.Response],
     clock: FakeClock | None = None,
-    **overrides: object,
+    **overrides: Any,
 ) -> tuple[LinkResolver, CountingTransport]:
-    cfg = LinkConfig(cache_dir=str(tmp_path / "link-cache"), **overrides)  # type: ignore[arg-type]
+    # overrides 是「只覆盖关心的那几个字段」的测试便利写法：取值由调用点决定，
+    # 逐个字段精确标注会让这个 helper 变成一堵墙（Any 只在这里出现）。
+    cfg = LinkConfig(cache_dir=str(tmp_path / "link-cache"), **overrides)
     counter = CountingTransport(responder)
     resolver = LinkResolver(cfg, transport=httpx.MockTransport(counter), clock=clock)
     return resolver, counter
@@ -326,4 +329,4 @@ def test_link_resolution_is_frozen() -> None:
         ok=True, url="http://x", status=200, title="t", text="b", reason="ok", fetched_at=1.0
     )
     with pytest.raises(AttributeError):
-        resolution.ok = False  # type: ignore[misc]
+        setattr(resolution, "ok", False)  # frozen dataclass：运行期就该炸

@@ -1,6 +1,7 @@
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -28,7 +29,9 @@ NOON = datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI)
 
 
 def make_settings(**overrides) -> Settings:
-    base = {
+    # base 是「测试要覆盖的那几个字段」的字典：`Settings(**base)` 无法让
+    # 类型检查器逐键对号入座，所以这里标注成 dict[str, Any]（值由调用点决定）。
+    base: dict[str, Any] = {
         "api_key": "sk-test",
         "base_url": "https://api.deepseek.com",
         "model": "deepseek-chat",
