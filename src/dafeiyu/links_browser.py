@@ -38,6 +38,7 @@ import websockets
 
 from dafeiyu.config import LinkBrowserConfig
 from dafeiyu.links import extract_title, html_to_text
+from dafeiyu.netssl import default_ssl_context
 
 __all__ = ["BrowserResult", "BrowserRenderer"]
 
@@ -257,13 +258,17 @@ class _DefaultCdpConnector:
     """真实端点实现：HTTP 发现端点用 httpx，target 连接用 websockets。"""
 
     async def version(self, port: int) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(
+            timeout=5.0, verify=default_ssl_context()
+        ) as client:
             resp = await client.get(f"http://127.0.0.1:{port}/json/version")
             resp.raise_for_status()
             return resp.json()
 
     async def create_target(self, port: int, url: str) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(
+            timeout=5.0, verify=default_ssl_context()
+        ) as client:
             try:
                 # 新版 Chrome/Edge 只认 PUT；旧版只认 GET（PUT 会回 405）。
                 resp = await client.put(
@@ -280,7 +285,9 @@ class _DefaultCdpConnector:
             return resp.json()
 
     async def close_target(self, port: int, target_id: str) -> None:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(
+            timeout=5.0, verify=default_ssl_context()
+        ) as client:
             # best-effort：关不掉也不抛，进程回收会兜底。
             with suppress(httpx.HTTPError):
                 await client.get(f"http://127.0.0.1:{port}/json/close/{target_id}")
