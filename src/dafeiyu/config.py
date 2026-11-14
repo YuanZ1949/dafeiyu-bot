@@ -161,6 +161,13 @@ class MindConfig:
     followup_after_hours: int = 24
     # 同一会话每天最多追问几次，按上海日期计。
     followup_daily_cap: int = 3
+    # 注定没人接的批次（纯表情/超短句/纯链接等）在调模型前被确定性过滤，
+    # 省一整轮模型调用；被 @、引用机器人或回答机器人提问的批次永远豁免。
+    # 设 false 关掉（回到逐批都调模型）。
+    skip_known_silent: bool = True
+    # 上面这条过滤只在「机器人在这么多秒内刚说过话」时生效：刚开口后出现的
+    # 弱批次大概率不是在等你，直接跳过；超出冷却窗的批次照常走模型。
+    skip_silent_cooldown_seconds: int = 90
 
 
 @dataclass(frozen=True)
@@ -223,6 +230,9 @@ class InjectionConfig:
     stances_chars: int = 160
     # 群气氛：确定性统计出来的一行观察，拼进「此刻」；默认关，先灰度。
     atmosphere_enabled: bool = False
+    # 「本群的教训」（本群自省笔记）段的字符预算。计划原文把它放在
+    # memory 段（memory.lessons_chars），与 workspace.* 三段预算不同段。
+    lessons_chars: int = 300
 
 
 @dataclass(frozen=True)
@@ -584,6 +594,66 @@ class MirrorConfig:
     enabled: bool = False
     pairs: tuple[MirrorPairConfig, ...] = ()
     nicknames: tuple[tuple[str, str], ...] = ()
+    # 消息泡（chat-driven-behaviour-fixes IS-5）：别人转来的消息在线上是
+    # 三行圆角框，入库仍是单行「昵称：正文」；关掉即退化为单行形态。
+    bubble_enabled: bool = True
+    # 框的四角字符，顺序：左上/右上/左下/右下。
+    bubble_corner_chars: str = "╭╮╰╯"
+    # 正文按中文显示宽度换行的最大列数。
+    bubble_max_content_width: int = 30
+
+
+@dataclass(frozen=True)
+class LinkBrowserConfig:
+    """本机浏览器渲染（chat-driven-behaviour-fixes T2）：有头最小化 CDP。
+
+    ``mode`` 只接受 ``minimized``：实测无头（哪怕先有头预热再换无头）
+    一律被知乎风控挡掉，所以其它值必须在启动期显式报错，绝不静默降级。
+    """
+
+    enabled: bool = True
+    # 留空 = 自动探测本机已装的 Edge/Chrome，不下载浏览器。
+    binary: str = ""
+    mode: str = "minimized"
+    timeout_seconds: float = 30.0
+    # 单实例空闲这么久后关闭浏览器进程。
+    idle_close_seconds: int = 300
+    # 并发渲染走多标签页，最多同时开这么多个 target。
+    max_targets: int = 2
+    # 独立 user-data-dir：绝不读用户自己的浏览器 profile，也不要求登录。
+    profile_dir: str = "data/link-browser-profile"
+
+
+@dataclass(frozen=True)
+class LinkConfig:
+    """服务端链接解析（chat-driven-behaviour-fixes T1/T6/T8）。
+
+    ``link:`` 段是可选的：老配置没有这一段也要能启动。
+    """
+
+    enabled: bool = True
+    # 单次 HTTP 抓取超时（秒）。
+    timeout_seconds: float = 12.0
+    # 单次抓取的响应体大小上限（字节）；超过按失败处理，不无限下载。
+    max_bytes: int = 2_000_000
+    # 正文进入提示词前的字符上限，防止长文挤占注入预算。
+    max_chars: int = 6000
+    # 缓存目录：URL 哈希命中的 JSON 缓存与 host-failures.json 都落在这里。
+    cache_dir: str = "data/link-cache"
+    # 缓存条目 TTL（秒）；过期视为未命中。
+    cache_ttl_seconds: int = 86400
+    cache_max_entries: int = 500
+    # 缓存目录总大小上限（64 MiB）；超限按最旧淘汰（只针对缓存条目）。
+    cache_max_bytes: int = 67_108_864
+    # 留空 = 请求头用内置的浏览器级 UA；填了则覆盖。
+    user_agent: str = ""
+    # 一批消息里所有 URL 解析的总预算（秒）；超预算的 URL 直接标「读不到」，
+    # 不得拖住回复主链路。
+    total_budget_seconds: float = 20.0
+    # 按 host 记录的失败结论（needs_browser / search_only）保留时长（秒），
+    # 7 天 = 604800；过期后允许重新尝试一次。
+    host_failure_ttl_seconds: int = 604800
+    browser: LinkBrowserConfig = field(default_factory=LinkBrowserConfig)
 
 
 @dataclass(frozen=True)
@@ -625,6 +695,8 @@ class Settings:
     social: SocialConfig = field(default_factory=SocialConfig)
     # 跨群镜像（QQ ↔ 微信群）：默认关闭。追加在最后，保持位置参数兼容。
     mirror: MirrorConfig = field(default_factory=MirrorConfig)
+    # 服务端链接解析：默认全开；缺 ``link:`` 段 = 全默认，老配置无感。
+    link: LinkConfig = field(default_factory=LinkConfig)
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -659,6 +731,13 @@ def _positive_int(value: Any, field: str, default: int) -> int:
     got = _int(default if value is None else value, field)
     if got < 1:
         raise ConfigError(f"{field} 必须大于等于 1")
+    return got
+
+
+def _positive_float(value: Any, field: str, default: float) -> float:
+    got = _float(default if value is None else value, field)
+    if got <= 0:
+        raise ConfigError(f"{field} 必须大于 0")
     return got
 
 
@@ -1021,6 +1100,14 @@ def _build_mind(raw: dict[str, Any]) -> MindConfig:
         followup_daily_cap=_positive_int(
             raw.get("followup_daily_cap"), "mind.followup_daily_cap", 3
         ),
+        skip_known_silent=_bool(
+            raw.get("skip_known_silent", True), "mind.skip_known_silent"
+        ),
+        skip_silent_cooldown_seconds=_positive_int(
+            raw.get("skip_silent_cooldown_seconds"),
+            "mind.skip_silent_cooldown_seconds",
+            90,
+        ),
     )
 
 
@@ -1043,6 +1130,72 @@ def _build_social(raw: dict[str, Any]) -> SocialConfig:
         join_welcome_daily_cap=_positive_int(
             raw.get("join_welcome_daily_cap"), "social.join_welcome_daily_cap", 10
         ),
+    )
+
+
+def _build_link_browser(raw: dict[str, Any]) -> LinkBrowserConfig:
+    """解析 ``link.browser:`` 子段（T2 的本机浏览器渲染参数）。"""
+    # mode 归一化后比较：只接受 minimized。实测无头（哪怕先有头预热再换
+    # 无头）一律被知乎风控挡掉，其它值必须显式报错，绝不静默降级为无头。
+    mode = str(raw.get("mode") or "minimized").strip().casefold()
+    if mode != "minimized":
+        raise ConfigError(
+            "link.browser.mode 只支持 minimized"
+            "（本机只有有头最小化能过知乎风控，不支持无头）"
+        )
+    return LinkBrowserConfig(
+        enabled=_bool(raw.get("enabled", True), "link.browser.enabled"),
+        binary=str(raw.get("binary") or "").strip(),
+        mode=mode,
+        timeout_seconds=_positive_float(
+            raw.get("timeout_seconds"), "link.browser.timeout_seconds", 30.0
+        ),
+        idle_close_seconds=_positive_int(
+            raw.get("idle_close_seconds"), "link.browser.idle_close_seconds", 300
+        ),
+        max_targets=_positive_int(
+            raw.get("max_targets"), "link.browser.max_targets", 2
+        ),
+        profile_dir=str(raw.get("profile_dir") or "data/link-browser-profile").strip(),
+    )
+
+
+def _build_link(raw: object) -> LinkConfig:
+    """解析可选的 ``link:`` 段；缺段 = 全默认，老配置不受影响。"""
+    if raw is None:
+        return LinkConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("config.yaml 的 link 必须是映射")
+    browser_raw = raw.get("browser") or {}
+    if not isinstance(browser_raw, dict):
+        raise ConfigError("config.yaml 的 link.browser 必须是映射")
+    return LinkConfig(
+        enabled=_bool(raw.get("enabled", True), "link.enabled"),
+        timeout_seconds=_positive_float(
+            raw.get("timeout_seconds"), "link.timeout_seconds", 12.0
+        ),
+        max_bytes=_positive_int(raw.get("max_bytes"), "link.max_bytes", 2_000_000),
+        max_chars=_positive_int(raw.get("max_chars"), "link.max_chars", 6000),
+        cache_dir=str(raw.get("cache_dir") or "data/link-cache").strip(),
+        cache_ttl_seconds=_positive_int(
+            raw.get("cache_ttl_seconds"), "link.cache_ttl_seconds", 86400
+        ),
+        cache_max_entries=_positive_int(
+            raw.get("cache_max_entries"), "link.cache_max_entries", 500
+        ),
+        cache_max_bytes=_positive_int(
+            raw.get("cache_max_bytes"), "link.cache_max_bytes", 67_108_864
+        ),
+        user_agent=str(raw.get("user_agent") or "").strip(),
+        total_budget_seconds=_positive_float(
+            raw.get("total_budget_seconds"), "link.total_budget_seconds", 20.0
+        ),
+        host_failure_ttl_seconds=_positive_int(
+            raw.get("host_failure_ttl_seconds"),
+            "link.host_failure_ttl_seconds",
+            604800,
+        ),
+        browser=_build_link_browser(browser_raw),
     )
 
 
@@ -1138,6 +1291,30 @@ def parse_mirror_nicknames(raw: object) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(result.items()))
 
 
+def _mirror_bubble(raw: dict[str, Any]) -> dict[str, Any]:
+    """解析 mirror 的三个 ``bubble_*`` 键（消息泡渲染参数，IS-5）。
+
+    关闭分支与启用分支都要调用：否则配置里设了也读不出来。
+    """
+    corners = raw.get("bubble_corner_chars")
+    corners = "╭╮╰╯" if corners is None else str(corners)
+    if len(corners) != 4:
+        raise ConfigError(
+            "mirror.bubble_corner_chars 必须是 4 个字符（左上/右上/左下/右下）"
+        )
+    return {
+        "bubble_enabled": _bool(
+            raw.get("bubble_enabled", True), "mirror.bubble_enabled"
+        ),
+        "bubble_corner_chars": corners,
+        "bubble_max_content_width": _positive_int(
+            raw.get("bubble_max_content_width"),
+            "mirror.bubble_max_content_width",
+            30,
+        ),
+    }
+
+
 def _build_mirror(
     raw_mirror: object,
     raw_gateway_provider: str,
@@ -1161,13 +1338,22 @@ def _build_mirror(
         # 关闭时不校验（写坏了也不能拦住启动），但能解析出来的配对/昵称照旧保留：
         # 面板重新打开卡片时不用从头再填，运行期仍按 enabled 忽略（MirrorRouter
         # 只在启用时建路由）。解析失败就当没配，绝不因此拒绝启动。
+        # bubble_* 是渲染参数：关闭分支也要解析（设了才读得到）；解析失败
+        # 单独回落默认值，不连累 pairs/nicknames。
+        try:
+            bubble = _mirror_bubble(raw_mirror)
+        except ConfigError:
+            bubble = _mirror_bubble({})
         try:
             pairs = parse_mirror_pairs(raw_mirror.get("pairs"))
             nicknames = parse_mirror_nicknames(raw_mirror.get("nicknames"))
         except ConfigError:
-            return MirrorConfig()
-        return MirrorConfig(enabled=False, pairs=pairs, nicknames=nicknames)
+            return MirrorConfig(**bubble)
+        return MirrorConfig(
+            enabled=False, pairs=pairs, nicknames=nicknames, **bubble
+        )
 
+    bubble = _mirror_bubble(raw_mirror)
     pairs = parse_mirror_pairs(raw_mirror.get("pairs"))
     nicknames = parse_mirror_nicknames(raw_mirror.get("nicknames"))
 
@@ -1193,7 +1379,9 @@ def _build_mirror(
             "mirror.enabled=true 要求微信通道已去节流（gateway.wechat）：" + detail
         )
 
-    return MirrorConfig(enabled=True, pairs=pairs, nicknames=nicknames)
+    return MirrorConfig(
+        enabled=True, pairs=pairs, nicknames=nicknames, **bubble
+    )
 
 
 def _mirror_capability(on: bool, reasons: list[str]) -> str:
@@ -1368,6 +1556,10 @@ def _build_injection(
         ),
         atmosphere_enabled=_bool(
             memory_raw.get("atmosphere_enabled", False), "memory.atmosphere_enabled"
+        ),
+        # 「本群的教训」：计划原文把预算放在 memory 段，不从 workspace 读。
+        lessons_chars=_positive_int(
+            memory_raw.get("lessons_chars"), "memory.lessons_chars", 300
         ),
     )
 
@@ -2396,4 +2588,5 @@ def load_settings(
         mind=mind,
         social=_build_social(raw.get("social") or {}),
         mirror=mirror,
+        link=_build_link(raw.get("link")),
     )

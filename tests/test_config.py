@@ -543,3 +543,139 @@ def test_wechat_self_nicknames_rejects_non_list(tmp_path: Path) -> None:
     yaml = BASE_YAML + "gateway:\n  wechat:\n    self_nicknames: 小菜鱼\n"
     with pytest.raises(ConfigError, match="self_nicknames"):
         load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+
+# ------------------------------------ chat-driven-behaviour-fixes todo 0: 配置键脚手架
+def test_link_defaults_without_section(tmp_path: Path) -> None:
+    """完全不带 ``link:`` 段的配置：全默认值，老配置无感。"""
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+    assert s.link.enabled is True
+    assert s.link.timeout_seconds == 12.0
+    assert s.link.max_bytes == 2_000_000
+    assert s.link.max_chars == 6000
+    assert s.link.cache_dir == "data/link-cache"
+    assert s.link.cache_ttl_seconds == 86400
+    assert s.link.cache_max_entries == 500
+    assert s.link.cache_max_bytes == 67108864
+    assert s.link.user_agent == ""
+    assert s.link.total_budget_seconds == 20.0
+    assert s.link.host_failure_ttl_seconds == 604800
+    assert s.link.browser.enabled is True
+    assert s.link.browser.binary == ""
+    assert s.link.browser.mode == "minimized"
+    assert s.link.browser.timeout_seconds == 30.0
+    assert s.link.browser.idle_close_seconds == 300
+    assert s.link.browser.max_targets == 2
+    assert s.link.browser.profile_dir == "data/link-browser-profile"
+
+
+def test_link_section_is_parsed(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + (
+        "link:\n"
+        "  enabled: true\n"
+        "  timeout_seconds: 5.5\n"
+        "  max_bytes: 1000\n"
+        "  max_chars: 800\n"
+        "  cache_dir: data/other-cache\n"
+        "  cache_ttl_seconds: 60\n"
+        "  cache_max_entries: 10\n"
+        "  cache_max_bytes: 2048\n"
+        "  user_agent: Mozilla/5.0 test\n"
+        "  total_budget_seconds: 9.5\n"
+        "  host_failure_ttl_seconds: 3600\n"
+        "  browser:\n"
+        '    mode: "minimized "\n'  # 带空白：归一化后必须通过
+        "    binary: C:/msedge.exe\n"
+        "    timeout_seconds: 15\n"
+        "    idle_close_seconds: 60\n"
+        "    max_targets: 3\n"
+        "    profile_dir: data/other-profile\n"
+    )
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+    assert s.link.timeout_seconds == 5.5
+    assert s.link.max_bytes == 1000
+    assert s.link.max_chars == 800
+    assert s.link.cache_dir == "data/other-cache"
+    assert s.link.cache_ttl_seconds == 60
+    assert s.link.cache_max_entries == 10
+    assert s.link.cache_max_bytes == 2048
+    assert s.link.user_agent == "Mozilla/5.0 test"
+    assert s.link.total_budget_seconds == 9.5
+    assert s.link.host_failure_ttl_seconds == 3600
+    assert s.link.browser.mode == "minimized"
+    assert s.link.browser.binary == "C:/msedge.exe"
+    assert s.link.browser.timeout_seconds == 15.0
+    assert s.link.browser.idle_close_seconds == 60
+    assert s.link.browser.max_targets == 3
+    assert s.link.browser.profile_dir == "data/other-profile"
+
+
+@pytest.mark.parametrize("mode", ["headless", "HEADLESS", "auto"])
+def test_link_browser_mode_rejects_everything_but_minimized(
+    tmp_path: Path, mode: str
+) -> None:
+    """只接受 minimized：其它值显式报错，绝不静默降级为无头。"""
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + f'link:\n  browser:\n    mode: "{mode}"\n'
+    with pytest.raises(ConfigError, match="minimized"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+
+
+def test_link_missing_section_and_browser_defaults(tmp_path: Path) -> None:
+    """link 段在但 browser 子段缺省：browser 全默认。"""
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + "link:\n  enabled: false\n"
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+    assert s.link.enabled is False
+    assert s.link.browser.mode == "minimized"
+
+
+def test_mirror_bubble_mind_skip_lessons_defaults(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+    assert s.mirror.bubble_enabled is True
+    assert s.mirror.bubble_corner_chars == "╭╮╰╯"
+    assert s.mirror.bubble_max_content_width == 30
+    assert s.mind.skip_known_silent is True
+    assert s.mind.skip_silent_cooldown_seconds == 90
+    assert s.injection.lessons_chars == 300
+
+
+def test_mirror_bubble_mind_skip_lessons_overrides(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML.replace(
+        "  extract_every: 20",
+        "  extract_every: 20\n  lessons_chars: 250",
+    ) + (
+        "mirror:\n"
+        "  bubble_enabled: false\n"
+        '  bubble_corner_chars: "┌┐└┘"\n'
+        "  bubble_max_content_width: 40\n"
+        "mind:\n"
+        "  skip_known_silent: false\n"
+        "  skip_silent_cooldown_seconds: 45\n"
+    )
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+    assert s.mirror.bubble_enabled is False
+    assert s.mirror.bubble_corner_chars == "┌┐└┘"
+    assert s.mirror.bubble_max_content_width == 40
+    assert s.mind.skip_known_silent is False
+    assert s.mind.skip_silent_cooldown_seconds == 45
+    assert s.injection.lessons_chars == 250
+
+
+def test_mirror_bubble_keys_parsed_even_when_mirror_disabled(tmp_path: Path) -> None:
+    """镜像整体关闭的早退分支也必须解析 bubble_*，否则设了也读不出来。"""
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + (
+        "mirror:\n"
+        "  enabled: false\n"
+        "  bubble_enabled: false\n"
+        "  bubble_max_content_width: 45\n"
+    )
+    s = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+    assert s.mirror.enabled is False
+    assert s.mirror.bubble_enabled is False
+    assert s.mirror.bubble_max_content_width == 45

@@ -173,6 +173,62 @@ mirror:
   # 也可以在面板「群互通（镜像）」卡片里改，面板的改动落在 data/settings.local.yaml。
   # nicknames:
   #   "qq:123456789": 老鱼
+  # 消息泡：只套在「别人转来」的消息上——线上是三行圆角框，入库仍是单行
+  # 「昵称：正文」（模型解析与检索不受多行内容影响）。
+  # 默认 true；设 false 关掉，退化为今天的单行形态。
+  bubble_enabled: true
+  # 框的四角字符，顺序：左上/右上/左下/右下；默认 ╭╮╰╯，必须给足 4 个字符。
+  bubble_corner_chars: "╭╮╰╯"
+  # 正文按中文显示宽度换行的最大列数；默认 30（窄窗口也不易折行错位），最小 1。
+  bubble_max_content_width: 30
+
+# 服务端链接解析（chat-driven-behaviour-fixes）：群里出现链接时，由 bot 进程
+# 先做两级抓取（HTTP 直抓 → 本机 Edge 有头最小化渲染），两级都失败才把
+# 「请用 websearch 搜主题 / 一句话回退」的降级指令交给模型。
+# 缺这一段也能启动——所有字段都有默认值；link.enabled: false 整条链关闭。
+link:
+  enabled: true
+  # 单次 HTTP 抓取超时（秒）；默认 12，普通网页够用又不会拖住回复太久。
+  timeout_seconds: 12
+  # 单次抓取响应体大小上限（字节，默认 2MB）；超过按失败处理，不无限下载。
+  max_bytes: 2000000
+  # 正文进入提示词前的字符上限；默认 6000，防止长文挤占注入预算。
+  max_chars: 6000
+  # 缓存目录：URL 哈希命中的 JSON 缓存与 host-failures.json（失败结论）都落这里。
+  cache_dir: data/link-cache
+  # 缓存条目 TTL（秒）；默认 86400（1 天），过期视为未命中重新抓。
+  cache_ttl_seconds: 86400
+  # 缓存条目数上限；默认 500，超限按最旧淘汰，防止长期运行无限增长。
+  cache_max_entries: 500
+  # 缓存目录总大小上限（字节，默认 64MiB）；超限同样按最旧淘汰。
+  cache_max_bytes: 67108864
+  # 留空 = 用内置的浏览器级 User-Agent（实测 B 站默认 UA 412、浏览器 UA 200）；
+  # 填了则覆盖。想伪装成别的客户端时才需要改。
+  user_agent: ""
+  # 一批消息里所有 URL 解析的总预算（秒，浮点）；默认 20，超预算的 URL 直接标
+  # 「服务器读不到」，不得拖住回复主链路。
+  total_budget_seconds: 20
+  # 按 host 记录的失败结论保留时长（秒）；默认 604800（7 天），过期后允许重试。
+  # 设 0 不合法（必须 >=1）；想尽快忘掉失败结论就调小。
+  host_failure_ttl_seconds: 604800
+  browser:
+    # 本机浏览器渲染层：有头最小化 CDP（不下载浏览器、不装 Playwright、
+    # 不读用户自己的 profile、不要求登录）。link.browser.enabled: false 关掉
+    # 这一层（届时降级为搜索兜底；无桌面会话的 Windows 服务部署必须关）。
+    enabled: true
+    # 留空 = 自动探测本机已装的 Edge/Chrome；填可执行文件路径则用它。
+    binary: ""
+    # 只支持 minimized：实测无头（哪怕先有头预热再换无头）一律被知乎风控
+    # 挡掉，所以其它任何值都会在启动时报错，绝不静默降级为无头。
+    mode: minimized
+    # 单个标签页的渲染超时（秒，浮点）；默认 30，知乎慢加载也够。
+    timeout_seconds: 30
+    # 单实例空闲这么多秒后关闭浏览器进程；默认 300，省内存又不频繁重启。
+    idle_close_seconds: 300
+    # 并发渲染最多同时开的标签页数；默认 2，再高会加重桌面负担。
+    max_targets: 2
+    # 独立的浏览器 profile 目录（--user-data-dir），绝不复用你自己的浏览器数据。
+    profile_dir: data/link-browser-profile
 
 opencode:
   # 留空自动找 npm 全局安装的 opencode.exe
@@ -395,6 +451,9 @@ memory:
   stance_chars: 160
   # 群气氛：把最近 10 分钟的消息量/人数/问句比例拼进「此刻」；默认关。
   atmosphere_enabled: false
+  # 「本群的教训」（机器人自己写的复盘笔记）段的字符预算，默认 300——
+  # 够装 3-5 条教训，又不至于挤掉其它注入段。设更大值会挤压「正在聊的事」。
+  lessons_chars: 300
 
 # 心智层（P1）：默认全关，灰度打开；关掉即回到当前行为（软回滚）。
 # 缺这一段也能启动——所有字段都有默认值。
@@ -429,6 +488,14 @@ mind:
   followup_after_hours: 24
   # 同一会话每日最多主动跟进几次（按上海日期计）。
   followup_daily_cap: 3
+  # 注定没人接的批次（纯表情/超短句/纯链接等）在调模型前被确定性过滤，
+  # 省一整轮模型调用；被 @、引用机器人或回答机器人提问的批次永远豁免。
+  # 默认 true；设 false 关掉（回到逐批都调模型）。
+  skip_known_silent: true
+  # 上面这条过滤只在「机器人在这么多秒内刚说过话」时生效：刚开口后出现的
+  # 弱批次大概率不是在等你，直接跳过；超出冷却窗的批次照常走模型。
+  # 默认 90；调小更省调用、也更容易误跳，调大更保守。
+  skip_silent_cooldown_seconds: 90
 
 # 面板「聊天行为」卡片可实时改；这里的值只是默认值，面板改动写
 # data/settings.local.yaml，重启后仍然保留。
