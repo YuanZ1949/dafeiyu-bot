@@ -543,3 +543,69 @@ def test_html_has_no_hex_colors_outside_the_theme_blocks() -> None:
     )
     assert set(re.findall(r"#[0-9a-fA-F]{3,8}\b", rest)) <= {"#fff"}
 
+
+# ------------------------------------------------- 气泡排版与通道配色契约
+
+
+def css_rule(style: str, selector: str) -> str:
+    """取出一条 CSS 规则的声明体（选择器按字面匹配，允许多选择器共用）。"""
+    match = re.search(rf"(?:^|\n)  {re.escape(selector)} \{{(.*?)\n  \}}", style, re.DOTALL)
+    assert match is not None, f"缺少 CSS 规则 {selector}"
+    return match.group(1)
+
+
+def mobile_block() -> str:
+    style = style_block()
+    start = style.index("@media (max-width: 720px) {")
+    depth = 0
+    for index in range(start, len(style)):
+        if style[index] == "{":
+            depth += 1
+        elif style[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return style[start : index + 1]
+    raise AssertionError("媒体查询块没有闭合")
+
+
+def test_html_bubble_width_comes_from_content() -> None:
+    style = style_block()
+    assert "justify-items: start" in css_rule(style, ".timeline-body")
+    bubble = css_rule(style, ".timeline-msg")
+    assert "width: fit-content" in bubble
+    assert "max-width: min(72ch, 88%)" in bubble
+    # 日期分隔条是兄弟 grid item：必须跨满整行，否则虚线塌成一个字宽。
+    date = css_rule(style, ".timeline-date")
+    assert "grid-column: 1 / -1" in date
+    assert "justify-self: stretch" in date
+
+
+def test_html_bot_bubble_aligns_right_on_every_viewport() -> None:
+    style = style_block()
+    assert "justify-self: end" in css_rule(style, ".timeline-msg.bot")
+    # 手机端曾经用 max-width:100% 把宽度拉满、顺带让 bot 靠左，不能再回来。
+    mobile = mobile_block()
+    assert ".timeline-msg" not in mobile or "max-width: 100%" not in mobile
+    assert "margin-left: auto" not in css_rule(style, ".timeline-msg.bot")
+
+
+def test_html_channel_colors_are_scoped_to_the_channel_attribute() -> None:
+    style = style_block()
+    for channel, token in (("qq", "--accent"), ("wechat", "--ok")):
+        tag = css_rule(style, f'.chan-tag[data-channel="{channel}"]')
+        assert token in tag
+        bubble = css_rule(style, f'.timeline-msg[data-channel="{channel}"]')
+        assert token in bubble
+
+
+def test_html_timeline_bubbles_carry_the_channel() -> None:
+    html = read_html()
+    match = re.search(
+        r"function renderTimelineMessages\(messages, channel\) \{(.*?)\n\}", html, re.DOTALL
+    )
+    assert match is not None, "renderTimelineMessages 必须接收并写入 channel"
+    body = match.group(1)
+    assert "item.dataset.channel = channel" in body
+    assert "channelOfId(timelineTarget.chat_id)" in html
+
+
