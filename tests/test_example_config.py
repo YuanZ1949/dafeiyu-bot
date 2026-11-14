@@ -133,3 +133,32 @@ def test_example_config_new_behaviour_keys(tmp_path, monkeypatch):
 def test_example_config_contains_new_keys(fragment: str) -> None:
     text = EXAMPLE.read_text(encoding="utf-8")
     assert fragment in text
+
+
+# ------------------------------------ hotchat-lifetime-panel-redesign todo 23: 文档 / 模板 / 代码三方口径
+README = Path(__file__).resolve().parents[1] / "README.md"
+
+
+def test_readme_persona_hold_max_seconds_matches_code() -> None:
+    """README 写的 persona 字段必须在 config.py 里真实存在（防文档漂移）。
+
+    既有守卫只覆盖 ``gateway.wechat`` 的字段集合，persona 段没有同类断言，
+    所以这里单独钉一次「文档里出现的键 = 代码里的字段」。
+    """
+    from dafeiyu.config import PersonaConfig
+
+    text = README.read_text(encoding="utf-8")
+    assert "`persona.hold_max_seconds`" in text
+    assert "`persona.opportunity_guard`" in text
+
+    persona_fields = {field.name for field in dataclasses.fields(PersonaConfig)}
+    assert "hold_max_seconds" in persona_fields
+
+
+def test_example_config_persona_hold_max_seconds(tmp_path, monkeypatch):
+    """模板里必须有 persona.hold_max_seconds，且 persona 解析能读出这个键。"""
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    assert raw["persona"]["hold_max_seconds"] == 300
+
+    settings = _load_example(tmp_path, monkeypatch)
+    assert settings.persona.hold_max_seconds == 300
