@@ -1133,3 +1133,109 @@ async def test_qq_segment_failure_still_uploads_files(tmp_path: Path) -> None:
     assert router.stats()["dropped"] == 1
 
 
+# ------------------------------- 丢失计数与留痕（I-4）
+
+
+async def test_unsupported_media_counts_dropped_and_records_message_id(
+    tmp_path: Path,
+) -> None:
+    """桥明确拒收图片：计 dropped 且失败环带源消息 id（G4）。"""
+    router, _store = make_router(
+        tmp_path,
+        wechat=FakeChannelAdapter(bot_id="wxg:self", media=True, media_ok=False),
+    )
+    place(tmp_path, "images/x.png")
+
+    await router._deliver(
+        make_item(
+            source_channel="qq",
+            attachments=(
+                Attachment(kind="image", path="images/x.png", name="x.png"),
+            ),
+        )
+    )
+
+    stats = router.stats()
+    assert stats["dropped"] == 1
+    failure = stats["recent_failures"][0]
+    assert failure["code"] == "unsupported_media"
+    assert failure["kind"] == "媒体发送"
+    assert failure["message_id"] == "m1"
+
+
+async def test_text_failure_records_message_id(tmp_path: Path) -> None:
+    """文本发送失败也要带源消息 id，便于按消息补发（G4）。"""
+    router, _store = make_router(tmp_path)
+    adapter = router.adapters["wechat"]
+
+    async def boom(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("text down")
+
+    adapter.send = boom
+
+    await router._deliver(make_item(source_channel="qq", text_lines=("你好",)))
+
+    stats = router.stats()
+    assert stats["dropped"] == 1
+    failure = stats["recent_failures"][0]
+    assert failure["code"] == "error"
+    assert failure["message_id"] == "m1"
+
+
+class FailingUploader(UploadRecorder):
+    """文件上传必失败：验证 dropped 计数与留痕。"""
+
+    async def upload_file(
+        self, chat_type: ChatType, chat_id: str, path: str, *, name: str = ""
+    ) -> None:
+        raise RuntimeError("upload down")
+
+
+async def test_upload_file_failure_counts_dropped_and_records_message_id(
+    tmp_path: Path,
+) -> None:
+    """文件上传失败以前完全静默：现在必须计 dropped 且留痕（G4）。"""
+    qq = FailingUploader()
+    router, _store = make_router(tmp_path, qq=qq)
+    place(tmp_path, "files/doc.pdf", b"%PDF-1.4")
+
+    await router._deliver(
+        make_item(
+            source_channel="wechat",
+            kind="file",
+            attachments=(
+                Attachment(kind="file", path="files/doc.pdf", name="doc.pdf"),
+            ),
+        )
+    )
+
+    stats = router.stats()
+    assert stats["dropped"] == 1
+    failure = stats["recent_failures"][0]
+    assert failure["code"] == "error"
+    assert failure["kind"] == "文件上传"
+    assert failure["message_id"] == "m1"
+
+
+async def test_unreadable_media_records_message_id(tmp_path: Path) -> None:
+    """源文件缺失＝真丢图：计 dropped 并留 media_unreadable（G4）。"""
+    router, _store = make_router(tmp_path)
+
+    await router._deliver(
+        make_item(
+            source_channel="qq",
+            attachments=(
+                Attachment(
+                    kind="image", path="images/missing.png", name="missing.png"
+                ),
+            ),
+        )
+    )
+
+    stats = router.stats()
+    assert stats["dropped"] == 1
+    failure = stats["recent_failures"][0]
+    assert failure["code"] == "media_unreadable"
+    assert failure["message_id"] == "m1"
+
+

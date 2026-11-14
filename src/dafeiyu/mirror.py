@@ -679,9 +679,14 @@ class MirrorRouter:
         }
 
     def _record_failure(
-        self, chat_id: str, label: str, code: str, detail: str = ""
+        self,
+        chat_id: str,
+        label: str,
+        code: str,
+        detail: str = "",
+        message_id: str = "",
     ) -> None:
-        """记一条最近失败：只有错误码/目标/动作，不含消息正文或昵称。"""
+        """记一条最近失败：错误码/目标/动作/消息 id，不含消息正文或昵称。"""
         target = str(chat_id or "")
         if target.startswith("wxg:"):
             direction = "qq->wechat"
@@ -698,6 +703,7 @@ class MirrorRouter:
                 "kind": label,
                 "code": code,
                 "detail": detail[:200],
+                "message_id": str(message_id or ""),
             }
         )
 
@@ -1012,6 +1018,15 @@ class MirrorRouter:
                 continue
             resolved = media.resolve_media_path(self.settings, attachment)
             if resolved is None:
+                # 目标侧读不到源文件＝这张图/文件真的丢了：必须留痕（I-4）。
+                self._counters["dropped"] += 1
+                self._record_failure(
+                    item.target_chat_id,
+                    kind,
+                    "media_unreadable",
+                    attachment.name,
+                    message_id=item.source_message_id,
+                )
                 continue
             prepared = replace(attachment, path=str(resolved))
             if kind == "file":
@@ -1033,6 +1048,7 @@ class MirrorRouter:
                 ),
                 "消息段发送",
                 item.target_chat_id,
+                item.source_message_id,
             )
             if not ok:
                 self._counters["dropped"] += 1
@@ -1052,7 +1068,7 @@ class MirrorRouter:
             await self._send_lines(item, adapter, rendered)
 
         for attachment in files:
-            await self._send_with_retry(
+            ok, _result = await self._send_with_retry(
                 adapter,
                 lambda a=attachment: adapter.upload_file(
                     ChatType.GROUP,
@@ -1062,7 +1078,11 @@ class MirrorRouter:
                 ),
                 "文件上传",
                 item.target_chat_id,
+                item.source_message_id,
             )
+            if not ok:
+                # 文件/照片上传失败以前完全静默：这里补上计数与留痕（I-4）。
+                self._counters["dropped"] += 1
 
     # ------------------------------------------------------------ 目标微信
     async def _deliver_wechat(
@@ -1083,29 +1103,65 @@ class MirrorRouter:
                 continue
             resolved = media.resolve_media_path(self.settings, attachment)
             if resolved is None:
+                # 目标侧读不到源文件＝这张图/文件真的丢了：必须留痕（I-4）。
+                self._counters["dropped"] += 1
+                self._record_failure(
+                    item.target_chat_id,
+                    kind,
+                    "media_unreadable",
+                    attachment.name,
+                    message_id=item.source_message_id,
+                )
                 continue
             path = str(resolved)
             name = attachment.name or ""
             if kind == "video":
                 # 微信 hook 没有视频原语：把原文件当「文件」发，至少能看能下载；
                 # hook 拒收/超限时不再重试，说明行里的 [视频] 占位就是全部。
-                await self._send_media(
-                    adapter, item.target_chat_id, "file", path, name
-                )
-                continue
-            if kind == "sticker":
                 ok = await self._send_media(
-                    adapter, item.target_chat_id, "sticker", path, name
+                    adapter,
+                    item.target_chat_id,
+                    "file",
+                    path,
+                    name,
+                    message_id=item.source_message_id,
                 )
                 if not ok:
-                    # 微信 hook 的 sticker 可能不被接受：降级当图片再试一次。
-                    await self._send_media(
-                        adapter, item.target_chat_id, "image", path, name
-                    )
+                    self._counters["dropped"] += 1
                 continue
-            await self._send_media(
-                adapter, item.target_chat_id, kind, path, name
+            if kind == "sticker":
+                delivered = await self._send_media(
+                    adapter,
+                    item.target_chat_id,
+                    "sticker",
+                    path,
+                    name,
+                    message_id=item.source_message_id,
+                )
+                if not delivered:
+                    # 微信 hook 的 sticker 可能不被接受：降级当图片再试一次。
+                    delivered = await self._send_media(
+                        adapter,
+                        item.target_chat_id,
+                        "image",
+                        path,
+                        name,
+                        message_id=item.source_message_id,
+                    )
+                if not delivered:
+                    self._counters["dropped"] += 1
+                continue
+            ok = await self._send_media(
+                adapter,
+                item.target_chat_id,
+                kind,
+                path,
+                name,
+                message_id=item.source_message_id,
             )
+            if not ok:
+                # 图片/语音发送失败以前完全静默：补上计数（I-4）。
+                self._counters["dropped"] += 1
 
     async def _send_lines(
         self, item: MirrorItem, adapter: Any, rendered: RenderedLines
@@ -1116,7 +1172,10 @@ class MirrorRouter:
             zip(rendered.wire, rendered.store)
         ):
             ok, message_id = await self._send_text(
-                adapter, item.target_chat_id, wire_text
+                adapter,
+                item.target_chat_id,
+                wire_text,
+                item.source_message_id,
             )
             if not ok:
                 self._counters["dropped"] += 1
@@ -1137,8 +1196,19 @@ class MirrorRouter:
         kind: str,
         path: str,
         name: str,
+        *,
+        message_id: str = "",
     ) -> bool:
         if not callable(getattr(adapter, "send_media", None)):
+            # 目标通道根本没有媒体原语：也算一次真实的丢失，必须留痕。
+            self._record_failure(
+                chat_id,
+                "媒体发送",
+                "unsupported_media",
+                "no_send_media",
+                message_id=message_id,
+            )
+            log.info("镜像目标通道没有 send_media：%s kind=%s", chat_id, kind)
             return False
         ok, result = await self._send_with_retry(
             adapter,
@@ -1147,23 +1217,36 @@ class MirrorRouter:
             ),
             "媒体发送",
             chat_id,
+            message_id,
         )
         if not ok:
             return False
         if result is False:
-            # 桥明确说不支持：不重试，也不补第二条占位。
+            # 桥明确说不支持：不重试，也不补第二条占位；但要留痕（含消息 id）。
+            self._record_failure(
+                chat_id,
+                "媒体发送",
+                "unsupported_media",
+                kind,
+                message_id=message_id,
+            )
             log.info("镜像媒体被目标通道拒绝（不重试，保留占位）：%s kind=%s", chat_id, kind)
             return False
         return True
 
     async def _send_text(
-        self, adapter: Any, chat_id: str, text: str
+        self,
+        adapter: Any,
+        chat_id: str,
+        text: str,
+        message_id: str = "",
     ) -> tuple[bool, str | None]:
         ok, result = await self._send_with_retry(
             adapter,
             lambda: adapter.send(ChatType.GROUP, chat_id, text),
             "发送",
             chat_id,
+            message_id,
         )
         if not ok:
             return False, None
@@ -1175,6 +1258,7 @@ class MirrorRouter:
         action: Callable[[], Awaitable[Any]],
         label: str,
         chat_id: str,
+        message_id: str = "",
     ) -> tuple[bool, Any]:
         """所有出站动作共用的超时/重试/终态分类（与 T3 文本发送一致）。"""
         attempt = 0
@@ -1186,12 +1270,22 @@ class MirrorRouter:
                 raise
             except TimeoutError:
                 self._counters["degraded"] += 1
-                self._record_failure(chat_id, label, "timeout")
+                self._record_failure(
+                    chat_id, label, "timeout", message_id=message_id
+                )
                 log.warning("镜像%s超时（结果未知，不重试）：%s", label, chat_id)
                 return False, None
             except Exception as exc:  # noqa: BLE001 - 按错误码分类
                 code = self._error_code(exc, adapter)
                 if code == "unsupported_media":
+                    # 明确「不支持」也是丢一次：不重试，但要能被面板/告警看见。
+                    self._record_failure(
+                        chat_id,
+                        label,
+                        "unsupported_media",
+                        str(exc),
+                        message_id=message_id,
+                    )
                     log.info(
                         "镜像目标不支持该媒体（不重试）：%s %s", chat_id, exc
                     )
@@ -1216,7 +1310,11 @@ class MirrorRouter:
                         continue
                 self._counters["degraded"] += 1
                 self._record_failure(
-                    chat_id, label, code or "error", str(exc)
+                    chat_id,
+                    label,
+                    code or "error",
+                    str(exc),
+                    message_id=message_id,
                 )
                 if code == "rate_limited":
                     log.warning(
