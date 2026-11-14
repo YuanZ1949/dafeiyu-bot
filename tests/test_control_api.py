@@ -2088,3 +2088,70 @@ async def test_delete_user_messages_hides_store_errors(
     assert "secret_sql" not in data["error"]
     assert "sqlite" not in data["error"].lower()
     assert "删除" in data["error"]
+
+
+async def test_holds_endpoint_reports_pending_counts(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    now = int(time.time())
+    _seed_message(control.store, "seed", "上线前", timestamp=now - 3600)
+    control.store.mark_delivered(ChatType.GROUP, 100, "seed")
+    _seed_message(control.store, "m1", "攒着的第一条", timestamp=now - 120)
+    _seed_message(control.store, "m2", "攒着的第二条", timestamp=now - 60)
+    control.store.record_decision(
+        ChatType.GROUP, "100", outcome="held", checkpoint="opportunity_hold"
+    )
+
+    async with running(app) as client:
+        resp = await client.get("/api/holds")
+        payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload["total"] == 1
+    item = payload["items"][0]
+    assert item["chat_type"] == "group"
+    assert item["chat_id"] == "100"
+    assert item["count"] == 2
+    assert 115 <= item["age_seconds"] <= 200
+    assert item["state"] == "held"
+    assert item["checkpoint"] == "opportunity_hold"
+    assert item["held_since"] is not None
+
+
+async def test_holds_endpoint_is_empty_without_backlog(tmp_path: Path) -> None:
+    _, _, app = make_control(tmp_path)
+
+    async with running(app) as client:
+        payload = await (await client.get("/api/holds")).json()
+
+    assert payload == {"items": [], "total": 0}
+
+
+async def test_holds_endpoint_marks_queued_chats_as_pending(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    now = int(time.time())
+    _seed_message(control.store, "seed", "上线前", timestamp=now - 3600)
+    control.store.mark_delivered(ChatType.GROUP, 100, "seed")
+    _seed_message(control.store, "m1", "刚进队列", timestamp=now - 5)
+    control.store.record_decision(ChatType.GROUP, "100", outcome="replied")
+
+    async with running(app) as client:
+        item = (await (await client.get("/api/holds")).json())["items"][0]
+
+    assert item["state"] == "pending"
+    assert item["checkpoint"] == ""
+
+
+async def test_holds_endpoint_drops_delivered_chats(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    now = int(time.time())
+    _seed_message(control.store, "seed", "上线前", timestamp=now - 3600)
+    control.store.mark_delivered(ChatType.GROUP, 100, "seed")
+    _seed_message(control.store, "m1", "攒着的", timestamp=now - 120)
+
+    async with running(app) as client:
+        before = await (await client.get("/api/holds")).json()
+        control.store.mark_delivered(ChatType.GROUP, 100, "m1")
+        after = await (await client.get("/api/holds")).json()
+
+    assert before["total"] == 1
+    assert after == {"items": [], "total": 0}

@@ -1908,6 +1908,46 @@ class BrainControl:
             "offset": offset,
         }
 
+    def holds_snapshot(self) -> dict[str, Any]:
+        """攒着中的会话：条数、已攒秒数，以及「真在攒着 / 只是待投」。
+
+        ``state`` 只按该会话**最新一条**决策判定（``held`` = 真的在攒着）。
+        绝不能统计 ``held`` 行数：``record_decision`` 对同类 held 有 60 秒去重，
+        按行数算出来的「攒了多久」必然偏小。
+        """
+        now_ts = int(time.time())
+        latest = {
+            (row["chat_type"], row["chat_id"]): row
+            for row in self.store.latest_decision_per_chat()
+        }
+        items: list[dict[str, Any]] = []
+        for info in self.store.pending_hold_info():
+            chat_type = info["chat_type"]
+            chat_id = info["chat_id"]
+            oldest = info["oldest_ts"]
+            state = "pending"
+            checkpoint = ""
+            held_since: float | None = None
+            decision = latest.get((chat_type, chat_id))
+            if decision is not None and decision["outcome"] == "held":
+                state = "held"
+                checkpoint = str(decision["checkpoint"])
+                held_since = float(decision["created_at"])
+            items.append(
+                {
+                    "chat_type": chat_type.value,
+                    "chat_id": chat_id,
+                    "count": int(info["count"]),
+                    "oldest_ts": oldest,
+                    "age_seconds": max(0, now_ts - int(oldest)) if oldest else 0,
+                    "state": state,
+                    "checkpoint": checkpoint,
+                    "held_since": held_since,
+                }
+            )
+        items.sort(key=lambda item: item["age_seconds"], reverse=True)
+        return {"items": items, "total": len(items)}
+
     async def session_action(
         self, action: str, chat_type: ChatType, chat_id: str
     ) -> dict[str, Any]:
@@ -3135,6 +3175,15 @@ def create_app(
                 {"error": f"读取会话失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def holds(_: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.holds_snapshot())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取攒着会话失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取攒着会话失败：{exc.__class__.__name__}"}, status=500
+            )
+
     async def timeline(request: web.Request) -> web.Response:
         chat_type, chat_id, error = _path_target(request)
         if error is not None:
@@ -3509,6 +3558,7 @@ def create_app(
     app.router.add_get("/api/memory/search", search_messages)
     app.router.add_get("/api/memory/export", export_memory)
     app.router.add_get("/api/sessions", sessions)
+    app.router.add_get("/api/holds", holds)
     app.router.add_get(
         "/api/sessions/{chat_type}/{chat_id}/timeline", timeline
     )

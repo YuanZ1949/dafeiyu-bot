@@ -747,6 +747,9 @@ def create_app(
     async def sessions(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/sessions")
 
+    async def holds(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/holds")
+
     async def debug_trigger(request: web.Request) -> web.Response:
         payload = await _json_body(request)
         if payload is None:
@@ -1261,6 +1264,7 @@ def create_app(
     app.router.add_post("/api/memory/unblock", memory_unblock)
     app.router.add_get("/api/memory/export", memory_export)
     app.router.add_get("/api/sessions", sessions)
+    app.router.add_get("/api/holds", holds)
     app.router.add_post("/api/debug/trigger", debug_trigger)
     app.router.add_post("/api/debug/batch", debug_batch)
     app.router.add_get(

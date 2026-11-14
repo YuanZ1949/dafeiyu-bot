@@ -1345,3 +1345,39 @@ async def test_index_has_mind_and_unblock_controls(tmp_path: Path) -> None:
     assert "/api/mind" in text
     assert "/api/workspace/file" in text
 
+
+
+async def test_holds_proxy_forwards_bot_payload(tmp_path: Path) -> None:
+    payload = {
+        "items": [
+            {
+                "chat_type": "group",
+                "chat_id": "100",
+                "count": 2,
+                "oldest_ts": 1_700_000_000,
+                "age_seconds": 90,
+                "state": "held",
+                "checkpoint": "opportunity_hold",
+                "held_since": 1_700_000_000.5,
+            }
+        ],
+        "total": 1,
+    }
+
+    async def holds_endpoint(_: web.Request) -> web.Response:
+        return web.json_response(payload)
+
+    bot_app = web.Application()
+    bot_app.router.add_get("/api/holds", holds_endpoint)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    try:
+        app, _, _ = make_app(tmp_path, bot_url=url)
+        async with running(app) as client:
+            resp = await client.get("/api/holds")
+            data = await resp.json()
+        assert resp.status == 200
+        assert data == payload
+    finally:
+        await bot_client.close()

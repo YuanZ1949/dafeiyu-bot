@@ -1972,8 +1972,10 @@ class Store:
         ).fetchall()
         return [
             {
-                "chat_type": str(row["chat_type"]),
-                "chat_id": row["chat_id"],
+                # 与其它查询一致地还原成 ChatType：调用方要拿它当 dict 键和
+                # ChatType 版的行对齐，混着裸字符串会因枚举的 hash 规则查不到。
+                "chat_type": ChatType(str(row["chat_type"])),
+                "chat_id": str(row["chat_id"]),
                 "count": int(row["pending_count"]),
                 "oldest_ts": (
                     None if row["oldest_ts"] is None else int(row["oldest_ts"])
@@ -4710,8 +4712,8 @@ class Store:
         ).fetchall()
         return [
             {
-                "chat_type": str(row["chat_type"]),
-                "chat_id": row["chat_id"],
+                "chat_type": ChatType(str(row["chat_type"])),
+                "chat_id": str(row["chat_id"]),
                 "outcome": str(row["outcome"]),
                 "checkpoint": str(row["checkpoint"]),
                 "created_at": float(row["created_at"]),
