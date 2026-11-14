@@ -198,7 +198,7 @@ def test_personas_share_discussion_principle() -> None:
     """两份人设都必须带「综合评论」原则，防止只改一处再次漂移。"""
     persona = PERSONA_FILE.read_text(encoding="utf-8")
     agent = AGENT_FILE.read_text(encoding="utf-8")
-    for marker in ("这段讨论缺什么", "不是逐条应答", "反套路"):
+    for marker in ("这段讨论缺什么", "不是对最后一条的应答", "反套路"):
         assert marker in persona, f"persona.md 缺少 {marker}"
         assert marker in agent, f"deepseek-qq.md 缺少 {marker}"
 

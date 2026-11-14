@@ -90,6 +90,21 @@ def test_persona_file_has_no_control_bytes() -> None:
     assert "read/edit" in text
 
 
+def test_persona_has_link_protocol() -> None:
+    """T5：链接读取协议（一次直抓 → 改搜索 → 一句话回退）写进「六、什么时候才查」。"""
+    text = load_persona()
+    for needle in (
+        "最多直抓一次",
+        "websearch",
+        "不要再",
+        "把这一批当成一段讨论",
+        "不是对最后一条的应答",
+        "【链接内容】",
+        "这链接本机读不到",
+    ):
+        assert needle in text, needle
+
+
 def test_opencode_agent_default_stays_in_sync() -> None:
     """opencode 的人设文件自带默认值，改 DEFAULT_OS_PROBABILITY 时要一起改。"""
     repo_root = Path(__file__).resolve().parents[1]

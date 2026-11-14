@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,9 @@ import yaml
 from dafeiyu.brain.provider_config import (
     AGENT_MARK,
     AGENT_MARK_SCAN_LINES,
+    agent_path,
     build_agent,
+    ensure_agent_files,
     write_generated,
 )
 
@@ -126,3 +129,66 @@ def test_repo_chat_agent_is_up_to_date() -> None:
         "free", lean=False, template=CHAT_AGENT_TEMPLATE.read_text(encoding="utf-8")
     )
     assert text == generated
+
+
+# ---- T5：链接读取协议与批次讨论措辞（渲染到临时 root，不碰仓库生成物） -------
+
+
+def _agent_settings(tmp_path: Path):
+    from dafeiyu.config import load_settings
+
+    config = tmp_path / "config.yaml"
+    # load_settings 要求的段与 test_config_agents.BASE 相同：缺一段就抛 ConfigError。
+    config.write_text(
+        "persona:\n"
+        "  name: 大肥鱼\n"
+        "  aliases: [肥鱼]\n"
+        "  os_probability: 0.05\n"
+        "  max_reply_chars: 120\n"
+        "  max_reply_chars_technical: 300\n"
+        "  reply_hard_part: 500\n"
+        "  reply_hard_total: 2000\n"
+        "triggers:\n"
+        "  cooldown_seconds: 60\n"
+        "  sample_rate: 0.05\n"
+        "  quiet_hours: [\"01:00\", \"07:00\"]\n"
+        "  keywords: [怎么]\n"
+        "groups:\n"
+        "  whitelist: []\n"
+        "  blacklist: []\n"
+        "budget:\n"
+        "  daily_calls: 200\n"
+        "  daily_tokens: 300000\n"
+        "memory:\n"
+        "  window_size: 20\n"
+        "logging:\n"
+        "  level: INFO\n",
+        encoding="utf-8",
+    )
+    env_file = tmp_path / "test.env"
+    env_file.write_text("DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n", encoding="utf-8")
+    return load_settings(env_file=env_file, config_file=config)
+
+
+def test_ensure_agent_files_renders_link_protocol(tmp_path: Path) -> None:
+    """渲染出的 agent 文件必须同时带上四处新措辞；只对临时 root 调用，绝不碰仓库根。"""
+    settings = _agent_settings(tmp_path)
+    ensure_agent_files(settings, root=tmp_path)
+    text = agent_path(tmp_path).read_text(encoding="utf-8")
+    for needle in ("最多直抓一次", "websearch", "不要再", "把这一批当成一段讨论"):
+        assert needle in text, needle
+
+
+def test_ensure_agent_files_has_no_unresolved_placeholders(tmp_path: Path) -> None:
+    settings = _agent_settings(tmp_path)
+    ensure_agent_files(settings, root=tmp_path)
+    text = agent_path(tmp_path).read_text(encoding="utf-8")
+    assert re.search(r"\$[a-z_]+", text) is None
+
+
+def test_ensure_agent_files_renders_reply_hard_part_from_config(tmp_path: Path) -> None:
+    """reply_hard_part 必须仍按配置渲染为数字：证明本次改动没碰长度配置。"""
+    settings = _agent_settings(tmp_path)
+    ensure_agent_files(settings, root=tmp_path)
+    text = agent_path(tmp_path).read_text(encoding="utf-8")
+    assert f"单条尽量不超过 {settings.persona.reply_hard_part} 字" in text
