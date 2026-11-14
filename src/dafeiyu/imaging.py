@@ -7,7 +7,8 @@
 设计约束：
 
 - 不引入 Pillow/OpenCV，只用外部 ffmpeg/ffprobe；
-- GIF 是动图，降采样会被 ``-frames:v 1`` 压成单帧，直接跳过；
+- GIF 是动图，降采样会被 ``-frames:v 1`` 压成单帧，直接跳过；WEBP 也可能是
+  多帧动图，所以 ``-frames:v 1`` 只加在静态容器上（``.jpg/.jpeg/.png/.bmp``）；
 - 临时文件与源同目录、名字形如 ``a.tmp.png``：ffmpeg 靠最后一个后缀选 muxer，
   ``a.png.tmp`` 会因无法识别输出格式而失败；
 - 本模块函数不抛异常（``locate`` 除外，它只做查找）。
@@ -25,6 +26,9 @@ log = logging.getLogger(__name__)
 
 #: ffmpeg/ffprobe 单次调用上限：降采样要完整解码一张图，留足余量。
 _PROBE_TIMEOUT = 60.0
+
+#: 只有静态容器才加 ``-frames:v 1``：WEBP 可能是多帧动图，压成单帧等于丢动画。
+_STATIC_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp"})
 
 #: Windows 上不要为每次 ffmpeg 调用弹出控制台窗口。
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -102,13 +106,15 @@ def downscale(path: Path, max_edge: int) -> bool:
     """超过 ``max_edge`` 的图片等比缩小并原地替换；成功返回 ``True``。
 
     任何前置条件不满足（关闭降采样、GIF、ffmpeg/ffprobe 缺失、读不到尺寸、
-    本来就不超限）或执行失败都返回 ``False``，原文件保持不动。
+    本来就不超限）或执行失败都返回 ``False``，原文件保持不动。静态容器只取
+    首帧；WEBP 不动帧数（多帧动图原样交给 ffmpeg 重编码）。
     """
     tmp: Path | None = None
     try:
+        suffix = path.suffix.lower()
         if max_edge <= 0:
             return False
-        if path.suffix.lower() == ".gif":
+        if suffix == ".gif":
             return False
         ffmpeg = locate("ffmpeg")
         if not ffmpeg:
@@ -123,7 +129,10 @@ def downscale(path: Path, max_edge: int) -> bool:
         tmp = path.with_name(f"{path.stem}.tmp{path.suffix}")
         # JPEG 二次编码会叠加有损压缩：mjpeg 默认量化偏保守，显式给 q=3。
         # PNG/GIF/WEBP 走各自的默认参数，避免误传 qscale 改变编码语义。
-        quality = ["-q:v", "3"] if path.suffix.lower() in (".jpg", ".jpeg") else []
+        quality = ["-q:v", "3"] if suffix in (".jpg", ".jpeg") else []
+        # 静态容器只留首帧；WEBP 交给 ffmpeg 保留全部帧（动图压成单帧等于丢动画）。
+        # 编码器不支持多帧时 ffmpeg 会失败，调用方保留原图——不会比原来更差。
+        frame_limit = ["-frames:v", "1"] if suffix in _STATIC_SUFFIXES else []
         completed = subprocess.run(
             [
                 ffmpeg,
@@ -135,8 +144,7 @@ def downscale(path: Path, max_edge: int) -> bool:
                     f"scale=min({max_edge}\\,iw):min({max_edge}\\,ih)"
                     ":force_original_aspect_ratio=decrease"
                 ),
-                "-frames:v",
-                "1",
+                *frame_limit,
                 *quality,
                 str(tmp),
             ],

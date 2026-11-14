@@ -181,6 +181,9 @@ mirror:
   bubble_corner_chars: "╭╮╰╯"
   # 正文按中文显示宽度换行的最大列数；默认 30（窄窗口也不易折行错位），最小 1。
   bubble_max_content_width: 30
+  # 镜像转发是否保持原图清晰度；默认 true：对侧收到的就是源图字节。
+  # 设 false 则与模型侧一致，按 images.max_edge 降采样（省流量但会二次编码）。
+  keep_image_quality: true
 
 # 服务端链接解析（chat-driven-behaviour-fixes）：群里出现链接时，由 bot 进程
 # 先做两级抓取（HTTP 直抓 → 本机 Edge 有头最小化渲染），两级都失败才把

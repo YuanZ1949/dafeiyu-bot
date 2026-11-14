@@ -601,6 +601,9 @@ class MirrorConfig:
     bubble_corner_chars: str = "╭╮╰╯"
     # 正文按中文显示宽度换行的最大列数。
     bubble_max_content_width: int = 30
+    # 镜像转发是否保持原图清晰度：默认 true，relay 物化不降采样、原样直传；
+    # 设 false 则与模型侧一致按 images.max_edge 降采样（省流量，但会二次编码）。
+    keep_image_quality: bool = True
 
 
 @dataclass(frozen=True)
@@ -1315,6 +1318,20 @@ def _mirror_bubble(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _mirror_keep_image_quality(raw: dict[str, Any]) -> bool:
+    """解析 ``mirror.keep_image_quality``：缺省 ``True``（镜像默认保真）。
+
+    写坏了也不能拦住启动：非法值回落 ``True``，只在 debug 日志里点名字段。
+    """
+    try:
+        return _bool(
+            raw.get("keep_image_quality", True), "mirror.keep_image_quality"
+        )
+    except ConfigError:
+        logger.debug("mirror.keep_image_quality 不是布尔值，按默认 true 处理")
+        return True
+
+
 def _build_mirror(
     raw_mirror: object,
     raw_gateway_provider: str,
@@ -1334,6 +1351,8 @@ def _build_mirror(
         raise ConfigError("config.yaml 的 mirror 必须是映射")
 
     enabled = _bool(raw_mirror.get("enabled", False), "mirror.enabled")
+    # 保真开关与 bubble_* 一样，关闭分支也要解析（设了才读得到）。
+    keep_image_quality = _mirror_keep_image_quality(raw_mirror)
     if not enabled:
         # 关闭时不校验（写坏了也不能拦住启动），但能解析出来的配对/昵称照旧保留：
         # 面板重新打开卡片时不用从头再填，运行期仍按 enabled 忽略（MirrorRouter
@@ -1348,9 +1367,13 @@ def _build_mirror(
             pairs = parse_mirror_pairs(raw_mirror.get("pairs"))
             nicknames = parse_mirror_nicknames(raw_mirror.get("nicknames"))
         except ConfigError:
-            return MirrorConfig(**bubble)
+            return MirrorConfig(keep_image_quality=keep_image_quality, **bubble)
         return MirrorConfig(
-            enabled=False, pairs=pairs, nicknames=nicknames, **bubble
+            enabled=False,
+            pairs=pairs,
+            nicknames=nicknames,
+            keep_image_quality=keep_image_quality,
+            **bubble,
         )
 
     bubble = _mirror_bubble(raw_mirror)
@@ -1380,7 +1403,11 @@ def _build_mirror(
         )
 
     return MirrorConfig(
-        enabled=True, pairs=pairs, nicknames=nicknames, **bubble
+        enabled=True,
+        pairs=pairs,
+        nicknames=nicknames,
+        keep_image_quality=keep_image_quality,
+        **bubble,
     )
 
 

@@ -269,6 +269,7 @@ async def materialize_relay(
     settings: Settings,
     *,
     fetch: FetchFn | None = None,
+    keep_original: bool = False,
 ) -> list[Attachment]:
     """跨群镜像专用图片物化：落盘并返回附件，**不修改 msg.content**。
 
@@ -276,10 +277,16 @@ async def materialize_relay(
     镜像需要真实文件才能真转发，所以这里绕过 ``annotate`` 门控，但仍然要求
     ``images.enabled`` + ``workspace.enabled``。复用 ``_source``/``_obtain``/
     ``_target``/``_cleanup``，永不抛异常。
+
+    ``keep_original`` 为真时跳过 ``imaging.downscale``：镜像转发要原样直传
+    （``mirror.keep_image_quality``）；默认 ``False`` 保持旧行为。
     """
     try:
         return await _materialize_relay(
-            msg, settings, fetch=fetch or _default_fetch
+            msg,
+            settings,
+            fetch=fetch or _default_fetch,
+            keep_original=keep_original,
         )
     except Exception:
         log.warning("镜像图片物化失败，回退占位：%s", msg.message_id, exc_info=True)
@@ -291,6 +298,7 @@ async def _materialize_relay(
     settings: Settings,
     *,
     fetch: FetchFn,
+    keep_original: bool,
 ) -> list[Attachment]:
     if not settings.images.enabled or not settings.workspace.enabled:
         return []
@@ -340,7 +348,7 @@ async def _materialize_relay(
                 "镜像图片写盘失败，保持占位：msg=%s", msg.message_id, exc_info=True
             )
             continue
-        if target.suffix.lower() != ".gif":
+        if target.suffix.lower() != ".gif" and not keep_original:
             await asyncio.to_thread(
                 imaging.downscale, target, settings.images.max_edge
             )

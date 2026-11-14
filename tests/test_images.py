@@ -9,7 +9,11 @@
 """
 
 import base64
+import shutil
+import struct
+import subprocess
 import time
+import zlib
 from pathlib import Path
 
 import pytest
@@ -28,7 +32,7 @@ from dafeiyu.config import (
     WorkspaceConfig,
     _build_images,
 )
-from dafeiyu.images import _sniff_ext, materialize
+from dafeiyu.images import _sniff_ext, materialize, materialize_relay
 from dafeiyu.memory.store import Store
 from dafeiyu.memory.workspace import Workspace
 from dafeiyu.models import ChatType, Message, Segment
@@ -36,6 +40,67 @@ from dafeiyu.router import Router
 from dafeiyu.service import Service
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 64
+
+
+def _solid_png(width: int, height: int) -> bytes:
+    """纯 Python 造一张真 PNG（2000×1500 也能解码）：不依赖 Pillow/ffmpeg。"""
+
+    def chunk(tag: bytes, body: bytes) -> bytes:
+        crc = zlib.crc32(tag + body) & 0xFFFFFFFF
+        return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", crc)
+
+    raw = b"".join(b"\x00" + b"\xff\x00\x00" * width for _ in range(height))
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _big_image(
+    tmp_path: Path, suffix: str, width: int = 2000, height: int = 1500
+) -> bytes:
+    """产出一张 > max_edge 的图：PNG 纯 Python，JPEG 用本机 ffmpeg（缺失则跳过）。"""
+    if suffix == ".png":
+        return _solid_png(width, height)
+    ffmpeg = imaging.locate("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("本机没有 ffmpeg，无法生成 JPEG 夹具")
+    target = tmp_path / f"fixture-{width}x{height}{suffix}"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=red:s={width}x{height}",
+            "-frames:v",
+            "1",
+            str(target),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return target.read_bytes()
+
+
+def _image_size(path: Path) -> tuple[int, int]:
+    """优先 ffprobe；没有 ffprobe 时 PNG 直接读 IHDR，其它格式跳过。"""
+    ffmpeg = imaging.locate("ffmpeg")
+    if ffmpeg:
+        ffprobe = imaging._locate_ffprobe(ffmpeg)
+        if ffprobe:
+            size = imaging.probe_size(path, ffprobe)
+            if size is not None:
+                return size
+    data = path.read_bytes()
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        width, height = struct.unpack(">II", data[16:24])
+        return width, height
+    pytest.skip("本机没有可用的 ffprobe，无法探测这张图的像素尺寸")
 
 
 def make_settings(tmp_path, **images_overrides) -> Settings:
@@ -557,4 +622,49 @@ async def test_gif_does_not_call_downscale(tmp_path, monkeypatch):
 
     assert got == 1
     assert calls == []
+
+
+# ---------------------------------------------------------- 镜像直传（I-1）
+
+
+@pytest.mark.parametrize("suffix", [".png", ".jpg"])
+async def test_materialize_relay_keep_original_keeps_bytes_and_size(
+    tmp_path, suffix
+):
+    """镜像保真：``keep_original=True`` 落盘即源图，字节与像素都不变。"""
+    data = _big_image(tmp_path, suffix)
+    settings = make_settings(tmp_path, max_edge=1280)
+    url = f"http://x/big{suffix}"
+    msg = make_msg(segs=[Segment("image", {"url": url})])
+    fetch, calls = fake_fetch(data)
+
+    produced = await materialize_relay(
+        msg, settings, fetch=fetch, keep_original=True
+    )
+
+    assert calls == [url]
+    assert len(produced) == 1
+    stored = Path(settings.workspace.dir) / produced[0].path
+    assert stored.read_bytes() == data
+    assert produced[0].size == len(data)
+    assert _image_size(stored) == (2000, 1500)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="本机没有 ffmpeg")
+@pytest.mark.parametrize("suffix", [".png", ".jpg"])
+async def test_materialize_relay_default_still_downscales(tmp_path, suffix):
+    """默认保持旧行为：relay 物化仍按 images.max_edge 降采样。"""
+    data = _big_image(tmp_path, suffix)
+    settings = make_settings(tmp_path, max_edge=1280)
+    url = f"http://x/big{suffix}"
+    msg = make_msg(segs=[Segment("image", {"url": url})])
+
+    produced = await materialize_relay(
+        msg, settings, fetch=fake_fetch(data)[0]
+    )
+
+    assert len(produced) == 1
+    stored = Path(settings.workspace.dir) / produced[0].path
+    assert max(_image_size(stored)) <= 1280
+    assert stored.read_bytes() != data
 

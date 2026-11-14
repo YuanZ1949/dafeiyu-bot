@@ -155,6 +155,26 @@ def test_png_downscale_keeps_encoder_defaults(
     assert calls and "-q:v" not in calls[0]
 
 
+@pytest.mark.parametrize("name", ["a.jpg", "a.jpeg", "a.png", "a.bmp"])
+def test_static_suffixes_pin_single_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """静态容器只留首帧：原有语义不能丢。"""
+    calls = _capture_downscale(tmp_path, monkeypatch, name)
+
+    assert calls and "-frames:v" in calls[0]
+    assert calls[0][calls[0].index("-frames:v") + 1] == "1"
+
+
+def test_webp_does_not_pin_single_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WEBP 可能是多帧动图：再压 ``-frames:v 1`` 等于丢动画（I-1）。"""
+    calls = _capture_downscale(tmp_path, monkeypatch, "a.webp")
+
+    assert calls and "-frames:v" not in calls[0]
+
+
 def test_empty_output_keeps_original(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -264,3 +284,114 @@ def test_real_ffmpeg_downscales_oversized_png(tmp_path: Path) -> None:
     assert after is not None
     assert max(after) <= 1280
     assert not list(tmp_path.glob("*.tmp.*"))
+
+
+def _frame_count(path: Path) -> int | None:
+    """用 ffprobe 数实际解出的帧；读不出（老版本 WEBP demuxer）返回 ``None``。"""
+    ffmpeg = imaging.locate("ffmpeg")
+    if not ffmpeg:
+        return None
+    ffprobe = imaging._locate_ffprobe(ffmpeg)
+    if not ffprobe:
+        return None
+    completed = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        return None
+    text = (completed.stdout or b"").decode("ascii", "ignore").strip()
+    try:
+        return int(text.splitlines()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _write_animated_webp(path: Path, frames: int = 6) -> bool:
+    """用本机 ffmpeg 造一段多帧 WEBP；没有 libwebp_anim 编码器时返回 ``False``。"""
+    ffmpeg = imaging.locate("ffmpeg")
+    if not ffmpeg:
+        return False
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size=320x240:rate=5:duration={frames / 5:.1f}",
+            "-loop",
+            "0",
+            "-c:v",
+            "libwebp_anim",
+            "-q:v",
+            "60",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+    )
+    return (
+        completed.returncode == 0
+        and path.is_file()
+        and path.stat().st_size > 0
+    )
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="本机没有 ffmpeg")
+def test_real_ffmpeg_keeps_animated_webp_frames(tmp_path: Path) -> None:
+    """多帧 WEBP 经 downscale 后帧数不变（I-1 / G5）。
+
+    ffprobe 读不出动画帧数的老构建（如某些 Windows 版 demuxer 不会解析
+    ANMF 块）只能跳过：没有可用的观测手段，绝不伪造成功。
+    """
+    source = tmp_path / "anim.webp"
+    if not _write_animated_webp(source):
+        pytest.skip("本机 ffmpeg 没有 libwebp_anim 编码器")
+    before = _frame_count(source)
+    if before is None or before < 2:
+        pytest.skip("本机 ffmpeg/ffprobe 读不出 WEBP 动画帧数")
+
+    imaging.downscale(source, 200)
+
+    assert _frame_count(source) == before
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="本机没有 ffmpeg")
+def test_real_ffmpeg_static_jpeg_stays_single_frame(tmp_path: Path) -> None:
+    """静态 JPEG 仍只产出单帧（``-frames:v 1`` 的旧语义不能丢）。"""
+    ffmpeg = imaging.locate("ffmpeg")
+    assert ffmpeg
+    source = tmp_path / "big.jpg"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=2000x1500",
+            "-frames:v",
+            "1",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    assert imaging.downscale(source, 1280) is True
+
+    assert _frame_count(source) == 1

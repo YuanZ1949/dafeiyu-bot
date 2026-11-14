@@ -821,6 +821,9 @@ class MirrorRouter:
                     self.settings,
                     fetch=self.fetch,
                     decode=self.decode,
+                    # 镜像默认直传原图；关掉 mirror.keep_image_quality 才按
+                    # images.max_edge 降采样（与模型侧一致）。
+                    keep_original=self.settings.mirror.keep_image_quality,
                 )
                 return list(materialized.attachments)
             return await self._materialize_qq(item, raw)
@@ -861,7 +864,10 @@ class MirrorRouter:
             if selected:
                 message = self._relay_message(item, [], selected)
                 produced = await images.materialize_relay(
-                    message, self.settings, fetch=self.fetch
+                    message,
+                    self.settings,
+                    fetch=self.fetch,
+                    keep_original=self.settings.mirror.keep_image_quality,
                 )
                 for index, attachment in zip(missing_images, produced):
                     merged[index] = attachment

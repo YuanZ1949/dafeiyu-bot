@@ -8,8 +8,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import struct
 import threading
 import time
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -20,12 +22,33 @@ import dafeiyu.media as media_module
 from dafeiyu import imaging
 from dafeiyu.config import Settings
 from dafeiyu.gateway.wechat_bridge.media.dat import decode_dat
-from dafeiyu.media import _download_video, materialize_attachments
+from dafeiyu.media import (
+    _download_video,
+    materialize_attachments,
+    materialize_relay_attachments,
+)
 from dafeiyu.models import Attachment, ChatType, Message
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 64
 JPG = b"\xff\xd8\xff\xe0" + b"0" * 64
 MP4 = b"\x00\x00\x00\x18ftypmp42" + b"video-bytes" * 8
+
+
+def _solid_png(width: int, height: int) -> bytes:
+    """纯 Python 造一张真 PNG：用来验证"不降采样"不是靠魔数骗过去。"""
+
+    def chunk(tag: bytes, body: bytes) -> bytes:
+        crc = zlib.crc32(tag + body) & 0xFFFFFFFF
+        return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", crc)
+
+    raw = b"".join(b"\x00" + b"\xff\x00\x00" * width for _ in range(height))
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
 
 
 def make_settings(
@@ -1042,3 +1065,87 @@ async def test_wechat_gif_does_not_call_downscale(
 
     assert count == 1
     assert calls == []
+
+
+# ------------------------------------------- 镜像直传与微信入站回归（I-1）
+
+
+async def test_relay_attachments_keep_original_skips_downscale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """镜像保真：``keep_original=True`` 时落盘即源图，不调 downscale。"""
+    data = _solid_png(2000, 1500)
+    source = tmp_path / "big.png"
+    source.write_bytes(data)
+    calls: list[tuple[Path, int]] = []
+
+    def fake_downscale(path: Path, max_edge: int) -> bool:
+        calls.append((Path(path), max_edge))
+        return True
+
+    monkeypatch.setattr(imaging, "downscale", fake_downscale)
+    settings = make_settings(tmp_path, max_edge=1280)
+    message = make_message(str(source))
+
+    result = await materialize_relay_attachments(
+        message, settings, decode=None, keep_original=True
+    )
+
+    assert calls == []
+    attachment = result.attachments[0]
+    stored = tmp_path / "ws" / attachment.path
+    assert stored.read_bytes() == data
+    assert attachment.size == len(data)
+    # 调用方消息零改动。
+    assert message.attachments[0].path == str(source)
+
+
+async def test_relay_attachments_default_still_downscales(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """默认仍是旧行为：relay 物化按 images.max_edge 降采样。"""
+    data = _solid_png(2000, 1500)
+    source = tmp_path / "big.png"
+    source.write_bytes(data)
+    calls: list[tuple[Path, int]] = []
+
+    def fake_downscale(path: Path, max_edge: int) -> bool:
+        calls.append((Path(path), max_edge))
+        Path(path).write_bytes(PNG[:8])
+        return True
+
+    monkeypatch.setattr(imaging, "downscale", fake_downscale)
+    settings = make_settings(tmp_path, max_edge=1280)
+    message = make_message(str(source))
+
+    result = await materialize_relay_attachments(message, settings, decode=None)
+
+    assert len(calls) == 1
+    assert calls[0][1] == 1280
+    assert result.attachments[0].size == len(PNG[:8])
+
+
+async def test_wechat_ingest_still_downscales_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回归保护：镜像开保真不能把微信普通入站也带成不缩。"""
+    data = _solid_png(2000, 1500)
+    source = tmp_path / "big.png"
+    source.write_bytes(data)
+    calls: list[tuple[Path, int]] = []
+
+    def fake_downscale(path: Path, max_edge: int) -> bool:
+        calls.append((Path(path), max_edge))
+        Path(path).write_bytes(PNG[:8])
+        return True
+
+    monkeypatch.setattr(imaging, "downscale", fake_downscale)
+    settings = make_settings(tmp_path, max_edge=1280)
+    message = make_message(str(source))
+
+    count = await materialize_attachments(message, settings, decode=None)
+
+    assert count == 1
+    assert len(calls) == 1
+    assert calls[0][1] == 1280
+    assert message.attachments[0].size == len(PNG[:8])

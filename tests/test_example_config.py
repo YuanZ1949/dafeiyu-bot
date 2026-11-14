@@ -96,6 +96,7 @@ def test_example_config_new_behaviour_keys(tmp_path, monkeypatch):
     assert settings.mirror.bubble_enabled is True
     assert settings.mirror.bubble_corner_chars == "╭╮╰╯"
     assert settings.mirror.bubble_max_content_width == 30
+    assert settings.mirror.keep_image_quality is True
     assert settings.mind.skip_known_silent is True
     assert settings.mind.skip_silent_cooldown_seconds == 90
     assert settings.injection.lessons_chars == 300
@@ -123,6 +124,7 @@ def test_example_config_new_behaviour_keys(tmp_path, monkeypatch):
         "bubble_enabled:",
         "bubble_corner_chars:",
         "bubble_max_content_width:",
+        "keep_image_quality:",
         "skip_known_silent:",
         "skip_silent_cooldown_seconds:",
         "lessons_chars:",

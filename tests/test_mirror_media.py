@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import struct
 import time
+import zlib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +23,7 @@ from typing import cast
 import pytest
 
 import dafeiyu.media as media_module
+from dafeiyu import imaging
 from dafeiyu.config import (
     BudgetConfig,
     GroupsConfig,
@@ -35,7 +38,11 @@ from dafeiyu.config import (
     WorkspaceConfig,
 )
 from dafeiyu.images import materialize_relay
-from dafeiyu.media import materialize_relay_attachments, resolve_media_path
+from dafeiyu.media import (
+    materialize_attachments,
+    materialize_relay_attachments,
+    resolve_media_path,
+)
 from dafeiyu.memory.store import Store
 from dafeiyu.mirror import FetchFn, MirrorItem, MirrorRouter
 from dafeiyu.models import Attachment, ChatType, Message, Segment
@@ -44,6 +51,23 @@ from tests.fakes import FakeChannelAdapter
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 64
 SILK = b"#!SILK_V3" + b"0" * 64
 MP4 = b"\x00\x00\x00\x18ftypmp42" + b"video-bytes" * 8
+
+
+def _solid_png(width: int, height: int) -> bytes:
+    """纯 Python 造一张真 PNG：镜像"不缩"必须能用真图验证。"""
+
+    def chunk(tag: bytes, body: bytes) -> bytes:
+        crc = zlib.crc32(tag + body) & 0xFFFFFFFF
+        return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", crc)
+
+    raw = b"".join(b"\x00" + b"\xff\x00\x00" * width for _ in range(height))
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
 
 
 def make_settings(
@@ -456,6 +480,111 @@ async def test_images_materialize_relay_disabled_returns_empty(
     assert await materialize_relay(msg, settings, fetch=boom) == []
     assert msg.content == "[图片]"
     assert not (tmp_path / "ws").exists()
+
+
+# ------------------------------------------- 镜像保真：keep_image_quality（I-1）
+
+
+async def test_qq_image_keep_quality_skips_downscale_and_preserves_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """镜像默认保真：QQ 源图片物化后字节与源图完全一致，不调 downscale。"""
+    data = _solid_png(2000, 1500)
+    calls: list[tuple[Path, int]] = []
+
+    def fake_downscale(path: Path, max_edge: int) -> bool:
+        calls.append((Path(path), max_edge))
+        return True
+
+    monkeypatch.setattr(imaging, "downscale", fake_downscale)
+
+    async def fake_fetch(_url: str, _timeout: float, _max_bytes: int) -> bytes:
+        return data
+
+    router, _store = make_router(tmp_path, fetch=fake_fetch)
+    assert router.settings.mirror.keep_image_quality is True
+    item = make_item(
+        source_channel="qq",
+        attachments=(Attachment(kind="image", source="https://x/big.png"),),
+        segments=(Segment("image", {"url": "https://x/big.png"}),),
+    )
+
+    attachments = await router._materialized_attachments(item)
+
+    assert calls == []
+    assert len(attachments) == 1
+    stored = resolve_media_path(router.settings, attachments[0])
+    assert stored is not None
+    assert stored.read_bytes() == data
+    assert attachments[0].size == len(data)
+
+
+async def test_qq_image_downscales_when_keep_quality_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """关掉 mirror.keep_image_quality：镜像物化回到降采样旧行为。"""
+    data = _solid_png(2000, 1500)
+    calls: list[tuple[Path, int]] = []
+
+    def fake_downscale(path: Path, max_edge: int) -> bool:
+        calls.append((Path(path), max_edge))
+        Path(path).write_bytes(PNG[:8])
+        return True
+
+    monkeypatch.setattr(imaging, "downscale", fake_downscale)
+
+    async def fake_fetch(_url: str, _timeout: float, _max_bytes: int) -> bytes:
+        return data
+
+    base = make_router_settings(tmp_path)
+    settings = replace(
+        base, mirror=replace(base.mirror, keep_image_quality=False)
+    )
+    store = Store(tmp_path / "mirror.db")
+    store.init_schema()
+    router = MirrorRouter(settings, store, {}, fetch=fake_fetch)
+    item = make_item(
+        source_channel="qq",
+        attachments=(Attachment(kind="image", source="https://x/big.png"),),
+        segments=(Segment("image", {"url": "https://x/big.png"}),),
+    )
+
+    attachments = await router._materialized_attachments(item)
+
+    assert len(calls) == 1
+    assert calls[0][1] == 1280
+    assert attachments[0].size == len(PNG[:8])
+
+
+@pytest.mark.parametrize("keep", [True, False])
+async def test_wechat_relay_receives_keep_image_quality(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keep: bool
+) -> None:
+    """微信源走 media.materialize_relay_attachments 时必须透传配置值。"""
+    seen: dict[str, object] = {}
+
+    async def fake_relay(message: Message, _settings: object, **kwargs: object):
+        seen.update(kwargs)
+        return message
+
+    monkeypatch.setattr(
+        media_module, "materialize_relay_attachments", fake_relay
+    )
+    base = make_router_settings(tmp_path)
+    settings = replace(
+        base, mirror=replace(base.mirror, keep_image_quality=keep)
+    )
+    store = Store(tmp_path / "mirror.db")
+    store.init_schema()
+    router = MirrorRouter(settings, store, {})
+    item = make_item(
+        source_channel="wechat",
+        attachments=(Attachment(kind="image", path=str(tmp_path / "x.png")),),
+    )
+
+    await router._materialized_attachments(item)
+
+    assert seen["keep_original"] is keep
 
 
 # ------------------------------------------------- T7：出站媒体投递与占位降级

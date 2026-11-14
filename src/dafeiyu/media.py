@@ -859,6 +859,7 @@ async def materialize_attachments(
     decode: Decode | None = None,
     annotate: bool = True,
     fetch: FetchFn | None = None,
+    keep_original: bool = False,
 ) -> int:
     """把附件物化进 workspace，返回成功写盘的图片数量。
 
@@ -870,6 +871,8 @@ async def materialize_attachments(
       时用 ffmpeg 抽帧到 ``images/``；URL 来源先下载到临时文件。
 
     ``decode`` 对微信 ``.dat`` 图片与表情缓存生效；``fetch`` 可注入下载函数。
+    ``keep_original`` 为真时图片落盘后不降采样（镜像直传原图）；默认 ``False``
+    保持模型侧入站按 ``images.max_edge`` 缩小的旧行为。
     任何失败都保留原占位，绝不抛出。
     """
     try:
@@ -1092,7 +1095,7 @@ async def materialize_attachments(
                 updated.append(attachment)
                 continue
 
-            if target.suffix.lower() != ".gif":
+            if target.suffix.lower() != ".gif" and not keep_original:
                 await asyncio.to_thread(
                     imaging.downscale, target, settings.images.max_edge
                 )
@@ -1242,6 +1245,7 @@ async def materialize_relay_attachments(
     *,
     fetch: FetchFn | None = None,
     decode: Decode | None = None,
+    keep_original: bool = False,
 ) -> Message:
     """镜像转发前物化附件，在副本上操作，绝不修改调用方的 ``Message``。
 
@@ -1251,6 +1255,7 @@ async def materialize_relay_attachments(
       （语音/``record`` 另受 ``speech.enabled`` 门控，视频不受）；
     - 微信本地 ``.dat`` 走与 ``Service.handle`` 相同的 ``decode``，解不开就把
       路径清空，由出站侧发占位，绝不把原始 ``.dat`` 交给目标通道；
+    - ``keep_original`` 为真时图片不降采样（镜像直传原图），默认假保持旧行为；
     - 任何失败只记日志并保留原附件，绝不抛异常。
     """
     copy = _clone_message(msg)
@@ -1268,6 +1273,7 @@ async def materialize_relay_attachments(
             decode=decode,
             annotate=False,
             fetch=fetch or _default_fetch,
+            keep_original=keep_original,
         )
         # 物化会向副本 content 追加注记；镜像只需要附件，恢复原文避免噪音。
         copy.content = msg.content

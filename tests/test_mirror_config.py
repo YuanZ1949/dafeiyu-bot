@@ -89,6 +89,44 @@ def test_mirror_config_defaults_disabled() -> None:
     mirror = MirrorConfig()
     assert mirror.enabled is False
     assert mirror.pairs == ()
+    assert mirror.keep_image_quality is True
+
+
+def test_keep_image_quality_defaults_true(tmp_path: Path) -> None:
+    settings = _load(tmp_path, _gateway_yaml(VALID_MIRROR))
+    assert settings.mirror.keep_image_quality is True
+
+
+def test_keep_image_quality_false_parsed(tmp_path: Path) -> None:
+    settings = _load(
+        tmp_path,
+        _gateway_yaml(VALID_MIRROR + "  keep_image_quality: false\n"),
+    )
+    assert settings.mirror.keep_image_quality is False
+
+
+def test_keep_image_quality_invalid_falls_back_true(
+    tmp_path: Path, caplog
+) -> None:
+    """写坏了不能拦住启动：非法值回落 true，并在 debug 日志里点名字段。"""
+    caplog.set_level(logging.DEBUG, logger="dafeiyu.config")
+    settings = _load(
+        tmp_path,
+        _gateway_yaml(VALID_MIRROR + '  keep_image_quality: "no"\n'),
+    )
+
+    assert settings.mirror.keep_image_quality is True
+    assert "keep_image_quality" in caplog.text
+
+
+def test_keep_image_quality_parsed_when_mirror_disabled(tmp_path: Path) -> None:
+    """关闭分支也要解析：设了才读得到，面板/热更新不会悄悄回到默认。"""
+    settings = _load(
+        tmp_path,
+        "mirror:\n  enabled: false\n  keep_image_quality: false\n",
+    )
+    assert settings.mirror.enabled is False
+    assert settings.mirror.keep_image_quality is False
 
 
 def test_missing_mirror_section_defaults_off(tmp_path: Path) -> None:
