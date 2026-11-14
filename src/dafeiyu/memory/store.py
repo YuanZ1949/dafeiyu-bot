@@ -2940,6 +2940,33 @@ class Store:
         )
         self._conn.commit()
 
+    def thread_states(self) -> list[dict[str, object]]:
+        """已落库的话题收尾信号（只读），按最近收尾时间倒序。
+
+        只返回 ``thread_closed_until`` / ``last_closed_at`` 至少有一个非空的会话，
+        避免把每个聊过一句的会话都列出来。这里读的是**已落库**的状态，不等于
+        router 的实时话题态（``ambient_streak`` / ``last_bot_spoke`` 只在点名或
+        收尾判定时落库），调用方文案要如实说明。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT chat_type, chat_id, thread_closed_until, last_closed_at, last_bot_spoke
+            FROM chat_state
+            WHERE thread_closed_until IS NOT NULL OR last_closed_at IS NOT NULL
+            ORDER BY COALESCE(thread_closed_until, last_closed_at) DESC
+            """
+        ).fetchall()
+        return [
+            {
+                "chat_type": ChatType(row["chat_type"]),
+                "chat_id": row["chat_id"],
+                "thread_closed_until": row["thread_closed_until"],
+                "last_closed_at": row["last_closed_at"],
+                "last_bot_spoke": row["last_bot_spoke"],
+            }
+            for row in rows
+        ]
+
     @staticmethod
     def _row_to_impression(r: sqlite3.Row) -> Impression:
         # v1 的整数 0 经 TEXT 重建已是字符串 '0'，同样按「无 subject」读回。

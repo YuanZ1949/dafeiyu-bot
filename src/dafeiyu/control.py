@@ -1948,6 +1948,31 @@ class BrainControl:
         items.sort(key=lambda item: item["age_seconds"], reverse=True)
         return {"items": items, "total": len(items)}
 
+    def thread_states_snapshot(self) -> dict[str, Any]:
+        """话题收尾状态（只读）。
+
+        **绝不调用 ``router.is_thread_closed``**：那个方法会写库，GET 接口产生写入
+        不可接受。这里只读 ``chat_state`` 里**已经落库**的收尾信号，所以它显示的是
+        「最近一次收尾状态」，不是 router 的实时话题态。
+        """
+        now_ts = int(time.time())
+        items: list[dict[str, Any]] = []
+        for row in self.store.thread_states():
+            closed_until = row["thread_closed_until"]
+            left = 0
+            if closed_until is not None:
+                left = max(0, int(float(closed_until)) - now_ts)
+            items.append(
+                {
+                    "chat_type": row["chat_type"].value,
+                    "chat_id": row["chat_id"],
+                    "closed_until": closed_until,
+                    "closed_left_seconds": left,
+                    "last_closed_at": row["last_closed_at"],
+                }
+            )
+        return {"items": items, "total": len(items)}
+
     async def session_action(
         self, action: str, chat_type: ChatType, chat_id: str
     ) -> dict[str, Any]:
@@ -3196,6 +3221,15 @@ def create_app(
                 {"error": f"读取攒着会话失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def thread_states(_: web.Request) -> web.Response:
+        try:
+            return web.json_response(control.thread_states_snapshot())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取话题状态失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取话题状态失败：{exc.__class__.__name__}"}, status=500
+            )
+
     async def timeline(request: web.Request) -> web.Response:
         chat_type, chat_id, error = _path_target(request)
         if error is not None:
@@ -3571,6 +3605,7 @@ def create_app(
     app.router.add_get("/api/memory/export", export_memory)
     app.router.add_get("/api/sessions", sessions)
     app.router.add_get("/api/holds", holds)
+    app.router.add_get("/api/thread-states", thread_states)
     app.router.add_get(
         "/api/sessions/{chat_type}/{chat_id}/timeline", timeline
     )
