@@ -1745,6 +1745,88 @@ async def test_unacked_frames_survive_hard_kill_and_replay_on_hello(
         await _stopped(server)
 
 
+async def test_inbound_state_is_not_written_until_flush(tmp_path: Path) -> None:
+    """节流核心：窗口内的帧只标脏，显式 flush 前状态文件根本不存在。"""
+    path = tmp_path / "state.json"
+    server = BridgeServer(state_path=path)
+    _freeze_clock(server)
+    try:
+        for text in ("m1", "m2", "m3"):
+            server._stamp_inbound({}, _bridge_msg(text))
+        assert server._inbound_dirty is True
+        assert not path.exists()
+
+        server.flush_inbound_state()
+        assert server._inbound_dirty is False
+        state = json.loads(path.read_text("utf-8"))
+        assert state["seq"] == 3
+        assert [item["seq"] for item in state["frames"]] == [1, 2, 3]
+
+        # 干净时再 flush 是 no-op：不产生额外写盘（mtime 不变）。
+        before = path.stat().st_mtime_ns
+        server.flush_inbound_state()
+        assert path.stat().st_mtime_ns == before
+    finally:
+        await _stopped(server)
+
+
+async def test_inbound_state_flushes_when_interval_elapses(tmp_path: Path) -> None:
+    """时间阈值：距上次落盘满 INBOUND_SAVE_INTERVAL 后，下一帧触发写盘。"""
+    path = tmp_path / "state.json"
+    server = BridgeServer(state_path=path)
+    clock = _freeze_clock(server)
+    try:
+        server._stamp_inbound({}, _bridge_msg("m1"))
+        assert not path.exists()
+
+        clock[0] += bridge_server.INBOUND_SAVE_INTERVAL
+        server._stamp_inbound({}, _bridge_msg("m2"))
+        state = json.loads(path.read_text("utf-8"))
+        assert [item["seq"] for item in state["frames"]] == [1, 2]
+    finally:
+        await _stopped(server)
+
+
+async def test_inbound_state_flushes_at_frame_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """帧数阈值：忙群里不等到时间间隔，累计到 INBOUND_SAVE_FRAMES 帧立刻落盘。"""
+    monkeypatch.setattr(bridge_server, "INBOUND_SAVE_FRAMES", 3)
+    path = tmp_path / "state.json"
+    server = BridgeServer(state_path=path)
+    _freeze_clock(server)
+    try:
+        for text in ("m1", "m2"):
+            server._stamp_inbound({}, _bridge_msg(text))
+        assert not path.exists()
+
+        server._stamp_inbound({}, _bridge_msg("m3"))
+        state = json.loads(path.read_text("utf-8"))
+        assert [item["seq"] for item in state["frames"]] == [1, 2, 3]
+    finally:
+        await _stopped(server)
+
+
+async def test_stop_flushes_pending_inbound_state(tmp_path: Path) -> None:
+    """正常停机兜底：窗口内没来得及写盘的水位在 stop() 里强制落盘，重启可恢复。"""
+    path = tmp_path / "state.json"
+    server = BridgeServer(state_path=path)
+    _freeze_clock(server)
+    for text in ("m1", "m2"):
+        server._stamp_inbound({}, _bridge_msg(text))
+    assert not path.exists()
+
+    await _stopped(server)
+
+    state = json.loads(path.read_text("utf-8"))
+    assert state["seq"] == 2
+    assert [item["seq"] for item in state["frames"]] == [1, 2]
+
+    restored = BridgeServer(state_path=path)
+    assert [seq for seq, _ in restored._unacked] == [1, 2]
+    await _stopped(restored)
+
+
 async def test_acked_frames_not_replayed_after_restart(tmp_path: Path) -> None:
     """ack(1) 后重建：只剩 seq=2 在文件里，hello(0) 只重投它。"""
     path = tmp_path / "state.json"
