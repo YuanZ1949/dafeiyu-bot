@@ -46,6 +46,9 @@ class PersonaConfig:
     repeat_guard: bool = True
     # 机会检测（规则版）：纯热聊/纯表情批次先攒着不投，等点名或问句再一起送。
     opportunity_guard: bool = True
+    # 攒着（纯热聊）最多攒多久（秒）；到点解除 hold，照旧送模型判断。
+    # 0 = 关闭过期，退回改前行为（无限期攒着）。
+    hold_max_seconds: int = 300
     # 引用回复：被点名/被回复时把回复挂在原消息下；关掉后发送参数与无引用时一致。
     quote_reply: bool = True
     # 长度安全阀：软目标（max_reply_chars*）只写进提示词，真正发送前只守这两条
@@ -1918,6 +1921,9 @@ def _build_persona(raw: dict[str, Any]) -> PersonaConfig:
     )
     if not 0 <= segment_delay <= 10:
         raise ConfigError("persona.segment_delay_seconds 必须在 0 到 10 秒之间")
+    hold_max = _int(raw.get("hold_max_seconds", 300), "persona.hold_max_seconds")
+    if hold_max < 0:
+        raise ConfigError("persona.hold_max_seconds 不能为负数（0 表示关闭攒着过期）")
     return PersonaConfig(
         name=str(raw.get("name", "溟月")),
         aliases=tuple(str(a) for a in aliases),
@@ -1930,6 +1936,7 @@ def _build_persona(raw: dict[str, Any]) -> PersonaConfig:
         opportunity_guard=_bool(
             raw.get("opportunity_guard", True), "persona.opportunity_guard"
         ),
+        hold_max_seconds=hold_max,
         quote_reply=_bool(raw.get("quote_reply", True), "persona.quote_reply"),
         reply_hard_total=hard_total,
         reply_hard_part=hard_part,

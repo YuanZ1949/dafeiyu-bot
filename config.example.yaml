@@ -19,6 +19,8 @@ persona:
   repeat_guard: true
   # 机会检测（规则版）：纯热聊/纯表情批次先攒着不投，等点名或问句再一起送。
   opportunity_guard: true
+  # 攒着寿命：纯热聊最多攒这么久（秒），到点照旧送模型判断；0 = 关闭过期。
+  hold_max_seconds: 300
   # 引用回复：被点名/被引用时把回复挂在原消息下；关掉后发纯文本。
   quote_reply: true
   # 留空使用内置人设 brain/persona.md；也可填自己的 md 路径（绝对或相对仓库根目录）
