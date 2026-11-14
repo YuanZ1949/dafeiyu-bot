@@ -1879,6 +1879,144 @@ class Store:
         ).fetchall()
         return [(ChatType(r["chat_type"]), r["chat_id"]) for r in rows]
 
+    def oldest_undelivered_ts(self, chat_type: ChatType, chat_id: str) -> int | None:
+        """该会话最早一条「时间已知」的未投递人类消息的时间戳（epoch 秒）。
+
+        口径与 ``pending_batch`` 完全一致：只看 ``is_bot = 0``，只看游标
+        （``delivered_cursors.last_message_id``）之后，且不在 ``delivered_messages`` 里。
+        没有游标行时按首次投递语义只看最新一条人类消息（与 ``pending_batch`` 一致）。
+
+        ``timestamp <= 0`` 表示时间未知（老库 / 测试工厂的占位值），一律不参与
+        取最小值；整组都没有已知时间时返回 ``None``（= 「没有年龄可算」），
+        避免把「未知」当成「1970 年至今一直没投」。
+        """
+        floor = self.last_delivered_id(chat_type, chat_id)
+        if floor is None:
+            row = self._conn.execute(
+                """
+                SELECT timestamp FROM messages
+                WHERE chat_type = ? AND chat_id = ? AND is_bot = 0
+                ORDER BY id DESC LIMIT 1
+                """,
+                (chat_type.value, chat_id),
+            ).fetchone()
+            if row is None:
+                return None
+            ts = int(row["timestamp"] or 0)
+            return ts if ts > 0 else None
+
+        row = self._conn.execute(
+            """
+            SELECT MIN(CASE WHEN m.timestamp > 0 THEN m.timestamp END) AS oldest_ts
+            FROM messages m
+            WHERE m.chat_type = ? AND m.chat_id = ? AND m.is_bot = 0
+              AND m.id > ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM delivered_messages d
+                  WHERE d.chat_type = m.chat_type AND d.chat_id = m.chat_id
+                    AND d.message_id = m.message_id
+              )
+            """,
+            (chat_type.value, chat_id, floor),
+        ).fetchone()
+        if row is None or row["oldest_ts"] is None:
+            return None
+        return int(row["oldest_ts"])
+
+    def pending_hold_info(self) -> list[dict[str, Any]]:
+        """哪些会话还有未投递的人类消息：条数 + 最早时间戳。
+
+        每项 ``{"chat_type", "chat_id", "count", "oldest_ts"}``，按 ``oldest_ts``
+        升序（攒得最久的排最前），时间未知的排最后；``oldest_ts`` 为 ``None``
+        表示这一组消息都没有已知时间（``timestamp <= 0``）。
+
+        与 ``chats_with_pending`` 的差别：这里**包含没有 ``delivered_cursors`` 行
+        的会话**。它们按首次投递语义只算最新一条人类消息（``count = 1``），
+        正是 ``chats_with_pending`` 会漏掉的那类会话。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT chat_type, chat_id, pending_count, oldest_ts FROM (
+                SELECT m.chat_type AS chat_type, m.chat_id AS chat_id,
+                       COUNT(*) AS pending_count,
+                       MIN(CASE WHEN m.timestamp > 0 THEN m.timestamp END) AS oldest_ts
+                FROM messages m
+                JOIN delivered_cursors c
+                  ON c.chat_type = m.chat_type AND c.chat_id = m.chat_id
+                WHERE m.is_bot = 0 AND m.id > c.last_message_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM delivered_messages d
+                      WHERE d.chat_type = m.chat_type AND d.chat_id = m.chat_id
+                        AND d.message_id = m.message_id
+                  )
+                GROUP BY m.chat_type, m.chat_id
+                UNION ALL
+                SELECT m.chat_type AS chat_type, m.chat_id AS chat_id,
+                       1 AS pending_count,
+                       CASE WHEN m.timestamp > 0 THEN m.timestamp END AS oldest_ts
+                FROM messages m
+                WHERE m.is_bot = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM delivered_cursors c
+                      WHERE c.chat_type = m.chat_type AND c.chat_id = m.chat_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messages newer
+                      WHERE newer.chat_type = m.chat_type
+                        AND newer.chat_id = m.chat_id
+                        AND newer.is_bot = 0 AND newer.id > m.id
+                  )
+            )
+            ORDER BY oldest_ts IS NULL, oldest_ts ASC, chat_type, chat_id
+            """
+        ).fetchall()
+        return [
+            {
+                "chat_type": str(row["chat_type"]),
+                "chat_id": row["chat_id"],
+                "count": int(row["pending_count"]),
+                "oldest_ts": (
+                    None if row["oldest_ts"] is None else int(row["oldest_ts"])
+                ),
+            }
+            for row in rows
+        ]
+
+    def undelivered_message_ids(self, chat_type: ChatType, chat_id: str) -> list[str]:
+        """该会话全部未投递人类消息的 ``message_id``（id 升序，**不设上限**）。
+
+        口径同 ``oldest_undelivered_ts`` / ``pending_batch``；``pending_batch`` 最多
+        只给 20 条，丢弃 / 结算时要把积压清干净就必须走这个全量枚举。
+        没有游标行的会话按首次投递语义只返回最新一条（``pending_batch`` 也只发这条）。
+        """
+        floor = self.last_delivered_id(chat_type, chat_id)
+        if floor is None:
+            row = self._conn.execute(
+                """
+                SELECT message_id FROM messages
+                WHERE chat_type = ? AND chat_id = ? AND is_bot = 0
+                ORDER BY id DESC LIMIT 1
+                """,
+                (chat_type.value, chat_id),
+            ).fetchone()
+            return [] if row is None else [str(row["message_id"])]
+
+        rows = self._conn.execute(
+            """
+            SELECT m.message_id FROM messages m
+            WHERE m.chat_type = ? AND m.chat_id = ? AND m.is_bot = 0
+              AND m.id > ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM delivered_messages d
+                  WHERE d.chat_type = m.chat_type AND d.chat_id = m.chat_id
+                    AND d.message_id = m.message_id
+              )
+            ORDER BY m.id
+            """,
+            (chat_type.value, chat_id, floor),
+        ).fetchall()
+        return [str(row["message_id"]) for row in rows]
+
     def mark_skipped(
         self, chat_type: ChatType, chat_id: str, message_ids: Sequence[str], reason: str
     ) -> None:
@@ -4549,6 +4687,37 @@ class Store:
             "reply_rate": (replied / denominator) if denominator else 0.0,
             "silence_rate": (silent / denominator) if denominator else 0.0,
         }
+
+    def latest_decision_per_chat(self) -> list[dict[str, Any]]:
+        """每个会话**最新一条**决策：``chat_type / chat_id / outcome / checkpoint / created_at``。
+
+        只看最新一行，绝不统计 ``held`` 的行数：``record_decision`` 对同群同
+        checkpoint 的 ``held`` 有 60 秒去重，计数必然低于真实攒着次数。
+        ``created_at`` 与 ``list_decisions`` 同口径（epoch 秒 float）。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT d.chat_type, d.chat_id, d.outcome, d.checkpoint, d.created_at
+            FROM decisions d
+            WHERE d.id = (
+                SELECT d2.id FROM decisions d2
+                WHERE d2.chat_type = d.chat_type AND d2.chat_id = d.chat_id
+                ORDER BY d2.created_at DESC, d2.id DESC
+                LIMIT 1
+            )
+            ORDER BY d.created_at DESC, d.chat_type, d.chat_id
+            """
+        ).fetchall()
+        return [
+            {
+                "chat_type": str(row["chat_type"]),
+                "chat_id": row["chat_id"],
+                "outcome": str(row["outcome"]),
+                "checkpoint": str(row["checkpoint"]),
+                "created_at": float(row["created_at"]),
+            }
+            for row in rows
+        ]
 
     def recent_errors(self, limit: int = 10) -> list[dict[str, object]]:
         """最近的 brain 错误时间线；created_at 是 UTC，这里直接换成上海时间展示串。"""
