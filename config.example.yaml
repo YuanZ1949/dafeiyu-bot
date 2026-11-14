@@ -187,6 +187,8 @@ mirror:
 # 「请用 websearch 搜主题 / 一句话回退」的降级指令交给模型。
 # 缺这一段也能启动——所有字段都有默认值；link.enabled: false 整条链关闭。
 link:
+  # 总闸：默认 true。设 false 整条服务端链关闭——不抓、不渲染、不注入
+  # 【链接内容】块，模型仍按人设里的链接协议自己 websearch / 一句话回退。
   enabled: true
   # 单次 HTTP 抓取超时（秒）；默认 12，普通网页够用又不会拖住回复太久。
   timeout_seconds: 12

@@ -27,5 +27,8 @@ config.yaml
 docs/superpowers/spikes/
 .codegraph/
 
+# agent 文件由 ensure_agent_files 重新生成；覆盖前的手工备份只留本机
+.opencode/agents/*.user-bak.*
+
 # 计划与证据（worktree 本地，不随分支入库）
 .omo/

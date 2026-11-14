@@ -671,6 +671,83 @@ detail 只含会话类型/ID 与用户 ID，不含正文）。冷却按「群 + 
 
 > `--type` 默认 `group`。群号和 QQ 号可能数字相同，所以必须区分。
 
+## 4.5 链接解析与跨平台消息泡
+
+### 链接解析：四级链与降级行为
+
+群里出现链接时，bot 进程先在服务端解析，读到内容就把「服务器替你读过的」正文塞进
+提示词；读不到就把降级指令交给模型。整条链最多四级，**越往后越保守，任何一级都不
+允许拖住回复主链路**：
+
+| 级 | 谁来做 | 做什么 | 失败后 |
+| --- | --- | --- | --- |
+| 1 | 服务端 | HTTP 直抓（`link.timeout_seconds`，默认 12 秒；响应体上限 `link.max_bytes`，默认 2MB；带浏览器级 UA 覆盖 `link.user_agent`） | 记下 host 的 `needs_browser`，进第 2 级 |
+| 2 | 服务端 | 本机 Edge/Chrome 有头最小化 CDP 渲染（`link.browser.*`），知乎这类靠 JS 渲染的站点在这里才读得到 | 把 host 升级为 `search_only`，提示词标「服务器读不到」 |
+| 3 | 模型 | 按人设协议用 `websearch` 搜链接主题（站点名 + 标题线索 + URL 里的 id） | 进第 4 级 |
+| 4 | 模型 | 一句话回退：「这链接本机读不到，麻烦给个标题或关键几句」，不再反复抓 | 到此为止 |
+
+细节：
+
+- 成功时提示词里出现【链接内容】块，每条形如 `- <URL>（标题：…）` + `  正文：…`；
+  HTTP 直抓的正文超过 `link.max_chars`（默认 6000 字符）按码点截断，避免挤占注入预算。
+- 失败时同一批只出现**一次**回退指令（多个失败链接共用一句），措辞里没有「再抓一次」，
+  模型侧对应「最多直抓一次」：同一 URL 只 `webfetch` 一次，抓不到就改 `websearch`。
+- 一批消息里所有 URL 共用一个总预算 `link.total_budget_seconds`（默认 20 秒）；预算用完
+  的 URL 直接标「服务器读不到」，不发起任何新请求。
+- 解析结果与失败结论都落在 `link.cache_dir`（默认 `data/link-cache`）：成功的 URL 哈希缓存
+  `link.cache_ttl_seconds`（默认 1 天），条目数与目录体积分别受 `link.cache_max_entries`
+  （500）和 `link.cache_max_bytes`（64MiB）约束，超限按最旧淘汰。
+- **失败会按 host 记住结论**（`data/link-cache/host-failures.json`，保留
+  `link.host_failure_ttl_seconds`，默认 7 天）：`needs_browser` 的 host 下次跳过 HTTP 直抓、
+  直接进浏览器层；`search_only` 的 host 连请求都不发，直接让模型搜索。7 天后自动忘掉重试；
+  期间只要抓到一次成功内容，旧结论立即作废。
+- 关掉整条链：`link.enabled: false`。模型仍按人设里的链接协议自己 `websearch` / 回退。
+
+### 浏览器渲染注意事项（`link.browser`）
+
+- **本机需装 Edge 或 Chrome**：`link.browser.binary` 留空时自动探测已安装的 Edge/Chrome；
+  探测不到就跳过浏览器层（不报错，直接走搜索兜底）。填路径则强制用它。
+- **必须有头**：`link.browser.mode` 只接受 `minimized`。实测无头（哪怕先有头预热再切无头）
+  一律被知乎风控挡掉，填其它值**启动就报错**，绝不静默降级成无头。
+- **不下载浏览器**：不装 Playwright、不跑 `playwright install`，只用系统已有的浏览器。
+- **不需要登录**：用独立的 `link.browser.profile_dir`（默认 `data/link-browser-profile`）作为
+  `--user-data-dir`，绝不读你自己的浏览器 profile，也不需要任何账号登录。
+- **首次会闪一个最小化窗口**：浏览器以最小化方式启动，任务栏会短暂出现图标；渲染完的标签页
+  即关，进程空闲 `link.browser.idle_close_seconds`（默认 300 秒）后自动退出，不常驻。
+- 并发标签页上限 `link.browser.max_targets`（默认 2），单页渲染超时
+  `link.browser.timeout_seconds`（默认 30 秒）。
+- **失败会按 host 记住结论**：浏览器层也失败时该 host 被升级为 `search_only`，7 天内不再
+  尝试（见上一节）。
+- **无桌面会话的部署必须关**：`link.browser.enabled: false`（Windows 服务/无交互会话里
+  起不了有头浏览器）。
+
+### 跨平台消息泡：线上气泡 / 入库单行
+
+打开跨群镜像（`mirror.enabled`）后，**别人转来的**消息在对面平台会套一个三行圆角气泡；
+bot 自己的话不套框，入库也永远是单行。同一份内容有两套形态：
+
+| 形态 | 用途 | 样例 |
+| --- | --- | --- |
+| 线上（wire） | 发到对面群里的实际文本 | 见下方代码块 |
+| 入库（store） | 写 SQLite / 给模型看的历史 | `阿鱼：顺路` |
+
+```
+╭────────────╮
+│ 阿鱼：顺路 │
+╰────────────╯
+```
+
+- 框宽按 `textwidth.display_width` 计算（中文算 2 列），正文超过
+  `mirror.bubble_max_content_width`（默认 30 列）先换行再对齐框宽。
+- 四角字符由 `mirror.bubble_corner_chars` 决定（默认 `╭╮╰╯`，必须给足 4 个字符，顺序
+  左上/右上/左下/右下）。
+- 媒体与文件用占位文本进气泡，例如 `阿鱼：[图片]`、`阿鱼：[文件] doc.pdf`；一条线上消息
+  始终是一个完整气泡，不会切出半个框。极端超长时（套框后超过 4500 字符）宁可不套框、
+  退回单行，也不发半截气泡。
+- **入库仍是单行**「昵称：正文」（bot 自己的消息没有 `昵称：` 前缀）：模型解析、检索、
+  摘要、印象全都基于这个形态，多行气泡只影响线上长相，不影响记忆。
+- `mirror.bubble_enabled: false` 整体退回旧形态：线上也是单行，其它行为不变。
+
 ## 5. 控制台面板
 
 `scripts/start-all.ps1` 启动后，supervisor 会打印并打开面板地址（端口在 `config.yaml` 的
