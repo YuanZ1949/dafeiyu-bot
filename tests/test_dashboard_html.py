@@ -660,15 +660,15 @@ def test_html_each_pane_holds_at_least_one_card() -> None:
 def test_html_every_card_belongs_to_exactly_one_pane() -> None:
     """分区只加一层壳：卡片不重复、不丢失，卡片 id 一个都不改。
 
-    22 是 todo 13 重排时的存量卡片数；W5 的「正在攒着」卡（todo 17）是**新增**卡片，
-    所以这里跟着 +1。断言仍是「main 里的卡片数 == 各分区内卡片数之和」这条不变量。
+    22 是 todo 13 重排时的存量卡片数；W5 新增了「正在攒着」（todo 17）与「话题状态」（todo 19）
+    两张卡，所以这里跟着 +2。断言仍是「main 里的卡片数 == 各分区内卡片数之和」这条不变量。
     """
     main = main_block()
     in_main = len(re.findall(r'<section class="card', main))
     in_panes = sum(
         len(re.findall(r'<section class="card', body)) for body in pane_blocks().values()
     )
-    assert in_main == in_panes == 23
+    assert in_main == in_panes == 24
     assert 'id="processes"' in main
     # 卡片自己的 id 仍然原样在（分区不改 id，只加壳）。
     for card_id in (
@@ -887,3 +887,22 @@ def test_html_global_search_says_it_is_windowed_not_full_db() -> None:
     assert 'ev.key !== "Escape"' in html
     assert "if (!q) {" in html
     assert "panel.contains(ev.target)" in html
+
+
+def test_html_thread_state_board_is_read_only() -> None:
+    """话题状态看板读已落库的收尾信号，只读，不给面板手动收尾的入口。"""
+    html = read_html()
+    assert 'id="thread-states-card"' in html
+    assert 'id="thread-states-list"' in html
+    assert 'id="thread-states-hint"' in html
+    assert "function loadThreadStates(" in html
+    match = re.search(r"async function loadThreadStates\(\) \{(.*?)\n\}", html, re.DOTALL)
+    assert match is not None, "loadThreadStates 必须是一段可直接断言的函数体"
+    assert 'api("/api/thread-states")' in match.group(1)
+    # 状态文案与「剩余 N 秒」都要出现；没有写接口就没有「收尾 / 重开」按钮。
+    assert "已收尾 · 剩余" in html
+    assert "进行中" in html
+    assert "data-thread-left" in html
+    assert "data-thread-closed" in html
+    assert "/thread-states/close" not in html
+    assert "重开话题" not in html

@@ -950,6 +950,18 @@
       <div class="mem-list list-h-md" id="holds-list"></div>
     </section>
 
+    <section class="card span-full" id="thread-states-card">
+      <div class="row card-head">
+        <h2>话题状态</h2>
+        <span class="kv" id="thread-states-hint">读的是已落库的收尾信号 · 只读</span>
+        <span class="spacer"></span>
+        <span class="kv card-updated" id="thread-states-updated" data-updated hidden></span>
+        <button class="btn" id="btn-refresh-thread-states">刷新</button>
+      </div>
+      <div class="kv">「已收尾」来自 chat_state 里已经落库的信号，不是 router 的实时判定；面板只读，不介入话题判定。</div>
+      <div class="mem-list list-h-md" id="thread-states-list"></div>
+    </section>
+
     <section class="card">
       <div class="row card-head">
         <h2>微信私聊</h2>
@@ -3804,6 +3816,58 @@ async function loadHolds() {
   }
 }
 
+// ---- 话题状态（只读）：展示 chat_state 里已经落库的收尾信号 ----
+function threadStateOf(item) {
+  const left = Number(item.closed_left_seconds) || 0;
+  if (left > 0) return { label: `已收尾 · 剩余 ${left} 秒`, cls: "st-offline", closed: true };
+  return { label: "进行中", cls: "st-running", closed: false };
+}
+
+function renderThreadStates(data) {
+  const box = $("thread-states-list");
+  const items = (data && data.items) || [];
+  box.replaceChildren();
+  let closed = 0;
+  items.forEach((item) => {
+    const state = threadStateOf(item);
+    if (state.closed) closed += 1;
+    const row = document.createElement("div");
+    row.className = "mem-item";
+    row.setAttribute("data-chat-type", String(item.chat_type || ""));
+    row.setAttribute("data-chat-id", String(item.chat_id || ""));
+    row.setAttribute("data-thread-left", String(Number(item.closed_left_seconds) || 0));
+    row.setAttribute("data-thread-closed", state.closed ? "1" : "0");
+    const meta = document.createElement("div");
+    meta.className = "mem-meta";
+    const pill = document.createElement("span");
+    pill.className = `pill ${state.cls}`;
+    pill.textContent = state.label;
+    meta.append(document.createTextNode(`${chatLabel(item.chat_type, item.chat_id)} `), pill);
+    const body = document.createElement("div");
+    body.className = "mem-text";
+    const at = Number(item.last_closed_at);
+    body.textContent = at
+      ? `最近收尾 ${new Date(at * 1000).toLocaleString("zh-CN", { hour12: false })}`
+      : "还没有收尾记录";
+    row.append(meta, body);
+    box.appendChild(row);
+  });
+  if (!items.length) box.innerHTML = '<div class="mem-empty">还没有会话的话题记录</div>';
+  $("thread-states-hint").textContent = items.length
+    ? `${closed} 个已收尾 · ${items.length - closed} 个进行中 · 只读`
+    : "读的是已落库的收尾信号 · 只读";
+}
+
+async function loadThreadStates() {
+  if (document.hidden) return; // 后台标签不刷新，回前台由 visibilitychange 触发
+  try {
+    renderThreadStates(await api("/api/thread-states"));
+    markUpdated("thread-states-card");
+  } catch (err) {
+    $("thread-states-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
 async function hardDeleteSession(session) {
   if (!confirm(`彻底删除 ${chatLabel(session.chat_type, session.chat_id)}？\n会删除远端 session 和本地全部消息、摘要、印象、用量，且不可恢复。`)) return;
   try {
@@ -4974,6 +5038,7 @@ document.addEventListener("click", (ev) => {
 $("btn-sessions-more").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadSessions(true)));
 $("btn-refresh-sessions").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadSessions()));
 $("btn-refresh-holds").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadHolds()));
+$("btn-refresh-thread-states").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadThreadStates()));
 $("btn-holds-all").addEventListener("click", () => {
   holdsShowAll = !holdsShowAll;
   $("btn-holds-all").setAttribute("aria-pressed", holdsShowAll ? "true" : "false");
@@ -5101,6 +5166,7 @@ loadEvals();
 loadBudget();
 loadSessions();
 loadHolds();
+loadThreadStates();
 loadConfig();
 loadBehavior();
 loadMind();
@@ -5122,6 +5188,8 @@ setInterval(() => {
 setInterval(() => { if (!document.hidden) loadDecisions(); }, 15000);
 // 攒着状态与决策流同频：攒着时长会一直涨，太慢就看不出变化。
 setInterval(() => { if (!document.hidden) loadHolds(); }, 15000);
+// 话题状态同样 15 秒一轮（只读信号，不需要更快）。
+setInterval(() => { if (!document.hidden) loadThreadStates(); }, 15000);
 // 只做本地判断：哪张卡超过 60 秒没刷新就标黄，不额外发请求。
 setInterval(sweepStaleCards, 15000);
 document.addEventListener("visibilitychange", () => {
@@ -5129,6 +5197,7 @@ document.addEventListener("visibilitychange", () => {
   refreshHealth();
   loadDecisions();
   loadHolds();
+  loadThreadStates();
   if (!alertsDisabled) refreshAlerts();
   refreshBackups();
   loadMemory();
