@@ -36,7 +36,8 @@ PORTS: tuple[tuple[int, str], ...] = (
     (24310, "opencode serve"),
 )
 
-# 只探本机公开健康口；控制口的 /api/health 不需要 token。
+# 只探本机公开健康口：控制口里 /api/health 是唯一免 token 的路径，
+# /api/health/detail 及其余接口都要 X-Control-Token。
 HEALTH_TARGETS: tuple[tuple[int, str], ...] = (
     (8788, "/api/health"),
     (8788, "/health"),
