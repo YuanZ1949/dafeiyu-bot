@@ -755,4 +755,53 @@ def test_html_login_card_collapses_when_logged_in() -> None:
     assert "/api/qr/image?t=${Date.now()}" in html
 
 
+# ------------------------------------------------------ 既有 DOM id 清单
+# 与 `tests/test_control_api.py::test_dashboard_exposes_new_panels` 同一张清单：
+# 那边逐个断言是为了守后端面板，这边把清单本身钉在面板契约文件里，
+# 让「分区重排只加壳、不改 id」这条规则在任何一次改版里都被同一个文件挡住。
+CONTRACT_DOM_IDS = (
+    "usage-bars",
+    "usage-days",
+    "search-q",
+    "btn-search-more",
+    "sessions",
+    "btn-sessions-more",
+    "config-body",
+    "btn-restart-bot",
+    "btn-backup",
+    "behavior-intensity",
+    "behavior-restriction-mode",
+    "behavior-banned-phrases",
+    "btn-save-behavior",
+    "groups-whitelist",
+    "groups-known",
+    "btn-save-groups",
+    "btn-refresh-groups",
+    "private-chats-state",
+    "private-chats-body",
+    "btn-refresh-private-chats",
+    "private-enabled",
+    "private-reply",
+    "private-allow",
+    "private-deny",
+    "btn-save-private-settings",
+    "wechat-account",
+    "btn-save-wechat-account",
+    "btn-refresh-wechat-account",
+    # 面板自身被其它契约用法钉住的核心 id（决策流 / 健康 / 告警 / 日志 / 二维码）。
+    "decisions-card",
+    "decisions-list",
+    "decisions-updated",
+    "health-card",
+    "alerts-card",
+    "qr",
+    "logs",
+    "memory-health",
+)
 
+
+def test_html_keeps_every_contracted_dom_id() -> None:
+    """契约钉死的 id 一个都不能少：分区只允许加壳，不允许换 id。"""
+    html = read_html()
+    missing = [element_id for element_id in CONTRACT_DOM_IDS if f'id="{element_id}"' not in html]
+    assert not missing, f"面板缺少这些契约 id：{missing}"
