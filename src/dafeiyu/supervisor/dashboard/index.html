@@ -481,19 +481,24 @@
   }
   .timeline-body {
     flex: 1; overflow: auto; padding: 16px 20px;
-    display: grid; align-content: start; gap: 8px;
+    /* 网格列不再拉伸子项：气泡宽度改由内容决定（配合 .timeline-msg 的 fit-content）。 */
+    display: grid; align-content: start; gap: 8px; justify-items: start;
   }
   .timeline-date {
     color: var(--muted); font-size: var(--fs-sm); text-align: center;
     padding: 8px 0 4px; border-bottom: 1px dashed var(--line);
+    /* 它是 .timeline-body 的兄弟 grid item：justify-items:start 会让虚线缩成
+       一个字宽，必须显式跨满整行（只改宽度归属，不改变日期居中语义）。 */
+    grid-column: 1 / -1; justify-self: stretch;
   }
   .timeline-msg {
     border: 1px solid var(--line); border-left: 3px solid var(--accent);
     border-radius: 8px; padding: 8px 12px; background: var(--panel-2);
-    max-width: 88%;
+    /* 宽度算法：短句按内容收窄，长句到上限换行；桌面与手机共用同一上限。 */
+    width: fit-content; max-width: min(72ch, 88%);
   }
   .timeline-msg.bot {
-    margin-left: auto; border-left-color: var(--ok); background: var(--bubble-ok);
+    justify-self: end; border-left-color: var(--ok); background: var(--bubble-ok);
   }
   .timeline-msg.hit {
     outline: 2px solid var(--warn); background: var(--bubble-warn);
@@ -567,7 +572,6 @@
     .timeline-drawer { width: 100vw; border-left: none; }
     .timeline-head, .timeline-metrics, .timeline-toolbar,
     .timeline-body, .timeline-context { padding-left: 12px; padding-right: 12px; }
-    .timeline-msg { max-width: 100%; }
     .timeline-context { max-height: 45vh; }
     .session-row .who, .session-row .meta { min-width: 0; }
     .decision-chat { max-width: 96px; }
