@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 
 import pytest
@@ -565,6 +566,40 @@ async def test_store_bot_chunks_without_attachments_unchanged(tmp_path) -> None:
 
     stored = service.store.recent_bot_messages_in(ChatType.GROUP, GROUP, 1)
     assert stored[0].content == "哈哈"
+
+
+async def test_store_bot_chunks_private_reply_records_peer(tmp_path) -> None:
+    adapter = _RichAdapter()
+    service = _rich_service(tmp_path, adapter)
+    msg = Message(
+        chat_type=ChatType.PRIVATE,
+        chat_id="qq:2",
+        user_id="qq:2",
+        nickname="阿花",
+        content="在吗",
+        message_id="pm1",
+        timestamp=int(time.time()),
+    )
+
+    service._store_bot_chunks(msg, [("在的", None)])
+
+    stored = service.store.recent_bot_messages_in(ChatType.PRIVATE, "qq:2", 1)
+    assert len(stored) == 1
+    assert stored[0].is_bot is True
+    assert stored[0].content == "在的"
+    assert stored[0].reply_to_user_id == "qq:2"
+    cards = service.store.relationship_cards(ChatType.PRIVATE, "qq:2", ["qq:2"])
+    assert cards["qq:2"].last_bot_reply == "在的"
+
+
+async def test_store_bot_chunks_group_reply_does_not_guess_peer(tmp_path) -> None:
+    adapter = _RichAdapter()
+    service = _rich_service(tmp_path, adapter)
+
+    service._store_bot_chunks(_plain_msg(), [("哈哈", None)])
+
+    stored = service.store.recent_bot_messages_in(ChatType.GROUP, GROUP, 1)
+    assert stored[0].reply_to_user_id is None
 
 
 async def test_single_reply_path_wires_attachments_and_mentions(

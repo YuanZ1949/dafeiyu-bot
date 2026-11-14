@@ -4116,9 +4116,12 @@ class Service:
         """入库 bot 回复：优先用网关返回的真实 message_id，没有才回退合成值。
 
         附件只以纯文本注记的形式挂在第一片 content 末尾（面板据此预览），
-        不新增字段、不写 pending_outbox。
+        不新增字段、不写 pending_outbox；私聊还会记下回复对象，供关系卡
+        渲染「你上次回他」。
         """
         now_ts = int(now_shanghai().timestamp())
+        # 私聊只有一个对话方，直接记下对方；群聊不猜（避免把「你上次回他」挂到错的人身上）。
+        reply_to_user_id = msg.user_id if msg.chat_type is ChatType.PRIVATE else None
         for index, (chunk, message_id) in enumerate(chunks):
             content = self._annotate_attachments(chunk, attachments) if index == 0 else chunk
             self.store.add_message(
@@ -4130,6 +4133,7 @@ class Service:
                     content=content,
                     message_id=message_id or f"{msg.message_id}:bot:{index}",
                     is_bot=True,
+                    reply_to_user_id=reply_to_user_id,
                     timestamp=now_ts,
                 )
             )
