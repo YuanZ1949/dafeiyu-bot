@@ -26,31 +26,52 @@ if (-not (Test-Path $pythonw)) { $pythonw = $python }
 
 $env:PYTHONIOENCODING = "utf-8"
 
+# 读配置的统一入口。
+# PS 5.1 的坑：原生命令把 stderr 重定向（2>$null / 2>&1）时，若
+# $ErrorActionPreference = "Stop"，写 stderr 会被当成 NativeCommandError 抛出。
+# 本项目 python 一 import 就往 stderr 打一行能力探测，于是每次读配置都进 catch，
+# 表现为「读取配置失败」并静默退回默认值（微信 hook 因此不会被拉起）。
+# 这里在读取期间临时放宽为 Continue，并且只取最后一行字符串。
+function Invoke-PythonRead([string]$Code) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $lines = & $python -c $Code 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($code -ne 0 -or -not $lines) {
+        return $null
+    }
+    $last = $lines | Where-Object { $_ -is [string] } | Select-Object -Last 1
+    if (-not $last) {
+        return $null
+    }
+    return ([string]$last).Trim()
+}
+
 # 端口和「面板自己会不会开浏览器」都以配置为准，不写死默认值
 $port = 8787
 $supervisorOpensBrowser = $true
-try {
-    $printed = & $python -c "from dafeiyu.config import load_settings; d = load_settings().supervisor.dashboard; print(f'{d.port} {int(d.open_browser)}')" 2>$null
-    if ($LASTEXITCODE -eq 0 -and $printed) {
-        $parts = ($printed | Select-Object -Last 1).Trim() -split '\s+'
-        if ($parts.Count -ge 2) {
-            $port = [int]$parts[0]
-            $supervisorOpensBrowser = ($parts[1] -eq "1")
-        }
+$printed = Invoke-PythonRead "from dafeiyu.config import load_settings; d = load_settings().supervisor.dashboard; print(f'{d.port} {int(d.open_browser)}')"
+if ($printed) {
+    $parts = $printed -split '\s+'
+    if ($parts.Count -ge 2) {
+        $port = [int]$parts[0]
+        $supervisorOpensBrowser = ($parts[1] -eq "1")
     }
-} catch {
+} else {
     Write-Host "读取配置失败，使用默认端口 8787" -ForegroundColor DarkYellow
 }
 
 # 微信出站走 hook/auto 时，先把本地 hook 服务拉起来（脚本自身幂等）。
 # 放在 supervisor 之前：bot 一连上桥就能发消息，不用等第一次发送才失败。
 $wechatHook = $false
-try {
-    $hookFlag = & $python -c "from dafeiyu.config import load_settings; w = load_settings().wechat; print('1' if (w.enabled and w.outbound in ('hook', 'auto')) else '0')" 2>$null
-    if ($LASTEXITCODE -eq 0 -and $hookFlag) {
-        $wechatHook = (($hookFlag | Select-Object -Last 1).Trim() -eq "1")
-    }
-} catch {
+$hookFlag = Invoke-PythonRead "from dafeiyu.config import load_settings; w = load_settings().wechat; print('1' if (w.enabled and w.outbound in ('hook', 'auto')) else '0')"
+if ($hookFlag) {
+    $wechatHook = ($hookFlag -eq "1")
+} else {
     Write-Host "读取微信出站配置失败，跳过 hook 服务启动" -ForegroundColor DarkYellow
 }
 
@@ -58,26 +79,22 @@ if ($wechatHook) {
     $hookScript = Join-Path $root "scripts\start-wechat-hook.ps1"
     # 端口以 config.yaml 的 gateway.wechat.hook_url 为准，脚本不再写死 30011。
     $hookPort = 30011
-    try {
-        $hookPortText = & $python -c "from urllib.parse import urlsplit; from dafeiyu.config import load_settings; print(urlsplit(load_settings().wechat.hook_url).port or 30011)" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $hookPortText) {
-            $parsedPort = 0
-            if ([int]::TryParse((($hookPortText | Select-Object -Last 1).Trim()), [ref]$parsedPort)) {
-                $hookPort = $parsedPort
-            }
+    $hookPortText = Invoke-PythonRead "from urllib.parse import urlsplit; from dafeiyu.config import load_settings; print(urlsplit(load_settings().wechat.hook_url).port or 30011)"
+    if ($hookPortText) {
+        $parsedPort = 0
+        if ([int]::TryParse($hookPortText, [ref]$parsedPort)) {
+            $hookPort = $parsedPort
         }
-    } catch {
+    } else {
         Write-Host "读取 hook 端口失败，回退 30011" -ForegroundColor DarkYellow
     }
     # 机器人 wxid 同理以配置为准（面板「微信账号」保存到覆盖层）：同时登录多个
     # 微信账号时，helper 必须显式绑定，否则报「多个微信账号同时登录」。
     $hookAccount = ""
-    try {
-        $hookAccountText = & $python -c "from dafeiyu.config import load_settings; print(load_settings().wechat.account or '')" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $hookAccountText) {
-            $hookAccount = ($hookAccountText | Select-Object -Last 1).Trim()
-        }
-    } catch {
+    $hookAccountText = Invoke-PythonRead "from dafeiyu.config import load_settings; print(load_settings().wechat.account or '')"
+    if ($hookAccountText) {
+        $hookAccount = $hookAccountText
+    } else {
         Write-Host "读取微信账号失败，按不绑定启动 hook" -ForegroundColor DarkYellow
     }
     if (Test-Path -LiteralPath $hookScript) {
