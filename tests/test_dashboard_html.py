@@ -213,8 +213,12 @@ def test_html_context_p90_matches_model_probe() -> None:
 
 def test_html_never_renders_a_stored_secret() -> None:
     html = read_html()
-    # 不落任何浏览器存储，也不从服务端数据里读 api_key 回填到 DOM。
-    assert "localStorage" not in html
+    # 不落任何浏览器存储（唯一例外：主题偏好键 dafeiyu.theme，读写各一处），也不
+    # 从服务端数据里读 api_key 回填到 DOM。
+    stripped = html.replace('localStorage.getItem("dafeiyu.theme")', "").replace(
+        'localStorage.setItem("dafeiyu.theme", next)', ""
+    )
+    assert "localStorage" not in stripped
     assert "sessionStorage" not in html
     assert ".api_key" not in html
     assert not re.search(r"(?:data|brain|response|result)\.api_key", html)
@@ -455,3 +459,87 @@ async def test_dashboard_models_proxy_forwards_query_string(tmp_path: Path) -> N
         if dash_client is not None:
             await dash_client.close()
         await bot_client.close()
+
+
+# ---------------------------------------------------------------- 浅色主题
+
+#: 深色 / 浅色两套主题共享的调色板令牌（尺寸令牌只有一套，不在此列）。
+THEME_COLOR_TOKENS = {
+    "--bg",
+    "--panel",
+    "--panel-2",
+    "--line",
+    "--text",
+    "--muted",
+    "--ok",
+    "--warn",
+    "--bad",
+    "--accent",
+    "--accent-hot",
+    "--danger-deep",
+    "--stopped-deep",
+    "--surface-deep",
+    "--toast-deep",
+    "--mode-active",
+    "--mode-glow",
+    "--bubble-ok",
+    "--bubble-warn",
+    "--hot",
+    "--tag-warn-bg",
+    "--tag-bad-bg",
+    "--tag-ok-bg",
+    "--overlay",
+    "--drawer-shadow",
+}
+
+
+def style_block() -> str:
+    html = read_html()
+    return html[html.index("<style>") : html.index("</style>")]
+
+
+def token_block(style: str, selector: str) -> str:
+    match = re.search(rf"{re.escape(selector)} \{{(.*?)\n  \}}", style, re.DOTALL)
+    assert match is not None, f"缺少令牌块 {selector}"
+    return match.group(1)
+
+
+def test_html_defaults_to_the_dark_theme() -> None:
+    html = read_html()
+    assert '<html lang="zh-CN" data-theme="dark">' in html
+
+
+def test_html_light_theme_defines_every_color_token() -> None:
+    style = style_block()
+    root = token_block(style, ":root")
+    light = token_block(style, '[data-theme="light"]')
+
+    root_tokens = set(re.findall(r"(--[a-z0-9-]+):", root))
+    light_tokens = set(re.findall(r"(--[a-z0-9-]+):", light))
+
+    # 只比较调色板令牌：尺寸令牌（--fs-* / --list-h-* / --w-*）在浅色块里不重复。
+    assert THEME_COLOR_TOKENS <= root_tokens
+    assert light_tokens == THEME_COLOR_TOKENS
+
+
+def test_html_theme_toggle_button_exists() -> None:
+    html = read_html()
+    assert 'id="btn-theme"' in html
+    assert "切换深色 / 浅色主题" in html
+
+
+def test_html_theme_preference_is_persisted_to_one_key() -> None:
+    html = read_html()
+    assert 'localStorage.getItem("dafeiyu.theme")' in html
+    assert 'localStorage.setItem("dafeiyu.theme"' in html
+    assert "applyTheme(" in html and "initTheme();" in html
+
+
+def test_html_has_no_hex_colors_outside_the_theme_blocks() -> None:
+    """色值只允许出现在两个令牌块内；块外既有 #fff 是旧代码，不新增即可。"""
+    style = style_block()
+    rest = style.replace(token_block(style, ":root"), "").replace(
+        token_block(style, '[data-theme="light"]'), ""
+    )
+    assert set(re.findall(r"#[0-9a-fA-F]{3,8}\b", rest)) <= {"#fff"}
+

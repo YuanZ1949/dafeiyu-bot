@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
@@ -16,7 +16,7 @@
     --warn: #fbbf24;
     --bad: #f87171;
     --accent: #60a5fa;
-    /* 主题色 token：这些色值只允许在 :root 出现，其它地方一律引用变量 */
+    /* 色值只允许出现在 :root 与 [data-theme="light"] 两个令牌块内，其它地方一律引用变量 */
     --accent-hot: #1d4ed8;
     --danger-deep: #7f1d1d;
     --stopped-deep: #4b5563;
@@ -51,6 +51,35 @@
     --w-user: 140px;
     --w-token: 180px;
     --w-confirm: 190px;
+  }
+  /* 浅色主题：与 :root 的调色板令牌一一对应（尺寸令牌共用，不重复）。
+     正文对白底对比度 ≥ 4.5:1，边框与面板保持可分辨。默认仍是深色。 */
+  [data-theme="light"] {
+    --bg: #f4f6f9;
+    --panel: #ffffff;
+    --panel-2: #eef1f5;
+    --line: #d3d9e3;
+    --text: #1b2130;
+    --muted: #5b6478;
+    --ok: #15803d;
+    --warn: #a15c07;
+    --bad: #b91c1c;
+    --accent: #1d4ed8;
+    --accent-hot: #1e3a8a;
+    --danger-deep: #fbd5d5;
+    --stopped-deep: #94a3b8;
+    --surface-deep: #e7ebf1;
+    --toast-deep: #ffffff;
+    --mode-active: #e3ecff;
+    --mode-glow: rgba(29, 78, 216, .16);
+    --bubble-ok: #e8f7ee;
+    --bubble-warn: #fdf3dc;
+    --hot: #c2410c;
+    --tag-warn-bg: rgba(161, 92, 7, .12);
+    --tag-bad-bg: rgba(185, 28, 28, .12);
+    --tag-ok-bg: rgba(21, 128, 61, .12);
+    --overlay: rgba(15, 23, 42, .42);
+    --drawer-shadow: rgba(15, 23, 42, .18);
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
@@ -596,6 +625,7 @@
   <button class="btn" data-act="start" data-target="all">全部启动</button>
   <button class="btn" data-act="restart" data-target="all">全部重启</button>
   <button class="btn danger" data-act="stop" data-target="all">全部停止</button>
+  <button class="btn" id="btn-theme" title="切换深色 / 浅色主题">浅色</button>
   <button class="btn" id="btn-logout" hidden>退出登录</button>
   <button class="btn danger" id="btn-shutdown">退出控制台</button>
 </header>
@@ -1300,6 +1330,27 @@ let memoryPendingDays = 0;
 let lastQrKey = "";
 
 const $ = (id) => document.getElementById(id);
+
+// 主题：深色是默认；只允许一个浏览器存储键，用于记住用户的选择。
+function applyTheme(theme) {
+  const next = theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  const button = $("btn-theme");
+  if (button) button.textContent = next === "light" ? "深色" : "浅色";
+}
+
+function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem("dafeiyu.theme"); } catch (_) { saved = null; }
+  applyTheme(saved === "light" ? "light" : "dark");
+  const button = $("btn-theme");
+  if (!button) return;
+  button.addEventListener("click", () => {
+    const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+    applyTheme(next);
+    try { localStorage.setItem("dafeiyu.theme", next); } catch (_) { /* 隐私模式忽略 */ }
+  });
+}
 
 function toast(message, isError = false) {
   const el = $("toast");
@@ -4557,6 +4608,7 @@ document.addEventListener("keydown", (ev) => {
 initTabs();
 // 摘要日期默认昨天，用户可改；每次打开面板都重置回默认，避免沿用上次选择。
 $("summary-date").value = yesterdayIso();
+initTheme();
 loadAuthSession();
 // 面板刚打开：强制重探一次免费档，别让上一次会话留下的旧黄条继续挂着。
 // 只为触发后端重探；响应丢弃也没关系，状态由下一轮 /api/status 带回。
