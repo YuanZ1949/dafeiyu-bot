@@ -709,7 +709,7 @@ async def test_new_session_history_keeps_mention_marks(store: Store) -> None:
 async def test_reply_fresh_replays_mention_marks_from_local_history(
     store: Store,
 ) -> None:
-    """reply_fresh 的历史经 service._history_before → to_prompt_line(with_markers)。"""
+    """reply_fresh 的历史经 service._history_before → timeline.format_message_line()。"""
     _seed_addressed_history(store)
     settings = make_settings()
     router = Router(settings, store)

@@ -47,7 +47,12 @@ from .memory.atmosphere import describe_atmosphere
 from .memory.context import build_injection
 from .memory.rotation import apply_rotation, needs_rotation
 from .memory.store import Store
-from .memory.timeline import TIMELINE_LIMIT, build_batch_prompt, time_label
+from .memory.timeline import (
+    TIMELINE_LIMIT,
+    build_batch_prompt,
+    format_message_line,
+    time_label,
+)
 from .memory.workspace import Workspace
 from .models import QQ_PREFIX, Attachment, ChatType, Message, NoticeEvent, RecallEvent, channel_of
 from .moment import (
@@ -3907,7 +3912,7 @@ class Service:
                     "role": "assistant" if message.is_bot else "user",
                     # 带标记渲染：裸「昵称: 内容」会把「（@了你）」等点名
                     # 线索抹掉，reply_fresh 重放时模型就认不出谁在叫它。
-                    "content": message.to_prompt_line(with_markers=True),
+                    "content": format_message_line(message),
                 }
             )
         return history[-window:]

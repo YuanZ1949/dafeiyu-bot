@@ -89,19 +89,16 @@ class Message:
     # 「上一条是不是 bot 提问」判定；仅保留在回声种子里。
     mirror: bool = False
 
-    def to_prompt_line(self, with_markers: bool = False) -> str:
-        """默认保持旧的裸「昵称: 内容」；带标记时用时间线渲染。
+    def to_prompt_line(self) -> str:
+        """裸「昵称: 内容」。
 
-        历史重放（新会话前缀 / reply_fresh 的本地窗口）需要「（@了你）」
-        「（引用你：…）」这些点名标记，裸形态会把它们全部抹掉。标记渲染
-        与 memory.timeline.format_message_line 是同一份实现，这里延迟导入，
-        避免 models ↔ timeline 循环依赖。
+        **不要在这里加「带标记」分支**：标记渲染在
+        `memory.timeline.format_message_line`，而 timeline 本身 import 了
+        `models` —— 反向 import（哪怕放在函数体内）会被 basedpyright 记成
+        `reportImportCycles` 新增 error。需要标记的调用点（历史重放）直接
+        调 `format_message_line(message)`。
         """
-        if not with_markers:
-            return f"{self.nickname}: {self.content}"
-        from dafeiyu.memory.timeline import format_message_line
-
-        return format_message_line(self)
+        return f"{self.nickname}: {self.content}"
 
     def attachment_paths(self) -> tuple[str, ...]:
         """返回非空 path 的附件路径，保持原顺序。"""
