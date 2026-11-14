@@ -177,6 +177,9 @@ GROUP_NAME_TIMEOUT_SECONDS = 2.0
 _WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 # 群气氛统计取最近多少条消息；只在实际打开 memory.atmosphere_enabled 时查询。
 ATMOSPHERE_WINDOW_MESSAGES = 60
+# 【本批】块的镜像窗口分页大小：上界是本批最后一条消息，50 条足够覆盖一批，
+# 保证查询有界、不扫全表。
+MIRROR_WINDOW_MESSAGES = 50
 # 入站媒体反应只认这几种附件：语音在 QQ 是 record、在微信是 voice。
 INBOUND_MEDIA_KINDS = frozenset({"image", "voice", "record", "video"})
 
@@ -3336,7 +3339,18 @@ class Service:
             elif delta >= 0:
                 parts.append("你刚刚才说过话")
         if messages and not messages[-1].is_bot:
-            parts.append(f"刚才是 {messages[-1].nickname} 在说")
+            if len(messages) == 1:
+                parts.append(f"刚才是 {messages[-1].nickname} 在说")
+            else:
+                # 多条批次只报最后一个人会误导模型（GAP-4）；且措辞不能含
+                # 「刚是」（「刚才是」里也含），整句改成列本批说话人。
+                speakers = list(
+                    dict.fromkeys(
+                        m.nickname for m in messages if not m.is_bot and m.nickname
+                    )
+                )
+                if speakers:
+                    parts.append(f"这批是 {'、'.join(speakers)} 在说")
         return "【此刻】" + "；".join(parts) + "。"
 
     def _build_prompt(
@@ -3461,6 +3475,9 @@ class Service:
             if reply_ids
             else None
         )
+        mirror_count, mirror_speakers = self._mirror_window(
+            chat_type, chat_id, messages
+        )
         return build_batch_prompt(
             messages,
             injection,
@@ -3469,7 +3486,47 @@ class Service:
             reply_names=reply_names,
             mention_ids=mention_ids,
             gap_seconds=self._batch_gap_seconds(messages),
+            mirror_count=mirror_count,
+            mirror_speakers=mirror_speakers,
+            addressed=[
+                m for m in messages if self.router.addressed_source(m) is not None
+            ],
         )
+
+    def _mirror_window(
+        self, chat_type: ChatType, chat_id: str, messages: list[Message]
+    ) -> tuple[int, tuple[str, ...]]:
+        """本批时间窗内的跨群镜像行数与发言人。
+
+        pending_batch 只取 is_bot=0 的行，而镜像入库是 is_bot=1，所以镜像
+        条数不能从批次数组里数，必须另查 recent_messages(include_mirror=True)。
+        查询必须有界：上界用本批最后一条消息的 message_id，limit 取固定小值；
+        时间下界（timestamp >= 本批起始）在取回后的内存里过滤——
+        recent_messages 没有 timestamp 参数。失败按 0 处理，不挡回复链路。
+        """
+        if not messages or not messages[-1].message_id:
+            return 0, ()
+        first_ts = next((m.timestamp for m in messages if m.timestamp), 0)
+        try:
+            rows = self.store.recent_messages(
+                chat_type,
+                chat_id,
+                MIRROR_WINDOW_MESSAGES,
+                upto_message_id=messages[-1].message_id,
+                include_mirror=True,
+            )
+        except Exception:  # noqa: BLE001 - 镜像计数是锦上添花，不能挡回复
+            return 0, ()
+        window = [
+            row
+            for row in rows
+            if row.mirror
+            and (not first_ts or not row.timestamp or row.timestamp >= first_ts)
+        ]
+        speakers = tuple(
+            dict.fromkeys(row.nickname for row in window if row.nickname)
+        )
+        return len(window), speakers
 
     def _batch_gap_seconds(self, messages: list[Message]) -> float:
         """这一批第一条消息与它前面那条之间的空档秒数；查不到就返回 0。"""
@@ -3637,7 +3694,9 @@ class Service:
             history.append(
                 {
                     "role": "assistant" if message.is_bot else "user",
-                    "content": message.to_prompt_line(),
+                    # 带标记渲染：裸「昵称: 内容」会把「（@了你）」等点名
+                    # 线索抹掉，reply_fresh 重放时模型就认不出谁在叫它。
+                    "content": message.to_prompt_line(with_markers=True),
                 }
             )
         return history[-window:]

@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from ..memory.store import Store
+from ..memory.timeline import format_message_line
 from ..models import ChatType
 from ..netssl import default_ssl_context
 from .client import BrainError, BrainReply, parse_brain_reply
@@ -419,8 +420,9 @@ class OpenCodeHttpBrain:
             content = (message.content or "").strip()
             if not content:
                 continue
-            who = "我" if message.is_bot else (message.nickname or message.user_id or "群友")
-            line = f"{who}: {content}"
+            # 与时间线同一套渲染：保留时间戳与「（@了你）」「（引用你：…）」标记。
+            # 裸「谁: 内容」会把新会话里的点名线索全部抹掉（IS-3）。
+            line = format_message_line(message)
             total += len(line) + 1
             if total > NEW_SESSION_HISTORY_CHARS:
                 break

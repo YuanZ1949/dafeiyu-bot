@@ -68,6 +68,14 @@ class Workspace:
         path.write_bytes(legacy.read_bytes())
         return path
 
+    def chat_notes_path(self, chat_type: ChatType, chat_id: str) -> Path:
+        """本群笔记路径（与 read_for 同款，含 v1 旧文件迁移）。
+
+        教训段注入从这里读；必须走 _chat_file 而不是 chat_path，
+        否则还在旧文件名下的笔记会整段消失。
+        """
+        return self._chat_file(chat_type, chat_id)
+
     # ---- 读取 ---------------------------------------------------------
 
     def read_segment(self, path: Path, limit_chars: int) -> str:

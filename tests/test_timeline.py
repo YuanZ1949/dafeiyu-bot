@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from dafeiyu.memory.store import Store
 from dafeiyu.memory.timeline import (
     TIMELINE_HINT,
+    build_batch_prompt,
     build_prompt,
     format_message_line,
     time_label,
@@ -269,14 +270,69 @@ def test_alias_mention_is_marked_uncertain() -> None:
 
 
 def test_batch_prompt_renders_reply_names() -> None:
-    from dafeiyu.memory.timeline import build_batch_prompt
-
     prompt = build_batch_prompt(
         [make_msg("我也觉得", "m2", reply_to_message_id="m1")],
         "",
         reply_names={"m1": "鱼片"},
     )
     assert "（回复 鱼片）" in prompt
+
+
+# ---- T3：批次头部【本批】------------------------------------------------
+
+
+def test_batch_block_has_four_elements() -> None:
+    """三条消息（1 条 @机器人、1 条镜像计数、1 条原生）：四要素齐。"""
+    messages = [
+        make_msg("大肥鱼今天怎么不理人", "m1", timestamp=at(21, 0), nickname="梦幻天使"),
+        make_msg("他是不是在忙", "m2", timestamp=at(21, 1), nickname="阿猫"),
+        make_msg("@溟月 出来玩", "m3", timestamp=at(21, 2), nickname="阿狗", at_bot=True),
+    ]
+    prompt = build_batch_prompt(
+        messages,
+        "",
+        mirror_count=1,
+        mirror_speakers=("阿猫",),
+        addressed=[messages[2]],
+    )
+    # 【本批】是整段提示词的第一块（在注入串之前）。
+    assert prompt.startswith("【本批】")
+    # ① 说话人（去重、按出现顺序）
+    assert "说话人：梦幻天使、阿猫、阿狗" in prompt
+    # ② 点名者
+    assert "在跟你说话：1 条（阿狗）" in prompt
+    # ③ 话题锚点：本批第一句前 40 字
+    assert "话题锚点：本批开头是「大肥鱼今天怎么不理人」" in prompt
+    # ④ 转发条数与发言人
+    assert "跨群转发：1 条（阿猫）" in prompt
+
+
+def test_batch_block_without_addressed_param_falls_back_to_flags() -> None:
+    """不传 addressed（eval 调用点）时按 at_bot / reply_to_bot 退化判定。"""
+    prompt = build_batch_prompt(
+        [
+            make_msg("先说一句", "m1", timestamp=at(21, 0)),
+            make_msg("@溟月 在么", "m2", timestamp=at(21, 1), at_bot=True),
+        ],
+        "",
+    )
+    assert "在跟你说话：1 条（梦幻天使）" in prompt
+    assert "跨群转发" not in prompt
+
+
+def test_single_unaddressed_batch_has_no_batch_block() -> None:
+    """单条且无人点名：不产出【本批】，避免噪声。"""
+    prompt = build_batch_prompt([make_msg("随便说说", "m1")], "")
+    assert "【本批】" not in prompt
+
+
+def test_single_addressed_batch_has_batch_block() -> None:
+    prompt = build_batch_prompt(
+        [make_msg("@溟月 在么", "m1", at_bot=True)],
+        "",
+        addressed=[],
+    )
+    assert prompt.startswith("【本批】")
 
 
 def test_empty_content_is_labelled(tmp_path) -> None:

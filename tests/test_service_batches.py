@@ -299,8 +299,84 @@ async def test_stateless_history_contains_prior_turns(tmp_path):
 
     assert [item["role"] for item in history] == ["user", "assistant"]
     assert "第一句" in history[0]["content"]
-    assert history[1]["content"] == "溟月: 旧回复"
+    # 带标记渲染（IS-3）：bot 行统一「你：」，不再用裸「溟月: 旧回复」。
+    assert history[1]["content"] == "你：旧回复"
     assert all("第二句" not in item["content"] for item in history)
+
+
+def _batch_msg(
+    content: str,
+    message_id: str,
+    timestamp: int,
+    *,
+    at_bot: bool = False,
+) -> Message:
+    return Message(
+        chat_type=ChatType.GROUP,
+        chat_id="qq:1001",
+        user_id="qq:2002",
+        nickname="阿鱼",
+        content=content,
+        message_id=message_id,
+        segments=[],
+        is_bot=False,
+        at_bot=at_bot,
+        timestamp=timestamp,
+    )
+
+
+def test_build_prompt_counts_mirror_rows_via_bounded_query(tmp_path) -> None:
+    """（T3 a2）转发条数来自 recent_messages(include_mirror=True) 的有界查询。
+
+    pending_batch 只取 is_bot=0，镜像行必须另查；查询参数必须是
+    upto_message_id=本批最后一条 + 一个明确的小 limit（这里是 50）。
+    """
+    service, store, _, _ = build(tmp_path, batch_seconds=0.0)
+    t0 = int(datetime(2026, 10, 24, 11, 0, tzinfo=SHANGHAI).timestamp())
+    # 镜像行：is_bot=1 + mirror=1，时间落在本批窗口之内（先入库 → id 更小）。
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id="qq:1001",
+            user_id="qq:other",
+            nickname="隔壁老王",
+            content="从别的群搬来的话",
+            message_id="mir1",
+            segments=[],
+            is_bot=True,
+            mirror=True,
+            timestamp=t0 + 30,
+        )
+    )
+    first = _batch_msg("本批第一句", "b1", t0)
+    second = _batch_msg("@溟月 在么", "b2", t0 + 60, at_bot=True)
+    store.add_message(first)
+    store.add_message(second)
+
+    calls: list[tuple[int, str | None, bool]] = []
+    original = store.recent_messages
+
+    def spy(chat_type, chat_id, limit, upto_message_id=None, *, include_mirror=True):
+        calls.append((limit, upto_message_id, include_mirror))
+        return original(
+            chat_type,
+            chat_id,
+            limit,
+            upto_message_id=upto_message_id,
+            include_mirror=include_mirror,
+        )
+
+    store.recent_messages = spy  # type: ignore[method-assign]
+
+    prompt = service._build_prompt(ChatType.GROUP, "qq:1001", [first, second])
+
+    # 查询有界：upto_message_id=本批最后一条、limit=50、include_mirror=True。
+    assert (50, "b2", True) in calls
+    # 镜像行被计入【本批】块。
+    assert "跨群转发：1 条（隔壁老王）" in prompt
+    assert prompt.startswith("【本批】")
+    assert "说话人：阿鱼" in prompt
+    assert "在跟你说话：1 条（阿鱼）" in prompt
 
 
 async def test_speak_false_is_logged_as_a_decision(tmp_path, caplog):

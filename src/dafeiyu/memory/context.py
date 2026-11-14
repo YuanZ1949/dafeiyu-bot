@@ -45,6 +45,9 @@ INJECTION_RECALL_HEADER = "【相关旧记忆】"
 # 注入受 memory.inject_episodes / memory.inject_open_loops 控制，默认关。
 INJECTION_EPISODE_HEADER = "【正在聊的事】"
 INJECTION_OPEN_LOOP_HEADER = "【没有下文的事】"
+# 本群的教训（IS-9）：机器人自己的复盘笔记前置，不再埋在【长期记忆】末尾。
+# 预算独立于 mind/memory（memory.lessons_chars，默认 300）。
+INJECTION_LESSONS_HEADER = "【本群的教训】"
 # 一次最多注入几段 episode：重要度高的在前，低分的先被 episode_chars 截断。
 EPISODE_MAX_ITEMS = 3
 # 群气氛只作为观察段里的一行提示，不写进「系统指令」。
@@ -591,7 +594,7 @@ def build_injection(
     """opencode 分支的注入前缀，按 spec §5.5 的注意力模型排序。
 
     「此刻」（scene）由 service._build_prompt 前置，之后依次是：
-    正在聊的事 → 没有下文的事 → 群友印象 → 相关旧记忆 → 近期摘要 → 长期记忆。
+    本群的教训 → 正在聊的事 → 没有下文的事 → 群友印象 → 相关旧记忆 → 近期摘要 → 长期记忆。
     关系对着人说话时最近，所以印象排在旧事和摘要之前；笔记类长期记忆降为
     背景板垫底。每段独立截断、空段整段省略；时间线由 timeline.build_delivery
     追加在最后。带数据边界行的段：笔记/数据是模型或库里落下来的，下一轮又进
@@ -599,6 +602,18 @@ def build_injection(
     只关掉长期记忆段，其余照常注入。
     """
     parts: list[str] = []
+
+    # 本群的教训（IS-9）：本群笔记前置到注入最前，预算独立（lessons_chars）。
+    # 本群笔记文本在整段注入里只出现一次——下面的【长期记忆】只放全局 MEMORY.md。
+    lessons = (
+        ""
+        if workspace is None
+        else workspace.read_segment(
+            workspace.chat_notes_path(chat_type, chat_id), cfg.lessons_chars
+        )
+    )
+    if lessons:
+        parts.append(f"{INJECTION_LESSONS_HEADER}\n{INJECTION_BOUNDARY}\n{lessons}")
 
     # 注意力三段受 mind_chars 合计预算约束（spec §5.5）。
     parts.extend(_mind_blocks(store, chat_type, chat_id, cfg))
@@ -631,16 +646,14 @@ def build_injection(
         if summary:
             parts.append(f"{INJECTION_SUMMARY_HEADER}\n{summary}")
 
-    # 长期记忆是背景板：排在最后，500 字预算分给全局笔记与本会话笔记各一半，
-    # 避免两份文件各自吃满预算。workspace 为 None 时整段省略。
+    # 长期记忆是背景板：排在最后。本会话笔记已前置为「本群的教训」，这里
+    # 只放全局 MEMORY.md（预算仍是 memory_chars 的一半，避免全局独占）。
+    # workspace 为 None 时整段省略。
     global_chars = max(0, cfg.memory_chars) // 2
-    chat_chars = max(0, cfg.memory_chars) - global_chars
     memory = (
         ""
         if workspace is None
-        else workspace.read_for(
-            chat_type, chat_id, global_chars=global_chars, chat_chars=chat_chars
-        )
+        else workspace.read_segment(workspace.global_path(), global_chars)
     )
     if memory:
         parts.append(f"{INJECTION_MEMORY_HEADER}\n{INJECTION_BOUNDARY}\n{memory}")

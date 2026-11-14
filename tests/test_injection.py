@@ -410,3 +410,50 @@ def test_config_parses_mind_chars():
     assert _build_injection({}, {"mind_chars": 120}).mind_chars == 120
     # 默认 1000：六段的合计预算，装得下六段上限 990。
     assert _build_injection({}, {}).mind_chars == 1000
+
+
+# ---- T3：本群的教训前置（IS-9）------------------------------------------
+
+
+def test_lessons_block_precedes_episodes_and_appears_once(store, tmp_path):
+    """【本群的教训】早于【正在聊的事】，且本群笔记文本整段注入只出现一次。"""
+    ws = Workspace(tmp_path)
+    ws.ensure()
+    ws.chat_notes_path(GROUP, CHAT).write_text(
+        "# 本群复盘\n- 别连抓同一个 403 链接\n- 读完就缓存\n", encoding="utf-8"
+    )
+    ws.global_path().write_text("# 全局记忆\n- 全局事实\n", encoding="utf-8")
+    _seed_mind_content(store)
+    cfg = InjectionConfig(inject_episodes=True)
+
+    text = build_injection(store, ws, GROUP, CHAT, cfg, today="2026-10-24")
+
+    assert "【本群的教训】" in text
+    assert text.index("【本群的教训】") < text.index(EPISODE_HEADER)
+    assert "别连抓同一个 403 链接" in text
+    # 本群笔记已从【长期记忆】移除：那里的数据体只剩全局 MEMORY.md。
+    assert text.count("别连抓同一个 403 链接") == 1
+    memory_body = text.split(MEMORY_HEADER, 1)[1]
+    assert "别连抓同一个 403 链接" not in memory_body
+    assert "全局事实" in memory_body
+
+
+def test_lessons_block_clipped_under_budget_but_episodes_survive(store, tmp_path):
+    """预算压满：教训段被裁（留截断提示）而「正在聊的事」仍在。"""
+    ws = Workspace(tmp_path)
+    ws.ensure()
+    ws.chat_notes_path(GROUP, CHAT).write_text(
+        "# 本群复盘\n"
+        + "\n".join(f"- 教训第{i}行" + "很" * 30 for i in range(30)),
+        encoding="utf-8",
+    )
+    _seed_mind_content(store)
+    cfg = InjectionConfig(inject_episodes=True, inject_open_loops=True)
+
+    text = build_injection(store, ws, GROUP, CHAT, cfg, today="2026-10-24")
+
+    lessons_body = text.split("【本群的教训】\n", 1)[1].split("\n\n", 1)[0]
+    # read_segment 的截断提示：教训段真的被裁了，而不是整段消失。
+    assert "（还有" in lessons_body
+    assert EPISODE_HEADER in text
+    assert "鱼缸：水草" in text

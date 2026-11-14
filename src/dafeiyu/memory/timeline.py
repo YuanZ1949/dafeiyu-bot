@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 
 from dafeiyu.memory.store import Store
@@ -21,6 +22,9 @@ TIMELINE_HINT = (
     "其余情况只在你对整段讨论有自己的看法时才开口，回就回你的观点，不是逐条应答。"
 )
 BATCH_HEADER = "—— 以下是自你上次开口以来的新消息 ——"
+BATCH_BLOCK_HEADER = "【本批】"
+# 话题锚点取本批第一句的前 40 字，足够认出「在聊哪件事」，又不至于把整句搬进去。
+TOPIC_ANCHOR_CHARS = 40
 CONTINUATION_HEADER = "【接续】"
 EMPTY_CONTENT = "（无文字内容）"
 
@@ -145,6 +149,38 @@ def build_prompt(store: Store, msg: Message, limit: int = TIMELINE_LIMIT) -> str
     return build_delivery(store, msg, limit)[0]
 
 
+def _batch_block(
+    messages: list[Message],
+    *,
+    mirror_count: int,
+    mirror_speakers: Sequence[str],
+    addressed: Sequence[Message],
+) -> str:
+    """【本批】块：谁在说、谁在叫你、在聊什么、几条是转发的。
+
+    build_batch_prompt 是纯函数：镜像条数由调用方（service）查库后传入，
+    这里只渲染，绝不查库；addressed 也是调用方用 router.addressed_source
+    判定好的点名消息，本函数不重新发明判定。
+    """
+    speakers = list(dict.fromkeys(m.nickname for m in messages if m.nickname))
+    lines = [
+        f"{BATCH_BLOCK_HEADER}这一批共 {len(messages)} 条消息，说话人：{'、'.join(speakers)}。"
+    ]
+    if addressed:
+        who = list(dict.fromkeys(m.nickname for m in addressed if m.nickname))
+        lines.append(f"- 在跟你说话：{len(addressed)} 条（{'、'.join(who)}）。")
+    anchor = (messages[0].content or "").strip().replace("\n", " ")
+    if anchor:
+        clipped = anchor[:TOPIC_ANCHOR_CHARS]
+        ellipsis = "…" if len(anchor) > TOPIC_ANCHOR_CHARS else ""
+        lines.append(f"- 话题锚点：本批开头是「{clipped}{ellipsis}」。")
+    if mirror_count > 0:
+        who = "、".join(dict.fromkeys(mirror_speakers))
+        suffix = f"（{who}）" if who else ""
+        lines.append(f"- 跨群转发：{mirror_count} 条{suffix}。")
+    return "\n".join(lines)
+
+
 def build_batch_prompt(
     messages: list[Message],
     injection: str,
@@ -154,18 +190,42 @@ def build_batch_prompt(
     reply_names: dict[str, str] | None = None,
     mention_ids: frozenset[str] | None = None,
     gap_seconds: float = 0.0,
+    mirror_count: int = 0,
+    mirror_speakers: Sequence[str] = (),
+    addressed: Sequence[Message] = (),
 ) -> str:
-    """批次 prompt：注入段 →（接续）→ 新消息时间线。
+    """批次 prompt：【本批】→ 注入段 →（接续）→ 新消息时间线。
 
-    三段注入必须留在最前、时间线留在最后（模型对末尾更敏感）。
+    三段注入必须留在最前、时间线留在最后（模型对末尾更敏感）；
+    【本批】是整段的第一块，给模型一个「这批是谁在跟谁聊什么」的总览。
+    单条且无人点名的批次不产出【本批】（避免噪声）。
     at_bot / reply_to_bot 随消息一起落库，每条按自己的标志渲染标记，
     模型才知道哪几句是对它说的、是 @ 还是引用回复。
     单条路径复用同一构建器，omitted 是更早未展开的消息数（由 pending 查询给出）。
     reply_names 是「被回复消息 id → 昵称」，用来渲染群友之间的「（回复 X）」。
     gap_seconds 是这一批第一条消息与上一批之间的空档：够长就明确提示「停顿」，
     让模型重新判断旧话题是否已经过去，而不是顺着很久以前的话头接。
+    mirror_count / mirror_speakers 是本批窗口内跨群镜像行的条数与发言人：
+    pending_batch 只取 is_bot=0 的行而镜像入库是 is_bot=1，所以必须由调用方
+    另查 recent_messages(include_mirror=True) 后传入，默认 0/空（eval 调用点不用改）。
+    addressed 是调用方用 router.addressed_source 判出的点名消息；不传时按
+    at_bot / reply_to_bot 退化判定（alias 点名只有 service 层能判）。
     """
+    addressed_msgs = (
+        list(addressed)
+        if addressed
+        else [m for m in messages if m.at_bot or m.reply_to_bot]
+    )
     parts: list[str] = []
+    if messages and (len(messages) >= 2 or addressed_msgs):
+        parts.append(
+            _batch_block(
+                messages,
+                mirror_count=mirror_count,
+                mirror_speakers=mirror_speakers,
+                addressed=addressed_msgs,
+            )
+        )
     if injection.strip():
         parts.append(injection.strip())
     if continuation:

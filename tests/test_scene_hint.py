@@ -265,6 +265,34 @@ def test_scene_hint_omits_atmosphere_by_default(tmp_path, monkeypatch) -> None:
     assert "群气氛" not in scene
 
 
+# ---- T3：多消息批次不再只报最后一个人（GAP-4）----------------------------
+
+
+def test_multi_message_scene_lists_all_speakers(tmp_path, monkeypatch) -> None:
+    """多条批次列出本批说话人，且整句不得含「刚是」（含「刚才是」）两个字。"""
+    monkeypatch.setattr(service_module, "now_shanghai", lambda: NOW)
+    service, _store, _adapter = build(tmp_path)
+
+    scene = service._scene_hint(
+        ChatType.GROUP,
+        GROUP,
+        [make_msg("今天聊什么", nickname="阿明"), make_msg("随便呀", nickname="阿花")],
+    )
+
+    assert "这批是 阿明、阿花 在说" in scene
+    assert "刚是" not in scene
+
+
+def test_single_message_scene_keeps_last_speaker_phrase(tmp_path, monkeypatch) -> None:
+    """单条批次保留原句「刚才是 X 在说」。"""
+    monkeypatch.setattr(service_module, "now_shanghai", lambda: NOW)
+    service, _store, _adapter = build(tmp_path)
+
+    scene = service._scene_hint(ChatType.GROUP, GROUP, [make_msg(nickname="阿明")])
+
+    assert "刚才是 阿明 在说" in scene
+
+
 def test_period_of_day_and_duration_labels() -> None:
     assert _period_of_day(2) == "凌晨"
     assert _period_of_day(7) == "清晨"

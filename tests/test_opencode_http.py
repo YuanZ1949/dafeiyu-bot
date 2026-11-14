@@ -16,6 +16,9 @@ from dafeiyu.brain.client import (
 from dafeiyu.brain.opencode_http import OpenCodeHttpBrain
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
+from dafeiyu.router import Router
+from dafeiyu.service import Service
+from tests.test_service_batches import make_settings
 
 
 @pytest.fixture
@@ -657,6 +660,80 @@ async def test_reply_fresh_replays_history_in_a_new_session(store: Store) -> Non
     # 旧会话被丢掉，新会话接管后续轮次。
     assert store.get_opencode_session(ChatType.PRIVATE, 42) == "ses_new"
     assert reply.reply == "在群聊卖萌"
+
+
+# ---- T3：历史重放保留点名标记（IS-3）------------------------------------
+
+
+def _seed_addressed_history(store: Store) -> None:
+    """一条 @过机器人 的历史 + 一条普通历史，游标推到 h1（模拟已聊过）。"""
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id="qq:1001",
+            user_id="qq:1",
+            nickname="阿鱼",
+            content="大肥鱼在么",
+            message_id="h0",
+            at_bot=True,
+            timestamp=100,
+        )
+    )
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id="qq:1001",
+            user_id="qq:1",
+            nickname="阿鱼",
+            content="后来他来了",
+            message_id="h1",
+            timestamp=200,
+        )
+    )
+    store.mark_delivered(ChatType.GROUP, "qq:1001", "h1")
+
+
+async def test_new_session_history_keeps_mention_marks(store: Store) -> None:
+    """新会话重放不能退化成裸「谁: 内容」：必须保留「（@了你）」。"""
+    _seed_addressed_history(store)
+    server = FakeServer()
+    brain = make_brain(store, server)
+
+    history = brain._new_session_history(ChatType.GROUP, "qq:1001")
+    await brain.aclose()
+
+    assert "大肥鱼在么" in history
+    assert "（@了你）" in history
+
+
+async def test_reply_fresh_replays_mention_marks_from_local_history(
+    store: Store,
+) -> None:
+    """reply_fresh 的历史经 service._history_before → to_prompt_line(with_markers)。"""
+    _seed_addressed_history(store)
+    settings = make_settings()
+    router = Router(settings, store)
+    service = Service(settings, store, object(), {}, router, "你是溟月")
+    current = Message(
+        chat_type=ChatType.GROUP,
+        chat_id="qq:1001",
+        user_id="qq:1",
+        nickname="阿鱼",
+        content="后来呢",
+        message_id="m1",
+        timestamp=300,
+    )
+    history = service._history_before(ChatType.GROUP, "qq:1001", [current])
+    assert any("（@了你）" in item["content"] for item in history)
+
+    server = FakeServer()
+    brain = make_brain(store, server)
+    await brain.reply_fresh(
+        ChatType.GROUP, "qq:1001", "刚才说到哪了", system="你是溟月", history=history
+    )
+    await brain.aclose()
+
+    assert "（@了你）" in server.prompts[-1]
 
 
 async def test_forget_treats_empty_delete_body_as_success(store: Store) -> None:
