@@ -39,6 +39,9 @@ IDEMPOTENCY_TTL = 600.0
 FINGERPRINT_TTL = 10.0
 #: 出队时超过这个年龄的条目直接丢弃，避免断桥恢复后补发一批过期消息。
 ITEM_MAX_AGE = 300.0
+#: 入站物化回填等待上限（秒）：worker 发图前等 ``Service.handle`` 把图落盘，
+#: 超时就退回入队快照自行下载（宁可慢一次，也不能把队列卡死）。
+MATERIALIZE_WAIT_SECONDS = 15.0
 #: 单条发送超时（秒）：超时视为结果未知，不重试，避免重复。
 SEND_TIMEOUT = 30.0
 #: 只有「可证明未发送」的暂时性失败才重试：not_connected（通道断开）以及
@@ -102,6 +105,33 @@ class _Stop:
 _STOP = _Stop()
 
 
+class MediaBox:
+    """入队快照与入站物化之间的握手。
+
+    ``observe_inbound`` 必须在第一个 await 之前同步入队（顺序保证），而图片
+    要等 ``Service.handle`` 物化后才有本地路径。入队时把本对象随条目带下去，
+    worker 发送前先等它回填：命中就复用已落盘文件，省掉一次下载与降采样；
+    超时则退回快照，行为与旧版一致。
+    """
+
+    def __init__(self) -> None:
+        self._ready = asyncio.Event()
+        self._attachments: tuple[Attachment, ...] = ()
+
+    def fill(self, attachments: Sequence[Attachment]) -> None:
+        """回填物化后的附件；重复调用以最后一次为准。"""
+        self._attachments = tuple(attachments)
+        self._ready.set()
+
+    async def wait(self, timeout: float) -> tuple[Attachment, ...] | None:
+        """等回填；超时返回 ``None``（调用方退回入队快照）。"""
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout)
+        except TimeoutError:
+            return None
+        return self._attachments
+
+
 @dataclass(frozen=True)
 class MirrorItem:
     """入队时的不可变快照：绝不持有活 `Message`。"""
@@ -122,6 +152,8 @@ class MirrorItem:
     user_id: str = ""
     #: 引用降级成的一行文本（``[回复 某人：原文]``）；空表示没有引用。
     reply_hint: str = ""
+    #: 入站物化回填握手；``observe_outbound`` 构造的条目没有它。
+    media: MediaBox | None = None
 
 
 def _normalize(text: str) -> str:
@@ -670,14 +702,18 @@ class MirrorRouter:
         )
 
     # ------------------------------------------------------------ 入站观察
-    def observe_inbound(self, msg: Message) -> None:
+    def observe_inbound(
+        self, msg: Message, *, media: MediaBox | None = None
+    ) -> None:
         """同步、O(1)、绝不 await/下载/抛异常。"""
         try:
-            self._observe_inbound(msg)
+            self._observe_inbound(msg, media)
         except Exception:  # noqa: BLE001 - 镜像异常不得影响原消息处理
             log.exception("镜像入站观察失败（已忽略）msg=%s", getattr(msg, "message_id", ""))
 
-    def _observe_inbound(self, msg: Message) -> None:
+    def _observe_inbound(
+        self, msg: Message, media: MediaBox | None = None
+    ) -> None:
         if msg.chat_type is not ChatType.GROUP:
             return
         direction = self._direction(msg.chat_id)
@@ -699,7 +735,7 @@ class MirrorRouter:
         if self._consume_echo(msg, source_channel, now):
             self._counters["deduped"] += 1
             return
-        item = self._snapshot(msg, target_chat_id, source_channel)
+        item = self._snapshot(msg, target_chat_id, source_channel, media)
         self._enqueue(item)
 
     # ------------------------------------------------------------ 出站观察
@@ -798,8 +834,14 @@ class MirrorRouter:
             log.warning("镜像目标通道没有 adapter，降级跳过：%s", target_channel)
             return
 
-        # 物化只发生在 worker：observe_inbound 仍是同步快照。
-        attachments = await self._materialized_attachments(item)
+        # 入队快照可能只有图片 URL；先等 Service.handle 物化回填：命中就
+        # 复用已落盘文件，省掉 worker 的重新下载与再缩一次。
+        raw: Sequence[Attachment] = item.attachments
+        if item.media is not None:
+            filled = await item.media.wait(MATERIALIZE_WAIT_SECONDS)
+            if filled:
+                raw = self._merge_materialized(item.attachments, filled)
+        attachments = await self._materialized_attachments(item, raw=raw)
         rendered = self._render(item)
         if target_channel == "qq":
             await self._deliver_qq(item, adapter, rendered, attachments)
@@ -807,15 +849,22 @@ class MirrorRouter:
             await self._deliver_wechat(item, adapter, rendered, attachments)
 
     # ------------------------------------------------------------ 物化
-    async def _materialized_attachments(self, item: MirrorItem) -> list[Attachment]:
+    async def _materialized_attachments(
+        self,
+        item: MirrorItem,
+        *,
+        raw: Sequence[Attachment] | None = None,
+    ) -> list[Attachment]:
         """按来源通道物化媒体，返回可直接交给目标通道的附件列表。
 
-        任何失败都只记日志并保留原附件（占位路径照常发送），绝不抛异常。
+        ``raw`` 缺省取入队快照；入站物化回填成功后由调用方传入合并结果，
+        此时可读附件会原样复用，不再下载。任何失败都只记日志并保留原附件
+        （占位路径照常发送），绝不抛异常。
         """
-        raw = list(item.attachments)
+        snapshot = list(item.attachments) if raw is None else list(raw)
         try:
             if item.source_channel == "wechat":
-                message = self._relay_message(item, raw, item.segments)
+                message = self._relay_message(item, snapshot, item.segments)
                 materialized = await media.materialize_relay_attachments(
                     message,
                     self.settings,
@@ -826,14 +875,42 @@ class MirrorRouter:
                     keep_original=self.settings.mirror.keep_image_quality,
                 )
                 return list(materialized.attachments)
-            return await self._materialize_qq(item, raw)
+            return await self._materialize_qq(item, snapshot)
         except Exception:  # noqa: BLE001 - 物化失败不得影响占位发送
             log.warning(
                 "镜像媒体物化失败，按占位发送：msg=%s",
                 item.source_message_id,
                 exc_info=True,
             )
-            return raw
+            return snapshot
+
+    def _merge_materialized(
+        self,
+        snapshot: Sequence[Attachment],
+        filled: Sequence[Attachment],
+    ) -> list[Attachment]:
+        """把入站物化结果按快照顺序并回，同一 ``(kind, source)`` 优先可读那份。
+
+        入站物化对 QQ 图片是**追加**（原图附件仍在），对微信是就地替换：
+        直接用 ``filled`` 会把同一张图发两遍，直接用 ``snapshot`` 又会重新
+        下载。这里按来源配对，每个快照位置只保留一份，且优先已落盘的。
+        """
+        pool: dict[tuple[str, str], list[Attachment]] = {}
+        for attachment in filled:
+            key = (_media_kind(attachment.kind), attachment.source)
+            pool.setdefault(key, []).append(attachment)
+        merged: list[Attachment] = []
+        for attachment in snapshot:
+            key = (_media_kind(attachment.kind), attachment.source)
+            candidates = pool.get(key)
+            chosen = attachment
+            while candidates:
+                candidate = candidates.pop(0)
+                if media.resolve_media_path(self.settings, candidate) is not None:
+                    chosen = candidate
+                    break
+            merged.append(chosen)
+        return merged
 
     async def _materialize_qq(
         self, item: MirrorItem, raw: list[Attachment]
@@ -1451,7 +1528,11 @@ class MirrorRouter:
             ] = expiry
 
     def _snapshot(
-        self, msg: Message, target_chat_id: str, source_channel: str
+        self,
+        msg: Message,
+        target_chat_id: str,
+        source_channel: str,
+        media: MediaBox | None = None,
     ) -> MirrorItem:
         return MirrorItem(
             source_chat_id=msg.chat_id,
@@ -1467,6 +1548,7 @@ class MirrorRouter:
             kind=msg.kind,
             user_id=msg.user_id,
             reply_hint=_reply_hint(msg),
+            media=media,
         )
 
     def _enqueue(self, item: MirrorItem) -> None:

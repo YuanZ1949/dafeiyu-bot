@@ -23,6 +23,7 @@ from typing import cast
 import pytest
 
 import dafeiyu.media as media_module
+import dafeiyu.mirror as mirror_module
 from dafeiyu import imaging
 from dafeiyu.config import (
     BudgetConfig,
@@ -44,7 +45,7 @@ from dafeiyu.media import (
     resolve_media_path,
 )
 from dafeiyu.memory.store import Store
-from dafeiyu.mirror import FetchFn, MirrorItem, MirrorRouter
+from dafeiyu.mirror import FetchFn, MediaBox, MirrorItem, MirrorRouter
 from dafeiyu.models import Attachment, ChatType, Message, Segment
 from tests.fakes import FakeChannelAdapter
 
@@ -985,5 +986,90 @@ async def test_wechat_to_qq_file_uses_upload_file(tmp_path: Path) -> None:
     assert [text for _ct, _cid, text in qq.sent] == [WIRE_FILE]
     assert qq.segments == []
     assert mirror_rows(store, QQ_CHAT) == ["阿鱼：[文件] doc.pdf"]
+
+
+# ------------------------------- 入站物化回填（I-2：媒体盒子）
+
+
+async def test_media_box_fill_before_wait_returns_attachments() -> None:
+    box = MediaBox()
+    filled = (Attachment(kind="image", path="images/x.png"),)
+
+    box.fill(filled)
+
+    assert await box.wait(0.1) == filled
+
+
+async def test_media_box_timeout_returns_none() -> None:
+    assert await MediaBox().wait(0.01) is None
+
+
+async def test_router_reuses_inbound_materialized_image(tmp_path: Path) -> None:
+    """入站已落盘的图不再下载：同一张图只下载一次（G2）。"""
+    path = place(tmp_path, "images/x.png", _solid_png(64, 48))
+    downloads: list[str] = []
+
+    async def fake_fetch(url: str, _timeout: float, _max_bytes: int) -> bytes:
+        downloads.append(url)
+        raise AssertionError("已物化的图不应再下载")
+
+    box = MediaBox()
+    # QQ 入站物化是「追加」：快照里那份原图（只有 URL）仍在，合并时不能发两遍。
+    box.fill(
+        (
+            Attachment(kind="image", source="https://x/a.png"),
+            Attachment(
+                kind="image",
+                source="https://x/a.png",
+                path="images/x.png",
+                name="x.png",
+                size=path.stat().st_size,
+            ),
+        )
+    )
+    router, _store = make_router(tmp_path, fetch=fake_fetch)
+    wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
+    item = replace(
+        make_item(
+            source_channel="qq",
+            attachments=(Attachment(kind="image", source="https://x/a.png"),),
+            segments=(Segment("image", {"url": "https://x/a.png"}),),
+        ),
+        media=box,
+    )
+
+    await router._deliver(item)
+
+    assert downloads == []
+    assert len(wechat.media) == 1
+    assert wechat.media[0][3] == str(path.resolve())
+
+
+async def test_router_falls_back_to_snapshot_when_box_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回填超时退回入队快照：老路径仍能自己下载并发送。"""
+    monkeypatch.setattr(mirror_module, "MATERIALIZE_WAIT_SECONDS", 0.01)
+    downloads: list[str] = []
+
+    async def fake_fetch(url: str, _timeout: float, _max_bytes: int) -> bytes:
+        downloads.append(url)
+        return _solid_png(64, 48)
+
+    router, _store = make_router(tmp_path, fetch=fake_fetch)
+    wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
+    item = replace(
+        make_item(
+            source_channel="qq",
+            attachments=(Attachment(kind="image", source="https://x/a.png"),),
+            segments=(Segment("image", {"url": "https://x/a.png"}),),
+        ),
+        media=MediaBox(),
+    )
+
+    await router._deliver(item)
+
+    assert downloads == ["https://x/a.png"]
+    assert len(wechat.media) == 1
 
 

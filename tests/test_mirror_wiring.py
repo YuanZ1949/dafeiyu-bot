@@ -28,7 +28,7 @@ from dafeiyu.config import (
 )
 from dafeiyu.gateway.base import GatewayError
 from dafeiyu.memory.store import Store
-from dafeiyu.mirror import MirrorItem, MirrorRouter, MirroredAdapter
+from dafeiyu.mirror import MediaBox, MirrorItem, MirrorRouter, MirroredAdapter
 from dafeiyu.models import Attachment, ChatType, Message, Segment
 from dafeiyu.router import Router
 from dafeiyu.service import Service
@@ -576,7 +576,9 @@ class RecordingMirror:
         # Service.__init__ 会把微信 .dat 解码器绑到这里。
         self.decode: Any = None
 
-    def observe_inbound(self, msg: Message) -> None:
+    def observe_inbound(
+        self, msg: Message, *, media: MediaBox | None = None
+    ) -> None:
         if self.raise_on_inbound:
             raise RuntimeError("mirror boom")
         self.inbound.append(msg.message_id)
@@ -649,7 +651,9 @@ class OrderMirror(RecordingMirror):
         super().__init__()
         self._order = order
 
-    def observe_inbound(self, msg: Message) -> None:
+    def observe_inbound(
+        self, msg: Message, *, media: MediaBox | None = None
+    ) -> None:
         self._order.append(("enqueue", msg.message_id))
 
 

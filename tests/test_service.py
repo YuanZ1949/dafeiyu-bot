@@ -1,7 +1,7 @@
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -16,8 +16,10 @@ from dafeiyu.config import (
     TriggerConfig,
 )
 from dafeiyu.memory.store import Store
+from dafeiyu.mirror import MediaBox
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router, TriggerDecision, now_shanghai
+import dafeiyu.service as service_module
 from dafeiyu.service import FORGET_REPLY, Service
 from dafeiyu.workers.failure import QUOTA_KEY
 
@@ -964,3 +966,47 @@ def test_explain_trigger_unknown_slash_is_not_a_command(tmp_path):
     )
 
     assert result["verdict"] != "command"
+
+
+class FakeMirror:
+    """只记录 ``Service.handle`` 递下来的物化回填握手。"""
+
+    def __init__(self) -> None:
+        self.boxes: list[MediaBox] = []
+
+    def observe_inbound(
+        self, _msg: object, *, media: MediaBox | None = None
+    ) -> None:
+        if media is not None:
+            self.boxes.append(media)
+
+
+async def test_handle_fills_mirror_media_box(tmp_path):
+    service, _, _, _, _ = build(tmp_path)
+    mirror = FakeMirror()
+    service.mirror = cast(Any, mirror)
+    msg = make_msg(message_id="img1")
+
+    await service.handle(msg)
+
+    assert len(mirror.boxes) == 1
+    assert await mirror.boxes[0].wait(0.01) == tuple(msg.attachments)
+
+
+async def test_handle_fills_media_box_even_when_materialize_raises(
+    tmp_path, monkeypatch
+):
+    service, _, _, _, _ = build(tmp_path)
+    mirror = FakeMirror()
+    service.mirror = cast(Any, mirror)
+
+    async def boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(service_module, "materialize", boom)
+
+    with pytest.raises(RuntimeError):
+        await service.handle(make_msg(message_id="img2"))
+
+    assert len(mirror.boxes) == 1
+    assert await mirror.boxes[0].wait(0.01) is not None

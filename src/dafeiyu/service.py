@@ -54,6 +54,7 @@ from .memory.timeline import (
     time_label,
 )
 from .memory.workspace import Workspace
+from .mirror import MediaBox, MirrorRouter
 from .models import QQ_PREFIX, Attachment, ChatType, Message, NoticeEvent, RecallEvent, channel_of
 from .moment import (
     analyze,
@@ -86,7 +87,6 @@ from .workers.failure import (
 from .workers.summary import summarize_for_rotation
 
 if TYPE_CHECKING:
-    from .mirror import MirrorRouter
     from .supervisor.audit import AuditLog
 
 log = logging.getLogger(__name__)
@@ -1160,20 +1160,28 @@ class Service:
     async def handle(self, msg: Message) -> None:
         # 入队必须在第一个 await 之前：qq.py 每条消息一个独立 task，
         # 先同步发布才能保证到达顺序与队列顺序一致。
+        media_box: MediaBox | None = None
         if not msg.is_bot and self.mirror is not None:
             try:
-                self.mirror.observe_inbound(msg)
+                media_box = MediaBox()
+                self.mirror.observe_inbound(msg, media=media_box)
             except Exception:  # noqa: BLE001 - 镜像异常绝不能影响 materialize/入库/命令
+                media_box = None
                 log.warning("镜像入队失败：%s", msg.message_id, exc_info=True)
         annotate = self._tools_enabled()
         # 图片物化必须在入库前：content 字符串是图片路径到达大脑的唯一载体。
         # materialize 内部永不抛异常，失败保持 [图片] 占位。
         # 没有 read 工具的大脑看不到图，路径字符串只是噪音：直接跳过物化。
-        await materialize(msg, self.settings, annotate=annotate)
-        # 微信图片解码依赖 read 工具；QQ 语音/视频的门控在 media 内部按来源判断，
-        # 不能被 annotate 或 wechat.media.enabled 一起挡掉。
-        decode = self._decode_wechat_dat if (annotate and self._wechat_media_enabled()) else None
-        await materialize_attachments(msg, self.settings, decode=decode, annotate=annotate)
+        try:
+            await materialize(msg, self.settings, annotate=annotate)
+            # 微信图片解码依赖 read 工具；QQ 语音/视频的门控在 media 内部按来源判断，
+            # 不能被 annotate 或 wechat.media.enabled 一起挡掉。
+            decode = self._decode_wechat_dat if (annotate and self._wechat_media_enabled()) else None
+            await materialize_attachments(msg, self.settings, decode=decode, annotate=annotate)
+        finally:
+            # 镜像 worker 在等这次回填；异常时也要放行，别让它白等满超时。
+            if media_box is not None:
+                media_box.fill(msg.attachments)
         if annotate and decode is not None:
             # 密钥可能还没扫出来（重启后的第一张图）：先挂起，等这批送审
             # 前再试一次，避免让模型看到一句「图片内容不可用」。
