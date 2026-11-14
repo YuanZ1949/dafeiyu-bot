@@ -591,7 +591,12 @@ class QQAdapter:
         self._notice_handler: Callable[[NoticeEvent], Awaitable[None]] | None = None
         self._server: Server | None = None
         self._ws: ServerConnection | None = None
-        self._pending: dict[str, tuple[asyncio.Future[dict[str, Any]], str]] = {}
+        #: 连接代次：每次 `_handle_connection` 进入时 +1；断开回调只失败本代
+        #: 登记的 pending，避免旧 handler 晚退出时误杀新连接上的 send。
+        self._generation = 0
+        self._pending: dict[
+            str, tuple[asyncio.Future[dict[str, Any]], str, int]
+        ] = {}
         self._echo = count(1)
         self._tasks: set[asyncio.Task[None]] = set()
         self._bound_port = port
@@ -797,7 +802,10 @@ class QQAdapter:
 
         echo = str(next(self._echo))
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        self._pending[echo] = (future, action)
+        # 与服务端连接的代次一起快照：这条请求属于哪个连接，就只由那个连接
+        # 的断开回调负责失败。
+        generation = self._generation
+        self._pending[echo] = (future, action, generation)
         try:
             await ws.send(
                 json.dumps(
@@ -821,6 +829,8 @@ class QQAdapter:
         return connection.respond(HTTPStatus.FORBIDDEN, "unauthorized\n")
 
     async def _handle_connection(self, ws: ServerConnection) -> None:
+        self._generation += 1
+        generation = self._generation
         self._ws = ws
         logger.info("NapCat 已连接")
         try:
@@ -832,7 +842,9 @@ class QQAdapter:
             self.last_disconnect_at = time.time()
             if self._ws is ws:
                 self._ws = None
-            self._fail_pending(GatewayError("QQ 网关连接已断开"))
+            self._fail_pending(
+                GatewayError("QQ 网关连接已断开"), generation=generation
+            )
             logger.info("NapCat 连接已断开")
 
     async def _handle_frame(self, raw: str | bytes) -> None:
@@ -864,7 +876,7 @@ class QQAdapter:
         entry = self._pending.pop(str(echo), None)
         if entry is None:
             return
-        future, action = entry
+        future, action, _generation = entry
         if future.done():
             return
         if data.get("status") != "ok" or data.get("retcode") != 0:
@@ -975,8 +987,15 @@ class QQAdapter:
         except Exception:
             logger.exception("notice 处理器异常")
 
-    def _fail_pending(self, exc: Exception) -> None:
-        for future, _action in self._pending.values():
+    def _fail_pending(self, exc: Exception, *, generation: int | None = None) -> None:
+        """失败未完成的请求；``generation`` 给定时只处理该代连接登记的条目。
+
+        旧连接的 handler 可能晚于新连接退出：不带代次地清空全部 pending，会把
+        新连接上正在等 echo 的 send 全打成"连接已断开"，而消息其实没发出去。
+        """
+        for echo, (future, _action, entry_generation) in list(self._pending.items()):
+            if generation is not None and entry_generation != generation:
+                continue
             if not future.done():
                 future.set_exception(exc)
-        self._pending.clear()
+            self._pending.pop(echo, None)

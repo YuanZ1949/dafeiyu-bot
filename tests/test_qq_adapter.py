@@ -833,3 +833,56 @@ async def test_nested_id_only_forward_is_not_fetched_recursively() -> None:
                 await asyncio.wait_for(ws.recv(), 0.2)
     finally:
         await adapter.stop()
+
+async def _until(predicate, message: str, timeout: float = 2.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() >= deadline:
+            raise AssertionError(message)
+        await asyncio.sleep(0.01)
+
+
+async def test_old_connection_disconnect_keeps_new_connection_send_alive() -> None:
+    """旧 handler 晚退出时只失败本代请求：新连接上的 send 不能被误杀。"""
+    adapter = make_adapter()
+    await adapter.start()
+    uri = f"ws://127.0.0.1:{adapter.port}"
+    headers = {"Authorization": "Bearer secret"}
+    try:
+        async with websockets.connect(uri, additional_headers=headers) as old:
+            old_task = asyncio.create_task(
+                adapter.send(ChatType.GROUP, "qq:1", "旧连接")
+            )
+            old_echo = json.loads(await asyncio.wait_for(old.recv(), 2))["echo"]
+
+            async with websockets.connect(uri, additional_headers=headers) as new:
+                await _until(lambda: adapter._generation >= 2, "新连接未被接管")
+                new_task = asyncio.create_task(
+                    adapter.send(ChatType.GROUP, "qq:1", "新连接")
+                )
+                new_echo = json.loads(await asyncio.wait_for(new.recv(), 2))["echo"]
+
+                await old.close()
+                await asyncio.sleep(0.05)
+
+                # 旧连接上的请求必须失败，不能悬挂到超时。
+                with pytest.raises(GatewayError):
+                    await asyncio.wait_for(old_task, 2)
+                # 新连接上的请求不受旧 handler 影响。
+                assert not new_task.done()
+
+                await new.send(
+                    json.dumps(
+                        {
+                            "status": "ok",
+                            "retcode": 0,
+                            "data": {"message_id": 77},
+                            "echo": new_echo,
+                        }
+                    )
+                )
+                assert await asyncio.wait_for(new_task, 2) == "77"
+                assert "77" in adapter.bot_message_ids
+    finally:
+        await adapter.stop()
