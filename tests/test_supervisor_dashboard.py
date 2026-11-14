@@ -1381,3 +1381,36 @@ async def test_holds_proxy_forwards_bot_payload(tmp_path: Path) -> None:
         assert data == payload
     finally:
         await bot_client.close()
+
+
+async def test_thread_states_proxy_forwards_bot_payload(tmp_path: Path) -> None:
+    payload = {
+        "items": [
+            {
+                "chat_type": "group",
+                "chat_id": "100",
+                "closed_until": 1_700_000_000.0,
+                "closed_left_seconds": 90,
+                "last_closed_at": 1_699_999_900.0,
+            }
+        ],
+        "total": 1,
+    }
+
+    async def thread_states_endpoint(_: web.Request) -> web.Response:
+        return web.json_response(payload)
+
+    bot_app = web.Application()
+    bot_app.router.add_get("/api/thread-states", thread_states_endpoint)
+    bot_client = TestClient(TestServer(bot_app))
+    await bot_client.start_server()
+    url = str(bot_client.server.make_url("/")).rstrip("/")
+    try:
+        app, _, _ = make_app(tmp_path, bot_url=url)
+        async with running(app) as client:
+            resp = await client.get("/api/thread-states")
+            data = await resp.json()
+        assert resp.status == 200
+        assert data == payload
+    finally:
+        await bot_client.close()
