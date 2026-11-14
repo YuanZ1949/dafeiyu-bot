@@ -903,6 +903,19 @@
       <div class="session-list" id="sessions"></div>
     </section>
 
+    <section class="card span-full" id="holds-card">
+      <div class="row card-head">
+        <h2>正在攒着</h2>
+        <span class="kv" id="holds-hint">纯热聊攒着中的会话 · 到点会照旧送模型判断</span>
+        <span class="spacer"></span>
+        <span class="kv card-updated" id="holds-updated" data-updated hidden></span>
+        <button class="btn" id="btn-holds-all" aria-pressed="false">显示全部待投</button>
+        <button class="btn" id="btn-refresh-holds">刷新</button>
+      </div>
+      <div class="kv">攒着 = 这批消息先不送模型，等群里再有人说话才判定。这里的数据来自实时聚合，不是决策流的 60 秒去重计数。</div>
+      <div class="mem-list list-h-md" id="holds-list"></div>
+    </section>
+
     <section class="card">
       <div class="row card-head">
         <h2>微信私聊</h2>
@@ -1362,6 +1375,11 @@ const DECISION_OUTCOME = {
 const DECISION_CHECKPOINT = {
   intensity_quiet: "安静强度",
   opportunity_hold: "纯热聊攒着",
+  // 攒着到期放行：仍是 held outcome，靠 checkpoint 区分「还在攒着」与「攒到点被放行」。
+  intensity_quiet_expired: "到期放行 · 安静强度",
+  opportunity_hold_expired: "到期放行 · 纯热聊",
+  manual_release: "手动放行",
+  manual_discard: "手动丢弃",
   budget: "预算",
   recalled: "已撤回",
   restricted: "言论限制",
@@ -3561,6 +3579,113 @@ async function sessionAction(session, action, ask) {
   }
 }
 
+// ---- 正在攒着（/api/holds）：实时聚合，不用决策流（那边 held 有 60 秒去重，会骗人）----
+let holdsShowAll = false;
+
+function holdAgeText(seconds) {
+  const value = Number(seconds) || 0;
+  if (value < 60) return "不到 1 分钟";
+  return `${Math.floor(value / 60)} 分钟`;
+}
+
+// 动作路径显式写死，面板契约测试按这两个片段钉住「放行 / 丢弃」两个出口。
+function holdActionPath(item, action) {
+  const base = `/api/sessions/${encodeURIComponent(item.chat_type)}/${encodeURIComponent(item.chat_id)}`;
+  return action === "release" ? `${base}/release` : `${base}/discard`;
+}
+
+async function holdAction(item, action, onDone) {
+  const isRelease = action === "release";
+  if (!isRelease && !confirm(`丢弃 ${chatLabel(item.chat_type, item.chat_id)} 的这批未投递消息？\n消息不会再送给模型，不可撤销。`)) return;
+  try {
+    await api(holdActionPath(item, action), { method: "POST", body: "{}" });
+    toast(isRelease ? "已放行，正在让大肥鱼判断这批消息" : "已丢弃这批消息");
+  } catch (err) {
+    toast(`${isRelease ? "放行" : "丢弃"}失败：${err.message}`, true);
+  }
+  if (onDone) onDone();
+}
+
+function renderHolds(data) {
+  const box = $("holds-list");
+  const all = (data && data.items) || [];
+  const held = all.filter((item) => item.state === "held");
+  const visible = holdsShowAll ? all : held;
+  $("holds-hint").textContent = all.length
+    ? `攒着 ${held.length} 个 · 待投 ${all.length - held.length} 个 · 到点会照旧送模型判断`
+    : "当前没有攒着的会话";
+  box.replaceChildren();
+  if (!visible.length) {
+    box.innerHTML = holdsShowAll
+      ? '<div class="mem-empty">当前没有未投递的会话</div>'
+      : '<div class="mem-empty">当前没有攒着的会话</div>';
+    return;
+  }
+  visible.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "mem-item";
+    // 「一眼看出攒了多久」要能被机器断言，所以把数字挂成 data-*，不靠读文案。
+    row.setAttribute("data-hold-seconds", String(Number(item.age_seconds) || 0));
+    row.setAttribute("data-hold-count", String(Number(item.count) || 0));
+    row.setAttribute("data-hold-state", String(item.state || ""));
+    row.setAttribute("data-chat-type", String(item.chat_type || ""));
+    row.setAttribute("data-chat-id", String(item.chat_id || ""));
+
+    const meta = document.createElement("div");
+    meta.className = "mem-meta";
+    const chan = document.createElement("span");
+    chan.className = "chan-tag";
+    chan.dataset.channel = channelOfId(item.chat_id);
+    chan.textContent = channelLabelOf(item.chat_id);
+    meta.append(
+      document.createTextNode(
+        `${chatLabel(item.chat_type, item.chat_id)} · 已攒 ${holdAgeText(item.age_seconds)} · ${Number(item.count) || 0} 条`
+      ),
+      chan
+    );
+
+    const body = document.createElement("div");
+    body.className = "mem-text";
+    if (item.state === "held") {
+      const since = item.checkpoint ? `（${decisionCheckpointLabel(item.checkpoint)}）` : "";
+      body.textContent = `正在攒着${since} · 群里再来消息或到点才会判定`;
+    } else {
+      body.textContent = "只是排队待投，还没进入攒着判定";
+    }
+
+    const acts = document.createElement("div");
+    acts.className = "mem-actions";
+    const add = (label, cls, action) => {
+      const btn = document.createElement("button");
+      btn.className = `btn ${cls}`.trim();
+      btn.textContent = label;
+      btn.title = action === "release"
+        ? "立刻把这批消息交给模型判断（会真调一次模型）"
+        : "丢弃这批未投递消息（不可撤销）";
+      btn.addEventListener("click", () => withBusy(btn, () => holdAction(item, action, () => {
+        loadHolds();
+        loadDecisions(); // 放行 / 丢弃都会留一条决策，立刻回读别等 15 秒
+      })));
+      acts.appendChild(btn);
+    };
+    add("放行", "primary", "release");
+    add("丢弃", "danger", "discard");
+
+    row.append(meta, body, acts);
+    box.appendChild(row);
+  });
+}
+
+async function loadHolds() {
+  if (document.hidden) return; // 后台标签不刷新，回到前台由 visibilitychange 触发
+  try {
+    renderHolds(await api("/api/holds"));
+    markUpdated("holds-card");
+  } catch (err) {
+    $("holds-hint").textContent = `读取失败：${err.message}`;
+  }
+}
+
 async function hardDeleteSession(session) {
   if (!confirm(`彻底删除 ${chatLabel(session.chat_type, session.chat_id)}？\n会删除远端 session 和本地全部消息、摘要、印象、用量，且不可恢复。`)) return;
   try {
@@ -4709,6 +4834,13 @@ $("search-q").addEventListener("keydown", (ev) => {
 $("btn-search-more").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => searchMessages(true)));
 $("btn-sessions-more").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadSessions(true)));
 $("btn-refresh-sessions").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadSessions()));
+$("btn-refresh-holds").addEventListener("click", (ev) => withBusy(ev.currentTarget, () => loadHolds()));
+$("btn-holds-all").addEventListener("click", () => {
+  holdsShowAll = !holdsShowAll;
+  $("btn-holds-all").setAttribute("aria-pressed", holdsShowAll ? "true" : "false");
+  $("btn-holds-all").textContent = holdsShowAll ? "只看攒着" : "显示全部待投";
+  loadHolds();
+});
 $("btn-debug-trigger").addEventListener("click", runTriggerDebug);
 $("btn-batch-preview").addEventListener("click", runBatchPreview);
 $("btn-batch-toggle-prompt").addEventListener("click", () => {
@@ -4829,6 +4961,7 @@ loadUsage();
 loadEvals();
 loadBudget();
 loadSessions();
+loadHolds();
 loadConfig();
 loadBehavior();
 loadMind();
@@ -4848,12 +4981,15 @@ setInterval(() => {
   if (!document.hidden && sessionsOffset <= SESSIONS_PAGE) loadSessions();
 }, 15000);
 setInterval(() => { if (!document.hidden) loadDecisions(); }, 15000);
+// 攒着状态与决策流同频：攒着时长会一直涨，太慢就看不出变化。
+setInterval(() => { if (!document.hidden) loadHolds(); }, 15000);
 // 只做本地判断：哪张卡超过 60 秒没刷新就标黄，不额外发请求。
 setInterval(sweepStaleCards, 15000);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   refreshHealth();
   loadDecisions();
+  loadHolds();
   if (!alertsDisabled) refreshAlerts();
   refreshBackups();
   loadMemory();

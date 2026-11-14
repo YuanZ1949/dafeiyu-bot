@@ -658,13 +658,17 @@ def test_html_each_pane_holds_at_least_one_card() -> None:
 
 
 def test_html_every_card_belongs_to_exactly_one_pane() -> None:
-    """分区只加一层壳：卡片不重复、不丢失，卡片 id 一个都不改。"""
+    """分区只加一层壳：卡片不重复、不丢失，卡片 id 一个都不改。
+
+    22 是 todo 13 重排时的存量卡片数；W5 的「正在攒着」卡（todo 17）是**新增**卡片，
+    所以这里跟着 +1。断言仍是「main 里的卡片数 == 各分区内卡片数之和」这条不变量。
+    """
     main = main_block()
     in_main = len(re.findall(r'<section class="card', main))
     in_panes = sum(
         len(re.findall(r'<section class="card', body)) for body in pane_blocks().values()
     )
-    assert in_main == in_panes == 22
+    assert in_main == in_panes == 23
     assert 'id="processes"' in main
     # 卡片自己的 id 仍然原样在（分区不改 id，只加壳）。
     for card_id in (
@@ -805,3 +809,48 @@ def test_html_keeps_every_contracted_dom_id() -> None:
     html = read_html()
     missing = [element_id for element_id in CONTRACT_DOM_IDS if f'id="{element_id}"' not in html]
     assert not missing, f"面板缺少这些契约 id：{missing}"
+
+
+def test_html_holds_view_reads_the_live_aggregate() -> None:
+    """「正在攒着」必须读 /api/holds 的实时聚合，不能用决策流冒充（那边 held 有 60 秒去重）。"""
+    html = read_html()
+    assert 'id="holds-card"' in html
+    assert 'id="holds-list"' in html
+    assert 'id="holds-hint"' in html
+    assert "function loadHolds(" in html
+    match = re.search(r"async function loadHolds\(\) \{(.*?)\n\}", html, re.DOTALL)
+    assert match is not None, "loadHolds 必须是一段可直接断言的函数体"
+    body = match.group(1)
+    assert 'api("/api/holds")' in body
+    assert "/api/decisions" not in body
+
+
+def test_html_holds_view_can_release_and_discard() -> None:
+    """两个干预动作都要在面板里：放行 / 丢弃，走既有会话动作路由。"""
+    html = read_html()
+    assert "function holdActionPath(" in html
+    assert "/release" in html and "/discard" in html
+    assert '"release"' in html and '"discard"' in html
+    assert 'method: "POST"' in html
+    # 行渲染把「攒了多久 / 多少条 / 是否真在攒着」挂成 data-*，供机器断言。
+    for attribute in ("data-hold-seconds", "data-hold-count", "data-hold-state", "data-chat-type", "data-chat-id"):
+        assert attribute in html, f"攒着行缺少 {attribute}"
+    # 15 秒一轮，与决策流同频；不要更快。
+    timers = html[html.index("setInterval(refresh,") : html.index('document.addEventListener("visibilitychange"')]
+    assert "loadHolds(); }, 15000)" in timers
+
+
+def test_html_decision_checkpoints_cover_hold_lifecycle() -> None:
+    """后端新增的 4 个 checkpoint 必须有中文标签，否则决策流直接显示英文 id。"""
+    html = read_html()
+    block = html[html.index("const DECISION_CHECKPOINT = {") : html.index("};", html.index("const DECISION_CHECKPOINT = {"))]
+    for checkpoint, label in (
+        ("opportunity_hold_expired", "到期放行 · 纯热聊"),
+        ("intensity_quiet_expired", "到期放行 · 安静强度"),
+        ("manual_release", "手动放行"),
+        ("manual_discard", "手动丢弃"),
+    ):
+        assert f'{checkpoint}:' in block
+        assert label in block
+    # 攒着筛选的语义不变：到期放行仍是 held outcome。
+    assert 'held: { label: "攒着", cls: "held" }' in html
