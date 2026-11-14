@@ -9,21 +9,26 @@ from pathlib import Path
 import httpx
 import pytest
 
+import dafeiyu.eval.checks as eval_checks
 from dafeiyu.brain.client import BrainReply
+from dafeiyu.config import MirrorConfig
 from dafeiyu.eval.__main__ import main
 from dafeiyu.eval.checks import run_checks
 from dafeiyu.eval.loader import EvalError, load_cases
 from dafeiyu.eval.models import (
+    EvalBubble,
     EvalCase,
     EvalCheck,
     EvalContext,
     EvalExpect,
+    EvalLink,
     EvalMessage,
     EvalReport,
 )
 from dafeiyu.eval.prompt import build_prompt
 from dafeiyu.eval.report import diff_reports, render_markdown
 from dafeiyu.eval.runner import FakeBrain, run_cases
+from dafeiyu.mirror import RenderedLines
 
 
 def make_case(**expect_kwargs) -> EvalCase:
@@ -651,3 +656,202 @@ def test_record_does_not_call_model(
         == 0
     )
     capsys.readouterr()
+
+
+# ---- T10: 链接解析 / 消息泡 / 批次头部 -------------------------------------
+
+#: 他人转发「顺路」的线上形态；宽度按 display_width 手算（与 test_mirror 同串）。
+WIRE_SHUNLU = "╭────────────╮\n│ 阿鱼：顺路 │\n╰────────────╯"
+
+#: T10 新增的回归 case：链接三态、批次头部三要素、气泡两态。
+NEW_CASE_IDS = frozenset(
+    {
+        "link-http-title-body",
+        "link-browser-rendered-title",
+        "link-server-unreadable",
+        "batch-header-three-elements",
+        "bubble-wire-and-store",
+        "bubble-wire-wraps",
+    }
+)
+
+
+def evidence_checks(case: EvalCase, prompt: str = "") -> dict[str, EvalCheck]:
+    reply = BrainReply(speak=True, reply="测试回复")
+    return {check.name: check for check in run_checks(case, reply, prompt)}
+
+
+def evidence_case(**expect_kwargs) -> EvalCase:
+    return EvalCase(
+        id="evidence",
+        chat_type="group",
+        chat_id="qq:1001",
+        messages=(EvalMessage(user_id="2", nickname="阿鱼", content="顺路"),),
+        expect=EvalExpect(**expect_kwargs),
+    )
+
+
+def test_loader_reads_links_and_evidence_expectations(tmp_path):
+    file = write_yaml(
+        tmp_path / "evidence.yaml",
+        """
+- id: link-and-bubble
+  chat_type: group
+  chat_id: qq:1001
+  messages:
+    - content: "看看 https://example.com/a"
+  links:
+    - url: https://example.com/a
+      outcome: browser_ok
+      status: 403
+      title: 标题
+      text: 正文
+  expect:
+    prompt_must_contain: ["【链接内容】"]
+    prompt_must_not_contain: ["服务器读不到"]
+    bubble:
+      nickname: 阿鱼
+      content: 顺路
+      wire: |
+        ╭────────────╮
+        │ 阿鱼：顺路 │
+        ╰────────────╯
+""",
+    )
+
+    case = load_cases(file)[0]
+
+    assert case.links == (
+        EvalLink(
+            url="https://example.com/a",
+            outcome="browser_ok",
+            status=403,
+            title="标题",
+            text="正文",
+        ),
+    )
+    assert case.expect.prompt_must_contain == ("【链接内容】",)
+    assert case.expect.prompt_must_not_contain == ("服务器读不到",)
+    assert case.expect.bubble is not None
+    # YAML 的 `|` 块结尾换行不算气泡内容。
+    assert case.expect.bubble.wire == WIRE_SHUNLU
+
+
+def test_loader_rejects_unknown_link_outcome(tmp_path):
+    file = write_yaml(
+        tmp_path / "bad-link.yaml",
+        """
+- id: bad-link
+  chat_type: group
+  messages: [{content: "https://example.com/a"}]
+  links:
+    - url: https://example.com/a
+      outcome: network_magic
+""",
+    )
+    with pytest.raises(EvalError, match="network_magic"):
+        load_cases(file)
+
+
+def test_check_evidence_prompt_requires_every_keyword():
+    case = evidence_case(prompt_must_contain=("【本批】", "说话人"))
+    passed = evidence_checks(case, "【本批】这一批共 2 条消息，说话人：阿猫")["evidence"]
+    assert passed.passed
+
+    failed = evidence_checks(case, "【本批】")["evidence"]
+    assert not failed.passed
+    assert "说话人" in failed.detail
+
+
+def test_check_evidence_prompt_rejects_forbidden_keywords():
+    case = evidence_case(prompt_must_not_contain=("服务器读不到",))
+    assert evidence_checks(case, "【链接内容】标题与正文")["evidence"].passed
+
+    failed = evidence_checks(case, "【链接内容】服务器读不到")["evidence"]
+    assert not failed.passed
+    assert "服务器读不到" in failed.detail
+
+
+def test_check_evidence_without_prompt_is_not_vacuous():
+    case = evidence_case(prompt_must_contain=("【链接内容】",))
+    check = evidence_checks(case)["evidence"]
+    assert not check.passed
+    assert "未提供提示词" in check.detail
+
+
+def test_check_evidence_bubble_passes_for_shipped_render():
+    case = evidence_case(bubble=EvalBubble("阿鱼", "顺路", WIRE_SHUNLU))
+    check = evidence_checks(case, "提示词")["evidence"]
+    assert check.passed, check.detail
+
+
+def test_check_evidence_bubble_detects_width_drift(monkeypatch):
+    case = evidence_case(bubble=EvalBubble("阿鱼", "顺路", WIRE_SHUNLU))
+    monkeypatch.setattr(eval_checks, "BUBBLE_WIDTH", 6)
+    check = evidence_checks(case, "提示词")["evidence"]
+    assert not check.passed
+    assert "线上形态与期望气泡不一致" in check.detail
+
+
+def test_check_evidence_bubble_detects_store_drift(monkeypatch):
+    case = evidence_case(bubble=EvalBubble("阿鱼", "顺路", WIRE_SHUNLU))
+
+    def render(self, nickname: str, content: str) -> RenderedLines:
+        return RenderedLines([WIRE_SHUNLU], [f"{nickname}  {content}"])
+
+    monkeypatch.setattr(eval_checks._BubbleProbe, "render", render)
+    check = evidence_checks(case, "提示词")["evidence"]
+    assert not check.passed
+    assert "入库形态不再是旧版单行" in check.detail
+
+
+def test_bubble_width_follows_mirror_default():
+    assert eval_checks.BUBBLE_WIDTH == MirrorConfig().bubble_max_content_width
+    assert eval_checks.BUBBLE_CORNERS == MirrorConfig().bubble_corner_chars
+
+
+def test_runner_feeds_prompt_to_checks():
+    ok = EvalCase(
+        id="prompt-ok",
+        chat_type="group",
+        chat_id="qq:1",
+        messages=(
+            EvalMessage(nickname="阿猫", content="在吗"),
+            EvalMessage(nickname="小北", content="在的"),
+        ),
+        expect=EvalExpect(prompt_must_contain=("【本批】", "说话人：阿猫、小北")),
+    )
+    bad = EvalCase(
+        id="prompt-bad",
+        chat_type="group",
+        chat_id="qq:1",
+        messages=(EvalMessage(nickname="阿猫", content="在吗"),),
+        expect=EvalExpect(prompt_must_contain=("这句不在提示词里",)),
+    )
+
+    report = run_cases([ok, bad], FakeBrain())
+    by_id = {result.id: result for result in report.cases}
+
+    assert by_id["prompt-ok"].passed
+    assert not by_id["prompt-bad"].passed
+    detail = next(
+        check.detail
+        for check in by_id["prompt-bad"].checks
+        if check.name == "evidence"
+    )
+    assert "提示词缺少" in detail
+
+
+def test_shipped_cases_pass_and_cover_new_capabilities():
+    cases = load_cases("eval/cases")
+    assert NEW_CASE_IDS <= {case.id for case in cases}
+
+    report = run_cases(cases, FakeBrain())
+
+    assert report.failed == 0
+    by_id = {result.id: result for result in report.cases}
+    for case_id in NEW_CASE_IDS:
+        evidence = [
+            check for check in by_id[case_id].checks if check.name == "evidence"
+        ]
+        assert evidence and evidence[0].passed

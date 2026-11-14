@@ -26,6 +26,7 @@ from .report import (
 from .runner import FakeBrain, run_cases
 
 DEFAULT_BASELINE = Path("eval/baseline.json")
+DEFAULT_CASES = Path("eval/cases")
 DEFAULT_RECORDED = Path("eval/cases/recorded.yaml")
 
 
@@ -34,7 +35,9 @@ def _parser() -> argparse.ArgumentParser:
         prog="python -m dafeiyu.eval",
         description="离线评测：YAML case + 确定性检查，默认假模型",
     )
-    parser.add_argument("--cases", default=None, help="case YAML 文件或目录")
+    parser.add_argument(
+        "--cases", default=str(DEFAULT_CASES), help="case YAML 文件或目录"
+    )
     parser.add_argument("--out", default=None, help="报告 JSON 输出路径（同名 .md 一并写）")
     parser.add_argument("--baseline", default=None, help="baseline JSON 路径")
     parser.add_argument(

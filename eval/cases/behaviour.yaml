@@ -1,0 +1,182 @@
+# chat-driven-behaviour-fixes T10：三条新能力的离线回归。
+#
+# 全部用例都不联网：
+# - links: 声明本 case 的 URL 在服务端两级链里的结局，HTTP / 浏览器两层都由
+#   eval 的离线桩顶上（未声明的 URL 一律按读不到处理）；
+# - expect.prompt_* 核对提示词，expect.bubble 核对跨群消息泡的两套形态。
+
+- id: link-http-title-body
+  description: HTTP 层可达 → 标题与正文都进提示词
+  chat_type: group
+  chat_id: qq:1001
+  context:
+    summary: ""
+  messages:
+    - user_id: "2002"
+      nickname: 群友
+      content: "这篇讲得挺清楚 https://example.com/news/2026 你们看看"
+      at_bot: false
+      reply_to_bot: false
+      timestamp: 1761888000
+  links:
+    - url: https://example.com/news/2026
+      outcome: http_ok
+      status: 200
+      title: 腾讯：这次变革不一样
+      text: 文章要点：游戏业务承压，视频号成了新的增长引擎。
+  expect:
+    prompt_must_contain:
+      - 【链接内容】
+      - （标题：腾讯：这次变革不一样）
+      - 正文：文章要点：游戏业务承压
+      - 视频号成了新的增长引擎
+    prompt_must_not_contain:
+      - 服务器读不到
+    min_chars: 1
+    max_chars: 120
+    must_not_contain: []
+
+- id: link-browser-rendered-title
+  description: HTTP 403 → 浏览器渲染成功，标题进提示词且不出现「服务器读不到」
+  chat_type: group
+  chat_id: qq:1001
+  context:
+    summary: ""
+  messages:
+    - user_id: "2002"
+      nickname: 群友
+      content: "知乎这个回答说得挺好 https://www.zhihu.com/question/123456"
+      at_bot: false
+      reply_to_bot: false
+      timestamp: 1761888060
+  links:
+    - url: https://www.zhihu.com/question/123456
+      outcome: browser_ok
+      status: 403
+      title: 知乎高赞：这轮变革到底新在哪
+      text: 有头浏览器渲染出来的回答正文。
+  expect:
+    prompt_must_contain:
+      - 【链接内容】
+      - （标题：知乎高赞：这轮变革到底新在哪）
+      - 正文：有头浏览器渲染出来的回答正文
+    prompt_must_not_contain:
+      - 服务器读不到
+    min_chars: 1
+    max_chars: 120
+    must_not_contain: []
+
+- id: link-server-unreadable
+  description: 两级都失败 → 提示词标「服务器读不到」，且不催模型重抓
+  chat_type: group
+  chat_id: qq:1001
+  context:
+    summary: ""
+  messages:
+    - user_id: "2002"
+      nickname: 群友
+      content: "这个链接你们打得开吗 https://www.zhihu.com/question/999999"
+      at_bot: false
+      reply_to_bot: false
+      timestamp: 1761888120
+  links:
+    - url: https://www.zhihu.com/question/999999
+      outcome: unreadable
+      status: 403
+  expect:
+    prompt_must_contain:
+      - 【链接内容】
+      - 服务器读不到
+      - （browser_timeout）
+    prompt_must_not_contain:
+      - 再抓
+      - 再来一次
+      - 继续抓
+    min_chars: 1
+    max_chars: 120
+    must_not_contain: []
+
+- id: batch-header-three-elements
+  description: 多条批次 → 【本批】里有说话人、点名者、话题锚点
+  chat_type: group
+  chat_id: qq:1001
+  context:
+    summary: ""
+  messages:
+    - user_id: "2002"
+      nickname: 阿猫
+      content: "有人用过那个新出的翻译插件吗"
+      at_bot: false
+      reply_to_bot: false
+      timestamp: 1761888000
+    - user_id: "2003"
+      nickname: 小北
+      content: "@大肥鱼 你怎么看"
+      at_bot: true
+      reply_to_bot: false
+      timestamp: 1761888010
+    - user_id: "2004"
+      nickname: 橙子
+      content: "我也想听听"
+      at_bot: false
+      reply_to_bot: false
+      timestamp: 1761888020
+  expect:
+    prompt_must_contain:
+      - 【本批】这一批共 3 条消息，说话人：阿猫、小北、橙子。
+      - 在跟你说话：1 条（小北）
+      - 话题锚点：本批开头是「有人用过那个新出的翻译插件吗」
+    min_chars: 1
+    max_chars: 120
+    must_not_contain: []
+
+- id: bubble-wire-and-store
+  description: 他人转发 → 线上是完整气泡，入库仍是旧版单行
+  chat_type: group
+  chat_id: qq:1001
+  context:
+    summary: ""
+  messages:
+    - user_id: "2002"
+      nickname: 阿鱼
+      content: "顺路"
+      at_bot: false
+      reply_to_bot: false
+      timestamp: 1761888000
+  expect:
+    bubble:
+      nickname: 阿鱼
+      content: 顺路
+      wire: |
+        ╭────────────╮
+        │ 阿鱼：顺路 │
+        ╰────────────╯
+    min_chars: 1
+    max_chars: 120
+    must_not_contain: []
+
+- id: bubble-wire-wraps
+  description: 长正文按显示宽度换行后仍是完整气泡，入库仍是单行
+  chat_type: group
+  chat_id: qq:1001
+  context:
+    summary: ""
+  messages:
+    - user_id: "2002"
+      nickname: 阿鱼
+      content: "刚看到一张图，猫穿着西装在开周会，笑死我了"
+      at_bot: false
+      reply_to_bot: false
+      timestamp: 1761888000
+  expect:
+    bubble:
+      nickname: 阿鱼
+      content: 刚看到一张图，猫穿着西装在开周会，笑死我了
+      wire: |
+        ╭──────────────────────────────╮
+        │ 阿鱼：刚看到一张图，         │
+        │ 猫穿着西装在开周会，笑死我了 │
+        ╰──────────────────────────────╯
+    min_chars: 1
+    max_chars: 120
+    must_not_contain: []

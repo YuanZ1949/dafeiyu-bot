@@ -12,7 +12,15 @@ from typing import Any
 
 import yaml
 
-from .models import EvalCase, EvalContext, EvalExpect, EvalMessage
+from .models import (
+    LINK_OUTCOMES,
+    EvalBubble,
+    EvalCase,
+    EvalContext,
+    EvalExpect,
+    EvalLink,
+    EvalMessage,
+)
 
 CASE_ID_RE = re.compile(r"^[a-z0-9-]+$")
 CHAT_TYPES = frozenset({"group", "private"})
@@ -91,6 +99,10 @@ def _parse_case(raw: Any, file: Path) -> EvalCase:
     if not isinstance(raw_messages, list) or not raw_messages:
         raise EvalError(f"{where}: messages 至少需要 1 条")
 
+    raw_links = raw.get("links", [])
+    if not isinstance(raw_links, list):
+        raise EvalError(f"{where}: links 必须是列表")
+
     return EvalCase(
         id=case_id,
         description=_as_str(raw.get("description", ""), where, "description"),
@@ -102,6 +114,9 @@ def _parse_case(raw: Any, file: Path) -> EvalCase:
             for index, item in enumerate(raw_messages)
         ),
         expect=_parse_expect(raw.get("expect"), where),
+        links=tuple(
+            _parse_link(item, where, index) for index, item in enumerate(raw_links)
+        ),
     )
 
 
@@ -144,6 +159,47 @@ def _parse_message(raw: Any, where: str, index: int) -> EvalMessage:
     )
 
 
+def _parse_link(raw: Any, where: str, index: int) -> EvalLink:
+    if not isinstance(raw, dict):
+        raise EvalError(f"{where}: links[{index}] 必须是对象")
+    url = _as_str(raw.get("url", ""), where, f"links[{index}].url").strip()
+    if not url:
+        raise EvalError(f"{where}: links[{index}] 缺少 url")
+    outcome = _as_str(raw.get("outcome", "http_ok"), where, f"links[{index}].outcome")
+    if outcome not in LINK_OUTCOMES:
+        raise EvalError(
+            f"{where}: links[{index}].outcome 必须是 "
+            f"{'/'.join(sorted(LINK_OUTCOMES))}，实际 {outcome!r}"
+        )
+    # HTTP 层失败才谈得上「浏览器接手」：非 http_ok 的默认状态码是 403。
+    default_status = 200 if outcome == "http_ok" else 403
+    return EvalLink(
+        url=url,
+        outcome=outcome,
+        status=_as_int(
+            raw.get("status", default_status), where, f"links[{index}].status"
+        ),
+        title=_as_str(raw.get("title", ""), where, f"links[{index}].title"),
+        text=_as_str(raw.get("text", ""), where, f"links[{index}].text"),
+    )
+
+
+def _parse_bubble(raw: Any, where: str) -> EvalBubble | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise EvalError(f"{where}: expect.bubble 必须是对象")
+    for key in ("nickname", "content", "wire"):
+        if key not in raw:
+            raise EvalError(f"{where}: expect.bubble 缺少 {key}")
+    return EvalBubble(
+        nickname=_as_str(raw["nickname"], where, "expect.bubble.nickname"),
+        content=_as_str(raw["content"], where, "expect.bubble.content"),
+        # YAML 的 `|` 块会把结尾换行带进来；气泡本身不以换行结尾。
+        wire=_as_str(raw["wire"], where, "expect.bubble.wire").rstrip("\n"),
+    )
+
+
 def _parse_expect(raw: Any, where: str) -> EvalExpect:
     if raw is None:
         return EvalExpect()
@@ -177,6 +233,15 @@ def _parse_expect(raw: Any, where: str) -> EvalExpect:
             else None
         ),
         safety=_as_bool(raw.get("safety", False), where, "expect.safety"),
+        prompt_must_contain=_as_str_list(
+            raw.get("prompt_must_contain", []), where, "expect.prompt_must_contain"
+        ),
+        prompt_must_not_contain=_as_str_list(
+            raw.get("prompt_must_not_contain", []),
+            where,
+            "expect.prompt_must_not_contain",
+        ),
+        bubble=_parse_bubble(raw.get("bubble"), where),
     )
 
 

@@ -14,7 +14,7 @@ from dafeiyu.models import ChatType
 
 from .checks import all_passed, run_checks
 from .models import EvalCase, EvalCheck, EvalReport, EvalResult
-from .prompt import build_prompt
+from .prompt import build_prompt_async
 
 FAKE_REPLY = "测试回复"
 
@@ -61,11 +61,11 @@ async def run_case_async(
     """跑一个 case；任何异常都转成失败结果，不中断整批。"""
     started = time.perf_counter()
     try:
-        prompt = build_prompt(case)
+        prompt = await build_prompt_async(case)
         reply = await _call_brain(
             brain, ChatType(case.chat_type), case.chat_id, prompt
         )
-        checks = run_checks(case, reply)
+        checks = run_checks(case, reply, prompt)
         latency_ms = int((time.perf_counter() - started) * 1000)
         return EvalResult(
             id=case.id,

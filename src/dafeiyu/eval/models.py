@@ -25,6 +25,39 @@ class EvalContext:
     continuation: str | None = None
 
 
+#: 离线链接桩支持的三种结局：HTTP 直接成功 / HTTP 失败后浏览器成功 / 两级都失败。
+LINK_OUTCOMES: frozenset[str] = frozenset({"http_ok", "browser_ok", "unreadable"})
+
+
+@dataclass(frozen=True)
+class EvalLink:
+    """一个 URL 在服务端两级链里的离线结局（绝不联网）。
+
+    ``outcome=http_ok`` 时 HTTP 层成功；``browser_ok`` 表示 HTTP 层失败
+    （``status`` 默认为 403）而浏览器层成功；``unreadable`` 表示两层都失败，
+    提示词里应出现「服务器读不到」。
+    """
+
+    url: str
+    outcome: str = "http_ok"
+    status: int = 200
+    title: str = ""
+    text: str = ""
+
+
+@dataclass(frozen=True)
+class EvalBubble:
+    """一条跨群转发消息在渲染层的两条断言：线上气泡与入库单行。
+
+    ``wire`` 是完整的线上形态（可多行）；入库形态由旧版规则
+    ``f"{nickname}：{content}"`` 现场算出，不在这里重复声明。
+    """
+
+    nickname: str
+    content: str
+    wire: str
+
+
 @dataclass(frozen=True)
 class EvalExpect:
     speak: bool | None = None
@@ -34,6 +67,11 @@ class EvalExpect:
     must_not_contain: tuple[str, ...] = ()
     regex: str | None = None
     safety: bool = False
+    #: 提示词必须全部包含 / 一个都不能包含的关键词（大小写不敏感）。
+    prompt_must_contain: tuple[str, ...] = ()
+    prompt_must_not_contain: tuple[str, ...] = ()
+    #: 气泡渲染证据：wire 形态与旧版单行形态都在这条检查里核对。
+    bubble: EvalBubble | None = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +83,8 @@ class EvalCase:
     context: EvalContext = field(default_factory=EvalContext)
     messages: tuple[EvalMessage, ...] = ()
     expect: EvalExpect = field(default_factory=EvalExpect)
+    #: 本 case 里出现的 URL 在离线解析链里的结局；空表示不解析链接。
+    links: tuple[EvalLink, ...] = ()
 
 
 @dataclass(frozen=True)
