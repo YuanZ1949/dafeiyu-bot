@@ -126,8 +126,28 @@ class FakeBehavior:
         self.load_after_navigate = True
         self.load_fired = False
         self.snapshot_payload = ""
+        # Browser.getWindowForTarget 的回包：None = 端点不支持（拿不到 windowId）
+        self.window_id: int | None = 7
+        # True = Browser.setWindowBounds 报错（最小化失败路径）
+        self.minimize_error = False
+        # Runtime.evaluate 的 document.readyState 依次回这些值（取完停在最后一个）
+        self.ready_states: list[str] = ["complete"]
 
     def reply(self, method: str, params: dict[str, Any], mid: int) -> dict[str, Any] | None:
+        if method == "Browser.getWindowForTarget":
+            if self.window_id is None:
+                return {"id": mid, "result": {}}
+            return {
+                "id": mid,
+                "result": {
+                    "windowId": self.window_id,
+                    "bounds": {"left": 0, "top": 0, "width": 800, "height": 600},
+                },
+            }
+        if method == "Browser.setWindowBounds":
+            if self.minimize_error:
+                return {"id": mid, "error": {"code": -32000, "message": "not supported"}}
+            return {"id": mid, "result": {}}
         if method == "Page.navigate":
             if self.navigate_silent:
                 return None
@@ -137,7 +157,12 @@ class FakeBehavior:
         if method == "Runtime.evaluate":
             expression = str(params.get("expression", ""))
             if "readyState" in expression:
-                return {"id": mid, "result": {"result": {"type": "string", "value": "complete"}}}
+                state = (
+                    self.ready_states.pop(0)
+                    if len(self.ready_states) > 1
+                    else self.ready_states[0]
+                )
+                return {"id": mid, "result": {"result": {"type": "string", "value": state}}}
             return {
                 "id": mid,
                 "result": {"result": {"type": "string", "value": self.snapshot_payload}},
@@ -272,6 +297,65 @@ def test_headless_mode_raises_at_construction(tmp_path: Path) -> None:
 
 
 # ---- (c) js-initialData 优先 -----------------------------------------------------
+
+
+async def test_window_minimized_via_cdp_before_navigate(tmp_path: Path) -> None:
+    """``--start-minimized`` 实测无效，最小化必须由 CDP 兜底，且在导航之前。"""
+    fixture = Fixture(make_config(tmp_path))
+    result = await fixture.renderer.render("http://example.test/page")
+
+    assert result.ok is True
+    sent = fixture.connector.page_sessions[0].sent
+    methods = [item["method"] for item in sent]
+    idx_get = methods.index("Browser.getWindowForTarget")
+    idx_set = methods.index("Browser.setWindowBounds")
+    idx_nav = methods.index("Page.navigate")
+    assert idx_get < idx_set < idx_nav
+    assert sent[idx_get]["params"] == {"targetId": "target-1"}
+    assert sent[idx_set]["params"] == {
+        "windowId": 7,
+        "bounds": {"windowState": "minimized"},
+    }
+
+
+async def test_minimize_failure_keeps_render_successful(tmp_path: Path) -> None:
+    """最小化失败只影响前台观感，不得把渲染判成失败。"""
+    fixture = Fixture(make_config(tmp_path))
+    fixture.behavior.minimize_error = True
+
+    result = await fixture.renderer.render("http://example.test/page")
+
+    assert result.ok is True
+    assert result.title == "知乎标题"
+
+
+async def test_waits_for_document_complete_before_snapshot(tmp_path: Path) -> None:
+    """loadEventFired 可能先于正文（about:blank 的事件）：必须按 readyState 等。"""
+    fixture = Fixture(make_config(tmp_path))
+    fixture.behavior.ready_states = ["loading", "loading", "complete"]
+
+    result = await fixture.renderer.render("https://www.zhihu.com/question/123")
+    assert result.ok is True
+
+    sent = fixture.connector.page_sessions[0].sent
+    ready = [i for i, item in enumerate(sent) if "readyState" in str(item["params"])]
+    shots = [i for i, item in enumerate(sent) if "outerHTML" in str(item["params"])]
+    assert len(ready) == 3
+    # 快照必须发生在最后一次 readyState=complete 之后
+    assert shots and shots[0] > ready[-1]
+
+
+async def test_document_never_complete_times_out(tmp_path: Path) -> None:
+    """永不 load 完的页面按超时处理，绝不在半成品页面上判成功。"""
+    fixture = Fixture(make_config(tmp_path, timeout_seconds=0.3), clock_step=0.1)
+    fixture.behavior.ready_states = ["loading"]
+
+    result = await asyncio.wait_for(
+        fixture.renderer.render("http://example.test/never"), timeout=10.0
+    )
+
+    assert result.ok is False
+    assert result.reason == "browser_timeout"
 
 
 async def test_initial_data_preferred_over_page_inner_text(tmp_path: Path) -> None:

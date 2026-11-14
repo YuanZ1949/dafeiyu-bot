@@ -45,6 +45,8 @@ __all__ = ["BrowserResult", "BrowserRenderer"]
 #: 等待 CDP 端点 / 命令回包时，注入时钟（测试）与真实时钟共用的轮询切片（秒）。
 #: 注入时钟不会随真实时间前进，切片必须短到测试能在几步内看到时钟被推进。
 _POLL_SLICE = 0.25
+#: 等文档 load 完的轮询间隔（``document.readyState`` 采样）。
+_READY_POLL = 0.2
 #: 版本端点就绪重试的保底次数上限：即便注入时钟被冻结也不会无限循环。
 _MAX_VERSION_RETRIES = 500
 
@@ -364,12 +366,19 @@ class BrowserRenderer:
                 deadline = self._clock() + self._config.timeout_seconds
                 await self._call(session.command("Page.enable", {}), deadline)
                 await self._call(session.command("Runtime.enable", {}), deadline)
+                # ``--start-minimized`` 在 Edge Beta 上是空操作（F3 真机实测：
+                # 新窗口 IsIconic 全为 false），有头窗口会抢微信桥的前台焦点。
+                # 所以再用 CDP 把承载本 target 的窗口压到最小化；失败不阻断
+                # 渲染——窗口状态只影响前台观感，不影响读到的内容。
+                with suppress(Exception):
+                    await self._minimize_window(session, target_id, deadline)
                 await self._call(
                     session.command("Page.navigate", {"url": url}), deadline
                 )
                 await self._call(
                     session.wait_event("Page.loadEventFired"), deadline
                 )
+                await self._wait_document_complete(session, deadline)
                 snapshot = await self._snapshot(session, deadline)
                 title, text = self._extract(snapshot)
                 if not text:
@@ -514,6 +523,58 @@ class BrowserRenderer:
             raise
 
     # ---- 渲染步骤 ---------------------------------------------------------
+
+    async def _wait_document_complete(
+        self, session: CdpSession, deadline: float
+    ) -> None:
+        """等 target 的文档真的 load 完再抓快照。
+
+        ``Page.loadEventFired`` 可能是「创建 target 时 about:blank」那一次的
+        事件（它可能晚于 ``Page.navigate`` 才排队到我们手上），此时正文还没
+        到，抓到的是前端站的加载占位页——F3 真机实测知乎：占位 639 B、无
+        ``js-initialData``；真正 load 完是 316 KB、正文 3252 字。以
+        ``document.readyState === 'complete'`` 为准可以无视事件先后。
+
+        deadline 到了仍没 load 完就按超时处理（渲染预算用尽 = browser_timeout），
+        绝不在半成品页面上判成功。
+        """
+        while True:
+            reply = await self._call(
+                session.command(
+                    "Runtime.evaluate",
+                    {"expression": "document.readyState", "returnByValue": True},
+                ),
+                deadline,
+            )
+            if (reply.get("result") or {}).get("value") == "complete":
+                return
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise TimeoutError("document did not finish loading")
+            await asyncio.sleep(min(_READY_POLL, remaining))
+
+    async def _minimize_window(
+        self, session: CdpSession, target_id: str, deadline: float
+    ) -> None:
+        """把承载 ``target_id`` 的浏览器窗口最小化（有头不抢前台焦点）。
+
+        走 CDP 而不是启动参数：``--start-minimized`` 实测无效（见 ``render``
+        里的说明）。窗口已经是最小化时重复设置无副作用。
+        """
+        info = await self._call(
+            session.command("Browser.getWindowForTarget", {"targetId": target_id}),
+            deadline,
+        )
+        window_id = info.get("windowId")
+        if not isinstance(window_id, int):
+            return
+        await self._call(
+            session.command(
+                "Browser.setWindowBounds",
+                {"windowId": window_id, "bounds": {"windowState": "minimized"}},
+            ),
+            deadline,
+        )
 
     async def _new_target(self) -> tuple[str, str]:
         info = await self._connector.create_target(self._port, "about:blank")
