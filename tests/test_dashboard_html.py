@@ -720,4 +720,39 @@ def test_html_card_spacing_tokens_are_shared() -> None:
     assert "top: var(--header-h" in nav
 
 
+def test_html_cards_report_last_update_time() -> None:
+    """有实时数据的卡片要把「上次刷新」写出来：markUpdated 负责写时间。"""
+    html = read_html()
+    style = style_block()
+    assert "function markUpdated(" in html
+    assert "card-updated" in style
+    assert "data-updated" in html
+    # 既有决策流时钟必须原样保留，新的 data-updated 是新增而不是替换。
+    assert 'id="decisions-updated"' in html
+    # 接到的刷新入口不能只有一两个：状态 / 健康 / 告警 / 决策 / 会话 / 记忆 / 用量 / 日志。
+    assert len(re.findall(r"markUpdated\(\"", html)) >= 8
+
+
+def test_html_stale_cards_are_marked_after_a_minute() -> None:
+    """60 秒没刷新要能被看出来，且只做本地判断（每 15 秒扫一次，不发请求）。"""
+    html = read_html()
+    style = style_block()
+    assert ".card.is-stale {" in style
+    assert ".card.is-stale .card-updated" in style
+    assert "CARD_STALE_MS = 60000" in html
+    assert "setInterval(sweepStaleCards, 15000);" in html
+
+
+def test_html_login_card_collapses_when_logged_in() -> None:
+    """已登录时二维码卡收成一行，点标题可再展开；二维码刷新能力不能被删掉。"""
+    html = read_html()
+    style = style_block()
+    assert ".card.collapsed #qr-wrap { display: none; }" in style
+    assert 'data-card="login"' in html
+    assert 'classList.toggle("collapsed"' in html
+    assert "initLoginCardToggle();" in html
+    # 收缩只是隐藏，重新登录仍要能拿到新二维码：缓存破坏与刷新入口必须还在。
+    assert "/api/qr/image?t=${Date.now()}" in html
+
+
 

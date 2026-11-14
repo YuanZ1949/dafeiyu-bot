@@ -174,6 +174,16 @@
   }
   .pane-nav .btn { flex: 0 0 auto; }
   .pane-nav .btn.active { border-color: var(--accent); background: var(--mode-active); }
+  /* 卡片最近一次刷新时间：默认藏在标题行，markUpdated() 写时间时现形。 */
+  .card-updated {
+    color: var(--muted); font-size: var(--fs-xs); white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  /* 60 秒没刷新：时间转警示色 + 左侧描边，卡片内容不动，不抢注意力。 */
+  .card.is-stale { border-left: 3px solid var(--warn); }
+  .card.is-stale .card-updated { color: var(--warn); }
+  /* 登录二维码卡：已登录时收成一行状态，二维码区让位给同分区的其它卡片。 */
+  .card.collapsed #qr-wrap { display: none; }
   .card h2 { margin: 0; font-size: var(--fs-md); color: var(--muted); font-weight: 600; letter-spacing: .04em; }
   .card > h2 { margin: 0 0 12px; }
   .card h3 { margin: 0; font-size: var(--fs-sm); color: var(--muted); font-weight: 600; letter-spacing: .04em; }
@@ -688,11 +698,13 @@
 
     <section class="grid-3 span-full" id="processes"></section>
 
-    <section class="card">
+    <section class="card" data-card="login">
       <h2>登录二维码</h2>
       <div class="row card-head">
         <span class="pill st-stopped" id="login-state"><span class="dot"></span>登录状态未知</span>
         <span class="kv" id="login-hint"></span>
+        <span class="spacer"></span>
+        <span class="kv card-updated" data-updated hidden></span>
       </div>
       <div id="qr-wrap">
         <img id="qr" alt="登录二维码" class="empty" />
@@ -710,6 +722,7 @@
         <span class="pill st-stopped" id="health-state"><span class="dot"></span>加载中</span>
         <span class="kv" id="health-hint"></span>
         <span class="spacer"></span>
+        <span class="kv card-updated" data-updated hidden></span>
         <button class="btn" id="btn-refresh-health">刷新</button>
       </div>
       <div class="kv cfg-grid" id="health-body"></div>
@@ -727,6 +740,7 @@
         <h2>告警事件</h2>
         <span class="kv" id="alerts-hint">暂无活动事件</span>
         <span class="spacer"></span>
+        <span class="kv card-updated" data-updated hidden></span>
         <button class="btn" id="btn-test-alert">测试告警</button>
         <button class="btn" id="btn-refresh-alerts">刷新</button>
       </div>
@@ -737,11 +751,12 @@
   <section class="pane" id="pane-memory">
     <h2 class="pane-title">记忆</h2>
 
-    <section class="card span-full">
+    <section class="card span-full" data-card="memory">
       <div class="row card-head">
         <h2>记忆</h2>
         <span class="kv" id="memory-hint"></span>
         <span class="spacer"></span>
+        <span class="kv card-updated" data-updated hidden></span>
         <select id="memory-chat-filter" title="按会话类型筛选" aria-label="按会话类型筛选">
           <option value="">全部会话</option>
           <option value="group">只看群聊</option>
@@ -796,11 +811,12 @@
       <div class="kv mt-2">只删除该用户在本会话的原始消息；摘要与印象等聚合数据可能仍保留痕迹，操作不可撤销。如需彻底重建，请联系管理员执行 /forget。</div>
     </section>
 
-    <section class="card span-full">
+    <section class="card span-full" data-card="usage">
       <div class="row card-head">
         <h2>用量趋势</h2>
         <span class="kv" id="usage-hint"></span>
         <span class="spacer"></span>
+        <span class="kv card-updated" data-updated hidden></span>
         <select id="usage-days" title="统计区间" aria-label="统计区间">
           <option value="7">近 7 天</option>
           <option value="14">近 14 天</option>
@@ -875,11 +891,12 @@
   <section class="pane" id="pane-chats">
     <h2 class="pane-title">会话</h2>
 
-    <section class="card span-full">
+    <section class="card span-full" data-card="sessions">
       <div class="row card-head">
         <h2>会话管理</h2>
         <span class="kv" id="sessions-hint"></span>
         <span class="spacer"></span>
+        <span class="kv card-updated" data-updated hidden></span>
         <button class="btn" id="btn-sessions-more" disabled>加载更多</button>
         <button class="btn" id="btn-refresh-sessions">刷新</button>
       </div>
@@ -1258,7 +1275,7 @@
   <section class="pane" id="pane-logs">
     <h2 class="pane-title">日志</h2>
 
-    <section class="card span-full">
+    <section class="card span-full" data-card="logs">
       <h2>日志</h2>
       <div class="log-head" id="log-tabs" role="tablist" aria-label="日志来源"></div>
       <div class="log-toolbar">
@@ -1278,6 +1295,7 @@
         <button class="btn" id="btn-log-clear">清屏</button>
         <button class="btn" id="btn-log-download">下载当前日志</button>
         <span class="kv" id="log-hint"></span>
+        <span class="kv card-updated" data-updated hidden></span>
       </div>
       <pre id="logs"></pre>
     </section>
@@ -1400,6 +1418,8 @@ let healthReadFailed = false;
 // 最近 7 天缺摘要的天数：由记忆体检接口写入，顶部横幅据此提醒。
 let memoryPendingDays = 0;
 let lastQrKey = "";
+// 已登录时登录卡默认收起；点标题展开后保持展开，别被 5 秒轮询又收回去。
+let loginCardExpanded = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -1429,6 +1449,43 @@ function syncHeaderHeight() {
   const header = document.querySelector("header");
   if (!header) return;
   document.documentElement.style.setProperty("--header-h", `${header.offsetHeight}px`);
+}
+
+// ---- 卡片刷新时间与「多久没更新」标记 ----
+const CARD_STALE_MS = 60000;      // 超过 60 秒没刷新就算过期
+const cardUpdatedAt = {};
+
+function cardElement(key) {
+  return document.querySelector(`[data-card="${key}"]`) || $(key);
+}
+
+function clockOf(when) {
+  const at = new Date(when);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`;
+}
+
+// 数据落地时调一次：写时间、清过期标记；元素不存在也不报错（分区可能被隐藏）。
+function markUpdated(key, when = Date.now()) {
+  cardUpdatedAt[key] = when;
+  const card = cardElement(key);
+  if (!card) return;
+  // 日志这类高频来源一秒内会调很多次：文本没变就不碰 DOM，避免无谓重排。
+  const text = `更新于 ${clockOf(when)}`;
+  const box = card.querySelector("[data-updated]");
+  if (box) {
+    if (box.textContent !== text) box.textContent = text;
+    box.hidden = false;
+  }
+  if (card.classList.contains("is-stale")) card.classList.remove("is-stale");
+}
+
+function sweepStaleCards() {
+  const now = Date.now();
+  Object.entries(cardUpdatedAt).forEach(([key, when]) => {
+    const card = cardElement(key);
+    if (card) card.classList.toggle("is-stale", now - when > CARD_STALE_MS);
+  });
 }
 
 function initPaneNav() {
@@ -1466,6 +1523,19 @@ function initPaneNav() {
   panes.forEach((pane) => observer.observe(pane));
   syncHeaderHeight();
   window.addEventListener("resize", syncHeaderHeight);
+}
+
+// 登录二维码卡：未登录时照旧露二维码；已登录时收成一行，点标题再展开。
+function initLoginCardToggle() {
+  const card = document.querySelector('[data-card="login"]');
+  const head = card && card.querySelector(".card-head");
+  if (!head) return;
+  head.addEventListener("click", () => {
+    if (!card.classList.contains("collapsed")) return;
+    loginCardExpanded = true;
+    card.classList.remove("collapsed");
+    $("login-hint").textContent = "已登录 · 二维码已展开，重新登录请重启 NapCat 后扫码。";
+  });
 }
 
 function toast(message, isError = false) {
@@ -2048,6 +2118,7 @@ function applyStatus(data) {
 
   renderLogin(data.napcat);
   renderQr(data.qr, data.napcat);
+  markUpdated("login");
   renderGlobalBanner(data);
   renderFreeBanner(data);
 }
@@ -2100,7 +2171,9 @@ function renderLogin(napcat) {
       const who = [napcat.qq, napcat.nickname].filter(Boolean).join(" ");
       cls = "st-running";
       text = who ? `已登录 · ${who}` : "已登录";
-      note = "NapCat 已在线，二维码已失效。";
+      note = loginCardExpanded
+        ? "已登录 · 二维码已展开，重新登录请重启 NapCat 后扫码。"
+        : "已登录 · 点标题可展开二维码。";
     } else {
       cls = "st-starting";
       text = napcat.phase_label ? `未登录 · ${napcat.phase_label}` : "未登录";
@@ -2120,6 +2193,12 @@ function renderQr(qr, napcat) {
   const img = $("qr");
   const placeholder = $("qr-placeholder");
   const meta = $("qr-meta");
+  // 已登录：二维码没用了，整卡收成一行状态，把纵向空间让给同分区的其它卡片。
+  // 用户点标题可以再展开（loginCardExpanded），展开后轮询不会把它收回去。
+  const card = document.querySelector('[data-card="login"]');
+  const loggedIn = Boolean(napcat && napcat.logged_in && !napcat.offline);
+  if (card) card.classList.toggle("collapsed", loggedIn && !loginCardExpanded);
+  if (!loggedIn) loginCardExpanded = false;
   if (napcat && napcat.logged_in && napcat.offline) {
     img.classList.add("empty");
     lastQrKey = "";
@@ -2315,6 +2394,7 @@ async function refreshHealth() {
   try {
     renderHealth(await api("/api/health/detail"));
     healthReadFailed = false;
+    markUpdated("health-card");
   } catch (err) {
     healthReadFailed = true;
     $("health-state").className = "pill st-failed";
@@ -2485,6 +2565,7 @@ async function loadDecisions() {
     $("decisions-updated").textContent = data.generated_at
       ? `更新 ${decisionClock(data.generated_at, true)}`
       : "";
+    markUpdated("decisions-card");
     renderDecisions();
   } catch (err) {
     $("decisions-hint").textContent = `读取失败：${err.message}`;
@@ -2509,6 +2590,7 @@ async function refreshAlerts() {
       disableAlertsCard();
       return;
     }
+    markUpdated("alerts-card");
     const events = data.events || [];
     const summary = data.summary || {};
     $("alerts-hint").textContent = events.length
@@ -2887,6 +2969,7 @@ async function loadMemory() {
   if (document.hidden) return; // 后台标签不刷新，回到前台由 visibilitychange 触发
   try {
     renderMemory(await api(memoryUrl()));
+    markUpdated("memory");
   } catch (err) {
     $("memory-summaries").replaceChildren();
     $("memory-impressions").replaceChildren();
@@ -3206,6 +3289,7 @@ async function loadUsage() {
           <div class="mem-text">${chatLabel(r.chat_type, r.chat_id)}</div>
         </div>`).join("")
       : '<div class="mem-empty">没有错误记录</div>';
+    markUpdated("usage");
   } catch (err) {
     $("usage-hint").textContent = `读取失败：${err.message}`;
   }
@@ -3341,6 +3425,7 @@ async function loadBudgetData() {
       `/api/budget?chat_type=${encodeURIComponent(chatType)}&chat_id=${encodeURIComponent(rawId)}`
     );
     renderBudget(data);
+    markUpdated("usage");
   } catch (err) {
     resetBudget(`预算读取失败：${err.message}`);
   }
@@ -3453,6 +3538,7 @@ async function loadSessions(append = false) {
     $("sessions-hint").textContent = `${loaded} / ${sessionsTotal} 个会话`;
     if (!loaded) box.innerHTML = '<div class="mem-empty">还没有会话记录</div>';
     $("btn-sessions-more").disabled = sessionsOffset >= sessionsTotal;
+    markUpdated("sessions");
   } catch (err) {
     $("sessions-hint").textContent = `读取失败：${err.message}`;
     $("btn-sessions-more").disabled = sessionsOffset >= sessionsTotal;
@@ -4459,6 +4545,7 @@ function appendLogLine(line) {
   if (logLines.length > LOG_MAX_LINES) {
     logLines.splice(0, logLines.length - LOG_MAX_LINES);
   }
+  markUpdated("logs");
   if (logPaused) {
     logPending += 1;
     $("log-hint").textContent = `已暂停 · ${logPending} 行待显示`;
@@ -4727,6 +4814,7 @@ initTabs();
 $("summary-date").value = yesterdayIso();
 initTheme();
 initPaneNav();
+initLoginCardToggle();
 loadAuthSession();
 // 面板刚打开：强制重探一次免费档，别让上一次会话留下的旧黄条继续挂着。
 // 只为触发后端重探；响应丢弃也没关系，状态由下一轮 /api/status 带回。
@@ -4760,6 +4848,8 @@ setInterval(() => {
   if (!document.hidden && sessionsOffset <= SESSIONS_PAGE) loadSessions();
 }, 15000);
 setInterval(() => { if (!document.hidden) loadDecisions(); }, 15000);
+// 只做本地判断：哪张卡超过 60 秒没刷新就标黄，不额外发请求。
+setInterval(sweepStaleCards, 15000);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   refreshHealth();
