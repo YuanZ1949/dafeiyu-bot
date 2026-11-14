@@ -173,7 +173,10 @@
     padding: 2px 8px; border-radius: 999px; font-size: var(--fs-sm);
     background: var(--panel-2); border: 1px solid var(--line);
   }
-  .chan-tag { margin-left: 6px; padding: 1px 6px; border-radius: 8px; font-size: 11px; background: rgba(120,120,120,.18); }
+  .chan-tag { margin-left: 6px; padding: 1px 6px; border-radius: 8px; font-size: 11px; background: rgba(120,120,120,.18); border: 1px solid transparent; }
+  /* 通道色：QQ 蓝 / 微信 绿。只引用既有令牌，不新增色值。 */
+  .chan-tag[data-channel="qq"] { color: var(--accent); border-color: var(--accent); }
+  .chan-tag[data-channel="wechat"] { color: var(--ok); border-color: var(--ok); }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
   .st-running .dot { background: var(--ok); }
   .st-starting .dot, .st-restarting .dot { background: var(--warn); }
@@ -522,10 +525,14 @@
   }
   .timeline-msg {
     border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-top: 2px solid var(--line);
     border-radius: 8px; padding: 8px 12px; background: var(--panel-2);
     /* 宽度算法：短句按内容收窄，长句到上限换行；桌面与手机共用同一上限。 */
     width: fit-content; max-width: min(72ch, 88%);
   }
+  /* 通道色走上边框（左边框已被 bot / 人占用），QQ 蓝 / 微信 绿。 */
+  .timeline-msg[data-channel="qq"] { border-top-color: var(--accent); }
+  .timeline-msg[data-channel="wechat"] { border-top-color: var(--ok); }
   .timeline-msg.bot {
     justify-self: end; border-left-color: var(--ok); background: var(--bubble-ok);
   }
@@ -4098,7 +4105,7 @@ function timelineDay(timestamp) {
   return new Date(timestamp * 1000).toLocaleDateString("zh-CN");
 }
 
-function renderTimelineMessages(messages) {
+function renderTimelineMessages(messages, channel) {
   const fragment = document.createDocumentFragment();
   let lastDay = "";
   messages.forEach((m) => {
@@ -4112,6 +4119,7 @@ function renderTimelineMessages(messages) {
     }
     const item = document.createElement("div");
     item.className = `timeline-msg${m.is_bot ? " bot" : ""}`;
+    item.dataset.channel = channel || "";
     item.dataset.messageId = m.message_id || "";
     const head = document.createElement("div");
     head.className = "timeline-msg-head";
@@ -4226,10 +4234,10 @@ async function loadTimeline({ append = false, anchor = null, scroll = "bottom" }
     const box = $("timeline-messages");
     if (append) {
       const previousHeight = box.scrollHeight;
-      box.prepend(renderTimelineMessages(messages));
+      box.prepend(renderTimelineMessages(messages, channelOfId(timelineTarget.chat_id)));
       box.scrollTop += box.scrollHeight - previousHeight;
     } else {
-      box.replaceChildren(renderTimelineMessages(messages));
+      box.replaceChildren(renderTimelineMessages(messages, channelOfId(timelineTarget.chat_id)));
       if (!messages.length) {
         box.innerHTML = '<div class="mem-empty">这个会话还没有消息</div>';
       }
