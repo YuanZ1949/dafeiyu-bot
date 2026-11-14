@@ -137,7 +137,9 @@
   .btn.danger { background: var(--danger-deep); border-color: var(--danger-deep); }
   .btn:disabled { opacity: .7; cursor: not-allowed; }
 .btn[data-busy="1"] { opacity: .55; pointer-events: none; cursor: progress; }
-  main { margin: 0 auto; padding: 16px 20px 40px; display: grid; gap: var(--card-gap); max-width: 1400px; }
+  /* minmax(0, 1fr) 而不是默认的 auto 轨道：窄屏时 auto 轨道会按内容的
+     min-content 撑宽（决策流里 nowrap 的摘要就能撑到 1000px），整页横向溢出。 */
+  main { margin: 0 auto; padding: 16px 20px 40px; display: grid; gap: var(--card-gap); max-width: 1400px; grid-template-columns: minmax(0, 1fr); }
   @media (min-width: 1280px) {
     main { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
     .span-full { grid-column: 1 / -1; }
@@ -154,6 +156,7 @@
      scroll-margin-top 让「跳转分区」不会把标题藏在 sticky 顶栏 + 导航下面。 */
   .pane {
     display: grid; gap: var(--card-gap); grid-column: 1 / -1;
+    grid-template-columns: minmax(0, 1fr);
     scroll-margin-top: calc(var(--header-h, 0px) + 52px);
   }
   @media (min-width: 1280px) {
@@ -422,7 +425,7 @@
   .decision-stats { justify-content: flex-start; gap: 6px; margin-bottom: 8px; }
   .decision-stats .pill { color: var(--muted); }
   .decision-stats .pill b { color: var(--text); font-weight: 600; }
-  .decision-list { display: grid; gap: 6px; max-height: var(--list-h-decisions); overflow: auto; }
+  .decision-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; max-height: var(--list-h-decisions); overflow: auto; }
   .decision-item { border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); }
   .decision-item:hover, .decision-item.open { border-color: var(--accent); }
   .decision-head {
