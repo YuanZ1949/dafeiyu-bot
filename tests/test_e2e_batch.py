@@ -68,7 +68,7 @@ def yesterday() -> str:
     return (date.fromisoformat(today_shanghai()) - timedelta(days=1)).isoformat()
 
 
-def make_settings() -> Settings:
+def make_settings(*, hold_max_seconds: int = 300) -> Settings:
     return Settings(
         api_key="sk-test",
         base_url="https://api.deepseek.com",
@@ -78,7 +78,9 @@ def make_settings() -> Settings:
         ws_port=8080,
         ws_token="",
         db_path=":memory:",
-        persona=PersonaConfig("溟月", ("大肥鱼",), 120, 300, 0.05),
+        persona=PersonaConfig(
+            "溟月", ("大肥鱼",), 120, 300, 0.05, hold_max_seconds=hold_max_seconds
+        ),
         triggers=TriggerConfig(
             60,
             0.0,
@@ -128,6 +130,7 @@ def make_msg(
     chat_id: str = CHAT,
     user_id: str = "qq:2002",
     at_bot: bool = False,
+    ts: int = 0,
 ) -> Message:
     return Message(
         chat_type=chat_type,
@@ -140,14 +143,14 @@ def make_msg(
         is_bot=False,
         at_bot=at_bot,
         reply_to_bot=False,
-        timestamp=0,
+        timestamp=ts,
     )
 
 
-def build(tmp_path, *, server: FakeServer | None = None, clock=NOON):
+def build(tmp_path, *, server: FakeServer | None = None, clock=NOON, hold_max_seconds: int = 300):
     store = Store(str(tmp_path / "t.db"))
     store.init_schema()
-    settings = make_settings()
+    settings = make_settings(hold_max_seconds=hold_max_seconds)
     adapter = FakeAdapter()
     server = server or FakeServer()
     brain = make_brain(store, server)
@@ -291,4 +294,165 @@ async def test_e2e_quiet_hours_never_calls_model(tmp_path):
     assert service.scheduler.tick() == []
     assert server.calls == []
     assert adapter.sent == []
+    await brain.aclose()
+
+
+# ---------------------------------------------------------------------------
+# 攒着寿命与面板干预：store → service → control 真串（不 mock 层间调用）
+# ---------------------------------------------------------------------------
+
+HOT_LINE = "今天这缸水草长得真好看"
+
+
+def build_control(service, store, adapter, tmp_path):
+    """真 Service + 真 Store 上的控制面：HTTP 请求会真的走 service 方法。"""
+    from dafeiyu.control import BrainControl, create_app
+
+    control = BrainControl(
+        service.settings,
+        store,
+        service,
+        adapter,
+        runtime_path=str(tmp_path / "runtime.json"),
+    )
+    return control, create_app(control, "", None)
+
+
+async def send_chatter(service, *, count: int, ts: int, prefix: str) -> list[str]:
+    """投一串纯闲聊（热聊信号：60 秒内 ≥5 条、无问句、不点名）。"""
+    ids: list[str] = []
+    for i in range(count):
+        mid = f"{prefix}{i}"
+        await service.handle(make_msg(f"{HOT_LINE}{i}", message_id=mid, ts=ts))
+        ids.append(mid)
+    return ids
+
+
+async def flush_due(service) -> None:
+    for key in service.scheduler.tick():
+        await service.scheduler._flush(*key)
+
+
+def checkpoints(store) -> list[str]:
+    return [row["checkpoint"] for row in store.list_decisions(limit=20, chat_id=CHAT)]
+
+
+async def test_e2e_hold_expires_and_leaves_the_holds_panel(tmp_path):
+    """攒着 → 改最早时间戳 → 超龄放行 → 面板不再列出（三段缺一不可）。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path)
+    control, app = build_control(service, store, adapter, tmp_path)
+    now = int(now_shanghai().timestamp())
+
+    # 1) 真实 handle → 调度器 → _run_batch：纯热聊被攒着，模型一次没调。
+    await send_chatter(service, count=6, ts=now, prefix="h")
+    await flush_due(service)
+    assert server.prompts == []
+    assert "opportunity_hold" in checkpoints(store)
+    assert control.holds_snapshot()["total"] == 1
+
+    # 2) 把最早那条改成 400 秒前（不 sleep），再投一条触发重判。
+    store._conn.execute(
+        "UPDATE messages SET timestamp = ? WHERE chat_type = ? AND chat_id = ? AND message_id = ?",
+        (now - 400, ChatType.GROUP.value, CHAT, "h0"),
+    )
+    store._conn.commit()
+    await send_chatter(service, count=1, ts=now, prefix="h6x")
+    await flush_due(service)
+
+    assert len(server.prompts) == 1
+    assert "opportunity_hold_expired" in checkpoints(store)
+    # 放行不是丢弃：这批消息没有 skipped_reason，且已经真的投出去。
+    assert store.skip_reason(ChatType.GROUP, CHAT, "h0") is None
+    assert adapter.sent
+
+    # 3) 全链路串起来：面板接口不再列出该会话。
+    from aiohttp.test_utils import TestClient, TestServer
+
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        data = await (await client.get("/api/holds")).json()
+    finally:
+        await client.close()
+    assert data["total"] == 0
+    assert data["items"] == []
+    await brain.aclose()
+
+
+async def test_e2e_zero_lifetime_keeps_holding(tmp_path):
+    """`hold_max_seconds=0` 必须真的关闭过期：仍然攒着、面板仍然列出。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path, hold_max_seconds=0)
+    control, _ = build_control(service, store, adapter, tmp_path)
+    now = int(now_shanghai().timestamp())
+
+    await send_chatter(service, count=6, ts=now, prefix="h")
+    store._conn.execute(
+        "UPDATE messages SET timestamp = ? WHERE chat_type = ? AND chat_id = ? AND message_id = ?",
+        (now - 5000, ChatType.GROUP.value, CHAT, "h0"),
+    )
+    store._conn.commit()
+    await send_chatter(service, count=1, ts=now, prefix="h6y")
+    await flush_due(service)
+
+    assert server.prompts == []
+    assert "opportunity_hold_expired" not in checkpoints(store)
+    assert control.holds_snapshot()["total"] == 1
+    await brain.aclose()
+
+
+async def test_e2e_release_speaks_and_discard_keeps_history(tmp_path):
+    """面板动作走真 HTTP：release 立刻开口，discard 只标记未投递那批。"""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path)
+    _, app = build_control(service, store, adapter, tmp_path)
+    now = int(now_shanghai().timestamp())
+    await send_chatter(service, count=6, ts=now, prefix="h")
+    await flush_due(service)
+    assert server.prompts == []
+    before = store.count_messages(ChatType.GROUP, CHAT)
+
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        released = await client.post(f"/api/sessions/group/{CHAT}/release")
+        release_body = await released.json()
+        assert released.status == 200
+        assert release_body["action"] == "release"
+    finally:
+        await client.close()
+
+    # release 真调了一次模型并投出去。
+    assert len(server.prompts) == 1
+    assert adapter.sent
+    assert store.pending_batch(ChatType.GROUP, CHAT, "h5") == []
+
+    # 再攒一批，用 discard 丢弃：只写 delivered_messages，不删历史行。
+    await send_chatter(service, count=6, ts=int(now_shanghai().timestamp()), prefix="d")
+    await flush_due(service)
+    held = pending_ids(service)
+    assert held, "预期又攒着一批"
+    before_discard = store.count_messages(ChatType.GROUP, CHAT)
+
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        discarded = await client.post(f"/api/sessions/group/{CHAT}/discard")
+        discard_body = await discarded.json()
+        assert discarded.status == 200
+        assert discard_body["count"] == len(held)
+    finally:
+        await client.close()
+
+    assert all(
+        store.skip_reason(ChatType.GROUP, CHAT, mid) == "hold_discard" for mid in held
+    )
+    assert store.count_messages(ChatType.GROUP, CHAT) == before_discard
+    assert before_discard >= before
     await brain.aclose()
