@@ -463,6 +463,14 @@ async def test_images_materialize_relay_disabled_returns_empty(
 QQ_CHAT = "qq:1001"
 WXG_CHAT = "wxg:group"
 
+# 他人转发消息的线上形态（wire）：三行圆角气泡，期望串硬编码。
+WIRE_TEXT = "╭────────────╮\n│ 阿鱼：你好 │\n╰────────────╯"
+WIRE_IMAGE = "╭──────────────╮\n│ 阿鱼：[图片] │\n╰──────────────╯"
+WIRE_VIDEO = "╭──────────────╮\n│ 阿鱼：[视频] │\n╰──────────────╯"
+WIRE_STICKER = "╭──────────────╮\n│ 阿鱼：[表情] │\n╰──────────────╯"
+WIRE_VOICE = "╭──────────────╮\n│ 阿鱼：[语音] │\n╰──────────────╯"
+WIRE_FILE = "╭──────────────────────╮\n│ 阿鱼：[文件] doc.pdf │\n╰──────────────────────╯"
+
 
 def make_router_settings(tmp_path: Path) -> Settings:
     """MirrorRouter 实际读取的真实 Settings（含 persona/mirror/workspace）。"""
@@ -578,7 +586,7 @@ async def test_outbound_text_still_uses_inner_send(tmp_path: Path) -> None:
 
     await router._deliver(make_item(source_channel="wechat", text_lines=("你好",)))
 
-    assert qq.sent == [(ChatType.GROUP, QQ_CHAT, "阿鱼：你好")]
+    assert qq.sent == [(ChatType.GROUP, QQ_CHAT, WIRE_TEXT)]
     assert qq.segments == []
     assert router.stats()["sent"] == 1
 
@@ -599,7 +607,7 @@ async def test_outbound_pure_media_sends_placeholder_then_media(
     )
 
     assert events[:2] == ["send", "send_media"]
-    assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[图片]"]
+    assert [text for _ct, _cid, text in wechat.sent] == [WIRE_IMAGE]
     assert len(wechat.media) == 1
     assert wechat.media[0][2:] == (
         "image",
@@ -623,7 +631,7 @@ async def test_outbound_placeholder_human_has_nickname_and_bot_not(
         make_item(source_channel="qq", attachments=(attachment,), is_bot=True)
     )
 
-    assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[图片]", "[图片]"]
+    assert [text for _ct, _cid, text in wechat.sent] == [WIRE_IMAGE, "[图片]"]
 
 
 async def test_video_wechat_degrades_to_file(tmp_path: Path) -> None:
@@ -641,7 +649,7 @@ async def test_video_wechat_degrades_to_file(tmp_path: Path) -> None:
         )
     )
 
-    assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[视频]"]
+    assert [text for _ct, _cid, text in wechat.sent] == [WIRE_VIDEO]
     _ct, _cid, kind, sent_path, name = wechat.media[0]
     assert kind == "file"
     assert sent_path == str(path.resolve())
@@ -693,7 +701,7 @@ async def test_wechat_to_qq_image_builds_image_segment(tmp_path: Path) -> None:
     image_segments = [seg for seg in segments if seg.get("type") == "image"]
     assert image_segments == [{"type": "image", "data": {"file": str(path.resolve())}}]
     text_segments = [seg for seg in segments if seg.get("type") == "text"]
-    assert text_segments == [{"type": "text", "data": {"text": "阿鱼：[图片]"}}]
+    assert text_segments == [{"type": "text", "data": {"text": WIRE_IMAGE}}]
     assert mirror_rows(store, QQ_CHAT) == ["阿鱼：[图片]"]
 
 
@@ -711,7 +719,7 @@ async def test_unsupported_media_sends_single_placeholder(tmp_path: Path) -> Non
         )
     )
 
-    assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[图片]"]
+    assert [text for _ct, _cid, text in wechat.sent] == [WIRE_IMAGE]
     assert len(wechat.media) == 1
     assert router.stats()["sent"] == 1
 
@@ -759,7 +767,7 @@ async def test_sticker_fallback_sends_sticker_then_image(tmp_path: Path) -> None
     )
 
     assert kinds == ["sticker", "image"]
-    assert [text for _ct, _cid, text in wechat.sent] == ["阿鱼：[表情]"]
+    assert [text for _ct, _cid, text in wechat.sent] == [WIRE_STICKER]
     assert router.stats()["sent"] == 1
 
 
@@ -798,7 +806,7 @@ async def test_wechat_to_qq_voice_builds_record_segment(tmp_path: Path) -> None:
         {"type": "record", "data": {"file": str(path.resolve())}}
     ]
     assert [seg for seg in segments if seg.get("type") == "text"] == [
-        {"type": "text", "data": {"text": "阿鱼：[语音]"}}
+        {"type": "text", "data": {"text": WIRE_VOICE}}
     ]
     assert mirror_rows(store, QQ_CHAT) == ["阿鱼：[语音]"]
 
@@ -824,7 +832,8 @@ async def test_wechat_to_qq_video_builds_video_segment(tmp_path: Path) -> None:
         {"type": "video", "data": {"file": str(path.resolve())}}
     ]
     texts = [seg["data"]["text"] for seg in segments if seg.get("type") == "text"]
-    assert "阿鱼：[视频]" in texts
+    # 线上是完整气泡：占位文本必须仍可读地出现在框内。
+    assert any("阿鱼：[视频]" in text for text in texts)
 
 
 async def test_wechat_to_qq_file_uses_upload_file(tmp_path: Path) -> None:
@@ -844,7 +853,7 @@ async def test_wechat_to_qq_file_uses_upload_file(tmp_path: Path) -> None:
     )
 
     assert qq.files == [(ChatType.GROUP, QQ_CHAT, str(path.resolve()), "doc.pdf")]
-    assert [text for _ct, _cid, text in qq.sent] == ["阿鱼：[文件] doc.pdf"]
+    assert [text for _ct, _cid, text in qq.sent] == [WIRE_FILE]
     assert qq.segments == []
     assert mirror_rows(store, QQ_CHAT) == ["阿鱼：[文件] doc.pdf"]
 

@@ -14,7 +14,7 @@ import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Mapping, NamedTuple, Protocol, Sequence
 
 from . import images, media
 from .config import Settings
@@ -22,6 +22,7 @@ from .memory.store import Store
 from .models import Attachment, ChatType, Message, Segment
 from .reply_media import build_onebot_segments
 from .sender import MAX_CHUNK, _split
+from .textwidth import display_width, pad_to_width, wrap_by_width
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,9 @@ REPLY_HINT_MAX = 40
 FORWARD_MAX_NODES = 10
 #: 合并转发单条节点的正文截断（与网关的 _FORWARD_NODE_CLIP 对齐）。
 FORWARD_NODE_CLIP = 60
+#: 线上单条（含气泡框开销）的保守长度上限：远低于 QQ/微信的单条上限，
+#: 正常套框后到不了这里，只作为极端组合的兜底。
+WIRE_MAX_CHARS = 4500
 #: 重试退避秒数（总尝试次数 = 1 + 3）。
 RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 #: 最近失败环形缓冲长度：面板只展示最近这些条，够定位问题又不涨内存。
@@ -78,6 +82,17 @@ _PLACEHOLDERS = {
     "video": "[视频]",
     "sticker": "[表情]",
 }
+
+
+class RenderedLines(NamedTuple):
+    """同一份镜像内容的两套形态：``wire`` 线上（气泡），``store`` 入库（单行）。
+
+    两个列表按分块一一对应：第 i 块的线上形态是 ``wire[i]``、
+    入库形态是 ``store[i]``，长度恒相等。
+    """
+
+    wire: list[str]
+    store: list[str]
 
 
 class _Stop:
@@ -785,11 +800,11 @@ class MirrorRouter:
 
         # 物化只发生在 worker：observe_inbound 仍是同步快照。
         attachments = await self._materialized_attachments(item)
-        lines = self._render(item)
+        rendered = self._render(item)
         if target_channel == "qq":
-            await self._deliver_qq(item, adapter, lines, attachments)
+            await self._deliver_qq(item, adapter, rendered, attachments)
         else:
-            await self._deliver_wechat(item, adapter, lines, attachments)
+            await self._deliver_wechat(item, adapter, rendered, attachments)
 
     # ------------------------------------------------------------ 物化
     async def _materialized_attachments(self, item: MirrorItem) -> list[Attachment]:
@@ -903,7 +918,7 @@ class MirrorRouter:
         self,
         item: MirrorItem,
         adapter: Any,
-        lines: list[str],
+        rendered: RenderedLines,
         attachments: Sequence[Attachment],
     ) -> None:
         segment_attachments: list[Attachment] = []
@@ -924,7 +939,7 @@ class MirrorRouter:
         if segment_attachments and callable(
             getattr(adapter, "send_segments", None)
         ):
-            explanation = "".join(lines)
+            explanation = "".join(rendered.wire)
             segments = build_onebot_segments(
                 explanation, attachments=segment_attachments
             )
@@ -943,10 +958,13 @@ class MirrorRouter:
             message_id = result if isinstance(result, str) else None
             self._register_fingerprints(item.target_chat_id, explanation, ())
             try:
-                self._store_line(item, adapter, explanation, message_id, 0)
+                # 入库永远是单行 store 形态，与今天逐字节一致。
+                self._store_line(
+                    item, adapter, "".join(rendered.store), message_id, 0
+                )
             except Exception:  # noqa: BLE001 - 落库失败不阻断文件上传
                 log.exception("镜像消息落库失败：%s", item.target_chat_id)
-        elif not await self._send_lines(item, adapter, lines):
+        elif not await self._send_lines(item, adapter, rendered):
             return
 
         for attachment in files:
@@ -967,12 +985,12 @@ class MirrorRouter:
         self,
         item: MirrorItem,
         adapter: Any,
-        lines: list[str],
+        rendered: RenderedLines,
         attachments: Sequence[Attachment],
     ) -> None:
-        if not lines:
+        if not rendered.wire:
             return
-        if not await self._send_lines(item, adapter, lines):
+        if not await self._send_lines(item, adapter, rendered):
             return
 
         for attachment in attachments:
@@ -1006,22 +1024,24 @@ class MirrorRouter:
             )
 
     async def _send_lines(
-        self, item: MirrorItem, adapter: Any, lines: Sequence[str]
+        self, item: MirrorItem, adapter: Any, rendered: RenderedLines
     ) -> bool:
-        """逐片发送说明行；全部成功才返回 True（失败计入 dropped 并跳过媒体）。"""
+        """逐片发送线上形态、入库单行形态；全部成功才返回 True。"""
         all_ok = True
-        for index, text in enumerate(lines):
+        for index, (wire_text, store_text) in enumerate(
+            zip(rendered.wire, rendered.store)
+        ):
             ok, message_id = await self._send_text(
-                adapter, item.target_chat_id, text
+                adapter, item.target_chat_id, wire_text
             )
             if not ok:
                 self._counters["dropped"] += 1
                 all_ok = False
                 continue
             self._counters["sent"] += 1
-            self._register_fingerprints(item.target_chat_id, text, ())
+            self._register_fingerprints(item.target_chat_id, wire_text, ())
             try:
-                self._store_line(item, adapter, text, message_id, index)
+                self._store_line(item, adapter, store_text, message_id, index)
             except Exception:  # noqa: BLE001 - 落库失败不阻断后续分片
                 log.exception("镜像消息落库失败：%s", item.target_chat_id)
         return all_ok
@@ -1138,7 +1158,13 @@ class MirrorRouter:
         return ""
 
     # ------------------------------------------------------------ 渲染
-    def _render(self, item: MirrorItem) -> list[str]:
+    def _render(self, item: MirrorItem) -> RenderedLines:
+        """把一个镜像条目一次性算出两套形态：线上气泡与入库单行。
+
+        ``store`` 与历史版本逐字节一致（``昵称：正文``，bot 无前缀）；
+        ``wire`` 只在「别人转来的 + bubble_enabled」时把每一分块套进
+        一个完整的三行圆角气泡，绝不在气泡中间分块。
+        """
         placeholders = self._placeholders(item)
         text = self._plain_text(item)
         if not text:
@@ -1151,10 +1177,54 @@ class MirrorRouter:
         if item.reply_hint:
             body = f"{item.reply_hint} {body}" if body else item.reply_hint
         if not body.strip():
-            return []
+            return RenderedLines([], [])
         prefix = "" if item.is_bot else f"{self._display_nickname(item)}："
         full = f"{prefix}{body}" if prefix else body
-        return _split(full, MAX_CHUNK) if full.strip() else []
+        if not full.strip():
+            return RenderedLines([], [])
+        # 先按 MAX_CHUNK 切正文，再给每一块套一个完整气泡：
+        # 一条线上消息 = 一个完整气泡，不会切出半个框。
+        chunks = _split(full, MAX_CHUNK)
+        if item.is_bot or not self.settings.mirror.bubble_enabled:
+            return RenderedLines(list(chunks), list(chunks))
+        wire = []
+        for chunk in chunks:
+            boxed = self._bubble(chunk)
+            if len(boxed) > WIRE_MAX_CHARS:
+                # 极端组合的兜底：宁可退回无框单行，也不发出会丢字的半截气泡。
+                log.warning(
+                    "镜像气泡超保守上限，退回单行：%d 字符", len(boxed)
+                )
+                wire.append(chunk)
+            else:
+                wire.append(boxed)
+        return RenderedLines(wire, list(chunks))
+
+    def _bubble(self, chunk: str) -> str:
+        """把一块正文（含昵称前缀）套进三行圆角气泡。
+
+        正文先按 ``bubble_max_content_width`` 显示列换行，再按各行
+        最大显示宽度对齐框宽；框宽与对齐全部用 ``display_width``。
+        """
+        corners = self.settings.mirror.bubble_corner_chars
+        limit = self.settings.mirror.bubble_max_content_width
+        top_left, top_right, bottom_left, bottom_right = (
+            corners[0],
+            corners[1],
+            corners[2],
+            corners[3],
+        )
+        inner: list[str] = []
+        for raw_line in chunk.split("\n"):
+            inner.extend(wrap_by_width(raw_line, limit))
+        content_width = max(display_width(line) for line in inner)
+        bar = "─" * (content_width + 2)
+        out = [f"{top_left}{bar}{top_right}"]
+        out.extend(
+            f"│ {pad_to_width(line, content_width)} │" for line in inner
+        )
+        out.append(f"{bottom_left}{bar}{bottom_right}")
+        return "\n".join(out)
 
     def _display_nickname(self, item: MirrorItem) -> str:
         """面板按平台给特定用户配的昵称优先，其次消息自带昵称。"""

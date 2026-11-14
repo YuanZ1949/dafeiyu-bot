@@ -257,7 +257,8 @@ async def test_proxy_segments_text_and_image_preserve_text(tmp_path: Path) -> No
     item = router._queues[WXG].get_nowait()
     assert isinstance(item, MirrorItem)
     # T3 的 QQ 渲染：有附件时正文只认 text 段，必须显式回传才不丢字。
-    assert router._render(item) == ["看这个 [图片]"]
+    # bot 自己转发的条目不加框，wire 与 store 相同。
+    assert router._render(item).wire == ["看这个 [图片]"]
     assert item.text_lines == ("看这个",)
 
 

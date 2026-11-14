@@ -27,12 +27,26 @@ from dafeiyu.config import (
 )
 from dafeiyu.gateway.base import GatewayError
 from dafeiyu.memory.store import Store
-from dafeiyu.mirror import MirrorItem, MirrorRouter
+from dafeiyu.mirror import MirrorItem, MirrorRouter, RenderedLines
 from dafeiyu.models import Attachment, ChatType, Message, Segment
 from dafeiyu.service import Service
+from dafeiyu.textwidth import display_width
 
 QQ = "qq:1001"
 WXG = "wxg:group"
+
+# 他人转发消息的线上形态（wire）：三行圆角气泡。
+# 期望串全部硬编码，不靠被测实现生成；宽度按 display_width 手算对齐。
+WIRE_SHUNLU = "╭────────────╮\n│ 阿鱼：顺路 │\n╰────────────╯"
+WIRE_YI = "╭──────────╮\n│ 阿鱼：一 │\n╰──────────╯"
+WIRE_SAN = "╭──────────╮\n│ 阿鱼：三 │\n╰──────────╯"
+WIRE_YIDUI = "╭────────────╮\n│ 阿鱼：一对 │\n╰────────────╯"
+WIRE_ERDUI = "╭────────────╮\n│ 阿鱼：二对 │\n╰────────────╯"
+WIRE_XINNIANCHENG = "╭──────────────╮\n│ 新昵称：换群 │\n╰──────────────╯"
+WIRE_XINDUI = "╭────────────╮\n│ 阿鱼：新对 │\n╰────────────╯"
+WIRE_DIER = "╭────────────╮\n│ 阿鱼：第二 │\n╰────────────╯"
+WIRE_VIDEO = "╭──────────────╮\n│ 阿鱼：[视频] │\n╰──────────────╯"
+WIRE_IMAGE = "╭──────────────╮\n│ 阿鱼：[图片] │\n╰──────────────╯"
 
 
 class Recorder:
@@ -130,10 +144,19 @@ def make_msg(
 
 
 def render(router: MirrorRouter, message: Message) -> list[str]:
+    """入库形态（store）：与气泡上线前的历史行为逐字节一致。"""
     direction = router._direction(message.chat_id)
     assert direction is not None
     source_channel, target = direction
-    return router._render(router._snapshot(message, target, source_channel))
+    return router._render(router._snapshot(message, target, source_channel)).store
+
+
+def render_wire(router: MirrorRouter, message: Message) -> list[str]:
+    """线上形态（wire）：别人转来的消息是三行圆角气泡。"""
+    direction = router._direction(message.chat_id)
+    assert direction is not None
+    source_channel, target = direction
+    return router._render(router._snapshot(message, target, source_channel)).wire
 
 
 async def wait_until(predicate: Any, timeout: float = 3.0) -> None:
@@ -441,6 +464,104 @@ def test_render_long_text_uses_sender_split(tmp_path: Path) -> None:
     assert "".join(chunks).replace("阿鱼：", "") == "字" * 1200
 
 
+# ---------------------------------------------------------------- 消息泡
+def test_wire_bubble_shape_for_human(tmp_path: Path) -> None:
+    """别人转来的消息线上是三行圆角气泡；入库仍是单行（store 零变化）。"""
+    router, _store, _adapters = make_router(tmp_path)
+    wire = render_wire(router, make_msg(QQ, "你好"))
+    lines = wire[0].splitlines()
+    assert lines[0].startswith("╭") and lines[0].endswith("╮")
+    assert lines[-1].startswith("╰") and lines[-1].endswith("╯")
+    for line in lines[1:-1]:
+        assert line.startswith("│") and line.endswith("│")
+    assert wire == ["╭────────────╮\n│ 阿鱼：你好 │\n╰────────────╯"]
+    # 入库基线（改动前硬编码）：单行「昵称：正文」。
+    assert render(router, make_msg(QQ, "你好")) == ["阿鱼：你好"]
+
+
+def test_wire_bubble_rows_align_with_mixed_scripts(tmp_path: Path) -> None:
+    """中英混排时框内每行显示宽度仍相等（用显示宽度而非 len() 对齐）。"""
+    router, _store, _adapters = make_router(tmp_path)
+    content = "甲" * 15 + "abcdefghij" + "乙" * 15
+    wire = render_wire(router, make_msg(QQ, content))
+    for entry in wire:
+        widths = {display_width(line) for line in entry.splitlines()}
+        assert len(widths) == 1
+    # 入库形态不受气泡影响：与改动前逐字节一致。
+    assert render(router, make_msg(QQ, content)) == ["阿鱼：" + content]
+
+
+def test_store_matches_pre_bubble_baseline(tmp_path: Path) -> None:
+    """入库形态与改动前基线逐字节相同（期望值硬编码，不用新实现生成）。"""
+    router, _store, _adapters = make_router(tmp_path)
+    assert render(router, make_msg(QQ, "你好")) == ["阿鱼：你好"]
+    assert render(router, make_msg(QQ, "你好", is_bot=True)) == ["你好"]
+    assert render(router, make_msg(QQ, "[图片] 同意")) == ["阿鱼：[图片] 同意"]
+
+
+def test_wire_bot_item_has_no_box_characters(tmp_path: Path) -> None:
+    """机器人自己转发的条目不加框：wire 与 store 相同、不含任何框字符。"""
+    router, _store, _adapters = make_router(tmp_path)
+    message = make_msg(QQ, "你好", is_bot=True)
+    rendered = router._render(router._snapshot(message, WXG, "qq"))
+    assert rendered.wire == rendered.store == ["你好"]
+    assert not any(ch in "╭╮╰╯│─" for text in rendered.wire for ch in text)
+
+
+def test_wire_bubble_never_names_the_platform(tmp_path: Path) -> None:
+    """气泡里不得出现平台名（「QQ」「微信」），平台由谁转的一目了然即可。"""
+    router, _store, _adapters = make_router(tmp_path)
+    wire = render_wire(router, make_msg(QQ, "那边讨论很热闹，搬过来一起看"))
+    joined = "\n".join(wire)
+    assert "QQ" not in joined
+    assert "微信" not in joined
+
+
+def test_bubble_disabled_makes_wire_equal_store(tmp_path: Path) -> None:
+    """bubble_enabled=false 时完全退化为今天的形态。"""
+    settings = dataclasses.replace(
+        make_settings(),
+        mirror=MirrorConfig(
+            enabled=True,
+            pairs=(MirrorPairConfig(qq=QQ, wechat=WXG),),
+            bubble_enabled=False,
+        ),
+    )
+    store = Store(tmp_path / "mirror.db")
+    store.init_schema()
+    router = MirrorRouter(
+        settings,
+        store,
+        {"qq": Recorder("qq:999"), "wechat": Recorder("wxg:self")},
+    )
+    rendered = router._render(router._snapshot(make_msg(QQ, "你好"), WXG, "qq"))
+    assert rendered.wire == rendered.store == ["阿鱼：你好"]
+
+
+def test_long_text_becomes_full_bubbles(tmp_path: Path) -> None:
+    """先按 MAX_CHUNK 切正文，再给每块套一个完整气泡：不会切出半个框。"""
+    router, _store, _adapters = make_router(tmp_path)
+    full = "阿鱼：" + "字" * 800
+    message = make_msg(QQ, "字" * 800)
+    rendered = router._render(router._snapshot(message, WXG, "qq"))
+    chunks = mirror_module._split(full, mirror_module.MAX_CHUNK)
+    assert len(chunks) == 2
+    # 线上气泡条数 == 正文按 MAX_CHUNK(500) 切出的块数。
+    assert len(rendered.wire) == len(rendered.store) == len(chunks)
+    for entry in rendered.wire:
+        assert len(entry) <= 4500
+        lines = entry.splitlines()
+        assert lines[0].startswith("╭") and lines[0].endswith("╮")
+        assert lines[-1].startswith("╰") and lines[-1].endswith("╯")
+        assert all(
+            line.startswith("│") and line.endswith("│")
+            for line in lines[1:-1]
+        )
+    # 入库仍是单行分块，不含框字符，拼接结果与改动前一致。
+    assert "".join(rendered.store) == full
+    assert not any(ch in "╭╮╰╯│─" for text in rendered.store for ch in text)
+
+
 # ---------------------------------------------------------------- 队列
 async def test_two_directions_do_not_block_each_other(tmp_path: Path) -> None:
     slow = Recorder("qq:999", delay=0.3)
@@ -509,9 +630,11 @@ async def test_same_direction_pairs_do_not_block_each_other(tmp_path: Path) -> N
     try:
         router.observe_inbound(make_msg("qq:1001", "卡住", message_id="a1"))
         router.observe_inbound(make_msg("qq:2002", "顺路", message_id="b1"))
-        await wait_until(lambda: ("wxg:b", "阿鱼：顺路") in wechat.sent)
+        await wait_until(
+            lambda: ("wxg:b", WIRE_SHUNLU) in wechat.sent
+        )
         # 卡住的那一对还没发出去，另一对已经送达。
-        assert wechat.sent == [("wxg:b", "阿鱼：顺路")]
+        assert wechat.sent == [("wxg:b", WIRE_SHUNLU)]
     finally:
         gate.set()
         await router.stop()
@@ -535,8 +658,8 @@ async def test_queue_full_on_one_pair_does_not_drop_other_pair(
     finally:
         await router.stop()
     assert set(adapters["wechat"].sent) == {
-        ("wxg:a", "阿鱼：一"),
-        ("wxg:b", "阿鱼：三"),
+        ("wxg:a", WIRE_YI),
+        ("wxg:b", WIRE_SAN),
     }
 
 
@@ -566,8 +689,8 @@ async def test_multiple_pairs_route_to_their_own_target(tmp_path: Path) -> None:
         await wait_until(lambda: router.stats()["sent"] == 2)
         assert adapters["qq"].sent == []
         assert set(adapters["wechat"].sent) == {
-            ("wxg:group", "阿鱼：一对"),
-            ("wxg:other", "阿鱼：二对"),
+            ("wxg:group", WIRE_YIDUI),
+            ("wxg:other", WIRE_ERDUI),
         }
         assert router._direction("qq:1001") == ("qq", "wxg:group")
         assert router._direction("wxg:other") == ("wechat", "qq:2002")
@@ -599,7 +722,7 @@ async def test_set_config_swaps_routes_and_nicknames(tmp_path: Path) -> None:
             make_msg("qq:2001", "换群", user_id="qq:3003", message_id="m1")
         )
         await wait_until(lambda: adapters["wechat"].sent)
-        assert adapters["wechat"].sent == [("wxg:other", "新昵称：换群")]
+        assert adapters["wechat"].sent == [("wxg:other", WIRE_XINNIANCHENG)]
         # worker 与目标群一一对应：旧对收摊、新对起两个，总数仍是 2。
         assert set(router._tasks) == {"qq:2001", "wxg:other"}
     finally:
@@ -655,7 +778,7 @@ async def test_set_config_retires_only_removed_pair_workers(tmp_path: Path) -> N
         router.observe_inbound(make_msg("qq:2002", "新对", message_id="new"))
         await wait_until(lambda: adapters["wechat"].sent)
         await asyncio.sleep(0.05)
-        assert adapters["wechat"].sent == [("wxg:b", "阿鱼：新对")]
+        assert adapters["wechat"].sent == [("wxg:b", WIRE_XINDUI)]
     finally:
         await router.stop()
 
@@ -881,7 +1004,7 @@ async def test_qq_video_reaches_wechat_as_file(tmp_path: Path) -> None:
     finally:
         await router.stop()
 
-    assert wechat.sent[0][1] == "阿鱼：[视频]"
+    assert wechat.sent[0][1] == WIRE_VIDEO
     assert wechat.media[0][0] == "file"
     assert wechat.media[0][1].endswith("clip.mp4")
     assert wechat.media[0][2] == "clip.mp4"
@@ -920,7 +1043,7 @@ async def test_worker_exception_continues_with_next_item(
     original = router._render
     calls = {"count": 0}
 
-    def flaky(item: MirrorItem) -> list[str]:
+    def flaky(item: MirrorItem) -> RenderedLines:
         calls["count"] += 1
         if calls["count"] == 1:
             raise RuntimeError("boom")
@@ -934,7 +1057,7 @@ async def test_worker_exception_continues_with_next_item(
         await wait_until(lambda: len(adapters["wechat"].sent) == 1)
     finally:
         await router.stop()
-    assert adapters["wechat"].sent == [(WXG, "阿鱼：第二")]
+    assert adapters["wechat"].sent == [(WXG, WIRE_DIER)]
     assert "RuntimeError" in str(router.stats()["last_error"])
 
 
