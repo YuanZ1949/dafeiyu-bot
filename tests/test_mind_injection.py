@@ -132,6 +132,24 @@ def test_relation_block_only_for_group_speakers(store: Store) -> None:
     assert "最近说过 1 句" in text
 
 
+def test_relation_block_covers_more_than_three_speakers(store: Store) -> None:
+    for i in range(1, 6):
+        uid = f"qq:{10 + i}"
+        add_message(store, i, user_id=uid, nickname=f"人{i}")
+        store.upsert_impression(
+            GROUP, CHAT, uid, "preference", f"事实{i}", 0.9, subject_nickname=f"人{i}"
+        )
+
+    # 关掉【群友印象】段：那里也会渲染「人N：事实N」，留着会让断言被它误判通过。
+    # 这样「人4：事实4」只能由关系卡段产生，才真正锁住发言人上限。
+    text = render(store, inject_impressions=False)
+
+    # 旧上限 3 时只保留前三个发言人（人4/人5 被切掉）；提到 12 后五个全部入场。
+    assert INJECTION_RELATION_HEADER in text
+    for i in range(1, 6):
+        assert f"人{i}：事实{i}" in text
+
+
 def test_relation_block_skips_strangers(store: Store) -> None:
     add_message(store, 1, user_id="qq:7", nickname="路人")
 

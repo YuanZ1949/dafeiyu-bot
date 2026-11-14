@@ -58,8 +58,10 @@ INJECTION_STATE_HEADER = "【本鱼的近况】"
 # 跨群立场（P3）： 她说过的话不该随群改变。
 INJECTION_STANCE_HEADER = "【我的立场】"
 INJECTION_IMPRESSION_TOPK = 3
-# 关系卡只给当前批次里最靠前的几个发言人，别把整群通讯录塞进 prompt。
-INJECTION_RELATION_SPEAKERS = 3
+# 关系卡分两级限流：先按发言人取前 12 个（本常量），再按 store 的
+# RELATIONSHIP_CARD_LIMIT（同为 12）截断；仍受 relation_chars 字数预算约束，
+# 不会把整群通讯录塞进 prompt。
+INJECTION_RELATION_SPEAKERS = 12
 # 印象注入看最近多少条消息判断「谁在说话」；只在群聊生效。
 IMPRESSION_FOCUS_MESSAGES = 20
 
