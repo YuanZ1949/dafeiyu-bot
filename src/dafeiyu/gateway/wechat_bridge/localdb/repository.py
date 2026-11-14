@@ -28,12 +28,14 @@ import importlib
 import logging
 import re
 import sqlite3
+import threading
+import time
 import xml.etree.ElementTree as ET
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 from urllib.parse import quote, urlsplit
 
 #: 可选依赖：没装时压缩消息退化成空文本，不影响其余行。用 importlib 而非静态
@@ -129,6 +131,12 @@ _FINDER_MEDIA_COUNT_RE = re.compile(
 #: 只认 `message/message_<数字>.db`；`message_fts.db` / `message_resource.db` /
 #: `biz_message_0.db` / `*.kvdb` 因此天然被排除。
 _MESSAGE_REL_RE = re.compile(r"^message/message_(\d+)\.db$")
+
+#: 索引缓存 TTL（秒）。回执确认每 0.5s 轮询一次，1s 的窗口足以让同一波轮询
+#: 复用一次 Name2Id/联系人扫描，同时保证「刚改的联系人/群名」最多晚 1s 生效。
+INDEX_CACHE_TTL = 1.0
+
+_T = TypeVar("_T")
 
 #: 非自己发的群消息正文以 `"<发送者wxid>:\n"` 开头。wxid 里不会有冒号/换行。
 _SENDER_PREFIX_RE = re.compile(r"^([^:\r\n]{1,128}):\r?\n")
@@ -266,6 +274,12 @@ class LocalMessageStore:
         self._media_enabled = media_enabled
         self._media_max_bytes = int(media_max_bytes)
         self._media_storage_root = str(media_storage_root or "").strip()
+        #: 索引缓存：``Name2Id`` / 联系人显示名在短 TTL 内复用同一份扫描结果。
+        #: 值只读；调用方不得原地修改（``_display_indexes`` 返回的就是缓存对象）。
+        self._index_cache: dict[tuple[str, ...], tuple[float, Any]] = {}
+        self._index_lock = threading.Lock()
+        #: 缓存时钟：测试替换成假时钟，生产走单调时钟。
+        self._clock: Callable[[], float] = time.monotonic
 
     # ------------------------------------------------------------- 公共 API
     def group_names(self) -> list[str]:
@@ -369,8 +383,15 @@ class LocalMessageStore:
             and value not in _SYSTEM_USERNAMES
         )
 
-    def recent(self, ref: ChatRef, limit: int = 50) -> list[dict[str, Any]]:
-        """读 ``ref`` 最近的 ``limit`` 条消息，时间正序（旧 -> 新）。"""
+    def recent(
+        self, ref: ChatRef, limit: int = 50, *, since: float | None = None
+    ) -> list[dict[str, Any]]:
+        """读 ``ref`` 最近的 ``limit`` 条消息，时间正序（旧 -> 新）。
+
+        ``since`` 给定时**先按 ``create_time`` 过滤再取 N 条**：回执确认每
+        0.5s 轮询一次，旧实现先把 50 个窗口位让给早已过期的行，目标消息反而
+        可能被挤出窗口。过滤条件与 Python 侧的 ``ts >= since`` 语义一致。
+        """
         count = _positive_int(limit)
         if count is None:
             log.debug("recent 的 limit 非法（%r），返回空列表", limit)
@@ -394,15 +415,23 @@ class LocalMessageStore:
             if not _has_columns(con, table):
                 log.debug("%s 里的表 %s 缺失或 schema 不符，返回空列表", shard, table)
                 return []
-            senders = _name2id(con)
+            senders = self._cached_index(
+                ("name2id", shard), lambda: _name2id(con)
+            )
             contacts, strangers = self._display_indexes()
+            query = (
+                f"SELECT local_id, local_type, real_sender_id, create_time, "
+                f"message_content, WCDB_CT_message_content "
+                f'FROM "{_quote_ident(table)}" '
+            )
+            params: list[Any] = [count]
+            if since is not None:
+                query += "WHERE create_time >= ? ORDER BY local_id DESC LIMIT ?"
+                params = [float(since), count]
+            else:
+                query += "ORDER BY local_id DESC LIMIT ?"
             try:
-                rows = con.execute(
-                    f"SELECT local_id, local_type, real_sender_id, create_time, "
-                    f"message_content, WCDB_CT_message_content "
-                    f'FROM "{_quote_ident(table)}" ORDER BY local_id DESC LIMIT ?',
-                    (count,),
-                ).fetchall()
+                rows = con.execute(query, params).fetchall()
             except sqlite3.Error as exc:
                 log.debug("读取 %s.%s 失败：%s", shard, table, exc)
                 return []
@@ -451,7 +480,7 @@ class LocalMessageStore:
             threshold = float(since)
         except (TypeError, ValueError):
             return None
-        for entry in reversed(self.recent(ref, limit)):
+        for entry in reversed(self.recent(ref, limit, since=threshold)):
             ts = entry.get("ts")
             if not isinstance(ts, int) or isinstance(ts, bool) or ts < threshold:
                 continue
@@ -617,9 +646,29 @@ class LocalMessageStore:
         return self._read_display_rows("contact")
 
     def _display_indexes(self) -> tuple[dict[str, str], dict[str, str]]:
-        contacts = dict(self._read_display_rows("contact"))
-        strangers = dict(self._read_display_rows("stranger"))
-        return contacts, strangers
+        """联系人/陌生人显示名索引（``username -> 显示名``），短 TTL 缓存。
+
+        返回的是缓存对象本身：调用方只读，不得原地修改。
+        """
+
+        def build() -> tuple[dict[str, str], dict[str, str]]:
+            contacts = dict(self._read_display_rows("contact"))
+            strangers = dict(self._read_display_rows("stranger"))
+            return contacts, strangers
+
+        return self._cached_index(("display",), build)
+
+    def _cached_index(self, key: tuple[str, ...], factory: Callable[[], _T]) -> _T:
+        """``key`` 的短 TTL 索引缓存；未命中才执行 ``factory``（可能重复计算）。"""
+        now = self._clock()
+        with self._index_lock:
+            hit = self._index_cache.get(key)
+        if hit is not None and now - hit[0] < INDEX_CACHE_TTL:
+            return cast(_T, hit[1])
+        value = factory()
+        with self._index_lock:
+            self._index_cache[key] = (self._clock(), value)
+        return value
 
     def _read_display_rows(self, table: str) -> list[tuple[str, str]]:
         if table not in ("contact", "stranger"):  # 表名只可能来自本模块常量

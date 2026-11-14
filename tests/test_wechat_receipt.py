@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from dafeiyu.gateway.wechat_bridge.localdb import repository as repository_module
 from dafeiyu.gateway.wechat_bridge.localdb.repository import (
     ChatRef,
     LocalMessageStore,
@@ -168,9 +169,8 @@ def test_find_self_message_rejects_blank_text_and_bad_since(tmp_path: Path) -> N
     _insert_messages(tmp_path / "mirror/message/message_0.db", [(2, 1002, "")])
 
     assert store.find_self_message(_ref(store), "", since=1000) is None
-    assert (
-        store.find_self_message(_ref(store), "x", since="not-a-number") is None  # type: ignore[arg-type]
-    )
+    bad_since: Any = "not-a-number"
+    assert store.find_self_message(_ref(store), "x", since=bad_since) is None
 
 
 def test_find_self_message_respects_limit(tmp_path: Path) -> None:
@@ -183,6 +183,79 @@ def test_find_self_message_respects_limit(tmp_path: Path) -> None:
 
     assert store.find_self_message(ref, "目标消息", since=1000, limit=10) is None
     assert store.find_self_message(ref, "目标消息", since=1000, limit=60) is not None
+
+
+def test_find_self_message_filters_by_time_before_limit(tmp_path: Path) -> None:
+    """过期行不能占用回读窗口：80 条旧消息 + 1 条目标，limit=10 仍要命中。"""
+    store = _store(tmp_path)
+    rows = [(3, 100 + index, f"旧消息 {index}") for index in range(80)]
+    rows.append((2, 1000, "目标消息"))
+    _insert_messages(tmp_path / "mirror/message/message_0.db", rows)
+    ref = _ref(store)
+
+    found = store.find_self_message(ref, "目标消息", since=900, limit=10)
+
+    assert found is not None
+    assert found["ts"] == 1000
+
+
+def test_index_cache_reused_across_repeated_lookups(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """0.5s 轮询下连续 3 次回读只扫 1 次 Name2Id、1 次联系人索引。"""
+    store = _store(tmp_path)
+    _insert_messages(
+        tmp_path / "mirror/message/message_0.db",
+        [(2, 1002, "机器人回复")],
+    )
+    ref = _ref(store)
+
+    scans = {"name2id": 0, "display": 0}
+    original_name2id = repository_module._name2id
+    original_read = LocalMessageStore._read_display_rows
+
+    def counting_name2id(con: sqlite3.Connection) -> dict[int, str]:
+        scans["name2id"] += 1
+        return original_name2id(con)
+
+    def counting_read(self: LocalMessageStore, table: str) -> list[tuple[str, str]]:
+        scans["display"] += 1
+        return original_read(self, table)
+
+    monkeypatch.setattr(repository_module, "_name2id", counting_name2id)
+    monkeypatch.setattr(LocalMessageStore, "_read_display_rows", counting_read)
+
+    for _ in range(3):
+        assert store.find_self_message(ref, "机器人回复", since=1000) is not None
+
+    assert scans == {"name2id": 1, "display": 2}
+
+
+def test_index_cache_expires_and_sees_contact_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """TTL 内复用旧索引，过期后能看到新加的联系人昵称（≤1s 的最终一致）。"""
+    store = _store(tmp_path)
+    _insert_messages(
+        tmp_path / "mirror/message/message_0.db",
+        [(3, 1002, "别人说的")],
+    )
+    ref = _ref(store)
+    now = [100.0]
+    monkeypatch.setattr(store, "_clock", lambda: now[0])
+
+    assert store.recent(ref, limit=5)[0]["nickname"] == ""
+    with sqlite3.connect(tmp_path / "mirror/contact/contact.db") as con:
+        con.execute(
+            "INSERT INTO contact(username, nick_name) VALUES (?, ?)",
+            (OTHER, "阿花"),
+        )
+
+    # TTL 内：仍是第一次扫描的索引。
+    assert store.recent(ref, limit=5)[0]["nickname"] == ""
+
+    now[0] += repository_module.INDEX_CACHE_TTL + 0.01
+    assert store.recent(ref, limit=5)[0]["nickname"] == "阿花"
 
 
 # --------------------------------------------------------- LocalDbSource 包装
