@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -50,8 +51,11 @@ _MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
 _MODEL_LOCK = threading.Lock()
 
 #: 每个事件循环各一份信号量：``asyncio.Semaphore`` 绑定循环，测试里跨
-#: ``asyncio.run`` 复用会报 "attached to a different loop"。
-_SEMAPHORES: dict[tuple[int, int], asyncio.Semaphore] = {}
+#: ``asyncio.run`` 复用会报 "attached to a different loop"。这里以循环对象本身
+#: 作弱引用键，循环被回收后不会因为 ``id()`` 复用而拿到绑在旧循环上的信号量。
+_SEMAPHORES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[int, asyncio.Semaphore]
+] = weakref.WeakKeyDictionary()
 
 
 def _locate(program: str) -> str | None:
@@ -66,11 +70,14 @@ def _locate(program: str) -> str | None:
 def _semaphore(limit: int) -> asyncio.Semaphore:
     """按 (事件循环, 并发数) 复用信号量；只在事件循环线程里调用。"""
     loop = asyncio.get_running_loop()
-    key = (id(loop), limit)
-    semaphore = _SEMAPHORES.get(key)
+    per_loop = _SEMAPHORES.get(loop)
+    if per_loop is None:
+        per_loop = {}
+        _SEMAPHORES[loop] = per_loop
+    semaphore = per_loop.get(limit)
     if semaphore is None:
         semaphore = asyncio.Semaphore(limit)
-        _SEMAPHORES[key] = semaphore
+        per_loop[limit] = semaphore
     return semaphore
 
 

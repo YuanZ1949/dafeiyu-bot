@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 import time
@@ -353,6 +354,28 @@ async def test_transcribe_missing_file_returns_empty(tmp_path: Path) -> None:
         )
         == ""
     )
+
+
+# ------------------------------------------------------- 信号量缓存的作用域
+def test_semaphore_cache_is_scoped_to_event_loop() -> None:
+    """不同事件循环各拿一份信号量；旧循环退出后不影响新循环。"""
+    got: list[asyncio.Semaphore] = []
+
+    async def use() -> None:
+        semaphore = speech_module._semaphore(2)
+        assert speech_module._semaphore(2) is semaphore
+        # 并发超过 limit，逼出等待者，让信号量真正绑定到当前循环。
+        async def hold() -> None:
+            async with semaphore:
+                await asyncio.sleep(0)
+
+        await asyncio.gather(*(hold() for _ in range(4)))
+        got.append(semaphore)
+
+    asyncio.run(use())
+    asyncio.run(use())
+
+    assert got[0] is not got[1]
 
 
 # ------------------------------------------------------- 可选：真实依赖往返测试
