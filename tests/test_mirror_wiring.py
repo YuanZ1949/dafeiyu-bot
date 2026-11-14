@@ -901,6 +901,14 @@ def _patch_main(
         return None
 
     class StopEvent:
+        def is_set(self) -> bool:
+            # asyncio.Event 的真实契约：observer_loop / open_loop_expiry_loop
+            # 都先查 is_set() 再等 wait()。替身缺这一项会让新周期循环直接
+            # AttributeError。这里返回 True：后台循环立即干净退出，不把
+            # SystemExit 抛进任务（那会变成 "Task exception was never
+            # retrieved" 并打断 pytest 的 teardown）。
+            return True
+
         async def wait(self) -> None:
             raise SystemExit("stop")
 
