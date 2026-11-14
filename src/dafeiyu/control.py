@@ -1957,6 +1957,18 @@ class BrainControl:
         if action == "forget":
             self.store.forget_messages(chat_type, chat_id)
             return {"ok": True, "action": action}
+        if action in ("release", "discard"):
+            # 攒着干预：release 立即放行一次，discard 丢弃这批未投递消息。
+            handler = getattr(self.service, f"{action}_hold", None)
+            if handler is None:
+                raise ValueError(f"当前服务不支持会话操作：{action}")
+            result = handler(chat_type, chat_id)
+            if inspect.isawaitable(result):
+                result = await result
+            payload = {"ok": True, "action": action}
+            if isinstance(result, dict):
+                payload.update(result)
+            return payload
         if action != "delete":
             raise ValueError(f"未知会话操作：{action}")
 
@@ -3240,7 +3252,7 @@ def create_app(
         if error is not None:
             return error
         action = request.match_info.get("action", "")
-        if action not in ("new", "forget"):
+        if action not in ("new", "forget", "release", "discard"):
             return web.json_response({"error": "未知会话操作"}, status=400)
         try:
             return web.json_response(

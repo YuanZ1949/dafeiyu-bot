@@ -930,10 +930,15 @@ def create_app(
         if error is not None:
             return error
         action = request.match_info.get("action", "")
-        if action not in ("new", "forget"):
+        if action not in ("new", "forget", "release", "discard"):
             return web.json_response({"error": "未知会话操作"}, status=400)
+        # release 会真调一次模型（数秒），必须给足超时，否则面板显示「超时」
+        # 但 bot 其实已经开口了。discard 只写库，沿用默认快速超时。
+        timeout = BOT_BACKUP_TIMEOUT if action == "release" else BOT_TIMEOUT
         code, data = await bot_call(
-            "POST", f"/api/sessions/{chat_type}/{chat_id}/{action}"
+            "POST",
+            f"/api/sessions/{chat_type}/{chat_id}/{action}",
+            timeout=timeout,
         )
         return web.json_response(data, status=code)
 

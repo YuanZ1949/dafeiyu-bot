@@ -235,6 +235,8 @@ def _duration_text(seconds: int) -> str:
 # （spec §8.4 原写作 failed，实现统一取 error，避免同一件事两个名字）。
 SKIP_BUDGET = "budget"
 SKIP_ERROR = "error"
+# 面板手动丢弃攒着的那批：只标「处理过但不投」，消息行本身不删。
+SKIP_HOLD_DISCARD = "hold_discard"
 
 # 机会检测（规则版）的阈值：命中纯热聊负分信号时先攒着不投。
 # 「纯热聊」= 60 秒内 ≥5 条、没有问句、也没有求助词；单条短句不在此列。
@@ -1986,15 +1988,69 @@ class Service:
             result["mode_note"] = mode_note
         return result
 
-    async def _run_batch(self, chat_type: ChatType, chat_id: str) -> None:
+    async def _run_batch(
+        self, chat_type: ChatType, chat_id: str, *, force_release: bool = False
+    ) -> None:
         """定时器到点：取批 → 预算 → 轮换 → 注入 prompt → 调模型 → 发送/静默 → 记账。
 
         同一会话串行：调度器的 inflight 已挡住 tick 重复触发，这里的锁再兜一层
         （drain 与 run 并发、或将来从 dashboard 直接调用时）。
+
+        ``force_release``：面板「现在说这一次」按钮，只跳过攒着判定，仍然走
+        预算 / 静默过滤 / 收尾等既有拦截。必须从这层进入，才能吃到同一把锁。
         """
         lock = self._batch_locks.setdefault((chat_type, chat_id), asyncio.Lock())
         async with lock:
-            await self._run_batch_locked(chat_type, chat_id)
+            await self._run_batch_locked(
+                chat_type, chat_id, force_release=force_release
+            )
+
+    async def release_hold(self, chat_type: ChatType, chat_id: str) -> dict[str, Any]:
+        """面板动作：把这批攒着立即放行一次（不改变后续判定）。
+
+        先留一条 ``manual_release`` 决策，再走正常批次处理；放行后正常路径还会
+        再记一条（``replied`` / ``silent`` / ``blocked``…），所以一次操作两条流水。
+        """
+        age = self._hold_age_seconds(
+            chat_type, chat_id, int(now_shanghai().timestamp())
+        )
+        ids = self.store.undelivered_message_ids(chat_type, chat_id)
+        self._record_decision(
+            chat_type,
+            chat_id,
+            outcome="held",
+            checkpoint="manual_release",
+            message_ids=ids,
+            message_count=len(ids),
+            detail={"age_seconds": age} if age is not None else None,
+        )
+        await self._run_batch(chat_type, chat_id, force_release=True)
+        return {
+            "ok": True,
+            "action": "release",
+            "count": len(ids),
+            "age_seconds": age,
+        }
+
+    async def discard_hold(self, chat_type: ChatType, chat_id: str) -> dict[str, Any]:
+        """面板动作：丢弃这批未投递消息（标记跳过，不删历史）。
+
+        取的是**全量**未投递（``undelivered_message_ids``，不受 20 条窗口限制），
+        否则安静强度积压 50 条时只能清掉 20 条。
+        """
+        ids = self.store.undelivered_message_ids(chat_type, chat_id)
+        if ids:
+            self.store.mark_skipped(chat_type, chat_id, ids, SKIP_HOLD_DISCARD)
+        self._record_decision(
+            chat_type,
+            chat_id,
+            outcome="held",
+            checkpoint="manual_discard",
+            message_ids=ids,
+            message_count=len(ids),
+            detail={"count": len(ids)},
+        )
+        return {"ok": True, "action": "discard", "count": len(ids)}
 
     def preview_batch(
         self, chat_type: ChatType, chat_id: str, *, now: Any = None
@@ -2256,7 +2312,9 @@ class Service:
             return None
         return shape
 
-    async def _run_batch_locked(self, chat_type: ChatType, chat_id: str) -> None:
+    async def _run_batch_locked(
+        self, chat_type: ChatType, chat_id: str, *, force_release: bool = False
+    ) -> None:
         latest = self.store.recent_messages(chat_type, chat_id, 1)
         if not latest:
             return
@@ -2301,37 +2359,44 @@ class Service:
         # 攒着判定（安静强度 / 纯热聊）与寿命共用一个入口：超过
         # persona.hold_max_seconds 就放行，照旧交给模型判断说不说。
         # 关键是不 mark_skipped：攒着时游标不动，下次被点名或有问句时连这批一起进 prompt。
-        hold_state, hold_checkpoint, hold_age = self._hold_outcome(
-            chat_type,
-            chat_id,
-            batch,
-            addressed=addressed,
-            backlog=backlog,
-            now_ts=int(now_shanghai().timestamp()),
-        )
-        if hold_state in ("hold", "release"):
-            self._record_decision(
+        # 面板的「现在说这一次」只跳过这一段，后面的预算 / 收尾拦截照旧。
+        if not force_release:
+            hold_state, hold_checkpoint, hold_age = self._hold_outcome(
                 chat_type,
                 chat_id,
-                outcome="held",
-                checkpoint=hold_checkpoint,
-                message_ids=ids,
+                batch,
                 addressed=addressed,
-                message_count=len(batch),
-                detail={"age_seconds": hold_age} if hold_age is not None else None,
+                backlog=backlog,
+                now_ts=int(now_shanghai().timestamp()),
             )
-            if hold_state == "hold":
-                log.debug(
-                    "批次攒着不投（%s）%s/%s", hold_checkpoint, chat_id, current_id
+            if hold_state in ("hold", "release"):
+                self._record_decision(
+                    chat_type,
+                    chat_id,
+                    outcome="held",
+                    checkpoint=hold_checkpoint,
+                    message_ids=ids,
+                    addressed=addressed,
+                    message_count=len(batch),
+                    detail=(
+                        {"age_seconds": hold_age} if hold_age is not None else None
+                    ),
                 )
-                return
-            log.info(
-                "批次攒着超龄放行（%s）%s/%s age=%s 秒",
-                hold_checkpoint,
-                chat_id,
-                current_id,
-                hold_age,
-            )
+                if hold_state == "hold":
+                    log.debug(
+                        "批次攒着不投（%s）%s/%s",
+                        hold_checkpoint,
+                        chat_id,
+                        current_id,
+                    )
+                    return
+                log.info(
+                    "批次攒着超龄放行（%s）%s/%s age=%s 秒",
+                    hold_checkpoint,
+                    chat_id,
+                    current_id,
+                    hold_age,
+                )
 
         budget = self._chat_budget_decision(chat_type, chat_id, addressed=addressed)
         if not self._budget_allows(budget, addressed):
