@@ -660,15 +660,15 @@ def test_html_each_pane_holds_at_least_one_card() -> None:
 def test_html_every_card_belongs_to_exactly_one_pane() -> None:
     """分区只加一层壳：卡片不重复、不丢失，卡片 id 一个都不改。
 
-    22 是 todo 13 重排时的存量卡片数；W5 新增了「正在攒着」（todo 17）与「话题状态」（todo 19）
-    两张卡，所以这里跟着 +2。断言仍是「main 里的卡片数 == 各分区内卡片数之和」这条不变量。
+    22 是 todo 13 重排时的存量卡片数；W5 新增了「正在攒着」（todo 17）、「话题状态」（todo 19）
+    与「保活」（todo 20）三张卡，所以这里跟着 +3。断言仍是「main 里的卡片数 == 各分区内卡片数之和」。
     """
     main = main_block()
     in_main = len(re.findall(r'<section class="card', main))
     in_panes = sum(
         len(re.findall(r'<section class="card', body)) for body in pane_blocks().values()
     )
-    assert in_main == in_panes == 24
+    assert in_main == in_panes == 25
     assert 'id="processes"' in main
     # 卡片自己的 id 仍然原样在（分区不改 id，只加壳）。
     for card_id in (
@@ -906,3 +906,25 @@ def test_html_thread_state_board_is_read_only() -> None:
     assert "data-thread-closed" in html
     assert "/thread-states/close" not in html
     assert "重开话题" not in html
+
+
+def test_html_keepalive_card_reuses_health_detail() -> None:
+    """保活卡只展示：复用既有健康轮询的 bot.keepalive，不加端点、不加开关。"""
+    html = read_html()
+    assert 'id="keepalive-card"' in html
+    assert 'id="keepalive-list"' in html
+    assert 'id="keepalive-hint"' in html
+    assert "function renderKeepalive(" in html
+    match = re.search(r"function renderKeepalive\(item\) \{(.*?)\n\}", html, re.DOTALL)
+    assert match is not None, "renderKeepalive 必须是一段可直接断言的函数体"
+    body = match.group(1)
+    for field in ("item.enabled", "item.interval_seconds", "item.last_at", "item.last_error", "item.text"):
+        assert field in body, field
+    # 未启用形态必须兼容 {"enabled": False}。
+    assert "保活未启用" in body
+    # 数据来自健康帧：renderHealth 里显式解包 bot.keepalive 并标记刷新时间。
+    assert "renderKeepalive(bot.keepalive)" in html
+    assert 'markUpdated("keepalive-card")' in html
+    # 不新增端点、不提供开关。
+    assert "/api/keepalive" not in html
+    assert 'id="btn-keepalive' not in html

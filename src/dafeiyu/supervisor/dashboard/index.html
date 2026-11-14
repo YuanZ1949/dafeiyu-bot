@@ -780,6 +780,17 @@
       </div>
       <div class="mem-list list-h-lg" id="alerts-list"></div>
     </section>
+
+    <section class="card" id="keepalive-card">
+      <div class="row card-head">
+        <h2>保活</h2>
+        <span class="kv" id="keepalive-hint">加载中…</span>
+        <span class="spacer"></span>
+        <span class="kv card-updated" id="keepalive-updated" data-updated hidden></span>
+      </div>
+      <div class="kv">数据来自既有的健康轮询（/api/health/detail 里的 bot.keepalive），不额外请求，也没有开关。</div>
+      <div class="mem-list list-h-sm" id="keepalive-list"></div>
+    </section>
   </section>
 
   <section class="pane" id="pane-memory">
@@ -2350,11 +2361,37 @@ function degradedReasonText(reason) {
     .join("；");
 }
 
+// ---- 保活（keepalive）：复用 /api/health/detail 里的 bot.keepalive，不额外轮询 ----
+function renderKeepalive(item) {
+  const box = $("keepalive-list");
+  box.replaceChildren();
+  if (!item || item.enabled === false) {
+    $("keepalive-hint").textContent = "保活未启用";
+    box.innerHTML = '<div class="mem-empty">当前没有开启保活探针</div>';
+    return;
+  }
+  const ok = item.ok;
+  $("keepalive-hint").textContent = ok === false
+    ? "最近一次保活失败"
+    : ok === true
+      ? "保活正常"
+      : "还没发过保活";
+  const interval = Math.round(Number(item.interval_seconds) || 0);
+  [
+    ["间隔", interval ? `${interval} 秒` : "—"],
+    ["最近一次", item.last_at || "—"],
+    ["最近错误", item.last_error || "—"],
+    ["内容", item.text || "—"],
+  ].forEach(([label, value]) => box.appendChild(healthKv(label, value)));
+}
+
 function renderHealth(data) {
   // /api/health/detail 把 bot 的健康帧嵌在 data.bot 下（uptime/version/gateway/
   // channels/traffic/scheduler/quota/memory），而 ok/generated_at/processes/
   // disk/napcat/backups/alerts 仍在顶层。bot 帧缺失时回退到 data，兼容旧响应。
   const bot = (data && data.bot && typeof data.bot === "object") ? data.bot : (data || {});
+  renderKeepalive(bot.keepalive);
+  markUpdated("keepalive-card");
   const ok = !!(data && data.ok);
   const stateEl = $("health-state");
   stateEl.className = `pill st-${ok ? "running" : "failed"}`;

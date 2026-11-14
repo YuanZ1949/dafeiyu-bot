@@ -33,6 +33,16 @@ async def test_probe_sends_private_message_to_self() -> None:
     assert status["ok"] is True
     assert status["last_error"] == ""
     assert status["last_at"].endswith("+08:00")
+    # 面板要能显示「发了什么」：纯追加 text，值取实例上的文本。
+    assert status["text"] == KEEPALIVE_TEXT
+
+
+async def test_status_reports_injected_text() -> None:
+    """实例可以注入自定义保活文本；面板读到的必须是这一条，而不是模块常量。"""
+    adapter = FakeAdapter()
+    keepalive = Keepalive(adapter, "qq:10001", 300, text="（自定义保活）")
+
+    assert keepalive.status()["text"] == "（自定义保活）"
 
 
 async def test_probe_failure_is_recorded_not_raised(

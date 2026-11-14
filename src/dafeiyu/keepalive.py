@@ -94,6 +94,8 @@ class Keepalive:
                 else None
             ),
             "last_error": self._last_error,
+            # 面板要显示「发了什么」。用实例上的 text，不是模块常量：允许注入自定义文本。
+            "text": self.text,
         }
 
 
