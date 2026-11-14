@@ -1129,6 +1129,18 @@ async def _stopped(server: BridgeServer) -> None:
         await asyncio.wait_for(server.stop(), STEP)
 
 
+def _freeze_clock(server: BridgeServer, now: float = 1000.0) -> list[float]:
+    """冻结入站水位落盘节流的时钟，返回可推进的 ``[now]``。
+
+    落盘节流按「时间间隔 / 帧数」双阈值触发：测试用假时钟推进时间，
+    不必真的等 ``INBOUND_SAVE_INTERVAL`` 秒，也不会因机器慢而偶发 flush。
+    """
+    clock = [now]
+    server._clock = lambda: clock[0]
+    server._inbound_last_save = clock[0]
+    return clock
+
+
 async def test_dedupe_replays_completed_result_with_current_receipt_id() -> None:
     """同一个 dedupe_key 连发两次：handler 只执行一次，两次回执都 ok 且
     message_id 相同，但 id 各自是当前请求的（回执复用 _receipt 的合并）。"""
@@ -1428,8 +1440,9 @@ async def test_inbound_seq_only_on_event_frames_and_monotonic(tmp_path: Path) ->
 
 
 async def test_ack_trims_unacked_and_persists(tmp_path: Path) -> None:
-    """ack 后未确认缓冲裁剪 + 水位即时落盘（seq / acked 两个键）。"""
+    """ack 后未确认缓冲裁剪 + 显式 flush 后水位落盘（seq / acked 两个键）。"""
     server = BridgeServer(state_path=tmp_path / "state.json")
+    _freeze_clock(server)
     port = await asyncio.wait_for(server.start(), STEP)
     try:
         async with connect(_uri(port)) as ws:
@@ -1453,6 +1466,10 @@ async def test_ack_trims_unacked_and_persists(tmp_path: Path) -> None:
             assert server._inbound_acked == 2
             assert server._inbound_seq == 2
 
+            # 节流：ack 只标脏，窗口内不写盘（写盘由定时器/帧数阈值/停机触发）。
+            assert not (tmp_path / "state.json").exists()
+
+            server.flush_inbound_state()
             state = json.loads((tmp_path / "state.json").read_text("utf-8"))
             assert state == {"seq": 2, "acked": 2, "gap_from": None, "frames": []}
     finally:
@@ -1673,6 +1690,7 @@ async def test_unacked_frames_survive_hard_kill_and_replay_on_hello(
     """不调用 stop 直接换实例：未确认帧从状态文件恢复，hello(0) 原样重投。"""
     path = tmp_path / "state.json"
     server = BridgeServer(state_path=path)
+    _freeze_clock(server)
     port = await asyncio.wait_for(server.start(), STEP)
     originals: dict[str, dict[str, Any]] = {}
     ws = await connect(_uri(port))
@@ -1687,7 +1705,13 @@ async def test_unacked_frames_survive_hard_kill_and_replay_on_hello(
     finally:
         await ws.close()
 
-    # 模拟进程被硬杀：server 既不 stop 也不额外落盘；文件在 broadcast 时已写好。
+    # 模拟进程被硬杀：不调用 stop。节流窗口内的帧此刻还没写盘——这正是
+    # 用「脏标记 + 定时 flush」换掉每帧写盘的代价，必须显式证明边界。
+    assert not path.exists()
+
+    # 生产环境由 1s / 20 帧的定时器在窗口结束时 flush；这里显式模拟该时刻，
+    # 证明「最后一帧已落盘」后硬杀，重启仍能原样重投。
+    server.flush_inbound_state()
     state = json.loads(path.read_text("utf-8"))
     assert [item["seq"] for item in state["frames"]] == [1, 2]
     # 状态文件是本地数据文件，允许包含帧正文（用于重投）。
@@ -1725,6 +1749,7 @@ async def test_acked_frames_not_replayed_after_restart(tmp_path: Path) -> None:
     """ack(1) 后重建：只剩 seq=2 在文件里，hello(0) 只重投它。"""
     path = tmp_path / "state.json"
     server = BridgeServer(state_path=path)
+    _freeze_clock(server)
     port = await asyncio.wait_for(server.start(), STEP)
     ws = await connect(_uri(port))
     try:
@@ -1741,6 +1766,9 @@ async def test_acked_frames_not_replayed_after_restart(tmp_path: Path) -> None:
     finally:
         await ws.close()
 
+    # 节流窗口内不自动落盘；模拟窗口结束时的定时 flush。
+    assert not path.exists()
+    server.flush_inbound_state()
     state = json.loads(path.read_text("utf-8"))
     assert state["acked"] == 1
     assert [item["seq"] for item in state["frames"]] == [2]
@@ -1850,6 +1878,9 @@ async def test_unacked_overflow_records_gap(
         server._stamp_inbound({}, _bridge_msg("m5"))
         assert server._inbound_gap_from == 1
 
+        # 节流窗口内不写盘；显式 flush 后账目（gap_from + 帧窗口）才可见。
+        assert not path.exists()
+        server.flush_inbound_state()
         state = json.loads(path.read_text("utf-8"))
         assert state["gap_from"] == 1
         assert [item["seq"] for item in state["frames"]] == [3, 4, 5]

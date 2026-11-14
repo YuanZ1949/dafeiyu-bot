@@ -67,9 +67,13 @@ _MAX_FRAME = 1 << 20
 UNACKED_MAX = 200
 #: 入站水位默认落盘路径：与 `DEFAULT_KILL_SWITCH` / 对齐状态同一 `data/` 约定。
 DEFAULT_INBOUND_STATE = "data/wechat-bridge/inbound_state.json"
-#: 旧版水位落盘节流常量（每 N 帧一次）。保留名字供旧调用方/测试引用，
-#: 现在未确认帧每帧都落盘（缓冲上限 200 条），不再依赖它。
-_INBOUND_SAVE_EVERY = 50
+#: 入站水位落盘节流：脏标记 + 「时间间隔 / 帧数」双阈值 flush。
+#: 忙群里每次广播都同步写一次 JSON（未确认缓冲最多 200 帧）会把发帧路径拖成
+#: IO 瓶颈；改为窗口内合并写，`stop()` 与显式 `flush_inbound_state()` 仍立刻
+#: 落盘。窗口内被硬杀最多丢一个窗口：恢复后 seq 小幅回退并重投同一批帧，
+#: 客户端按 message_id 去重，不会丢消息。
+INBOUND_SAVE_INTERVAL = 1.0
+INBOUND_SAVE_FRAMES = 20
 #: 每个连接记录的已发 seq 历史上限：广播重试与 hello 重投按它对同一连接去重。
 _CONN_SEQ_MAX = 2048
 
@@ -212,6 +216,11 @@ class BridgeServer:
         self._unacked: deque[tuple[int, dict[str, Any]]] = deque(maxlen=UNACKED_MAX)
         # 首次缓冲溢出时被挤掉的最旧 seq（None = 没有丢帧）；随水位落盘。
         self._inbound_gap_from: int | None = None
+        # 落盘节流：脏标记 + 双阈值（时间/帧数）。`_clock` 可注入，测试不真的等。
+        self._inbound_dirty = False
+        self._inbound_dirty_frames = 0
+        self._clock: Callable[[], float] = time.monotonic
+        self._inbound_last_save = self._clock()
         # 每个连接已发事件帧 seq 的有界历史：广播 pending 重试与 hello 重投
         # 在此汇合，同一帧对同一连接绝不出两遍。
         self._conn_seq_hist: dict[ServerConnection, deque[int]] = {}
@@ -310,6 +319,8 @@ class BridgeServer:
             server.close()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(server.wait_closed(), _AWAIT_TIMEOUT)
+        # 收摊前把最后一个窗口强制写下去：正常停机后重启靠它恢复未确认帧。
+        self.flush_inbound_state()
         self.request_stop()
 
     # --------------------------------------------------------------- 推帧
@@ -391,9 +402,9 @@ class BridgeServer:
                 self._inbound_seq,
             )
         self._unacked.append((self._inbound_seq, envelope))
-        # 未确认帧随水位一起落盘：硬杀进程后仍能靠 hello 重投把它补出去。
-        # 缓冲上限 200 条，文件很小；失败只记 debug，不影响发帧。
-        self._save_inbound_state()
+        # 水位/缓冲变了：标脏并交给节流器决定何时落盘（忙群里每帧写盘太贵）；
+        # `stop()` 或显式 flush 仍会立刻把最后一帧写下去。
+        self._mark_inbound_dirty()
 
     # ------------------------------------------------------- 入站水位（P3-11）
     def _load_inbound_state(self) -> None:
@@ -475,14 +486,15 @@ class BridgeServer:
             )
         self._unacked.extend(sorted(valid.items())[-UNACKED_MAX:])
 
-    def _save_inbound_state(self) -> None:
+    def _save_inbound_state(self) -> bool:
         """水位 + 未确认帧落盘：临时文件 + ``os.replace`` 原子替换；失败只记 debug。
 
-        `state_path` 为 None（未显式开启持久化）时什么都不写。
+        `state_path` 为 None（未显式开启持久化）时什么都不写，按成功处理。
+        返回值只用于决定是否清脏标记：失败时下一轮 flush 还会再试。
         """
         path = self.state_path
         if path is None:
-            return
+            return True
         try:
             payload = {
                 "seq": self._inbound_seq,
@@ -501,11 +513,36 @@ class BridgeServer:
                 "utf-8",
             )
             os.replace(tmp, path)
+            return True
         except Exception as exc:  # noqa: BLE001 - 落盘失败只影响重投
             logger.debug("写入微信桥入站水位失败：%s", exc)
+            return False
+
+    def _mark_inbound_dirty(self) -> None:
+        """水位/未确认缓冲已变：按「时间间隔 / 帧数」双阈值决定是否立刻落盘。"""
+        self._inbound_dirty = True
+        self._inbound_dirty_frames += 1
+        if self._inbound_dirty_frames >= INBOUND_SAVE_FRAMES:
+            self.flush_inbound_state()
+            return
+        if self._clock() - self._inbound_last_save >= INBOUND_SAVE_INTERVAL:
+            self.flush_inbound_state()
+
+    def flush_inbound_state(self) -> None:
+        """把脏水位立刻落盘（`stop()` 与测试的显式 flush 走这里）。
+
+        干净时是 no-op，重复调用不产生额外 IO；写失败时保留脏标记，
+        下一轮 mark/flush 会再试，绝不因为一次磁盘抖动丢掉重投账目。
+        """
+        if not self._inbound_dirty:
+            return
+        if self._save_inbound_state():
+            self._inbound_dirty = False
+            self._inbound_dirty_frames = 0
+            self._inbound_last_save = self._clock()
 
     def _handle_ack(self, params: dict[str, Any], command_id: str) -> dict[str, Any]:
-        """ack 指令：丢弃所有 seq <= 参数值的未确认帧并落盘，回 ok。"""
+        """ack 指令：丢弃所有 seq <= 参数值的未确认帧并标脏，回 ok。"""
         seq = params.get("seq")
         if type(seq) is not int or seq < 0:
             return _receipt(command_id, False, "bad_params")
@@ -515,7 +552,7 @@ class BridgeServer:
             self._inbound_acked = seq
             while self._unacked and self._unacked[0][0] <= seq:
                 self._unacked.popleft()
-            self._save_inbound_state()
+            self._mark_inbound_dirty()
         return _receipt(command_id, True, None)
 
     async def _handle_hello(
