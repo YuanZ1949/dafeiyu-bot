@@ -354,9 +354,11 @@ async def test_opencode_brain_receives_speaker_and_chat(tmp_path):
     service, _, _, adapter, _ = build(tmp_path, brain=brain)
     await service.handle(make_msg())
     # 单条消息也走批次构建器：带时间线表头，行内仍标出说话人与 @。
-    # 「此刻」在时间线之前，内容是时钟相关的，只断言位置不断言具体时间。
+    # 这条 @ 了机器人，按「本批≥2 条或有点名就产出【本批】」的规则，提示词以【本批】开头；
+    # 「此刻」仍在时间线正文之前，内容是时钟相关的，只断言位置不断言具体时间。
     prompt = brain.calls[0][2]
-    assert prompt.startswith("【此刻】")
+    assert prompt.startswith("【本批】")
+    assert prompt.index("【此刻】") < prompt.index("—— 以下是自你上次开口以来的新消息 ——")
     assert prompt.endswith(
         "—— 以下是自你上次开口以来的新消息 ——\n阿鱼：@溟月 在吗（@了你）"
     )

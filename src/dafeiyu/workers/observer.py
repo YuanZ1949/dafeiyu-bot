@@ -519,3 +519,43 @@ async def observer_loop(
             await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
         except TimeoutError:
             pass
+
+
+def expire_open_loops_once(
+    store: Store, *, days: int = OPEN_LOOP_TTL_DAYS
+) -> int:
+    """全会话清一次过期未了事，返回 drop 掉的条数。
+
+    ``observe_chat`` 只在访问到某个群时顺手过期该群的未了事；一个群
+    没人说话就永远轮不到。这里直接扫所有还挂着 open loop 的会话，
+    不依赖活跃列表。
+    """
+    expired = 0
+    for chat_type, chat_id in store.open_chats_with_open_loops():
+        try:
+            expired += store.expire_open_loops(chat_type, chat_id, days=days)
+        except Exception:
+            log.exception("open_loops 过期失败：%s %s", chat_type.value, chat_id)
+    return expired
+
+
+async def open_loop_expiry_loop(
+    store: Store,
+    interval_seconds: float = 600,
+    stop: asyncio.Event | None = None,
+) -> None:
+    """后台长期任务：全会话过期 open_loops，直到 stop 被置位。
+
+    与 observer_loop 同形态的周期任务；启动即清一次，之后每个 interval
+    再清一次。纯 store 记账，不调模型，也不依赖 mind 开关。
+    """
+    stop = stop or asyncio.Event()
+    while not stop.is_set():
+        try:
+            expire_open_loops_once(store)
+        except Exception:
+            log.exception("open_loops 过期循环执行失败")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+        except TimeoutError:
+            pass

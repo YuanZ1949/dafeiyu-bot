@@ -184,9 +184,13 @@ def test_prompt_puts_scene_before_timeline(tmp_path) -> None:
     service, store, _adapter, _brain = build(tmp_path)
     seed_batch(store)
 
+    # 【本批】是整段提示词的第一块（多条批次必然产出）；「此刻」仍排在时间线正文之前。
     prompt = service.preview_batch(ChatType.GROUP, CHAT, now=NOW).prompt
 
-    assert prompt.startswith("【此刻】")
+    assert prompt.startswith("【本批】")
+    assert prompt.index("【此刻】") < prompt.index(
+        "—— 以下是自你上次开口以来的新消息 ——"
+    )
     assert "11-04 周三 12:00（中午）" in prompt
 
 

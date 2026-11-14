@@ -39,7 +39,7 @@ from .version import get_version
 from .workers.failure import FailureBackoff, MemoryPaused
 from .workers.followup import followup_loop
 from .workers.impressions import ImpressionWorker
-from .workers.observer import ObserverWorker, observer_loop
+from .workers.observer import ObserverWorker, observer_loop, open_loop_expiry_loop
 from .workers.outcome import OutcomeWorker, outcome_loop
 from .workers.reflector import ReflectorWorker, reflector_loop
 from .workers.reminders import reminder_loop
@@ -490,6 +490,11 @@ async def main() -> None:
             )
         # 提醒轮询是主动链路：只走 outbox，不调用模型，也不需要 mind 开关。
         mind_tasks.append(asyncio.create_task(reminder_loop(service)))
+        # open_loops 过期是纯记账：不依赖 observer 开关，全部会话统一清。
+        # observer 只在访问到某个群时顺手过期，没人说话的群永远轮不到。
+        mind_tasks.append(
+            asyncio.create_task(open_loop_expiry_loop(store, interval_seconds=600))
+        )
         # 承诺跟进默认关：开关关时 loop 立即返回，任务本身不占资源。
         mind_tasks.append(asyncio.create_task(followup_loop(service)))
         retention_task = (

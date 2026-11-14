@@ -2974,26 +2974,85 @@ class Store:
         self._conn.commit()
         return max(cur.rowcount, 0)
 
-    def add_open_loop(self, loop: OpenLoop) -> int:
-        """记一条「没有下文的事」；同群同内容且还 open 的不重复记。
+    # ---- open_loops 归一化与去重 --------------------------------------
+    # observer 输出的 loop 内容常带状态注记与提问前缀，同一件事两次观察
+    # 只差这些装饰词时应当算同一条：去空白与标点、剥模板尾巴、剥前缀词
+    # 之后比较，而不是要求 content 完全相等。
+    _LOOP_TAIL_MARKERS: tuple[str, ...] = (
+        "无人正面回答",
+        "还没人正面回答",
+        "没人正面回答",
+        "无人回应",
+        "无人接话",
+        "无人回答",
+        "没人回应",
+        "没人接",
+        "没人答",
+    )
+    # 先剥长前缀，避免「追问」被「问」截断成残留。
+    _LOOP_PREFIX_WORDS: tuple[str, ...] = ("追问", "反问", "问")
+    # 空白 + 中英文标点：只参与归一化比较，不影响落库原文。
+    _LOOP_STRIP_RE = re.compile(
+        r"[\s，。！？、；：…—·~～,.!?;:\"'“”‘’「」『』（）【】《》〈〉"
+        r"@＠#＃*＊]+"
+    )
 
-        返回行 id（已存在时返回原行）。content 为空直接拒绝——空字符串
-        进了注入就是一行没意义的破折号。
+    @classmethod
+    def _normalize_loop_text(cls, text: str) -> str:
+        """归一化 loop 内容：去空白与标点、剥模板尾巴与提问前缀。
+
+        只用于重复判定；落库的 content 保持观察到的原文。
+        """
+        compact = cls._LOOP_STRIP_RE.sub("", text).lower()
+        changed = True
+        while changed:
+            changed = False
+            for marker in cls._LOOP_TAIL_MARKERS:
+                if compact.endswith(marker):
+                    compact = compact[: -len(marker)]
+                    changed = True
+            for word in cls._LOOP_PREFIX_WORDS:
+                if compact.startswith(word):
+                    compact = compact[len(word) :]
+                    changed = True
+        return compact
+
+    def add_open_loop(self, loop: OpenLoop) -> int:
+        """记一条「没有下文的事」；同群归一化后相同且还 open 的不重复记。
+
+        归一化：去空白与中英文标点、剥「（，）无人回应」类模板尾巴、
+        剥「问/追问/反问」类前缀词后比较。返回行 id：
+        - 存在 24 小时内的同内容 open 行 → 直接返回那行的 id（不新建）；
+        - 同内容 open 行已超过 24 小时 → 先把老行标 dropped（历史保留），
+          再新建一行，让重新被观察到的事拿到新的时间起点。
+        content 为空直接拒绝——空字符串进了注入就是一行没意义的破折号。
         """
         kind = loop.kind if loop.kind in OPEN_LOOP_KINDS else "question"
         content = loop.content.strip()
         if not content:
             raise ValueError("open_loop 的 content 不能为空")
-        existing = self._conn.execute(
-            """
-            SELECT id FROM open_loops
-            WHERE chat_type = ? AND chat_id = ? AND status = 'open' AND content = ?
-            LIMIT 1
-            """,
-            (loop.chat_type.value, loop.chat_id, content),
-        ).fetchone()
-        if existing is not None:
-            return int(existing["id"])
+        normalized = self._normalize_loop_text(content)
+        if normalized:
+            rows = self._conn.execute(
+                """
+                SELECT id, content,
+                       (created_at >= datetime('now', '-24 hours')) AS fresh
+                FROM open_loops
+                WHERE chat_type = ? AND chat_id = ? AND status = 'open'
+                ORDER BY id DESC
+                """,
+                (loop.chat_type.value, loop.chat_id),
+            ).fetchall()
+            stale_ids: list[int] = []
+            for row in rows:
+                if self._normalize_loop_text(row["content"]) != normalized:
+                    continue
+                if row["fresh"]:
+                    # 24 小时内重复被观察到：不新建，也不 drop。
+                    return int(row["id"])
+                stale_ids.append(int(row["id"]))
+            for stale_id in stale_ids:
+                self.close_open_loop(stale_id, status="dropped")
         cur = self._conn.execute(
             """
             INSERT INTO open_loops (
@@ -3107,6 +3166,50 @@ class Store:
         )
         self._conn.commit()
         return max(cur.rowcount, 0)
+
+    def open_chats_with_open_loops(self) -> list[tuple[ChatType, str]]:
+        """还挂着 open loop 的全部会话（去重，任意顺序）。
+
+        observer 只在访问到某个群时顺手过期该群的未了事；没人说话的群
+        永远轮不到。全会话过期调度据此枚举，不再依赖活跃列表。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT chat_type, chat_id FROM open_loops
+            WHERE status = 'open'
+            """
+        ).fetchall()
+        chats: list[tuple[ChatType, str]] = []
+        for row in rows:
+            try:
+                chat_type = ChatType(row["chat_type"])
+            except ValueError:
+                continue
+            chats.append((chat_type, row["chat_id"]))
+        return chats
+
+    def open_question_loops_for_sources(
+        self, chat_type: ChatType, chat_id: str, source_ids: Sequence[str]
+    ) -> list[int]:
+        """source_message_id 落在本批消息里的 question loop id。
+
+        「你问我」闭环用：机器人回复成功后，本批里被问到的那条消息
+        对应的未了事就该了结。只认 kind='question' 且还 open 的行。
+        """
+        ids = [source for source in source_ids if source]
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        rows = self._conn.execute(
+            f"""
+            SELECT id FROM open_loops
+            WHERE chat_type = ? AND chat_id = ? AND status = 'open'
+              AND kind = 'question'
+              AND source_message_id IN ({placeholders})
+            """,
+            (chat_type.value, chat_id, *ids),
+        ).fetchall()
+        return [int(row["id"]) for row in rows]
 
     @staticmethod
     def _row_to_episode(r: sqlite3.Row) -> Episode:

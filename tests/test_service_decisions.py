@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from dafeiyu.brain.client import BrainReply
@@ -11,6 +13,7 @@ from dafeiyu.config import (
     GroupsConfig,
     LoggingConfig,
     MemoryConfig,
+    MindConfig,
     PersonaConfig,
     Settings,
     TriggerConfig,
@@ -106,10 +109,10 @@ def make_msg(content: str = "hi", *, message_id: str = "m1") -> Message:
     )
 
 
-def build(tmp_path, brain):
+def build(tmp_path, brain, settings=None):
     store = Store(str(tmp_path / "t.db"))
     store.init_schema()
-    settings = make_settings()
+    settings = settings or make_settings()
     adapter = FakeAdapter()
     router = Router(settings, store, clock=lambda: NOON)
     service = Service(settings, store, brain, {"qq": adapter}, router, "你是溟月")
@@ -288,6 +291,150 @@ async def test_retry_mark_is_skipped_on_old_store(tmp_path, monkeypatch):
 
     assert await service._flush_outbox() == 1
     assert adapter.sent
+
+
+# --------------------------------------------- 注定沉默批次的确定性前置过滤
+def make_batch_settings() -> Settings:
+    """点名的批次也立刻投递：把 addressed 防抖关掉，闸门行为与运行时刻无关。"""
+    return replace(
+        make_settings(),
+        triggers=TriggerConfig(
+            60,
+            0.0,
+            ("01:00", "07:00"),
+            ("怎么",),
+            mode="model",
+            batch_seconds=0.0,
+            addressed_debounce_seconds=0.0,
+        ),
+    )
+
+
+class CountingBrain:
+    """数模型调用次数的桩：每次 reply 记一笔并正常回话。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def reply(self, chat_type, chat_id, text, *, on_tool=None) -> BrainReply:
+        self.calls += 1
+        return BrainReply(True, "在呢", "test", 0, 0)
+
+    async def aclose(self) -> None:
+        pass
+
+
+def bot_spoke(store: Store, *, seconds_ago: float) -> None:
+    """把「机器人刚说过话」写进 chat_state；闸门读的就是这一格。"""
+    store.save_chat_state(
+        ChatType.GROUP, "qq:1001", {"last_bot_spoke": time.time() - seconds_ago}
+    )
+
+
+def make_bot_question(message_id: str = "b1") -> Message:
+    """机器人上一句是提问：隐式点名豁免的前置。"""
+    return Message(
+        chat_type=ChatType.GROUP,
+        chat_id="qq:1001",
+        user_id="qq:999",
+        nickname="溟月",
+        content="要不要一起点外卖？",
+        message_id=message_id,
+        segments=[],
+        is_bot=True,
+        at_bot=False,
+        reply_to_bot=False,
+        timestamp=0,
+    )
+
+
+async def test_known_silent_sticker_batch_skips_model(tmp_path):
+    """四条命中前提齐：单条表情包 + 无 @/引用/接话 + 机器人 90 秒内刚说话。"""
+    brain = CountingBrain()
+    service, store, adapter = build(tmp_path, brain, settings=make_batch_settings())
+    bot_spoke(store, seconds_ago=10)
+
+    await service.handle(make_msg("[表情:狗头]"))
+    await service.drain()
+
+    assert brain.calls == 0
+    assert adapter.sent == []
+    item = store.list_decisions()[0]
+    assert item["outcome"] == "silent"
+    assert item["checkpoint"] == "skip_known_silent"
+    assert item["reason"] == "纯表情占位"
+
+
+async def test_at_sticker_still_goes_to_model(tmp_path):
+    """被 @ 的表情包豁免：照常调模型，不许少回一条本该回的。"""
+    brain = CountingBrain()
+    service, store, adapter = build(tmp_path, brain, settings=make_batch_settings())
+    bot_spoke(store, seconds_ago=10)
+
+    await service.handle(make_msg("@溟月[表情:狗头]"))
+    await service.drain()
+
+    assert brain.calls == 1
+    assert adapter.sent
+    assert store.list_decisions()[0]["outcome"] == "replied"
+
+
+async def test_short_answer_to_bot_question_not_filtered(tmp_path):
+    """「对」接在机器人提问后：隐式点名豁免最先生效，2 字短答不误杀。"""
+    brain = CountingBrain()
+    service, store, _ = build(tmp_path, brain, settings=make_batch_settings())
+    store.add_message(make_bot_question())
+    bot_spoke(store, seconds_ago=10)
+
+    await service.handle(make_msg("对"))
+    await service.drain()
+
+    assert brain.calls == 1
+
+
+async def test_silent_skip_respects_cooldown_window(tmp_path):
+    """同一条表情包：冷却窗内 0 次调用；超过 90 秒后 1 次调用。"""
+    brain = CountingBrain()
+    service, _, _ = build(tmp_path, brain, settings=make_batch_settings())
+    bot_spoke(store=service.store, seconds_ago=10)
+    await service.handle(make_msg("[表情]"))
+    await service.drain()
+    assert brain.calls == 0
+
+    later = CountingBrain()
+    service2, store2, _ = build(tmp_path, later, settings=make_batch_settings())
+    bot_spoke(store2, seconds_ago=120)
+    await service2.handle(make_msg("[表情]", message_id="m2"))
+    await service2.drain()
+    assert later.calls == 1
+
+
+async def test_new_question_within_cooldown_is_exempt(tmp_path):
+    """机器人刚说过话但这条是新的提问：「为啥？」短到会命中弱消息形态，
+    豁免④必须盖过命中，否则问句被吞。"""
+    brain = CountingBrain()
+    service, store, _ = build(tmp_path, brain, settings=make_batch_settings())
+    bot_spoke(store, seconds_ago=10)
+
+    await service.handle(make_msg("为啥？"))
+    await service.drain()
+
+    assert brain.calls == 1
+
+
+async def test_skip_known_silent_false_keeps_model_call(tmp_path):
+    """开关关掉：同一批表情包回到今天的行为，照常调模型。"""
+    settings = replace(
+        make_batch_settings(), mind=MindConfig(skip_known_silent=False)
+    )
+    brain = CountingBrain()
+    service, store, _ = build(tmp_path, brain, settings=settings)
+    bot_spoke(store, seconds_ago=10)
+
+    await service.handle(make_msg("[表情:狗头]"))
+    await service.drain()
+
+    assert brain.calls == 1
 
 # ------------------------------------------------- 微信私聊只读 / 自动回复
 def build_wechat_private(tmp_path, brain, *, private_reply: bool):

@@ -47,6 +47,8 @@ from .moment import (
     analyze,
     answers_bot_question,
     follows_bot_expression,
+    is_question,
+    is_sticker_content,
     reopened_by_question,
     requests_continuation,
 )
@@ -232,9 +234,35 @@ REGENERATE_ATTEMPTS = 2
 # 改写走一次性补全，必须封顶等待时间，不能拖住发送链路。
 REGENERATE_TIMEOUT_SECONDS = 20.0
 
-# 跨群查证缓存注入段：只当参考，明确告诉模型可能过时、拿不准就重查。
+# 跨群查证缓存注入段：只当参考，明确告诉模型可能过时、拿不准就自己再查一遍。
 SHARED_FACT_HEADER = "【别的群问过的同一问题（只作参考，可能过时）】"
 SHARED_FACT_HINT = "这条是别的群查过的结论，别直接当事实复述；拿不准就自己再查一遍。"
+
+# 纯媒体占位：图片/文件/视频/语音的网关占位（可带名字与物化注记）。
+# 形态参照 images.py / media.py 的占位与注记模板（[图片]（图存 …）等）。
+_MEDIA_PLACEHOLDER_RE = re.compile(
+    r"^\[(?:图片|文件|视频|语音)(?::[^\]\n]*)?\](?:（[^）\n]*）)?$"
+)
+
+
+def _silent_content_shape(content: str) -> str | None:
+    """弱消息形态：纯表情/纯媒体占位、纯链接、或正文 ≤3 字。
+
+    返回命中原因短语；像一句正常发言返回 None（不进沉默过滤）。
+    """
+    body = (content or "").strip()
+    if is_sticker_content(body):
+        return "纯表情占位"
+    if _MEDIA_PLACEHOLDER_RE.fullmatch(body):
+        return "纯媒体占位"
+    tokens = body.split()
+    if tokens and all(
+        token.startswith(("http://", "https://")) for token in tokens
+    ):
+        return "纯链接"
+    if len(body) <= 3:
+        return "正文过短"
+    return None
 
 
 @dataclass
@@ -2042,6 +2070,65 @@ class Service:
         # 只在确定要 hold 时才查上一条，正常批次不增加额外 DB 查询。
         return not any(self._weakly_addressed(m) for m in batch)
 
+    def _bot_spoke_within(
+        self, chat_type: ChatType, chat_id: str, seconds: int, now_ts: int
+    ) -> bool:
+        """机器人在 ``seconds`` 秒内是否刚开过口（chat_state.last_bot_spoke）。
+
+        与 ``_scene_hint`` 的「距你上次开口」同一数据源：Router 发言成功后
+        经 ``note_bot_spoke`` 持久化，重启也不丢。
+        """
+        if seconds <= 0:
+            return False
+        try:
+            state = self.store.load_chat_state(chat_type, chat_id) or {}
+        except Exception:  # noqa: BLE001 - 状态读不到就当没说过，不拦批次
+            return False
+        last = state.get("last_bot_spoke")
+        if not isinstance(last, (int, float)) or last <= 0:
+            return False
+        return now_ts - float(last) <= seconds
+
+    def _known_silent_reason(
+        self, batch: list[Message], *, now_ts: int
+    ) -> str | None:
+        """注定沉默批次的确定性判定（先豁免，后命中；命中返回原因）。
+
+        只对「单条非机器人消息」生效：多条批次可能整批在讨论，交给模型。
+        豁免（任一成立就走模型）：被 @/引用/别名点名、回答机器人上一句
+        提问（必须在最前，否则「对」「哈哈」这类短答被误杀）、紧跟机器人
+        发言的新提问、机器人冷却窗口内刚说话后的新提问。
+        命中（四条全 AND）：单条 + 弱消息形态 + 不在跟它说话 + 它刚说过话。
+        """
+        mind = self.settings.mind
+        if not mind.skip_known_silent:
+            return None
+        if len(batch) != 1:
+            return None
+        msg = batch[0]
+        # 豁免①②：回答机器人上一句提问最优先，其次显式点名（@/引用/别名）。
+        if self._answers_bot_question(msg) or self.router.is_addressed(msg):
+            return None
+        if is_question(msg.content):
+            # 豁免③：紧跟机器人发言的明确新提问。
+            previous = self._previous_message(msg)
+            if previous is not None and previous.is_bot:
+                return None
+            # 豁免④：机器人冷却窗口内刚说过，但这条是抛给它的新的提问。
+            if self._bot_spoke_within(
+                msg.chat_type, msg.chat_id, mind.skip_silent_cooldown_seconds, now_ts
+            ):
+                return None
+        # 命中：弱消息形态 + 机器人刚说过话（没人接话多半是冲它来的附和）。
+        shape = _silent_content_shape(msg.content)
+        if shape is None:
+            return None
+        if not self._bot_spoke_within(
+            msg.chat_type, msg.chat_id, mind.skip_silent_cooldown_seconds, now_ts
+        ):
+            return None
+        return shape
+
     async def _run_batch_locked(self, chat_type: ChatType, chat_id: str) -> None:
         latest = self.store.recent_messages(chat_type, chat_id, 1)
         if not latest:
@@ -2143,6 +2230,33 @@ class Service:
             )
             return
 
+        # 注定沉默的批次在调模型前确定性过滤（GAP-8）：单条弱消息 + 机器人
+        # 刚说过话 + 没有任何点名/接话钩子，直接判 silent，省一整轮调用。
+        # 游标随 mark_delivered 推进，与模型自决 silent 的记账同口径。
+        skip_reason = self._known_silent_reason(
+            batch, now_ts=int(now_shanghai().timestamp())
+        )
+        if skip_reason:
+            self.store.mark_delivered(chat_type, chat_id, *ids)
+            self._record_decision(
+                chat_type,
+                chat_id,
+                outcome="silent",
+                checkpoint="skip_known_silent",
+                message_ids=ids,
+                addressed=addressed,
+                message_count=len(batch),
+                reason=skip_reason,
+            )
+            log.info(
+                "批次注定沉默，跳过模型 %s/%s reason=%s ids=%d",
+                chat_id,
+                current_id,
+                skip_reason,
+                len(ids),
+            )
+            return
+
         await self._maybe_rotate(chat_type, chat_id)
 
         # 重启后第一张图常常卡在「密钥还没扫出来」：送审前等一次并重试物化。
@@ -2201,6 +2315,10 @@ class Service:
         )
         if not sent:
             self.router.note_no_reply(chat_type, chat_id)
+        else:
+            # 「你问我」闭环：回复成功后，本批里被问到的那条消息对应的
+            # question 未了事随这次回复了结（不再等 observer 下一轮猜）。
+            self._close_answered_question_loops(chat_type, chat_id, batch)
         self._remember_shared_fact(chat_type, chat_id, batch, reply, tool_use)
 
         self.store.record_usage(
@@ -2224,6 +2342,36 @@ class Service:
             self._continuation_used.add(key)
         log.debug("本轮工具调用 %s/%s: %s", chat_id, current_id, tool_use.names)
         self._check_workspace(chat_type, chat_id)
+
+    def _close_answered_question_loops(
+        self, chat_type: ChatType, chat_id: str, batch: list[Message]
+    ) -> int:
+        """机器人回复成功后，把「本批里被问到」的 question loop 标 done。
+
+        闭环挂在回复成功之后的真实路径上（``_run_batch_locked`` 拿到非空
+        sent 列表才调）：batch 里哪条消息是某个 question loop 的来源
+        （``source_message_id``），这次回复就等于回答了那件事。关闭失败
+        只记日志，不影响主链路。
+        """
+        closed = 0
+        try:
+            loop_ids = self.store.open_question_loops_for_sources(
+                chat_type, chat_id, [m.message_id for m in batch]
+            )
+        except Exception:
+            log.exception(
+                "查询待闭环 question loop 失败：%s %s", chat_type.value, chat_id
+            )
+            return 0
+        for loop_id in loop_ids:
+            try:
+                if self.store.close_open_loop(loop_id, status="done"):
+                    closed += 1
+            except Exception:
+                log.exception("关闭已回答的 question loop 失败：id=%s", loop_id)
+        if closed:
+            log.info("你问我闭环 %s/%s closed=%d", chat_type.value, chat_id, closed)
+        return closed
 
     def _shared_fact_hint(
         self,
@@ -3866,6 +4014,8 @@ class Service:
             record("error", "send_failed", reply_preview=preview)
         else:
             record("replied", reply_preview=preview)
+            # 「你问我」闭环：与批次路径同语义，回复成功才了结被问到的 question。
+            self._close_answered_question_loops(msg.chat_type, msg.chat_id, [msg])
 
     def _store_bot_chunks(
         self,
