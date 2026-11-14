@@ -2029,19 +2029,22 @@ class Service:
             now=moment,
         )
         report = self.budget_guard.report(chat_type, chat_id, now=moment)
-        quiet_blocked = not addressed and self.behavior.chat_intensity == "quiet"
         prompt = ""
         truncated = False
-        opportunity_hold = False
+        hold_blocked = False
         if batch:
             ids = [m.message_id for m in batch]
             omitted = self.store.count_undelivered_before(chat_type, chat_id, ids[0])
-            opportunity_hold = self._opportunity_hold(
+            # 预览必须和真跑看到同一刻的攒着判定（含寿命放行）。
+            hold_state, _checkpoint, _age = self._hold_outcome(
+                chat_type,
+                chat_id,
                 batch,
                 addressed=addressed,
-                now_ts=int(moment.timestamp()),
                 backlog=omitted,
+                now_ts=int(moment.timestamp()),
             )
+            hold_blocked = hold_state == "hold"
             prompt = self._build_prompt(
                 chat_type,
                 chat_id,
@@ -2062,8 +2065,7 @@ class Service:
         would_call = (
             bool(batch)
             and self._budget_allows(decision, addressed)
-            and not quiet_blocked
-            and not opportunity_hold
+            and not hold_blocked
         )
         tokens = estimate_tokens(prompt)
         window: dict[str, Any] = (
@@ -2114,6 +2116,63 @@ class Service:
         # 本来该 hold，但批里有「紧跟 bot 的表情」这类弱回应：别一票否决。
         # 只在确定要 hold 时才查上一条，正常批次不增加额外 DB 查询。
         return not any(self._weakly_addressed(m) for m in batch)
+
+    def _hold_age_seconds(
+        self, chat_type: ChatType, chat_id: str, now_ts: int
+    ) -> int | None:
+        """待投队列里最早一条消息已经等了多久（秒）；没有待投消息时为 None。"""
+        oldest = self.store.oldest_undelivered_ts(chat_type, chat_id)
+        if oldest is None:
+            return None
+        return max(0, now_ts - oldest)
+
+    def _hold_expired(
+        self, chat_type: ChatType, chat_id: str, now_ts: int
+    ) -> tuple[bool, int | None]:
+        """攒着是否已经超过 ``persona.hold_max_seconds``。
+
+        ``0`` 表示关闭过期（永不到期，退回改前行为）。时间未知（``timestamp``
+        缺失或为 0）时一律视为「未到期」，不能拿 1970 年当基准。
+        """
+        limit = self.settings.persona.hold_max_seconds
+        if limit <= 0:
+            return False, None
+        age = self._hold_age_seconds(chat_type, chat_id, now_ts)
+        if age is None:
+            return False, None
+        return age >= limit, age
+
+    def _hold_outcome(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        batch: list[Message],
+        *,
+        addressed: bool,
+        backlog: int,
+        now_ts: int,
+    ) -> tuple[str, str, int | None]:
+        """这一次批次该不该攒着：``("hold" | "release" | "none", checkpoint, age)``。
+
+        - ``hold``：照旧攒着不投，``checkpoint`` 是攒着原因；
+        - ``release``：本来要攒着，但已经超过寿命上限，放行送模型判断，
+          ``checkpoint`` 带 ``_expired`` 后缀用于决策流区分；
+        - ``none``：本来就不攒着。
+
+        预览与真跑共用这一个判定，避免「预览说会投、实际不投」。
+        """
+        expired, age = self._hold_expired(chat_type, chat_id, now_ts)
+        if not addressed and self.behavior.chat_intensity == "quiet":
+            if expired:
+                return "release", "intensity_quiet_expired", age
+            return "hold", "intensity_quiet", age
+        if self._opportunity_hold(
+            batch, addressed=addressed, now_ts=now_ts, backlog=backlog
+        ):
+            if expired:
+                return "release", "opportunity_hold_expired", age
+            return "hold", "opportunity_hold", age
+        return "none", "", age
 
     def _bot_spoke_within(
         self, chat_type: ChatType, chat_id: str, seconds: int, now_ts: int
@@ -2216,42 +2275,40 @@ class Service:
         current_id = addressed_ids[-1] if addressed_ids else ids[-1]
         key = (chat_type, chat_id)
 
-        # 切到安静强度前已经排队的批次：非点名也不送模型。不 mark_skipped，
-        # 消息留在待投队列里，等下一次点名再一起看。
-        if not addressed and self.behavior.chat_intensity == "quiet":
-            self._record_decision(
-                chat_type,
-                chat_id,
-                outcome="held",
-                checkpoint="intensity_quiet",
-                message_ids=ids,
-                addressed=addressed,
-                message_count=len(batch),
-            )
-            log.debug("批次跳过（安静强度）%s/%s", chat_id, current_id)
-            return
-
-        # 机会检测（规则版）：纯热聊/纯斗图先攒着不投。
-        # 关键是不 mark_skipped：游标不动，下次被点名或有问句时连这批一起进 prompt。
-        if self._opportunity_hold(
+        # 攒着判定（安静强度 / 纯热聊）与寿命共用一个入口：超过
+        # persona.hold_max_seconds 就放行，照旧交给模型判断说不说。
+        # 关键是不 mark_skipped：攒着时游标不动，下次被点名或有问句时连这批一起进 prompt。
+        hold_state, hold_checkpoint, hold_age = self._hold_outcome(
+            chat_type,
+            chat_id,
             batch,
             addressed=addressed,
-            now_ts=int(now_shanghai().timestamp()),
             backlog=backlog,
-        ):
+            now_ts=int(now_shanghai().timestamp()),
+        )
+        if hold_state in ("hold", "release"):
             self._record_decision(
                 chat_type,
                 chat_id,
                 outcome="held",
-                checkpoint="opportunity_hold",
+                checkpoint=hold_checkpoint,
                 message_ids=ids,
                 addressed=addressed,
                 message_count=len(batch),
+                detail={"age_seconds": hold_age} if hold_age is not None else None,
             )
-            log.debug(
-                "批次攒着不投（纯热聊）%s/%s ids=%d", chat_id, current_id, len(batch)
+            if hold_state == "hold":
+                log.debug(
+                    "批次攒着不投（%s）%s/%s", hold_checkpoint, chat_id, current_id
+                )
+                return
+            log.info(
+                "批次攒着超龄放行（%s）%s/%s age=%s 秒",
+                hold_checkpoint,
+                chat_id,
+                current_id,
+                hold_age,
             )
-            return
 
         budget = self._chat_budget_decision(chat_type, chat_id, addressed=addressed)
         if not self._budget_allows(budget, addressed):
