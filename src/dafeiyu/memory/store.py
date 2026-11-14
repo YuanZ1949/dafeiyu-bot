@@ -35,6 +35,11 @@ MAX_TIMELINE_PAGE = 200
 # 预算只统计对话用途：摘要/批评测/记忆提取不属于对话预算。
 _BUDGET_PURPOSES: tuple[str, ...] = ("reply", "ambient")
 
+# 关系卡产品口径（2026-11-14 拍板）：窗口 14 天、单批最多 12 人。
+# 只影响「你和他」这一段：窗口越长/上限越大，注入的提示词越长。
+RELATIONSHIP_CARD_DAYS = 14
+RELATIONSHIP_CARD_LIMIT = 12
+
 # 模型输出不可信：episode / open_loop 的枚举值落库前按白名单归一，
 # 认不出来的退回默认值，而不是把脏值写进去再注回 prompt。
 EPISODE_PHASES: tuple[str, ...] = (
@@ -3466,14 +3471,18 @@ class Store:
         chat_id: str,
         user_ids: Sequence[str],
         *,
-        days: int = 7,
+        days: int = RELATIONSHIP_CARD_DAYS,
         now_ts: int | None = None,
     ) -> dict[str, RelationshipCard]:
         """一次调用批量取当前发言人的关系卡（impressions + messages 聚合）。
 
         只给批次里真的说话的人建卡；生人只留昵称，facts 为空，绝不臆测关系。
+        ``chat_type`` 同时支持群聊与私聊：聚合始终按 ``chat_id`` 收口，私聊
+        不会把 A 会话的事实串到 B 会话。
         """
-        ids = [str(uid) for uid in dict.fromkeys(user_ids) if uid][:8]
+        ids = [str(uid) for uid in dict.fromkeys(user_ids) if uid][
+            :RELATIONSHIP_CARD_LIMIT
+        ]
         if not ids:
             return {}
         marks = ",".join("?" for _ in ids)

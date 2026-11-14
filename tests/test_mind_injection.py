@@ -149,6 +149,79 @@ def test_relation_block_is_group_only(store: Store) -> None:
 
     text = render(store, chat_type=PRIVATE)
 
+    # 群里的卡不会因为切到私聊就冒出来：私聊只读自己这个会话。
+    assert INJECTION_RELATION_HEADER not in text
+
+
+def _add_private_message(
+    store: Store, chat_id: str, user_id: str, nickname: str, message_id: str
+) -> None:
+    store.add_message(
+        Message(
+            chat_type=PRIVATE,
+            chat_id=chat_id,
+            user_id=user_id,
+            nickname=nickname,
+            content="在吗",
+            message_id=message_id,
+            timestamp=int(time.time()) - 30,
+        )
+    )
+
+
+def render_private(store: Store, chat_id: str, **overrides) -> str:
+    return build_injection(
+        store,
+        None,
+        PRIVATE,
+        chat_id,
+        cfg(**overrides),
+        today="2026-11-04",
+    )
+
+
+def test_relation_block_renders_for_private_chat(store: Store) -> None:
+    """D-4：私聊也建卡，"你和他"不再是群聊专属。"""
+    peer = "qq:2"
+    _add_private_message(store, peer, peer, "阿花", "pm1")
+    store.upsert_impression(
+        PRIVATE, peer, peer, "preference", "喜欢猫", 0.9, subject_nickname="阿花"
+    )
+
+    text = render_private(store, peer)
+
+    assert INJECTION_RELATION_HEADER in text
+    assert "阿花：喜欢猫" in text
+    assert "最近说过 1 句" in text
+
+
+def test_relation_block_does_not_mix_private_chats(store: Store) -> None:
+    """私聊建卡必须按 chat_id 收口：A 会话的事实不能出现在 B 会话。"""
+    for peer, name, fact in (
+        ("qq:2", "阿花", "喜欢猫"),
+        ("qq:3", "阿蓝", "讨厌猫"),
+    ):
+        _add_private_message(store, peer, peer, name, f"pm-{peer}")
+        store.upsert_impression(
+            PRIVATE, peer, peer, "preference", fact, 0.9, subject_nickname=name
+        )
+
+    text = render_private(store, "qq:2")
+
+    assert "阿花：喜欢猫" in text
+    assert "讨厌猫" not in text
+    assert "阿蓝" not in text
+
+
+def test_relation_block_can_be_switched_off_for_private(store: Store) -> None:
+    peer = "qq:2"
+    _add_private_message(store, peer, peer, "阿花", "pm1")
+    store.upsert_impression(
+        PRIVATE, peer, peer, "preference", "喜欢猫", 0.9, subject_nickname="阿花"
+    )
+
+    text = render_private(store, peer, inject_relations=False)
+
     assert INJECTION_RELATION_HEADER not in text
 
 

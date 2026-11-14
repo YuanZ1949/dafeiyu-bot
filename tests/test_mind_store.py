@@ -181,6 +181,29 @@ def test_relationship_cards_without_speakers(store: Store) -> None:
     assert store.relationship_cards(GROUP, CHAT, [], now_ts=0) == {}
 
 
+def test_relationship_cards_window_is_fourteen_days(store: Store) -> None:
+    now = int(time.time())
+    store.add_message(
+        msg(content="十天前", message_id="m10", timestamp=now - 10 * 86400)
+    )
+    store.add_message(
+        msg(content="十五天前", message_id="m15", timestamp=now - 15 * 86400)
+    )
+
+    card = store.relationship_cards(GROUP, CHAT, ["qq:2"], now_ts=now)["qq:2"]
+
+    assert card.message_count == 1
+    assert card.last_seen_ts == now - 10 * 86400
+
+
+def test_relationship_cards_cap_at_twelve(store: Store) -> None:
+    ids = [f"qq:{index}" for index in range(1, 15)]
+
+    cards = store.relationship_cards(GROUP, CHAT, ids, now_ts=int(time.time()))
+
+    assert list(cards) == ids[:12]
+
+
 # ---- 结果打标 --------------------------------------------------------------
 
 

@@ -436,8 +436,12 @@ def _impression_body(
 def _relation_block(
     store: Store, chat_type: ChatType, chat_id: str, cfg: InjectionConfig
 ) -> str:
-    """「你和他」：只给当前批次发言人的关系卡，生人不臆测。"""
-    if not cfg.inject_relations or chat_type != ChatType.GROUP:
+    """「你和他」：只给当前批次发言人的关系卡，生人不臆测。
+
+    群聊与私聊都注入；数据始终按 ``(chat_type, chat_id)`` 取，私聊不会把
+    另一个会话的发言/事实串进来。
+    """
+    if not cfg.inject_relations:
         return ""
     speakers = _focus_user_ids(store, chat_type, chat_id)[
         :INJECTION_RELATION_SPEAKERS
