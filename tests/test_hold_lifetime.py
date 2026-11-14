@@ -265,6 +265,55 @@ async def test_preview_still_blocks_before_the_limit(tmp_path):
     assert preview.would_call_model is False
 
 
+async def test_prompt_carries_the_age_note_past_the_limit(tmp_path):
+    service, store, brain, _ = build(tmp_path, hold_max_seconds=300)
+    seed_cursor(store)
+    add_messages(store, "old", 1, ts=int(time.time()) - 600)
+    add_messages(store, "h", 5, ts=int(time.time()))
+
+    await service._run_batch(ChatType.GROUP, GROUP)
+
+    assert brain.reply_calls == 1
+    assert "这批消息已经攒了" in brain.prompts[0]
+    assert "话题可能已经结束" in brain.prompts[0]
+
+
+async def test_prompt_has_no_age_note_before_the_limit(tmp_path):
+    service, store, brain, _ = build(tmp_path, hold_max_seconds=300)
+    seed_cursor(store)
+    add_messages(store, "h", 6, ts=int(time.time()))
+    # 让这一批不被攒着，直接走到模型（加一个问句）。
+    store.add_message(make_msg("这个怎么弄？", message_id="ask", ts=int(time.time())))
+
+    await service._run_batch(ChatType.GROUP, GROUP)
+
+    assert brain.reply_calls == 1
+    assert "这批消息已经攒了" not in brain.prompts[0]
+
+
+def test_age_note_is_silent_when_lifetime_is_disabled(tmp_path):
+    service, store, _, _ = build(tmp_path, hold_max_seconds=0)
+    seed_cursor(store)
+    add_messages(store, "old", 3, ts=int(time.time()) - 10_000)
+
+    assert service._hold_age_note(store.pending_batch(ChatType.GROUP, GROUP, "old2")) == ""
+
+
+def test_age_note_uses_the_batch_not_the_backlog(tmp_path):
+    """积压里更早的消息不在 prompt 里，年龄不能按它算。"""
+    service, store, _, _ = build(tmp_path, hold_max_seconds=300)
+    seed_cursor(store)
+    add_messages(store, "backlog", 2, ts=int(time.time()) - 10_000)
+    add_messages(store, "batch", 20, ts=int(time.time()))
+
+    batch = store.pending_batch(ChatType.GROUP, GROUP, "batch19")
+    assert batch[0].message_id == "batch0"  # 老的落在批次窗口之外
+
+    note = service._hold_age_note(batch)
+
+    assert note == ""
+
+
 async def test_twenty_message_ceiling_wins_over_the_lifetime(tmp_path):
     """热聊路径天然被 PENDING_BATCH_LIMIT 封顶：20 条就不再攒，用不到 300 秒。"""
     service, store, brain, _ = build(tmp_path, hold_max_seconds=300)

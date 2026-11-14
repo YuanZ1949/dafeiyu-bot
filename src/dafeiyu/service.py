@@ -2055,6 +2055,7 @@ class Service:
                 fact_hint=self._shared_fact_hint(
                     chat_type, chat_id, batch, bump=False
                 ),
+                hold_note=self._hold_age_note(batch, now=moment),
                 # 预览必须和真实批次看到同一刻，否则「此刻」「时机」会漂。
                 now=moment,
             )
@@ -2173,6 +2174,28 @@ class Service:
                 return "release", "opportunity_hold_expired", age
             return "hold", "opportunity_hold", age
         return "none", "", age
+
+    def _hold_age_note(self, messages: list[Message], *, now: Any = None) -> str:
+        """攒着超龄的一句中立说明；没超龄或关闭寿命时返回空串。
+
+        只看**本批**里最早一条有时间戳的消息：比批次更早的积压模型根本看不到，
+        拿它算年龄会写出「攒了 3 天」却没有任何那天的消息在 prompt 里。
+        只陈述事实，不写「必须回复 / 必须沉默」。
+        """
+        limit = self.settings.persona.hold_max_seconds
+        if limit <= 0 or not messages:
+            return ""
+        oldest = min(
+            (int(m.timestamp) for m in messages if m.timestamp > 0), default=0
+        )
+        if oldest <= 0:
+            return ""
+        moment = now or now_shanghai()
+        age = max(0, int(moment.timestamp()) - oldest)
+        if age < limit:
+            return ""
+        minutes = max(1, age // 60)
+        return f"【这批消息已经攒了 {minutes} 分钟，话题可能已经结束；说不说由你判断】"
 
     def _bot_spoke_within(
         self, chat_type: ChatType, chat_id: str, seconds: int, now_ts: int
@@ -2377,6 +2400,7 @@ class Service:
             omitted=backlog,
             fact_hint=fact_hint,
             link_block=link_block,
+            hold_note=self._hold_age_note(batch),
         )
 
         log.info(
@@ -3647,6 +3671,7 @@ class Service:
         omitted: int = 0,
         fact_hint: str | None = None,
         link_block: str | None = None,
+        hold_note: str = "",
         now: Any = None,
     ) -> str:
         """三种模式共用的 prompt：长期记忆注入 + 时间线（单条也走这里）。"""
@@ -3687,6 +3712,12 @@ class Service:
         if fact_hint:
             injection = (
                 f"{injection}\n\n{fact_hint}" if injection.strip() else fact_hint
+            )
+
+        # 攒着超龄的批次：只给一句事实 + 把说不说交还模型，不写任何指令。
+        if hold_note:
+            injection = (
+                f"{injection}\n\n{hold_note}" if injection.strip() else hold_note
             )
 
         # 时机提示只给群聊：私聊无所谓「插不插嘴」。
