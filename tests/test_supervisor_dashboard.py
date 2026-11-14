@@ -97,6 +97,8 @@ async def test_index_serves_dashboard(tmp_path: Path) -> None:
     assert "memory-summaries" in text
     assert "群印象" in text
     assert "btn-more-memory" in text
+    # 面板改动频繁：首页必须不缓存，否则改完刷新看不到新版。
+    assert resp.headers["Cache-Control"] == "no-store"
     assert "memory-chat-filter" in text
     assert "MEMORY_PAGE_MAX" in text
     assert "timeline-drawer" in text
