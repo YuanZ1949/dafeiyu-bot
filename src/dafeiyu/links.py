@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -27,10 +28,17 @@ from dafeiyu.config import LinkConfig
 from dafeiyu.netssl import default_ssl_context
 
 __all__ = [
+    "LINK_BLOCK_HEADER",
+    "LINK_UNREADABLE",
+    "LinkBlock",
+    "LinkPromptResolver",
     "LinkResolution",
     "LinkResolver",
-    "html_to_text",
     "extract_title",
+    "extract_urls",
+    "html_to_text",
+    "render_link_block",
+    "resolve_for_prompt",
     "resolve_url",
 ]
 
@@ -74,6 +82,37 @@ class LinkResolution:
     text: str = ""
     reason: str = ""
     fetched_at: float = 0.0
+
+
+#: 【链接内容】块头。模型侧协议（persona「六、什么时候才查」）以它为锚点：
+#: 看到这一块就以块内内容为准，不再自己抓同一个链接。
+LINK_BLOCK_HEADER = "【链接内容】"
+#: 服务端读不到时的统一措辞。整块里只出现一次（每个失败 URL 一行），
+#: 后面跟一次给模型的回退指令——绝不再让模型「再抓一次」。
+LINK_UNREADABLE = "服务器读不到"
+
+#: URL 提取：到空白/引号/中文标点为止（ASCII 尾部标点另有清理）。
+_URL_RE = re.compile(r"https?://[^\s<>\"'，。；：！？、（）【】《》]+", re.IGNORECASE)
+#: 句子末尾常粘上这些字符，它们不属于 URL。
+_URL_TRAILING = ".,;:!?'\">"
+
+
+@dataclass(frozen=True)
+class LinkBlock:
+    """一个 URL 进入提示词时的最终形态（服务端两级降级的结论）。
+
+    ``failure_layer`` 是给 T8「失败知识复用」读的：``http`` / ``browser``
+    表示结论来自哪一层，``none`` 表示成功（或根本没来得及发起请求）。
+    ``reason`` 复用既有词汇（``http_403`` / ``browser_timeout`` /
+    ``budget_exhausted`` …），T8 按 host 沉淀结论时直接照抄。
+    """
+
+    url: str
+    ok: bool
+    title: str = ""
+    text: str = ""
+    failure_layer: str = "none"
+    reason: str = ""
 
 
 class _TextExtractor(HTMLParser):
@@ -386,3 +425,205 @@ async def resolve_url(
 ) -> LinkResolution:
     """便捷入口：内部建 resolver，供后续任务（T6 注入、T8 失败沉淀）调用。"""
     return await LinkResolver(config, **kwargs).resolve(url)
+
+
+# ---- URL 提取与提示词块（T6） ---------------------------------------------
+
+
+def _trim_url(url: str) -> str:
+    """剪掉句子尾巴上的 ASCII 标点；配对不上的右括号也不属于 URL。"""
+    trimmed = url.strip().rstrip(_URL_TRAILING)
+    while trimmed.endswith(")") and trimmed.count("(") < trimmed.count(")"):
+        trimmed = trimmed[:-1].rstrip(_URL_TRAILING)
+    return trimmed
+
+
+def extract_urls(text: str) -> list[str]:
+    """从一段消息正文里抽 http(s) URL：去重、保序、剪掉尾随标点。"""
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _URL_RE.finditer(text or ""):
+        url = _trim_url(match.group(0))
+        if url and url not in seen:
+            seen.add(url)
+            found.append(url)
+    return found
+
+
+#: 失败块的唯一一条模型侧指令。措辞刻意不含「再抓 / 再来一次 / 继续抓」：
+#: 服务端只声明读不到，重试由模型改用 websearch，最后一步是请对方贴内容。
+_LINK_FALLBACK_INSTRUCTION = (
+    "未能解析的链接：请用 websearch 搜这个链接的主题（站点名 + 标题线索 + 链接里的 id），"
+    "不要重新打开同一个链接；如果还是搜不到，就用一句话回退："
+    "「这链接本机读不到，麻烦给个标题或关键几句」，不要反复尝试。"
+)
+
+
+def _unreadable(url: str, layer: str, reason: str) -> LinkBlock:
+    return LinkBlock(url=url, ok=False, failure_layer=layer, reason=reason)
+
+
+def render_link_block(blocks: Sequence[LinkBlock]) -> str:
+    """把解析结果渲染成【链接内容】块：成功给标题与正文，失败标「服务器读不到」。
+
+    失败块整段只出现一次，且只在有失败 URL 时追加一条模型侧回退指令——
+    多个失败 URL 共用同一句，避免提示词里堆叠重复指令。
+    """
+    blocks = [block for block in blocks if block.url]
+    if not blocks:
+        return ""
+    lines = [
+        f"{LINK_BLOCK_HEADER}下面是服务器替你读过的链接内容，以这里的为准"
+        "（原文链接仍在本批消息里）："
+    ]
+    unreadable: list[LinkBlock] = []
+    for block in blocks:
+        if block.ok:
+            title = f"（标题：{block.title}）" if block.title else ""
+            lines.append(f"- {block.url}{title}")
+            if block.text:
+                lines.append(f"  正文：{block.text}")
+        else:
+            unreadable.append(block)
+            suffix = f"（{block.reason}）" if block.reason else ""
+            lines.append(f"- {block.url}：{LINK_UNREADABLE}{suffix}")
+    if unreadable:
+        lines.append(_LINK_FALLBACK_INSTRUCTION)
+    return "\n".join(lines)
+
+
+class _BudgetExhausted(Exception):
+    """本批总预算用完：这一层没跑完，后续 URL 也不再发起请求。"""
+
+    def __init__(self, layer: str) -> None:
+        super().__init__(layer)
+        self.layer = layer
+
+
+class LinkPromptResolver:
+    """一批 URL 的两级降级解析（HTTP → 浏览器），产出提示词用的 LinkBlock。
+
+    服务端只有两层：T1 的 HTTP 抓取，失败（403/超时/挑战页/空白）才进 T2
+    的有头最小化浏览器渲染。「仍读不到」是模型侧的行为（websearch / 请对方
+    贴一段），服务端的职责到此为止。
+
+    ``resolver`` / ``renderer`` / ``clock`` 是测试注入点：分别需要
+    ``resolve(url) -> LinkResolution`` 与 ``render(url) -> BrowserResult``；
+    生产恒传 None（懒建真实实现，浏览器进程只在第一次需要时才起）。
+    """
+
+    def __init__(
+        self,
+        config: LinkConfig,
+        *,
+        resolver: Any = None,
+        renderer: Any = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self._config = config
+        self._resolver: Any = resolver if resolver is not None else LinkResolver(config)
+        self._renderer: Any = renderer
+        self._renderer_owned = False
+        self._clock: Callable[[], float] = clock or time.time
+
+    async def aclose(self) -> None:
+        """只关自己起的浏览器进程；注入进来的实现由调用方负责。"""
+        renderer = self._renderer
+        self._renderer = None
+        if self._renderer_owned and renderer is not None:
+            await renderer.aclose()
+
+    def _browser(self) -> Any:
+        if self._renderer is None:
+            # 运行时 import：links_browser 反向依赖本模块的抽取函数，写成静态 import
+            # 会构成模块环（basedpyright reportImportCycles），这里让依赖只在真要用
+            # 浏览器层时才解析。
+            module = importlib.import_module("dafeiyu.links_browser")
+            self._renderer = module.BrowserRenderer(self._config.browser)
+            self._renderer_owned = True
+        return self._renderer
+
+    async def resolve_for_prompt(self, urls: Sequence[str]) -> list[LinkBlock]:
+        """解析一批 URL：同一 URL 只解析一次，整批共用一个总预算。"""
+        if not self._config.enabled:
+            return []
+        unique = list(dict.fromkeys(_trim_url(url) for url in urls if url))
+        unique = [url for url in unique if url]
+        if not unique:
+            return []
+        budget = max(0.0, self._config.total_budget_seconds)
+        deadline = self._clock() + budget
+        blocks: list[LinkBlock] = []
+        exhausted = False
+        for url in unique:
+            if exhausted:
+                # 预算已用完：不发起任何新请求，直接按读不到处理。
+                blocks.append(_unreadable(url, "none", "budget_exhausted"))
+                continue
+            try:
+                blocks.append(await self._resolve_one(url, deadline))
+            except _BudgetExhausted as exc:
+                blocks.append(_unreadable(url, exc.layer, "budget_exhausted"))
+                exhausted = True
+        return blocks
+
+    async def _resolve_one(self, url: str, deadline: float) -> LinkBlock:
+        layer = "http"
+        try:
+            http = await self._within(self._resolver.resolve(url), deadline, layer)
+            if http.ok:
+                return LinkBlock(
+                    url=url, ok=True, title=http.title, text=http.text, reason="ok"
+                )
+            reason = http.reason or "http_error"
+            if not self._config.browser.enabled:
+                return _unreadable(url, "http", reason)
+            layer = "browser"
+            browser = await self._within(self._browser().render(url), deadline, layer)
+            if browser.ok:
+                return LinkBlock(
+                    url=url,
+                    ok=True,
+                    title=browser.title,
+                    text=browser.text,
+                    reason="ok",
+                )
+            return _unreadable(url, "browser", browser.reason or "browser_error")
+        except _BudgetExhausted:
+            raise
+        except Exception:  # noqa: BLE001 - 解析失败只降级，绝不挡回复主链路
+            return _unreadable(url, layer, "error")
+
+    async def _within(
+        self, coro: Awaitable[Any], deadline: float, layer: str
+    ) -> Any:
+        """等一层的结果，最多等到本批 deadline；超时归因为该层预算耗尽。"""
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise _BudgetExhausted(layer)
+        try:
+            return await asyncio.wait_for(coro, timeout=remaining)
+        except TimeoutError as exc:
+            raise _BudgetExhausted(layer) from exc
+
+
+async def resolve_for_prompt(
+    urls: Sequence[str],
+    config: LinkConfig | None = None,
+    *,
+    resolver: Any = None,
+    renderer: Any = None,
+    clock: Callable[[], float] | None = None,
+) -> list[LinkBlock]:
+    """便捷入口：建一个临时 LinkPromptResolver 并在结束时回收它起的浏览器。
+
+    需要跨批复用时（service 就是这样）请自己持有 ``LinkPromptResolver``
+    实例，否则每批都会重新起步。
+    """
+    engine = LinkPromptResolver(
+        config or LinkConfig(), resolver=resolver, renderer=renderer, clock=clock
+    )
+    try:
+        return await engine.resolve_for_prompt(urls)
+    finally:
+        await engine.aclose()

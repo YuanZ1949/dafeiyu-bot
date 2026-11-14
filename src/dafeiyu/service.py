@@ -34,6 +34,12 @@ from .gateway.base import Adapter
 from .hotconfig import WeChatRuntime, WeChatRuntimeView
 from .images import materialize
 from .keepalive import Keepalive
+from .links import (
+    LinkBlock,
+    LinkPromptResolver,
+    extract_urls,
+    render_link_block,
+)
 from .media import materialize_attachments
 from .memory import shared_facts
 from .memory.atmosphere import describe_atmosphere
@@ -483,6 +489,9 @@ class Service:
         self._inbound_reaction_at: dict[tuple[ChatType, str], float] = {}
         # 戳一戳的冷却/每日上限：测试可注入带假时钟的实例。
         self.poke_reactor = poke_reactor or PokeReactor(settings.social)
+        # 链接解析（T6）：懒建浏览器进程，跨批复用；测试可整体替换成假实现
+        # （只要它有 resolve_for_prompt(urls) 协程）。
+        self.link_resolver: Any = LinkPromptResolver(settings.link)
 
     def _adapter_for(self, chat_id: str) -> Adapter:
         """按会话 id 的通道前缀选适配器；单一派生点是 channel_of。"""
@@ -580,6 +589,12 @@ class Service:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
             self._scheduler_task = None
+        # 链接解析（T6）可能起过浏览器进程：停机时一并回收，别把窗口留在后台。
+        link_closer = getattr(self.link_resolver, "aclose", None)
+        if callable(link_closer):
+            closed = link_closer()
+            if inspect.isawaitable(closed):
+                await closed
         # mirror 必须晚于 outbox/keepalive/scheduler 停、早于 adapter 停：
         # 先停下会继续消费队列的 worker，避免它们向已断开的通道发送。
         if self.mirror is not None:
@@ -2264,6 +2279,9 @@ class Service:
 
         continuation = self._continuation_for(chat_type, chat_id)
         fact_hint = self._shared_fact_hint(chat_type, chat_id, batch)
+        # 链接解析挂在异步批处理层（不是同步的 _build_prompt）：总预算内能读
+        # 多少算多少，读不到的 URL 在同一块里标「服务器读不到」。
+        link_block = await self._link_block_for_prompt(chat_type, batch)
         prompt = self._build_prompt(
             chat_type,
             chat_id,
@@ -2271,6 +2289,7 @@ class Service:
             continuation=continuation,
             omitted=backlog,
             fact_hint=fact_hint,
+            link_block=link_block,
         )
 
         log.info(
@@ -3501,6 +3520,36 @@ class Service:
                     parts.append(f"这批是 {'、'.join(speakers)} 在说")
         return "【此刻】" + "；".join(parts) + "。"
 
+    async def _link_block_for_prompt(
+        self, chat_type: ChatType, messages: list[Message]
+    ) -> str | None:
+        """本批群友消息里的 URL → 【链接内容】块；没有链接就返回 None。
+
+        只解析群聊里非机器人发的消息（T6 规格）：机器人自己的消息、私聊与
+        其它来源都不解析。同一 URL 只解析一次（由 LinkPromptResolver 去重）。
+        解析失败不抛异常，最坏情况是整块「服务器读不到」，绝不挡回复主链路。
+        """
+        if chat_type is not ChatType.GROUP or not self.settings.link.enabled:
+            return None
+        urls: list[str] = []
+        for message in messages:
+            if message.is_bot or message.recalled_at or not message.content:
+                continue
+            urls.extend(extract_urls(message.content))
+        urls = list(dict.fromkeys(urls))
+        if not urls:
+            return None
+        resolver = self.link_resolver
+        resolve_many: Any = getattr(resolver, "resolve_for_prompt", None)
+        if resolve_many is None:
+            return None
+        try:
+            blocks = await resolve_many(urls)
+        except Exception:  # noqa: BLE001 - 链接是锦上添花，不能挡回复
+            log.warning("链接解析失败，按读不到处理", exc_info=True)
+            blocks = [LinkBlock(url=url, ok=False, reason="error") for url in urls]
+        return render_link_block(blocks) or None
+
     def _build_prompt(
         self,
         chat_type: ChatType,
@@ -3510,6 +3559,7 @@ class Service:
         continuation: str | None = None,
         omitted: int = 0,
         fact_hint: str | None = None,
+        link_block: str | None = None,
         now: Any = None,
     ) -> str:
         """三种模式共用的 prompt：长期记忆注入 + 时间线（单条也走这里）。"""
@@ -3613,6 +3663,15 @@ class Service:
                 f"{injection}\n\n{other_at_hint}"
                 if injection.strip()
                 else other_at_hint
+            )
+
+        # 【链接内容】是整段注入的第一块：位置在【本批】之后、其它注入块之前。
+        # 必须在所有「往前缀加」的块之后再做，否则会被【此刻】等块挤到后面。
+        if link_block and link_block.strip():
+            injection = (
+                f"{link_block.strip()}\n\n{injection}"
+                if injection.strip()
+                else link_block.strip()
             )
 
         reply_ids = [
