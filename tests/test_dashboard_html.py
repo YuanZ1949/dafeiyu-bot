@@ -609,3 +609,115 @@ def test_html_timeline_bubbles_carry_the_channel() -> None:
     assert "channelOfId(timelineTarget.chat_id)" in html
 
 
+# ------------------------------------------------------ 分区信息架构契约
+
+PANE_IDS = (
+    "pane-overview",
+    "pane-memory",
+    "pane-chats",
+    "pane-delivery",
+    "pane-config",
+    "pane-logs",
+)
+
+
+def main_block() -> str:
+    html = read_html()
+    return html[html.index("<main>") : html.index("</main>")]
+
+
+def pane_blocks() -> dict[str, str]:
+    """按 id 切出每个分区的内部 markup（含嵌套的卡片 section）。"""
+    main = main_block()
+    panes: dict[str, str] = {}
+    for match in re.finditer(r'<section class="pane" id="(pane-[a-z]+)">', main):
+        depth = 1
+        pos = match.end()
+        while depth:
+            open_at = main.find("<section", pos)
+            close_at = main.find("</section>", pos)
+            assert close_at != -1, f"{match.group(1)} 的 </section> 没闭合"
+            if open_at != -1 and open_at < close_at:
+                depth += 1
+                pos = open_at + len("<section")
+            else:
+                depth -= 1
+                pos = close_at + len("</section>")
+        panes[match.group(1)] = main[match.end() : close_at]
+    return panes
+
+
+def test_html_is_split_into_six_panes() -> None:
+    panes = pane_blocks()
+    assert tuple(panes) == PANE_IDS
+
+
+def test_html_each_pane_holds_at_least_one_card() -> None:
+    for pane_id, body in pane_blocks().items():
+        assert '<section class="card' in body, f"{pane_id} 里没有卡片"
+
+
+def test_html_every_card_belongs_to_exactly_one_pane() -> None:
+    """分区只加一层壳：卡片不重复、不丢失，卡片 id 一个都不改。"""
+    main = main_block()
+    in_main = len(re.findall(r'<section class="card', main))
+    in_panes = sum(
+        len(re.findall(r'<section class="card', body)) for body in pane_blocks().values()
+    )
+    assert in_main == in_panes == 22
+    assert 'id="processes"' in main
+    # 卡片自己的 id 仍然原样在（分区不改 id，只加壳）。
+    for card_id in (
+        "health-card",
+        "decisions-card",
+        "alerts-card",
+        "backups-card",
+        "security-card",
+        "brain-card",
+        "evals-card",
+        "trigger-debug",
+        "batch-preview",
+    ):
+        assert f'id="{card_id}"' in main
+
+
+def test_html_pane_nav_jumps_to_every_pane() -> None:
+    html = read_html()
+    nav = html[html.index('<nav class="pane-nav"') : html.index("</nav>")]
+    assert 'id="pane-nav"' in nav
+    targets = re.findall(r'data-pane="(pane-[a-z]+)"', nav)
+    assert tuple(targets) == PANE_IDS
+    assert nav.count("<button") == 6
+    assert 'aria-current="true"' in nav
+    # 点击跳转 + 滚动联动，必须都在 initPaneNav 自己的函数体里。
+    match = re.search(r"function initPaneNav\(\) \{(.*?)\n\}", html, re.DOTALL)
+    assert match is not None, "initPaneNav 必须是一段可直接断言的函数体"
+    body = match.group(1)
+    assert 'pane.scrollIntoView({ behavior: "smooth", block: "start" })' in body
+    assert "new IntersectionObserver" in body
+    assert "aria-current" in body
+    assert "initPaneNav();" in html
+
+
+def test_html_card_spacing_tokens_are_shared() -> None:
+    style = style_block()
+    root = token_block(style, ":root")
+    for token in ("--card-pad:", "--card-radius:", "--card-gap:"):
+        assert token in root
+    card = css_rule(style, ".card")
+    assert "padding: var(--card-pad)" in card
+    assert "border-radius: var(--card-radius)" in card
+    assert "gap: var(--card-gap)" in css_rule(style, ".grid-2")
+    assert "gap: var(--card-gap)" in css_rule(style, ".grid-3")
+    assert "gap: var(--card-gap)" in style
+    assert "var(--card-gap)" in css_rule(style, ".card-head")
+    assert "var(--card-gap)" in css_rule(style, ".card-toolbar")
+    pane = css_rule(style, ".pane")
+    assert "gap: var(--card-gap)" in pane
+    # 分区导航吸在 sticky 顶栏下面，高度用 JS 量出来的变量。
+    nav = css_rule(style, ".pane-nav")
+    assert "position: sticky" in nav
+    assert "top: var(--header-h" in nav
+
+
+

@@ -51,6 +51,10 @@
     --w-user: 140px;
     --w-token: 180px;
     --w-confirm: 190px;
+    /* 卡片与间距 token：同一分区内的卡片内边距、圆角、间距共用一套数值 */
+    --card-pad: 14px;
+    --card-radius: 10px;
+    --card-gap: 14px;
   }
   /* 浅色主题：与 :root 的调色板令牌一一对应（尺寸令牌共用，不重复）。
      正文对白底对比度 ≥ 4.5:1，边框与面板保持可分辨。默认仍是深色。 */
@@ -133,26 +137,50 @@
   .btn.danger { background: var(--danger-deep); border-color: var(--danger-deep); }
   .btn:disabled { opacity: .7; cursor: not-allowed; }
 .btn[data-busy="1"] { opacity: .55; pointer-events: none; cursor: progress; }
-  main { margin: 0 auto; padding: 16px 20px 40px; display: grid; gap: 16px; max-width: 1400px; }
+  main { margin: 0 auto; padding: 16px 20px 40px; display: grid; gap: var(--card-gap); max-width: 1400px; }
   @media (min-width: 1280px) {
     main { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
     .span-full { grid-column: 1 / -1; }
   }
-  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
-  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--card-gap); }
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--card-gap); }
   .card {
     background: var(--panel);
     border: 1px solid var(--line);
-    border-radius: 10px;
-    padding: 16px;
+    border-radius: var(--card-radius);
+    padding: var(--card-pad);
   }
+  /* 分区：每个分区占满整行，内部再按两列排版；一张卡片只归属一个分区。
+     scroll-margin-top 让「跳转分区」不会把标题藏在 sticky 顶栏 + 导航下面。 */
+  .pane {
+    display: grid; gap: var(--card-gap); grid-column: 1 / -1;
+    scroll-margin-top: calc(var(--header-h, 0px) + 52px);
+  }
+  @media (min-width: 1280px) {
+    .pane { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  }
+  .pane-title {
+    grid-column: 1 / -1; margin: 0;
+    padding-bottom: 6px; border-bottom: 1px solid var(--line);
+    font-size: var(--fs-sm); font-weight: 600; letter-spacing: .08em;
+    color: var(--muted);
+  }
+  /* 分区导航：顶栏之下再吸一条，只做锚点跳转，不隐藏任何卡片。 */
+  .pane-nav {
+    position: sticky; top: var(--header-h, 0px); z-index: 4;
+    display: flex; gap: 8px; overflow-x: auto;
+    padding: 8px 20px;
+    background: var(--bg); border-bottom: 1px solid var(--line);
+  }
+  .pane-nav .btn { flex: 0 0 auto; }
+  .pane-nav .btn.active { border-color: var(--accent); background: var(--mode-active); }
   .card h2 { margin: 0; font-size: var(--fs-md); color: var(--muted); font-weight: 600; letter-spacing: .04em; }
   .card > h2 { margin: 0 0 12px; }
   .card h3 { margin: 0; font-size: var(--fs-sm); color: var(--muted); font-weight: 600; letter-spacing: .04em; }
   .card > h3 { margin: 0 0 8px; }
   .card > h3.gap-top { margin: 12px 0 8px; }
-  .card-head { margin-bottom: 12px; }
-  .card-toolbar { margin-bottom: 12px; }
+  .card-head { margin-bottom: var(--card-gap); }
+  .card-toolbar { margin-bottom: var(--card-gap); }
   .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .w-id { width: var(--w-id); }
   .w-sid { width: var(--w-sid); }
@@ -592,6 +620,9 @@
     .global-banner, .warn { padding: 8px 12px; }
     main { padding: 10px 10px 32px; gap: 10px; }
     .card { padding: 12px; border-radius: 8px; }
+    /* 手机上顶栏本来就随页面滚走，分区导航直接吸顶，不留 --header-h 的空隙。 */
+    .pane-nav { top: 0; padding: 8px 10px; }
+    .pane { scroll-margin-top: 52px; }
     /* 这三处 minmax 的下限大于窄屏可用宽度，必须显式收成单列，否则会横向溢出。 */
     .grid-2, .grid-3, .mem-grid { grid-template-columns: 1fr; }
     .grow { flex-basis: 100%; min-width: 0; }
@@ -642,582 +673,616 @@
 </div>
 <div class="global-banner" id="global-banner" role="status" hidden></div>
 
+<nav class="pane-nav" id="pane-nav" aria-label="面板分区导航">
+  <button type="button" class="btn active" data-pane="pane-overview" aria-current="true">总览</button>
+  <button type="button" class="btn" data-pane="pane-memory">记忆</button>
+  <button type="button" class="btn" data-pane="pane-chats">会话</button>
+  <button type="button" class="btn" data-pane="pane-delivery">投递</button>
+  <button type="button" class="btn" data-pane="pane-config">配置</button>
+  <button type="button" class="btn" data-pane="pane-logs">日志</button>
+</nav>
+
 <main>
-  <section class="grid-3 span-full" id="processes"></section>
+  <section class="pane" id="pane-overview">
+    <h2 class="pane-title">总览</h2>
 
-  <section class="card">
-    <h2>登录二维码</h2>
-    <div class="row card-head">
-      <span class="pill st-stopped" id="login-state"><span class="dot"></span>登录状态未知</span>
-      <span class="kv" id="login-hint"></span>
-    </div>
-    <div id="qr-wrap">
-      <img id="qr" alt="登录二维码" class="empty" />
-      <div id="qr-placeholder">暂无二维码<br />NapCat 需要登录时会自动出现</div>
-      <div>
-        <div class="kv" id="qr-meta">—</div>
-        <div class="kv mt-2">扫码后会自动刷新，过期二维码会标黄。</div>
+    <section class="grid-3 span-full" id="processes"></section>
+
+    <section class="card">
+      <h2>登录二维码</h2>
+      <div class="row card-head">
+        <span class="pill st-stopped" id="login-state"><span class="dot"></span>登录状态未知</span>
+        <span class="kv" id="login-hint"></span>
       </div>
-    </div>
-  </section>
-
-  <section class="card" id="health-card">
-    <div class="row card-head">
-      <h2>健康总览</h2>
-      <span class="pill st-stopped" id="health-state"><span class="dot"></span>加载中</span>
-      <span class="kv" id="health-hint"></span>
-      <span class="spacer"></span>
-      <button class="btn" id="btn-refresh-health">刷新</button>
-    </div>
-    <div class="kv cfg-grid" id="health-body"></div>
-    <div class="grid-2" id="health-channels"></div>
-    <div class="row" id="wechat-kill-row">
-      <span class="kv" id="wechat-kill-hint">急停只停微信轮询，QQ 不受影响</span>
-      <span class="spacer"></span>
-      <button class="btn danger" id="btn-wechat-stop" data-channel="wechat">微信急停</button>
-      <button class="btn" id="btn-wechat-resume" data-channel="wechat">恢复轮询</button>
-    </div>
-  </section>
-
-  <section class="card span-full" id="decisions-card">
-    <div class="row card-head">
-      <h2>决策流</h2>
-      <span class="kv" id="decisions-hint"></span>
-      <span class="spacer"></span>
-      <span class="kv" id="decisions-updated"></span>
-    </div>
-    <div class="row decision-stats" id="decisions-stats"></div>
-    <div class="row card-toolbar" id="decision-filters" role="group" aria-label="按决策结果筛选">
-      <button type="button" class="tab active" data-filter="" aria-pressed="true">全部</button>
-      <button type="button" class="tab" data-filter="replied" aria-pressed="false">回复</button>
-      <button type="button" class="tab" data-filter="silent" aria-pressed="false">沉默</button>
-      <button type="button" class="tab" data-filter="blocked" aria-pressed="false">拦截</button>
-      <button type="button" class="tab" data-filter="held" aria-pressed="false">攒着</button>
-      <button type="button" class="tab" data-filter="error" aria-pressed="false">错误</button>
-    </div>
-    <div class="decision-list" id="decisions-list"></div>
-  </section>
-
-  <section class="card" id="alerts-card">
-    <div class="row card-head">
-      <h2>告警事件</h2>
-      <span class="kv" id="alerts-hint">暂无活动事件</span>
-      <span class="spacer"></span>
-      <button class="btn" id="btn-test-alert">测试告警</button>
-      <button class="btn" id="btn-refresh-alerts">刷新</button>
-    </div>
-    <div class="mem-list list-h-lg" id="alerts-list"></div>
-  </section>
-
-  <section class="card" id="backups-card">
-    <div class="row card-head">
-      <h2>备份与恢复</h2>
-      <span class="kv" id="backups-hint"></span>
-      <span class="spacer"></span>
-      <button class="btn primary" id="btn-backup-now">立即备份</button>
-      <button class="btn" id="btn-refresh-backups">刷新</button>
-    </div>
-    <div class="row card-toolbar">
-      <input id="backup-restore-file" type="file" accept=".db,application/octet-stream" aria-label="选择要恢复的备份文件" />
-      <input id="backup-restore-confirm" class="w-token" placeholder="输入 RESTORE 确认" aria-label="输入 RESTORE 确认以启用恢复" />
-      <button class="btn" id="btn-backup-restore">上传并恢复</button>
-    </div>
-    <div class="mem-list list-h-md" id="backup-list"></div>
-    <h3 class="gap-top">审计日志</h3>
-    <div class="mem-list list-h-md" id="audit-list"></div>
-  </section>
-
-  <section class="card" id="security-card">
-    <div class="row card-head">
-      <h2>安全</h2>
-      <span class="kv" id="rotate-token-status">轮换控制口令会立即重启 Bot，旧口令立即失效</span>
-    </div>
-    <div class="row">
-      <input id="rotate-token-confirm" class="w-token" placeholder="输入 ROTATE 确认" aria-label="输入 ROTATE 确认以启用轮换" />
-      <button class="btn danger" id="btn-rotate-token">轮换控制口令</button>
-    </div>
-    <div class="kv mt-2">轮换后 Bot 会用新口令重启；任一步失败会保留旧口令。</div>
-  </section>
-
-  <section class="card" id="brain-card">
-    <div class="row card-head">
-      <h2>大脑模式</h2>
-      <span class="spacer"></span>
-      <span class="kv" id="brain-hint"></span>
-    </div>
-    <div class="brain-modes" id="modes" role="radiogroup" aria-label="大脑模式">
-      <button type="button" class="mode-card" data-mode="free" role="radio" aria-checked="true" tabindex="0">
-        <span class="mode-num">01</span>
-        <span class="mode-name">免费额度</span>
-        <span class="mode-need">无需配置</span>
-        <span class="mode-check" aria-hidden="true">✓</span>
-      </button>
-      <button type="button" class="mode-card" data-mode="key" role="radio" aria-checked="false" tabindex="-1">
-        <span class="mode-num">02</span>
-        <span class="mode-name">自备 Key</span>
-        <span class="mode-need">自备 API Key</span>
-        <span class="mode-check" aria-hidden="true">✓</span>
-      </button>
-      <button type="button" class="mode-card" data-mode="local_model" role="radio" aria-checked="false" tabindex="-1">
-        <span class="mode-num">03</span>
-        <span class="mode-name">本地模型</span>
-        <span class="mode-need">本地 LM Studio</span>
-        <span class="mode-check" aria-hidden="true">✓</span>
-      </button>
-    </div>
-    <div class="brain-fields" data-mode-fields="free">
-      <div class="brain-free-note">使用内置免费模型，不需要填写任何配置。想用自己的端点，切到另外两档。</div>
-    </div>
-    <div class="brain-fields" data-mode-fields="key" hidden>
-      <label class="field">
-        <span>接口地址</span>
-        <input id="key-base-url" type="text" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false" />
-      </label>
-      <label class="field">
-        <span>模型</span>
-        <input id="key-model" type="text" placeholder="留空 = 自动选 flash" autocomplete="off" spellcheck="false" />
-      </label>
-      <label class="field field-wide">
-        <span>API Key</span>
-        <input id="key-api-key" type="password" placeholder="输入 API Key" autocomplete="new-password" />
-        <span class="field-note">Key 单独保存在本机，不会回显，也不会用于本地模型档。</span>
-      </label>
-    </div>
-    <div class="brain-fields" data-mode-fields="local_model" hidden>
-      <div class="field field-wide">
-        <span>接口地址</span>
-        <div class="field-row">
-          <input id="local-base-url" type="text" placeholder="http://127.0.0.1:1234/v1" autocomplete="off" spellcheck="false" />
-          <button class="btn" id="probe-btn" type="button">探测模型</button>
+      <div id="qr-wrap">
+        <img id="qr" alt="登录二维码" class="empty" />
+        <div id="qr-placeholder">暂无二维码<br />NapCat 需要登录时会自动出现</div>
+        <div>
+          <div class="kv" id="qr-meta">—</div>
+          <div class="kv mt-2">扫码后会自动刷新，过期二维码会标黄。</div>
         </div>
-        <span class="probe-status" id="probe-status" role="status" aria-live="polite"></span>
       </div>
-      <label class="field">
-        <span>模型</span>
-        <select id="local-model-select" aria-label="本地模型列表">
-          <option value="">先探测模型</option>
-        </select>
-      </label>
-      <label class="field">
-        <span>上下文窗口</span>
-        <input id="local-context" type="number" min="0" step="1024" inputmode="numeric" placeholder="留空使用默认" />
-        <span class="field-note" id="context-hint">留空使用默认；0 也表示默认。</span>
-      </label>
-      <label class="field">
-        <span>访问令牌（可选）</span>
-        <input id="local-api-key" type="password" placeholder="访问令牌（可选）" autocomplete="new-password" />
-        <span class="field-note">令牌单独保存，不会复用自备 Key；只有需要鉴权的本地网关才填。</span>
-      </label>
-      <label class="field-check">
-        <input id="local-lean" type="checkbox" />
-        精简模式（只回话，不调用工具）
-      </label>
-    </div>
-    <div class="brain-actions">
-      <button class="btn primary" id="btn-apply-brain">应用切换</button>
-      <span class="kv">切换会重新生成 opencode 配置</span>
-    </div>
-    <div class="brain-status" id="brain-status" role="status" aria-live="polite" hidden></div>
+    </section>
+
+    <section class="card" id="health-card">
+      <div class="row card-head">
+        <h2>健康总览</h2>
+        <span class="pill st-stopped" id="health-state"><span class="dot"></span>加载中</span>
+        <span class="kv" id="health-hint"></span>
+        <span class="spacer"></span>
+        <button class="btn" id="btn-refresh-health">刷新</button>
+      </div>
+      <div class="kv cfg-grid" id="health-body"></div>
+      <div class="grid-2" id="health-channels"></div>
+      <div class="row" id="wechat-kill-row">
+        <span class="kv" id="wechat-kill-hint">急停只停微信轮询，QQ 不受影响</span>
+        <span class="spacer"></span>
+        <button class="btn danger" id="btn-wechat-stop" data-channel="wechat">微信急停</button>
+        <button class="btn" id="btn-wechat-resume" data-channel="wechat">恢复轮询</button>
+      </div>
+    </section>
+
+    <section class="card" id="alerts-card">
+      <div class="row card-head">
+        <h2>告警事件</h2>
+        <span class="kv" id="alerts-hint">暂无活动事件</span>
+        <span class="spacer"></span>
+        <button class="btn" id="btn-test-alert">测试告警</button>
+        <button class="btn" id="btn-refresh-alerts">刷新</button>
+      </div>
+      <div class="mem-list list-h-lg" id="alerts-list"></div>
+    </section>
   </section>
 
-  <section class="card span-full">
-    <div class="row card-head">
-      <h2>记忆</h2>
-      <span class="kv" id="memory-hint"></span>
-      <span class="spacer"></span>
-      <select id="memory-chat-filter" title="按会话类型筛选" aria-label="按会话类型筛选">
-        <option value="">全部会话</option>
-        <option value="group">只看群聊</option>
-        <option value="private">只看私聊</option>
-      </select>
-    </div>
-    <div class="row card-toolbar">
-      <label class="kv" for="summary-date">摘要日期</label>
-      <input id="summary-date" type="date" class="w-id" title="默认昨天，可自选" aria-label="摘要日期" />
-      <button class="btn" id="btn-merge-impressions" disabled>合并所选</button>
-      <button class="btn" id="btn-more-memory">显示更多</button>
-      <button class="btn" id="btn-refresh-memory">刷新</button>
-    </div>
-    <details id="memory-advanced">
-      <summary class="kv">高级：手动指定会话 ID</summary>
+  <section class="pane" id="pane-memory">
+    <h2 class="pane-title">记忆</h2>
+
+    <section class="card span-full">
+      <div class="row card-head">
+        <h2>记忆</h2>
+        <span class="kv" id="memory-hint"></span>
+        <span class="spacer"></span>
+        <select id="memory-chat-filter" title="按会话类型筛选" aria-label="按会话类型筛选">
+          <option value="">全部会话</option>
+          <option value="group">只看群聊</option>
+          <option value="private">只看私聊</option>
+        </select>
+      </div>
       <div class="row card-toolbar">
-        <select id="memory-target-type" title="手动触发目标的会话类型" aria-label="手动触发目标的会话类型">
+        <label class="kv" for="summary-date">摘要日期</label>
+        <input id="summary-date" type="date" class="w-id" title="默认昨天，可自选" aria-label="摘要日期" />
+        <button class="btn" id="btn-merge-impressions" disabled>合并所选</button>
+        <button class="btn" id="btn-more-memory">显示更多</button>
+        <button class="btn" id="btn-refresh-memory">刷新</button>
+      </div>
+      <details id="memory-advanced">
+        <summary class="kv">高级：手动指定会话 ID</summary>
+        <div class="row card-toolbar">
+          <select id="memory-target-type" title="手动触发目标的会话类型" aria-label="手动触发目标的会话类型">
+            <option value="group">群聊</option>
+            <option value="private">私聊</option>
+          </select>
+          <input id="memory-chat-id" placeholder="会话 ID（数字或 wxg:…）" class="w-id" title="手动触发用的会话 ID" aria-label="手动触发用的会话 ID" />
+          <button class="btn" id="btn-summarize">按 ID 生成摘要</button>
+          <button class="btn" id="btn-extract">按 ID 抽取印象</button>
+        </div>
+      </details>
+      <div class="kv" id="memory-health" role="status" aria-live="polite"></div>
+      <div class="row" id="memory-unblock-row" hidden>
+        <button class="btn" id="btn-memory-unblock">解除熔断</button>
+      </div>
+      <div class="mem-grid">
+        <div class="mem-col">
+          <h3>按日摘要</h3>
+          <div class="mem-list" id="memory-summaries"></div>
+        </div>
+        <div class="mem-col">
+          <h3>群印象</h3>
+          <div class="mem-list" id="memory-impressions"></div>
+        </div>
+      </div>
+      <form class="row delete-user-form" id="delete-user-form">
+        <span class="kv w-label">按用户删除</span>
+        <select id="delete-user-chat-type" title="会话类型" aria-label="要删除的会话类型">
           <option value="group">群聊</option>
           <option value="private">私聊</option>
         </select>
-        <input id="memory-chat-id" placeholder="会话 ID（数字或 wxg:…）" class="w-id" title="手动触发用的会话 ID" aria-label="手动触发用的会话 ID" />
-        <button class="btn" id="btn-summarize">按 ID 生成摘要</button>
-        <button class="btn" id="btn-extract">按 ID 抽取印象</button>
-      </div>
-    </details>
-    <div class="kv" id="memory-health" role="status" aria-live="polite"></div>
-    <div class="row" id="memory-unblock-row" hidden>
-      <button class="btn" id="btn-memory-unblock">解除熔断</button>
-    </div>
-    <div class="mem-grid">
-      <div class="mem-col">
-        <h3>按日摘要</h3>
-        <div class="mem-list" id="memory-summaries"></div>
-      </div>
-      <div class="mem-col">
-        <h3>群印象</h3>
-        <div class="mem-list" id="memory-impressions"></div>
-      </div>
-    </div>
-    <form class="row delete-user-form" id="delete-user-form">
-      <span class="kv w-label">按用户删除</span>
-      <select id="delete-user-chat-type" title="会话类型" aria-label="要删除的会话类型">
-        <option value="group">群聊</option>
-        <option value="private">私聊</option>
-      </select>
-      <input id="delete-user-chat-id" placeholder="会话 ID（数字或 wxg:…）" class="w-id" aria-label="要删除的会话 ID" />
-      <input id="delete-user-id" placeholder="用户 ID（QQ 号或 wxg:…）" class="w-user" aria-label="要删除的用户 QQ 号" />
-      <input id="delete-user-confirm" class="w-confirm" placeholder="输入 DELETE_USER 确认" aria-label="输入 DELETE_USER 确认以启用删除" />
-      <button class="btn danger" type="submit" id="btn-delete-user">删除该用户消息</button>
-      <span class="kv" id="delete-user-status"></span>
-    </form>
-    <div class="kv mt-2">只删除该用户在本会话的原始消息；摘要与印象等聚合数据可能仍保留痕迹，操作不可撤销。如需彻底重建，请联系管理员执行 /forget。</div>
-  </section>
+        <input id="delete-user-chat-id" placeholder="会话 ID（数字或 wxg:…）" class="w-id" aria-label="要删除的会话 ID" />
+        <input id="delete-user-id" placeholder="用户 ID（QQ 号或 wxg:…）" class="w-user" aria-label="要删除的用户 QQ 号" />
+        <input id="delete-user-confirm" class="w-confirm" placeholder="输入 DELETE_USER 确认" aria-label="输入 DELETE_USER 确认以启用删除" />
+        <button class="btn danger" type="submit" id="btn-delete-user">删除该用户消息</button>
+        <span class="kv" id="delete-user-status"></span>
+      </form>
+      <div class="kv mt-2">只删除该用户在本会话的原始消息；摘要与印象等聚合数据可能仍保留痕迹，操作不可撤销。如需彻底重建，请联系管理员执行 /forget。</div>
+    </section>
 
-  <section class="card span-full">
-    <div class="row card-head">
-      <h2>用量趋势</h2>
-      <span class="kv" id="usage-hint"></span>
-      <span class="spacer"></span>
-      <select id="usage-days" title="统计区间" aria-label="统计区间">
-        <option value="7">近 7 天</option>
-        <option value="14">近 14 天</option>
-        <option value="30">近 30 天</option>
-      </select>
-      <button class="btn" id="btn-refresh-usage">刷新</button>
-    </div>
-    <div class="usage-grid">
-      <div>
-        <div class="usage-bars" id="usage-bars"></div>
-        <div class="usage-legend">
-          <span class="legend-key"><span class="legend-seg"></span>回复</span>
-          <span class="legend-key"><span class="legend-seg err"></span>错误</span>
-        </div>
-        <div class="row kv usage-totals" id="usage-totals"></div>
-        <div class="budget-panel" id="budget-panel">
-          <div class="row budget-head">
-            <h3>预算</h3>
-            <span class="kv">估算 · 上海时区</span>
-            <span class="spacer"></span>
-            <select id="budget-chat-type" title="会话类型" class="select-compact" aria-label="预算统计的会话类型">
-              <option value="group">群聊</option>
-              <option value="private">私聊</option>
-            </select>
-            <input id="budget-chat-id" value="1" class="w-id" title="会话 ID" aria-label="预算统计的会话 ID" />
-            <button class="btn" id="btn-budget-refresh">刷新</button>
+    <section class="card span-full">
+      <div class="row card-head">
+        <h2>用量趋势</h2>
+        <span class="kv" id="usage-hint"></span>
+        <span class="spacer"></span>
+        <select id="usage-days" title="统计区间" aria-label="统计区间">
+          <option value="7">近 7 天</option>
+          <option value="14">近 14 天</option>
+          <option value="30">近 30 天</option>
+        </select>
+        <button class="btn" id="btn-refresh-usage">刷新</button>
+      </div>
+      <div class="usage-grid">
+        <div>
+          <div class="usage-bars" id="usage-bars"></div>
+          <div class="usage-legend">
+            <span class="legend-key"><span class="legend-seg"></span>回复</span>
+            <span class="legend-key"><span class="legend-seg err"></span>错误</span>
           </div>
-          <div class="budget-chat" id="budget-chat">填写会话 ID 后加载预算</div>
-          <div class="budget-metric" id="budget-global"></div>
-          <div class="budget-metric" id="budget-monthly"></div>
-          <div class="budget-metric" id="budget-cost"></div>
-          <div class="budget-warnings" id="budget-warnings"></div>
+          <div class="row kv usage-totals" id="usage-totals"></div>
+          <div class="budget-panel" id="budget-panel">
+            <div class="row budget-head">
+              <h3>预算</h3>
+              <span class="kv">估算 · 上海时区</span>
+              <span class="spacer"></span>
+              <select id="budget-chat-type" title="会话类型" class="select-compact" aria-label="预算统计的会话类型">
+                <option value="group">群聊</option>
+                <option value="private">私聊</option>
+              </select>
+              <input id="budget-chat-id" value="1" class="w-id" title="会话 ID" aria-label="预算统计的会话 ID" />
+              <button class="btn" id="btn-budget-refresh">刷新</button>
+            </div>
+            <div class="budget-chat" id="budget-chat">填写会话 ID 后加载预算</div>
+            <div class="budget-metric" id="budget-global"></div>
+            <div class="budget-metric" id="budget-monthly"></div>
+            <div class="budget-metric" id="budget-cost"></div>
+            <div class="budget-warnings" id="budget-warnings"></div>
+          </div>
+        </div>
+        <div>
+          <h3>回复最多的会话</h3>
+          <div class="mem-list list-h-sm" id="usage-top"></div>
+          <h3 class="gap-top">最近错误</h3>
+          <div class="mem-list list-h-sm" id="usage-errors"></div>
         </div>
       </div>
-      <div>
-        <h3>回复最多的会话</h3>
-        <div class="mem-list list-h-sm" id="usage-top"></div>
-        <h3 class="gap-top">最近错误</h3>
-        <div class="mem-list list-h-sm" id="usage-errors"></div>
+    </section>
+
+    <section class="card span-full" id="evals-card">
+      <div class="row card-head">
+        <h2>黄金集趋势</h2>
+        <span class="kv" id="evals-hint">最近 10 次评测（只读）</span>
       </div>
-    </div>
-  </section>
+      <div class="mem-list" id="evals-list"></div>
+    </section>
 
-  <section class="card span-full" id="evals-card">
-    <div class="row card-head">
-      <h2>黄金集趋势</h2>
-      <span class="kv" id="evals-hint">最近 10 次评测（只读）</span>
-    </div>
-    <div class="mem-list" id="evals-list"></div>
-  </section>
-
-  <section class="card span-full">
-    <div class="row card-head">
-      <h2>记忆搜索</h2>
-      <span class="kv" id="search-hint"></span>
-    </div>
-    <div class="row card-toolbar">
-      <input id="search-q" class="grow" placeholder="搜聊天记录里的关键词…" aria-label="搜索聊天记录的关键词" />
-      <select id="search-chat-filter" aria-label="按会话类型筛选搜索结果">
-        <option value="">全部会话</option>
-        <option value="group">只看群聊</option>
-        <option value="private">只看私聊</option>
-      </select>
-      <input id="search-chat-id" placeholder="会话 ID（可选）" class="w-sid" aria-label="限定搜索的会话 ID（可选）" />
-      <button class="btn primary" id="btn-search">搜索</button>
-      <button class="btn" id="btn-search-more" disabled>更多</button>
-    </div>
-    <div class="mem-list list-h-xl" id="search-results"></div>
-  </section>
-
-  <section class="card span-full">
-    <div class="row card-head">
-      <h2>会话管理</h2>
-      <span class="kv" id="sessions-hint"></span>
-      <span class="spacer"></span>
-      <button class="btn" id="btn-sessions-more" disabled>加载更多</button>
-      <button class="btn" id="btn-refresh-sessions">刷新</button>
-    </div>
-    <div class="session-list" id="sessions"></div>
-  </section>
-
-  <section class="card span-full" id="trigger-debug">
-    <div class="row card-head">
-      <h2>触发规则调试器</h2>
-      <span class="kv" id="debug-hint">只读模拟 · 不会发送到会话</span>
-      <span class="spacer"></span>
-      <button class="btn primary" id="btn-debug-trigger">模拟判定</button>
-    </div>
-    <div class="debug-form">
-      <label>会话类型
-        <select id="debug-chat-type">
-          <option value="group">群聊</option>
-          <option value="private">私聊</option>
-        </select>
-      </label>
-      <label>会话 ID
-        <input id="debug-chat-id" value="1" />
-      </label>
-      <label>用户 ID
-        <input id="debug-user-id" value="2" />
-      </label>
-      <label>昵称
-        <input id="debug-nickname" maxlength="40" value="调试用户" />
-      </label>
-      <label class="debug-wide">消息
-        <textarea id="debug-content" rows="2" placeholder="输入一条模拟消息，例如：大肥鱼在吗"></textarea>
-      </label>
-    </div>
-    <div class="row debug-switches">
-      <label><input type="checkbox" id="debug-at-bot" /> @ 机器人</label>
-      <label><input type="checkbox" id="debug-reply-bot" /> 引用回复机器人</label>
-    </div>
-    <div class="kv debug-note">不写消息、不调模型、不消耗预算/冷却、不动调度器</div>
-    <div id="debug-result" hidden aria-live="polite">
-      <div class="debug-verdict" id="debug-verdict"></div>
-      <div class="kv mt-2" id="debug-reason"></div>
-      <div class="debug-checks" id="debug-checks"></div>
-      <div class="debug-metrics" id="debug-metrics"></div>
-    </div>
-  </section>
-
-  <section class="card span-full" id="batch-preview">
-    <div class="row card-head">
-      <h2>批次预览</h2>
-      <span class="kv" id="batch-hint">只读预览 · 不会调用模型</span>
-      <span class="spacer"></span>
-      <button class="btn primary" id="btn-batch-preview">预览</button>
-    </div>
-    <div class="debug-form">
-      <label>会话类型
-        <select id="batch-chat-type">
-          <option value="group">群聊</option>
-          <option value="private">私聊</option>
-        </select>
-      </label>
-      <label>会话 ID
-        <input id="batch-chat-id" value="1" />
-      </label>
-    </div>
-    <div class="kv debug-note">取当前待投批次、预算判定与最终 prompt；不写库、不发消息、不动调度器</div>
-    <div id="batch-result" hidden aria-live="polite">
-      <div class="debug-verdict" id="batch-budget"></div>
-      <div class="debug-metrics" id="batch-stats"></div>
-      <div class="debug-checks" id="batch-messages"></div>
-      <div class="row mt-2">
-        <button class="btn" id="btn-batch-toggle-prompt">显示最终 prompt</button>
-        <span class="kv" id="batch-prompt-hint"></span>
+    <section class="card span-full">
+      <div class="row card-head">
+        <h2>记忆搜索</h2>
+        <span class="kv" id="search-hint"></span>
       </div>
-      <pre class="batch-prompt" id="batch-prompt" hidden></pre>
-    </div>
-  </section>
-
-  <section class="card">
-    <div class="row card-head">
-      <h2>运行配置</h2>
-      <span class="kv" id="config-hint">只读</span>
-      <span class="spacer"></span>
-      <button class="btn" id="btn-backup">下载备份</button>
-      <button class="btn" id="btn-refresh-config">刷新</button>
-    </div>
-    <div class="kv cfg-grid" id="config-body"></div>
-  </section>
-
-  <section class="card">
-    <div class="row card-head">
-      <h2>微信账号</h2>
-      <span class="kv" id="wechat-account-hint">保存后重启生效</span>
-      <span class="spacer"></span>
-      <button class="btn" id="btn-refresh-wechat-account">刷新</button>
-      <button class="btn primary" id="btn-save-wechat-account">保存</button>
-    </div>
-    <div class="debug-form">
-      <label class="debug-wide">机器人微信账号（wxid）
-        <input type="text" id="wechat-account" placeholder="例如 wxid_516rht3txzox22；留空 = 仅一个账号登录时自动识别" />
-      </label>
-    </div>
-    <div class="kv" style="margin-top:8px">同时登录多个微信账号时必须填写，否则 hook 启动会报「多个微信账号同时登录」。保存后下次运行 scripts/start-all.ps1 时用它启动 hook。</div>
-  </section>
-
-  <section class="card">
-    <div class="row card-head">
-      <h2>聊天行为</h2>
-      <span class="kv" id="behavior-hint">即时生效 · 重启后保留</span>
-      <span class="spacer"></span>
-      <button class="btn" id="btn-refresh-behavior">刷新</button>
-      <button class="btn primary" id="btn-save-behavior">保存</button>
-    </div>
-    <div class="debug-form">
-      <label>聊天强度
-        <select id="behavior-intensity">
-          <option value="quiet">安静（只回点名）</option>
-          <option value="normal">正常</option>
-          <option value="active">活跃（更愿意接话）</option>
+      <div class="row card-toolbar">
+        <input id="search-q" class="grow" placeholder="搜聊天记录里的关键词…" aria-label="搜索聊天记录的关键词" />
+        <select id="search-chat-filter" aria-label="按会话类型筛选搜索结果">
+          <option value="">全部会话</option>
+          <option value="group">只看群聊</option>
+          <option value="private">只看私聊</option>
         </select>
-      </label>
-      <label>言论限制
-        <select id="behavior-restriction-mode">
-          <option value="off">关闭</option>
-          <option value="soft">提示模型（仍可能说出）</option>
-          <option value="strict">严格（命中关键词整条不发）</option>
-          <option value="regenerate">先改写（最多 2 次）</option>
+        <input id="search-chat-id" placeholder="会话 ID（可选）" class="w-sid" aria-label="限定搜索的会话 ID（可选）" />
+        <button class="btn primary" id="btn-search">搜索</button>
+        <button class="btn" id="btn-search-more" disabled>更多</button>
+      </div>
+      <div class="mem-list list-h-xl" id="search-results"></div>
+    </section>
+  </section>
+
+  <section class="pane" id="pane-chats">
+    <h2 class="pane-title">会话</h2>
+
+    <section class="card span-full">
+      <div class="row card-head">
+        <h2>会话管理</h2>
+        <span class="kv" id="sessions-hint"></span>
+        <span class="spacer"></span>
+        <button class="btn" id="btn-sessions-more" disabled>加载更多</button>
+        <button class="btn" id="btn-refresh-sessions">刷新</button>
+      </div>
+      <div class="session-list" id="sessions"></div>
+    </section>
+
+    <section class="card">
+      <div class="row card-head">
+        <h2>微信私聊</h2>
+        <span class="kv" id="private-chats-hint">加载中…</span>
+        <span class="spacer"></span>
+        <button class="btn" id="btn-refresh-private-chats">刷新</button>
+        <button class="btn primary" id="btn-save-private-settings">保存</button>
+      </div>
+      <div class="kv" style="margin-top:8px">开关与名单保存后一个轮询周期内热生效（重启不丢）。</div>
+      <div class="debug-form">
+        <label><input type="checkbox" id="private-enabled" /> 接入私聊</label>
+        <label><input type="checkbox" id="private-reply" /> 自动回复（需先接入私聊）</label>
+        <label class="debug-wide">允许名单（一行一个 wxg:...；允许为空 = 不限制，拒绝优先）
+          <textarea id="private-allow" rows="3" placeholder="例如：wxg:46034f826c8b"></textarea>
+        </label>
+        <label class="debug-wide">拒绝名单（一行一个 wxg:...；拒绝优先于允许）
+          <textarea id="private-deny" rows="3" placeholder="例如：wxg:46034f826c8b"></textarea>
+        </label>
+      </div>
+      <div class="kv" id="private-chats-state" style="margin-top:8px">加载中…</div>
+      <div class="private-chats-scroll" id="private-chats-wrap" hidden>
+        <table class="private-chats">
+          <thead>
+            <tr><th>标题</th><th>会话 id</th><th>消息数</th><th>最近活跃</th><th>已投递数</th><th>名单</th></tr>
+          </thead>
+          <tbody id="private-chats-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="row card-head">
+        <h2>群白名单</h2>
+        <span class="kv" id="groups-hint">留空 = 不限制回复对象</span>
+        <span class="spacer"></span>
+        <button class="btn" id="btn-refresh-groups">刷新</button>
+        <button class="btn primary" id="btn-save-groups">保存</button>
+      </div>
+      <div class="debug-form">
+        <label class="debug-wide">回复白名单（一行一个，必须带通道前缀；留空 = 不限制）
+          <textarea id="groups-whitelist" rows="4" placeholder="例如：qq:123456&#10;wxg:46034f826c8b"></textarea>
+        </label>
+      </div>
+      <div class="kv" style="margin-top:8px">留空 = 所有群都按判定回复；非空 = 只有名单内的群会被主动回复，@ / 引用 / 叫名字仍然必回。这里同时决定「回不回」和「抓哪些微信群」（桥只轮询这里的微信会话）。</div>
+      <div class="kv" id="groups-known" style="margin-top:8px">已知群：（暂无）</div>
+    </section>
+
+    <section class="card">
+      <div class="row card-head">
+        <h2>群互通（镜像）</h2>
+        <span class="kv" id="mirror-hint">加载中…</span>
+        <span class="spacer"></span>
+        <button class="btn" id="btn-refresh-mirror">刷新</button>
+        <button class="btn primary" id="btn-save-mirror">保存</button>
+      </div>
+      <div class="debug-form">
+        <label class="debug-wide"><input type="checkbox" id="mirror-enabled" /> 启用双向镜像（QQ 群 ⇄ 微信群）</label>
+      </div>
+      <div class="kv" style="margin-top:8px">配对（左 QQ 群，右 微信群，都要带前缀；同一个群只能出现在一对里）</div>
+      <div id="mirror-pairs"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn" id="btn-add-mirror-pair" type="button">+ 新增一对</button>
+      </div>
+      <div class="kv" style="margin-top:12px">昵称（按平台指定：转发时用这里的昵称代替原昵称；键形如 qq:123456 / wxg:abc123）</div>
+      <div id="mirror-nicknames"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn" id="btn-add-mirror-nickname" type="button">+ 新增昵称</button>
+      </div>
+      <datalist id="mirror-qq-options"></datalist>
+      <datalist id="mirror-wechat-options"></datalist>
+      <div class="kv" style="margin-top:12px">运行状态（本次进程内累计，不含消息正文）</div>
+      <div class="kv" id="mirror-stats">运行状态：—</div>
+      <div class="kv" id="mirror-capabilities" style="margin-top:6px">能力矩阵：—</div>
+      <div class="kv" id="mirror-failures" style="margin-top:6px">最近失败：—</div>
+      <div class="kv" style="margin-top:8px">改动写入 data/settings.local.yaml 并热更新路由，不用重启；镜像原先未启用时，首次开启需重启 bot 才会建立转发。机器人自己的回复不回灌到对端。</div>
+    </section>
+  </section>
+
+  <section class="pane" id="pane-delivery">
+    <h2 class="pane-title">投递</h2>
+
+    <section class="card span-full" id="decisions-card">
+      <div class="row card-head">
+        <h2>决策流</h2>
+        <span class="kv" id="decisions-hint"></span>
+        <span class="spacer"></span>
+        <span class="kv" id="decisions-updated"></span>
+      </div>
+      <div class="row decision-stats" id="decisions-stats"></div>
+      <div class="row card-toolbar" id="decision-filters" role="group" aria-label="按决策结果筛选">
+        <button type="button" class="tab active" data-filter="" aria-pressed="true">全部</button>
+        <button type="button" class="tab" data-filter="replied" aria-pressed="false">回复</button>
+        <button type="button" class="tab" data-filter="silent" aria-pressed="false">沉默</button>
+        <button type="button" class="tab" data-filter="blocked" aria-pressed="false">拦截</button>
+        <button type="button" class="tab" data-filter="held" aria-pressed="false">攒着</button>
+        <button type="button" class="tab" data-filter="error" aria-pressed="false">错误</button>
+      </div>
+      <div class="decision-list" id="decisions-list"></div>
+    </section>
+
+    <section class="card span-full" id="trigger-debug">
+      <div class="row card-head">
+        <h2>触发规则调试器</h2>
+        <span class="kv" id="debug-hint">只读模拟 · 不会发送到会话</span>
+        <span class="spacer"></span>
+        <button class="btn primary" id="btn-debug-trigger">模拟判定</button>
+      </div>
+      <div class="debug-form">
+        <label>会话类型
+          <select id="debug-chat-type">
+            <option value="group">群聊</option>
+            <option value="private">私聊</option>
+          </select>
+        </label>
+        <label>会话 ID
+          <input id="debug-chat-id" value="1" />
+        </label>
+        <label>用户 ID
+          <input id="debug-user-id" value="2" />
+        </label>
+        <label>昵称
+          <input id="debug-nickname" maxlength="40" value="调试用户" />
+        </label>
+        <label class="debug-wide">消息
+          <textarea id="debug-content" rows="2" placeholder="输入一条模拟消息，例如：大肥鱼在吗"></textarea>
+        </label>
+      </div>
+      <div class="row debug-switches">
+        <label><input type="checkbox" id="debug-at-bot" /> @ 机器人</label>
+        <label><input type="checkbox" id="debug-reply-bot" /> 引用回复机器人</label>
+      </div>
+      <div class="kv debug-note">不写消息、不调模型、不消耗预算/冷却、不动调度器</div>
+      <div id="debug-result" hidden aria-live="polite">
+        <div class="debug-verdict" id="debug-verdict"></div>
+        <div class="kv mt-2" id="debug-reason"></div>
+        <div class="debug-checks" id="debug-checks"></div>
+        <div class="debug-metrics" id="debug-metrics"></div>
+      </div>
+    </section>
+
+    <section class="card span-full" id="batch-preview">
+      <div class="row card-head">
+        <h2>批次预览</h2>
+        <span class="kv" id="batch-hint">只读预览 · 不会调用模型</span>
+        <span class="spacer"></span>
+        <button class="btn primary" id="btn-batch-preview">预览</button>
+      </div>
+      <div class="debug-form">
+        <label>会话类型
+          <select id="batch-chat-type">
+            <option value="group">群聊</option>
+            <option value="private">私聊</option>
+          </select>
+        </label>
+        <label>会话 ID
+          <input id="batch-chat-id" value="1" />
+        </label>
+      </div>
+      <div class="kv debug-note">取当前待投批次、预算判定与最终 prompt；不写库、不发消息、不动调度器</div>
+      <div id="batch-result" hidden aria-live="polite">
+        <div class="debug-verdict" id="batch-budget"></div>
+        <div class="debug-metrics" id="batch-stats"></div>
+        <div class="debug-checks" id="batch-messages"></div>
+        <div class="row mt-2">
+          <button class="btn" id="btn-batch-toggle-prompt">显示最终 prompt</button>
+          <span class="kv" id="batch-prompt-hint"></span>
+        </div>
+        <pre class="batch-prompt" id="batch-prompt" hidden></pre>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="row card-head">
+        <h2>聊天行为</h2>
+        <span class="kv" id="behavior-hint">即时生效 · 重启后保留</span>
+        <span class="spacer"></span>
+        <button class="btn" id="btn-refresh-behavior">刷新</button>
+        <button class="btn primary" id="btn-save-behavior">保存</button>
+      </div>
+      <div class="debug-form">
+        <label>聊天强度
+          <select id="behavior-intensity">
+            <option value="quiet">安静（只回点名）</option>
+            <option value="normal">正常</option>
+            <option value="active">活跃（更愿意接话）</option>
+          </select>
+        </label>
+        <label>言论限制
+          <select id="behavior-restriction-mode">
+            <option value="off">关闭</option>
+            <option value="soft">提示模型（仍可能说出）</option>
+            <option value="strict">严格（命中关键词整条不发）</option>
+            <option value="regenerate">先改写（最多 2 次）</option>
+          </select>
+        </label>
+        <label class="debug-wide">禁词（一行一个，子串匹配）
+          <textarea id="behavior-banned-phrases" rows="3" placeholder="例如：某个公司名&#10;某句内部黑话"></textarea>
+        </label>
+        <label class="debug-wide">禁话题（一行一个，注入提示；严格模式下也做关键词拦截）
+          <textarea id="behavior-banned-topics" rows="3" placeholder="例如：政治&#10;股票推荐"></textarea>
+        </label>
+      </div>
+      <div class="kv" style="margin-top:8px">安静 = 只有 @ / 引用 / 叫名字才进模型；正常 = 当前行为；活跃 = 放开话题收尾与降频闸门。言论限制是关键词级兜底，不是语义审核。</div>
+    </section>
+
+    <section class="card">
+      <div class="row card-head">
+        <h2>心智</h2>
+        <span class="kv" id="mind-hint">保存后重启生效</span>
+        <span class="spacer"></span>
+        <button class="btn" id="btn-refresh-mind">刷新</button>
+        <button class="btn primary" id="btn-save-mind">保存</button>
+      </div>
+      <div class="debug-form">
+        <label>观察者
+          <input type="checkbox" id="mind-observer-enabled" />
+        </label>
+        <label>每日调用上限
+          <input type="number" id="mind-daily-calls" min="1" max="1000" step="1" />
+        </label>
+      </div>
+      <div class="kv" id="mind-prerequisites" style="margin-top:8px"></div>
+      <div class="kv" id="mind-cost" style="margin-top:8px"></div>
+      <div class="kv" style="margin-top:8px">观察者只观察群聊；需要心智总闸打开且当前大脑支持 complete_detailed。改动写入 config.yaml，重启后生效。</div>
+    </section>
+  </section>
+
+  <section class="pane" id="pane-config">
+    <h2 class="pane-title">配置</h2>
+
+    <section class="card" id="brain-card">
+      <div class="row card-head">
+        <h2>大脑模式</h2>
+        <span class="spacer"></span>
+        <span class="kv" id="brain-hint"></span>
+      </div>
+      <div class="brain-modes" id="modes" role="radiogroup" aria-label="大脑模式">
+        <button type="button" class="mode-card" data-mode="free" role="radio" aria-checked="true" tabindex="0">
+          <span class="mode-num">01</span>
+          <span class="mode-name">免费额度</span>
+          <span class="mode-need">无需配置</span>
+          <span class="mode-check" aria-hidden="true">✓</span>
+        </button>
+        <button type="button" class="mode-card" data-mode="key" role="radio" aria-checked="false" tabindex="-1">
+          <span class="mode-num">02</span>
+          <span class="mode-name">自备 Key</span>
+          <span class="mode-need">自备 API Key</span>
+          <span class="mode-check" aria-hidden="true">✓</span>
+        </button>
+        <button type="button" class="mode-card" data-mode="local_model" role="radio" aria-checked="false" tabindex="-1">
+          <span class="mode-num">03</span>
+          <span class="mode-name">本地模型</span>
+          <span class="mode-need">本地 LM Studio</span>
+          <span class="mode-check" aria-hidden="true">✓</span>
+        </button>
+      </div>
+      <div class="brain-fields" data-mode-fields="free">
+        <div class="brain-free-note">使用内置免费模型，不需要填写任何配置。想用自己的端点，切到另外两档。</div>
+      </div>
+      <div class="brain-fields" data-mode-fields="key" hidden>
+        <label class="field">
+          <span>接口地址</span>
+          <input id="key-base-url" type="text" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="field">
+          <span>模型</span>
+          <input id="key-model" type="text" placeholder="留空 = 自动选 flash" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="field field-wide">
+          <span>API Key</span>
+          <input id="key-api-key" type="password" placeholder="输入 API Key" autocomplete="new-password" />
+          <span class="field-note">Key 单独保存在本机，不会回显，也不会用于本地模型档。</span>
+        </label>
+      </div>
+      <div class="brain-fields" data-mode-fields="local_model" hidden>
+        <div class="field field-wide">
+          <span>接口地址</span>
+          <div class="field-row">
+            <input id="local-base-url" type="text" placeholder="http://127.0.0.1:1234/v1" autocomplete="off" spellcheck="false" />
+            <button class="btn" id="probe-btn" type="button">探测模型</button>
+          </div>
+          <span class="probe-status" id="probe-status" role="status" aria-live="polite"></span>
+        </div>
+        <label class="field">
+          <span>模型</span>
+          <select id="local-model-select" aria-label="本地模型列表">
+            <option value="">先探测模型</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>上下文窗口</span>
+          <input id="local-context" type="number" min="0" step="1024" inputmode="numeric" placeholder="留空使用默认" />
+          <span class="field-note" id="context-hint">留空使用默认；0 也表示默认。</span>
+        </label>
+        <label class="field">
+          <span>访问令牌（可选）</span>
+          <input id="local-api-key" type="password" placeholder="访问令牌（可选）" autocomplete="new-password" />
+          <span class="field-note">令牌单独保存，不会复用自备 Key；只有需要鉴权的本地网关才填。</span>
+        </label>
+        <label class="field-check">
+          <input id="local-lean" type="checkbox" />
+          精简模式（只回话，不调用工具）
+        </label>
+      </div>
+      <div class="brain-actions">
+        <button class="btn primary" id="btn-apply-brain">应用切换</button>
+        <span class="kv">切换会重新生成 opencode 配置</span>
+      </div>
+      <div class="brain-status" id="brain-status" role="status" aria-live="polite" hidden></div>
+    </section>
+
+    <section class="card">
+      <div class="row card-head">
+        <h2>运行配置</h2>
+        <span class="kv" id="config-hint">只读</span>
+        <span class="spacer"></span>
+        <button class="btn" id="btn-backup">下载备份</button>
+        <button class="btn" id="btn-refresh-config">刷新</button>
+      </div>
+      <div class="kv cfg-grid" id="config-body"></div>
+    </section>
+
+    <section class="card">
+      <div class="row card-head">
+        <h2>微信账号</h2>
+        <span class="kv" id="wechat-account-hint">保存后重启生效</span>
+        <span class="spacer"></span>
+        <button class="btn" id="btn-refresh-wechat-account">刷新</button>
+        <button class="btn primary" id="btn-save-wechat-account">保存</button>
+      </div>
+      <div class="debug-form">
+        <label class="debug-wide">机器人微信账号（wxid）
+          <input type="text" id="wechat-account" placeholder="例如 wxid_516rht3txzox22；留空 = 仅一个账号登录时自动识别" />
+        </label>
+      </div>
+      <div class="kv" style="margin-top:8px">同时登录多个微信账号时必须填写，否则 hook 启动会报「多个微信账号同时登录」。保存后下次运行 scripts/start-all.ps1 时用它启动 hook。</div>
+    </section>
+
+    <section class="card" id="security-card">
+      <div class="row card-head">
+        <h2>安全</h2>
+        <span class="kv" id="rotate-token-status">轮换控制口令会立即重启 Bot，旧口令立即失效</span>
+      </div>
+      <div class="row">
+        <input id="rotate-token-confirm" class="w-token" placeholder="输入 ROTATE 确认" aria-label="输入 ROTATE 确认以启用轮换" />
+        <button class="btn danger" id="btn-rotate-token">轮换控制口令</button>
+      </div>
+      <div class="kv mt-2">轮换后 Bot 会用新口令重启；任一步失败会保留旧口令。</div>
+    </section>
+
+    <section class="card" id="backups-card">
+      <div class="row card-head">
+        <h2>备份与恢复</h2>
+        <span class="kv" id="backups-hint"></span>
+        <span class="spacer"></span>
+        <button class="btn primary" id="btn-backup-now">立即备份</button>
+        <button class="btn" id="btn-refresh-backups">刷新</button>
+      </div>
+      <div class="row card-toolbar">
+        <input id="backup-restore-file" type="file" accept=".db,application/octet-stream" aria-label="选择要恢复的备份文件" />
+        <input id="backup-restore-confirm" class="w-token" placeholder="输入 RESTORE 确认" aria-label="输入 RESTORE 确认以启用恢复" />
+        <button class="btn" id="btn-backup-restore">上传并恢复</button>
+      </div>
+      <div class="mem-list list-h-md" id="backup-list"></div>
+      <h3 class="gap-top">审计日志</h3>
+      <div class="mem-list list-h-md" id="audit-list"></div>
+    </section>
+  </section>
+
+  <section class="pane" id="pane-logs">
+    <h2 class="pane-title">日志</h2>
+
+    <section class="card span-full">
+      <h2>日志</h2>
+      <div class="log-head" id="log-tabs" role="tablist" aria-label="日志来源"></div>
+      <div class="log-toolbar">
+        <select id="log-level" title="按文本中的级别关键字筛选" aria-label="按级别筛选日志">
+          <option value="">全部级别</option>
+          <option value="error">ERROR</option>
+          <option value="warn">WARNING</option>
+          <option value="info">INFO</option>
         </select>
-      </label>
-      <label class="debug-wide">禁词（一行一个，子串匹配）
-        <textarea id="behavior-banned-phrases" rows="3" placeholder="例如：某个公司名&#10;某句内部黑话"></textarea>
-      </label>
-      <label class="debug-wide">禁话题（一行一个，注入提示；严格模式下也做关键词拦截）
-        <textarea id="behavior-banned-topics" rows="3" placeholder="例如：政治&#10;股票推荐"></textarea>
-      </label>
-    </div>
-    <div class="kv" style="margin-top:8px">安静 = 只有 @ / 引用 / 叫名字才进模型；正常 = 当前行为；活跃 = 放开话题收尾与降频闸门。言论限制是关键词级兜底，不是语义审核。</div>
+        <input id="log-filter" placeholder="关键字筛选…" aria-label="按关键字筛选日志" />
+        <select id="log-lines" title="重新连接时加载最近多少行" aria-label="重连时加载的行数">
+          <option value="200">200 行</option>
+          <option value="1000">1000 行</option>
+          <option value="2000">2000 行</option>
+        </select>
+        <button class="btn" id="btn-log-pause">暂停</button>
+        <button class="btn" id="btn-log-clear">清屏</button>
+        <button class="btn" id="btn-log-download">下载当前日志</button>
+        <span class="kv" id="log-hint"></span>
+      </div>
+      <pre id="logs"></pre>
+    </section>
   </section>
 
-  <section class="card">
-    <div class="row card-head">
-      <h2>心智</h2>
-      <span class="kv" id="mind-hint">保存后重启生效</span>
-      <span class="spacer"></span>
-      <button class="btn" id="btn-refresh-mind">刷新</button>
-      <button class="btn primary" id="btn-save-mind">保存</button>
-    </div>
-    <div class="debug-form">
-      <label>观察者
-        <input type="checkbox" id="mind-observer-enabled" />
-      </label>
-      <label>每日调用上限
-        <input type="number" id="mind-daily-calls" min="1" max="1000" step="1" />
-      </label>
-    </div>
-    <div class="kv" id="mind-prerequisites" style="margin-top:8px"></div>
-    <div class="kv" id="mind-cost" style="margin-top:8px"></div>
-    <div class="kv" style="margin-top:8px">观察者只观察群聊；需要心智总闸打开且当前大脑支持 complete_detailed。改动写入 config.yaml，重启后生效。</div>
-  </section>
-
-  <section class="card">
-    <div class="row card-head">
-      <h2>群白名单</h2>
-      <span class="kv" id="groups-hint">留空 = 不限制回复对象</span>
-      <span class="spacer"></span>
-      <button class="btn" id="btn-refresh-groups">刷新</button>
-      <button class="btn primary" id="btn-save-groups">保存</button>
-    </div>
-    <div class="debug-form">
-      <label class="debug-wide">回复白名单（一行一个，必须带通道前缀；留空 = 不限制）
-        <textarea id="groups-whitelist" rows="4" placeholder="例如：qq:123456&#10;wxg:46034f826c8b"></textarea>
-      </label>
-    </div>
-    <div class="kv" style="margin-top:8px">留空 = 所有群都按判定回复；非空 = 只有名单内的群会被主动回复，@ / 引用 / 叫名字仍然必回。这里同时决定「回不回」和「抓哪些微信群」（桥只轮询这里的微信会话）。</div>
-    <div class="kv" id="groups-known" style="margin-top:8px">已知群：（暂无）</div>
-  </section>
-
-  <section class="card">
-    <div class="row card-head">
-      <h2>群互通（镜像）</h2>
-      <span class="kv" id="mirror-hint">加载中…</span>
-      <span class="spacer"></span>
-      <button class="btn" id="btn-refresh-mirror">刷新</button>
-      <button class="btn primary" id="btn-save-mirror">保存</button>
-    </div>
-    <div class="debug-form">
-      <label class="debug-wide"><input type="checkbox" id="mirror-enabled" /> 启用双向镜像（QQ 群 ⇄ 微信群）</label>
-    </div>
-    <div class="kv" style="margin-top:8px">配对（左 QQ 群，右 微信群，都要带前缀；同一个群只能出现在一对里）</div>
-    <div id="mirror-pairs"></div>
-    <div class="row" style="margin-top:8px">
-      <button class="btn" id="btn-add-mirror-pair" type="button">+ 新增一对</button>
-    </div>
-    <div class="kv" style="margin-top:12px">昵称（按平台指定：转发时用这里的昵称代替原昵称；键形如 qq:123456 / wxg:abc123）</div>
-    <div id="mirror-nicknames"></div>
-    <div class="row" style="margin-top:8px">
-      <button class="btn" id="btn-add-mirror-nickname" type="button">+ 新增昵称</button>
-    </div>
-    <datalist id="mirror-qq-options"></datalist>
-    <datalist id="mirror-wechat-options"></datalist>
-    <div class="kv" style="margin-top:12px">运行状态（本次进程内累计，不含消息正文）</div>
-    <div class="kv" id="mirror-stats">运行状态：—</div>
-    <div class="kv" id="mirror-capabilities" style="margin-top:6px">能力矩阵：—</div>
-    <div class="kv" id="mirror-failures" style="margin-top:6px">最近失败：—</div>
-    <div class="kv" style="margin-top:8px">改动写入 data/settings.local.yaml 并热更新路由，不用重启；镜像原先未启用时，首次开启需重启 bot 才会建立转发。机器人自己的回复不回灌到对端。</div>
-  </section>
-
-  <section class="card">
-    <div class="row card-head">
-      <h2>微信私聊</h2>
-      <span class="kv" id="private-chats-hint">加载中…</span>
-      <span class="spacer"></span>
-      <button class="btn" id="btn-refresh-private-chats">刷新</button>
-      <button class="btn primary" id="btn-save-private-settings">保存</button>
-    </div>
-    <div class="kv" style="margin-top:8px">开关与名单保存后一个轮询周期内热生效（重启不丢）。</div>
-    <div class="debug-form">
-      <label><input type="checkbox" id="private-enabled" /> 接入私聊</label>
-      <label><input type="checkbox" id="private-reply" /> 自动回复（需先接入私聊）</label>
-      <label class="debug-wide">允许名单（一行一个 wxg:...；允许为空 = 不限制，拒绝优先）
-        <textarea id="private-allow" rows="3" placeholder="例如：wxg:46034f826c8b"></textarea>
-      </label>
-      <label class="debug-wide">拒绝名单（一行一个 wxg:...；拒绝优先于允许）
-        <textarea id="private-deny" rows="3" placeholder="例如：wxg:46034f826c8b"></textarea>
-      </label>
-    </div>
-    <div class="kv" id="private-chats-state" style="margin-top:8px">加载中…</div>
-    <div class="private-chats-scroll" id="private-chats-wrap" hidden>
-      <table class="private-chats">
-        <thead>
-          <tr><th>标题</th><th>会话 id</th><th>消息数</th><th>最近活跃</th><th>已投递数</th><th>名单</th></tr>
-        </thead>
-        <tbody id="private-chats-body"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <section class="card span-full">
-    <h2>日志</h2>
-    <div class="log-head" id="log-tabs" role="tablist" aria-label="日志来源"></div>
-    <div class="log-toolbar">
-      <select id="log-level" title="按文本中的级别关键字筛选" aria-label="按级别筛选日志">
-        <option value="">全部级别</option>
-        <option value="error">ERROR</option>
-        <option value="warn">WARNING</option>
-        <option value="info">INFO</option>
-      </select>
-      <input id="log-filter" placeholder="关键字筛选…" aria-label="按关键字筛选日志" />
-      <select id="log-lines" title="重新连接时加载最近多少行" aria-label="重连时加载的行数">
-        <option value="200">200 行</option>
-        <option value="1000">1000 行</option>
-        <option value="2000">2000 行</option>
-      </select>
-      <button class="btn" id="btn-log-pause">暂停</button>
-      <button class="btn" id="btn-log-clear">清屏</button>
-      <button class="btn" id="btn-log-download">下载当前日志</button>
-      <span class="kv" id="log-hint"></span>
-    </div>
-    <pre id="logs"></pre>
-  </section>
 </main>
 
 <div class="drawer-backdrop" id="timeline-backdrop" hidden></div>
@@ -1357,6 +1422,50 @@ function initTheme() {
     applyTheme(next);
     try { localStorage.setItem("dafeiyu.theme", next); } catch (_) { /* 隐私模式忽略 */ }
   });
+}
+
+// 顶栏是 sticky 的，分区导航要吸在它下面；高度随换行变化，量一次写进 CSS 变量。
+function syncHeaderHeight() {
+  const header = document.querySelector("header");
+  if (!header) return;
+  document.documentElement.style.setProperty("--header-h", `${header.offsetHeight}px`);
+}
+
+function initPaneNav() {
+  const nav = $("pane-nav");
+  if (!nav) return;
+  const buttons = Array.from(nav.querySelectorAll("[data-pane]"));
+  const markActive = (paneId) => {
+    buttons.forEach((button) => {
+      const on = button.dataset.pane === paneId;
+      button.classList.toggle("active", on);
+      if (on) button.setAttribute("aria-current", "true");
+      else button.removeAttribute("aria-current");
+    });
+  };
+  buttons.forEach((button) => {
+    button.addEventListener("click", () => {
+      const pane = $(button.dataset.pane);
+      if (!pane) return;
+      markActive(button.dataset.pane);
+      pane.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  });
+  const panes = buttons.map((button) => $(button.dataset.pane)).filter(Boolean);
+  if (!panes.length || !("IntersectionObserver" in window)) return;
+  const observer = new IntersectionObserver(
+    (entries) => {
+      // 只看进入「顶栏下方那一条」的分区，取最靠上的一个作为当前分区。
+      const visible = entries
+        .filter((entry) => entry.isIntersecting)
+        .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+      if (visible.length) markActive(visible[0].target.id);
+    },
+    { rootMargin: "-20% 0px -65% 0px", threshold: 0 },
+  );
+  panes.forEach((pane) => observer.observe(pane));
+  syncHeaderHeight();
+  window.addEventListener("resize", syncHeaderHeight);
 }
 
 function toast(message, isError = false) {
@@ -4617,6 +4726,7 @@ initTabs();
 // 摘要日期默认昨天，用户可改；每次打开面板都重置回默认，避免沿用上次选择。
 $("summary-date").value = yesterdayIso();
 initTheme();
+initPaneNav();
 loadAuthSession();
 // 面板刚打开：强制重探一次免费档，别让上一次会话留下的旧黄条继续挂着。
 // 只为触发后端重探；响应丢弃也没关系，状态由下一轮 /api/status 带回。
