@@ -40,6 +40,7 @@ from .links import (
     extract_urls,
     render_link_block,
 )
+from .links_failures import HostFailureStore
 from .media import materialize_attachments
 from .memory import shared_facts
 from .memory.atmosphere import describe_atmosphere
@@ -490,8 +491,11 @@ class Service:
         # 戳一戳的冷却/每日上限：测试可注入带假时钟的实例。
         self.poke_reactor = poke_reactor or PokeReactor(settings.social)
         # 链接解析（T6）：懒建浏览器进程，跨批复用；测试可整体替换成假实现
-        # （只要它有 resolve_for_prompt(urls) 协程）。
-        self.link_resolver: Any = LinkPromptResolver(settings.link)
+        # （只要它有 resolve_for_prompt(urls) 协程）。T8 的失败知识按 host 落
+        # data/link-cache/host-failures.json，跨进程复用「这个站直连不行」。
+        self.link_resolver: Any = LinkPromptResolver(
+            settings.link, failures=HostFailureStore(settings.link)
+        )
 
     def _adapter_for(self, chat_id: str) -> Adapter:
         """按会话 id 的通道前缀选适配器；单一派生点是 channel_of。"""

@@ -25,6 +25,13 @@ from urllib.parse import urlsplit
 import httpx
 
 from dafeiyu.config import LinkConfig
+from dafeiyu.links_failures import (
+    NEEDS_BROWSER,
+    SEARCH_ONLY,
+    HostFailureStore,
+    HostVerdict,
+    url_host,
+)
 from dafeiyu.netssl import default_ssl_context
 
 __all__ = [
@@ -507,9 +514,10 @@ class LinkPromptResolver:
     的有头最小化浏览器渲染。「仍读不到」是模型侧的行为（websearch / 请对方
     贴一段），服务端的职责到此为止。
 
-    ``resolver`` / ``renderer`` / ``clock`` 是测试注入点：分别需要
-    ``resolve(url) -> LinkResolution`` 与 ``render(url) -> BrowserResult``；
-    生产恒传 None（懒建真实实现，浏览器进程只在第一次需要时才起）。
+    ``resolver`` / ``renderer`` / ``clock`` / ``failures`` 是测试注入点：
+    分别需要 ``resolve(url) -> LinkResolution``、``render(url) -> BrowserResult``、
+    时钟，以及 T8 的 ``HostFailureStore``；生产由 service 显式注入
+    ``HostFailureStore(config)``（不注入 = 不带失败知识，只做本次降级链）。
     """
 
     def __init__(
@@ -519,12 +527,15 @@ class LinkPromptResolver:
         resolver: Any = None,
         renderer: Any = None,
         clock: Callable[[], float] | None = None,
+        failures: HostFailureStore | None = None,
     ) -> None:
         self._config = config
         self._resolver: Any = resolver if resolver is not None else LinkResolver(config)
         self._renderer: Any = renderer
         self._renderer_owned = False
         self._clock: Callable[[], float] = clock or time.time
+        # T8：跨批次的 host 级失败知识。None = 不读也不写（测试与一次性调用）。
+        self._failures: HostFailureStore | None = failures
 
     async def aclose(self) -> None:
         """只关自己起的浏览器进程；注入进来的实现由调用方负责。"""
@@ -568,31 +579,92 @@ class LinkPromptResolver:
         return blocks
 
     async def _resolve_one(self, url: str, deadline: float) -> LinkBlock:
+        """查失败知识 → 该跳的层直接跳 → 逐层失败就地记录（T6 + T8）。"""
+        host = url_host(url)
+        known = self._lookup(host)
+        if known is not None and known.verdict == SEARCH_ONLY:
+            # 上次已经证明本机两层都到不了：连一次请求都不发，直接给模型兜底指令。
+            return _unreadable(url, "none", SEARCH_ONLY)
+        if known is not None and known.verdict == NEEDS_BROWSER:
+            # HTTP 层已被证伪（403/超时/挑战页…）：跳过它，直接进浏览器层。
+            if not self._config.browser.enabled:
+                return _unreadable(url, "http", NEEDS_BROWSER)
+            return await self._render(url, host, deadline)
+
         layer = "http"
         try:
             http = await self._within(self._resolver.resolve(url), deadline, layer)
-            if http.ok:
-                return LinkBlock(
-                    url=url, ok=True, title=http.title, text=http.text, reason="ok"
-                )
-            reason = http.reason or "http_error"
-            if not self._config.browser.enabled:
-                return _unreadable(url, "http", reason)
-            layer = "browser"
-            browser = await self._within(self._browser().render(url), deadline, layer)
-            if browser.ok:
-                return LinkBlock(
-                    url=url,
-                    ok=True,
-                    title=browser.title,
-                    text=browser.text,
-                    reason="ok",
-                )
-            return _unreadable(url, "browser", browser.reason or "browser_error")
         except _BudgetExhausted:
             raise
         except Exception:  # noqa: BLE001 - 解析失败只降级，绝不挡回复主链路
             return _unreadable(url, layer, "error")
+        if http.ok:
+            # 真实抓取成功推翻了（可能已过期的）旧结论：旧账可以销了。
+            self._forget(host)
+            return LinkBlock(
+                url=url, ok=True, title=http.title, text=http.text, reason="ok"
+            )
+        reason = http.reason or "http_error"
+        # 按层记：HTTP 一失败就写 needs_browser，不等整条链跑完。
+        self._record_http(host, reason)
+        if not self._config.browser.enabled:
+            return _unreadable(url, "http", reason)
+        return await self._render(url, host, deadline)
+
+    async def _render(self, url: str, host: str, deadline: float) -> LinkBlock:
+        """浏览器层：成功照常返回；失败把该 host 升级为 search_only。"""
+        try:
+            browser = await self._within(self._browser().render(url), deadline, "browser")
+        except _BudgetExhausted:
+            raise
+        except Exception:  # noqa: BLE001 - 渲染失败只降级，绝不挡回复主链路
+            return _unreadable(url, "browser", "error")
+        if browser.ok:
+            return LinkBlock(
+                url=url,
+                ok=True,
+                title=browser.title,
+                text=browser.text,
+                reason="ok",
+            )
+        reason = browser.reason or "browser_error"
+        # 浏览器层也失败：同一条记录升级为 search_only（不是新增第二条）。
+        self._record_browser(host, reason)
+        return _unreadable(url, "browser", reason)
+
+    # ---- 失败知识（T8）的读写钩子 ----------------------------------------
+
+    def _lookup(self, host: str) -> HostVerdict | None:
+        if self._failures is None or not host:
+            return None
+        try:
+            return self._failures.get(host)
+        except Exception:  # noqa: BLE001 - 坏账本等同于没有知识
+            return None
+
+    def _record_http(self, host: str, reason: str) -> None:
+        if self._failures is None or not host:
+            return
+        try:
+            self._failures.record_http_failure(host, reason)
+        except Exception:  # noqa: BLE001 - 记账失败不挡回复
+            return
+
+    def _record_browser(self, host: str, reason: str) -> None:
+        if self._failures is None or not host:
+            return
+        try:
+            self._failures.record_browser_failure(host, reason)
+        except Exception:  # noqa: BLE001 - 记账失败不挡回复
+            return
+
+    def _forget(self, host: str) -> None:
+        if self._failures is None or not host:
+            return
+        try:
+            self._failures.forget(host)
+        except Exception:  # noqa: BLE001 - 记账失败不挡回复
+            return
 
     async def _within(
         self, coro: Awaitable[Any], deadline: float, layer: str
@@ -614,14 +686,19 @@ async def resolve_for_prompt(
     resolver: Any = None,
     renderer: Any = None,
     clock: Callable[[], float] | None = None,
+    failures: HostFailureStore | None = None,
 ) -> list[LinkBlock]:
     """便捷入口：建一个临时 LinkPromptResolver 并在结束时回收它起的浏览器。
 
     需要跨批复用时（service 就是这样）请自己持有 ``LinkPromptResolver``
-    实例，否则每批都会重新起步。
+    实例，否则每批都会重新起步；需要 T8 的失败知识也请显式传 ``failures``。
     """
     engine = LinkPromptResolver(
-        config or LinkConfig(), resolver=resolver, renderer=renderer, clock=clock
+        config or LinkConfig(),
+        resolver=resolver,
+        renderer=renderer,
+        clock=clock,
+        failures=failures,
     )
     try:
         return await engine.resolve_for_prompt(urls)
