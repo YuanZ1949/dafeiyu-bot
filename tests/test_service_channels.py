@@ -194,6 +194,20 @@ class _BrokenReceiptStatusAdapter(_RawStatusAdapter):
         raise RuntimeError("回执统计坏了")
 
 
+class _InboundStatusAdapter(_RawStatusAdapter):
+    def __init__(self, inbound: dict[str, Any]) -> None:
+        super().__init__()
+        self._inbound = inbound
+
+    def inbound_stats(self) -> dict[str, Any]:
+        return dict(self._inbound)
+
+
+class _BrokenInboundStatusAdapter(_RawStatusAdapter):
+    def inbound_stats(self) -> dict[str, Any]:
+        raise RuntimeError("入站水位坏了")
+
+
 def _service_with_adapters(tmp_path, adapters):
     store = Store(str(tmp_path / "t.db"))
     store.init_schema()
@@ -266,6 +280,42 @@ def test_channel_status_receipt_stats_error_keeps_other_fields(tmp_path):
         "last_disconnect_at": None,
         "last_send_at": 456.0,
     }
+
+
+def test_channel_status_fallback_exposes_inbound_watermark(tmp_path):
+    """桥侧入站水位要进健康快照：gap_from 非空＝有帧永久丢失（G6）。"""
+
+    service, _store = _service_with_adapters(
+        tmp_path,
+        {
+            "qq": _RawStatusAdapter(),
+            "wechat": _InboundStatusAdapter(
+                {"seq": 9, "acked": 4, "unacked": 3, "gap_from": 5}
+            ),
+        },
+    )
+
+    status = service.channel_status()
+
+    assert status["wechat"]["inbound"] == {
+        "seq": 9,
+        "acked": 4,
+        "unacked": 3,
+        "gap_from": 5,
+    }
+    # 没有 inbound_stats 的通道不得凭空造字段。
+    assert "inbound" not in status["qq"]
+
+
+def test_channel_status_inbound_stats_error_keeps_other_fields(tmp_path):
+    service, _store = _service_with_adapters(
+        tmp_path, {"wechat": _BrokenInboundStatusAdapter()}
+    )
+
+    status = service.channel_status()
+
+    assert "inbound" not in status["wechat"]
+    assert status["wechat"]["connected"] is True
 
 
 

@@ -281,6 +281,38 @@ def test_health_snapshot_omits_receipts_when_absent(tmp_path: Path) -> None:
     assert "receipts" not in snapshot["channels"]["wechat"]
 
 
+def test_health_snapshot_passes_inbound_watermark(tmp_path: Path) -> None:
+    """桥侧丢帧必须能从健康快照看见：只透传计数，不夹带正文（G6）。"""
+    control, _adapter, _store, _app = make_control(tmp_path)
+    control.service.channel_status = lambda: {
+        "wechat": {
+            "connected": True,
+            "inbound": {
+                "seq": 12,
+                "acked": 9,
+                "unacked": 3,
+                "gap_from": 10,
+                "frames": ["不该透传的帧正文"],
+            },
+        }
+    }
+
+    snapshot = control.health_snapshot()
+
+    inbound = snapshot["channels"]["wechat"]["inbound"]
+    assert inbound == {"seq": 12, "acked": 9, "unacked": 3, "gap_from": 10}
+    assert "不该透传的帧正文" not in json.dumps(snapshot, ensure_ascii=False)
+
+
+def test_health_snapshot_omits_inbound_when_absent(tmp_path: Path) -> None:
+    control, _adapter, _store, _app = make_control(tmp_path)
+    control.service.channel_status = lambda: {"wechat": {"connected": True}}
+
+    snapshot = control.health_snapshot()
+
+    assert "inbound" not in snapshot["channels"]["wechat"]
+
+
 def test_health_snapshot_channel_status_failure_keeps_snapshot(
     tmp_path: Path,
 ) -> None:

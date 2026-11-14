@@ -302,11 +302,55 @@ async def test_wechat_down_fires_after_threshold(tmp_path: Path) -> None:
     assert incident.detail == "微信桥连接已断开"
 
 
+async def test_bridge_gap_fires_when_inbound_frames_dropped(tmp_path: Path) -> None:
+    """桥侧未确认帧被挤掉＝永久丢消息，必须告警（G6）。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = wechat_snapshot(
+        wechat={
+            "connected": True,
+            "degraded": False,
+            "logged_in": True,
+            "desktop": "interactive",
+            "inbound": {"seq": 12, "acked": 9, "unacked": 3, "gap_from": 10},
+        }
+    )
+
+    await mgr.evaluate(snapshot)
+
+    assert len(channel.sent) == 1
+    incident, event = channel.sent[0]
+    assert event == "firing"
+    assert incident.rule == "bridge_gap"
+    assert incident.severity == "warning"
+    assert incident.title == "微信桥丢帧"
+    assert "seq 10" in incident.detail
+
+
+async def test_bridge_gap_silent_without_gap(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = wechat_snapshot(
+        wechat={
+            "connected": True,
+            "degraded": False,
+            "logged_in": True,
+            "desktop": "interactive",
+            "inbound": {"seq": 12, "acked": 12, "unacked": 0, "gap_from": None},
+        }
+    )
+
+    await mgr.evaluate(snapshot)
+
+    assert all(incident.rule != "bridge_gap" for incident, _event in channel.sent)
+
+
 @pytest.mark.parametrize(
     ("snapshot_kwargs", "expected"),
     [
-        ({"bridge": "failed"}, "微信桥进程不在线（状态：failed）"),
-        (
+        ({"bridge": "failed"}, "微信桥进程不在线（状态：failed）"),        (
             {
                 "wechat": {
                     "connected": True,

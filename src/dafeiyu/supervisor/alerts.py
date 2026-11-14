@@ -319,6 +319,21 @@ class AlertManager:
                 conditions["wechat_down"] = Condition(
                     True, "critical", "微信通道不在线", detail
                 )
+            # 桥侧入站缓冲挤掉最旧帧：这些消息再也不会重投，属于永久丢消息。
+            inbound = wechat.get("inbound")
+            if isinstance(inbound, dict):
+                gap_from = inbound.get("gap_from")
+                if type(gap_from) is int and gap_from > 0:
+                    conditions["bridge_gap"] = Condition(
+                        True,
+                        "warning",
+                        "微信桥丢帧",
+                        (
+                            f"入站未确认帧被挤掉：从 seq {gap_from} 起的消息无法重投"
+                            f"（seq={inbound.get('seq')}, acked={inbound.get('acked')}）"
+                        ),
+                        {"gap_from": gap_from},
+                    )
 
         napcat = snapshot.get("napcat") or {}
         if not isinstance(napcat, dict):

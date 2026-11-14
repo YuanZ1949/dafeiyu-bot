@@ -179,7 +179,10 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 
 ### 观测与告警
 
-- `GET /api/mirror` 与面板「群互通（镜像）」卡片除配置外还返回 `stats`：本进程累计的 `sent` / `degraded` / `dropped` / `expired` / `deduped` / `retries`、每个目标群的队列深度 `queues`、worker 列表，以及最近 20 条失败（时间 / 方向 / 目标 / 动作 / 错误码，**不含正文与昵称**）。
+- `GET /api/mirror` 与面板「群互通（镜像）」卡片除配置外还返回 `stats`：本进程累计的 `sent` / `degraded` / `dropped` / `expired` / `deduped` / `retries`、每个目标群的队列深度 `queues`、worker 列表，以及最近 20 条失败（时间 / 方向 / 目标 / 动作 / 错误码 / 消息 id，**不含正文与昵称**）。
+- 镜像转发**不降采样**：`mirror.keep_image_quality`（默认 `true`）下对侧收到的就是源图字节，动图也不压帧；置 `false` 才回落到与模型侧一致的 `images.max_edge`（二次编码、省流量）。
+- 媒体条目的过期上限放宽到 15 分钟（纯文本仍是 5 分钟），队列满时先挤掉最旧的纯文本给图片/文件让位；发送失败、过期、队列挤掉、`.dat` 解码补发耗尽都会进失败环（带消息 id），可据此补发。
+- 微信桥入站丢帧（未确认缓冲被挤掉）在健康快照的 `channels.wechat.inbound.gap_from` 暴露，并触发 `bridge_gap` 告警：从该 seq 起的消息不会重投。
 - 同一次响应里的 `capabilities` 是按当前配置推导的方向矩阵（与启动日志 `mirror capability …` 同源，只读配置、不探测网络）；`off(...)` 的类型在镜像里只会发可读占位。
 - 健康快照（`/api/health/detail`）的 `mirror` 段给 supervisor 告警用：`enabled` / `router` / `queued` / `dropped` / `degraded` / `failures_5m` / `last_error`。镜像启用时，5 分钟内 ≥3 次转发失败、单个目标积压 ≥200 条、或「已启用但没有路由（需重启 bot）」会触发 `mirror_errors` 告警（warning），避免「一边发了、另一边没到」再次静默。
 

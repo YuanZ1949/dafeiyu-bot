@@ -498,6 +498,60 @@ async def test_health_connected_false_reaches_adapter_and_blocks_send() -> None:
         assert len(bridge.commands) == frames_before
 
 
+async def test_health_frame_exposes_inbound_watermark() -> None:
+    """桥上报的入站水位要能在适配器上读到：gap_from 非空＝有帧永久丢失。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        assert adapter.inbound_stats() == {
+            "seq": 0,
+            "acked": 0,
+            "unacked": 0,
+            "gap_from": None,
+        }
+
+        await bridge.push(
+            {
+                "v": 1,
+                "type": "health",
+                "connected": True,
+                "logged_in": True,
+                "desktop": "interactive",
+                "queue_depth": 0,
+                "inbound_seq": 12,
+                "inbound_acked": 9,
+                "unacked_count": 3,
+                "inbound_gap_from": 10,
+            }
+        )
+        await wait_for(lambda: adapter.inbound_stats()["seq"] == 12)
+
+        assert adapter.inbound_stats() == {
+            "seq": 12,
+            "acked": 9,
+            "unacked": 3,
+            "gap_from": 10,
+        }
+
+
+async def test_health_frame_ignores_non_positive_gap() -> None:
+    """``gap_from`` 只有正整数才算丢帧：0/字符串/布尔都当没有丢。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        for gap in (0, -1, "10", True):
+            await bridge.push(
+                {
+                    "v": 1,
+                    "type": "health",
+                    "connected": True,
+                    "logged_in": True,
+                    "desktop": "interactive",
+                    "queue_depth": 0,
+                    "inbound_gap_from": gap,
+                }
+            )
+        await asyncio.sleep(0.1)
+
+        assert adapter.inbound_stats()["gap_from"] is None
+
+
 async def test_stale_health_expires_connected() -> None:
     async with FakeBridge() as bridge, running(bridge, poll_seconds=0.1) as adapter:
         assert adapter.connected is True

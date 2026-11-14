@@ -1105,6 +1105,14 @@ class BrainControl:
                                 entry["receipts"]["last_at"] = _iso_ts(
                                     raw_receipts["last_at"]
                                 )
+                        # 桥侧入站水位只透传计数；gap_from 非空＝有帧永久丢失。
+                        raw_inbound = item.get("inbound")
+                        if isinstance(raw_inbound, dict):
+                            entry["inbound"] = {
+                                key: raw_inbound[key]
+                                for key in ("seq", "acked", "unacked", "gap_from")
+                                if key in raw_inbound
+                            }
                         channels[str(name)] = entry
 
         memory_failures: dict[str, Any] = {

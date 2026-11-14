@@ -333,6 +333,8 @@ class BridgeServer:
             envelope["inbound_seq"] = self._inbound_seq
             envelope["inbound_acked"] = self._inbound_acked
             envelope["unacked_count"] = len(self._unacked)
+            # 丢帧起点（None = 没丢）：面板/告警据此发现「有帧永久补不回来」。
+            envelope["inbound_gap_from"] = self._inbound_gap_from
             self._latest_health = dict(envelope)
         payload = json.dumps(envelope, ensure_ascii=False)
         sent = 0

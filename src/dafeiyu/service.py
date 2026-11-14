@@ -553,6 +553,19 @@ class Service:
                 else:
                     if isinstance(receipts, dict):
                         status[channel]["receipts"] = receipts
+            # 入站水位同理：只有实现了 inbound_stats 的适配器才有，桥侧丢帧
+            # 时 gap_from 非空，供健康快照与告警发现「有消息再也补不回来」。
+            inbound_stats = getattr(adapter, "inbound_stats", None)
+            if callable(inbound_stats):
+                try:
+                    inbound = inbound_stats()
+                except Exception:
+                    log.warning(
+                        "通道 %s 入站水位读取失败", channel, exc_info=True
+                    )
+                else:
+                    if isinstance(inbound, dict):
+                        status[channel]["inbound"] = inbound
         return status
 
     async def start(self) -> None:

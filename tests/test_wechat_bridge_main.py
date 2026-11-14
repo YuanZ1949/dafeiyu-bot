@@ -347,6 +347,41 @@ async def test_unknown_action_receipt() -> None:
         await asyncio.wait_for(server.stop(), STEP)
 
 
+async def test_health_frame_reports_inbound_gap_after_overflow() -> None:
+    """未确认帧被挤掉后，健康帧必须暴露 ``inbound_gap_from``（G6）。"""
+    server = BridgeServer(bridge_token=TOKEN)
+    for index in range(bridge_server.UNACKED_MAX + 1):
+        await asyncio.wait_for(
+            server.broadcast(
+                {
+                    "type": "message",
+                    "chat_id": "wxg:g1",
+                    "message_id": f"1:{index}",
+                    "text": "x",
+                }
+            ),
+            STEP,
+        )
+    await asyncio.wait_for(server.broadcast({"type": "health", **HEALTH_FRAME}), STEP)
+
+    health = server.latest_health
+    assert health is not None
+    assert health["inbound_seq"] == bridge_server.UNACKED_MAX + 1
+    assert health["unacked_count"] == bridge_server.UNACKED_MAX
+    # 第一条被挤掉的帧 seq=1：从它起再也补不回来。
+    assert health["inbound_gap_from"] == 1
+
+
+async def test_health_frame_without_overflow_has_no_gap() -> None:
+    server = BridgeServer(bridge_token=TOKEN)
+    await asyncio.wait_for(server.broadcast({"type": "health", **HEALTH_FRAME}), STEP)
+
+    health = server.latest_health
+    assert health is not None
+    assert health["inbound_gap_from"] is None
+    assert health["inbound_seq"] == 0
+
+
 # --------------------------------------------------- (e) 启动 fail-closed 拒绝
 def test_startup_refuses_empty_nickname() -> None:
     with pytest.raises(ConfigError) as excinfo:

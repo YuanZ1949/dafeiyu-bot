@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import struct
 import time
 import zlib
@@ -637,6 +638,7 @@ def make_router(
     qq: FakeChannelAdapter | None = None,
     wechat: FakeChannelAdapter | None = None,
     fetch: FetchFn | None = None,
+    decode: mirror_module.DecodeFn | None = None,
 ) -> tuple[MirrorRouter, Store]:
     store = Store(tmp_path / "mirror.db")
     store.init_schema()
@@ -650,6 +652,7 @@ def make_router(
             store,
             adapters,
             fetch=fetch,
+            decode=decode,
         ),
         store,
     )
@@ -1237,5 +1240,267 @@ async def test_unreadable_media_records_message_id(tmp_path: Path) -> None:
     failure = stats["recent_failures"][0]
     assert failure["code"] == "media_unreadable"
     assert failure["message_id"] == "m1"
+
+
+# ------------------------------- .dat 解码失败延迟补发（I-5）
+
+
+def undecodable_dat(tmp_path: Path) -> Attachment:
+    """一张解不开的微信 ``.dat``：模拟密钥未到。"""
+    place(tmp_path, "images/msg.dat", b"not-a-decodable-dat")
+    return Attachment(kind="image", path="images/msg.dat", name="msg.dat")
+
+
+async def decode_none(_data: bytes) -> bytes | None:
+    return None
+
+
+async def test_undecodable_dat_schedules_media_only_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """解不开的 .dat 先发占位，同时排一次「只含图片」的补发（G6）。"""
+    monkeypatch.setattr(mirror_module, "MEDIA_DECODE_RETRY_DELAY", 0.0)
+    router, _store = make_router(tmp_path, decode=decode_none)
+    qq = cast(FakeChannelAdapter, router.adapters["qq"])
+    # _requeue_after_delay 只在 worker 仍在运行时重排：用占位 task 模拟存活。
+    placeholder = asyncio.create_task(asyncio.sleep(3600))
+    router._tasks[QQ_CHAT] = placeholder
+    try:
+        await router._deliver(
+            make_item(
+                source_channel="wechat",
+                kind="image",
+                text_lines=("你好",),
+                attachments=(undecodable_dat(tmp_path),),
+            )
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+        retry = router._queues[QQ_CHAT].get_nowait()
+    finally:
+        placeholder.cancel()
+
+    assert isinstance(retry, MirrorItem)
+    assert retry.media_only is True
+    assert retry.media_attempts == 1
+    assert retry.text_lines == ()
+    assert [item.kind for item in retry.attachments] == ["image"]
+    assert retry.source_message_id == "m1"
+    # 首次投递：占位照发，图片按 media_unreadable 留痕。
+    assert qq.segments == []
+    assert [text for _ct, _cid, text in qq.sent] == [WIRE_IMAGE]
+    stats = router.stats()
+    assert stats["dropped"] == 1
+    assert stats["recent_failures"][0]["code"] == "media_unreadable"
+
+
+async def test_dat_decode_retry_exhausted_records_failed_image(
+    tmp_path: Path,
+) -> None:
+    """补发次数耗尽＝这张图真的没补上：必须留 media_decode_failed（G6）。"""
+    router, _store = make_router(tmp_path, decode=decode_none)
+    item = replace(
+        make_item(
+            source_channel="wechat",
+            kind="image",
+            attachments=(undecodable_dat(tmp_path),),
+        ),
+        media_attempts=mirror_module.MEDIA_DECODE_RETRIES,
+    )
+
+    await router._deliver(item)
+
+    codes = [
+        failure["code"]
+        for failure in router.stats()["recent_failures"]
+    ]
+    assert "media_decode_failed" in codes
+    failed = next(
+        failure
+        for failure in router.stats()["recent_failures"]
+        if failure["code"] == "media_decode_failed"
+    )
+    assert failed["message_id"] == "m1"
+    # 不再排新的补发任务。
+    assert router._retry_tasks == set()
+
+
+async def test_media_only_retry_sends_image_without_text_or_store(
+    tmp_path: Path,
+) -> None:
+    """补发条目只发图片：不再重发正文，也不重复入库（I-5）。"""
+    router, store = make_router(tmp_path)
+    qq = cast(FakeChannelAdapter, router.adapters["qq"])
+    path = place(tmp_path, "images/x.png")
+
+    await router._deliver(
+        replace(
+            make_item(
+                source_channel="wechat",
+                kind="image",
+                text_lines=("你好",),
+                attachments=(
+                    Attachment(kind="image", path=str(path), name="x.png"),
+                ),
+            ),
+            media_only=True,
+            media_attempts=1,
+        )
+    )
+
+    assert qq.sent == []
+    assert len(qq.segments) == 1
+    _ct, _cid, segments = qq.segments[0]
+    assert [seg["type"] for seg in segments] == ["image"]
+    assert mirror_rows(store, QQ_CHAT) == []
+
+
+# ------------------------------- 队列与过期（I-6）
+
+
+async def test_media_item_not_expired_after_ten_minutes(tmp_path: Path) -> None:
+    """图片晚到 10 分钟仍要补发：媒体 TTL 900s，文本仍是 300s。"""
+    router, _store = make_router(tmp_path)
+    qq = cast(FakeChannelAdapter, router.adapters["qq"])
+    path = place(tmp_path, "images/x.png")
+
+    await router._deliver(
+        replace(
+            make_item(
+                source_channel="wechat",
+                kind="image",
+                attachments=(
+                    Attachment(kind="image", path=str(path), name="x.png"),
+                ),
+            ),
+            created_at=time.time() - 600,
+        )
+    )
+
+    assert router.stats()["expired"] == 0
+    assert len(qq.segments) == 1
+
+
+async def test_text_item_still_expires_at_five_minutes(tmp_path: Path) -> None:
+    router, _store = make_router(tmp_path)
+    qq = cast(FakeChannelAdapter, router.adapters["qq"])
+
+    await router._deliver(
+        replace(
+            make_item(source_channel="wechat", text_lines=("你好",)),
+            created_at=time.time() - 400,
+        )
+    )
+
+    assert router.stats()["expired"] == 1
+    assert qq.sent == []
+
+
+async def test_expired_media_records_message_id(tmp_path: Path) -> None:
+    """媒体过期＝永久丢图：过期也必须留痕，带源消息 id（G6）。"""
+    router, _store = make_router(tmp_path)
+
+    await router._deliver(
+        replace(
+            make_item(
+                source_channel="wechat",
+                kind="image",
+                attachments=(
+                    Attachment(kind="image", path="images/x.png", name="x.png"),
+                ),
+            ),
+            created_at=time.time() - 1000,
+        )
+    )
+
+    stats = router.stats()
+    assert stats["expired"] == 1
+    failure = stats["recent_failures"][0]
+    assert failure["code"] == "expired"
+    assert failure["message_id"] == "m1"
+
+
+async def test_full_queue_drops_oldest_text_for_media(tmp_path: Path) -> None:
+    """队列满时图片优先：挤掉最旧纯文本，媒体照常入队（G6）。"""
+    router, _store = make_router(tmp_path)
+    queue: asyncio.Queue[mirror_module.MirrorItem | mirror_module._Stop] = (
+        asyncio.Queue(maxsize=2)
+    )
+    router._queues[QQ_CHAT] = queue
+
+    text_item = replace(
+        make_item(source_channel="wechat", text_lines=("第一条",)),
+        source_message_id="text-1",
+    )
+    first_media = replace(
+        make_item(
+            source_channel="wechat",
+            kind="image",
+            attachments=(Attachment(kind="image", path="images/a.png"),),
+        ),
+        source_message_id="img-1",
+    )
+    second_media = replace(
+        make_item(
+            source_channel="wechat",
+            kind="image",
+            attachments=(Attachment(kind="image", path="images/b.png"),),
+        ),
+        source_message_id="img-2",
+    )
+
+    router._enqueue(text_item)
+    router._enqueue(first_media)
+    router._enqueue(second_media)
+
+    remaining = [queue.get_nowait(), queue.get_nowait()]
+    kept: list[MirrorItem] = []
+    for entry in remaining:
+        assert isinstance(entry, MirrorItem)
+        kept.append(entry)
+    assert [item.source_message_id for item in kept] == ["img-1", "img-2"]
+    assert router.stats()["dropped"] == 1
+    # 未完成计数必须抹平，否则 join() 永远等不到归零。
+    for _ in kept:
+        queue.task_done()
+    await asyncio.wait_for(queue.join(), 0.2)
+
+
+async def test_full_queue_media_overflow_is_recorded(tmp_path: Path) -> None:
+    """队列里全是媒体时只能丢最新，但丢的是图，必须留痕（G6）。"""
+    router, _store = make_router(tmp_path)
+    queue: asyncio.Queue[mirror_module.MirrorItem | mirror_module._Stop] = (
+        asyncio.Queue(maxsize=1)
+    )
+    router._queues[QQ_CHAT] = queue
+
+    kept = replace(
+        make_item(
+            source_channel="wechat",
+            kind="image",
+            attachments=(Attachment(kind="image", path="images/a.png"),),
+        ),
+        source_message_id="img-1",
+    )
+    lost = replace(
+        make_item(
+            source_channel="wechat",
+            kind="image",
+            attachments=(Attachment(kind="image", path="images/b.png"),),
+        ),
+        source_message_id="img-2",
+    )
+
+    router._enqueue(kept)
+    router._enqueue(lost)
+
+    first = queue.get_nowait()
+    assert isinstance(first, MirrorItem)
+    assert first.source_message_id == "img-1"
+    stats = router.stats()
+    assert stats["dropped"] == 1
+    failure = stats["recent_failures"][0]
+    assert failure["code"] == "queue_overflow"
+    assert failure["message_id"] == "img-2"
 
 

@@ -134,6 +134,11 @@ class WeChatAdapter:
             "failed": 0,
         }
         self.last_receipt_at: float | None = None
+        # 桥上报的入站水位：丢帧（gap_from 非空）必须能在健康快照里看见。
+        self.inbound_seq = 0
+        self.inbound_acked = 0
+        self.inbound_gap_from: int | None = None
+        self.unacked_count = 0
 
     # ----------------------------------------------------------- 身份/状态
     @property
@@ -198,6 +203,20 @@ class WeChatAdapter:
                 "unverified_rate": 0.0,
                 "last_at": None,
             }
+
+    def inbound_stats(self) -> dict[str, Any]:
+        """入站水位快照：``gap_from`` 非空表示桥侧有帧被永久挤掉。
+
+        桥的健康帧透传 ``inbound_seq`` / ``inbound_acked`` / ``unacked_count``
+        / ``inbound_gap_from``；旧版桥没有这些键时全部为 0/None，健康快照
+        形状不变（只是多了 ``inbound`` 段）。
+        """
+        return {
+            "seq": self.inbound_seq,
+            "acked": self.inbound_acked,
+            "unacked": self.unacked_count,
+            "gap_from": self.inbound_gap_from,
+        }
 
     def _record_receipt(self, outcome: str) -> None:
         """累加一次发送回执/失败尝试；未知口径归入 failed。"""
@@ -645,6 +664,12 @@ class WeChatAdapter:
         self.degraded = bool(envelope.get("degraded", False))
         self.health_reason = str(envelope.get("reason") or "")
         self.queue_depth = _int(envelope.get("queue_depth"))
+        # 入站水位：丢帧时桥会给 gap_from，原样记下来供健康快照/告警使用。
+        self.inbound_seq = _int(envelope.get("inbound_seq"))
+        self.inbound_acked = _int(envelope.get("inbound_acked"))
+        self.unacked_count = _int(envelope.get("unacked_count"))
+        gap = envelope.get("inbound_gap_from")
+        self.inbound_gap_from = gap if type(gap) is int and gap > 0 else None
         version = envelope.get("wechat_version")
         self.wechat_version = str(version) if version is not None else None
         language = envelope.get("language")

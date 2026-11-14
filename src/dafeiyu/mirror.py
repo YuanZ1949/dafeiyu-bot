@@ -39,9 +39,16 @@ IDEMPOTENCY_TTL = 600.0
 FINGERPRINT_TTL = 10.0
 #: 出队时超过这个年龄的条目直接丢弃，避免断桥恢复后补发一批过期消息。
 ITEM_MAX_AGE = 300.0
+#: 媒体条目（图片/语音/视频/文件）的过期上限：比纯文本宽松得多。
+#: 断桥恢复后图片晚到 10 分钟仍应尽量补发，一张图丢了就是永久丢失。
+ITEM_MAX_AGE_MEDIA = 900.0
 #: 入站物化回填等待上限（秒）：worker 发图前等 ``Service.handle`` 把图落盘，
 #: 超时就退回入队快照自行下载（宁可慢一次，也不能把队列卡死）。
 MATERIALIZE_WAIT_SECONDS = 15.0
+#: 微信 ``.dat`` 解码失败后的补发次数与间隔：密钥迟到时不要让图永久丢失。
+#: 补发走独立 task 延迟后重新入队，绝不 sleep 占住 worker。
+MEDIA_DECODE_RETRIES = 2
+MEDIA_DECODE_RETRY_DELAY = 60.0
 #: 单条发送超时（秒）：超时视为结果未知，不重试，避免重复。
 SEND_TIMEOUT = 30.0
 #: 只有「可证明未发送」的暂时性失败才重试：not_connected（通道断开）以及
@@ -154,6 +161,10 @@ class MirrorItem:
     reply_hint: str = ""
     #: 入站物化回填握手；``observe_outbound`` 构造的条目没有它。
     media: MediaBox | None = None
+    #: ``.dat`` 解码失败的补发轮次：0 = 首次投递，达到上限后不再重排。
+    media_attempts: int = 0
+    #: 只补发媒体、不再重发正文/占位的条目（延迟重试用）。
+    media_only: bool = False
 
 
 def _normalize(text: str) -> str:
@@ -285,6 +296,14 @@ def _render_forward(payload: Any) -> str:
 def _media_kind(kind: str) -> str:
     normalized = _SEGMENT_MEDIA.get(str(kind or "").strip().lower(), "")
     return normalized or str(kind or "").strip().lower()
+
+
+def _is_media_item(item: MirrorItem) -> bool:
+    """条目是否携带媒体：有附件，或来源类型不是纯文本。
+
+    媒体条目用更宽的 TTL、队列满时优先保留；纯文本条目让位。
+    """
+    return bool(item.attachments) or item.kind != "text"
 
 
 #: 只为内层真实存在的方法生成包装，能力探测语义才不会被代理伪造。
@@ -565,6 +584,8 @@ class MirrorRouter:
         self._recent_failures: deque[dict[str, Any]] = deque(
             maxlen=FAILURE_RING_MAX
         )
+        #: 延迟补发任务（``.dat`` 解码失败）：stop 时必须一起取消。
+        self._retry_tasks: set[asyncio.Task[None]] = set()
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -622,8 +643,15 @@ class MirrorRouter:
         log.error("镜像 worker 异常退出：%s", task.get_name(), exc_info=exc)
 
     async def stop(self) -> None:
+        # 延迟补发任务先取消：否则它们会在 worker 收摊后把条目塞回新队列。
+        retries, self._retry_tasks = self._retry_tasks, set()
+        for retry in retries:
+            retry.cancel()
         tasks, self._tasks = self._tasks, {}
         queues, self._queues = self._queues, {}
+        for retry in retries:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await retry
         if not tasks:
             return
         for task in tasks.values():
@@ -828,8 +856,20 @@ class MirrorRouter:
                 queue.task_done()
 
     async def _deliver(self, item: MirrorItem) -> None:
-        if time.time() - item.created_at > ITEM_MAX_AGE:
+        max_age = (
+            ITEM_MAX_AGE_MEDIA if _is_media_item(item) else ITEM_MAX_AGE
+        )
+        if time.time() - item.created_at > max_age:
             self._counters["expired"] += 1
+            if _is_media_item(item):
+                # 媒体过期是永久丢图：不能只写光秃秃的 info 日志。
+                self._record_failure(
+                    item.target_chat_id,
+                    "过期",
+                    "expired",
+                    "",
+                    message_id=item.source_message_id,
+                )
             log.info("镜像条目已过期，丢弃：%s msg=%s", item.source_chat_id, item.source_message_id)
             return
         target_channel = "wechat" if item.source_channel == "qq" else "qq"
@@ -848,7 +888,11 @@ class MirrorRouter:
             if filled:
                 raw = self._merge_materialized(item.attachments, filled)
         attachments = await self._materialized_attachments(item, raw=raw)
-        rendered = self._render(item)
+        # 微信 .dat 解码失败可能是密钥迟到：有限次延迟补发，别让图永久丢失。
+        self._maybe_retry_dat(item, attachments)
+        rendered = (
+            RenderedLines([], []) if item.media_only else self._render(item)
+        )
         if target_channel == "qq":
             await self._deliver_qq(item, adapter, rendered, attachments)
         else:
@@ -1002,6 +1046,76 @@ class MirrorRouter:
             kind=item.kind,
         )
 
+    # ------------------------------------------------------------ 延迟补发
+    def _maybe_retry_dat(
+        self, item: MirrorItem, attachments: Sequence[Attachment]
+    ) -> None:
+        """微信 ``.dat`` 解码失败时登记一次延迟补发。
+
+        密钥迟到是真实存在的（``Service`` 有同源逻辑），以前镜像侧一失败
+        就永久发占位。这里只在「源是 .dat 图片、目标仍读不到文件」时补发，
+        最多 :data:`MEDIA_DECODE_RETRIES` 次；耗尽后记 ``media_decode_failed``，
+        让面板能查到哪条消息的图没补上。
+        """
+        if item.source_channel != "wechat":
+            return
+        if not any(
+            (attachment.path or "").lower().endswith(".dat")
+            for attachment in item.attachments
+        ):
+            return
+        unreadable = [
+            attachment
+            for attachment in attachments
+            if _media_kind(attachment.kind) == "image"
+            and media.resolve_media_path(self.settings, attachment) is None
+        ]
+        if not unreadable:
+            return
+        if item.media_attempts >= MEDIA_DECODE_RETRIES:
+            self._record_failure(
+                item.target_chat_id,
+                "图片补发",
+                "media_decode_failed",
+                "",
+                message_id=item.source_message_id,
+            )
+            log.warning(
+                "微信图片 .dat 解码重试耗尽，按占位结束：%s msg=%s",
+                item.target_chat_id,
+                item.source_message_id,
+            )
+            return
+        self._schedule_media_retry(item)
+
+    def _schedule_media_retry(self, item: MirrorItem) -> None:
+        """把一次补发排到 ``MEDIA_DECODE_RETRY_DELAY`` 之后，不阻塞 worker。"""
+        retry = replace(
+            item,
+            attachments=tuple(
+                attachment
+                for attachment in item.attachments
+                if _media_kind(attachment.kind) == "image"
+            ),
+            segments=(),
+            text_lines=(),
+            reply_hint="",
+            media_attempts=item.media_attempts + 1,
+            media_only=True,
+        )
+        task = asyncio.create_task(
+            self._requeue_after_delay(retry),
+            name=f"mirror-retry-{item.source_message_id}",
+        )
+        self._retry_tasks.add(task)
+        task.add_done_callback(self._retry_tasks.discard)
+
+    async def _requeue_after_delay(self, item: MirrorItem) -> None:
+        await asyncio.sleep(MEDIA_DECODE_RETRY_DELAY)
+        if item.target_chat_id not in self._tasks:
+            return
+        self._enqueue(item)
+
     # ------------------------------------------------------------ 目标 QQ
     async def _deliver_qq(
         self,
@@ -1055,14 +1169,25 @@ class MirrorRouter:
             else:
                 self._counters["sent"] += 1
                 message_id = result if isinstance(result, str) else None
-                self._register_fingerprints(item.target_chat_id, explanation, ())
-                try:
-                    # 入库永远是单行 store 形态，与今天逐字节一致。
-                    self._store_line(
-                        item, adapter, "".join(rendered.store), message_id, 0
+                # 补发条目只有媒体：正文/指纹/入库都已在首次投递完成，
+                # 这里再写会多出一条空行。
+                if not item.media_only:
+                    self._register_fingerprints(
+                        item.target_chat_id, explanation, ()
                     )
-                except Exception:  # noqa: BLE001 - 落库失败不阻断文件上传
-                    log.exception("镜像消息落库失败：%s", item.target_chat_id)
+                    try:
+                        # 入库永远是单行 store 形态，与今天逐字节一致。
+                        self._store_line(
+                            item,
+                            adapter,
+                            "".join(rendered.store),
+                            message_id,
+                            0,
+                        )
+                    except Exception:  # noqa: BLE001 - 落库失败不阻断文件上传
+                        log.exception(
+                            "镜像消息落库失败：%s", item.target_chat_id
+                        )
         else:
             # 文本失败只计 dropped，不再连坐后面的文件上传（I-3）。
             await self._send_lines(item, adapter, rendered)
@@ -1092,10 +1217,10 @@ class MirrorRouter:
         rendered: RenderedLines,
         attachments: Sequence[Attachment],
     ) -> None:
-        if not rendered.wire:
-            return
         # 文本失败也不能连坐媒体：图片/文件比一行占位更值钱（I-3）。
-        await self._send_lines(item, adapter, rendered)
+        # 补发条目没有正文（media_only），这里只跳过文本、照常发媒体。
+        if rendered.wire:
+            await self._send_lines(item, adapter, rendered)
 
         for attachment in attachments:
             kind = _media_kind(attachment.kind)
@@ -1654,11 +1779,74 @@ class MirrorRouter:
         queue = self._queue_for(item.target_chat_id)
         try:
             queue.put_nowait(item)
+            return
         except asyncio.QueueFull:
-            self._counters["dropped"] += 1
-            log.warning(
-                "镜像队列已满，丢弃最新一条：%s -> %s msg=%s",
-                item.source_chat_id,
+            pass
+        # 队列满时媒体优先：先挤掉最旧的一条纯文本，图片/文件排到队里。
+        if _is_media_item(item):
+            dropped = self._drop_oldest_text(queue)
+            if dropped is not None:
+                self._counters["dropped"] += 1
+                log.warning(
+                    "镜像队列已满，丢弃最旧一条纯文本为媒体让位：%s msg=%s",
+                    item.target_chat_id,
+                    dropped.source_message_id,
+                )
+                with contextlib.suppress(asyncio.QueueFull):
+                    queue.put_nowait(item)
+                    return
+        self._counters["dropped"] += 1
+        if _is_media_item(item):
+            # 媒体被队列挤掉是永久丢图：必须留痕（含消息 id）。
+            self._record_failure(
                 item.target_chat_id,
-                item.source_message_id,
+                "入队",
+                "queue_overflow",
+                "",
+                message_id=item.source_message_id,
             )
+        log.warning(
+            "镜像队列已满，丢弃最新一条：%s -> %s msg=%s",
+            item.source_chat_id,
+            item.target_chat_id,
+            item.source_message_id,
+        )
+
+    @staticmethod
+    def _drop_oldest_text(
+        queue: "asyncio.Queue[MirrorItem | _Stop]",
+    ) -> MirrorItem | None:
+        """整队取出再放回，挤掉最旧的一条纯文本；没有可丢的就原样恢复。
+
+        ``asyncio.Queue`` 不支持按下标删除，只能 drain + re-put。每次 put
+        都让未完成数 +1，所以最后统一补 ``task_done`` 把账抹平——否则
+        ``join()`` 永远等不到归零。
+        """
+        items: list[MirrorItem | _Stop] = []
+        while True:
+            try:
+                items.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        dropped: MirrorItem | None = None
+        kept: list[MirrorItem | _Stop] = []
+        for entry in items:
+            if (
+                dropped is None
+                and isinstance(entry, MirrorItem)
+                and not _is_media_item(entry)
+            ):
+                dropped = entry
+                continue
+            kept.append(entry)
+        if dropped is None:
+            for entry in items:
+                queue.put_nowait(entry)
+            for _ in items:
+                queue.task_done()
+            return None
+        for entry in kept:
+            queue.put_nowait(entry)
+        for _ in items:
+            queue.task_done()
+        return dropped
