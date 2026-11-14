@@ -1036,19 +1036,20 @@ class MirrorRouter:
             )
             if not ok:
                 self._counters["dropped"] += 1
-                return
-            self._counters["sent"] += 1
-            message_id = result if isinstance(result, str) else None
-            self._register_fingerprints(item.target_chat_id, explanation, ())
-            try:
-                # 入库永远是单行 store 形态，与今天逐字节一致。
-                self._store_line(
-                    item, adapter, "".join(rendered.store), message_id, 0
-                )
-            except Exception:  # noqa: BLE001 - 落库失败不阻断文件上传
-                log.exception("镜像消息落库失败：%s", item.target_chat_id)
-        elif not await self._send_lines(item, adapter, rendered):
-            return
+            else:
+                self._counters["sent"] += 1
+                message_id = result if isinstance(result, str) else None
+                self._register_fingerprints(item.target_chat_id, explanation, ())
+                try:
+                    # 入库永远是单行 store 形态，与今天逐字节一致。
+                    self._store_line(
+                        item, adapter, "".join(rendered.store), message_id, 0
+                    )
+                except Exception:  # noqa: BLE001 - 落库失败不阻断文件上传
+                    log.exception("镜像消息落库失败：%s", item.target_chat_id)
+        else:
+            # 文本失败只计 dropped，不再连坐后面的文件上传（I-3）。
+            await self._send_lines(item, adapter, rendered)
 
         for attachment in files:
             await self._send_with_retry(
@@ -1073,8 +1074,8 @@ class MirrorRouter:
     ) -> None:
         if not rendered.wire:
             return
-        if not await self._send_lines(item, adapter, rendered):
-            return
+        # 文本失败也不能连坐媒体：图片/文件比一行占位更值钱（I-3）。
+        await self._send_lines(item, adapter, rendered)
 
         for attachment in attachments:
             kind = _media_kind(attachment.kind)

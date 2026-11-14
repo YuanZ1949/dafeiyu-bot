@@ -1073,3 +1073,63 @@ async def test_router_falls_back_to_snapshot_when_box_times_out(
     assert len(wechat.media) == 1
 
 
+# ------------------------------- 文本与媒体解耦（I-3）
+
+
+async def test_wechat_text_failure_does_not_block_media(tmp_path: Path) -> None:
+    """文本发送失败不能连坐图片（G3）。"""
+    router, _store = make_router(tmp_path)
+    adapter = router.adapters["wechat"]
+
+    async def boom(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("text down")
+
+    adapter.send = boom
+    place(tmp_path, "images/x.png")
+
+    await router._deliver(
+        make_item(
+            source_channel="qq",
+            attachments=(
+                Attachment(kind="image", path="images/x.png", name="x.png"),
+            ),
+        )
+    )
+
+    wechat = cast(FakeChannelAdapter, adapter)
+    assert len(wechat.media) == 1
+    assert wechat.media[0][2] == "image"
+    assert router.stats()["dropped"] >= 1
+
+
+class FailingSegmentUploader(UploadRecorder):
+    """消息段发送必失败，用来验证文件上传不被连坐。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._segments_error = RuntimeError("segments down")
+
+
+async def test_qq_segment_failure_still_uploads_files(tmp_path: Path) -> None:
+    """消息段失败不能连坐文件上传（G3）。"""
+    qq = FailingSegmentUploader()
+    router, _store = make_router(tmp_path, qq=qq)
+    place(tmp_path, "images/x.png")
+    place(tmp_path, "files/doc.pdf", b"%PDF-1.4")
+
+    await router._deliver(
+        make_item(
+            source_channel="wechat",
+            kind="image",
+            attachments=(
+                Attachment(kind="image", path="images/x.png", name="x.png"),
+                Attachment(kind="file", path="files/doc.pdf", name="doc.pdf"),
+            ),
+        )
+    )
+
+    assert qq.segments == []
+    assert [entry[3] for entry in qq.files] == ["doc.pdf"]
+    assert router.stats()["dropped"] == 1
+
+
