@@ -2,12 +2,29 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from conftest import TEST_CONFIG_YAML
 
 from dafeiyu.config import DashboardConfig, load_settings
 from dafeiyu.supervisor.lan_access import dashboard_urls, ensure_dashboard_password
 
 LAN_HOST = "0.0.0.0"
+
+#: ``load_settings`` 是 ``env.update(os.environ)``——进程环境**盖过** ``.env`` 文件
+#: （`config.py:2251-2253`）。进程里残留任何一个面板变量，本文件写的临时 ``.env``
+#: 就失效了。
+_DASHBOARD_ENV_VARS = (
+    "DAFEIYU_DASHBOARD_USER",
+    "DAFEIYU_DASHBOARD_PASSWORD",
+    "DAFEIYU_DASHBOARD_SESSION_HOURS",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_dashboard_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """让临时 ``.env`` 说了算：先摘掉进程环境里的面板变量。"""
+    for name in _DASHBOARD_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 def load(tmp_path: Path, *, dashboard_yaml: str = "", password: str | None = None):
