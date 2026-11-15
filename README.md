@@ -896,6 +896,9 @@ Bot 控制口（8788）与 OneBot 反向 WS（8080）仍只监听本机。**
 各截「整页 + 会话时间线抽屉」两张 PNG，并把气泡左右边缘、宽度、日期条宽度写成 `metrics.json`。
 详细说明见 [docs/dashboard-2026-11-15.md](docs/dashboard-2026-11-15.md)。
 
+本轮「攒着寿命 + 气泡排版 + 面板改版」的完整改动、实测数字与验收结果见
+[docs/hotchat-lifetime-panel-redesign-2026-11-15.md](docs/hotchat-lifetime-panel-redesign-2026-11-15.md)。
+
 ### 运维 runbook（健康 / 告警 / 备份 / 恢复 / 审计）
 
 **健康**：`GET /api/health/detail`（需控制口令）返回 `ok`、三个进程状态、bot 的网关/额度/错误
