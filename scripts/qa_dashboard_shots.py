@@ -20,11 +20,11 @@
 本机没有任何会话时不报错：只产出整页截图，``metrics.json`` 里写
 ``"bubbles": []`` 与 ``"reason": "no-session"``。
 
-口令来源（按优先级，脚本不落盘、不写进提交）：
+口令来源（按优先级，脚本不落盘、不写进提交）。**不接受命令行参数**：
+命令行口令会留在 shell history 与进程命令行里，只走进程环境或 0600 文件。
 
-1. ``--password``
-2. 环境变量 ``DAFEIYU_DASHBOARD_PASSWORD``
-3. ``data/dashboard.password``（只读；本机通常不存在）
+1. 环境变量 ``DAFEIYU_DASHBOARD_PASSWORD``
+2. ``data/dashboard.password``（只读；本机通常不存在）
 
 退出码::
 
@@ -188,10 +188,8 @@ def _login(base_url: str, user: str, password: str, timeout: float) -> str:
     return token
 
 
-def _resolve_password(explicit: str) -> str:
-    """三级口令来源：--password → 环境变量 → data/dashboard.password（只读）。"""
-    if explicit:
-        return explicit
+def _resolve_password() -> str:
+    """两级口令来源：环境变量 → data/dashboard.password（只读）。"""
     env = os.environ.get("DAFEIYU_DASHBOARD_PASSWORD", "").strip()
     if env:
         return env
@@ -851,11 +849,6 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="登录用户名（默认取 DAFEIYU_DASHBOARD_USER 或 admin）",
     )
     parser.add_argument(
-        "--password",
-        default="",
-        help="登录口令（默认取 DAFEIYU_DASHBOARD_PASSWORD 或 data/dashboard.password）",
-    )
-    parser.add_argument(
         "--timeout", type=float, default=60.0, help="整体超时（秒，默认 60）"
     )
     parser.add_argument(
@@ -897,12 +890,12 @@ def main(argv: list[str] | None = None) -> int:
         probe = _probe(base_url, min(10.0, args.timeout))
         cookie = ""
         if probe.status == 401:
-            password = _resolve_password(args.password)
+            password = _resolve_password()
             if not password:
                 raise QaError(
                     3,
-                    "面板需要登录但没有口令：用 --password、环境变量 "
-                    "DAFEIYU_DASHBOARD_PASSWORD 或 data/dashboard.password 提供",
+                    "面板需要登录但没有口令：设置环境变量 "
+                    "DAFEIYU_DASHBOARD_PASSWORD 或写入 data/dashboard.password",
                 )
             cookie = _login(base_url, args.user, password, min(10.0, args.timeout))
         binary = _find_browser(args.browser)

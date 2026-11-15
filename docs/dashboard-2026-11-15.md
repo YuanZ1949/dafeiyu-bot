@@ -117,11 +117,12 @@ Esc 或点面板外部关闭。
 ```
 
 参数：`--base-url`（默认 `http://127.0.0.1:8787`）、`--out-dir`（默认
-`.omo/evidence/visual/<时间戳>`）、`--user`、`--password`、`--timeout`（默认 60 秒）、
+`.omo/evidence/visual/<时间戳>`）、`--user`、`--timeout`（默认 60 秒）、
 `--browser`、`--viewports both|desktop|mobile`、`--debug`。
 
-口令来源优先级：`--password` → 环境变量 `DAFEIYU_DASHBOARD_PASSWORD` → `data/dashboard.password`
-（只读）。脚本不落盘口令。
+口令来源优先级：环境变量 `DAFEIYU_DASHBOARD_PASSWORD` → `data/dashboard.password`
+（只读）。脚本不落盘口令，也**不接受命令行口令**——命令行参数会留在 shell history
+与进程命令行里。
 
 流程与产物：
 
