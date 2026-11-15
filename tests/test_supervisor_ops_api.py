@@ -331,6 +331,49 @@ async def test_restore_with_file_and_confirm(tmp_path: Path) -> None:
         await client.close()
 
 
+async def test_restore_streams_multi_chunk_upload(tmp_path: Path) -> None:
+    """大备份体要经过多次 ``read_chunk()``：落盘字节必须与上传字节完全一致。
+
+    这条同时卡住 ``restore_backup`` 里对 ``part`` 的类型收窄——如果收窄写错把
+    真正的 ``BodyPartReader`` 跳过了，这里会变成 400「缺少备份文件」。
+    """
+
+    class _SizeRecordingRestore(FakeRestore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sizes: list[int] = []
+
+        async def restore(
+            self, path: Path, *, actor: str, ip: str = "", request_id: str = ""
+        ) -> dict:
+            self.sizes.append(path.stat().st_size)
+            return await super().restore(path, actor=actor, ip=ip, request_id=request_id)
+
+    restore = _SizeRecordingRestore()
+    ops = OpsServices(
+        health=FakeHealth(),
+        alerts=FakeAlerts(),
+        backups=FakeBackups(),
+        restore=restore,
+        audit=None,
+    )
+    app, _supervisor, ops, _audit = make_app(tmp_path, ops=ops)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    payload = b"SQLite format 3\x00" + bytes(range(256)) * 1024  # 256 KiB，必然多次 read_chunk
+    try:
+        form = FormData()
+        form.add_field("file", payload, filename="upload.db")
+        form.add_field("confirm", "RESTORE")
+        resp = await client.post("/api/backups/restore", data=form)
+        assert resp.status == 200
+        assert (await resp.json())["ok"] is True
+        assert restore.sizes == [len(payload)]
+        assert len(ops.restore.calls) == 1
+    finally:
+        await client.close()
+
+
 async def test_audit_endpoint_and_process_control(tmp_path: Path) -> None:
     app, supervisor, _ops, _audit = make_app(tmp_path)
     client = TestClient(TestServer(app))
@@ -651,7 +694,7 @@ async def test_budget_passes_bot_error_status(tmp_path: Path) -> None:
 
 
 async def test_restore_workspace_requires_confirm_and_passes_id(tmp_path: Path) -> None:
-    app, _supervisor, ops, audit = make_app(tmp_path)
+    app, _supervisor, ops, _audit = make_app(tmp_path)
     client = TestClient(TestServer(app))
     await client.start_server()
     try:

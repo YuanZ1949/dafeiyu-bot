@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
+from aiohttp.multipart import BodyPartReader
 
 from ..config import Settings
 from ..ids import normalize_chat_id
@@ -480,6 +481,10 @@ def create_app(
             except Exception:  # noqa: BLE001 - 非 multipart 请求按 400 处理
                 return web.json_response({"error": "请求必须是 multipart 表单"}, status=400)
             async for part in reader:
+                # aiohttp 的迭代类型是 ``MultipartReader | BodyPartReader | None``：
+                # 嵌套 multipart 与 None 都不是本接口的用法，跳过而不是 AttributeError。
+                if not isinstance(part, BodyPartReader):
+                    continue
                 if part.name == "file":
                     fd, tmp = tempfile.mkstemp(prefix="dafeiyu-restore-", suffix=".db")
                     upload_path = Path(tmp)
