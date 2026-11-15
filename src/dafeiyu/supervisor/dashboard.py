@@ -338,7 +338,7 @@ def create_app(
             }
         )
 
-    async def index(_: web.Request) -> web.Response:
+    async def index(_: web.Request) -> web.StreamResponse:
         # 面板单文件、改动频繁：不缓存，改完刷新就能看到新版（与 login.html 同款）。
         return web.FileResponse(
             DASHBOARD_DIR / "index.html", headers={"Cache-Control": "no-store"}
