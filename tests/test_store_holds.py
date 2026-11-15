@@ -153,6 +153,32 @@ def test_pending_hold_info_ignores_bot_messages(store: Store) -> None:
     assert store.oldest_undelivered_ts(GROUP, "1") is None
 
 
+def test_cursor_message_is_not_pending_without_delivery_row(store: Store) -> None:
+    """(h) 游标指向的那条消息本身不算积压（`id > cursor` 而非 `>=`）。
+
+    正常流程里 ``mark_delivered`` / ``mark_skipped`` 会同时写 ``delivered_messages``，
+    ``NOT EXISTS (delivered_messages ...)`` 会先把游标那条消息过滤掉，`>` 与 `>=`
+    结果相同。这里直接写游标、不写投递记录（打破该不变量），锁定谓词本身的语义。
+    """
+    store.add_message(make_msg(0, ts=1000))
+    store.add_message(make_msg(1, ts=1100))
+    row = store._conn.execute(
+        "SELECT id FROM messages WHERE message_id = 'm0'"
+    ).fetchone()[0]
+    store._conn.execute(
+        "INSERT INTO delivered_cursors (chat_type, chat_id, last_message_id)"
+        " VALUES (?, ?, ?)",
+        (GROUP.value, "1", row),
+    )
+    store._conn.commit()
+
+    assert store.pending_hold_info() == [
+        {"chat_type": "group", "chat_id": "1", "count": 1, "oldest_ts": 1100}
+    ]
+    assert store.oldest_undelivered_ts(GROUP, "1") == 1100
+    assert store.undelivered_message_ids(GROUP, "1") == ["m1"]
+
+
 def test_latest_decision_per_chat_returns_only_latest_row(store: Store) -> None:
     """每个会话只返回最新一条决策，不统计 held 行数（held 有 60 秒去重）。"""
     store.record_decision(
