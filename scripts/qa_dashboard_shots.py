@@ -40,6 +40,7 @@ import asyncio
 import base64
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -291,7 +292,7 @@ class _Cdp:
                 future = self._pending.pop(int(data["id"]), None)
                 if future is not None and not future.done():
                     future.set_result(data)
-        except Exception:  # noqa: BLE001 - 连接层异常统一折成失败回包
+        except Exception:  # noqa: BLE001, S110 - 连接层异常统一折成失败回包
             pass
         finally:
             closed = ConnectionError("cdp websocket closed")
@@ -347,7 +348,7 @@ class _Cdp:
             self._reader.cancel()
         try:
             await self._ws.close()
-        except Exception:  # noqa: BLE001 - 关连接失败不影响结论
+        except Exception:  # noqa: BLE001, S110 - 关连接失败不影响结论
             pass
 
 
@@ -765,7 +766,8 @@ async def _run(
         "--window-size=1280,900",
         "about:blank",
     ]
-    proc = subprocess.Popen(
+    proc = await asyncio.to_thread(
+        subprocess.Popen,
         [binary, *args],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -820,15 +822,10 @@ async def _run(
         try:
             proc.terminate()
             proc.wait(timeout=5)
-        except Exception:  # noqa: BLE001 - 进程回收失败不应掩盖真实结论
+        except Exception:  # noqa: BLE001, S110 - 进程回收失败不应掩盖真实结论
             pass
         # 独立的临时 profile：删除，绝不在仓库里留产物。
-        try:
-            import shutil
-
-            shutil.rmtree(profile_dir, ignore_errors=True)
-        except Exception:  # noqa: BLE001
-            pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:

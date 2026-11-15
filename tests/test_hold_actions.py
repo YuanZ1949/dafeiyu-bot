@@ -218,8 +218,8 @@ async def test_release_skips_only_the_hold_not_the_budget(tmp_path):
     harness = build(tmp_path)
     hold_a_batch(harness)
 
-    setattr(harness.service, "_chat_budget_decision", lambda *a, **k: SimpleNamespace(scope="day", reason="测试：预算已满"))
-    setattr(harness.service, "_budget_allows", lambda *a, **k: False)
+    setattr(harness.service, "_chat_budget_decision", lambda *a, **k: SimpleNamespace(scope="day", reason="测试：预算已满"))  # noqa: B010 - setattr 绕开 basedpyright 的返回类型检查
+    setattr(harness.service, "_budget_allows", lambda *a, **k: False)  # noqa: B010 - 同上，私有方法赋值
 
     await harness.control.session_action("release", ChatType.GROUP, GROUP)
 

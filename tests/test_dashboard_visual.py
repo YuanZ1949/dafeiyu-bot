@@ -73,6 +73,7 @@ def visual_metrics(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
         capture_output=True,
         text=True,
         timeout=300,
+        check=False,
     )
     if result.returncode == 2:
         pytest.skip(f"面板不可达：{BASE_URL}（{result.stderr.strip()}）")
