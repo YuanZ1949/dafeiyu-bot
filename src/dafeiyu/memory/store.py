@@ -2940,7 +2940,7 @@ class Store:
         )
         self._conn.commit()
 
-    def thread_states(self) -> list[dict[str, object]]:
+    def thread_states(self) -> list[dict[str, Any]]:
         """已落库的话题收尾信号（只读），按最近收尾时间倒序。
 
         只返回 ``thread_closed_until`` / ``last_closed_at`` 至少有一个非空的会话，
