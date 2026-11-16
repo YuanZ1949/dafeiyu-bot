@@ -335,7 +335,7 @@ def test_private_source_snapshot_feeds_aligner(tmp_path: Any) -> None:
     assert snapshot is not None
     assert snapshot["chat_name"] == FRIEND_NAME
     assert [m["kind"] for m in snapshot["messages"]] == [
-        "text", "image", "voice", "link", "quote",
+        "text", "image", "voice", "file", "quote",
     ]
     assert snapshot["messages"][0]["nickname"] == FRIEND_NAME
     assert snapshot["messages"][1]["media"]["kind"] == "image"
@@ -357,7 +357,7 @@ def test_private_source_snapshot_feeds_aligner(tmp_path: Any) -> None:
     assert [(m["kind"], m["text"]) for m in messages] == [
         ("image", "[图片]"),
         ("voice", "[语音]"),
-        ("link", FILE_TITLE),
+        ("file", f"[文件] {FILE_TITLE}"),
         ("quote", QUOTE_REPLY),
     ]
     assert all(m["nickname"] == FRIEND_NAME for m in messages)

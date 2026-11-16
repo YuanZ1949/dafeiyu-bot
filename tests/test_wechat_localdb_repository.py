@@ -570,6 +570,33 @@ def test_appmsg_forward_without_title_degrades_to_marker(tmp_path: Path) -> None
     assert entry["text"] == "[合并转发]"
 
 
+def test_appmsg_file_renders_file_marker(tmp_path: Path) -> None:
+    """文件消息（appmsg type 6）只显示文件名，不伪造路径、不下载文件。"""
+    xml = (
+        "<msg><appmsg><title>季度报表.pdf</title><type>6</type>"
+        "<appattach></appattach></appmsg></msg>"
+    )
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, f"wxid_a:\n{xml}", local_type=49)
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["kind"] == "file"
+    assert entry["text"] == "[文件] 季度报表.pdf"
+
+
+def test_appmsg_file_without_title_degrades_to_marker(tmp_path: Path) -> None:
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, "wxid_a:\n<msg><appmsg><type>6</type></appmsg></msg>", local_type=49),
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["kind"] == "file"
+    assert entry["text"] == "[文件]"
+
+
 def test_quote_message_exposes_refer_fields(tmp_path: Path) -> None:
     xml = (
         "<msg><appmsg><title>我的回复</title><type>57</type>"
@@ -1713,10 +1740,10 @@ def test_friend_recent_media_and_quote_end_to_end(tmp_path: Path) -> None:
     entries = store.recent(ref)
 
     assert [entry["kind"] for entry in entries] == [
-        "text", "image", "voice", "link", "quote",
+        "text", "image", "voice", "file", "quote",
     ]
     assert [entry["text"] for entry in entries] == [
-        QUOTED_ORIGINAL, "[图片]", "[语音]", FILE_TITLE, QUOTE_REPLY,
+        QUOTED_ORIGINAL, "[图片]", "[语音]", f"[文件] {FILE_TITLE}", QUOTE_REPLY,
     ]
     # 好友已联系入 contact：所有条目的昵称都是好友显示名。
     assert all(entry["nickname"] == FRIEND_NAME for entry in entries)
@@ -1735,7 +1762,7 @@ def test_friend_recent_media_and_quote_end_to_end(tmp_path: Path) -> None:
     assert voice["media"]["name"] == VOICE_NAME
     assert voice["media"]["size"] == len(VOICE_PAYLOAD)
     assert voice["media"]["duration"] == 3000
-    # 文件消息走 appmsg/link 映射（现有实现没有独立 file kind），且无媒体元数据。
+    # 文件消息走 appmsg/file 渲染，只有文件名占位，无媒体元数据。
     assert "media" not in entries[3]
     # quote：同群场景只多出 reply 字段，不进媒体管线。
     quote = entries[4]

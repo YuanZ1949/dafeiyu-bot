@@ -118,6 +118,9 @@ _APPMSG_QUOTE = 57
 #: appmsg 的合并转发类型。
 _APPMSG_FORWARD = 19
 
+#: appmsg 的文件消息类型。
+_APPMSG_FILE = 6
+
 #: 视频号分享 XML 的正则兜底（ElementTree 解析失败时用）。
 _FINDER_NICK_RE = re.compile(r"<nickname[^>]*>(.*?)</nickname>", re.DOTALL)
 _FINDER_DESC_RE = re.compile(r"<desc[^>]*>(.*?)</desc>", re.DOTALL)
@@ -1119,6 +1122,9 @@ def _render_appmsg(body: str) -> tuple[str, str, str, str]:
         # 合并转发（聊天记录）没有可展开的子消息：只把标题标出来，避免模型
         # 把它当成普通链接。kind 保持 link，timeline/附件语义不变。
         return "link", f"[合并转发] {title}".strip(), "", ""
+    if appmsg_type == str(_APPMSG_FILE):
+        # 文件消息只渲染文件名占位：不伪造路径、不触发下载。
+        return "file", f"[文件] {title}".strip(), "", ""
     finder = _finder_share(body)
     if finder is not None:
         # 视频号的 <title> 是「当前版本不支持展示该内容」这类模板文案，真正
