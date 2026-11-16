@@ -10,7 +10,7 @@
    localStorage 写入，重载页面后主题仍在；
 2. 六个分区页签：逐个点 #pane-nav [data-pane]，页面上始终恰好一个
    .pane.active 且 id 与点击目标一致；
-3. 会话时间线抽屉：点会话行的「查看时间线」让抽屉可见，点关闭按钮再隐藏；
+3. 会话时间线抽屉：点会话行的 [data-action="timeline"] 按钮让抽屉可见，点关闭按钮再隐藏；
 4. 用量趋势：点 #btn-refresh-usage 后 #usage-bars 渲染出柱子，且 dashboard
    的 GET /api/usage（经 TestClient）透传 200 + series 数组；
 5. 用量按用途：真实 BrainControl 临时 Store 里种下四行 usage，页面
@@ -246,11 +246,11 @@ async def test_e2e_timeline_drawer_opens_and_closes(tmp_path: Path) -> None:
         # loadSessions() 首屏自动拉 /api/sessions 并渲染会话行；等行出现再点。
         await page.wait_for(".session-row")
         opened = await page.eval_js(
-            "(() => { const btn = [...document.querySelectorAll("
-            "'.session-row .acts button')].find((b) => b.textContent === '查看时间线');"
+            "(() => { const btn = document.querySelector("
+            "'.session-row .acts [data-action=\"timeline\"]');"
             "if (!btn) return false; btn.click(); return true; })()"
         )
-        assert opened, "会话行里应存在「查看时间线」按钮"
+        assert opened, "会话行里应存在 data-action=timeline 按钮"
 
         await wait_until(
             page,

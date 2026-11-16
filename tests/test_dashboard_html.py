@@ -70,8 +70,10 @@ def test_html_memory_health_lists_pending_slots() -> None:
 def test_memory_session_rows_trigger_summary_and_impressions() -> None:
     """会话行直接带 chat_type/chat_id，用户不用把 ID 抄到上面的输入框。"""
     html = read_html()
-    assert 'add("摘要", "", () => triggerSummary(s.chat_type, s.chat_id));' in html
-    assert 'add("印象", "", () => triggerExtract(s.chat_type, s.chat_id));' in html
+    assert 'add("摘要", "", () => triggerSummary(s.chat_type, s.chat_id), "summary");' in html
+    assert 'add("印象", "", () => triggerExtract(s.chat_type, s.chat_id), "impression");' in html
+    # 按钮带 data-action 钩子：E2E 靠它定位，不依赖中文文案。
+    assert "btn.dataset.action = action;" in html
 
 
 def test_memory_manual_target_lives_in_advanced_and_has_own_type() -> None:

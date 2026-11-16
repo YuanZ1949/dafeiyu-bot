@@ -4562,21 +4562,23 @@ async function loadSessions(append = false) {
       meta.textContent = parts.join(" · ");
       const acts = document.createElement("div");
       acts.className = "acts";
-      const add = (label, cls, onClick) => {
+      const add = (label, cls, onClick, action) => {
         const btn = document.createElement("button");
         btn.className = `btn ${cls}`.trim();
+        // data-action 是 E2E 的定位钩子，断言不要依赖按钮文案。
+        btn.dataset.action = action;
         btn.textContent = label;
         btn.addEventListener("click", () => withBusy(btn, onClick));
         acts.appendChild(btn);
       };
-      add("摘要", "", () => triggerSummary(s.chat_type, s.chat_id));
-      add("印象", "", () => triggerExtract(s.chat_type, s.chat_id));
-      add("查看时间线", "", () => openTimeline(s));
-      add("新建会话", "", () => sessionAction(s, "new", "只清 session 映射，消息和摘要都会保留。继续？"));
-      add("软忘记", "", () => sessionAction(s, "forget", "将清空该会话的消息和映射，保留摘要与印象。继续？"));
-      add("彻底删除", "danger", () => hardDeleteSession(s));
-      add("导出 MD", "", () => exportChat(s, "md"));
-      add("导出 JSON", "", () => exportChat(s, "json"));
+      add("摘要", "", () => triggerSummary(s.chat_type, s.chat_id), "summary");
+      add("印象", "", () => triggerExtract(s.chat_type, s.chat_id), "impression");
+      add("查看时间线", "", () => openTimeline(s), "timeline");
+      add("新建会话", "", () => sessionAction(s, "new", "只清 session 映射，消息和摘要都会保留。继续？"), "new");
+      add("软忘记", "", () => sessionAction(s, "forget", "将清空该会话的消息和映射，保留摘要与印象。继续？"), "forget");
+      add("彻底删除", "danger", () => hardDeleteSession(s), "delete");
+      add("导出 MD", "", () => exportChat(s, "md"), "export-md");
+      add("导出 JSON", "", () => exportChat(s, "json"), "export-json");
       row.append(who, meta, acts);
       box.appendChild(row);
     });
