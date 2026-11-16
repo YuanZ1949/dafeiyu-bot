@@ -26,9 +26,11 @@ Weixin.dll 的版本/大小/SHA-256 指纹校验后注入微信进程，直接�
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -40,6 +42,8 @@ DEFAULT_HELPER_ROOT = r"C:\MyFile\AICoding\helper"
 DEFAULT_PORT = 30011
 MAX_BODY = 1 << 20
 _TARGET_SUFFIXES = ("@chatroom",)
+_HELPER_MARKER = Path("native") / "text_service.py"
+_VERSION_PART = re.compile(r"\d+")
 
 log = logging.getLogger("wechat-hook")
 
@@ -84,7 +88,7 @@ class HookBackend:
 
     def health(self) -> dict[str, Any]:
         service = self._service
-        return {
+        payload: dict[str, Any] = {
             "ok": self.ready,
             "ready": self.ready,
             "self_wxid": getattr(service, "self_wxid", "") if service is not None else "",
@@ -92,10 +96,43 @@ class HookBackend:
             "account": self.account or "",
             "last_error": self.last_error,
         }
+        payload.update(self._helper_frame())
+        return payload
+
+    def _helper_frame(self) -> dict[str, Any]:
+        """helper 版本兼容字段；任何一步失败只降级，不让 /health 变成 500。"""
+        frame: dict[str, Any] = {
+            "supported_versions": (),
+            "helper_version": "",
+            "helper_compat": "unknown",
+            "helper_fingerprint_available": False,
+        }
+        if not _helper_import_allowed() or not _helper_marker(self.helper_root).is_file():
+            return frame
+        try:
+            profiles = _core_profiles()
+        except Exception:  # noqa: BLE001 - helper 缺失/损坏时健康帧必须照常返回
+            log.debug("helper 版本表导入失败，helper_compat 按 unknown 降级", exc_info=True)
+            return frame
+        try:
+            supported = tuple(str(profile.version) for profile in profiles)
+        except Exception:  # noqa: BLE001 - 版本表结构变化同样只降级
+            log.warning("helper 版本表结构异常，helper_compat 按 unknown 降级", exc_info=True)
+            return frame
+        frame["supported_versions"] = supported
+        try:
+            frame["helper_version"] = _helper_version(service=self._service)
+        except Exception:  # noqa: BLE001 - helper 没自报版本就留空
+            log.debug("读取 helper 版本失败", exc_info=True)
+        try:
+            frame["helper_compat"] = _compat_state(self.wechat_version, supported)
+        except Exception:  # noqa: BLE001
+            log.debug("helper 版本比较失败，按 unknown 降级", exc_info=True)
+        return frame
 
     def _bootstrap(self) -> None:
         root = self.helper_root
-        if not (root / "native" / "text_service.py").is_file():
+        if not _helper_marker(root).is_file():
             raise SystemExit(f"helper 目录不对（找不到 native/text_service.py）：{root}")
         for path in (root / "native", root):
             entry = str(path)
@@ -344,6 +381,64 @@ def create_server(backend: HookBackend, host: str, port: int, *, token: str = ""
 
 
 # --------------------------------------------------------------------------- 工具函数
+
+
+def _helper_marker(helper_root: Path) -> Path:
+    """helper 目录是否像一份可用的 helper 树，用 ``native/text_service.py`` 判定。"""
+    return Path(helper_root) / _HELPER_MARKER
+
+
+def _helper_import_allowed() -> bool:
+    """helper 依赖只在 Windows 可用；其它平台一律不碰 ``wxbot_framework``。"""
+    return sys.platform == "win32"
+
+
+def _core_profiles() -> tuple[Any, ...]:
+    """延迟导入 helper 的支持版本表；导入失败由调用方降级。"""
+    module = importlib.import_module("wxbot_framework.native_profiles")
+    return tuple(getattr(module, "CORE_PROFILES", None) or ())
+
+
+def _helper_version(*, service: Any = None) -> str:
+    """运行中 helper 自报的版本；helper 不暴露版本时返回空串。"""
+    profiles_module = sys.modules.get("wxbot_framework.native_profiles")
+    package = sys.modules.get("wxbot_framework")
+    for source, attr in (
+        (service, "helper_version"),
+        (profiles_module, "HELPER_VERSION"),
+        (profiles_module, "__version__"),
+        (package, "__version__"),
+    ):
+        value = getattr(source, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _version_tuple(value: Any) -> tuple[int, ...]:
+    """``"4.2.0.13"`` -> ``(4, 2, 0, 13)``；没有数字时返回空元组。"""
+    return tuple(int(part) for part in _VERSION_PART.findall(str(value or "")))
+
+
+def _same_version(left: Any, right: Any) -> bool:
+    """按数字段比较（短版本补 0：``4.1.6`` == ``4.1.6.0``）。"""
+    left_parts = _version_tuple(left)
+    right_parts = _version_tuple(right)
+    if not left_parts or not right_parts:
+        return False
+    width = max(len(left_parts), len(right_parts))
+    return left_parts + (0,) * (width - len(left_parts)) == right_parts + (0,) * (
+        width - len(right_parts)
+    )
+
+
+def _compat_state(wechat_version: Any, supported: tuple[str, ...]) -> str:
+    """把 helper 报告的实际微信版本折成 ``ok`` / ``unsupported`` / ``unknown``。"""
+    if not _version_tuple(wechat_version) or not supported:
+        return "unknown"
+    if any(_same_version(wechat_version, version) for version in supported):
+        return "ok"
+    return "unsupported"
 
 
 def _resolve_mentions(service: Any, room: str, names: list[str]) -> tuple[list[str] | None, str]:

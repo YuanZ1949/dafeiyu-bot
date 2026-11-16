@@ -12,6 +12,7 @@ import importlib.util
 import json
 import sys
 import threading
+import types
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -381,3 +382,155 @@ def test_resolve_mentions_empty_at_fails_closed():
     members, reason = hook._resolve_mentions(FakeMemberService(ROWS), "1@chatroom", ["  "])
     assert members is None
     assert reason
+
+
+# --------------------------------------------------------------------------- helper 版本兼容
+
+HELPER_PROFILES = ("4.1.15.13", "4.2.0.13")
+
+
+def _helper_root(tmp_path: Path, *, marker: bool = True) -> Path:
+    root = tmp_path / "helper"
+    native = root / "native"
+    native.mkdir(parents=True)
+    if marker:
+        (native / "text_service.py").write_text("", encoding="utf-8")
+    return root
+
+
+def _fake_helper_profiles(monkeypatch, versions: tuple[str, ...] = HELPER_PROFILES) -> None:
+    """把 helper 的版本表换成假的，避免测试依赖真实 helper 仓。"""
+    module = types.ModuleType("wxbot_framework.native_profiles")
+    module.__dict__["CORE_PROFILES"] = tuple(
+        types.SimpleNamespace(version=version) for version in versions
+    )
+    monkeypatch.setitem(sys.modules, "wxbot_framework.native_profiles", module)
+    monkeypatch.setattr(hook, "_helper_import_allowed", lambda: True)
+
+
+def _boom(*_args: object, **_kwargs: object) -> None:
+    raise AssertionError("这种情况不允许导入 helper")
+
+
+def test_health_exposes_supported_versions_and_ok_compat(tmp_path, monkeypatch):
+    _fake_helper_profiles(monkeypatch)
+    backend = hook.HookBackend(_helper_root(tmp_path))
+    backend.wechat_version = "4.1.15.13"
+
+    body = backend.health()
+
+    assert body["supported_versions"] == HELPER_PROFILES
+    assert body["wechat_version"] == "4.1.15.13"
+    assert body["helper_compat"] == "ok"
+    assert body["helper_version"] == ""
+    assert body["helper_fingerprint_available"] is False
+    # 其余字段保持不变。
+    assert body["ok"] is False
+    assert body["ready"] is False
+    assert body["self_wxid"] == ""
+    assert body["account"] == ""
+    assert body["last_error"] == ""
+
+
+def test_health_marks_unlisted_wechat_version_unsupported(tmp_path, monkeypatch):
+    _fake_helper_profiles(monkeypatch)
+    backend = hook.HookBackend(_helper_root(tmp_path))
+    backend.wechat_version = "4.2.1.7"
+
+    body = backend.health()
+
+    assert body["helper_compat"] == "unsupported"
+    assert body["supported_versions"] == HELPER_PROFILES
+
+
+def test_health_compat_unknown_without_reported_version(tmp_path, monkeypatch):
+    _fake_helper_profiles(monkeypatch)
+    backend = hook.HookBackend(_helper_root(tmp_path))
+
+    body = backend.health()
+
+    assert body["helper_compat"] == "unknown"
+    assert body["wechat_version"] == ""
+    assert body["supported_versions"] == HELPER_PROFILES
+
+
+def test_health_degrades_to_unknown_when_helper_import_fails(tmp_path, monkeypatch):
+    _fake_helper_profiles(monkeypatch)
+    # ``None`` 会让 import 直接抛 ImportError，模拟 helper 装坏/缺依赖。
+    monkeypatch.setitem(sys.modules, "wxbot_framework.native_profiles", None)
+    backend = hook.HookBackend(_helper_root(tmp_path))
+    backend.wechat_version = "4.1.15.13"
+
+    body = backend.health()
+
+    assert body["helper_compat"] == "unknown"
+    assert body["supported_versions"] == ()
+    assert body["helper_fingerprint_available"] is False
+    assert body["wechat_version"] == "4.1.15.13"
+    assert body["ok"] is False
+
+
+def test_health_skips_helper_import_without_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(hook, "_helper_import_allowed", lambda: True)
+    monkeypatch.setattr(hook, "_core_profiles", _boom)
+    backend = hook.HookBackend(_helper_root(tmp_path, marker=False))
+    backend.wechat_version = "4.1.15.13"
+
+    body = backend.health()
+
+    assert body["helper_compat"] == "unknown"
+    assert body["supported_versions"] == ()
+
+
+def test_health_skips_helper_import_off_windows(tmp_path, monkeypatch):
+    _fake_helper_profiles(monkeypatch)
+    monkeypatch.setattr(hook, "_helper_import_allowed", lambda: False)
+    monkeypatch.setattr(hook, "_core_profiles", _boom)
+    backend = hook.HookBackend(_helper_root(tmp_path))
+    backend.wechat_version = "4.1.15.13"
+
+    body = backend.health()
+
+    assert body["helper_compat"] == "unknown"
+    assert body["supported_versions"] == ()
+
+
+def test_health_endpoint_reports_helper_fields_as_200(tmp_path, monkeypatch):
+    _fake_helper_profiles(monkeypatch)
+    backend = hook.HookBackend(_helper_root(tmp_path))
+    backend.wechat_version = "4.2.0.13"
+    server, base = _serve(backend)
+    try:
+        status, body = _get(f"{base}/health")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status == 200
+    assert body["helper_compat"] == "ok"
+    assert body["supported_versions"] == list(HELPER_PROFILES)
+    assert body["helper_version"] == ""
+    assert body["helper_fingerprint_available"] is False
+    assert body["wechat_version"] == "4.2.0.13"
+    assert body["ok"] is False
+
+
+def test_health_endpoint_still_200_when_helper_import_fails(tmp_path, monkeypatch):
+    _fake_helper_profiles(monkeypatch)
+    monkeypatch.setitem(sys.modules, "wxbot_framework.native_profiles", None)
+    backend = hook.HookBackend(_helper_root(tmp_path))
+    server, base = _serve(backend)
+    try:
+        status, body = _get(f"{base}/health")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status == 200
+    assert body["helper_compat"] == "unknown"
+    assert body["supported_versions"] == []
+    assert body["ok"] is False
+    assert body["ready"] is False
+    assert body["self_wxid"] == ""
+    assert body["account"] == ""
+    assert body["last_error"] == ""
