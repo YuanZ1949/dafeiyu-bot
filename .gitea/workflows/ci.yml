@@ -113,6 +113,14 @@ jobs:
           & .\.ci-venv\Scripts\python.exe -m compileall -q src
           if ($LASTEXITCODE -ne 0) { throw 'compileall failed' }
 
+      # ruff 随 Install 步骤的 `.[dev]` extra 一起装进 .ci-venv，这里不再单独 pip install。
+      # 用 exit 透出退出码：pwsh 最后一条外部命令非零不会自动让 step 失败。
+      - name: Lint
+        shell: pwsh
+        run: |
+          & .\.ci-venv\Scripts\ruff.exe check src tests
+          exit $LASTEXITCODE
+
       - name: Run pytest
         shell: pwsh
         run: |
