@@ -30,7 +30,18 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 import dafeiyu.gateway.wechat_bridge.__main__ as bridge_main
 import dafeiyu.gateway.wechat_bridge.server as bridge_server
-from dafeiyu.config import ConfigError, WeChatConfig
+from dafeiyu.config import (
+    BudgetConfig,
+    ConfigError,
+    GroupsConfig,
+    LoggingConfig,
+    MemoryConfig,
+    PersonaConfig,
+    Settings,
+    TriggerConfig,
+    WeChatConfig,
+)
+from dafeiyu.gateway.wechat_bridge.sender import SendResult
 from dafeiyu.gateway.wechat_bridge.server import BridgeServer, pump_frames
 
 WORKTREE = Path(__file__).resolve().parents[1]
@@ -2048,3 +2059,165 @@ async def test_run_forwards_state_path_to_server_factory() -> None:
             state_path="data/custom-state.json",
         )
     assert recorded["state_path"] == "data/custom-state.json"
+
+
+# ---------------------------------- (i) send_media：贴纸放行 + 情感原语映射
+def test_validate_media_accepts_sticker() -> None:
+    """sticker 是合法媒体 kind：_validate_media 放行，不回 bad_params。"""
+    chat_id, kind, path, name = bridge_main._validate_media(
+        {"chat_id": "wxg:g1", "kind": "sticker", "path": "x.gif"}
+    )
+    assert (chat_id, kind, path, name) == ("wxg:g1", "sticker", "x.gif", "")
+
+
+def test_validate_media_rejects_unknown_kind() -> None:
+    """白名单外的 kind 仍然拒绝（放宽 sticker 不能连带放开一切）。"""
+    with pytest.raises(bridge_main._CommandError) as excinfo:
+        bridge_main._validate_media({"chat_id": "wxg:g1", "kind": "exe", "path": "x"})
+    assert excinfo.value.code == "bad_params"
+
+
+class _StickerPoller:
+    """只实现 run() 内置发送路径用到的轮询接缝（无 localdb / 无 UiThread）。"""
+
+    def __init__(self, display_name: str) -> None:
+        self.stopped = False
+        peer = SimpleNamespace(display_name=display_name, live=True, kind="group")
+        self.registry = SimpleNamespace(by_alias=lambda _alias: peer)
+
+    async def start(self) -> None:
+        return None
+
+    async def request_send(self, fn: Any) -> Any:
+        return fn()
+
+    def allows_chat(self, _chat_id: str) -> bool:
+        return True
+
+    def abort_sends(self) -> int:
+        self.stopped = True
+        return 0
+
+    def stop(self, *, timeout: float = 5.0) -> bool:
+        self.stopped = True
+        return True
+
+    def reset_for_resume(self) -> bool:
+        return True
+
+    async def frames(self):
+        while not self.stopped:
+            yield dict(HEALTH_FRAME)
+            await asyncio.sleep(0.05)
+
+
+class _EmoticonTransport:
+    """HookTransport 替身：按 hook 服务器同表把 kind 映射到原生发送原语。
+
+    `_KIND_METHODS` 与 ``scripts/wechat_hook_server.py`` 的 senders 表一致；
+    记录命中的原语名，测试才能断言「sticker 走的是 send_emoticon」。
+    """
+
+    _KIND_METHODS = {
+        "image": "send_image",
+        "file": "send_file",
+        "voice": "send_voice",
+        "sticker": "send_emoticon",
+    }
+
+    def __init__(self) -> None:
+        self.media_calls: list[tuple[str, str, str, str]] = []
+        self.primitive_calls: list[str] = []
+
+    def send_media(
+        self, chat_name: str, kind: str, path: str, name: str
+    ) -> SendResult:
+        self.media_calls.append((chat_name, kind, path, name))
+        primitive = self._KIND_METHODS.get(kind)
+        if primitive is None:
+            return SendResult(
+                False, "hook_rejected", "failed", chat_name=chat_name, not_sent=True
+            )
+        self.primitive_calls.append(primitive)
+        return SendResult(
+            True, None, "observed", f"{primitive}:{len(self.primitive_calls)}"
+        )
+
+
+async def test_builtin_send_media_maps_sticker_to_emoticon() -> None:
+    """内置 send_media 放行 sticker：白名单 -> 传输层 -> hook 的 send_emoticon。"""
+    transport = _EmoticonTransport()
+    poller = _StickerPoller("老友群")
+    holder: dict[str, Any] = {}
+
+    def server_factory(*args: Any, **kwargs: Any) -> BridgeServer:
+        server = BridgeServer(*args, **kwargs)
+        holder["server"] = server
+        return server
+
+    settings = Settings(
+        api_key="sk-test",
+        base_url="https://api.deepseek.com",
+        model="deepseek-chat",
+        bot_qq=999,
+        ws_host="127.0.0.1",
+        ws_port=8080,
+        ws_token="",
+        db_path=":memory:",
+        persona=PersonaConfig("小助手", (), 120, 300, 0.05),
+        triggers=TriggerConfig(60, 0.0, ("00:00", "00:00"), (), mode="model"),
+        groups=GroupsConfig(frozenset(), frozenset(), frozenset()),
+        budget=BudgetConfig(200, 300000),
+        memory=MemoryConfig(20, 5, 20),
+        logging=LoggingConfig("INFO", "logs"),
+        wechat=_wechat(),
+    )
+    run_task = asyncio.create_task(
+        bridge_main.run(
+            settings=settings,
+            driver_factory=type("FakeDriver", (), {}),
+            server_factory=server_factory,
+            poller_factory=lambda _config, _driver: poller,
+            sender_factory=lambda _config, _poller, _driver: SimpleNamespace(
+                transport=transport
+            ),
+        )
+    )
+    try:
+        server = await _wait_for_port(holder)
+        port = server.port
+        assert port is not None
+        async with connect(
+            _uri(port), additional_headers={"Authorization": f"Bearer {TOKEN}"}
+        ) as ws:
+            await _recv_until(ws, lambda f: f.get("type") == "health")
+            await asyncio.wait_for(
+                ws.send(
+                    json.dumps(
+                        {
+                            "v": 1,
+                            "id": "stk1",
+                            "action": "send_media",
+                            "params": {
+                                "chat_id": "wxg:g1",
+                                "kind": "sticker",
+                                "path": "x.gif",
+                                "name": "摸鱼.gif",
+                            },
+                        }
+                    )
+                ),
+                STEP,
+            )
+            receipt = await _recv_until(ws, lambda f: f.get("id") == "stk1")
+            assert receipt["ok"] is True
+            assert receipt["delivered"] == "observed"
+            # 显示名（不是 alias）传给传输层；kind 原样转发。
+            assert transport.media_calls == [("老友群", "sticker", "x.gif", "摸鱼.gif")]
+            # hook 侧把 sticker 映射成 send_emoticon，不是 image/file 原语。
+            assert transport.primitive_calls == ["send_emoticon"]
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(run_task, STEP)

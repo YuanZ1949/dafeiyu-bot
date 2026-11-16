@@ -315,3 +315,94 @@ async def test_wechat_upload_failure_still_sends_text() -> None:
     assert result == "plain"
     assert adapter.uploads == []
     assert adapter.sent == [(ChatType.GROUP, "wxg:abc123", "文件在这")]
+
+
+# ---- 出站视频/贴纸：无 send_segments 的通道逐条 send_media，视频降级为文件 --
+class _WeChatMediaAdapter(_WeChatFileAdapter):
+    """加 send_media 的微信假适配器：仍无 send_segments（逐条媒体推送路径）。"""
+
+    def __init__(
+        self,
+        outcomes: dict[str, object] | None = None,
+        upload_error: Exception | None = None,
+    ) -> None:
+        super().__init__(upload_error)
+        self._outcomes = outcomes or {}
+        self.media_calls: list[tuple[str, str, str]] = []
+
+    async def send_media(
+        self, chat_type: ChatType, chat_id: str, kind: str, path: str, name: str = ""
+    ) -> bool:
+        self.media_calls.append((kind, path, name))
+        outcome = self._outcomes.get(kind, True)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return bool(outcome)
+
+
+async def test_wechat_video_attachment_pushes_as_file_not_video() -> None:
+    """微信 hook 没有视频原语：视频必须按 kind=file 推送，绝不发 kind=video。"""
+    adapter = _WeChatMediaAdapter()
+    service = _wechat_service(adapter)
+
+    result = await service._send_chunk(
+        ChatType.GROUP,
+        "wxg:abc123",
+        "视频在这",
+        attachments=(
+            Attachment(kind="video", path="C:/ws/replies/a.mp4", name="剪辑.mp4"),
+        ),
+    )
+
+    assert result == "plain"
+    assert adapter.media_calls == [("file", "C:/ws/replies/a.mp4", "剪辑.mp4")]
+    assert all(kind != "video" for kind, _path, _name in adapter.media_calls)
+    assert adapter.sent == [(ChatType.GROUP, "wxg:abc123", "视频在这")]
+
+
+async def test_wechat_sticker_tries_sticker_then_image_fallback() -> None:
+    """贴纸仍先推真实 GIF（sticker → send_emoticon）；被拒降级 image 再试。"""
+    adapter = _WeChatMediaAdapter({"sticker": False})
+    service = _wechat_service(adapter)
+
+    await service._send_chunk(
+        ChatType.GROUP,
+        "wxg:abc123",
+        "看这个",
+        attachments=(
+            Attachment(kind="sticker", path="C:/ws/replies/x.gif", name="摸鱼"),
+        ),
+    )
+
+    assert adapter.media_calls == [
+        ("sticker", "C:/ws/replies/x.gif", "摸鱼"),
+        ("image", "C:/ws/replies/x.gif", "摸鱼"),
+    ]
+    assert adapter.sent == [(ChatType.GROUP, "wxg:abc123", "看这个")]
+
+
+async def test_wechat_file_fallback_failure_still_sends_text() -> None:
+    """视频按文件推送被拒（False）或桥断连（异常）都不抛异常，正文照发。"""
+    rejected = _WeChatMediaAdapter({"file": False})
+    result = await _wechat_service(rejected)._send_chunk(
+        ChatType.GROUP,
+        "wxg:abc123",
+        "视频在这",
+        attachments=(Attachment(kind="video", path="C:/ws/replies/a.mp4"),),
+    )
+
+    assert result == "plain"
+    assert rejected.media_calls == [("file", "C:/ws/replies/a.mp4", "")]
+    assert rejected.sent == [(ChatType.GROUP, "wxg:abc123", "视频在这")]
+
+    disconnected = _WeChatMediaAdapter({"file": GatewayError("微信桥未连接")})
+    result = await _wechat_service(disconnected)._send_chunk(
+        ChatType.GROUP,
+        "wxg:abc123",
+        "视频在这",
+        attachments=(Attachment(kind="video", path="C:/ws/replies/a.mp4"),),
+    )
+
+    assert result == "plain"
+    assert disconnected.media_calls == [("file", "C:/ws/replies/a.mp4", "")]
+    assert disconnected.sent == [(ChatType.GROUP, "wxg:abc123", "视频在这")]

@@ -62,7 +62,8 @@ _AWAIT_TIMEOUT = 5.0
 _SEND_ACTIONS = ("send_text", "send_at", "send_media")
 
 #: 媒体 kind 白名单：与 reply_media / media.py 的 Attachment.kind 对齐。
-_MEDIA_KINDS = frozenset({"image", "file", "voice", "video"})
+#: sticker 由 hook 侧映射成 send_emoticon（见 scripts/wechat_hook_server.py）。
+_MEDIA_KINDS = frozenset({"image", "file", "voice", "video", "sticker"})
 #: 帧泵连续空转多少次才停泵。1 次 = 单次慢轮询就自杀，正是之前「帧源超时即
 #: return」导致假活的根源；3 次（≈ 6 × poll_seconds）给慢轮询留足余量，真卡死
 #: 时仍会退出，由 run() 的完成回调请求停机、交给 supervisor 重启。

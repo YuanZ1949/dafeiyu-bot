@@ -2908,7 +2908,14 @@ class Service:
                         continue
                     # 贴纸先按原 kind 推真实 GIF；被桥拒绝（hook_rejected 的
                     # 非 GIF / 超限 GIF，或断连 GatewayError）时降级为图片再试。
-                    kinds = ("sticker", "image") if is_sticker else (item.kind,)
+                    # 微信 hook 没有视频原语：视频当「文件」发（mirror 同款降级），
+                    # 拒收/失败不重试，正文照发。
+                    if is_sticker:
+                        kinds = ("sticker", "image")
+                    elif item.kind == "video":
+                        kinds = ("file",)
+                    else:
+                        kinds = (item.kind,)
                     for attempt in kinds:
                         try:
                             pushed = await push_media(
@@ -2923,6 +2930,9 @@ class Service:
                             break
                         if attempt == kinds[-1]:
                             # 桥把 unsupported_media 折成 False：明确失败时也要回退文本。
+                            log.info(
+                                "媒体推送失败（继续发文本）%s kind=%s", chat_id, attempt
+                            )
                             media_ok = False
                         else:
                             log.info("贴纸推送被拒，降级为图片发送 %s", chat_id)
