@@ -3,8 +3,8 @@
 按 `docs/superpowers/specs/2026-11-01-wechat-bridge-protocol.md` 的 v1 信封实现：
 
 - 连接 `ws://{bridge_host}:{bridge_port}/wechat-bridge`，可选 `Authorization: Bearer`；
-- `message` / `recall` / `health` / `resync` 四类事件转成进程内的 `Message` /
-  `RecallEvent` / 健康字段；
+- `message` / `recall` / `notice` / `health` / `resync` 五类事件转成进程内的
+  `Message` / `RecallEvent` / `NoticeEvent` / 健康字段；
 - 发送走 `send_text` 指令 + 同 `id` 回执（照抄 OneBot 的 echo/pending 模式）；
 - 入站可靠投递（P3-10/P3-11）：连接建立发一次 `hello`（带内存 `_last_inbound_seq`），
   handler 成功消化 message/recall 后回 `ack`（带 `seq`），桥据此做有界重投；
@@ -26,7 +26,7 @@ wxhook 锁 3.9.5.81），wxauto 开源版止于 3.9.X，WeChatPadPro 付费且�
 原消息保留在 DB、不进 prompt、时间线显示「[已撤回]」占位、末条消息被撤回时
 阻塞本批回复；但 UIA 轮询观察不到撤回，桥端目前没有 recall 数据源
 （见 `gateway/wechat_bridge/poller.py`），因此撤回实际不会自动生效。
-edit 事件不支持，信封只有 message / recall / health / resync 四类。
+edit 事件不支持，信封只有 message / recall / notice / health / resync 五类。
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
 from ..config import ConfigError, WeChatConfig
-from ..models import Attachment, ChatType, Message, RecallEvent
+from ..models import Attachment, ChatType, Message, NoticeEvent, RecallEvent
 from .base import GatewayError
 
 logger = logging.getLogger(__name__)
@@ -96,6 +96,7 @@ class WeChatAdapter:
         self._config = config
         self._handler: Callable[[Message], Awaitable[None]] | None = None
         self._recall_handler: Callable[[RecallEvent], Awaitable[None]] | None = None
+        self._notice_handler: Callable[[NoticeEvent], Awaitable[None]] | None = None
         self._ws: Any | None = None
         self._task: asyncio.Task[None] | None = None
         # 入站 message/recall 在后台任务里处理，收帧循环从此不被 handler 阻塞
@@ -235,6 +236,9 @@ class WeChatAdapter:
 
     def on_recall(self, handler: Callable[[RecallEvent], Awaitable[None]]) -> None:
         self._recall_handler = handler
+
+    def on_notice(self, handler: Callable[[NoticeEvent], Awaitable[None]]) -> None:
+        self._notice_handler = handler
 
     def set_echo_seed(
         self, provider: Callable[[], Sequence[tuple[str, str, int]]] | None
@@ -392,7 +396,7 @@ class WeChatAdapter:
 
     # --------------------------------------------------------- 入站后台任务
     def _schedule_inbound(self, envelope: dict[str, Any]) -> bool:
-        """message/recall 且 handler 已登记时转后台任务；返回是否已接手。
+        """message/recall/notice 且 handler 已登记时转后台任务；返回是否已接手。
 
         受理判定（parse + 回声过滤）在这里同步做：last_event_at 保持「信封被
         接受即更新、回声/无效不更新」的语义，且写在调度之前；后台任务里
@@ -415,6 +419,13 @@ class WeChatAdapter:
             return True
         if kind == "recall" and self._recall_handler is not None:
             event = self._parse_recall(envelope)
+            if event is None:
+                return False
+            self.last_event_at = time.time()
+            self._spawn_inbound((event.chat_type, event.chat_id), envelope)
+            return True
+        if kind == "notice" and self._notice_handler is not None:
+            event = self._parse_notice(envelope)
             if event is None:
                 return False
             self.last_event_at = time.time()
@@ -523,6 +534,19 @@ class WeChatAdapter:
             self.last_event_at = time.time()
             if self._recall_handler is not None:
                 await self._recall_handler(event)
+                await self._send_ack(seq)
+            else:
+                await self._send_ack(seq)
+            return
+        if kind == "notice":
+            self._record_inbound_seq(seq)
+            event = self._parse_notice(envelope)
+            if event is None:
+                await self._send_ack(seq)
+                return
+            self.last_event_at = time.time()
+            if self._notice_handler is not None:
+                await self._notice_handler(event)
                 await self._send_ack(seq)
             else:
                 await self._send_ack(seq)
@@ -659,6 +683,36 @@ class WeChatAdapter:
             chat_id=chat_id,
             message_id=message_id,
             operator_id=str(envelope.get("user_id") or ""),
+        )
+
+    def _parse_notice(self, envelope: dict[str, Any]) -> NoticeEvent | None:
+        """解析非撤回 notice（进退群/禁言/申请等）；缺关键字段返回 None。
+
+        只产出结构化事件供上层记日志，不触发模型回复。必填只有
+        ``chat_id``（``wxg:`` 前缀）、``chat_type`` 与非空 ``kind``；其余
+        字段（user_id/operator_id/sub_type/duration/nickname/comment/
+        event_id）读不到就给空值。
+        """
+        chat_id = str(envelope.get("chat_id") or "")
+        kind = str(envelope.get("kind") or "").strip()
+        if not chat_id.startswith("wxg:") or not kind:
+            logger.warning("微信 notice 事件缺 chat_id/kind，已丢弃")
+            return None
+        chat_type = _CHAT_TYPES.get(str(envelope.get("chat_type") or ""))
+        if chat_type is None:
+            logger.warning("微信 notice 事件 chat_type 未知：%r", envelope.get("chat_type"))
+            return None
+        return NoticeEvent(
+            kind=kind,
+            chat_type=chat_type,
+            chat_id=chat_id,
+            user_id=str(envelope.get("user_id") or ""),
+            operator_id=str(envelope.get("operator_id") or ""),
+            sub_type=str(envelope.get("sub_type") or ""),
+            duration=max(0, _int(envelope.get("duration"))),
+            nickname=str(envelope.get("nickname") or ""),
+            comment=str(envelope.get("comment") or ""),
+            event_id=str(envelope.get("event_id") or ""),
         )
 
     def _apply_health(self, envelope: dict[str, Any]) -> None:

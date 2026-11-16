@@ -16,7 +16,7 @@
 
 ## 2. 事件信封 event（桥 → 主进程）
 
-`type` 四选一：`"message"`（普通消息）、`"recall"`（撤回）、`"health"`（健康快照，字段见 §5，另行成节）、`"resync"`（桥重启/失联恢复后要求主进程重放会话）。
+`type` 四选一：`"message"`（普通消息）、`"recall"`（撤回）、`"health"`（健康快照，字段见 §5，另行成节）、`"resync"`（桥重启/失联恢复后要求主进程重放会话）。v2 增量追加第五类 `"notice"`（非撤回群/好友事件，见 §10.4）。
 
 ### 2.1 字段表
 
@@ -299,4 +299,30 @@ text, image, voice, video, file, sticker, card, location, call, link, quote, rec
 - 微信 `send_at` 的定向 @：action 已接受，`at` 非空时明确 `unsupported_at`；不静默丢 @。
 - 微信语音转写、视频转码：**不做**。
 - QQ `send_forward`：adapter 有协议动作封装，但模型输出协议没有对应字段，service 也未接线——**未启用**。
+
+### 10.4 新增 `notice` 事件类型
+
+`type` 枚举追加 `"notice"`：非撤回的群/好友事件（进退群、禁言、戳一戳、好友/加群申请等）。旧桥不发该帧、旧客户端按 §6 规则 5 忽略未知 `type` 即可，线协议 `v` 仍为 `1`。
+
+字段表：
+
+| 字段 | 类型 | 必填 | 含义 |
+| --- | --- | --- | --- |
+| `v` / `type` / `channel` | 同 §2.1 | 是 | `type` 恒 `"notice"` |
+| `kind` | string | 是（非空） | 事件种类，如 `group_increase` / `group_decrease` / `group_ban` / `group_poke` / `friend_poke`；空或缺失 → 坏帧 |
+| `chat_id` | string `"wxg:<alias>"` | 是 | 事件所属会话；缺前缀或缺失 → 坏帧 |
+| `chat_type` | string 枚举 `"group"\|"private"` | 是 | 与 `models.ChatType` 对齐；未知值 → 坏帧 |
+| `user_id` | string `"wxg:<alias>"` | 否 | 事件主体（进/退群者、被戳者、被禁言者） |
+| `operator_id` | string `"wxg:<alias>"` | 否 | 操作者/发起者 |
+| `sub_type` | string | 否 | 细分类型，透传 |
+| `duration` | int | 否 | 禁言时长（秒）；负值按 0 处理 |
+| `nickname` | string | 否 | 申请类事件里申请者的昵称 |
+| `comment` | string | 否 | 申请类事件的验证消息 |
+| `event_id` | string | 否 | 申请类事件的响应定位符（同 QQ 的 flag） |
+
+seq/ack 语义与 `recall` **完全一致**（P3-10/P3-11）：
+
+- 桥端 `broadcast` 对 `message`/`recall`/`notice` 一视同仁地发号 `seq` 并进未确认缓冲；
+- 客户端 `dispatch_envelope` 收到 `notice`：先记 `last_seq` 高水位；坏帧（缺 `chat_id`/`kind`、`chat_type` 未知）当场 ack 消化；有 handler 且注册了就调用（与 `recall` 一样经 `_schedule_inbound` 转后台任务，不阻塞收帧循环），**handler 成功后才 ack**；没注册 handler 也 ack；handler 抛异常绝不 ack，帧留在桥的未确认缓冲等重投，异常由后台任务记日志、绝不拆掉连接；
+- `notice` 只转成 `NoticeEvent`（仅用于日志与后续接入），**绝不**按 `message` 处理、不触发模型回复、不进批次调度。
 

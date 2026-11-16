@@ -62,7 +62,7 @@ _KNOWN_ACTIONS = (
 )
 _MAX_FRAME = 1 << 20
 
-#: 入站事件帧（message/recall）的未确认缓冲上限：有界重投窗口（P3-11），
+#: 入站事件帧（message/recall/notice）的未确认缓冲上限：有界重投窗口（P3-11），
 #: ack 到位后从头裁剪；窗口之外的帧为已知残余（健康帧 `unacked_count` 可见）。
 UNACKED_MAX = 200
 #: 入站水位默认落盘路径：与 `DEFAULT_KILL_SWITCH` / 对齐状态同一 `data/` 约定。
@@ -209,7 +209,7 @@ class BridgeServer:
         # 发送去重表：key = (action, chat_id, dedupe_key)。只在 params 带非空
         # dedupe_key 时启用；无 key 指令完全不受影响。
         self._dedupe: dict[tuple[str, str, str], _DedupeEntry] = {}
-        # 入站帧水位（P3-10/P3-11）：seq 单调递增只发给 message/recall 事件帧，
+        # 入站帧水位（P3-10/P3-11）：seq 单调递增只发给 message/recall/notice 事件帧，
         # hello/ack 指令维护未确认缓冲；水位落盘让崩溃/重启后 seq 不回退。
         self._inbound_seq: int = 0
         self._inbound_acked: int = 0
@@ -337,7 +337,7 @@ class BridgeServer:
             raise TypeError("broadcast 需要一条 v1 信封 dict")
         envelope: dict[str, Any] = {"v": PROTOCOL_VERSION, "channel": "wechat"}
         envelope.update(frame)
-        if envelope.get("type") in ("message", "recall"):
+        if envelope.get("type") in ("message", "recall", "notice"):
             self._stamp_inbound(envelope, frame)
         if envelope.get("type") == "health":
             # 健康帧暴露入站水位：丢帧窗口 = inbound_seq - inbound_acked。
@@ -377,7 +377,7 @@ class BridgeServer:
     def _stamp_inbound(
         self, envelope: dict[str, Any], frame: dict[str, Any]
     ) -> None:
-        """给 message/recall 事件帧分配单调递增 seq 并进入未确认缓冲（P3-10）。
+        """给 message/recall/notice 事件帧分配单调递增 seq 并进入未确认缓冲（P3-10）。
 
         health/startup 帧永不带 seq。已带合法 seq 的帧（帧泵 pending 对同一
         dict 的重试）沿用原 seq，不再发号、不再入缓冲——seq 同时写回调用方

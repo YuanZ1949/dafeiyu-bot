@@ -12,7 +12,7 @@ import contextlib
 import json
 import time
 from collections.abc import Callable
-from typing import Self
+from typing import Any, Self
 
 import pytest
 from websockets.asyncio.server import serve
@@ -22,7 +22,7 @@ import dafeiyu.gateway.wechat as wechat_module
 from dafeiyu.config import ConfigError, WeChatConfig
 from dafeiyu.gateway.base import GatewayError
 from dafeiyu.gateway.wechat import WeChatAdapter
-from dafeiyu.models import ChatType, Message, RecallEvent
+from dafeiyu.models import ChatType, Message, NoticeEvent, RecallEvent
 
 GROUP_CHAT = "wxg:abc123"
 EPOCH = 3
@@ -99,6 +99,20 @@ def message_envelope(**overrides: object) -> dict:
         "message_id": f"{EPOCH}:1",
         "is_bot": False,
         "session_epoch": EPOCH,
+    }
+    envelope.update(overrides)
+    return envelope
+
+
+def notice_envelope(**overrides: Any) -> dict[str, Any]:
+    envelope: dict[str, Any] = {
+        "v": 1,
+        "type": "notice",
+        "channel": "wechat",
+        "kind": "group_increase",
+        "chat_type": "group",
+        "chat_id": GROUP_CHAT,
+        "user_id": "wxg:user1",
     }
     envelope.update(overrides)
     return envelope
@@ -1164,6 +1178,141 @@ async def test_handler_error_records_seq_but_skips_ack() -> None:
         await asyncio.sleep(0.2)
 
         assert all(command.get("action") != "ack" for command in bridge.commands)
+
+
+# ------------------------------------------------- notice 帧（task-7）
+async def test_notice_seq_frame_acked() -> None:
+    """notice 与 recall 同一套 ack 语义：handler 成功后恰好一条 ack。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        events: list[NoticeEvent] = []
+
+        async def on_notice(event: NoticeEvent) -> None:
+            events.append(event)
+
+        adapter.on_notice(on_notice)
+        await bridge.push(
+            notice_envelope(
+                kind="group_increase",
+                chat_id="wxg:g1",
+                user_id="wxg:u1",
+                seq=7,
+            )
+        )
+        await wait_for(lambda: events)
+        assert len(events) == 1
+        event = events[0]
+        assert event.kind == "group_increase"
+        assert event.chat_type is ChatType.GROUP
+        assert event.chat_id == "wxg:g1"
+        assert event.user_id == "wxg:u1"
+        await wait_for(
+            lambda: any(
+                command.get("action") == "ack"
+                and command.get("params") == {"seq": 7}
+                for command in bridge.commands
+            )
+        )
+        assert adapter._last_inbound_seq == 7
+
+
+async def test_notice_envelope_maps_optional_fields() -> None:
+    """operator_id/sub_type/duration/nickname/comment/event_id 原样进 NoticeEvent。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        events: list[NoticeEvent] = []
+
+        async def on_notice(event: NoticeEvent) -> None:
+            events.append(event)
+
+        adapter.on_notice(on_notice)
+        await bridge.push(
+            notice_envelope(
+                kind="group_ban",
+                sub_type="ban",
+                user_id="wxg:u1",
+                operator_id="wxg:admin",
+                duration=600,
+                nickname="张三",
+                comment="验证消息",
+                event_id="flag-1",
+                seq=10,
+            )
+        )
+        await wait_for(lambda: events)
+        event = events[0]
+        assert event.kind == "group_ban"
+        assert event.chat_type is ChatType.GROUP
+        assert event.sub_type == "ban"
+        assert event.operator_id == "wxg:admin"
+        assert event.duration == 600
+        assert event.nickname == "张三"
+        assert event.comment == "验证消息"
+        assert event.event_id == "flag-1"
+
+
+async def test_bad_notice_acked_without_handler_call() -> None:
+    """坏 notice 帧（缺 chat_id）当场 ack 消化：handler 绝不会被调。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        events: list[NoticeEvent] = []
+
+        async def on_notice(event: NoticeEvent) -> None:
+            events.append(event)
+
+        adapter.on_notice(on_notice)
+        await bridge.push(notice_envelope(chat_id="", seq=11))
+        await wait_for(
+            lambda: any(
+                command.get("action") == "ack"
+                and command.get("params") == {"seq": 11}
+                for command in bridge.commands
+            )
+        )
+        assert events == []
+
+
+async def test_notice_handler_error_skips_ack() -> None:
+    """notice handler 抛异常绝不 ack：帧留在桥缓冲等重投，且连接不断开。
+
+    handler 在后台任务里运行（与 recall 同一条 _schedule_inbound 路径），
+    异常由 done-callback 记日志，绝不允许传回读循环拆掉连接。
+    """
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        seen: list[NoticeEvent] = []
+
+        async def on_notice(event: NoticeEvent) -> None:
+            if event.kind == "group_increase":
+                raise RuntimeError("notice boom")
+            seen.append(event)
+
+        adapter.on_notice(on_notice)
+        await bridge.push(notice_envelope(seq=12))
+        await wait_for(lambda: adapter._last_inbound_seq == 12)
+        await asyncio.sleep(0.2)
+        assert all(command.get("action") != "ack" for command in bridge.commands)
+
+        # 读循环没有被异常打断：后续帧照常进 handler 并 ack，连接仍是同一个。
+        await bridge.push(notice_envelope(kind="group_decrease", seq=13))
+        await wait_for(lambda: len(seen) == 1)
+        await wait_for(
+            lambda: any(
+                command.get("action") == "ack"
+                and command.get("params") == {"seq": 13}
+                for command in bridge.commands
+            )
+        )
+        assert adapter._ws is not None
+
+
+async def test_notice_without_handler_acked() -> None:
+    """没注册 notice handler 也 ack：帧不会卡在未确认缓冲。"""
+    async with FakeBridge() as bridge, running(bridge) as adapter:
+        await bridge.push(notice_envelope(seq=13))
+        await wait_for(
+            lambda: any(
+                command.get("action") == "ack"
+                and command.get("params") == {"seq": 13}
+                for command in bridge.commands
+            )
+        )
 
 
 async def test_reconnect_sends_hello_once_per_connection_last_seq_grows() -> None:
