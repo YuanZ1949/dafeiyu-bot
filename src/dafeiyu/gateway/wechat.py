@@ -19,8 +19,14 @@ PyPI 包名 `pywechat127`，支持微信 4.1.6+），不再保留「三条候选
 hook 系方案均已不可用（WeChatFerry 2026-07-10 归档、Gewechat 停止维护、
 wxhook 锁 3.9.5.81），wxauto 开源版止于 3.9.X，WeChatPadPro 付费且受 DMCA 压力，
 腾讯官方 ClawBot/iLink 仅支持 1v1 私聊、进不了群。代价与边界（无真实 message_id、
-无撤回、同名群需人工区分、锁屏掉线、封号自担）见
+同名群需人工区分、锁屏掉线、封号自担）见
 `docs/superpowers/specs/2026-10-24-im-bot-design.md` 第 3.1 节「已更新」段落。
+
+撤回语义：入站 `recall` 帧会解析成 `RecallEvent` 并分发，机器人只做标记——
+原消息保留在 DB、不进 prompt、时间线显示「[已撤回]」占位、末条消息被撤回时
+阻塞本批回复；但 UIA 轮询观察不到撤回，桥端目前没有 recall 数据源
+（见 `gateway/wechat_bridge/poller.py`），因此撤回实际不会自动生效。
+edit 事件不支持，信封只有 message / recall / health / resync 四类。
 """
 
 from __future__ import annotations
