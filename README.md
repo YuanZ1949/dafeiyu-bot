@@ -605,8 +605,8 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 ### 已知上限（不承诺与 QQ 完全一致）
 
 - **无真实 message_id**：桥为会话/消息在本地铸造 id，跨重启不保证稳定。
-- 不支持撤回 / 编辑事件。
-- 同名群只能靠显示名 / 人工区分，面板白名单里的群要人工核对（同名群由成员集合区分 alias）。
+- **入站撤回已接线，但桥还没有撤回数据源**：桥的 `recall` 帧会被 adapter 解析成 `RecallEvent`，bot 侧只做标记——原文留库但不再进 prompt，时间线显示 `[已撤回]` 占位，批次末条被撤回则整批不回复。不过当前 UIA 轮询推不出撤回（快照 diff 只能得到新消息），桥不会主动发 `recall` 帧，所以日常运行中撤回不会自动生效。编辑事件不支持：协议只有 `message` / `recall` / `health` / `resync` 四类帧。
+- **同名群靠本地 alias + 成员集合区分，不靠显示名**：每个群铸本地 `wxg:<alias>`；同名群按成员集合的 Jaccard 重叠度判定，≥ 0.6（`MEMBER_OVERLAP_THRESHOLD`）视为同一个群（群改名也复用 alias），不重叠则铸新 alias 并告警 `wechat_alias_ambiguous`，绝不共用 alias/记忆。成员信息缺失时（例如老条目没记过成员）退回「同名唯一存活」的旧语义；只要同名存活 alias 多于一个，`resolve()` 就 fail-closed 拒绝发送，这时才需要人工核对面板白名单里的 `wxg:<alias>`。
 - `@` 触发依赖轮询，最坏有约一个 `poll_seconds`（默认 8 秒）的延迟；本地库模式同样受这个轮询间隔限制，但不再有开窗开销。
 - 发送有频率上限：`send_min_interval_seconds`（默认 20 秒）、`send_max_per_hour`（20）、`send_max_per_day`（60）；三者设为 `0` = 不限制。
 - 默认出站（`outbound: uia`）桌面锁屏即发不出去；改用 `hook` / `auto` 可绕开桌面，但依赖外部注入服务。RPA 可能误点，`require_foreground_idle` 默认要求微信窗口前台且空闲才执行操作；开启微信通道时别在那台机器上干重要的事。
