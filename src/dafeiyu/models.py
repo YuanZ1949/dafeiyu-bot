@@ -39,6 +39,8 @@ class Attachment:
     """消息附件（图片/语音/视频/文件等）。
 
     仅存在于内存中，用于提示词与出站发送；永不写入 messages 表或任何持久化存储。
+    请求事件（好友/加群申请）与 OneBot 文件定位信息也在这里承载：
+    ``file_id`` / ``busid`` 用来向 OneBot 索回或上报文件位置，均默认空串。
     """
 
     kind: str
@@ -53,6 +55,10 @@ class Attachment:
     #: 同一媒体的备选本地路径（微信原图解不开时按顺序退回 ``_h`` / ``_t``）。
     #: 其它通道不填，保持空元组。
     fallbacks: tuple[str, ...] = ()
+    #: OneBot 文件定位：``file_id`` 供 get_image/get_record 等接口回查，
+    #: ``busid`` 是群文件上传返回的总线 id。追加在末尾，旧的位置参数构造保持可用。
+    file_id: str = ""
+    busid: str = ""
 
 
 @dataclass
@@ -126,7 +132,9 @@ class NoticeEvent:
 
     ``kind`` 统一成 ``group_poke`` / ``friend_poke`` / ``group_increase`` /
     ``group_decrease`` / ``group_ban``；``user_id`` 是事件主体（被戳者、进/退群者、
-    被禁言者），``operator_id`` 是操作者或发起者。仅用于日志与后续接入，不触发模型。
+    被禁言者），``operator_id`` 是操作者或发起者。请求类事件（好友申请/加群申请）
+    也在这里承载：``nickname`` / ``comment`` 来自申请表单，``event_id`` 是请求
+    响应事件里回传的 flag 定位符。仅用于日志与后续接入，不触发模型。
     """
 
     kind: str
@@ -136,6 +144,12 @@ class NoticeEvent:
     operator_id: str = ""
     sub_type: str = ""
     duration: int = 0
+    #: 请求类事件（好友/加群申请）的表单字段与响应定位符：
+    #: ``nickname`` 申请时的昵称，``comment`` 验证消息，``event_id`` 是
+    #: request 事件里的 flag。追加在末尾，旧的位置参数构造保持可用。
+    nickname: str = ""
+    comment: str = ""
+    event_id: str = ""
 
 
 @dataclass
