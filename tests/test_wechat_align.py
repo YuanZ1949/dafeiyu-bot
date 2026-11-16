@@ -540,3 +540,55 @@ def test_owner_entries_are_ordered_and_timestamped() -> None:
     result = aligner.poll([msg("阿猫", "开场", ts=999), msg("阿猫", "新的", ts=1000)])
 
     assert ids(result) == ["7:1"]
+
+
+# ------------------------------------------------------------------ server_id
+def test_server_id_reaches_the_envelope_without_changing_ids() -> None:
+    """server_id 只透传进信封；message_id 仍是 epoch:seq，不拿它当编号。"""
+    aligner = make_aligner()
+    aligner.poll([msg("阿猫", "开场", server_id=41)])
+
+    result = aligner.poll(
+        [msg("阿猫", "开场", server_id=41), msg("阿狗", "新的", server_id=99)]
+    )
+
+    event = result.messages[0]
+    assert event["server_id"] == 99
+    assert event["message_id"] == "7:1"
+
+
+def test_export_then_seed_preserves_server_id() -> None:
+    """重启续跑：align-state 里带出的 server_id 原样还原。"""
+    aligner = make_aligner()
+    aligner.poll([msg("阿猫", "开场", server_id=41), msg("阿狗", "尾巴", server_id=99)])
+
+    state = aligner.export()
+    assert state[-1]["server_id"] == 99
+
+    restarted = make_aligner()
+    restarted.seed(state)
+    assert restarted.export() == state
+
+    result = restarted.poll(
+        [
+            msg("阿猫", "开场", server_id=41),
+            msg("阿狗", "尾巴", server_id=99),
+            msg("阿猫", "新的", server_id=100),
+        ]
+    )
+    assert result.messages[0]["server_id"] == 100
+
+
+def test_entries_without_server_id_still_emit_with_zero() -> None:
+    """旧 align-state / 旧库条目没有 server_id：不崩、不丢条，信封给 0。"""
+    aligner = make_aligner()
+    aligner.seed([{"nickname": "阿猫", "text": "开场", "ts": 1}])
+
+    result = aligner.poll(
+        [{"nickname": "阿猫", "text": "开场"}, {"nickname": "阿猫", "text": "新"}]
+    )
+
+    event = result.messages[0]
+    assert event["server_id"] == 0
+    assert event["message_id"] == "7:1"
+    assert len(result.messages) == 1

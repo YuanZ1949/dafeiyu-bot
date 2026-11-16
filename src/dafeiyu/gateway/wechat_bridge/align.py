@@ -63,6 +63,9 @@ class Entry:
     ts: int = 0
     #: 媒体元数据（本地库发现的可信路径）；只透传，不解析、不读字节。
     media: dict[str, Any] = field(default_factory=dict)
+    #: 微信侧服务端消息 id（本地库条目携带，旧库无此列为 0）；只透传，
+    #: 不参与对齐匹配，也不能当 occurrence id（对齐仍靠 nickname/text）。
+    server_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -182,7 +185,7 @@ class SessionAligner:
             self._prev = seeded
 
     def export(self) -> list[dict[str, Any]]:
-        """导出当前窗口，供 :meth:`seed` 在重启后还原（只含对齐需要的字段）。"""
+        """导出当前窗口，供 :meth:`seed` 在重启后还原（对齐 + 透传字段）。"""
         return [
             {
                 "nickname": entry.nickname,
@@ -192,6 +195,7 @@ class SessionAligner:
                 "reply_text": entry.reply_text,
                 "ts": entry.ts,
                 "media": dict(entry.media),
+                "server_id": entry.server_id,
             }
             for entry in self._prev
         ]
@@ -248,6 +252,9 @@ class SessionAligner:
             "reply_to_author": entry.reply_author or None,
             "ts": entry.ts or int(self._clock()),
             "message_id": f"{self._epoch}:{self._seq}",
+            # 微信侧服务端 id 随信封透传，主进程用它做关联/去重；本地编号
+            # 仍然只有 epoch:seq，server_id=0（旧库）不是丢弃理由。
+            "server_id": int(entry.server_id or 0),
             # 自己的发言必须由桥自己标记：主进程侧还有两层回声过滤，但源头标对了
             # 才不会有「重启后先自我回复一次」的窗口。
             "is_bot": self._is_bot(entry),
@@ -346,6 +353,7 @@ def _entry_from(raw: Any) -> Entry:
             reply_text=reply_text,
             ts=_int(raw.get("ts")),
             media=(dict(raw["media"]) if isinstance(raw.get("media"), dict) else {}),
+            server_id=int(raw.get("server_id") or 0),
         )
     if isinstance(raw, (tuple, list)):
         items = list(raw) + ["", ""]
