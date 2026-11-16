@@ -616,9 +616,11 @@ class MirrorConfig:
     pairs: tuple[MirrorPairConfig, ...] = ()
     nicknames: tuple[tuple[str, str], ...] = ()
     # 消息泡（chat-driven-behaviour-fixes IS-5）：别人转来的消息在线上是
-    # 三行圆角框，入库仍是单行「昵称：正文」；关掉即退化为单行形态。
+    # 字体无关的「左锚」气泡（首行 ``╭ 正文``、中间 ``│ 正文``、末行单独 ``╰``），
+    # 入库仍是单行「昵称：正文」；关掉即退化为单行形态。
     bubble_enabled: bool = True
-    # 框的四角字符，顺序：左上/右上/左下/右下。
+    # 四角字符，顺序：左上/右上/左下/右下。左锚形态只用到第 1 个（``╭``）
+    # 与第 3 个（``╰``）；另两个保留兼容旧配置。
     bubble_corner_chars: str = "╭╮╰╯"
     # 正文按中文显示宽度换行的最大列数。
     bubble_max_content_width: int = 30
@@ -1366,7 +1368,8 @@ def _mirror_bubble(raw: dict[str, Any]) -> dict[str, Any]:
     corners = "╭╮╰╯" if corners is None else str(corners)
     if len(corners) != 4:
         raise ConfigError(
-            "mirror.bubble_corner_chars 必须是 4 个字符（左上/右上/左下/右下）"
+            "mirror.bubble_corner_chars 必须是 4 个字符（左上/右上/左下/右下；"
+            "左锚气泡只用第 1 个与第 3 个）"
         )
     return {
         "bubble_enabled": _bool(

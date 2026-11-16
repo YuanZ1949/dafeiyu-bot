@@ -12,8 +12,8 @@ from typing import cast
 
 from dafeiyu.brain.client import BrainReply
 from dafeiyu.config import MirrorConfig, Settings
-from dafeiyu.mirror import MirrorItem, MirrorRouter, RenderedLines
-from dafeiyu.textwidth import PixelMetrics, display_width
+from dafeiyu.mirror import _BAR, MirrorItem, MirrorRouter, RenderedLines
+from dafeiyu.textwidth import display_width
 
 from .models import EvalBubble, EvalCase, EvalCheck
 
@@ -82,14 +82,6 @@ class _BubbleProbe(MirrorRouter):
             created_at=0.0,
         )
         return self._render(item)
-
-    def _bubble_metrics(self) -> PixelMetrics | None:
-        """评估证据要跨机器逐字节一致：按显示列对齐，不随系统字体变化。
-
-        线上气泡的像素对齐由 ``tests/test_bubble_pixels.py`` 与
-        ``tests/test_mirror.py`` 覆盖；这里只锁定气泡形态与换行。
-        """
-        return None
 
 
 def _check(
@@ -180,9 +172,10 @@ def check_evidence(case: EvalCase, prompt: str = "") -> EvalCheck | None:
     - 提示词证据：``prompt_must_contain`` 要求**全部**命中；
       ``prompt_must_not_contain`` 一个都不许命中（大小写不敏感）。
       没拿到提示词时直接判失败，绝不让 case 静默恒过。
-    - 渲染证据：``bubble`` 要求线上形态是一个完整气泡（三行以上、顶底边
-      齐全、中间每行都有左右边、各行显示宽度一致），且入库形态与旧版
-      ``昵称：正文`` **逐字节相同**；``wire`` 再与声明的期望气泡对齐。
+    - 渲染证据：``bubble`` 要求线上形态是一个完整气泡（左锚形态：首行
+      ``╭ 正文``、中间 ``│ 正文``、末行单独 ``╰``，行尾不带补白空格，每行正文
+      不超过 ``bubble_max_content_width``），且入库形态与旧版 ``昵称：正文``
+      **逐字节相同**；``wire`` 再与声明的期望气泡对齐。
 
     没有声明任何证据时返回 None，不产出检查项。
     """
@@ -248,20 +241,27 @@ def _bubble_problems(expected: EvalBubble) -> list[str]:
 
 def _bubble_shape_problems(text: str) -> list[str]:
     lines = text.split("\n")
-    if len(lines) < 3:
-        return [f"气泡不足 3 行: {text!r}"]
+    if len(lines) < 2:
+        return [f"气泡不足 2 行（首行 + 收尾）: {text!r}"]
     top_left, top_right, bottom_left, bottom_right = BUBBLE_CORNERS
     problems: list[str] = []
-    if not (lines[0].startswith(top_left) and lines[0].endswith(top_right)):
-        problems.append(f"气泡首行不是完整顶边: {lines[0]!r}")
-    if not (lines[-1].startswith(bottom_left) and lines[-1].endswith(bottom_right)):
-        problems.append(f"气泡末行不是完整底边: {lines[-1]!r}")
-    widths = {display_width(line) for line in lines}
-    if len(widths) != 1:
-        problems.append(f"气泡各行显示宽度不一致: {sorted(widths)}")
+    head = f"{top_left} "
+    if not lines[0].startswith(head):
+        problems.append(f"气泡首行不是左锚顶边: {lines[0]!r}")
+    if lines[-1] != bottom_left:
+        problems.append(f"气泡末行应只有一个 {bottom_left!r}: {lines[-1]!r}")
+    if any(line != line.rstrip() for line in lines):
+        problems.append("气泡行尾有补白空格：客户端会折叠，反而制造新的不齐")
     for number, line in enumerate(lines[1:-1], start=2):
-        if not (line.startswith("│") and line.endswith("│")):
-            problems.append(f"气泡第 {number} 行缺少完整的左右边: {line!r}")
+        if not line.startswith(f"{_BAR} "):
+            problems.append(f"气泡第 {number} 行缺少左锚: {line!r}")
+    if top_right in text or bottom_right in text:
+        problems.append("气泡出现右边框字符（左锚形态不应有）")
+    contents = [lines[0][len(head) :]]
+    contents.extend(line[len(_BAR) + 1 :] for line in lines[1:-1])
+    over = [line for line in contents if display_width(line) > BUBBLE_WIDTH]
+    if over:
+        problems.append(f"气泡内容行超出 {BUBBLE_WIDTH} 列: {over[:1]!r}")
     return problems
 
 

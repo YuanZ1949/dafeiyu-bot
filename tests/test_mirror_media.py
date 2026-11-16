@@ -594,18 +594,13 @@ QQ_CHAT = "qq:1001"
 WXG_CHAT = "wxg:group"
 
 
-@pytest.fixture(autouse=True)
-def _column_aligned_bubbles(monkeypatch: pytest.MonkeyPatch) -> None:
-    """本文件的硬编码气泡期望串按显示列对齐；像素对齐在 test_mirror 覆盖。"""
-    monkeypatch.setattr(mirror_module.MirrorRouter, "_bubble_metrics", lambda self: None)
-
-# 他人转发消息的线上形态（wire）：三行圆角气泡，期望串硬编码。
-WIRE_TEXT = "╭────────────╮\n│ 阿鱼：你好 │\n╰────────────╯"
-WIRE_IMAGE = "╭──────────────╮\n│ 阿鱼：[图片] │\n╰──────────────╯"
-WIRE_VIDEO = "╭──────────────╮\n│ 阿鱼：[视频] │\n╰──────────────╯"
-WIRE_STICKER = "╭──────────────╮\n│ 阿鱼：[表情] │\n╰──────────────╯"
-WIRE_VOICE = "╭──────────────╮\n│ 阿鱼：[语音] │\n╰──────────────╯"
-WIRE_FILE = "╭──────────────────────╮\n│ 阿鱼：[文件] doc.pdf │\n╰──────────────────────╯"
+# 他人转发消息的线上形态（wire）：字体无关的左锚气泡，期望串硬编码。
+WIRE_TEXT = "╭ 阿鱼：你好\n╰"
+WIRE_IMAGE = "╭ 阿鱼：[图片]\n╰"
+WIRE_VIDEO = "╭ 阿鱼：[视频]\n╰"
+WIRE_STICKER = "╭ 阿鱼：[表情]\n╰"
+WIRE_VOICE = "╭ 阿鱼：[语音]\n╰"
+WIRE_FILE = "╭ 阿鱼：[文件] doc.pdf\n╰"
 
 
 def make_router_settings(tmp_path: Path) -> Settings:

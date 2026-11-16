@@ -660,8 +660,8 @@ def test_record_does_not_call_model(
 
 # ---- T10: 链接解析 / 消息泡 / 批次头部 -------------------------------------
 
-#: 他人转发「顺路」的线上形态；宽度按 display_width 手算（与 test_mirror 同串）。
-WIRE_SHUNLU = "╭────────────╮\n│ 阿鱼：顺路 │\n╰────────────╯"
+#: 他人转发「顺路」的线上形态；字体无关的左锚气泡（与 test_mirror 同串）。
+WIRE_SHUNLU = "╭ 阿鱼：顺路\n╰"
 
 #: T10 新增的回归 case：链接三态、批次头部三要素、气泡两态。
 NEW_CASE_IDS = frozenset(
@@ -713,9 +713,8 @@ def test_loader_reads_links_and_evidence_expectations(tmp_path):
       nickname: 阿鱼
       content: 顺路
       wire: |
-        ╭────────────╮
-        │ 阿鱼：顺路 │
-        ╰────────────╯
+        ╭ 阿鱼：顺路
+        ╰
 """,
     )
 
@@ -791,6 +790,20 @@ def test_check_evidence_bubble_detects_width_drift(monkeypatch):
     check = evidence_checks(case, "提示词")["evidence"]
     assert not check.passed
     assert "线上形态与期望气泡不一致" in check.detail
+
+
+def test_check_evidence_bubble_detects_right_border(monkeypatch):
+    """回归守卫：闭合框（右边框/横线）必须被判失败——那正是两端都歪的形态。"""
+    case = evidence_case(bubble=EvalBubble("阿鱼", "顺路", WIRE_SHUNLU))
+    closed = "╭────────────╮\n│ 阿鱼：顺路 │\n╰────────────╯"
+
+    def render(self, nickname: str, content: str) -> RenderedLines:
+        return RenderedLines([closed], [f"{nickname}：{content}"])
+
+    monkeypatch.setattr(eval_checks._BubbleProbe, "render", render)
+    check = evidence_checks(case, "提示词")["evidence"]
+    assert not check.passed
+    assert "右边框" in check.detail
 
 
 def test_check_evidence_bubble_detects_store_drift(monkeypatch):

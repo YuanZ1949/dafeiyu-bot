@@ -36,23 +36,18 @@ QQ = "qq:1001"
 WXG = "wxg:group"
 
 
-@pytest.fixture(autouse=True)
-def _column_aligned_bubbles(monkeypatch: pytest.MonkeyPatch) -> None:
-    """本文件的硬编码期望串按显示列对齐；像素对齐由专门用例注入假字体度量。"""
-    monkeypatch.setattr(mirror_module.MirrorRouter, "_bubble_metrics", lambda self: None)
-
-# 他人转发消息的线上形态（wire）：三行圆角气泡。
-# 期望串全部硬编码，不靠被测实现生成；宽度按 display_width 手算对齐。
-WIRE_SHUNLU = "╭────────────╮\n│ 阿鱼：顺路 │\n╰────────────╯"
-WIRE_YI = "╭──────────╮\n│ 阿鱼：一 │\n╰──────────╯"
-WIRE_SAN = "╭──────────╮\n│ 阿鱼：三 │\n╰──────────╯"
-WIRE_YIDUI = "╭────────────╮\n│ 阿鱼：一对 │\n╰────────────╯"
-WIRE_ERDUI = "╭────────────╮\n│ 阿鱼：二对 │\n╰────────────╯"
-WIRE_XINNIANCHENG = "╭──────────────╮\n│ 新昵称：换群 │\n╰──────────────╯"
-WIRE_XINDUI = "╭────────────╮\n│ 阿鱼：新对 │\n╰────────────╯"
-WIRE_DIER = "╭────────────╮\n│ 阿鱼：第二 │\n╰────────────╯"
-WIRE_VIDEO = "╭──────────────╮\n│ 阿鱼：[视频] │\n╰──────────────╯"
-WIRE_IMAGE = "╭──────────────╮\n│ 阿鱼：[图片] │\n╰──────────────╯"
+# 他人转发消息的线上形态（wire）：字体无关的左锚气泡（首行 `╭ 正文`、末行 `╰`）。
+# 期望串全部硬编码，不靠被测实现生成。
+WIRE_SHUNLU = "╭ 阿鱼：顺路\n╰"
+WIRE_YI = "╭ 阿鱼：一\n╰"
+WIRE_SAN = "╭ 阿鱼：三\n╰"
+WIRE_YIDUI = "╭ 阿鱼：一对\n╰"
+WIRE_ERDUI = "╭ 阿鱼：二对\n╰"
+WIRE_XINNIANCHENG = "╭ 新昵称：换群\n╰"
+WIRE_XINDUI = "╭ 阿鱼：新对\n╰"
+WIRE_DIER = "╭ 阿鱼：第二\n╰"
+WIRE_VIDEO = "╭ 阿鱼：[视频]\n╰"
+WIRE_IMAGE = "╭ 阿鱼：[图片]\n╰"
 
 
 class Recorder:
@@ -206,6 +201,71 @@ def test_render_wechat_voice_from_kind(tmp_path: Path) -> None:
         attachments=[Attachment(kind="voice")],
     )
     assert render(router, message) == ["阿鱼：[语音]"]
+
+
+def test_render_wechat_link_card_keeps_title(tmp_path: Path) -> None:
+    """微信链接卡片：桥接已把 <title> 放进 content，转发时必须保留。
+
+    线上事故：知乎卡片到 QQ 只剩一个 ``[link]`` —— 正文被 ``kind != text`` 整段
+    丢掉，占位又兜底成英文 kind。
+    """
+    router, _store, _adapters = make_router(tmp_path)
+    title = "中国新能源企业在芬建厂涉人口贩运调查，出海中企该如何规避海外用工合规风险？"
+    message = make_msg(WXG, title, user_id="wxg:human", kind="link")
+    assert render(router, message) == ["阿鱼：" + title]
+    wire = render_wire(router, message)
+    assert len(wire) == 1
+    lines = wire[0].splitlines()
+    bodies = [lines[0][2:]] + [line[2:] for line in lines[1:-1]]
+    assert "".join(bodies) == "阿鱼：" + title
+    assert "[link]" not in wire[0]
+    assert "[链接]" not in wire[0]
+
+
+def test_render_wechat_link_card_without_title_keeps_chinese_placeholder(
+    tmp_path: Path,
+) -> None:
+    """标题没解析出来时留中文占位，而不是把整条消息吞掉或漏出英文 kind。"""
+    router, _store, _adapters = make_router(tmp_path)
+    message = make_msg(WXG, "", user_id="wxg:human", kind="link")
+    assert render(router, message) == ["阿鱼：[链接]"]
+
+
+def test_render_wechat_quote_and_card_keep_text(tmp_path: Path) -> None:
+    """引用回复与普通卡片同样属于可读正文，标题不得被丢掉。"""
+    router, _store, _adapters = make_router(tmp_path)
+    quote = make_msg(WXG, "引用正文", user_id="wxg:human", kind="quote")
+    assert render(router, quote) == ["阿鱼：引用正文"]
+    card = make_msg(WXG, "卡片标题", user_id="wxg:human", kind="card")
+    assert render(router, card) == ["阿鱼：卡片标题"]
+
+
+def test_render_wechat_empty_text_is_dropped(tmp_path: Path) -> None:
+    """空正文的纯文本不产生任何线上消息（改动前后一致，不造占位）。"""
+    router, _store, _adapters = make_router(tmp_path)
+    message = make_msg(WXG, "", user_id="wxg:human", kind="text")
+    rendered = router._render(router._snapshot(message, QQ, "wechat"))
+    assert rendered.wire == [] and rendered.store == []
+
+
+def test_render_wechat_image_kind_still_uses_placeholder(tmp_path: Path) -> None:
+    """图片等媒体 kind 不把 content 的 [图片] 当正文重复，仍只出一个占位。"""
+    router, _store, _adapters = make_router(tmp_path)
+    message = make_msg(
+        WXG,
+        "[图片]",
+        user_id="wxg:human",
+        kind="image",
+        attachments=[Attachment(kind="image", path="images/x.png")],
+    )
+    assert render(router, message) == ["阿鱼：[图片]"]
+
+
+def test_render_wechat_unknown_kind_never_leaks_english(tmp_path: Path) -> None:
+    """未知 kind 的兜底占位必须是中文：英文 kind 不能漏进群里。"""
+    router, _store, _adapters = make_router(tmp_path)
+    message = make_msg(WXG, "", user_id="wxg:human", kind="hologram")
+    assert render(router, message) == ["阿鱼：[其它消息]"]
 
 
 def test_render_file_keeps_name_and_forward_count(tmp_path: Path) -> None:
@@ -462,112 +522,71 @@ def test_render_forward_with_attachment_keeps_forward_content(tmp_path: Path) ->
     assert render(router, message) == ["阿鱼：[图片] [聊天记录]\n小明: 在吗"]
 
 
-def test_render_long_text_uses_sender_split(tmp_path: Path) -> None:
+def test_render_long_text_store_is_single_line(tmp_path: Path) -> None:
+    """长正文入库仍是**一行** ``昵称：正文``（分块只发生在线上兜底路径）。"""
     router, _store, _adapters = make_router(tmp_path)
     chunks = render(router, make_msg(QQ, "字" * 1200))
-    assert len(chunks) > 1
-    assert all(len(chunk) <= 500 for chunk in chunks)
-    assert "".join(chunks).replace("阿鱼：", "") == "字" * 1200
+    assert chunks == ["阿鱼：" + "字" * 1200]
 
 
 # ---------------------------------------------------------------- 消息泡
 def test_wire_bubble_shape_for_human(tmp_path: Path) -> None:
-    """别人转来的消息线上是三行圆角气泡；入库仍是单行（store 零变化）。"""
+    """别人转来的消息线上是左锚气泡；入库仍是单行（store 零变化）。"""
     router, _store, _adapters = make_router(tmp_path)
     wire = render_wire(router, make_msg(QQ, "你好"))
     lines = wire[0].splitlines()
-    assert lines[0].startswith("╭") and lines[0].endswith("╮")
-    assert lines[-1].startswith("╰") and lines[-1].endswith("╯")
-    for line in lines[1:-1]:
-        assert line.startswith("│") and line.endswith("│")
-    assert wire == ["╭────────────╮\n│ 阿鱼：你好 │\n╰────────────╯"]
+    assert lines[0] == "╭ 阿鱼：你好"
+    assert lines[-1] == "╰"
+    assert wire == ["╭ 阿鱼：你好\n╰"]
     # 入库基线（改动前硬编码）：单行「昵称：正文」。
     assert render(router, make_msg(QQ, "你好")) == ["阿鱼：你好"]
 
 
-def test_wire_bubble_rows_align_with_mixed_scripts(tmp_path: Path) -> None:
-    """中英混排时框内每行显示宽度仍相等（用显示宽度而非 len() 对齐）。"""
+def test_wire_bubble_has_no_right_border_or_padding(tmp_path: Path) -> None:
+    """左锚形态：没有右边框、没有上下横线、行尾不留补白空格。
+
+    闭合框在手机字体 / 会折叠行尾空格的客户端上必然歪，所以整条路径都不该再
+    出现 ``╮`` / ``╯`` / ``─``，也不该靠补空格对齐。
+    """
     router, _store, _adapters = make_router(tmp_path)
     content = "甲" * 15 + "abcdefghij" + "乙" * 15
-    wire = render_wire(router, make_msg(QQ, content))
-    for entry in wire:
-        widths = {display_width(line) for line in entry.splitlines()}
-        assert len(widths) == 1
+    for entry in render_wire(router, make_msg(QQ, content)):
+        assert "╮" not in entry and "╯" not in entry and "─" not in entry
+        for line in entry.splitlines():
+            assert line == line.rstrip()
     # 入库形态不受气泡影响：与改动前逐字节一致。
     assert render(router, make_msg(QQ, content)) == ["阿鱼：" + content]
 
 
-class _PixelMetrics:
-    """雅黑 16px 的实测宽度表；未列出的字符按 CJK 16px 算。"""
-
-    _WIDTHS = {
-        " ": 5,
-        "\u200a": 2,
-        "─": 11,
-        "│": 11,
-        "╭": 10,
-        "╮": 10,
-        "╰": 10,
-        "╯": 10,
-    }
-
-    def width(self, text: str) -> int:
-        return sum(self._WIDTHS.get(ch, 16) for ch in text)
-
-
-def test_pixel_bubble_keeps_both_borders_aligned(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """比例字体下顶/底栏与内容行的像素宽度差 ≤1px，左右边框都保留。"""
-    metrics = _PixelMetrics()
-    monkeypatch.setattr(mirror_module.MirrorRouter, "_bubble_metrics", lambda self: metrics)
+def test_wire_bubble_wraps_by_display_width(tmp_path: Path) -> None:
+    """框内每行正文按显示宽度换行，且不超过 bubble_max_content_width。"""
     router, _store, _adapters = make_router(tmp_path)
-    content = (
-        "这图糊得跟被鲸鱼尾巴扫过似的，本鱼只看出是一张截图，一个字都认不出来。"
-        "原帖链接甩一个过来吧，别让我凭空猜。"
-    )
-
+    content = "甲" * 15 + "abcdefghij" + "乙" * 15
     wire = render_wire(router, make_msg(QQ, content))
-
-    for entry in wire:
-        rows = entry.splitlines()
-        assert rows[0].startswith("╭") and rows[0].endswith("╮")
-        assert rows[-1].startswith("╰") and rows[-1].endswith("╯")
-        assert all(row.startswith("│") and row.endswith("│") for row in rows[1:-1])
-        widths = [metrics.width(row) for row in rows]
-        assert max(widths) - min(widths) <= 1
+    assert len(wire) == 1
+    lines = wire[0].splitlines()
+    assert len(lines) > 2
+    bodies = [lines[0][2:]] + [line[2:] for line in lines[1:-1]]
+    assert all(display_width(body) <= 30 for body in bodies)
+    assert "".join(bodies) == "阿鱼：" + content
 
 
-def test_pixel_pad_hits_every_residue_without_tofu() -> None:
-    """空格 5px + U+200A 2px 能补到任意目标宽度（最多多 1px），不靠缺字形。"""
-    metrics = _PixelMetrics()
-    for delta in range(0, 200):
-        pad = mirror_module._pixel_pad(delta, metrics)
-        assert pad.strip("\u200a ") == ""
-        assert delta <= metrics.width(pad) <= delta + 1
-        # 发丝空格是唯一「可能被客户端吞掉」的补白：每行最多 2 个。
-        assert pad.count("\u200a") <= 2
+def test_wire_bubble_only_drops_invisible_break_spaces(tmp_path: Path) -> None:
+    """线上只丢「换行点上的空格」；其余字符逐字保留，入库逐字节不变。
 
-
-def test_pixel_bubble_survives_clients_that_swallow_hair_space(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """极端客户端把 U+200A 渲染成零宽时，右边框最坏偏差仍 ≤4px（改动前 8px）。"""
-    metrics = _PixelMetrics()
-    monkeypatch.setattr(
-        mirror_module.MirrorRouter, "_bubble_metrics", lambda self: metrics
-    )
+    行尾空白必须剥掉（客户端会折叠，留着反而造成右侧参差），所以带空格的正文
+    在换行点会少一个不可见空格——这是唯一允许的差异。
+    """
     router, _store, _adapters = make_router(tmp_path)
-    content = (
-        "这图糊得跟被鲸鱼尾巴扫过似的，本鱼只看出是一张截图，一个字都认不出来。"
-        "原帖链接甩一个过来吧，别让我凭空猜。"
-    )
-
-    for entry in render_wire(router, make_msg(QQ, content)):
-        rows = entry.splitlines()
-        assert all(row.count("\u200a") <= 2 for row in rows)
-        collapsed = [metrics.width(row.replace("\u200a", "")) for row in rows]
-        assert max(collapsed) - min(collapsed) <= 4
+    content = "明早 6:45 的发射 " + "再看一遍 回放"
+    rendered = router._render(router._snapshot(make_msg(QQ, content), WXG, "qq"))
+    assert len(rendered.wire) == 1
+    lines = rendered.wire[0].splitlines()
+    joined = "".join([lines[0][2:]] + [line[2:] for line in lines[1:-1]])
+    assert joined.replace(" ", "") == ("阿鱼：" + content).replace(" ", "")
+    assert all(line == line.rstrip() for line in lines)
+    # 入库形态一个字符都不少。
+    assert rendered.store == ["阿鱼：" + content]
 
 
 def test_store_matches_pre_bubble_baseline(tmp_path: Path) -> None:
@@ -617,27 +636,38 @@ def test_bubble_disabled_makes_wire_equal_store(tmp_path: Path) -> None:
     assert rendered.wire == rendered.store == ["阿鱼：你好"]
 
 
-def test_long_text_becomes_full_bubbles(tmp_path: Path) -> None:
-    """先按 MAX_CHUNK 切正文，再给每块套一个完整气泡：不会切出半个框。"""
+def test_long_text_is_one_bubble_not_many(tmp_path: Path) -> None:
+    """一条长消息只套一个气泡：线上 1 条、入库 1 条（676 字线上事故的回归）。"""
     router, _store, _adapters = make_router(tmp_path)
-    full = "阿鱼：" + "字" * 800
-    message = make_msg(QQ, "字" * 800)
+    body = "字" * 800
+    message = make_msg(QQ, body)
     rendered = router._render(router._snapshot(message, WXG, "qq"))
-    chunks = mirror_module._split(full, mirror_module.MAX_CHUNK)
-    assert len(chunks) == 2
-    # 线上气泡条数 == 正文按 MAX_CHUNK(500) 切出的块数。
-    assert len(rendered.wire) == len(rendered.store) == len(chunks)
+    assert len(rendered.wire) == len(rendered.store) == 1
+    assert rendered.store == ["阿鱼：" + body]
+    lines = rendered.wire[0].splitlines()
+    assert lines[0].startswith("╭ 阿鱼：")
+    assert lines[-1] == "╰"
+    assert all(line.startswith("│ ") for line in lines[1:-1])
+    bodies = [lines[0][2:]] + [line[2:] for line in lines[1:-1]]
+    assert "".join(bodies) == "阿鱼：" + body
+    assert len(rendered.wire[0]) <= mirror_module.WIRE_MAX_CHARS
+
+
+def test_extreme_long_text_falls_back_to_chunks(tmp_path: Path) -> None:
+    """只有整段套框后超过 WIRE_MAX_CHARS 才拆，且每块仍是完整气泡。"""
+    router, _store, _adapters = make_router(tmp_path)
+    body = "字" * 6000
+    message = make_msg(QQ, body)
+    rendered = router._render(router._snapshot(message, WXG, "qq"))
+    assert len(rendered.wire) == len(rendered.store) > 1
     for entry in rendered.wire:
-        assert len(entry) <= 4500
+        assert len(entry) <= mirror_module.WIRE_MAX_CHARS
         lines = entry.splitlines()
-        assert lines[0].startswith("╭") and lines[0].endswith("╮")
-        assert lines[-1].startswith("╰") and lines[-1].endswith("╯")
-        assert all(
-            line.startswith("│") and line.endswith("│")
-            for line in lines[1:-1]
-        )
+        assert lines[0].startswith("╭ ")
+        assert lines[-1] == "╰"
+        assert all(line.startswith("│ ") for line in lines[1:-1])
     # 入库仍是单行分块，不含框字符，拼接结果与改动前一致。
-    assert "".join(rendered.store) == full
+    assert "".join(rendered.store) == "阿鱼：" + body
     assert not any(ch in "╭╮╰╯│─" for text in rendered.store for ch in text)
 
 

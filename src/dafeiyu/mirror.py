@@ -22,14 +22,7 @@ from .memory.store import Store
 from .models import Attachment, ChatType, Message, Segment
 from .reply_media import build_onebot_segments
 from .sender import MAX_CHUNK, _split
-from .textwidth import (
-    PixelMeasurer,
-    PixelMetrics,
-    display_width,
-    load_chat_metrics,
-    pad_to_width,
-    wrap_by_width,
-)
+from .textwidth import wrap_by_width
 
 log = logging.getLogger(__name__)
 
@@ -93,104 +86,36 @@ _SEGMENT_MEDIA = {
     "forward": "forward",
 }
 
+#: 微信桥接把卡片/引用/链接的标题放进了 ``content``：这些 kind 属于**可读正文**，
+#: 不是媒体占位，转发时必须保留（否则知乎卡片到 QQ 只剩一个 ``[link]``）。
+_WECHAT_TEXT_KINDS = frozenset({"text", "link", "quote", "card"})
+
 _PLACEHOLDERS = {
     "image": "[图片]",
     "voice": "[语音]",
     "video": "[视频]",
     "sticker": "[表情]",
+    "link": "[链接]",
+    "quote": "[引用]",
+    "card": "[卡片]",
+    "location": "[位置]",
+    "call": "[通话]",
 }
+#: 未知 kind 的兜底占位：绝不把英文 kind 漏进群里。
+_UNKNOWN_PLACEHOLDER = "[其它消息]"
 
 
-# ------------------------------------------------------- 气泡：像素级对齐
+# --------------------------------------------------- 气泡：字体无关的左锚形态
 #
-# 比例字体下 ``─`` / ``│`` / 空格 / 中文的宽度都不一样（雅黑 16px：11/11/5/16），
-# 按显示列补空格只能保证列数相等，右边框会错开几十像素。这里用真实字体度量
-# 把每一行补到同一像素宽度，并反算顶/底栏的横线数量。
+# 曾用过「闭合三行框」（``╭───╮`` / ``│ 正文 │`` / ``╰───╯``）并按雅黑像素宽度
+# 补齐：只在本机雅黑下成立。手机端字体（PingFang / 系统字体）里 ``─`` / ``│`` /
+# 空格 / CJK 的宽度比例不同，多数客户端还会折叠行尾空格，右边框与上下横线必然
+# 错开——两端都不可能与电脑端对齐。现在只保留与字体比例无关的左锚：
+# 首行 ``╭ 正文``、中间行 ``│ 正文``、末行单独一个 ``╰``；不补任何行尾空格，
+# 也不读任何字体度量。
 
-#: 气泡框线与补白字符。
+#: 气泡内容行的左锚字符。
 _BAR = "│"
-_DASH = "─"
-#: U+200A HAIR SPACE：雅黑 16px 下宽 2px。空格是 5px，1–4px 的残差靠它补。
-#: 主流中文字体都有这个字形，但仍有被客户端吞成零宽的可能，所以补白里
-#: 最多只用 2 个（见 ``_pixel_pad``）。
-_HAIR_SPACE = "\u200a"
-
-
-def _ceil_div(value: int, unit: int) -> int:
-    return -(-value // unit)
-
-
-def _pixel_pad(delta: int, metrics: PixelMeasurer) -> str:
-    """用空格 + U+200A 补出 ``delta`` 像素；凑不整时最多多补 1px。
-
-    第一轮把 U+200A 限制在 2 个以内：正常字体下 5px 空格 + 2px 发丝空格仍能
-    命中任意残差，而万一某个客户端把它渲染成零宽，单行最多偏 4px（改动前
-    最多 4 个、最坏 8px）。只有字体比例异常、前两轮凑不出时才放宽到 4 个。
-    """
-    if delta <= 0:
-        return ""
-    space = metrics.width(" ")
-    hair = metrics.width(_HAIR_SPACE)
-    if space <= 0:
-        return ""
-    if hair <= 0:
-        return " " * _ceil_div(delta, space)
-    for limit, max_extra in ((2, 1), (4, 3)):
-        for extra in range(0, max_extra + 1):
-            for hairs in range(0, limit + 1):
-                rest = delta + extra - hairs * hair
-                if rest < 0:
-                    continue
-                if rest % space == 0:
-                    return " " * (rest // space) + _HAIR_SPACE * hairs
-    return " " * _ceil_div(delta, space)
-
-
-def _pixel_bubble(
-    lines: Sequence[str], corners: str, metrics: PixelMeasurer
-) -> str | None:
-    """按真实字体像素宽度拼三行气泡；度量不可用时返回 ``None``。
-
-    同一气泡内所有行（顶栏、内容行、底栏）的像素宽度差 ≤1px：先按最宽内容
-    行确定目标宽度，再把顶/底栏的横线数量反算到同一宽度，内容行用空格补齐。
-    """
-    top_left, top_right, bottom_left, bottom_right = (
-        corners[0],
-        corners[1],
-        corners[2],
-        corners[3],
-    )
-    dash = metrics.width(_DASH)
-    bar = metrics.width(_BAR)
-    space = metrics.width(" ")
-    if dash <= 0 or bar <= 0 or space <= 0:
-        return None
-    top_extra = metrics.width(top_left) + metrics.width(top_right)
-    bottom_extra = metrics.width(bottom_left) + metrics.width(bottom_right)
-    # 四角宽度不一致时压不到同一个像素宽度：交给按列对齐的旧路径。
-    if (top_extra - bottom_extra) % dash:
-        return None
-    side = 2 * (bar + space)
-    content = max(side + metrics.width(line) for line in lines)
-    target = content
-    top_count = bottom_count = 1
-    for _ in range(6):
-        top_count = max(1, _ceil_div(target - top_extra, dash))
-        bottom_count = max(1, _ceil_div(target - bottom_extra, dash))
-        grown = max(
-            content,
-            top_extra + top_count * dash,
-            bottom_extra + bottom_count * dash,
-        )
-        if grown == target:
-            break
-        target = grown
-    rows = [f"{top_left}{_DASH * top_count}{top_right}"]
-    for line in lines:
-        pad = _pixel_pad(target - side - metrics.width(line), metrics)
-        rows.append(f"{_BAR} {line}{pad} {_BAR}")
-    rows.append(f"{bottom_left}{_DASH * bottom_count}{bottom_right}")
-    return "\n".join(rows)
 
 
 class RenderedLines(NamedTuple):
@@ -1567,9 +1492,11 @@ class MirrorRouter:
     def _render(self, item: MirrorItem) -> RenderedLines:
         """把一个镜像条目一次性算出两套形态：线上气泡与入库单行。
 
-        ``store`` 与历史版本逐字节一致（``昵称：正文``，bot 无前缀）；
-        ``wire`` 只在「别人转来的 + bubble_enabled」时把每一分块套进
-        一个完整的三行圆角气泡，绝不在气泡中间分块。
+        ``store`` 与历史版本逐字节一致（``昵称：正文``，bot 无前缀）。
+        ``wire`` 只在「别人转来的 + bubble_enabled」时套**一个**完整气泡：
+        一条消息 = 一个气泡，绝不把一条长消息拆成多条。只有整段套框后超过
+        ``WIRE_MAX_CHARS``（平台单条保守上限）才退回按 ``MAX_CHUNK`` 分块，
+        每块各自套框，超限的块再退回无框单行。
         """
         placeholders = self._placeholders(item)
         text = self._plain_text(item)
@@ -1588,64 +1515,51 @@ class MirrorRouter:
         full = f"{prefix}{body}" if prefix else body
         if not full.strip():
             return RenderedLines([], [])
-        # 先按 MAX_CHUNK 切正文，再给每一块套一个完整气泡：
-        # 一条线上消息 = 一个完整气泡，不会切出半个框。
-        chunks = _split(full, MAX_CHUNK)
         if item.is_bot or not self.settings.mirror.bubble_enabled:
+            chunks = _split(full, MAX_CHUNK)
             return RenderedLines(list(chunks), list(chunks))
-        wire = []
+        boxed = self._bubble(full)
+        if len(boxed) <= WIRE_MAX_CHARS:
+            return RenderedLines([boxed], [full])
+        # 只有超过平台单条保守上限才拆：此时宁可分成几条带框消息，
+        # 也不能发出一段会被平台截断的文本。
+        log.warning(
+            "镜像气泡超过单条保守上限（%d 字符），退回按 %d 字分块：%d 字符",
+            len(boxed),
+            MAX_CHUNK,
+            len(full),
+        )
+        chunks = _split(full, MAX_CHUNK)
+        wire: list[str] = []
         for chunk in chunks:
-            boxed = self._bubble(chunk)
-            if len(boxed) > WIRE_MAX_CHARS:
-                # 极端组合的兜底：宁可退回无框单行，也不发出会丢字的半截气泡。
-                log.warning(
-                    "镜像气泡超保守上限，退回单行：%d 字符", len(boxed)
-                )
-                wire.append(chunk)
-            else:
-                wire.append(boxed)
+            chunk_boxed = self._bubble(chunk)
+            wire.append(chunk if len(chunk_boxed) > WIRE_MAX_CHARS else chunk_boxed)
         return RenderedLines(wire, list(chunks))
 
-    def _bubble(self, chunk: str) -> str:
-        """把一块正文（含昵称前缀）套进三行圆角气泡。
+    def _bubble(self, text: str) -> str:
+        """把正文（含昵称前缀）套成一个与字体无关的气泡。
 
-        正文先按 ``bubble_max_content_width`` 显示列换行；随后优先按真实字体
-        的**像素宽度**对齐（比例字体里 ``─``/``│``/空格/CJK 宽度各不相同，
-        按显示列补空格会让右边框错开几十像素）。没有可用字体度量时退回按
-        显示列对齐，形态不变。
+        形态固定为「左锚」：首行 ``╭ 正文``、中间行 ``│ 正文``、末行单独一个
+        ``╰``。**故意不画右边框、不画上下横线**：闭合框要求每一行的像素/列宽
+        一致，而手机与电脑的字体比例不同、多数客户端还会折叠行尾空格，右边框
+        必然错开（用户实测两端都歪）。左锚只依赖行首字符，与字体、字号、
+        客户端无关；也不补任何行尾空格（补了既不对齐，又会被折叠成空隙）。
+        正文仍按 ``bubble_max_content_width`` 显示列换行。
+
+        换行点上的空格不可见，这里会连同行尾空白一起剥掉（留着只会让右边缘
+        参差）；除此之外正文逐字符保留，入库形态（``store``）更是逐字节不变。
         """
         corners = self.settings.mirror.bubble_corner_chars
         limit = self.settings.mirror.bubble_max_content_width
         inner: list[str] = []
-        for raw_line in chunk.split("\n"):
+        for raw_line in text.split("\n"):
             inner.extend(wrap_by_width(raw_line, limit))
-        metrics = self._bubble_metrics()
-        if metrics is not None:
-            boxed = _pixel_bubble(inner, corners, metrics)
-            if boxed is not None:
-                return boxed
-        top_left, top_right, bottom_left, bottom_right = (
-            corners[0],
-            corners[1],
-            corners[2],
-            corners[3],
-        )
-        content_width = max(display_width(line) for line in inner)
-        bar = "─" * (content_width + 2)
-        out = [f"{top_left}{bar}{top_right}"]
-        out.extend(
-            f"│ {pad_to_width(line, content_width)} │" for line in inner
-        )
-        out.append(f"{bottom_left}{bar}{bottom_right}")
-        return "\n".join(out)
-
-    def _bubble_metrics(self) -> PixelMetrics | None:
-        """气泡对齐用的字体度量；没有 Pillow / 聊天字体时返回 ``None``。
-
-        抽成方法而不是模块函数：评估用的 ``_BubbleProbe`` 覆盖成 ``None``，
-        让证据串跨机器逐字节稳定；生产路径仍走像素对齐。
-        """
-        return load_chat_metrics(16)
+        if not inner:
+            return corners[2]
+        rows = [f"{corners[0]} {inner[0]}"]
+        rows.extend(f"{_BAR} {line}" for line in inner[1:])
+        rows.append(corners[2])
+        return "\n".join(row.rstrip() for row in rows)
 
     def _display_nickname(self, item: MirrorItem) -> str:
         """面板按平台给特定用户配的昵称优先，其次消息自带昵称。"""
@@ -1676,8 +1590,9 @@ class MirrorRouter:
             if item.attachments:
                 return ""
             return "\n".join(item.text_lines).strip()
-        # 微信：kind 非 text 时 content 常是 [图片] 占位，不能当正文重复。
-        if item.kind != "text":
+        # 微信：桥接已把卡片/引用的标题放进 content（见 ``_WECHAT_TEXT_KINDS``），
+        # 这些是可读正文，不能当媒体占位丢掉；其它 kind 的 content 才是占位文本。
+        if item.kind not in _WECHAT_TEXT_KINDS:
             return ""
         return "\n".join(item.text_lines).strip()
 
@@ -1708,9 +1623,17 @@ class MirrorRouter:
                 return [
                     (_media_kind(att.kind), att.name, 0) for att in item.attachments
                 ]
-            if item.kind != "text":
+            if item.kind not in _WECHAT_TEXT_KINDS:
                 return [(_media_kind(item.kind), "", 0)]
-            return []
+            if item.kind == "text":
+                # 空正文的纯文本没有可发内容：与改动前一样直接丢掉，
+                # 不能凭空造一个「[其它消息]」。
+                return []
+            if any(line.strip() for line in item.text_lines):
+                # 卡片/引用的正文已由 `_plain_text` 取走，别再补一个占位重复一遍。
+                return []
+            # 标题没解析出来时仍要留一个中文占位，不能把整条消息静默吞掉。
+            return [(_media_kind(item.kind), "", 0)]
 
         entries: list[tuple[str, str, int]] = [
             (_media_kind(att.kind), att.name, 0) for att in item.attachments
@@ -1767,7 +1690,7 @@ class MirrorRouter:
             return f"[文件] {name}".rstrip()
         if kind == "forward":
             return f"[合并转发 {max(1, count)} 条]"
-        return _PLACEHOLDERS.get(kind, f"[{kind}]")
+        return _PLACEHOLDERS.get(kind, _UNKNOWN_PLACEHOLDER)
 
     # ------------------------------------------------------------ 落库
     def _store_line(
