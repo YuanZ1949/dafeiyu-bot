@@ -1,9 +1,14 @@
-"""B4：印象抽取只对群聊生效——私聊既不调模型，也不写 impressions/usage。"""
+"""B4：印象抽取按会话生效——总闸关时私聊不抽取；observe_private 后私聊走同一条链路。
+
+隐私边界：私聊抽取的内容只落本会话的 impressions，绝不进 bot_stances /
+shared_facts / 全局 MEMORY。
+"""
 
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,6 +17,7 @@ from dafeiyu.config import (
     GroupsConfig,
     LoggingConfig,
     MemoryConfig,
+    MindConfig,
     PersonaConfig,
     Settings,
     TriggerConfig,
@@ -50,7 +56,7 @@ class FakeBrain:
         return EXTRACTED
 
 
-def make_settings() -> Settings:
+def make_settings(mind: MindConfig | None = None) -> Settings:
     return Settings(
         api_key="sk-test",
         base_url="https://api.deepseek.com",
@@ -66,6 +72,7 @@ def make_settings() -> Settings:
         budget=BudgetConfig(200, 300000),
         memory=MemoryConfig(20, 5, EVERY),
         logging=LoggingConfig("INFO", "logs"),
+        mind=mind or MindConfig(),
     )
 
 
@@ -77,8 +84,10 @@ def store(tmp_path: Path):
     s.close()
 
 
-def make_service(store: Store, brain: FakeBrain) -> Service:
-    settings = make_settings()
+def make_service(
+    store: Store, brain: Any, mind: MindConfig | None = None
+) -> Service:
+    settings = make_settings(mind)
     router = Router(settings, store, clock=lambda: NOW)
     worker = ImpressionWorker(store, brain, every=EVERY)
     return Service(
@@ -134,6 +143,7 @@ def impression_usage(store: Store, chat_type: ChatType, chat_id: str) -> int:
 
 
 async def test_private_chat_does_not_extract_impressions(store: Store) -> None:
+    """总闸关（默认）时私聊不抽取：observe_private 也要先过 mind.enabled。"""
     brain = FakeBrain()
     service = make_service(store, brain)
 
@@ -142,6 +152,67 @@ async def test_private_chat_does_not_extract_impressions(store: Store) -> None:
     assert brain.calls == 0, "私聊不应调用模型抽取印象"
     assert store.list_impressions(ChatType.PRIVATE, PRIVATE_ID, topk=10) == []
     assert impression_usage(store, ChatType.PRIVATE, PRIVATE_ID) == 0
+
+
+async def test_private_chat_extracts_impressions_when_mind_observes(
+    store: Store,
+) -> None:
+    brain = FakeBrain()
+    service = make_service(store, brain, MindConfig(enabled=True))
+
+    await trigger(service, store, ChatType.PRIVATE, PRIVATE_ID)
+
+    assert brain.calls == 1, "总闸开 + observe_private 时私聊应抽取一次"
+    assert [im.content for im in store.list_impressions(ChatType.PRIVATE, PRIVATE_ID, topk=10)] == [
+        "外号叫鱼片"
+    ]
+    assert impression_usage(store, ChatType.PRIVATE, PRIVATE_ID) == 1
+    # 隐私边界：私聊抽取的内容绝不进跨群立场 / 群级 shared_facts。
+    assert store.list_stances(10) == []
+    assert store.shared_facts() == []
+
+
+async def test_private_chat_skips_extraction_when_observe_private_false(
+    store: Store,
+) -> None:
+    brain = FakeBrain()
+    service = make_service(
+        store, brain, MindConfig(enabled=True, observe_private=False)
+    )
+
+    await trigger(service, store, ChatType.PRIVATE, PRIVATE_ID)
+
+    assert brain.calls == 0, "observe_private 关时私聊不抽取"
+    assert store.list_impressions(ChatType.PRIVATE, PRIVATE_ID, topk=10) == []
+    assert impression_usage(store, ChatType.PRIVATE, PRIVATE_ID) == 0
+
+
+async def test_private_extraction_failure_does_not_block_group(store: Store) -> None:
+    """私聊抽取失败只记日志并按会话退避；群聊下一轮照常抽取。"""
+
+    class ExplodingBrain:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self, system: str, messages: list[dict[str, Any]], max_tokens: int = 400
+        ) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("boom")
+            return EXTRACTED
+
+    brain = ExplodingBrain()
+    service = make_service(store, brain, MindConfig(enabled=True))
+
+    await trigger(service, store, ChatType.PRIVATE, PRIVATE_ID)
+    assert brain.calls == 1
+
+    await trigger(service, store, ChatType.GROUP, GROUP_ID)
+    assert brain.calls == 2
+    assert [
+        im.content for im in store.list_impressions(ChatType.GROUP, GROUP_ID, topk=10)
+    ] == ["外号叫鱼片"]
 
 
 async def test_group_chat_still_extracts_impressions(store: Store) -> None:
@@ -155,3 +226,32 @@ async def test_group_chat_still_extracts_impressions(store: Store) -> None:
     assert [im.content for im in store.list_impressions(ChatType.GROUP, GROUP_ID, topk=10)] == [
         "外号叫鱼片"
     ]
+
+
+async def test_private_bad_json_extraction_does_not_block_group(store: Store) -> None:
+    """私聊抽取返回非法 JSON：本轮 0 条，群聊下一轮照常抽取。"""
+
+    class GarbageThenGoodBrain:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.systems: list[str] = []
+
+        async def complete(
+            self, system: str, messages: list[dict[str, Any]], max_tokens: int = 400
+        ) -> str:
+            self.calls += 1
+            self.systems.append(system)
+            return "这不是 JSON" if self.calls == 1 else EXTRACTED
+
+    brain = GarbageThenGoodBrain()
+    service = make_service(store, brain, MindConfig(enabled=True))
+
+    await trigger(service, store, ChatType.PRIVATE, PRIVATE_ID)
+    assert brain.calls == 1
+    assert store.list_impressions(ChatType.PRIVATE, PRIVATE_ID, topk=10) == []
+
+    await trigger(service, store, ChatType.GROUP, GROUP_ID)
+    assert brain.calls == 2
+    assert [
+        im.content for im in store.list_impressions(ChatType.GROUP, GROUP_ID, topk=10)
+    ] == ["外号叫鱼片"]

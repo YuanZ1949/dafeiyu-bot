@@ -12,9 +12,14 @@ import pytest
 from dafeiyu.config import MindConfig
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
-from dafeiyu.timeutil import today_shanghai
+from dafeiyu.timeutil import now_shanghai, today_shanghai
 from dafeiyu.workers.failure import FailureBackoff
-from dafeiyu.workers.observer import ObserverWorker, observer_loop
+from dafeiyu.workers.observer import (
+    ObserverWorker,
+    chat_type_allowed,
+    observer_loop,
+)
+from dafeiyu.workers.reflector import ReflectorWorker
 
 GROUP = ChatType.GROUP
 PRIVATE = ChatType.PRIVATE
@@ -111,7 +116,9 @@ def store(tmp_path: Path):
     s.close()
 
 
-def make_worker(store: Store, brain: FakeBrain, **mind: Any) -> ObserverWorker:
+def make_worker(
+    store: Store, brain: FakeBrain | SequenceBrain, **mind: Any
+) -> ObserverWorker:
     mind.setdefault("enabled", True)
     mind.setdefault("observer_enabled", True)
     return ObserverWorker(
@@ -145,10 +152,81 @@ async def test_switched_off_never_calls_model(store: Store, flags: dict[str, Any
     assert brain.calls == []
 
 
-async def test_private_chat_is_never_observed(store: Store) -> None:
+async def test_observe_private_false_never_observes_private(store: Store) -> None:
+    add_messages(store, 1, chat_type=PRIVATE, chat_id="qq:9")
+    brain = FakeBrain(payload())
+    worker = make_worker(store, brain, observe_private=False)
+
+    assert await worker.run_once() == 0
+    assert await worker.observe_chat(PRIVATE, "qq:9") is False
+    assert brain.calls == []
+
+
+# ---- 私聊观察（observe_private）-------------------------------------------
+
+
+def test_chat_type_allowed_predicate() -> None:
+    mind = MindConfig(enabled=True, observer_enabled=True)
+    assert chat_type_allowed(mind, PRIVATE) is True
+    assert chat_type_allowed(mind, GROUP) is True
+
+    no_private = MindConfig(
+        enabled=True, observer_enabled=True, observe_private=False
+    )
+    assert chat_type_allowed(no_private, PRIVATE) is False
+    assert chat_type_allowed(no_private, GROUP) is True
+
+    # 总闸对群聊同样生效：没有 GROUP 直通。
+    off = MindConfig(enabled=False, observer_enabled=True)
+    assert chat_type_allowed(off, GROUP) is False
+    assert chat_type_allowed(off, PRIVATE) is False
+
+
+async def test_observe_private_observes_private_chat(store: Store) -> None:
     add_messages(store, 1, chat_type=PRIVATE, chat_id="qq:9")
     brain = FakeBrain(payload())
     worker = make_worker(store, brain)
+
+    assert await worker.run_once() == 1
+    assert len(brain.calls) == 1
+    # 私聊提示第一行点明这是私聊，不是群聊。
+    assert brain.calls[0][0]["content"].startswith(
+        "这是与对方的私聊，不是群聊。\n"
+    )
+    episode = store.latest_episode(PRIVATE, "qq:9")
+    assert episode is not None
+    assert episode.chat_type == PRIVATE
+
+
+async def test_private_daily_cap_is_per_chat(store: Store) -> None:
+    add_messages(store, 1, chat_type=PRIVATE, chat_id="qq:9")
+    brain = FakeBrain(payload())
+    # daily=2：Reflector 保留 1 次，Observer 自己最多 1 次。
+    worker = make_worker(store, brain, observer_daily_calls=2)
+
+    assert await worker.run_once() == 1
+    assert store.observer_calls_today(PRIVATE, "qq:9", today_shanghai()) == 1
+
+    add_messages(store, 9, chat_type=PRIVATE, chat_id="qq:9", timestamp=1200)
+    assert await worker.run_once() == 0  # 1 >= 1：第二轮让位给 Reflector
+    assert len(brain.calls) == 1
+
+
+async def test_private_below_min_messages_is_not_observed(store: Store) -> None:
+    add_messages(store, 1, count=7, chat_type=PRIVATE, chat_id="qq:9")
+    brain = FakeBrain(payload())
+    worker = make_worker(store, brain)
+
+    assert await worker.run_once() == 0
+    assert brain.calls == []
+
+
+async def test_master_switch_off_blocks_private_even_with_observe_private(
+    store: Store,
+) -> None:
+    add_messages(store, 1, chat_type=PRIVATE, chat_id="qq:9")
+    brain = FakeBrain(payload())
+    worker = make_worker(store, brain, enabled=False)
 
     assert await worker.run_once() == 0
     assert await worker.observe_chat(PRIVATE, "qq:9") is False
@@ -170,15 +248,118 @@ async def test_skips_until_min_messages(store: Store) -> None:
 async def test_daily_cap_blocks_extra_calls(store: Store) -> None:
     add_messages(store, 1)
     brain = FakeBrain(payload())
-    worker = make_worker(store, brain, observer_daily_calls=1)
+    # daily=2：Reflector 保留 1 次，Observer 自己最多 1 次（daily-1）。
+    worker = make_worker(store, brain, observer_daily_calls=2)
 
-    assert await worker.run_once() == 1
+    assert await worker.run_once() == 1  # 首轮 0 >= 1 不成立，放行
     assert await worker.run_once() == 0  # 游标已推进，也没有新消息
     assert store.observer_calls_today(GROUP, CHAT, today_shanghai()) == 1
 
     add_messages(store, 9, timestamp=1200)
-    assert await worker.run_once() == 0
+    assert await worker.run_once() == 0  # 1 >= 1：额度让给 Reflector
     assert len(brain.calls) == 1
+
+
+class ReflectorBrain:
+    """返回合法自省 JSON 的最小假脑，用来验证 Reflector 的额度保留。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete_detailed(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 600,
+        temperature: float = 0.7,
+    ) -> tuple[str, int, int]:
+        self.calls += 1
+        payload = {
+            "focus": "在意今天的鱼缸",
+            "mood_note": "有点困",
+            "relationships": [],
+            "lessons": [],
+            "life": [],
+        }
+        return json.dumps(payload, ensure_ascii=False), 10, 5
+
+
+def make_reflector(store: Store, brain: ReflectorBrain, daily: int) -> ReflectorWorker:
+    moment = now_shanghai().replace(hour=6, minute=0, second=0, microsecond=0)
+    return ReflectorWorker(
+        store,
+        brain,
+        MindConfig(enabled=True, reflection_hour=5, observer_daily_calls=daily),
+        now=lambda: moment.timestamp(),
+    )
+
+
+async def test_daily_one_observer_yields_and_reflector_still_runs(store: Store) -> None:
+    start = int(
+        now_shanghai().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    )
+
+    # daily=1：门限 max(0, 0)=0，Observer 立刻让位，一次都不调模型。
+    add_messages(store, 1)
+    brain = FakeBrain(payload())
+    worker = make_worker(store, brain, observer_daily_calls=1)
+    assert await worker.run_once() == 0
+    assert brain.calls == []
+
+    # Reflector 仍能用这唯一的 1 次。
+    store.add_message(
+        make_message(1, chat_id="qq:2", user_id="qq:2", timestamp=start + 60)
+    )
+    reflect_brain = ReflectorBrain()
+    reflector = make_reflector(store, reflect_brain, daily=1)
+    assert await reflector.run_once() == 1
+    assert reflect_brain.calls == 1
+
+
+async def test_daily_zero_turns_both_off(store: Store) -> None:
+    start = int(
+        now_shanghai().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    )
+
+    add_messages(store, 1)
+    brain = FakeBrain(payload())
+    worker = make_worker(store, brain, observer_daily_calls=0)
+    assert await worker.run_once() == 0
+    assert brain.calls == []
+
+    store.add_message(
+        make_message(1, chat_id="qq:2", user_id="qq:2", timestamp=start + 60)
+    )
+    reflect_brain = ReflectorBrain()
+    reflector = make_reflector(store, reflect_brain, daily=0)
+    assert await reflector.run_once() == 0
+    assert reflect_brain.calls == 0
+
+
+async def test_observer_reserve_leaves_reflector_one_call(store: Store) -> None:
+    """Observer 用满 daily-1 次后，Reflector 仍能跑 1 次，再下一次被额度拒绝。"""
+    start = int(
+        now_shanghai().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    )
+    add_messages(store, 1)
+    brain = FakeBrain(payload())
+    worker = make_worker(store, brain, observer_daily_calls=2)
+    assert await worker.run_once() == 1  # 首轮 0 >= 1 不成立，放行
+    assert len(brain.calls) == 1
+    add_messages(store, 9, timestamp=1200)
+    assert await worker.run_once() == 0  # 1 >= 1：让位
+
+    # 同一会话：Reflector 仍能跑 1 次（1 >= 2 不成立）。
+    store.add_message(make_message(50, user_id="qq:2", timestamp=start + 60))
+    reflect_brain = ReflectorBrain()
+    reflector = make_reflector(store, reflect_brain, daily=2)
+    assert await reflector.run_once() == 1
+    assert reflect_brain.calls == 1
+
+    # 再下一次被额度拒绝：2 >= 2（清掉当日标记，只看额度闸）。
+    store.set_mind_state(store.reflector_key(GROUP, CHAT), "")
+    assert await reflector.run_once() == 0
+    assert reflect_brain.calls == 1
 
 
 # ---- 正常一次 -------------------------------------------------------------
@@ -388,6 +569,140 @@ async def test_new_episode_after_30_minute_gap(store: Store) -> None:
     assert latest is not None
     assert latest.start_message_id == "m9"
     assert {episode.start_message_id for episode in episodes} == {"m1", "m9"}
+
+
+# ---- 同 gap 内的并行话题与相似合并 ----------------------------------------
+
+
+class SequenceBrain:
+    """按调用次序返回不同 payload 的假脑：验证并行话题/合并行为。"""
+
+    def __init__(self, payloads: list[str]) -> None:
+        self.payloads = list(payloads)
+        self.calls = 0
+
+    async def complete_detailed(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 400,
+        temperature: float = 0.2,
+    ) -> tuple[str, int, int]:
+        index = min(self.calls, len(self.payloads) - 1)
+        self.calls += 1
+        return self.payloads[index], 10, 5
+
+
+def add_batch(store: Store, start: int, timestamp: int, **message_kw: Any) -> None:
+    """一批 8 条消息（够 observer_min_messages），来自同一人。"""
+    for i in range(start, start + 8):
+        store.add_message(
+            make_message(i, timestamp=timestamp + i - start, **message_kw)
+        )
+
+
+async def test_parallel_topics_within_gap_open_two_episodes(store: Store) -> None:
+    """30 分钟内先聊显卡再聊鱼缸：两个并行话题各成一行 open，不互相覆盖。"""
+    add_batch(store, 1, 1000)
+    worker = make_worker(store, FakeBrain(payload()))
+    assert await worker.run_once() == 1
+
+    add_batch(store, 9, 1100)
+    worker._now = lambda: 2100.0
+    worker.brain = FakeBrain(
+        payload(topic="鱼缸造景", summary="大家在聊鱼缸造景。", open_loops=[])
+    )
+    assert await worker.run_once() == 1
+
+    episodes = store.episodes_between(GROUP, CHAT, 0, 5000)
+    assert len(episodes) == 2
+    assert {episode.status for episode in episodes} == {"open"}
+    assert {episode.start_message_id for episode in episodes} == {"m1", "m9"}
+    latest = store.latest_episode(GROUP, CHAT)
+    assert latest is not None
+    assert latest.start_message_id == "m9"
+    assert latest.topic == "鱼缸造景"
+
+
+async def test_same_topic_within_gap_updates_same_row(store: Store) -> None:
+    """同一话题再次观察：行 id 不变、summary 更新、participants 取并集。"""
+    add_batch(store, 1, 1000)
+    worker = make_worker(store, FakeBrain(payload()))
+    assert await worker.run_once() == 1
+    first = store.latest_episode(GROUP, CHAT)
+    assert first is not None and first.id is not None
+
+    add_batch(store, 9, 1100, user_id="qq:3", nickname="阿九")
+    worker._now = lambda: 2100.0
+    worker.brain = FakeBrain(
+        payload(
+            topic="显卡驱动报错",
+            summary="阿九也说他的驱动会闪退。",
+            participants=[{"user_id": "qq:3", "nickname": "阿九"}],
+            open_loops=[],
+        )
+    )
+    assert await worker.run_once() == 1
+
+    episodes = store.episodes_between(GROUP, CHAT, 0, 5000)
+    assert len(episodes) == 1
+    row = episodes[0]
+    assert row.id == first.id
+    assert row.start_message_id == "m1"
+    assert row.summary == "阿九也说他的驱动会闪退。"
+    assert row.last_message_id == "m16"
+    # 并集：既有参与者 + 本批新出现的人。
+    assert [(p.user_id, p.nickname) for p in row.participants] == [
+        (USER, "阿猫"),
+        ("qq:3", "阿九"),
+    ]
+    assert row.status == "open"
+
+
+async def test_four_topics_in_one_gap_keep_top_three_open(store: Store) -> None:
+    """同一 gap 内连来 4 个不同话题：open 恰为 3 条，最低 importance 的收尾。"""
+    topics = (
+        ("显卡驱动报错", 0.9),
+        ("鱼缸造景", 0.8),
+        ("周末爬山", 0.7),
+        ("晚饭吃什么", 0.6),
+    )
+    payloads = [
+        payload(topic=name, summary=f"在聊{name}。", importance=score, open_loops=[])
+        for name, score in topics
+    ]
+    add_batch(store, 1, 1000)
+    worker = make_worker(store, SequenceBrain(payloads))
+
+    for index, base in enumerate((1000, 1100, 1200, 1300)):
+        if index > 0:
+            add_batch(store, 1 + 8 * index, base)
+        worker._now = lambda base=base: float(base + 1000)
+        assert await worker.run_once() == 1
+
+    episodes = store.episodes_between(GROUP, CHAT, 0, 5000)
+    open_rows = [episode for episode in episodes if episode.status == "open"]
+    closed_rows = [episode for episode in episodes if episode.status == "closed"]
+    assert len(open_rows) == 3
+    assert {episode.importance for episode in open_rows} == {0.9, 0.8, 0.7}
+    assert len(closed_rows) == 1
+    assert closed_rows[0].importance == 0.6
+
+
+async def test_missing_topic_creates_new_row_without_raising(store: Store) -> None:
+    """payload 缺 topic：退回新建，不抛异常。"""
+    add_batch(store, 1, 1000)
+    worker = make_worker(store, FakeBrain(payload()))
+    assert await worker.run_once() == 1
+
+    add_batch(store, 9, 1100)
+    worker._now = lambda: 2100.0
+    worker.brain = FakeBrain(payload(topic=None, summary="没有话题。", open_loops=[]))
+    assert await worker.run_once() == 1
+
+    episodes = store.episodes_between(GROUP, CHAT, 0, 5000)
+    assert len(episodes) == 2
+    assert all(episode.status == "open" for episode in episodes)
 
 
 # ---- 后台循环 -------------------------------------------------------------

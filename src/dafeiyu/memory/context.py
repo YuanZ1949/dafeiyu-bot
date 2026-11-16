@@ -8,10 +8,11 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 
 from dafeiyu.config import InjectionConfig
+from dafeiyu.memory.recall import freshness, normalize_relevance, score
 from dafeiyu.memory.store import Store
 from dafeiyu.memory.summary_text import clean_summary
 from dafeiyu.memory.workspace import Workspace
-from dafeiyu.models import ChatType, Message
+from dafeiyu.models import ChatType, Episode, Message
 
 CONTEXT_BUDGET = 2500
 OUTPUT_RESERVE = 300
@@ -55,8 +56,14 @@ EPISODE_MOOD_PREFIX = "群气氛："
 # 关系卡与本鱼近况（P1）：数据由 Reflector / 规则写，注入受 mind 总闸控制。
 INJECTION_RELATION_HEADER = "【你和他】"
 INJECTION_STATE_HEADER = "【本鱼的近况】"
+# 「本鱼的近况」心情的时效默认值，与 config.MindConfig.bot_state_ttl_hours 的
+# 默认一致；调用方（service）会显式传入配置值，这里只兜底直接构造的调用。
+STATE_TTL_HOURS_DEFAULT = 12
 # 跨群立场（P3）： 她说过的话不该随群改变。
 INJECTION_STANCE_HEADER = "【我的立场】"
+# 私聊的印象段（T14）：私聊没有「群友」概念，标题换成对方视角；
+# 预算仍用 impression_chars，只在私聊会话注入本会话的印象。
+INJECTION_PRIVATE_IMPRESSION_HEADER = "【关于对方】"
 INJECTION_IMPRESSION_TOPK = 3
 # 关系卡分两级限流：先按发言人取前 12 个（本常量），再按 store 的
 # RELATIONSHIP_CARD_LIMIT（同为 12）截断；仍受 relation_chars 字数预算约束，
@@ -273,12 +280,15 @@ def _recall_lines(
     queries: Sequence[str],
     topk: int,
     exclude_ids: set[str] | None,
+    now_ts: float | None = None,
 ) -> list[str]:
-    """按 FTS bm25 相关性召回同会话旧消息。
+    """按四因子分数（相关性/新鲜度/重要度/关系）召回旧消息与旧话题。
 
-    每条消息跨多个 query 取最小的非 None rank（越小越相关），升序排列；
-    rank 相同或都没有 rank 时按 ``-timestamp``（新的在前）。LIKE 回退路径
-    没有 rank，统一排在所有有 rank 的消息之后。
+    bm25 跨多个 query 取最小非 None rank（越小越相关），再对候选集做
+    min-max 归一化；LIKE 回退候选没有 rank，相关性按 0.5 处理。旧 episode
+    只取 closed/stale（open 的由 ``_episode_block`` 注入，避免重复），相关性
+    用 query 词项与 topic+summary 的重合比例，重要度取行内值，关系权重 0。
+    两类候选合并排序，总条数仍受 ``topk`` 与 ``recall_chars`` 限制。
     """
     ranks: dict[tuple[str, str, str], float] = {}
     found: dict[tuple[str, str, str], Message] = {}
@@ -300,27 +310,83 @@ def _recall_lines(
             best = ranks.get(key)
             if best is None or rank < best:
                 ranks[key] = rank
-    ordered = sorted(found.values(), key=lambda message: _recall_sort_key(message, ranks))
-    return [
-        f"{message.nickname}: {message.content}"
-        for message in ordered[: max(1, min(10, topk))]
-    ]
+    now = time.time() if now_ts is None else now_ts
+    relevance = normalize_relevance({key: ranks.get(key) for key in found})
+
+    # 候选统一成 (分数, 时间戳, 行文本)：同分新的在前，再拼接排序输出。
+    candidates: list[tuple[float, int, str]] = []
+    for message in found.values():
+        key = (message.chat_type.value, message.chat_id, message.message_id)
+        total = score(
+            relevance.get(key, 0.5),
+            freshness(int(message.timestamp), now),
+            0.5,
+            0.0,
+        )
+        candidates.append(
+            (-total, -int(message.timestamp), f"{message.nickname}: {message.content}")
+        )
+
+    query_terms = [terms for terms in map(_recall_terms, queries) if terms]
+    if query_terms:
+        for episode in store.episodes_between(
+            chat_type,
+            chat_id,
+            int(now) - 90 * 86400,
+            int(now) + 1,
+            limit=max(topk * 6, 12),
+        ):
+            if episode.status == "open":
+                continue
+            topic = episode.topic.strip()
+            summary = episode.summary.strip()
+            text = (
+                f"{topic}：{summary}" if topic and summary else (topic or summary)
+            )
+            if not text:
+                continue
+            started = int(episode.started_at) or int(now)
+            total = score(
+                _episode_relevance(episode, query_terms),
+                freshness(started, now),
+                episode.importance,
+                0.0,
+            )
+            age = _episode_age_label(started, int(now)) or "刚刚"
+            candidates.append((-total, -started, f"旧话题｜{text}（{age}）"))
+
+    candidates.sort()
+    return [line for _score, _ts, line in candidates[: max(1, min(10, topk))]]
 
 
-def _recall_sort_key(
-    message: Message, ranks: dict[tuple[str, str, str], float]
-) -> tuple[int, float, int]:
-    """有 rank 的按 rank 升序在前，无 rank 的整段靠后；同组按新的在前。"""
-    rank = ranks.get((message.chat_type.value, message.chat_id, message.message_id))
-    if rank is None:
-        return (1, 0.0, -int(message.timestamp))
-    return (0, rank, -int(message.timestamp))
+def _episode_relevance(
+    episode: Episode, query_terms: list[list[str]]
+) -> float:
+    """旧话题相关性：query 词项与 topic+summary 词项的重合比例，多 query 取最大。"""
+    text_terms = set(_recall_terms(f"{episode.topic} {episode.summary}"))
+    best = 0.0
+    for terms in query_terms:
+        if not terms:
+            continue
+        hits = sum(1 for term in terms if term in text_terms)
+        best = max(best, hits / len(terms))
+    return best
 
 
 def _focus_user_ids(
-    store: Store, chat_type: ChatType, chat_id: str
+    store: Store,
+    chat_type: ChatType,
+    chat_id: str,
+    explicit: Sequence[str] = (),
 ) -> list[str]:
-    """最近 20 条消息的发言人（不含 bot），用于印象注入优先占名额。"""
+    """印象注入优先占名额的发言人 id（不含 bot）。
+
+    explicit 由调用方（service._build_prompt）从本批消息算好：
+    去重、不含 bot、不超过 20 个；显式列表非空时直接用（保序去重），
+    否则回退旧的「最近 20 条消息」逻辑。
+    """
+    if explicit:
+        return list(dict.fromkeys(explicit))
     seen: list[str] = []
     for message in store.recent_messages(
         chat_type, chat_id, IMPRESSION_FOCUS_MESSAGES
@@ -414,17 +480,26 @@ def _open_loop_block(
 
 
 def _impression_body(
-    store: Store, chat_type: ChatType, chat_id: str, cfg: InjectionConfig
+    store: Store,
+    chat_type: ChatType,
+    chat_id: str,
+    cfg: InjectionConfig,
+    *,
+    focus_user_ids: Sequence[str] = (),
 ) -> str:
-    """群友印象的数据体：只看人，不看历史——私聊没有群友概念，整段省略。"""
-    if not cfg.inject_impressions or chat_type != ChatType.GROUP:
+    """印象段的数据体：只看人，不看历史。
+
+    群聊给「群友印象」，私聊（T14）给「关于对方」——数据始终按
+    ``(chat_type, chat_id)`` 取，两个会话不会串台。
+    """
+    if not cfg.inject_impressions:
         return ""
     lines = []
     for imp in store.list_impressions(
         chat_type,
         chat_id,
         INJECTION_IMPRESSION_TOPK,
-        focus_user_ids=_focus_user_ids(store, chat_type, chat_id),
+        focus_user_ids=_focus_user_ids(store, chat_type, chat_id, focus_user_ids),
     ):
         name = imp.subject_nickname.strip()
         if name and not imp.content.startswith(name):
@@ -470,16 +545,40 @@ def _relation_block(
     return _clip("\n".join(lines), cfg.relation_chars)
 
 
-def _state_block(store: Store, cfg: InjectionConfig) -> str:
-    """「本鱼的近况」：只有在意什么、什么心情两句，空着就整段省略。"""
+def _state_block(
+    store: Store,
+    cfg: InjectionConfig,
+    chat_type: ChatType,
+    chat_id: str,
+    now_ts: float,
+    state_ttl_hours: float,
+) -> str:
+    """「本鱼的近况」：只有在意什么、什么心情两句，空着就整段省略。
+
+    状态行按会话读取（GAP-5）：focus/mood 来自本群的 bot_state_chats 行，
+    心情只在 ``now_ts - mood_at`` 未超过 TTL 时注入。旧全局 bot_state 单行
+    仅在新表整表为空（首次升级）时回退；一旦任何会话写入过新表，没自省的
+    会话就宁可不注入——否则会看到别的群的 focus/mood。
+    """
     if not cfg.inject_state:
         return ""
-    state = store.get_bot_state()
+    row = store.get_bot_state_chat(chat_type, chat_id)
+    if row is not None:
+        focus = row["focus"]
+        mood = row["mood_note"]
+        if mood and now_ts - row["mood_at"] > max(0.0, state_ttl_hours) * 3600:
+            mood = ""
+    elif store.count_bot_state_chats() == 0:
+        state = store.get_bot_state()
+        focus = state.focus
+        mood = state.mood_note
+    else:
+        focus = mood = ""
     lines: list[str] = []
-    if state.focus.strip():
-        lines.append(f"现在在意：{state.focus.strip()}")
-    if state.mood_note.strip():
-        lines.append(f"心情：{state.mood_note.strip()}")
+    if focus.strip():
+        lines.append(f"现在在意：{focus.strip()}")
+    if mood.strip():
+        lines.append(f"心情：{mood.strip()}")
     return _clip("\n".join(lines), cfg.state_chars)
 
 
@@ -498,7 +597,14 @@ def _stance_block(store: Store, cfg: InjectionConfig) -> str:
 
 
 def _mind_blocks(
-    store: Store, chat_type: ChatType, chat_id: str, cfg: InjectionConfig
+    store: Store,
+    chat_type: ChatType,
+    chat_id: str,
+    cfg: InjectionConfig,
+    now_ts: float,
+    state_ttl_hours: float,
+    *,
+    focus_user_ids: Sequence[str] = (),
 ) -> list[str]:
     """注意力段（spec §5.5）：正在聊的事 → 没有下文的事 → 你和他 → 本鱼近况 → 我的立场 → 群友印象。
 
@@ -534,7 +640,7 @@ def _mind_blocks(
             relations,
         )
 
-    state = _state_block(store, cfg)
+    state = _state_block(store, cfg, chat_type, chat_id, now_ts, state_ttl_hours)
     if state:
         blocks["state"] = (
             f"{INJECTION_STATE_HEADER}\n{INJECTION_BOUNDARY}",
@@ -548,9 +654,17 @@ def _mind_blocks(
             stances,
         )
 
-    impressions = _impression_body(store, chat_type, chat_id, cfg)
+    impressions = _impression_body(
+        store, chat_type, chat_id, cfg, focus_user_ids=focus_user_ids
+    )
     if impressions:
-        blocks["impressions"] = (INJECTION_IMPRESSION_HEADER, impressions)
+        # 私聊（T14）标题换「关于对方」；群聊仍是「群友印象」。
+        header = (
+            INJECTION_IMPRESSION_HEADER
+            if chat_type is ChatType.GROUP
+            else INJECTION_PRIVATE_IMPRESSION_HEADER
+        )
+        blocks["impressions"] = (header, impressions)
 
     budget = max(0, cfg.mind_chars)
     # 丢弃顺序：印象最先让位，未了事排最后（关系卡先于未了事消失）；episode
@@ -596,6 +710,9 @@ def build_injection(
     today: str,
     recall_queries: Sequence[str] = (),
     exclude_ids: set[str] | None = None,
+    now_ts: float | None = None,
+    state_ttl_hours: float = STATE_TTL_HOURS_DEFAULT,
+    focus_user_ids: Sequence[str] = (),
 ) -> str:
     """opencode 分支的注入前缀，按 spec §5.5 的注意力模型排序。
 
@@ -605,7 +722,8 @@ def build_injection(
     背景板垫底。每段独立截断、空段整段省略；时间线由 timeline.build_delivery
     追加在最后。带数据边界行的段：笔记/数据是模型或库里落下来的，下一轮又进
     prompt，必须当作不可信输入。workspace 为 None（`workspace.dir: ""`）时
-    只关掉长期记忆段，其余照常注入。
+    只关掉长期记忆段，其余照常注入。focus_user_ids 是本批发言人 id（去重、
+    不含 bot、最多 20 个）；非空时印象优先注入他们的，空时回退最近消息。
     """
     parts: list[str] = []
 
@@ -622,7 +740,18 @@ def build_injection(
         parts.append(f"{INJECTION_LESSONS_HEADER}\n{INJECTION_BOUNDARY}\n{lessons}")
 
     # 注意力三段受 mind_chars 合计预算约束（spec §5.5）。
-    parts.extend(_mind_blocks(store, chat_type, chat_id, cfg))
+    now = time.time() if now_ts is None else now_ts
+    parts.extend(
+        _mind_blocks(
+            store,
+            chat_type,
+            chat_id,
+            cfg,
+            now,
+            state_ttl_hours,
+            focus_user_ids=focus_user_ids,
+        )
+    )
 
     if cfg.recall_enabled and recall_queries:
         recalled = _clip(
@@ -634,6 +763,7 @@ def build_injection(
                     recall_queries,
                     cfg.recall_topk,
                     exclude_ids,
+                    now,
                 )
             ),
             cfg.recall_chars,

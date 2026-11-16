@@ -134,6 +134,70 @@ def test_bot_messages_do_not_count_as_engagement(store: Store) -> None:
     assert stats(store)["silent"] == 2
 
 
+def outcome_row(
+    store: Store,
+    message_id: str,
+    spoken_at: int,
+    *,
+    engaged: bool = False,
+) -> None:
+    store.upsert_reply_outcome(
+        GROUP,
+        CHAT,
+        message_id,
+        spoken_at,
+        180,
+        engaged=engaged,
+        quoted=False,
+        replied=engaged,
+        silence_after=not engaged,
+    )
+
+
+def test_consecutive_silent_turns_same_spoken_at_is_one_turn(store: Store) -> None:
+    """同一次回复的多片 chunk 共享同一 timestamp，按 spoken_at 分组只算 1 轮。"""
+    for index in range(3):
+        outcome_row(store, f"b{index}", 1000, engaged=False)
+
+    assert store.consecutive_silent_turns(GROUP, CHAT) == 1
+
+
+def test_consecutive_silent_turns_counts_distinct_turns(store: Store) -> None:
+    for index, spoken_at in enumerate((1000, 2000, 3000)):
+        outcome_row(store, f"b{index}", spoken_at, engaged=False)
+
+    assert store.consecutive_silent_turns(GROUP, CHAT) == 3
+    # limit 边界：只看最近 2 轮，返回 2，不越界虚构第 3 轮。
+    assert store.consecutive_silent_turns(GROUP, CHAT, limit=2) == 2
+
+
+def test_consecutive_silent_turns_resets_on_engaged_turn(store: Store) -> None:
+    outcome_row(store, "b0", 3000, engaged=False)
+    outcome_row(store, "b1", 2000, engaged=True)
+    outcome_row(store, "b2", 1000, engaged=False)
+
+    assert store.consecutive_silent_turns(GROUP, CHAT) == 1
+
+
+def test_consecutive_silent_turns_empty_table_returns_zero(store: Store) -> None:
+    assert store.consecutive_silent_turns(GROUP, CHAT) == 0
+
+
+def test_replied_rate_formula(store: Store) -> None:
+    for index, (spoken_at, engaged) in enumerate(
+        ((1000, True), (2000, False), (3000, True), (4000, False))
+    ):
+        outcome_row(store, f"b{index}", spoken_at, engaged=engaged)
+
+    result = stats(store)
+    assert result["replied"] == 2
+    assert result["replied_rate"] == round(2 / 4, 3)
+
+
+def test_replied_rate_zero_when_no_rows(store: Store) -> None:
+    assert stats(store)["replied_rate"] == 0.0
+
+
 async def test_outcome_loop_stops(store: Store) -> None:
     worker = make_worker(store)
     stop = asyncio.Event()

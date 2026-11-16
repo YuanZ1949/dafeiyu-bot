@@ -22,7 +22,7 @@ from dafeiyu.config import (
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router
-from dafeiyu.service import SHARED_FACT_HEADER, Service
+from dafeiyu.service import SHARED_FACT_HEADER, Service, ToolUse
 
 SHANGHAI = timezone(timedelta(hours=8))
 NOON = datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI)
@@ -100,12 +100,14 @@ def make_msg(
     message_id: str,
     chat_type: ChatType = ChatType.GROUP,
     chat_id: str = GROUP_A,
+    user_id: str = "wx:2002",
+    nickname: str = "阿鱼",
 ) -> Message:
     return Message(
         chat_type=chat_type,
         chat_id=chat_id,
-        user_id="wx:2002",
-        nickname="阿鱼",
+        user_id=user_id,
+        nickname=nickname,
         content=content,
         message_id=message_id,
         segments=[],
@@ -231,3 +233,35 @@ async def test_statement_without_question_is_not_cached(store: Store) -> None:
     await ask(service, store, question="今天天气不错", message_id="a1")
 
     assert store.shared_facts() == []
+
+
+async def test_shared_fact_records_questioner_identity(store: Store) -> None:
+    """昵称与 user_id 必须来自提问那条消息，而不是批次末尾的闲聊。"""
+    brain = FakeBrain()
+    service, _ = build(store, brain)
+
+    # 提问在批次里较早，最后一条是别人（路人）的闲聊。
+    question = make_msg(
+        "云朵哒哒哒是什么梗？",
+        message_id="a1",
+        user_id="wx:1001",
+        nickname="提问者",
+    )
+    chatter = make_msg(
+        "哈哈哈今天好冷",
+        message_id="a2",
+        user_id="wx:1002",
+        nickname="路人",
+    )
+    reply = BrainReply(True, "是的，原神的相关介绍。", "test", 10, 5)
+    tool_use = ToolUse()
+    await tool_use.record("websearch")
+
+    service._remember_shared_fact(
+        ChatType.GROUP, GROUP_A, [question, chatter], reply, tool_use
+    )
+
+    facts = store.shared_facts()
+    assert len(facts) == 1
+    assert facts[0]["source_user_id"] == "wx:1001"
+    assert facts[0]["source_nickname"] == "提问者"

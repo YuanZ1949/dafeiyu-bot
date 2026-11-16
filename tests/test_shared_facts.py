@@ -80,6 +80,7 @@ def test_store_skips_private_chat(store: Store) -> None:
             "出自《原神》的宣传曲动画短片。",
             ChatType.PRIVATE,
             "qq:1",
+            user_id="wx:2002",
         )
         == 0
     )
@@ -172,3 +173,76 @@ def test_forget_chat_purges_sourced_facts(store: Store) -> None:
     )
     assert store.purge_shared_facts_for_chat(ChatType.GROUP, "wxg:aaa") == 1
     assert [row["source_chat_id"] for row in store.shared_facts()] == ["wxg:bbb"]
+
+
+def test_store_writes_source_user_id_when_given(store: Store) -> None:
+    fact_id = store.add_shared_fact(
+        "云朵哒哒哒是什么梗",
+        "出自《原神》的宣传曲动画短片。",
+        ChatType.GROUP,
+        "wxg:aaa",
+        "提问者",
+        user_id="wx:1001",
+    )
+    assert fact_id > 0
+    row = store.shared_facts()[0]
+    assert row["source_user_id"] == "wx:1001"
+    assert row["source_nickname"] == "提问者"
+
+
+def test_store_legacy_call_leaves_source_user_id_empty(store: Store) -> None:
+    # 旧的 5 个位置参数调用必须继续工作；没有 user_id 就如实落 ''。
+    fact_id = store.add_shared_fact(
+        "云朵哒哒哒是什么梗",
+        "出自《原神》的宣传曲动画短片。",
+        ChatType.GROUP,
+        "wxg:aaa",
+        "提问者",
+    )
+    assert fact_id > 0
+    assert store.shared_facts()[0]["source_user_id"] == ""
+
+
+def test_store_updates_source_user_id_on_longer_answer(store: Store) -> None:
+    store.add_shared_fact(
+        "云朵哒哒哒是什么梗",
+        "出自《原神》的宣传曲动画短片。",
+        ChatType.GROUP,
+        "wxg:aaa",
+    )
+    # 旧调用留下 '' 的行：更长答案（带 user_id）刷新时要把来源用户洗出来。
+    second = store.add_shared_fact(
+        "云朵哒哒哒是什么梗",
+        "出自《原神》2023 年的宣传曲《哒哒哒》动画短片，B 站播放量极高。",
+        ChatType.GROUP,
+        "wxg:bbb",
+        "另一个人",
+        user_id="wx:1002",
+    )
+    assert second > 0
+    rows = store.shared_facts()
+    assert len(rows) == 1
+    assert rows[0]["source_user_id"] == "wx:1002"
+    assert rows[0]["source_nickname"] == "另一个人"
+
+
+def test_store_updates_keep_old_user_when_new_call_has_none(store: Store) -> None:
+    store.add_shared_fact(
+        "云朵哒哒哒是什么梗",
+        "出自《原神》的宣传曲动画短片。",
+        ChatType.GROUP,
+        "wxg:aaa",
+        "提问者",
+        user_id="wx:1001",
+    )
+    # 更长的答案来自旧式（无 user_id）调用：不能把已知来源洗成 ''。
+    store.add_shared_fact(
+        "云朵哒哒哒是什么梗",
+        "出自《原神》2023 年的宣传曲《哒哒哒》动画短片，B 站播放量极高。",
+        ChatType.GROUP,
+        "wxg:bbb",
+        "另一个人",
+    )
+    rows = store.shared_facts()
+    assert len(rows) == 1
+    assert rows[0]["source_user_id"] == "wx:1001"

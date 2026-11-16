@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import pytest
@@ -679,3 +680,157 @@ def test_mirror_bubble_keys_parsed_even_when_mirror_disabled(tmp_path: Path) -> 
     assert s.mirror.enabled is False
     assert s.mirror.bubble_enabled is False
     assert s.mirror.bubble_max_content_width == 45
+
+def test_mind_new_keys_parse_with_defaults(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    mind = load_settings(env_file=env, config_file=write_yaml(tmp_path)).mind
+    assert mind.observe_private is True
+    assert mind.silence_backoff_enabled is True
+    assert mind.silence_backoff_streak == 3
+    assert mind.silence_backoff_minutes == 15
+    assert mind.impression_ttl_days == 45
+    assert mind.impression_min_confidence == 0.3
+    assert mind.impression_low_conf_grace_days == 7
+    assert mind.bot_state_ttl_hours == 12
+    assert mind.stance_decay_per_night == 0.98
+    assert mind.stance_ttl_days == 30
+    assert mind.stance_min_confidence == 0.2
+
+
+def test_mind_new_keys_parse_custom_values(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + (
+        "mind:\n"
+        "  observe_private: false\n"
+        "  silence_backoff_enabled: false\n"
+        "  silence_backoff_streak: 5\n"
+        "  silence_backoff_minutes: 30\n"
+        "  impression_ttl_days: 60\n"
+        "  impression_min_confidence: 0.5\n"
+        "  impression_low_conf_grace_days: 14\n"
+        "  bot_state_ttl_hours: 24\n"
+        "  stance_decay_per_night: 0.95\n"
+        "  stance_ttl_days: 14\n"
+        "  stance_min_confidence: 0.4\n"
+    )
+    mind = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml)).mind
+    assert mind.observe_private is False
+    assert mind.silence_backoff_enabled is False
+    assert mind.silence_backoff_streak == 5
+    assert mind.silence_backoff_minutes == 30
+    assert mind.impression_ttl_days == 60
+    assert mind.impression_min_confidence == 0.5
+    assert mind.impression_low_conf_grace_days == 14
+    assert mind.bot_state_ttl_hours == 24
+    assert mind.stance_decay_per_night == 0.95
+    assert mind.stance_ttl_days == 14
+    assert mind.stance_min_confidence == 0.4
+
+
+def test_mind_new_keys_reject_invalid_values(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    cases = {
+        "silence_backoff_streak: 0": "silence_backoff_streak",
+        "silence_backoff_minutes: 0": "silence_backoff_minutes",
+        "impression_ttl_days: 0": "impression_ttl_days",
+        "impression_min_confidence: 1.5": "impression_min_confidence",
+        "impression_min_confidence: -0.1": "impression_min_confidence",
+        "impression_low_conf_grace_days: 0": "impression_low_conf_grace_days",
+        "bot_state_ttl_hours: 0": "bot_state_ttl_hours",
+        "stance_decay_per_night: 1.5": "stance_decay_per_night",
+        "stance_decay_per_night: 0": "stance_decay_per_night",
+        "stance_ttl_days: 0": "stance_ttl_days",
+        "stance_min_confidence: 2": "stance_min_confidence",
+        "stance_min_confidence: -1": "stance_min_confidence",
+    }
+    for snippet, field in cases.items():
+        bad = BASE_YAML + f"mind:\n  {snippet}\n"
+        with pytest.raises(ConfigError, match=field):
+            load_settings(env_file=env, config_file=write_yaml(tmp_path, bad))
+
+
+def test_injection_flags_follow_mind_master_switch(tmp_path: Path) -> None:
+    """inject_episodes / inject_open_loops 的 None 哨兵语义。"""
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+
+    # 无 mind 段：总闸关，缺省键为 False（dataclass 默认不翻转）。
+    off = load_settings(env_file=env, config_file=write_yaml(tmp_path))
+    assert off.injection.inject_episodes is False
+    assert off.injection.inject_open_loops is False
+
+    # 总闸开、两个键都缺省：跟随总闸为 True。
+    on = load_settings(
+        env_file=env,
+        config_file=write_yaml(tmp_path, BASE_YAML + "mind:\n  enabled: true\n"),
+    )
+    assert on.injection.inject_episodes is True
+    assert on.injection.inject_open_loops is True
+
+    # episodes 子闸关：显式 inject_episodes: true 仍为 False。
+    gated = load_settings(
+        env_file=env,
+        config_file=write_yaml(
+            tmp_path,
+            BASE_YAML + "mind:\n  enabled: true\n  episodes_enabled: false\n",
+        ),
+    )
+    assert gated.injection.inject_episodes is False
+    assert gated.injection.inject_open_loops is False
+
+    # 显式 false + 总闸开：尊重显式值。
+    explicit_off = load_settings(
+        env_file=env,
+        config_file=write_yaml(
+            tmp_path,
+            BASE_YAML
+            + "mind:\n  enabled: true\nmemory:\n  inject_episodes: false\n",
+        ),
+    )
+    assert explicit_off.injection.inject_episodes is False
+
+
+def test_closed_sample_rate_warns_when_present(tmp_path: Path, caplog) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    present = BASE_YAML.replace(
+        "sample_rate: 0.05",
+        "sample_rate: 0.05\n  closed_sample_rate: 0.1",
+    )
+    with caplog.at_level(logging.WARNING, logger="dafeiyu.config"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path, present))
+    assert "closed_sample_rate" in caplog.text
+    assert caplog.records[-1].levelno == logging.WARNING
+
+    # 缺省配置不告警。
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="dafeiyu.config"):
+        load_settings(env_file=env, config_file=write_yaml(tmp_path))
+    assert "closed_sample_rate" not in caplog.text
+
+
+def test_startup_logs_effective_mind_switches(tmp_path: Path, caplog) -> None:
+    env = write_env(tmp_path, "DEEPSEEK_API_KEY=sk-test\nBOT_QQ=10001\n")
+    yaml = BASE_YAML + (
+        "mind:\n"
+        "  enabled: true\n"
+        "  observe_private: false\n"
+        "  emoji_reactions: true\n"
+    )
+    settings = load_settings(env_file=env, config_file=write_yaml(tmp_path, yaml))
+    from dafeiyu.__main__ import log_effective_mind_memory
+
+    with caplog.at_level(logging.INFO, logger="dafeiyu.__main__"):
+        log_effective_mind_memory(settings)
+    text = caplog.text
+    assert "mind.enabled=True" in text
+    assert "state=True" in text
+    assert "episodes=True" in text
+    assert "observer=False" in text
+    assert "observe_private=False" in text
+    assert "emoji=True" in text
+    assert "stances=True" in text
+    assert "silence_backoff=True" in text
+    # BASE_YAML 的 memory 段没有 inject_* / recall_enabled：
+    # episodes/loops 跟随总闸为 True，recall 保持默认 False。
+    assert "inject_episodes=True" in text
+    assert "inject_open_loops=True" in text
+    assert "recall_enabled=False" in text

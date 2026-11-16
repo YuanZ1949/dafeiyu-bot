@@ -15,8 +15,8 @@ from .failure import FAILURE_BACKOFF_SECONDS, FailureBackoff, log_memory_failure
 log = logging.getLogger(__name__)
 
 EXTRACT_SYSTEM = """\
-你是群聊信息抽取器。下面每行是一条群消息，格式为 `user_id|昵称: 内容`。
-抽取值得长期记住的群友信息：外号/称呼（kind=nickname）、偏好与雷点（kind=preference）、
+你是对话信息抽取器。下面每行是一条对话消息，格式为 `user_id|昵称: 内容`。
+抽取值得长期记住的对方信息：外号/称呼（kind=nickname）、偏好与雷点（kind=preference）、
 稳定的事实（kind=fact，如职业、所在城市、养猫）。
 不要抽取一次性情绪、玩笑、隐私敏感信息（身份证、住址门牌、手机号、密码）。
 user_id 必须原样复制输入行里的前缀 id（含 "qq:"/"wxg:" 前缀），不要改写、不要漏掉前缀。

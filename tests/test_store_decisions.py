@@ -223,6 +223,96 @@ def test_decision_stats_respects_window(tmp_path: Path) -> None:
     assert store.decision_stats(days=7, now_ts=time.time())["total"] == 1
 
 
+def _add_held_row(store: Store, chat_type: ChatType, chat_id: str, checkpoint: str) -> int:
+    """写一条 held 决策并把它挪到 2 分钟前，绕开 record_decision 的 60 秒去重。"""
+    row_id = store.record_decision(
+        chat_type, chat_id, outcome="held", checkpoint=checkpoint
+    )
+    store._conn.execute(
+        "UPDATE decisions SET created_at = created_at - 120 WHERE id = ?", (row_id,)
+    )
+    store._conn.commit()
+    return row_id
+
+
+def test_decision_stats_scopes_to_single_chat(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    _add_held_row(store, ChatType.GROUP, "qq:1001", "opportunity_hold")
+    store.record_decision(
+        ChatType.GROUP, "qq:1001", outcome="held", checkpoint="opportunity_hold"
+    )
+    store.record_decision(ChatType.GROUP, "qq:1001", outcome="silent", reason="在忙")
+    store.record_decision(
+        ChatType.GROUP, "qq:1001", outcome="blocked", checkpoint="budget"
+    )
+    # 另一会话自己的 4 条同样数据，不许串进 qq:1001 的统计。
+    _add_held_row(store, ChatType.GROUP, "qq:2002", "opportunity_hold")
+    store.record_decision(
+        ChatType.GROUP, "qq:2002", outcome="held", checkpoint="opportunity_hold"
+    )
+    store.record_decision(ChatType.GROUP, "qq:2002", outcome="silent")
+    store.record_decision(ChatType.GROUP, "qq:2002", outcome="blocked")
+
+    stats = store.decision_stats(
+        days=1, now_ts=time.time(), chat_type=ChatType.GROUP, chat_id="qq:1001"
+    )
+
+    assert stats["total"] == 4
+    assert stats["by_outcome"] == {
+        "replied": 0,
+        "silent": 1,
+        "blocked": 1,
+        "held": 2,
+        "error": 0,
+    }
+    assert stats["by_checkpoint"]["opportunity_hold"] == 2
+
+    # 另一会话看自己，互不串台。
+    other = store.decision_stats(
+        days=1, now_ts=time.time(), chat_type=ChatType.GROUP, chat_id="qq:2002"
+    )
+    assert other["total"] == 4
+    assert other["by_outcome"]["held"] == 2
+
+    # 不带作用域 = 全局口径，与改动前一致。
+    assert store.decision_stats(days=1, now_ts=time.time())["total"] == 8
+
+
+def test_decision_stats_empty_table_returns_zeros(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+
+    stats = store.decision_stats(
+        days=1, now_ts=time.time(), chat_type=ChatType.GROUP, chat_id="qq:1001"
+    )
+
+    assert stats["total"] == 0
+    assert stats["by_outcome"] == {
+        "replied": 0,
+        "silent": 0,
+        "blocked": 0,
+        "held": 0,
+        "error": 0,
+    }
+    assert stats["by_checkpoint"] == {}
+    assert stats["top_reasons"] == []
+    assert stats["tokens"] == {"prompt": 0, "completion": 0}
+
+
+def test_decision_stats_error_rows_count_without_raising(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    store.record_decision(
+        ChatType.GROUP, "qq:1001", outcome="error", checkpoint="send_failed"
+    )
+
+    stats = store.decision_stats(
+        days=1, now_ts=time.time(), chat_type=ChatType.GROUP, chat_id="qq:1001"
+    )
+
+    assert stats["total"] == 1
+    assert stats["by_outcome"]["error"] == 1
+    assert stats["by_checkpoint"] == {"send_failed": 1}
+
+
 def test_held_decisions_are_throttled_per_chat_and_checkpoint(tmp_path: Path) -> None:
     store = make_store(tmp_path)
 

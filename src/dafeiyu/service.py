@@ -279,6 +279,41 @@ def _silent_content_shape(content: str) -> str | None:
     return None
 
 
+def silence_backoff_decision(
+    *,
+    enabled: bool,
+    addressed: bool,
+    streak: int,
+    threshold: int,
+    age: int | None,
+    window_seconds: int,
+    known_silent: bool,
+) -> tuple[str, str, int | None] | None:
+    """冷场快反馈的纯判定（GAP-11），与 Service 解耦，eval 可离线复用。
+
+    连续 ``streak`` 轮无人接话达到 ``threshold`` → 非点名批次先攒着
+    ``window_seconds``，到点放行照旧送模型判断。窗口独立于
+    ``persona.hold_max_seconds``，不复用寿命上限（默认 300 秒会把 15
+    分钟缩成 5 分钟）。返回三元组与调用点 ``_hold_outcome`` 的形状一致。
+
+    - ``known_silent``：命中注定沉默的弱批次时返回 ``("none", "", age)``，
+      让既有 ``skip_known_silent`` 路径照常 ``mark_delivered``——冷场
+      hold 不能把本该跳过的弱附和拖到窗口后送模型，反而增加调用；
+    - ``enabled=False`` / ``addressed=True`` / streak 不足：返回 ``None``，
+      调用点继续走原有判定。
+    """
+    if known_silent:
+        return "none", "", age
+    if not enabled or addressed:
+        return None
+    if streak < threshold:
+        return None
+    # 时间未知（timestamp 缺失）视为未到期，与 _hold_expired 同一口径。
+    if age is not None and age >= window_seconds:
+        return "release", "silence_backoff_expired", age
+    return "hold", "silence_backoff", age
+
+
 @dataclass
 class ToolUse:
     """本轮模型是否调用过工具、调过哪些；只做内部判定，不往群里发任何提示。"""
@@ -958,9 +993,9 @@ class Service:
         if not self._is_addressed(msg):
             return
         if any(word in text for word in self._MOOD_JAB):
-            self.store.note_bot_mood("被怼了，不太高兴")
+            self.store.note_bot_mood_chat(msg.chat_type, msg.chat_id, "被怼了，不太高兴")
         elif any(word in text for word in self._MOOD_PRAISE):
-            self.store.note_bot_mood("被夸了一句，有点飘")
+            self.store.note_bot_mood_chat(msg.chat_type, msg.chat_id, "被夸了一句，有点飘")
 
     def _wechat_media_enabled(self) -> bool:
         media = getattr(getattr(self.settings, "wechat", None), "media", None)
@@ -2223,6 +2258,28 @@ class Service:
             if expired:
                 return "release", "intensity_quiet_expired", age
             return "hold", "intensity_quiet", age
+        # 冷场快反馈（GAP-11）：插在安静强度与纯热聊之间，15 分钟窗口独立于
+        # persona.hold_max_seconds。先豁免注定沉默的弱批次：交给
+        # _run_batch_locked 的 skip_known_silent 照常 mark_delivered，否则
+        # 冷场 hold 会把它拖到窗口后送模型，反而增加调用。force_release
+        # 已在 _run_batch_locked 跳过整段判定，勿重复实现。
+        if self._known_silent_reason(batch, now_ts=now_ts):
+            return "none", "", age
+        mind = self.settings.mind
+        if mind.enabled and mind.silence_backoff_enabled and not addressed:
+            decision = silence_backoff_decision(
+                enabled=True,
+                addressed=addressed,
+                streak=self.store.consecutive_silent_turns(
+                    chat_type, chat_id, limit=mind.silence_backoff_streak
+                ),
+                threshold=mind.silence_backoff_streak,
+                age=self._hold_age_seconds(chat_type, chat_id, now_ts),
+                window_seconds=mind.silence_backoff_minutes * 60,
+                known_silent=False,
+            )
+            if decision is not None:
+                return decision
         if self._opportunity_hold(
             batch, addressed=addressed, now_ts=now_ts, backlog=backlog
         ):
@@ -2614,19 +2671,16 @@ class Service:
         """
         if chat_type is not ChatType.GROUP or not tool_use.used or not reply.speak:
             return
-        question = self._shared_fact_question(messages)
-        if question is None:
+        question_message = self._shared_fact_question_message(messages)
+        if question_message is None:
             return
-        nickname = next(
-            (
-                message.nickname
-                for message in reversed(messages)
-                if not message.is_bot and message.content.strip()
-            ),
-            "",
-        )
         fact_id = self.store.add_shared_fact(
-            question, reply.reply, chat_type, chat_id, nickname
+            question_message.content.strip(),
+            reply.reply,
+            chat_type,
+            chat_id,
+            question_message.nickname,
+            user_id=question_message.user_id,
         )
         if fact_id:
             log.info(
@@ -2634,15 +2688,23 @@ class Service:
             )
 
     @staticmethod
-    def _shared_fact_question(messages: list[Message]) -> str | None:
+    def _shared_fact_question_message(
+        messages: list[Message],
+    ) -> Message | None:
         """批次里最后一条「像提问」的人类消息；没有就返回 None。"""
         for message in reversed(messages):
             if message.is_bot or message.recalled_at:
                 continue
             text = message.content.strip()
             if text and shared_facts.looks_like_question(text):
-                return text
+                return message
         return None
+
+    @staticmethod
+    def _shared_fact_question(messages: list[Message]) -> str | None:
+        """批次里最后一条「像提问」的人类消息文本；没有就返回 None。"""
+        message = Service._shared_fact_question_message(messages)
+        return None if message is None else message.content.strip()
 
     async def _maybe_emoji_reaction(
         self,
@@ -3755,6 +3817,13 @@ class Service:
                     chat_type, chat_id, self.settings.memory.window_size
                 )
             )
+        # 本批发言人（去重、不含 bot、最多 20 个）给印象注入排序：
+        # 他们的印象优先占 topk 名额，而不是按库里的旧排名。
+        focus_user_ids = list(
+            dict.fromkeys(
+                m.user_id for m in messages if not m.is_bot and m.user_id
+            )
+        )[:20]
         injection = build_injection(
             self.store,
             self.workspace,
@@ -3764,6 +3833,9 @@ class Service:
             today=moment.date().isoformat(),
             recall_queries=recall_queries,
             exclude_ids=exclude_ids,
+            now_ts=moment.timestamp(),
+            state_ttl_hours=self.settings.mind.bot_state_ttl_hours,
+            focus_user_ids=focus_user_ids,
         )
         if injection_cfg.scene_enabled:
             scene = self._scene_hint(chat_type, chat_id, messages, now=moment)
@@ -4292,8 +4364,12 @@ class Service:
             )
 
     def _schedule_impressions(self, msg: Message) -> None:
-        # 印象是「群友印象」：私聊既不落库也不消耗抽取配额。
-        if msg.chat_type != ChatType.GROUP:
+        # 群聊印象照旧；私聊（T14）只在 mind.enabled + observe_private 时
+        # 走同一条抽取链路，内容只落本会话，不碰 shared_facts/全局 MEMORY。
+        mind = self.settings.mind
+        if msg.chat_type != ChatType.GROUP and not (
+            msg.chat_type is ChatType.PRIVATE and mind.enabled and mind.observe_private
+        ):
             return
         if self.impressions is None:
             return

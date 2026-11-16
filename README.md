@@ -266,8 +266,8 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `memory.recall_topk` | `3` | 相关旧记忆最多注入几条 |
 | `memory.recall_chars` | `300` | 相关旧记忆段落的字符预算 |
 | `memory.scene_injection` | `true` | 注入「此刻」：现在几点、本群叫什么、距上次开口多久、刚才是谁在说；关掉后 prompt 里不再有这行 |
-| `memory.inject_episodes` | 示例/本机 `true`，代码 `false` | 注入「正在聊的事」（`episodes` 最新一条 open 的一句话摘要），数据由 Observer 写。示例配置与本机 `config.yaml` 默认 `true`（已打开）；`InjectionConfig` 代码默认 `false`，缺键的旧配置行为不变（仍不注入） |
-| `memory.inject_open_loops` | 示例/本机 `true`，代码 `false` | 注入「没有下文的事」（谁问了没人接、谁答应了没做）。示例配置与本机 `config.yaml` 默认 `true`（已打开）；`InjectionConfig` 代码默认 `false`，缺键的旧配置行为不变（仍不注入） |
+| `memory.inject_episodes` | 缺省随 `mind.enabled`；示例/本机 `true` | 注入「正在聊的事」（`episodes` 最新一条 open 的一句话摘要），数据由 Observer 写。缺键时跟随 `mind.enabled` 总闸（总闸关仍不注入）；显式 `false` 可单独关；显式 `true` 也仍需总闸与 `mind.episodes_enabled` 打开 |
+| `memory.inject_open_loops` | 缺省随 `mind.enabled`；示例/本机 `true` | 注入「没有下文的事」（谁问了没人接、谁答应了没做）。缺键时跟随 `mind.enabled` 总闸（总闸关仍不注入）；显式 `false` 可单独关；显式 `true` 也仍需总闸与 `mind.episodes_enabled` 打开 |
 | `memory.open_loop_topk` | `3` | 「没有下文的事」最多注入几条 |
 | `memory.open_loop_chars` | `200` | 「没有下文的事」段落的字符预算 |
 | `memory.episode_chars` | `220` | 「正在聊的事」段落的字符预算 |
@@ -283,7 +283,7 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `mind.observer_enabled` | `false` | 是否启用 Observer 旁路（需要主脑支持 `complete_detailed`） |
 | `mind.observer_interval_seconds` | `600` | Observer 扫描间隔 |
 | `mind.observer_min_messages` | `8` | 单群至少累积多少条新消息才观察一次 |
-| `mind.observer_daily_calls` | `24` | 单群每天「观察 + 自省」总调用上限，与回复预算分开 |
+| `mind.observer_daily_calls` | `24` | 单群每天「观察 + 自省」总调用的**估算上限**，与回复预算分开；实际 Observer 可用次数为 `daily-1`，最后 1 次留给 Reflector |
 | `mind.reflection_hour` | `5` | 每天几点之后跑夜间自省（0-23，上海时区） |
 | `mind.stances_enabled` | `true` | 总闸打开时是否注入「我的立场」（Reflector 每晚写入，同一话题覆盖旧观点） |
 | `mind.inbound_media_reactions` | `false` | 群里的语音/图片到达时先贴个表情回应（旁路，失败只记日志） |
@@ -291,6 +291,17 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `mind.proactive_followup` | `false` | 承诺跟进：只对 `kind=promise` 且超过 `followup_after_hours` 的未了事主动追问一句；默认关，开启后仍受静音与预算门控，不调用模型 |
 | `mind.followup_after_hours` | `24` | promise 类未了事创建后多少小时才允许跟进 |
 | `mind.followup_daily_cap` | `3` | 同一会话每日承诺跟进上限（按上海日期计） |
+| `mind.observe_private` | `true` | 私聊也进观察/自省/印象（仍受总闸约束）；闸门不区分通道，微信「只读私聊」也会被观察——只读=不回复，不是不记忆；`shared_facts` 仍只收群聊 |
+| `mind.silence_backoff_enabled` | `true` | 冷场快反馈总开关：连续 N 轮没人接后，非点名批次临时 hold |
+| `mind.silence_backoff_streak` | `3` | 触发 hold 需要的连续静默「轮」数（同一 `spoken_at` 的多片回复算 1 轮） |
+| `mind.silence_backoff_minutes` | `15` | 触发后非点名批次 hold 的分钟数；被 @/引用/force_release 立即穿透，窗口独立于 `persona.hold_max_seconds` |
+| `mind.impression_ttl_days` | `45` | 群友印象保留天数；超过即清理 |
+| `mind.impression_min_confidence` | `0.3` | 印象最低置信度；低于该值且超过宽限期的旧行会被清理 |
+| `mind.impression_low_conf_grace_days` | `7` | 低置信印象的宽限天数；刚写入的低置信行不立即清 |
+| `mind.bot_state_ttl_hours` | `12` | 会话级「本鱼的近况/心情」注入有效期（小时）；超时不再注入，等下次夜间自省刷新 |
+| `mind.stance_decay_per_night` | `0.98` | 「我的立场」每晚置信度乘的衰减系数 |
+| `mind.stance_ttl_days` | `30` | 立场保留天数；超过即清理 |
+| `mind.stance_min_confidence` | `0.2` | 立场最低置信度；低于该值清理 |
 | `behavior.chat_intensity` | `normal` | 聊天强度：`quiet` 只回点名、`normal` 当前行为、`active` 放开连续空转的降频闸门（话题收尾已不拦截，两档一致） |
 | `behavior.restriction_mode` | `off` | 言论限制：`off` 关闭、`soft` 只注入提示、`strict` 命中关键词的整条回复丢弃、`regenerate` 先让模型改写（每批最多 2 次），仍命中则删掉含禁句的整句 |
 | `behavior.banned_phrases` | `[]` | 禁词（关键词级子串匹配，非语义审核） |
@@ -326,8 +337,12 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 
 Observer（`mind.observer_enabled`）默认关闭，打开它需要同时满足 `mind.enabled: true`、
 `mind.episodes_enabled: true`，且当前大脑提供 `complete_detailed`（面板的 `effective`
-字段把这三个条件一起算进去）。成本按「`mind.observer_daily_calls` × 白名单群数」粗估；
-白名单为空时面板显示「群白名单为空，暂不估算」，不会把 0 当成免费。
+字段把这三个条件一起算进去）。成本按「`mind.observer_daily_calls` × 白名单群数」粗估——
+这是**估算上限**，不是精确值：实际 Observer 每天最多用 `daily-1` 次，最后 1 次留给
+Reflector。白名单为空时面板显示「群白名单为空，暂不估算」，不会把 0 当成免费。
+`mind.observe_private` 不区分通道：打开后私聊同样进观察/自省/印象，微信「只读私聊」
+也会被观察——只读=不回复，不是不记忆；`shared_facts` 仍只收群聊，私聊不写跨群立场
+与全局 life 笔记。
 
 Reflector（夜间自省，`mind.reflection_hour` 之后每个活跃群一次）在 `mind.enabled: true`
 时运行，产物是 `bot_state`（在意的事/心情）、跨群 `bot_stances`（话题 → 观点，同一话题
@@ -675,7 +690,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 | `/stats` `/统计` | 所有人 | 所有人 | 群 60 秒 / 私聊 5 秒 | 今日全局 + 当前会话调用/token；群内不显示费用 |
 | `/status` `/状态` | 仅管理员 | 仅管理员 | 30 秒 | 网关、调度、配额、预算状态与运行时长 |
 | `/budget` `/预算` | 仅管理员 | 仅管理员 | 30 秒 | 全局/月度/本会话预算与费用估算 |
-| `/forget` | 仅管理员 | 所有人 | 无 | 清空当前会话全部记忆（消息、摘要、印象、用量与会话映射，不可撤销） |
+| `/forget` | 仅管理员 | 所有人 | 无 | 清空当前会话全部记忆（消息、摘要、印象、用量与会话映射，不可撤销）；`chat_state` 也整行删除，因此会**同时解除静音与降频**（`muted_until` / `downshift_until` / `no_reply_streak` 一并清零） |
 | `/remind` `/提醒` | 仅管理员 | 所有人 | 无 | 定时提醒，三种写法：`/remind <分钟> <内容>` 新建、`/remind list` 查看本会话最近提醒、`/remind cancel <id>` 取消自己创建的提醒；分钟为 1–10080 的整数，内容非空且 ≤200 字；到点由后台 worker 发送 |
 
 群聊专用的 `/shutup`（`/闭嘴`）与 `/wake`（`/醒来`）不在上表（私聊不可用），说明见前面的群内用法。
@@ -830,8 +845,12 @@ Bot 控制口（8788）与 OneBot 反向 WS（8080）仍只监听本机。**
 - **进程 / 大脑 / 登录二维码**：查看 OpenCode、Bot、NapCat 状态，切换模型，扫码登录。
 - **记忆**：查看按日摘要与群印象，可按群聊/私聊筛选；填会话 ID 可手动生成摘要、抽取印象。
   每条印象可编辑内容/置信度/类型、查看来源消息摘录，勾选多条后可合并；编辑与合并都会同步更新搜索索引。
-  卡片底部可按「会话类型 + 会话 ID + 用户 QQ」删除该用户的原始消息（需输入 `DELETE_USER`），
-  摘要与印象等聚合数据会保留。
+  卡片底部可按「会话类型 + 会话 ID + 用户 QQ」删除该用户的记忆（需输入 `DELETE_USER`）：
+  原始消息（含投递记录）之外，还会清**可归因**的派生数据——该用户的印象、未了事
+  （open_loops）、episodes 的参与者（参与者清空则整行删除）、按消息归因的 decisions
+  和跨会话共享事实里 `source_user_id` 等于该用户的行，接口返回逐项 `derived` 计数。
+  按日摘要（summaries / weekly_summaries）等无法按用户切分的派生内容不删，在
+  `unattributable` 里如实报告。
 - **用量**：最近 7/14/30 天的调用与 token 柱状图、Top 会话、最近错误。
 - **预算**：全局今日、月度、当前会话的调用/token/费用估算与预警状态；只读，修改请改
   `config.yaml` 后重启。
@@ -841,7 +860,8 @@ Bot 控制口（8788）与 OneBot 反向 WS（8080）仍只监听本机。**
   - **查看时间线**：只读抽屉展示消息流、会话摘要、按日摘要、印象和当日用量；支持「加载更早」「回到最新」；
   - **新建会话**：重置 OpenCode session 映射与会话内摘要；消息、按日摘要、印象、用量都保留；
   - **软忘记**：删本会话的消息和 session 映射，保留按日摘要与印象；
-  - **彻底删除**：删远端 session + 本地消息、摘要、印象、用量，不可恢复；
+  - **彻底删除**：删远端 session + 本地消息、摘要、印象、用量与会话映射，不可恢复；
+    `chat_state` 也整行删除，因此会同时解除静音与降频（同 `/forget`）；
   - **导出 MD / JSON**：导出单会话记忆。
 - **触发规则调试器**：输入一条模拟消息，只读展示 rules / 批次模式下的判定路径、硬触发来源、
   预算 / 静默 / 冷却 / 采样指标和最终是否会进入模型。不会写消息、调模型、消耗预算或改调度器。
@@ -964,7 +984,9 @@ dashboard 每次请求动态读取当前口令。轮换必须输入 `ROTATE`；�
 bot 与 supervisor 会写同一文件，写入和轮转通过 `.audit.jsonl.lock` 跨进程串行，避免并发轮转
 覆盖归档。
 记录登录/登出、告警触发与恢复、备份创建/删除、恢复结果、进程启停、shutdown、口令轮换
-（`token.rotate`）、管理员命令（`command.admin`）和按用户删除（`memory.user_delete`）。
+（`token.rotate`）、管理员命令（`command.admin`）和按用户删除（`memory.user_delete`；
+detail 只记消息条数与会话/用户 ID，派生数据的 `derived` / `unattributable` 明细只在
+接口响应里，不进审计）。
 审计 detail 只写结构化元数据，不记录消息正文或昵称；写入失败只记 supervisor 日志，
 不阻塞操作。面板审计列表按时间倒序，受限 `limit` 1–200；每行可展开查看格式化后的 detail。
 
@@ -1026,9 +1048,21 @@ case 都是 0。`skipped` 在基线和当前两边都剔除，只在报告里统
 
 默认写 `data/evals/samples/<UTC 日期>.yaml`（`--out` 可改），可直接交给
 `dafeiyu.eval.loader.load_cases` 回放。采样**只读**，不会创建或迁移数据库；SQL 层过滤
-`is_bot = 1`，bot 自己的发言不会变成 case 里的 user 消息；`--db` 指定主库，
+`is_bot = 0`，只采人类消息，bot 自己的发言不会变成 case 里的 user 消息；`--db` 指定主库，
 `--chat-type group|private` 只采一类会话。库不存在、缺表或时间窗内没有人类消息时只打印原因
 并退出 0，不写文件；抽样不调用模型。
+
+**心智回归（离线）**：`scripts/eval_mind.py` 跑 8 个确定性场景，全部离线——不联网、
+不调模型、不读真实配置，临时 SQLite 库写在系统临时目录（不写 `data/`）：
+
+```powershell
+.venv\Scripts\python scripts/eval_mind.py --json
+```
+
+场景覆盖：召回排序、冷场 backoff、多 episode 分段、心情 TTL 与会话隔离、按用户删除、
+私聊闸门矩阵、A/B 群隔离、Observer/Reflector 配额预留。全部通过退出码 0，任一场景
+失败退出码 1；无法运行（临时目录不可用、模块加载失败）时打印可读错误并以退出码 1 结束。
+`--verbose` 额外打印每个场景的 detail；`--tmp-dir` 指定临时目录根（不存在会自动创建）。
 
 面板的「评测」卡片（`GET /api/evals`）只读展示 `data/evals/results/` 里最近 10 次运行的文件名
 （含模式）、生成时间与通过/失败/跳过数量和准确率；目录不存在或文件坏掉时卡片只少几行，
@@ -1077,13 +1111,25 @@ powershell -ExecutionPolicy Bypass -File scripts/diag.ps1 -LogLines 500 -OutFile
 
 - 消息原文保存在本地 `data/dafeiyu.db`，不会上传到除 DeepSeek API 之外的任何地方。
 - **按用户删除**：面板「记忆」卡片底部选择会话类型、填会话 ID 和用户 QQ，再输入
-  `DELETE_USER`。它只删除该用户在该会话的原始消息，以及这些消息对应的
-  `delivered_messages` 投递记录；其他用户的消息、按日摘要、印象和会话摘要都会保留。
-  删除不可撤销，并写 `memory.user_delete` 审计（只记数量与会话/用户 ID，不记正文）。
-  因为摘要和印象是聚合数据，仍可能保留该用户信息的痕迹；需要更彻底地重建整个会话时，
+  `DELETE_USER`。除了该用户在该会话的原始消息（含 `delivered_messages` 投递记录），
+  还会清**可归因**的派生记忆：该用户的印象与未了事（open_loops，按 subject_user_id）、
+  episodes 的 participants（去掉该用户后参与者为空则整行删除）、按 `message_ids`
+  归因的 decisions（整行删除，隐私优先）、以及跨会话共享事实里 `source_user_id`
+  等于该用户的行。删除在同一事务内完成、不可撤销，接口返回逐项 `derived` 计数，
+  并写 `memory.user_delete` 审计（只记数量与会话/用户 ID，不记正文）。
+  无法按用户切分的内容不删，在 `unattributable` 里如实报告：按日摘要
+  （summaries / weekly_summaries）、`reply_outcomes.detail` 的 first_user_id、
+  旧数据里 `source_user_id=''` 的 shared_facts、缺 `message_ids` 的 decisions。
+  这些聚合内容仍可能保留该用户信息的痕迹；需要更彻底地重建整个会话时，
   用 `/forget`（群内管理员）或下面的 CLI。
 - **整会话删除**：`.venv\Scripts\dafeiyu-cli.exe forget --chat <群号>`；私聊需加
-  `--type private`。这会清空该会话的消息、摘要、印象、用量与会话映射，请先确认范围。
+  `--type private`。这会清空该会话的消息、摘要、印象、用量与会话映射；`chat_state`
+  也整行删除，因此会**同时解除静音与降频**——`muted_until` / `downshift_until` /
+  `no_reply_streak` 一并清零，之后该会话恢复正常参与对话，这是有意的「忘干净」，
+  不会额外保留运行状态。请先确认范围。
+- 心智层的增量 schema（`chat_state`、episodes/open_loops 等新表）**不 bump
+  `SCHEMA_VERSION`**（保持 2）：新库不写更高的 schema 版本号，旧版本程序仍能打开
+  （可回滚），备份恢复的版本校验也不会因此拒绝。
 - 删除会移除数据库行，但不做介质级擦除；SQLite 的自由页、WAL 或操作系统缓存中可能短时间保留旧字节。
   对介质级清除有要求时，应在停机后对 `data/dafeiyu.db` 做安全擦除或重建。
 - **QQ 小号有被风控/封禁的风险**，本项目通过非官方协议端接入，请自行评估；不要用主号，不要高频刷屏。

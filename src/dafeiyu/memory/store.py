@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import calendar
 import json
+import logging
 import re
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -30,6 +31,19 @@ from dafeiyu.timeutil import SHANGHAI, today_shanghai
 
 # dashboard 只读面板单页上限，接口层同样按这个值校验。
 MAX_MEMORY_PAGE = 200
+
+log = logging.getLogger(__name__)
+
+# 用户级删除时无法按用户切分的派生内容：不删，只在返回值里如实报告。
+# weekly_summaries / reply_outcomes.detail.first_user_id 含混用户聚合文本；
+# 旧 shared_facts / 无 message_ids 的 decisions 缺少归因列。
+UNATTRIBUTABLE_TABLES: tuple[str, ...] = (
+    "summaries",
+    "weekly_summaries",
+    "reply_outcomes_detail_first_user_id",
+    "shared_facts_without_source_user_id",
+    "decisions_without_message_ids",
+)
 # 时间线单页上限；首屏默认小一些，避免一次把长会话全塞给浏览器。
 MAX_TIMELINE_PAGE = 200
 # 预算只统计对话用途：摘要/批评测/记忆提取不属于对话预算。
@@ -88,6 +102,13 @@ CHAT_SCOPED_TABLES: tuple[str, ...] = (
     "pending_outbox",
     "session_summaries",
     "reminders",
+    # 运行状态与决策流水（T15）：decisions 存 read/think/reason/reply_preview
+    # 模型原文，/forget 后必须消失；整行删 chat_state 会顺带清掉
+    # muted_until / downshift_until / no_reply_streak，即 /forget 会解除
+    # 静音与降频 —— 有意的「忘干净」，不额外保留运行状态。
+    "chat_state",
+    "bot_state_chats",
+    "decisions",
 )
 
 # forget_messages（软忘记）的子集：只清原文与投递状态、保留聚合记忆。
@@ -225,6 +246,18 @@ CREATE TABLE IF NOT EXISTS bot_state (
     focus TEXT NOT NULL DEFAULT '',
     mood_note TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 每会话的机器人状态：focus / mood 按会话隔离，bot_state 仍是单行全局口径。
+-- 纯增量新表：老库由 CREATE TABLE IF NOT EXISTS 幂等补建，不 bump SCHEMA_VERSION。
+CREATE TABLE IF NOT EXISTS bot_state_chats (
+    chat_type TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    focus TEXT NOT NULL DEFAULT '',
+    mood_note TEXT NOT NULL DEFAULT '',
+    mood_at REAL NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_type, chat_id)
 );
 
 -- 跨群立场（P3）：话题 → 我的观点，全局共享、不按群隔离。
@@ -476,6 +509,8 @@ CREATE TABLE IF NOT EXISTS shared_facts (
     source_chat_type TEXT NOT NULL,
     source_chat_id TEXT NOT NULL,
     source_nickname TEXT NOT NULL DEFAULT '',
+    -- 提供结论的用户；老库由 _ensure_columns 幂等补列，旧行保持 ''，不回填历史。
+    source_user_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     last_hit_at TEXT,
     hits INTEGER NOT NULL DEFAULT 0,
@@ -523,6 +558,10 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
     },
     "pending_outbox": {
         "dedupe_key": "TEXT NOT NULL DEFAULT ''",
+    },
+    # shared_facts 的来源用户；旧行保持 ''，不回填历史。
+    "shared_facts": {
+        "source_user_id": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -1438,14 +1477,30 @@ class Store:
         self._conn.commit()
         return deleted
 
-    def delete_user_messages(
+    def delete_user_data(
         self, chat_type: ChatType, chat_id: str, user_id: str
-    ) -> int:
-        """按用户删除某会话的原始消息，并清理对应投递记录。
+    ) -> dict[str, Any]:
+        """按用户删除某会话的原始消息与**可归因**的派生记忆，返回逐项计数。
 
-        摘要/印象等聚合表无法可靠归因，保留不动；消息与 delivered_messages
-        在同一事务内删除，返回删除的消息行数（不含投递行）。
+        可归因路径：impressions / open_loops 按 subject_user_id；episodes 重写
+        participants（剩余为空则整行删除）；decisions 只按 message_ids 归因
+        （detail 不含 user_id，整行删除是隐私优先的有意选择）；shared_facts
+        按 source_user_id（本表无会话维度，跨会话按人删除是有意行为）。
+
+        summaries / weekly_summaries / reply_outcomes.detail 里的派生内容
+        无法按用户切分：不删，在 ``unattributable`` 里如实报告。
+        全部删除在同一事务内完成。
         """
+        message_ids = [
+            str(row["message_id"])
+            for row in self._conn.execute(
+                """
+                SELECT message_id FROM messages
+                WHERE chat_type = ? AND chat_id = ? AND user_id = ?
+                """,
+                (chat_type.value, chat_id, user_id),
+            ).fetchall()
+        ]
         with self._conn:
             self._conn.execute(
                 """
@@ -1465,7 +1520,122 @@ class Store:
                 """,
                 (chat_type.value, chat_id, user_id),
             )
-        return max(cur.rowcount, 0)
+            deleted_messages = max(cur.rowcount, 0)
+            cur = self._conn.execute(
+                """
+                DELETE FROM impressions
+                WHERE chat_type = ? AND chat_id = ? AND subject_user_id = ?
+                """,
+                (chat_type.value, chat_id, user_id),
+            )
+            deleted_impressions = max(cur.rowcount, 0)
+            cur = self._conn.execute(
+                """
+                DELETE FROM open_loops
+                WHERE chat_type = ? AND chat_id = ? AND subject_user_id = ?
+                """,
+                (chat_type.value, chat_id, user_id),
+            )
+            deleted_open_loops = max(cur.rowcount, 0)
+            deleted_decisions = self._delete_decisions_by_message_ids(message_ids)
+            updated_episodes, deleted_episodes = self._strip_episode_participants(
+                chat_type, chat_id, user_id
+            )
+            cur = self._conn.execute(
+                "DELETE FROM shared_facts WHERE source_user_id = ?",
+                (user_id,),
+            )
+            deleted_shared_facts = max(cur.rowcount, 0)
+        return {
+            "deleted_messages": deleted_messages,
+            "deleted_impressions": deleted_impressions,
+            "deleted_open_loops": deleted_open_loops,
+            "updated_episodes": updated_episodes,
+            "deleted_episodes": deleted_episodes,
+            "deleted_decisions": deleted_decisions,
+            "deleted_shared_facts": deleted_shared_facts,
+            "unattributable": list(UNATTRIBUTABLE_TABLES),
+        }
+
+    def _delete_decisions_by_message_ids(self, message_ids: Sequence[str]) -> int:
+        """按 message_ids JSON 归因删除 decisions；返回删除行数。
+
+        decisions.detail 不含 user_id，只能靠 message_ids 归因；整行删除
+        连同 read/think/reason/reply_preview 是隐私优先的选择。
+        """
+        deleted = 0
+        for mid in message_ids:
+            # LIKE 通配符转义，与 search_messages 的 _like_pattern 同一口径。
+            escaped = (
+                str(mid).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            cur = self._conn.execute(
+                "DELETE FROM decisions WHERE message_ids LIKE ? ESCAPE '\\'",
+                (f'%"{escaped}"%',),
+            )
+            deleted += max(cur.rowcount, 0)
+        return deleted
+
+    def _strip_episode_participants(
+        self, chat_type: ChatType, chat_id: str, user_id: str
+    ) -> tuple[int, int]:
+        """episodes 的 participants JSON 去掉该用户（含其昵称）。
+
+        返回 (更新行数, 删除行数)；剩余参与者为空则整行删除。participants
+        不是合法 JSON 的行跳过不动（记 warning），不阻塞其余删除。
+        """
+        updated = 0
+        deleted = 0
+        rows = self._conn.execute(
+            "SELECT id, participants FROM episodes WHERE chat_type = ? AND chat_id = ?",
+            (chat_type.value, chat_id),
+        ).fetchall()
+        for row in rows:
+            try:
+                raw = json.loads(str(row["participants"] or "[]"))
+            except (TypeError, ValueError):
+                log.warning(
+                    "按用户删除记忆：episode id=%s 的 participants 不是合法 JSON，跳过",
+                    row["id"],
+                )
+                continue
+            if not isinstance(raw, list):
+                log.warning(
+                    "按用户删除记忆：episode id=%s 的 participants 不是数组，跳过",
+                    row["id"],
+                )
+                continue
+            kept = [
+                item
+                for item in raw
+                if not (
+                    isinstance(item, dict)
+                    and str(item.get("user_id") or "") == user_id
+                )
+            ]
+            if len(kept) == len(raw):
+                continue
+            row_id = int(row["id"])
+            if kept:
+                self._conn.execute(
+                    "UPDATE episodes SET participants = ? WHERE id = ?",
+                    (json.dumps(kept, ensure_ascii=False), row_id),
+                )
+                updated += 1
+            else:
+                self._conn.execute("DELETE FROM episodes WHERE id = ?", (row_id,))
+                deleted += 1
+        return updated, deleted
+
+    def delete_user_messages(
+        self, chat_type: ChatType, chat_id: str, user_id: str
+    ) -> int:
+        """兼容旧调用：执行完整用户级删除，只返回删除的消息数（不含投递行）。
+
+        派生记忆的计数见 :meth:`delete_user_data`。
+        """
+        result = self.delete_user_data(chat_type, chat_id, user_id)
+        return int(result["deleted_messages"])
 
     def search_messages(
         self,
@@ -2299,11 +2469,16 @@ class Store:
         chat_type: ChatType,
         chat_id: str,
         nickname: str = "",
+        user_id: str = "",
     ) -> int:
         """写入一条跨群可复用的查证结论；返回行 id（0 = 未写入）。
 
         隐私闸门在这里再拦一次（调用方也会先过滤）：私聊、疑似个人信息、
         以及「没查到」这类失败回答都不会落库。
+
+        ``user_id`` 是提问者的用户标识，供用户级删除（delete_user_data）按人
+        清掉对应缓存；旧式调用不带它时如实落 ''，且刷新旧行时不会把已知的
+        来源用户洗掉。
         """
         if chat_type is not ChatType.GROUP:
             return 0
@@ -2315,7 +2490,7 @@ class Store:
         if not key:
             return 0
         existing = self._conn.execute(
-            "SELECT id, answer_text FROM shared_facts WHERE question_key = ?",
+            "SELECT id, answer_text, source_user_id FROM shared_facts WHERE question_key = ?",
             (key,),
         ).fetchone()
         if existing is not None:
@@ -2325,7 +2500,7 @@ class Store:
                     """
                     UPDATE shared_facts
                     SET question_text = ?, answer_text = ?, source_chat_type = ?,
-                        source_chat_id = ?, source_nickname = ?,
+                        source_chat_id = ?, source_nickname = ?, source_user_id = ?,
                         created_at = datetime('now')
                     WHERE id = ?
                     """,
@@ -2335,6 +2510,7 @@ class Store:
                         chat_type.value,
                         chat_id,
                         str(nickname or ""),
+                        str(user_id or "") or str(existing["source_user_id"] or ""),
                         int(existing["id"]),
                     ),
                 )
@@ -2344,10 +2520,18 @@ class Store:
             """
             INSERT INTO shared_facts
                 (question_key, question_text, answer_text, source_chat_type,
-                 source_chat_id, source_nickname)
-            VALUES (?, ?, ?, ?, ?, ?)
+                 source_chat_id, source_nickname, source_user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (key, ask, reply, chat_type.value, chat_id, str(nickname or "")),
+            (
+                key,
+                ask,
+                reply,
+                chat_type.value,
+                chat_id,
+                str(nickname or ""),
+                str(user_id or ""),
+            ),
         )
         self._conn.commit()
         return int(cur.lastrowid or 0)
@@ -2357,7 +2541,7 @@ class Store:
         rows = self._conn.execute(
             """
             SELECT id, question_text, answer_text, source_chat_type, source_chat_id,
-                   source_nickname, created_at, hits
+                   source_nickname, source_user_id, created_at, hits
             FROM shared_facts
             ORDER BY id DESC
             LIMIT ?
@@ -2709,6 +2893,41 @@ class Store:
             return None
         return self.get_impression(impression_id)
 
+    def apply_relationship_deltas(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        deltas: Mapping[str, float],
+        now: str | None = None,
+    ) -> int:
+        """夜间自省的关系刷新：只更新已有印象的 confidence/last_seen_at。
+
+        绝不 INSERT：名单外或当天没被观察过的 user_id 自然命中 0 行，
+        note 也不落库。返回命中的行数；``now`` 仅测试用，默认取库时间。
+        """
+        matched = 0
+        for user_id, delta in deltas.items():
+            cur = self._conn.execute(
+                """
+                UPDATE impressions
+                SET confidence = max(0, min(1, confidence + ?)),
+                    last_seen_at = coalesce(?, datetime('now')),
+                    updated_at = coalesce(?, datetime('now'))
+                WHERE chat_type = ? AND chat_id = ? AND subject_user_id = ?
+                """,
+                (
+                    float(delta),
+                    now,
+                    now,
+                    chat_type.value,
+                    chat_id,
+                    user_id,
+                ),
+            )
+            matched += cur.rowcount
+        self._conn.commit()
+        return matched
+
     def merge_impressions(
         self, impression_ids: Sequence[int], content: str | None = None
     ) -> Impression | None:
@@ -2789,29 +3008,74 @@ class Store:
             ).fetchall()
         return [self._row_to_impression(r) for r in rows]
 
+    @staticmethod
+    def _sqlite_dt(now_ts: float | None, *, days: int) -> str:
+        """datetime('now') 口径（UTC、秒精度）的过去时间点文本。
+
+        比较列都是 ``datetime('now')`` 写入的 UTC 文本，cutoff 必须同口径，
+        不能用本地时区时间。
+        """
+        ts = time.time() if now_ts is None else float(now_ts)
+        dt = datetime.fromtimestamp(ts, timezone.utc) - timedelta(days=days)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _impression_live_clause(
+        now_ts: float | None,
+        ttl_days: int,
+        min_confidence: float,
+        grace_days: int,
+    ) -> tuple[str, tuple[Any, ...]]:
+        """「还活着」的印象条件：没过 TTL，且（置信达标或没过低置信宽限期）。
+
+        即删除条件 ``last_seen_at < ttl_cut OR (confidence < min AND
+        last_seen_at < grace_cut)`` 的补集。list_impressions 与
+        relationship_cards 必须共用这一条：注入里过期了关系卡里还在，
+        就是两边过滤不一致。
+        """
+        ttl_cut = Store._sqlite_dt(now_ts, days=ttl_days)
+        grace_cut = Store._sqlite_dt(now_ts, days=grace_days)
+        clause = "(last_seen_at >= ? AND (confidence >= ? OR last_seen_at >= ?))"
+        return clause, (ttl_cut, min_confidence, grace_cut)
+
     def list_impressions(
         self,
         chat_type: ChatType,
         chat_id: str,
         topk: int,
         focus_user_ids: Sequence[str] = (),
+        *,
+        now_ts: float | None = None,
+        ttl_days: int = 45,
+        min_confidence: float = 0.3,
+        low_conf_grace_days: int = 7,
     ) -> list[Impression]:
         """按新鲜度/置信度排序；focus_user_ids 里的人优先占名额。
 
         focus 只影响谁先入选，名额内仍按 30 天内见过 > confidence > updated_at 排。
+        过期印象（超 TTL 或低置信超宽限期）不返回；与 relationship_cards 同口径。
         """
+        live_clause, live_params = self._impression_live_clause(
+            now_ts, ttl_days, min_confidence, low_conf_grace_days
+        )
         focus = list(dict.fromkeys(focus_user_ids))[:32]
         if focus:
             marks = ",".join("?" for _ in focus)
             order = f"(subject_user_id IN ({marks})) DESC,"
-            params: tuple[Any, ...] = (chat_type.value, chat_id, *focus, topk)
+            params: tuple[Any, ...] = (
+                chat_type.value,
+                chat_id,
+                *live_params,
+                *focus,
+                topk,
+            )
         else:
             order = ""
-            params = (chat_type.value, chat_id, topk)
+            params = (chat_type.value, chat_id, *live_params, topk)
         rows = self._conn.execute(
             f"""
             SELECT * FROM impressions
-            WHERE chat_type = ? AND chat_id = ?
+            WHERE chat_type = ? AND chat_id = ? AND {live_clause}
             ORDER BY {order} (last_seen_at >= datetime('now', '-30 days')) DESC,
                      confidence DESC, updated_at DESC
             LIMIT ?
@@ -2849,6 +3113,28 @@ class Store:
             f"SELECT COUNT(*) AS total FROM impressions {scope}", params
         ).fetchone()
         return int(row["total"] or 0)
+
+    def prune_impressions(
+        self,
+        *,
+        now_ts: float | None = None,
+        ttl_days: int = 45,
+        min_confidence: float = 0.3,
+        low_conf_grace_days: int = 7,
+    ) -> int:
+        """删过期印象：超过 TTL，或低置信且超过宽限期。返回删除行数。
+
+        高置信的行只受 TTL 管；低置信的行给 ``low_conf_grace_days`` 天宽限，
+        别把刚观察到还没攒够置信的新行清掉。
+        """
+        clause, params = self._impression_live_clause(
+            now_ts, ttl_days, min_confidence, low_conf_grace_days
+        )
+        cur = self._conn.execute(
+            f"DELETE FROM impressions WHERE NOT {clause}", params
+        )
+        self._conn.commit()
+        return max(cur.rowcount, 0)
 
     # ---- 印象抽取游标 ----------------------------------------------
     def get_impression_cursor(self, chat_type: ChatType, chat_id: str) -> int:
@@ -3155,6 +3441,117 @@ class Store:
             sql += " AND id != ?"
             params.append(keep_id)
         cur = self._conn.execute(sql, params)
+        self._conn.commit()
+        return max(cur.rowcount, 0)
+
+    def find_similar_open_episode(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        topic: str,
+        *,
+        threshold: float = OPEN_LOOP_SIMILARITY,
+    ) -> Episode | None:
+        """在该会话 open 的 episode 里找与 topic 最相似的一条。
+
+        同一段对话换个说法继续聊时，应当推进既有行而不是新建——并行话题
+        才各自成行。归一化后用 shared_facts.similarity 比字符 bigram，取最高
+        分且 ≥ threshold；并列取 id 更大的（新的那行）。空 topic 直接不找。
+        """
+        needle = self._normalize_loop_text(topic)
+        if not needle:
+            return None
+        rows = self._conn.execute(
+            """
+            SELECT * FROM episodes
+            WHERE chat_type = ? AND chat_id = ? AND status = 'open'
+            ORDER BY id DESC
+            """,
+            (chat_type.value, chat_id),
+        ).fetchall()
+        best: Episode | None = None
+        best_score = 0.0
+        for row in rows:
+            episode = self._row_to_episode(row)
+            score = shared_facts.similarity(
+                needle, self._normalize_loop_text(episode.topic)
+            )
+            # id DESC 遍历 + 严格大于：同分时先遇到（id 更大）的行保持占位。
+            if score >= threshold and score > best_score:
+                best = episode
+                best_score = score
+        return best
+
+    def update_episode_progress(
+        self,
+        episode_id: int,
+        *,
+        last_message_id: str,
+        summary: str,
+        participants: tuple[Participant, ...],
+        phase: str,
+        mood: str,
+        importance: float,
+    ) -> int:
+        """推进既有 open episode：只动进度列与 updated_at，不动 start/topic/status。
+
+        相似话题合并走这里：start_message_id 是行的身份，topic 是「这段在
+        聊什么」的锚，被模型换措辞覆盖就会丢段。
+        """
+        participants_json = json.dumps(
+            [{"user_id": p.user_id, "nickname": p.nickname} for p in participants],
+            ensure_ascii=False,
+        )
+        normalized_phase = phase if phase in EPISODE_PHASES else "discussion"
+        clamped_importance = min(max(float(importance), 0.0), 1.0)
+        cur = self._conn.execute(
+            """
+            UPDATE episodes SET
+                last_message_id = ?, summary = ?, participants = ?, phase = ?,
+                mood = ?, importance = ?, updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            (
+                last_message_id,
+                summary,
+                participants_json,
+                normalized_phase,
+                mood,
+                clamped_importance,
+                int(episode_id),
+            ),
+        )
+        self._conn.commit()
+        return max(cur.rowcount, 0)
+
+    def close_excess_open_episodes(
+        self, chat_type: ChatType, chat_id: str, *, keep: int = 3
+    ) -> int:
+        """同会话最多同时 keep 条 open：按 importance DESC, id DESC 保留，其余收尾。
+
+        并行话题放开后必须有上限，否则每小时一条的 open 行会把注入预算
+        挤光。重要的、新的优先活下来。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id FROM episodes
+            WHERE chat_type = ? AND chat_id = ? AND status = 'open'
+            ORDER BY importance DESC, id DESC
+            LIMIT -1 OFFSET ?
+            """,
+            (chat_type.value, chat_id, max(0, keep)),
+        ).fetchall()
+        ids = [row["id"] for row in rows]
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        cur = self._conn.execute(
+            f"""
+            UPDATE episodes SET status = 'closed', updated_at = datetime('now')
+            WHERE id IN ({placeholders})
+            """,
+            ids,
+        )
         self._conn.commit()
         return max(cur.rowcount, 0)
 
@@ -3645,6 +4042,83 @@ class Store:
         self.set_bot_state(mood_note=text)
         return True
 
+    def get_bot_state_chat(self, chat_type: ChatType, chat_id: str) -> dict | None:
+        """会话级状态行；没写过时返回 None（调用方据此决定是否回退全局）。"""
+        row = self._conn.execute(
+            """
+            SELECT focus, mood_note, mood_at, updated_at
+            FROM bot_state_chats
+            WHERE chat_type = ? AND chat_id = ?
+            """,
+            (chat_type.value, chat_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "focus": str(row["focus"] or ""),
+            "mood_note": str(row["mood_note"] or ""),
+            "mood_at": float(row["mood_at"] or 0.0),
+            "updated_at": str(row["updated_at"] or ""),
+        }
+
+    def set_bot_state_chat(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        *,
+        focus: str | None = None,
+        mood_note: str | None = None,
+        now_ts: float | None = None,
+    ) -> dict:
+        """只覆盖传入的字段（None = 不动），每次都刷新 mood_at，返回当前行。"""
+        base = self.get_bot_state_chat(chat_type, chat_id) or {
+            "focus": "",
+            "mood_note": "",
+            "mood_at": 0.0,
+        }
+        new_focus = base["focus"] if focus is None else focus.strip()[:80]
+        new_mood = base["mood_note"] if mood_note is None else mood_note.strip()[:80]
+        mood_at = float(now_ts) if now_ts is not None else time.time()
+        self._conn.execute(
+            """
+            INSERT INTO bot_state_chats
+                (chat_type, chat_id, focus, mood_note, mood_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT (chat_type, chat_id) DO UPDATE SET
+                focus = excluded.focus,
+                mood_note = excluded.mood_note,
+                mood_at = excluded.mood_at,
+                updated_at = datetime('now')
+            """,
+            (chat_type.value, chat_id, new_focus, new_mood, mood_at),
+        )
+        self._conn.commit()
+        return self.get_bot_state_chat(chat_type, chat_id) or {}
+
+    def note_bot_mood_chat(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        mood_note: str,
+        now_ts: float | None = None,
+    ) -> bool:
+        """会话级的心情改写；同一句话连续出现时抑制，成功时写 mood_at。"""
+        text = mood_note.strip()[:80]
+        if not text:
+            return False
+        current = self.get_bot_state_chat(chat_type, chat_id)
+        if current is not None and current["mood_note"] == text:
+            return False
+        self.set_bot_state_chat(chat_type, chat_id, mood_note=text, now_ts=now_ts)
+        return True
+
+    def count_bot_state_chats(self) -> int:
+        """新表的总行数；0 表示还没有任何会话写入过（首次升级判据）。"""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM bot_state_chats"
+        ).fetchone()
+        return int(row["n"]) if row is not None else 0
+
     # ---------------------------------------------------------------- 跨群立场
     def upsert_stance(
         self,
@@ -3715,6 +4189,38 @@ class Store:
     def clear_stances(self) -> None:
         self._conn.execute("DELETE FROM bot_stances")
         self._conn.commit()
+
+    def decay_stances(self, *, factor: float = 0.98) -> int:
+        """立场每晚衰减：``confidence = max(0, confidence * factor)``。
+
+        绝不动 ``updated_at``：那是 prune_stances 的过期判据，衰减刷新它
+        会让立场永远不过期。返回被衰减的行数。
+        """
+        cur = self._conn.execute(
+            "UPDATE bot_stances SET confidence = MAX(0, confidence * ?)",
+            (float(factor),),
+        )
+        self._conn.commit()
+        return max(cur.rowcount, 0)
+
+    def prune_stances(
+        self,
+        *,
+        now_ts: float | None = None,
+        ttl_days: int = 30,
+        min_confidence: float = 0.2,
+    ) -> int:
+        """删过期立场：``updated_at`` 超过 TTL，或置信低于最低值（无宽限期）。
+
+        返回删除行数；两条件独立生效，任一命中即删。
+        """
+        cutoff = self._sqlite_dt(now_ts, days=ttl_days)
+        cur = self._conn.execute(
+            "DELETE FROM bot_stances WHERE updated_at < ? OR confidence < ?",
+            (cutoff, float(min_confidence)),
+        )
+        self._conn.commit()
+        return max(cur.rowcount, 0)
 
     def get_mind_state(self, key: str, default: str = "") -> str:
         """心智层的小标记（如「这个群今天自省过了」）；没有就返回默认值。"""
@@ -3808,12 +4314,17 @@ class Store:
         *,
         days: int = RELATIONSHIP_CARD_DAYS,
         now_ts: int | None = None,
+        ttl_days: int = 45,
+        min_confidence: float = 0.3,
+        low_conf_grace_days: int = 7,
     ) -> dict[str, RelationshipCard]:
         """一次调用批量取当前发言人的关系卡（impressions + messages 聚合）。
 
         只给批次里真的说话的人建卡；生人只留昵称，facts 为空，绝不臆测关系。
         ``chat_type`` 同时支持群聊与私聊：聚合始终按 ``chat_id`` 收口，私聊
         不会把 A 会话的事实串到 B 会话。
+        印象走与 list_impressions 同一套 TTL/置信过滤：注入里过期了的关系卡
+        里也不能再出现。
         """
         ids = [str(uid) for uid in dict.fromkeys(user_ids) if uid][
             :RELATIONSHIP_CARD_LIMIT
@@ -3822,6 +4333,9 @@ class Store:
             return {}
         marks = ",".join("?" for _ in ids)
         since = int(now_ts if now_ts is not None else time.time()) - max(1, days) * 86400
+        live_clause, live_params = self._impression_live_clause(
+            now_ts, ttl_days, min_confidence, low_conf_grace_days
+        )
 
         facts: dict[str, list[str]] = {uid: [] for uid in ids}
         nicknames: dict[str, str] = {}
@@ -3830,10 +4344,10 @@ class Store:
             SELECT subject_user_id, subject_nickname, content
             FROM impressions
             WHERE chat_type = ? AND chat_id = ?
-              AND subject_user_id IN ({marks})
+              AND subject_user_id IN ({marks}) AND {live_clause}
             ORDER BY confidence DESC, updated_at DESC
             """,
-            (chat_type.value, chat_id, *ids),
+            (chat_type.value, chat_id, *ids, *live_params),
         ).fetchall():
             uid = str(row["subject_user_id"])
             nickname = str(row["subject_nickname"] or "").strip()
@@ -3986,14 +4500,43 @@ class Store:
         ).fetchone()
         total = int(row["total"] or 0)
         engaged = int(row["engaged"] or 0)
+        replied = int(row["replied"] or 0)
         return {
             "total": total,
             "engaged": engaged,
             "quoted": int(row["quoted"] or 0),
-            "replied": int(row["replied"] or 0),
+            "replied": replied,
             "silent": int(row["silent"] or 0),
             "engaged_rate": round(engaged / total, 3) if total else 0.0,
+            "replied_rate": round(replied / total, 3) if total else 0.0,
         }
+
+    def consecutive_silent_turns(
+        self, chat_type: ChatType, chat_id: str, *, limit: int = 3
+    ) -> int:
+        """最近 ``limit`` 轮里连续无人接话的轮数。
+
+        按 ``spoken_at`` 分组（不是按行）：同一次回复的多片 bot chunk 共享
+        同一时间戳，只算 1 轮；组内任一行 engaged 即视为有人接，streak 到此
+        为止。``mirror=1`` 的消息在入库前就已被排除，无需再过滤。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT spoken_at, MAX(engaged) AS any_engaged
+            FROM reply_outcomes
+            WHERE chat_type = ? AND chat_id = ?
+            GROUP BY spoken_at
+            ORDER BY spoken_at DESC
+            LIMIT ?
+            """,
+            (chat_type.value, chat_id, max(1, int(limit))),
+        ).fetchall()
+        count = 0
+        for row in rows:
+            if int(row["any_engaged"] or 0):
+                break
+            count += 1
+        return count
 
 
     # ---- summaries ------------------------------------------------
@@ -4806,19 +5349,37 @@ class Store:
         return items
 
     def decision_stats(
-        self, *, days: int = 1, now_ts: float | None = None
+        self,
+        *,
+        days: int = 1,
+        now_ts: float | None = None,
+        chat_type: ChatType | None = None,
+        chat_id: str | None = None,
     ) -> dict[str, Any]:
-        """窗口内的决策聚合：沉默率、拦截归因、延迟与 token。"""
+        """窗口内的决策聚合：沉默率、拦截归因、延迟与 token。
+
+        给了 ``chat_type/chat_id`` 就只统计该会话（Reflector 自省用），
+        与 ``_memory_scope`` 同款的可选过滤；默认 ``None`` 保持全局口径。
+        """
         window_days = max(1, int(days))
         since = (time.time() if now_ts is None else float(now_ts)) - window_days * 86400
+        clauses = ["created_at >= ?"]
+        scope_params: list[object] = [since]
+        if chat_type is not None:
+            clauses.append("chat_type = ?")
+            scope_params.append(chat_type.value)
+        if chat_id is not None:
+            clauses.append("chat_id = ?")
+            scope_params.append(chat_id)
+        where = " AND ".join(clauses)
         rows = self._conn.execute(
-            """
+            f"""
             SELECT outcome, COUNT(*) AS count
             FROM decisions
-            WHERE created_at >= ?
+            WHERE {where}
             GROUP BY outcome
             """,
-            (since,),
+            tuple(scope_params),
         ).fetchall()
         by_outcome = {"replied": 0, "silent": 0, "blocked": 0, "held": 0, "error": 0}
         for row in rows:
@@ -4826,42 +5387,42 @@ class Store:
         total = sum(by_outcome.values())
 
         checkpoint_rows = self._conn.execute(
-            """
+            f"""
             SELECT checkpoint, COUNT(*) AS count
             FROM decisions
-            WHERE created_at >= ? AND checkpoint <> ''
+            WHERE {where} AND checkpoint <> ''
             GROUP BY checkpoint
             ORDER BY count DESC
             """,
-            (since,),
+            tuple(scope_params),
         ).fetchall()
         by_checkpoint = {
             str(row["checkpoint"]): int(row["count"]) for row in checkpoint_rows
         }
 
         aggregate = self._conn.execute(
-            """
+            f"""
             SELECT COALESCE(
                        AVG(CASE WHEN latency_ms > 0 THEN latency_ms END), 0
                    ) AS avg_latency,
                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens
             FROM decisions
-            WHERE created_at >= ?
+            WHERE {where}
             """,
-            (since,),
+            tuple(scope_params),
         ).fetchone()
 
         reason_rows = self._conn.execute(
-            """
+            f"""
             SELECT reason, COUNT(*) AS count
             FROM decisions
-            WHERE created_at >= ? AND reason <> ''
+            WHERE {where} AND reason <> ''
             GROUP BY reason
             ORDER BY count DESC, reason ASC
             LIMIT 5
             """,
-            (since,),
+            tuple(scope_params),
         ).fetchall()
 
         replied = by_outcome["replied"]
@@ -5040,6 +5601,12 @@ class Store:
         self._conn.commit()
 
     def forget_chat(self, chat_type: ChatType, chat_id: str) -> None:
+        """硬忘记：按 CHAT_SCOPED_TABLES 清空该会话的派生数据与决策流水。
+
+        显式副作用：chat_state 整行删除，muted_until / downshift_until /
+        no_reply_streak 一并清零 —— /forget 会解除静音与降频，这是有意的
+        「忘干净」，不额外保留运行状态。
+        """
         self.purge_shared_facts_for_chat(chat_type, chat_id)
         for table in CHAT_SCOPED_TABLES:
             self._conn.execute(

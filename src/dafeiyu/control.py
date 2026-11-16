@@ -3134,15 +3134,25 @@ def create_app(
                 {"error": "confirm 必须是 DELETE_USER"}, status=400
             )
         try:
-            deleted = control.store.delete_user_messages(
-                chat_type, chat_id, user_id
-            )
+            result = control.store.delete_user_data(chat_type, chat_id, user_id)
         except Exception as exc:  # noqa: BLE001 - 不把 SQL/内部细节回给调用方
-            log.warning("按用户删除消息失败：%s", exc)
+            log.warning("按用户删除记忆失败：%s", exc)
             return web.json_response(
                 {"error": "删除消息失败，请查看日志"}, status=500
             )
-        return web.json_response({"ok": True, "deleted_messages": deleted})
+        derived = {
+            key: value
+            for key, value in result.items()
+            if key not in ("deleted_messages", "unattributable")
+        }
+        return web.json_response(
+            {
+                "ok": True,
+                "deleted_messages": result["deleted_messages"],
+                "derived": derived,
+                "unattributable": result["unattributable"],
+            }
+        )
 
     async def usage(request: web.Request) -> web.Response:
         try:

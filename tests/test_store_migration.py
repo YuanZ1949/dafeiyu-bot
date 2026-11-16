@@ -758,3 +758,62 @@ def test_migration_prefixes_legacy_qq_ids(tmp_path: Path) -> None:
         assert db_version(conn2) == 2
     finally:
         store.close()
+
+
+def test_v2_db_gains_bot_state_chats_and_source_user_id(tmp_path: Path) -> None:
+    """升级前的 v2 老库重开 init_schema：补新表与新列，但版本号保持 2。
+
+    bot_state_chats 与 shared_facts.source_user_id 是纯增量：不 bump
+    SCHEMA_VERSION（bump 会让旧程序按版本检查拒开新库）；旧行保留且
+    source_user_id 落空哨兵 ''，不回填历史来源。
+    """
+    db = tmp_path / "v2-old.db"
+    store = Store(db)
+    try:
+        store.init_schema()
+    finally:
+        store.close()
+
+    # 手工拆掉新表与新列，还原成改动前的 v2 布局，并塞入迁移前的旧行。
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DROP TABLE bot_state_chats")
+        conn.execute("ALTER TABLE shared_facts DROP COLUMN source_user_id")
+        conn.execute(
+            "INSERT INTO messages (chat_type, chat_id, message_id, user_id,"
+            " nickname, content, timestamp)"
+            " VALUES ('group', 'qq:1', 'm-old', 'qq:2', '阿猫', '旧消息', 1)"
+        )
+        conn.execute(
+            "INSERT INTO shared_facts (question_key, question_text, answer_text,"
+            " source_chat_type, source_chat_id)"
+            " VALUES ('k', '旧问', '旧答', 'group', 'qq:1')"
+        )
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+    store = Store(db)
+    try:
+        store.init_schema()
+        assert store.db_stats()["schema_version"] == 2
+        conn = store._conn
+        # 旧行存活：messages 计数迁移前后不变，shared_facts 旧行补成 ''。
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
+        facts = conn.execute(
+            "SELECT question_key, source_user_id FROM shared_facts"
+        ).fetchall()
+        assert [tuple(row) for row in facts] == [("k", "")]
+        # 新表存在且恰为 6 列。
+        cols = [row["name"] for row in conn.execute("PRAGMA table_info(bot_state_chats)")]
+        assert cols == [
+            "chat_type",
+            "chat_id",
+            "focus",
+            "mood_note",
+            "mood_at",
+            "updated_at",
+        ]
+    finally:
+        store.close()

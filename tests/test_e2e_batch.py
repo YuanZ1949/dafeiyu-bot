@@ -22,6 +22,7 @@ from dafeiyu.config import (
     InjectionConfig,
     LoggingConfig,
     MemoryConfig,
+    MindConfig,
     PersonaConfig,
     Settings,
     TriggerConfig,
@@ -68,7 +69,9 @@ def yesterday() -> str:
     return (date.fromisoformat(today_shanghai()) - timedelta(days=1)).isoformat()
 
 
-def make_settings(*, hold_max_seconds: int = 300) -> Settings:
+def make_settings(
+    *, hold_max_seconds: int = 300, mind: MindConfig | None = None
+) -> Settings:
     return Settings(
         api_key="sk-test",
         base_url="https://api.deepseek.com",
@@ -96,6 +99,7 @@ def make_settings(*, hold_max_seconds: int = 300) -> Settings:
         budget=BudgetConfig(200, 300000),
         memory=MemoryConfig(20, 5, 20),
         logging=LoggingConfig("INFO", "logs"),
+        mind=MindConfig() if mind is None else mind,
     )
 
 
@@ -147,10 +151,17 @@ def make_msg(
     )
 
 
-def build(tmp_path, *, server: FakeServer | None = None, clock=NOON, hold_max_seconds: int = 300):
+def build(
+    tmp_path,
+    *,
+    server: FakeServer | None = None,
+    clock=NOON,
+    hold_max_seconds: int = 300,
+    mind: MindConfig | None = None,
+):
     store = Store(str(tmp_path / "t.db"))
     store.init_schema()
-    settings = make_settings(hold_max_seconds=hold_max_seconds)
+    settings = make_settings(hold_max_seconds=hold_max_seconds, mind=mind)
     adapter = FakeAdapter()
     server = server or FakeServer()
     brain = make_brain(store, server)
@@ -455,4 +466,261 @@ async def test_e2e_release_speaks_and_discard_keeps_history(tmp_path):
     )
     assert store.count_messages(ChatType.GROUP, CHAT) == before_discard
     assert before_discard >= before
+    await brain.aclose()
+
+
+# ---------------------------------------------------------------------------
+# 冷场快反馈：连续 3 轮无人接 → 非点名批次 hold 15 分钟（GAP-11）
+# ---------------------------------------------------------------------------
+
+MIND_ON = MindConfig(enabled=True)
+MIND_BACKOFF_OFF = MindConfig(enabled=True, silence_backoff_enabled=False)
+
+
+def seed_silent_turns(
+    store: Store, *, turns: int, base_ts: int, engaged_oldest: bool = False
+) -> None:
+    """预置 N「轮」无人接话：每轮独立 spoken_at，engaged 全 0。"""
+    for i in range(turns):
+        store.upsert_reply_outcome(
+            ChatType.GROUP,
+            CHAT,
+            f"b{i}",
+            base_ts + i * 1000,
+            180,
+            engaged=engaged_oldest and i == 0,
+            quoted=False,
+            replied=False,
+            silence_after=True,
+        )
+
+
+async def test_e2e_silence_backoff_holds_non_addressed_batch(tmp_path):
+    """连续 3 轮 silent：非点名批次攒着不投，模型一次没调。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path, mind=MIND_ON)
+    now = int(now_shanghai().timestamp())
+    seed_silent_turns(store, turns=3, base_ts=now - 100_000)
+
+    await service.handle(make_msg("随口一提", message_id="s1", ts=now))
+    await service.handle(make_msg("没人接也再说一句", message_id="s2", ts=now))
+    await flush_due(service)
+
+    assert server.prompts == []
+    assert "silence_backoff" in checkpoints(store)
+    # 攒着不是丢弃：游标不动，下次被点名或有问句时连这批一起进 prompt。
+    assert sorted(pending_ids(service)) == ["s1", "s2"]
+    await brain.aclose()
+
+
+async def test_e2e_silence_backoff_releases_after_fifteen_minutes(tmp_path):
+    """hold_max_seconds=0 只关寿命；15 分钟冷场窗口独立生效，到点放行送模型。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(
+        tmp_path, mind=MIND_ON, hold_max_seconds=0
+    )
+    now = int(now_shanghai().timestamp())
+    seed_silent_turns(store, turns=3, base_ts=now - 100_000)
+    await service.handle(make_msg("随口一提", message_id="r1", ts=now - 1000))
+    await service.handle(make_msg("没人接也再说一句", message_id="r2", ts=now - 900))
+    await flush_due(service)
+
+    assert len(server.prompts) == 1
+    assert "silence_backoff_expired" in checkpoints(store)
+    await brain.aclose()
+
+
+async def test_e2e_force_release_bypasses_silence_backoff(tmp_path):
+    """面板「现在说这一次」跳过整个攒着判定，冷场中也直接送模型。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path, mind=MIND_ON)
+    now = int(now_shanghai().timestamp())
+    seed_silent_turns(store, turns=3, base_ts=now - 100_000)
+    await service.handle(make_msg("随口一提", message_id="s1", ts=now))
+    await service.handle(make_msg("没人接也再说一句", message_id="s2", ts=now))
+
+    await service._run_batch(ChatType.GROUP, CHAT, force_release=True)
+
+    assert len(server.prompts) == 1
+    assert adapter.sent
+    await brain.aclose()
+
+
+async def test_e2e_addressed_batch_bypasses_silence_backoff(tmp_path):
+    """被 @ 的批次永远穿透冷场 hold。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path, mind=MIND_ON)
+    now = int(now_shanghai().timestamp())
+    seed_silent_turns(store, turns=3, base_ts=now - 100_000)
+
+    await service.handle(
+        make_msg("@溟月 看这缸水草", message_id="a1", at_bot=True, ts=now)
+    )
+    await flush_due(service)
+
+    assert len(server.prompts) == 1
+    assert "silence_backoff" not in checkpoints(store)
+    await brain.aclose()
+
+
+async def test_e2e_engaged_turn_resets_the_streak(tmp_path):
+    """最早一轮有人接：streak 只剩 2，够不到阈值，批次照常送模型。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path, mind=MIND_ON)
+    now = int(now_shanghai().timestamp())
+    seed_silent_turns(store, turns=3, base_ts=now - 100_000, engaged_oldest=True)
+
+    await service.handle(make_msg("随口一提", message_id="e1", ts=now))
+    await service.handle(make_msg("没人接也再说一句", message_id="e2", ts=now))
+    await flush_due(service)
+
+    assert store.consecutive_silent_turns(ChatType.GROUP, CHAT, limit=3) == 2
+    assert len(server.prompts) == 1
+    assert "silence_backoff" not in checkpoints(store)
+    await brain.aclose()
+
+
+async def test_e2e_two_silent_turns_do_not_backoff(tmp_path):
+    """只有 2 轮冷场：够不到阈值，不攒（失败探针）。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path, mind=MIND_ON)
+    now = int(now_shanghai().timestamp())
+    seed_silent_turns(store, turns=2, base_ts=now - 100_000)
+
+    await service.handle(make_msg("随口一提", message_id="t1", ts=now))
+    await service.handle(make_msg("没人接也再说一句", message_id="t2", ts=now))
+    await flush_due(service)
+
+    assert len(server.prompts) == 1
+    assert "silence_backoff" not in checkpoints(store)
+    await brain.aclose()
+
+
+async def test_e2e_same_spoken_at_counts_as_one_silent_turn(tmp_path):
+    """同一次回复的多片 chunk 共享 spoken_at，只算 1 轮。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path, mind=MIND_ON)
+    now = int(now_shanghai().timestamp())
+    spoken_at = now - 100_000
+    for i in range(3):
+        store.upsert_reply_outcome(
+            ChatType.GROUP,
+            CHAT,
+            f"b{i}",
+            spoken_at,
+            180,
+            engaged=False,
+            quoted=False,
+            replied=False,
+            silence_after=True,
+        )
+    assert store.consecutive_silent_turns(ChatType.GROUP, CHAT) == 1
+
+    await service.handle(make_msg("随口一提", message_id="c1", ts=now))
+    await service.handle(make_msg("没人接也再说一句", message_id="c2", ts=now))
+    await flush_due(service)
+
+    assert len(server.prompts) == 1
+    assert "silence_backoff" not in checkpoints(store)
+    await brain.aclose()
+
+
+async def test_e2e_weak_batch_during_cold_streak_still_skips_the_model(tmp_path):
+    """冷场期间的单条弱附和：known_silent 优先，mark_delivered，0 模型调用。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path, mind=MIND_ON)
+    now = int(now_shanghai().timestamp())
+    seed_silent_turns(store, turns=3, base_ts=now - 100_000)
+    # 机器人刚说过话（90 秒冷却窗内），弱附和大概率不是在等它。
+    store.save_chat_state(ChatType.GROUP, CHAT, {"last_bot_spoke": now - 10})
+
+    await service.handle(make_msg("哈哈", message_id="w1", ts=now))
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    assert server.prompts == []
+    assert "silence_backoff" not in checkpoints(store)
+    assert "skip_known_silent" in checkpoints(store)
+    assert pending_ids(service) == []
+    await brain.aclose()
+
+
+async def test_e2e_silence_backoff_disabled_matches_old_behavior(tmp_path):
+    """silence_backoff_enabled=false：与改动前一致，冷场 streak 不产生攒着。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path, mind=MIND_BACKOFF_OFF)
+    now = int(now_shanghai().timestamp())
+    seed_silent_turns(store, turns=3, base_ts=now - 100_000)
+
+    await service.handle(make_msg("随口一提", message_id="d1", ts=now))
+    await service.handle(make_msg("没人接也再说一句", message_id="d2", ts=now))
+    await flush_due(service)
+
+    assert len(server.prompts) == 1
+    assert "silence_backoff" not in checkpoints(store)
+    await brain.aclose()
+
+
+async def test_e2e_mind_disabled_never_backoffs(tmp_path):
+    """mind.enabled=false（老配置）：行为逐字节不变，不触发 backoff。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path)
+    now = int(now_shanghai().timestamp())
+    seed_silent_turns(store, turns=3, base_ts=now - 100_000)
+
+    await service.handle(make_msg("随口一提", message_id="o1", ts=now))
+    await service.handle(make_msg("没人接也再说一句", message_id="o2", ts=now))
+    await flush_due(service)
+
+    assert len(server.prompts) == 1
+    assert "silence_backoff" not in checkpoints(store)
+    await brain.aclose()
+
+
+async def test_e2e_silence_backoff_and_downshift_are_independent(tmp_path):
+    """冷场 hold（GAP-11）与 note_no_reply 的 30 分钟半速是两套信号，互不覆盖。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path, mind=MIND_ON)
+    now = int(now_shanghai().timestamp())
+
+    # 信号一：reply_outcomes 口径的冷场 streak 命中 → 批次攒着。
+    seed_silent_turns(store, turns=3, base_ts=now - 100_000)
+    await service.handle(make_msg("随口一提", message_id="n1", ts=now))
+    await service.handle(make_msg("没人接也再说一句", message_id="n2", ts=now))
+    await flush_due(service)
+    assert server.prompts == []
+    assert "silence_backoff" in checkpoints(store)
+    # 但它不碰 router 的半速状态：no_reply_streak / downshift_until 原样。
+    st = service.router._state(ChatType.GROUP, CHAT)
+    assert st.no_reply_streak == 0
+    assert st.downshift_until is None
+
+    # 信号二：router 侧 3 次无人接 → downshift_until（30 分钟半速）。
+    held_before = sum(
+        1
+        for row in store.list_decisions(limit=20, chat_id=CHAT)
+        if row["checkpoint"] == "silence_backoff"
+    )
+    for _ in range(3):
+        service.router.note_no_reply(ChatType.GROUP, CHAT)
+    st = service.router._state(ChatType.GROUP, CHAT)
+    assert st.no_reply_streak == 3
+    assert st.downshift_until is not None
+    held_after = sum(
+        1
+        for row in store.list_decisions(limit=20, chat_id=CHAT)
+        if row["checkpoint"] == "silence_backoff"
+    )
+    assert held_after == held_before
+    assert store.consecutive_silent_turns(ChatType.GROUP, CHAT, limit=3) == 3
     await brain.aclose()

@@ -110,7 +110,9 @@ def bodies(blocks: list[str]) -> dict[str, str]:
 
 
 def render(store: Store, mind_chars: int) -> dict[str, str]:
-    return bodies(_mind_blocks(store, GROUP, CHAT, cfg(mind_chars)))
+    return bodies(
+        _mind_blocks(store, GROUP, CHAT, cfg(mind_chars), time.time(), 12)
+    )
 
 
 # ---- (a) 六段总和 > 预算时，返回的数据体合计不超过预算 --------------------
@@ -214,6 +216,6 @@ def test_zero_budget_with_only_episode_returns_empty(store: Store) -> None:
         )
     )
 
-    blocks = _mind_blocks(store, GROUP, CHAT, cfg(0))
+    blocks = _mind_blocks(store, GROUP, CHAT, cfg(0), time.time(), 12)
 
     assert blocks == []

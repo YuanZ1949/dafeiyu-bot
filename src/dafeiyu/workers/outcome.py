@@ -54,6 +54,14 @@ class OutcomeWorker:
         return handled
 
     def tag(self, message: Message) -> None:
+        """给一条已过观察窗的 bot 发言打标。
+
+        两个信号的口径刻意不同：
+        * ``engaged`` 是上下文信号——窗口内**任意真人**发言就算有人接，
+          供「连续冷场」这类情境判断用；
+        * ``replied`` 才是学习信号——必须是真人明确引用/回复这句 bot 发言。
+        不要把 ``engaged`` 改成 ``replied`` 的口径，也不要反向。
+        """
         start = int(message.timestamp)
         if start <= 0:
             return
@@ -105,7 +113,9 @@ class OutcomeWorker:
         )
         if not latest or latest[0].message_id != message.message_id:
             return
-        self.store.note_bot_mood("刚才那句没人接，有点闷")
+        self.store.note_bot_mood_chat(
+            message.chat_type, message.chat_id, "刚才那句没人接，有点闷"
+        )
 
 
 async def outcome_loop(

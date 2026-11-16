@@ -48,7 +48,7 @@ def _episode() -> Episode:
 
 
 def _seed_memory(store: Store) -> None:
-    """写全五类聚合记忆 + 原文 + 游标，作为 forget 各入口的共同前置。"""
+    """写全五类聚合记忆 + 原文 + 游标 + 运行状态/决策，作为 forget 各入口的共同前置。"""
     store.add_message(_message())
     store.upsert_impression(GROUP, CHAT, "qq:2", "preference", "阿猫喜欢三湖", 0.8)
     store.set_impression_cursor(GROUP, CHAT, 5)
@@ -56,6 +56,22 @@ def _seed_memory(store: Store) -> None:
     store.add_open_loop(OpenLoop(GROUP, CHAT, "question", "阿猫问的灯怎么选，没人接"))
     store.upsert_summary(GROUP, CHAT, "2026-11-03", "那天聊了灯")
     store.upsert_weekly_summary(GROUP, CHAT, "2026-11-02", "这一周都在聊鱼缸")
+    # T15：运行状态与决策流水也属于会话派生数据，/forget 后必须消失。
+    store.save_chat_state(
+        GROUP,
+        CHAT,
+        {"muted_until": 9999.0, "no_reply_streak": 3, "downshift_until": 8888.0},
+    )
+    store.set_bot_state_chat(GROUP, CHAT, focus="鱼缸", mood_note="好奇")
+    store.record_decision(
+        GROUP,
+        CHAT,
+        outcome="replied",
+        read="群里在聊灯",
+        think="该接一句",
+        reason="话题没结束",
+        reply_preview="灯选暖光的",
+    )
 
 
 # ---- 常量防呆 ---------------------------------------------------------------
@@ -81,6 +97,14 @@ def test_fixed_vulnerability_tables_are_in_chat_scoped() -> None:
     """本次修的漏洞：这两个表要留在硬忘记清单里，防止以后被随手删掉。"""
     assert "weekly_summaries" in CHAT_SCOPED_TABLES
     assert "impression_cursors" in CHAT_SCOPED_TABLES
+
+
+def test_chat_runtime_state_tables_are_in_chat_scoped() -> None:
+    """T15：运行状态与决策流水必须进硬忘记清单，软忘清单保持不变。"""
+    assert set(CHAT_SCOPED_TABLES) >= {"chat_state", "bot_state_chats", "decisions"}
+    # decisions 存 read/think/reason/reply_preview 模型原文，/forget 后必须消失。
+    for table in ("chat_state", "bot_state_chats", "decisions"):
+        assert table not in MESSAGE_SCOPED_TABLES, table
 
 
 def test_chat_scoped_tables_all_exist_in_schema(store: Store) -> None:
@@ -122,6 +146,45 @@ def test_hard_forget_clears_everything(store: Store, use_forget_all: bool) -> No
     assert store.open_loops(GROUP, CHAT) == []
     assert store.get_summary(GROUP, CHAT, "2026-11-03") is None
     assert store.latest_weekly_summary(GROUP, CHAT) is None
+    # T15：运行状态/会话级 bot_state/决策流水随硬忘记一起清。
+    assert store.load_chat_state(GROUP, CHAT) is None
+    assert store.get_bot_state_chat(GROUP, CHAT) is None
+    assert store.list_decisions(chat_type=GROUP, chat_id=CHAT) == []
+
+
+# ---- forget_chat 清三张运行状态/决策表（含显式副作用锁） ---------------------
+
+
+def test_hard_forget_drops_chat_state_row_unmuting_chat(store: Store) -> None:
+    """显式副作用：整行删 chat_state 会一并清掉 muted_until/downshift_until/
+    no_reply_streak —— /forget 解除静音与降频，这是有意的「忘干净」。"""
+    _seed_memory(store)
+
+    store.forget_chat(GROUP, CHAT)
+
+    state = store.load_chat_state(GROUP, CHAT)
+    assert state is None, "chat_state 整行必须随 /forget 删除，不得保留静音"
+    assert store.get_bot_state_chat(GROUP, CHAT) is None
+    assert store.list_decisions(chat_type=GROUP, chat_id=CHAT) == []
+
+
+def test_hard_forget_only_touches_target_chat(store: Store) -> None:
+    store.save_chat_state(GROUP, CHAT, {"muted_until": 9999.0})
+    store.set_bot_state_chat(GROUP, CHAT, focus="本群")
+    store.record_decision(GROUP, CHAT, outcome="held", reason="先攒着")
+    other = "qq:9"
+    store.save_chat_state(GROUP, other, {"muted_until": 1234.0})
+    store.set_bot_state_chat(GROUP, other, focus="别的群")
+    store.record_decision(GROUP, other, outcome="replied", reply_preview="别群回复")
+
+    store.forget_chat(GROUP, CHAT)
+
+    other_state = store.load_chat_state(GROUP, other)
+    assert other_state is not None and other_state["muted_until"] == 1234.0
+    other_bot = store.get_bot_state_chat(GROUP, other)
+    assert other_bot is not None and other_bot["focus"] == "别的群"
+    other_decisions = store.list_decisions(chat_type=GROUP, chat_id=other)
+    assert len(other_decisions) == 1
 
 
 # ---- forget_messages --------------------------------------------------------
@@ -143,6 +206,10 @@ def test_soft_forget_keeps_aggregate_memory(store: Store) -> None:
     assert store.get_summary(GROUP, CHAT, "2026-11-03") == "那天聊了灯"
     weekly = store.latest_weekly_summary(GROUP, CHAT)
     assert weekly is not None and weekly.content == "这一周都在聊鱼缸"
+    # T15：软忘记不动运行状态与决策流水（不在 MESSAGE_SCOPED_TABLES 里）。
+    assert store.load_chat_state(GROUP, CHAT) is not None
+    assert store.get_bot_state_chat(GROUP, CHAT) is not None
+    assert store.list_decisions(chat_type=GROUP, chat_id=CHAT) != []
 
 
 def test_soft_forget_only_touches_target_chat(store: Store) -> None:

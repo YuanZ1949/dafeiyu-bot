@@ -2,11 +2,10 @@
 
 本文件供 AI 编码代理使用；面向人类的说明见 `README.md`。
 
-## 代码探查：先用 CodeGraph
+## 代码探查：先用 CodeGraph（仅当索引存在）
 
-本仓库已建立 CodeGraph 索引（`.codegraph/`，已在 `.gitignore` 中，不要提交）。
-
-遇到下列问题时，**先调用 `codegraph_explore`，不要直接 grep + 逐个 Read**：
+**若存在 `.codegraph/` 索引**（该目录未被 git 跟踪，见 `.gitignore`，不要提交），
+遇到下列问题时**先调用 `codegraph_explore`，不要直接 grep + 逐个 Read**：
 
 - "X 在哪里实现"
 - "谁调用了 X / 改 X 会影响哪些地方"
@@ -15,7 +14,10 @@
 它一次返回：相关符号的**逐行原文源码** + 调用路径 + 影响面（调用方与测试文件）。
 拿到结果后，不要对同一片代码再重复 grep / Read。
 
-代码发生结构性改动（新增、删除、重命名函数或模块）后，更新索引：
+**若不存在 `.codegraph/` 索引**，codegraph 无可查询内容，上述探查直接用 grep + Read
+完成，本节其余内容不适用；是否建立索引由用户决定，代理不要擅自运行 `codegraph init`。
+
+代码发生结构性改动（新增、删除、重命名函数或模块）后，**仅当索引存在时**更新索引：
 
 ```powershell
 codegraph sync

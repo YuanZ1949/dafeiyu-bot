@@ -434,6 +434,7 @@ memory:
   # 「此刻」注入：现在几点、本群叫什么、距上次开口多久、刚才是谁在说。
   # 关掉后 prompt 里不再有【此刻】那行，其余记忆注入不受影响。
   scene_injection: true
+  # 回复前按当前批次检索同会话旧消息，注入「相关旧记忆」。
   recall_enabled: true
   recall_topk: 3
   recall_chars: 300
@@ -503,6 +504,27 @@ mind:
   # 弱批次大概率不是在等你，直接跳过；超出冷却窗的批次照常走模型。
   # 默认 90；调小更省调用、也更容易误跳，调大更保守。
   skip_silent_cooldown_seconds: 90
+  # 私聊观察/自省/印象（P2）：默认打开（仍受 mind.enabled 总闸约束）。
+  # 闸门不区分通道：微信「只读私聊」也会被观察——只读=不回复，不是不记忆。
+  # shared_facts 仍只收群聊，私聊不写跨群立场与全局 life 笔记。
+  observe_private: true
+  # 冷场快反馈（P2）：同一会话连续 N「轮」没人接（同一 spoken_at 的多片回复
+  # 算 1 轮）→ 非点名批次 hold M 分钟；被 @/引用/force_release 照常穿透，
+  # 窗口独立于 persona.hold_max_seconds。
+  silence_backoff_enabled: true
+  silence_backoff_streak: 3
+  silence_backoff_minutes: 15
+  # 印象衰减（P3）：超过 TTL 天数、或置信低于最低值（仅对超过宽限期的旧行）清理。
+  impression_ttl_days: 45
+  impression_min_confidence: 0.3
+  # 低置信印象的宽限天数：刚写入的低置信行不会立即被清。
+  impression_low_conf_grace_days: 7
+  # 会话级近况/心情 TTL（小时）：超时后不再注入，等下一次夜间自省刷新。
+  bot_state_ttl_hours: 12
+  # 立场衰减（P3）：每晚置信度 ×decay；超过 TTL 天数或置信低于最低值即清理。
+  stance_decay_per_night: 0.98
+  stance_ttl_days: 30
+  stance_min_confidence: 0.2
 
 # 面板「聊天行为」卡片可实时改；这里的值只是默认值，面板改动写
 # data/settings.local.yaml，重启后仍然保留。

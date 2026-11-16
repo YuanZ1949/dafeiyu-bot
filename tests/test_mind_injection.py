@@ -109,6 +109,115 @@ def test_state_block_renders_focus_and_mood(store: Store) -> None:
     assert "心情：被夸了一句" in text
 
 
+def test_state_block_reads_chat_row(store: Store) -> None:
+    """会话级状态行优先：focus/mood 来自本群的 bot_state_chats 行。"""
+    now = time.time()
+    store.set_bot_state_chat(
+        GROUP, CHAT, focus="显卡驱动那个坑", mood_note="被夸了一句", now_ts=now
+    )
+
+    text = build_injection(
+        store, None, GROUP, CHAT, cfg(), today="2026-11-04", now_ts=now
+    )
+
+    assert INJECTION_STATE_HEADER in text
+    assert "现在在意：显卡驱动那个坑" in text
+    assert "心情：被夸了一句" in text
+
+
+def test_state_block_is_chat_scoped(store: Store) -> None:
+    """A 群的心情不许出现在 B 群（GAP-5）：状态行按会话读取，不回退。"""
+    now = time.time()
+    store.set_bot_state_chat(
+        GROUP, CHAT, focus="A 群的事", mood_note="A 群的心情", now_ts=now
+    )
+
+    text = build_injection(
+        store, None, GROUP, "qq:9", cfg(), today="2026-11-04", now_ts=now
+    )
+
+    assert INJECTION_STATE_HEADER not in text
+    assert "A 群的事" not in text
+    assert "A 群的心情" not in text
+
+
+def test_state_block_mood_expires_after_ttl(store: Store) -> None:
+    """心情有时效：mood_at 距今超过 TTL 就只剩「在意什么」。"""
+    now = time.time()
+    store.set_bot_state_chat(
+        GROUP, CHAT, focus="在意的事", mood_note="有点困", now_ts=now - 13 * 3600
+    )
+
+    text = build_injection(
+        store,
+        None,
+        GROUP,
+        CHAT,
+        cfg(),
+        today="2026-11-04",
+        now_ts=now,
+        state_ttl_hours=12,
+    )
+
+    assert "现在在意：在意的事" in text
+    assert "心情：" not in text
+
+
+def test_state_block_mood_within_ttl_is_injected(store: Store) -> None:
+    now = time.time()
+    store.set_bot_state_chat(
+        GROUP, CHAT, mood_note="有点困", now_ts=now - 11 * 3600
+    )
+
+    text = build_injection(
+        store,
+        None,
+        GROUP,
+        CHAT,
+        cfg(),
+        today="2026-11-04",
+        now_ts=now,
+        state_ttl_hours=12,
+    )
+
+    assert "心情：有点困" in text
+
+
+def test_state_block_falls_back_to_global_before_first_upgrade(store: Store) -> None:
+    """新表整表为空时仍回退旧全局单行（首次升级，不丢已有人设状态）。"""
+    store.set_bot_state(focus="全局在意", mood_note="全局心情")
+
+    text = build_injection(
+        store, None, GROUP, CHAT, cfg(), today="2026-11-04", now_ts=time.time()
+    )
+
+    assert "现在在意：全局在意" in text
+    assert "心情：全局心情" in text
+
+
+def test_state_block_never_falls_back_once_any_chat_row_exists(store: Store) -> None:
+    """新表一旦有任何行，没自省的 B 群注入为空：既不回退全局，也不看别的群。"""
+    store.set_bot_state(focus="全局在意", mood_note="全局心情")
+    store.set_bot_state_chat(GROUP, "qq:2", focus="别的群的事", now_ts=time.time())
+
+    text = build_injection(
+        store, None, GROUP, CHAT, cfg(), today="2026-11-04", now_ts=time.time()
+    )
+
+    assert INJECTION_STATE_HEADER not in text
+    assert "全局在意" not in text
+    assert "别的群的事" not in text
+
+
+def test_state_block_empty_tables_returns_empty_string(store: Store) -> None:
+    """两张表都没有行：返回空串，不抛异常。"""
+    text = build_injection(
+        store, None, GROUP, CHAT, cfg(), today="2026-11-04", now_ts=time.time()
+    )
+
+    assert text == ""
+
+
 def test_empty_state_is_omitted(store: Store) -> None:
     add_message(store, 1)
     assert INJECTION_STATE_HEADER not in render(store)

@@ -1633,9 +1633,13 @@ const DECISION_OUTCOME = {
 const DECISION_CHECKPOINT = {
   intensity_quiet: "安静强度",
   opportunity_hold: "纯热聊攒着",
+  // 冷场快反馈（GAP-11）：连续 3 轮无人接 → 非点名批次 hold 15 分钟，
+  // 窗口独立于 persona.hold_max_seconds。
+  silence_backoff: "冷场收手",
   // 攒着到期放行：仍是 held outcome，靠 checkpoint 区分「还在攒着」与「攒到点被放行」。
   intensity_quiet_expired: "到期放行 · 安静强度",
   opportunity_hold_expired: "到期放行 · 纯热聊",
+  silence_backoff_expired: "到期放行 · 冷场收手",
   manual_release: "手动放行",
   manual_discard: "手动丢弃",
   budget: "预算",

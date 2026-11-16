@@ -654,4 +654,33 @@ mind:
 - `tests/test_images.py`：GIF 注记带「动图」。
 - `tests/test_run_batch.py`：图片提示、缺少图片提示、最近图片补全。
 
+## 18. 实现状态（2026-11 修订）
+
+本节只记录前文各条的**实际落地口径**（对应 2026-11 mind-dialogue-closure 一批任务），
+不改写前文任何段落。表中常量均已在代码中核对。
+
+| 章节 | 状态 | 关键实现口径 |
+| --- | --- | --- |
+| §4.2 角色状态（动态单行） | 已落地 | 动态状态持久化并随会话更新，见 T8 的隔离与 TTL 口径 |
+| §5.1 话题簿（episodes） | 已落地 | 接话锚点按设计写入与召回 |
+| §5.2 未了事（open_loops） | 已落地 | 信号来源见 §8.1 行的打标口径 |
+| §5.4 召回打分 | 已落地 | 四因子权重 0.45/0.25/0.20/0.10（`memory/recall.py` 的 `WEIGHTS`）；相关性对候选集做 min-max 归一化，LIKE 回退候选统一按 0.5（T4/T11）。**向量/embedding 方案不采用**——本实现用词项重合 + 四因子打分，无 embedding 依赖 |
+| §8.1 结果打标 | 已落地 | 「被直接回复/引用」= replied；engaged 仅作上下文信号，不并入正向打标（T3） |
+| §8.2 夜间自省（Reflector） | 已落地 | relationships 只更新**已有** impressions 的 `last_seen_at`/`confidence`，绝不新建 impression，名单外 user 自然命中 0 行（T5） |
+| §8.3 评测 | LLM judge 未新增 | 原设计的 LLM judge 不做，改为确定性 eval（`scripts/eval_mind.py`）。该脚本已落地：8 个离线确定性场景（`recall_ranking`/`silence_backoff`/`multi_episode`/`mood_ttl`/`privacy_delete`/`private_gate`/`chat_isolation`/`quota_reserve`），支持 `--json` 输出、退出码 0/1，测试见 `tests/test_eval_mind.py` |
+
+其余落地口径：
+
+- **冷场按「轮」计**：同一次回复的多片只算 1 轮；连续 3 轮没人接 → 非点名批次 hold
+  15 分钟，`@`/引用/force_release 照常穿透（T6，`MindConfig.silence_backoff_*`）。
+- **心智状态**：按会话隔离 + 12h TTL（`bot_state_ttl_hours = 12`）；旧的全局行仅在新表
+  整表为空时回退读取一次（T8）。
+- **印象（impressions）**：45 天 TTL；置信低于下限（0.3）的行仅对超过宽限期（7 天）的旧行
+  清理；立场每晚 ×0.98 衰减（`stance_decay_per_night = 0.98`）（T10）。
+- **私聊观察/自省**：默认开启（`observe_private = True`，仍受 `mind.enabled` 总闸约束），
+  但私聊不写 `bot_stances` / `shared_facts` / 全局 life（T13/T14）。
+- **§4.3 关系卡**：保持现状，只受同一 TTL 过滤，未追加新逻辑。
+- **增量 schema**：纯增量新表，由 `CREATE TABLE IF NOT EXISTS` 幂等补建，
+  **不 bump `SCHEMA_VERSION`（保持 2）**，旧程序可回滚打开。
+
 

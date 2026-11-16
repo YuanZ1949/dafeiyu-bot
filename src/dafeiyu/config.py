@@ -171,6 +171,24 @@ class MindConfig:
     # 上面这条过滤只在「机器人在这么多秒内刚说过话」时生效：刚开口后出现的
     # 弱批次大概率不是在等你，直接跳过；超出冷却窗的批次照常走模型。
     skip_silent_cooldown_seconds: int = 90
+    # 私聊观察/自省/印象（P2）：默认打开（仍受 mind.enabled 总闸约束）；
+    # shared_facts 仍只收群聊，私聊不写跨群立场与全局 life 笔记。
+    observe_private: bool = True
+    # 冷场快反馈（P2）：连续 N「轮」没人接 → 非点名批次 hold M 分钟；
+    # 被 @/引用/force_release 照常穿透，窗口独立于 persona.hold_max_seconds。
+    silence_backoff_enabled: bool = True
+    silence_backoff_streak: int = 3
+    silence_backoff_minutes: int = 15
+    # 印象衰减（P3）：超过 TTL 天数、或置信低于最低值（仅对超过宽限期的旧行）清理。
+    impression_ttl_days: int = 45
+    impression_min_confidence: float = 0.3
+    impression_low_conf_grace_days: int = 7
+    # 会话级近况/心情 TTL（小时）：超时后不再注入，等下一次夜间自省刷新。
+    bot_state_ttl_hours: int = 12
+    # 立场衰减（P3）：每晚 ×decay；超过 TTL 天数或置信低于最低值即清理。
+    stance_decay_per_night: float = 0.98
+    stance_ttl_days: int = 30
+    stance_min_confidence: float = 0.2
 
 
 @dataclass(frozen=True)
@@ -1060,6 +1078,21 @@ def _build_mind(raw: dict[str, Any]) -> MindConfig:
     hour = _int(raw.get("reflection_hour", 5), "mind.reflection_hour")
     if not 0 <= hour <= 23:
         raise ConfigError("mind.reflection_hour 必须在 0-23 之间")
+    impression_min_confidence = _float(
+        raw.get("impression_min_confidence", 0.3), "mind.impression_min_confidence"
+    )
+    if not 0 <= impression_min_confidence <= 1:
+        raise ConfigError("mind.impression_min_confidence 必须在 [0, 1] 之间")
+    stance_min_confidence = _float(
+        raw.get("stance_min_confidence", 0.2), "mind.stance_min_confidence"
+    )
+    if not 0 <= stance_min_confidence <= 1:
+        raise ConfigError("mind.stance_min_confidence 必须在 [0, 1] 之间")
+    stance_decay = _float(
+        raw.get("stance_decay_per_night", 0.98), "mind.stance_decay_per_night"
+    )
+    if not 0 < stance_decay <= 1:
+        raise ConfigError("mind.stance_decay_per_night 必须在 (0, 1] 之间")
     return MindConfig(
         enabled=_bool(raw.get("enabled", False), "mind.enabled"),
         state_enabled=_bool(raw.get("state_enabled", True), "mind.state_enabled"),
@@ -1114,6 +1147,33 @@ def _build_mind(raw: dict[str, Any]) -> MindConfig:
             "mind.skip_silent_cooldown_seconds",
             90,
         ),
+        observe_private=_bool(raw.get("observe_private", True), "mind.observe_private"),
+        silence_backoff_enabled=_bool(
+            raw.get("silence_backoff_enabled", True), "mind.silence_backoff_enabled"
+        ),
+        silence_backoff_streak=_positive_int(
+            raw.get("silence_backoff_streak"), "mind.silence_backoff_streak", 3
+        ),
+        silence_backoff_minutes=_positive_int(
+            raw.get("silence_backoff_minutes"), "mind.silence_backoff_minutes", 15
+        ),
+        impression_ttl_days=_positive_int(
+            raw.get("impression_ttl_days"), "mind.impression_ttl_days", 45
+        ),
+        impression_min_confidence=impression_min_confidence,
+        impression_low_conf_grace_days=_positive_int(
+            raw.get("impression_low_conf_grace_days"),
+            "mind.impression_low_conf_grace_days",
+            7,
+        ),
+        bot_state_ttl_hours=_positive_int(
+            raw.get("bot_state_ttl_hours"), "mind.bot_state_ttl_hours", 12
+        ),
+        stance_decay_per_night=stance_decay,
+        stance_ttl_days=_positive_int(
+            raw.get("stance_ttl_days"), "mind.stance_ttl_days", 30
+        ),
+        stance_min_confidence=stance_min_confidence,
     )
 
 
@@ -1517,6 +1577,19 @@ def _log_mirror_capabilities(
         )
 
 
+def _injection_flag(
+    memory_raw: dict[str, Any], key: str, mind: MindConfig
+) -> bool:
+    """episodes / open_loops 注入键的 None 哨兵语义。
+
+    键缺省（None）时跟随 ``mind.enabled`` 总闸；显式值也要通过总闸与
+    ``mind.episodes_enabled`` 子闸——关总闸得到「半活」心智是不允许的。
+    """
+    raw = memory_raw.get(key)
+    value = mind.enabled if raw is None else _bool(raw, f"memory.{key}")
+    return value and mind.enabled and mind.episodes_enabled
+
+
 def _build_injection(
     workspace_raw: dict[str, Any],
     memory_raw: dict[str, Any],
@@ -1550,12 +1623,8 @@ def _build_injection(
         recall_chars=_positive_int(
             memory_raw.get("recall_chars"), "memory.recall_chars", 300
         ),
-        inject_open_loops=_bool(
-            memory_raw.get("inject_open_loops", False), "memory.inject_open_loops"
-        ),
-        inject_episodes=_bool(
-            memory_raw.get("inject_episodes", False), "memory.inject_episodes"
-        ),
+        inject_open_loops=_injection_flag(memory_raw, "inject_open_loops", mind),
+        inject_episodes=_injection_flag(memory_raw, "inject_episodes", mind),
         open_loop_topk=_positive_int(
             memory_raw.get("open_loop_topk"), "memory.open_loop_topk", 3
         ),
@@ -1979,6 +2048,11 @@ def _build_triggers(raw: dict[str, Any]) -> TriggerConfig:
         raw.get("thread_closed_seconds", 600), "triggers.thread_closed_seconds"
     )
     # 已废弃：收尾不再抽样放行（全部交给模型判断）；仅保留老配置兼容解析。
+    if "closed_sample_rate" in raw:
+        logger.warning(
+            "triggers.closed_sample_rate 已废弃：收尾不再抽样放行，运行期不读取该值，"
+            "配置里可以删掉"
+        )
     closed_sample_rate = _float(
         raw.get("closed_sample_rate", 0.05), "triggers.closed_sample_rate"
     )

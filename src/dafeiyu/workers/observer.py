@@ -5,6 +5,9 @@
 * episode：正在聊的事（同一段对话更新同一行）；
 * open_loop：没有下文的事（谁问了没接、谁答应了没做）。
 
+默认只观察群聊；``mind.observe_private`` 打开后私聊也进记忆。闸门不区分
+通道：微信「只读私聊」同样会被观察——只读=不回复，不是不记忆。
+
 任何失败都只记日志并交给 ``FailureBackoff``，绝不影响回复主链路。
 """
 
@@ -68,6 +71,22 @@ MAX_LINE_CHARS = 200
 # 超过这个空档就视为换了一段对话：新 episode 重新开一行，而不是把上午的事续上。
 EPISODE_GAP_SECONDS = 1800
 OBSERVER_MAX_TOKENS = 600
+# 私聊批次的 user prompt 首行：告诉模型这不是群消息，别按「一群人」理解。
+PRIVATE_NOTICE = "这是与对方的私聊，不是群聊。"
+
+
+def chat_type_allowed(mind: MindConfig, chat_type: ChatType) -> bool:
+    """总闸 + 观察开关 + episode 开关 + 私聊开关，四层门控合成一个纯谓词。
+
+    总闸对群聊同样生效，不存在「GROUP 直接 True」的绕过。闸门不区分通道：
+    微信「只读私聊」也会被观察（只读=不回复，不是不记忆）。
+    """
+    return bool(
+        mind.enabled
+        and mind.observer_enabled
+        and mind.episodes_enabled
+        and (chat_type is ChatType.GROUP or mind.observe_private)
+    )
 
 
 def _clip(value: Any, limit: int) -> str:
@@ -160,16 +179,12 @@ class ObserverWorker:
     def _current_brain(self):
         return self._brain_getter() if self._brain_getter is not None else self.brain
 
-    def _enabled(self) -> bool:
-        return bool(
-            self.mind.enabled
-            and self.mind.observer_enabled
-            and self.mind.episodes_enabled
-        )
+    def _enabled(self, chat_type: ChatType) -> bool:
+        return chat_type_allowed(self.mind, chat_type)
 
     async def run_once(self) -> int:
-        """扫一轮活跃群；返回真正调用过模型的会话数。"""
-        if not self._enabled() or self._backoff.is_paused():
+        """扫一轮活跃会话（observe_private 放行的私聊也算）；返回调过模型的会话数。"""
+        if self._backoff.is_paused():
             return 0
 
         now_ts = int(self._now())
@@ -179,7 +194,7 @@ class ObserverWorker:
         for chat_type, chat_id in self.store.active_chats_between(
             now_ts - window, now_ts + 1
         ):
-            if chat_type != ChatType.GROUP:
+            if not self._enabled(chat_type):
                 continue
             if self._backoff.is_paused():
                 break
@@ -193,8 +208,8 @@ class ObserverWorker:
         return observed
 
     async def observe_chat(self, chat_type: ChatType, chat_id: str) -> bool:
-        # 只观察群聊：私聊不进入记忆。
-        if chat_type != ChatType.GROUP or not self._enabled():
+        # 总闸/子开关/私聊开关统一走谓词：群聊默认放行，私聊看 observe_private。
+        if not self._enabled(chat_type):
             return False
         if self._backoff.is_paused():
             return False
@@ -215,9 +230,12 @@ class ObserverWorker:
             return False
 
         today = today_shanghai()
+        # 每会话每天给 Reflector 留 1 次：门限是 daily-1 而不是 daily。
+        # max(0, …) 而非 max(1, …)：daily=1 时门限 0，Observer 直接让位；
+        # daily=0 时两边都关（_non_negative_int 允许 0）。
         if (
             self.store.observer_calls_today(chat_type, chat_id, today)
-            >= int(self.mind.observer_daily_calls)
+            >= max(0, int(self.mind.observer_daily_calls) - 1)
         ):
             return False
 
@@ -255,6 +273,10 @@ class ObserverWorker:
         )
         if loop_lines:
             body = f"当前未了事（id|kind|content）：\n{loop_lines}\n\n{body}"
+        # 私聊批次首行点明场景，模型才不会按「一群人」理解；system prompt 不动，
+        # 避免污染群聊那边的提示缓存。
+        if chat_type is ChatType.PRIVATE:
+            body = f"{PRIVATE_NOTICE}\n{body}"
         prompt_text = f"{OBSERVER_SYSTEM}\n{body}"
         try:
             content, prompt_tokens, completion_tokens = await self._current_brain().complete_detailed(
@@ -331,14 +353,6 @@ class ObserverWorker:
             or marker_last_ts is None
             or first.timestamp - marker_last_ts > EPISODE_GAP_SECONDS
         )
-        if marker is None or replace:
-            start_id = first.message_id
-            start_ts = int(first.timestamp)
-        else:
-            start_id = str(marker.get("start") or first.message_id)
-            start_ts = _marker_timestamp(marker, "start_ts")
-            if start_ts is None:
-                start_ts = int(first.timestamp)
 
         participants = self._participants(human, payload)
         phase = payload.get("phase")
@@ -349,35 +363,79 @@ class ObserverWorker:
             importance = float(payload.get("importance", 0.5))
         except (TypeError, ValueError):
             importance = 0.5
+        importance = min(1.0, max(0.0, importance))
+        topic = _clip(payload.get("topic"), MAX_TOPIC_CHARS)
+        summary = _clip(payload.get("summary"), MAX_SUMMARY_CHARS)
+        mood = _clip(payload.get("mood"), MAX_MOOD_CHARS)
 
+        def _write_marker(start_id: str, start_ts: int) -> None:
+            self.store.set_mind_state(
+                marker_key,
+                json.dumps(
+                    {
+                        "start": start_id,
+                        "start_ts": start_ts,
+                        "last_ts": int(last.timestamp),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+
+        if marker is not None and not replace:
+            # 同一段对话：先找话题相似的 open episode，命中就推进那一行，
+            # 不新建——并行话题才各自成行。start 键沿用 marker，但 last_ts
+            # 必须回写，否则下一轮 gap 判定会用陈旧时间戳。
+            similar = self.store.find_similar_open_episode(chat_type, chat_id, topic)
+            if similar is not None and similar.id is not None:
+                merged = list(similar.participants)
+                seen = {person.user_id for person in merged}
+                for person in participants:
+                    if person.user_id not in seen and len(merged) < MAX_PARTICIPANTS:
+                        merged.append(person)
+                        seen.add(person.user_id)
+                self.store.update_episode_progress(
+                    similar.id,
+                    last_message_id=last.message_id,
+                    summary=summary,
+                    participants=tuple(merged),
+                    phase=phase,
+                    mood=mood,
+                    importance=importance,
+                )
+                start_id = str(marker.get("start") or first.message_id)
+                start_ts = _marker_timestamp(marker, "start_ts")
+                if start_ts is None:
+                    start_ts = int(first.timestamp)
+                _write_marker(start_id, start_ts)
+                self.store.close_excess_open_episodes(chat_type, chat_id)
+                return
+
+        # 新建分支必须用新段起点当 start 键：save_episode 以
+        # (chat_type, chat_id, start_message_id) upsert，沿用旧 start 会把
+        # 同 gap 内的并行话题 UPDATE 进第一行。
+        start_id = first.message_id
+        start_ts = int(first.timestamp)
         episode = Episode(
             chat_type=chat_type,
             chat_id=chat_id,
             start_message_id=start_id,
             last_message_id=last.message_id,
-            topic=_clip(payload.get("topic"), MAX_TOPIC_CHARS),
-            summary=_clip(payload.get("summary"), MAX_SUMMARY_CHARS),
+            topic=topic,
+            summary=summary,
             participants=participants,
             phase=phase,
-            mood=_clip(payload.get("mood"), MAX_MOOD_CHARS),
-            importance=min(1.0, max(0.0, importance)),
+            mood=mood,
+            importance=importance,
             status="open",
             started_at=start_ts,
         )
         episode_id = self.store.save_episode(episode)
-        # 同一会话只允许一条 open：新一段一开，旧的必须闭。
-        self.store.close_open_episodes(chat_type, chat_id, keep_id=episode_id)
-        self.store.set_mind_state(
-            marker_key,
-            json.dumps(
-                {
-                    "start": start_id,
-                    "start_ts": start_ts,
-                    "last_ts": int(last.timestamp),
-                },
-                ensure_ascii=False,
-            ),
-        )
+        if replace:
+            # 30 分钟静默视为上一段结束：旧的全部收尾。
+            self.store.close_open_episodes(chat_type, chat_id, keep_id=episode_id)
+        # 并行话题允许并存，但同会话最多 3 条 open（重要的、新的优先）。
+        self.store.close_excess_open_episodes(chat_type, chat_id)
+        _write_marker(start_id, start_ts)
 
     def _participants(
         self, human: list[Message], payload: dict[str, Any]

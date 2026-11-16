@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 from dafeiyu.behavior import BehaviorSettings
 from dafeiyu.brain.client import BrainReply
@@ -16,6 +17,7 @@ from dafeiyu.config import (
     InjectionConfig,
     LoggingConfig,
     MemoryConfig,
+    MindConfig,
     PersonaConfig,
     Settings,
     TriggerConfig,
@@ -30,8 +32,10 @@ GROUP = "qq:1001"
 LONG_LINE = "今天这缸水草长得真好看"
 
 
-def make_settings(*, hold_max_seconds: int = 300) -> Settings:
-    return Settings(
+def make_settings(
+    *, hold_max_seconds: int = 300, mind: MindConfig | None = None
+) -> Settings:
+    settings = Settings(
         api_key="sk-test",
         base_url="https://api.deepseek.com",
         model="deepseek-chat",
@@ -57,6 +61,7 @@ def make_settings(*, hold_max_seconds: int = 300) -> Settings:
         logging=LoggingConfig("INFO", "logs"),
         injection=InjectionConfig(),
     )
+    return settings if mind is None else replace(settings, mind=mind)
 
 
 class FakeAdapter:
@@ -95,10 +100,12 @@ class FakeBrain:
         pass
 
 
-def build(tmp_path, *, hold_max_seconds: int = 300):
+def build(
+    tmp_path, *, hold_max_seconds: int = 300, mind: MindConfig | None = None
+):
     store = Store(str(tmp_path / "t.db"))
     store.init_schema()
-    settings = make_settings(hold_max_seconds=hold_max_seconds)
+    settings = make_settings(hold_max_seconds=hold_max_seconds, mind=mind)
     adapter = FakeAdapter()
     brain = FakeBrain()
     router = Router(settings, store)
@@ -333,3 +340,83 @@ async def test_twenty_message_ceiling_wins_over_the_lifetime(tmp_path):
 
     await service._run_batch(ChatType.GROUP, GROUP)
     assert brain.reply_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# 冷场快反馈（GAP-11）：连续 3 轮无人接 → 非点名批次 hold 15 分钟。
+# 窗口独立于 persona.hold_max_seconds；这里用 FakeBrain 串 Service + Store。
+# ---------------------------------------------------------------------------
+
+MIND_ON = MindConfig(enabled=True)
+
+
+def seed_silent_turns(store: Store, turns: int = 3) -> None:
+    """预置 N「轮」无人接话：每轮独立 spoken_at，engaged 全 0。"""
+    for i in range(turns):
+        store.upsert_reply_outcome(
+            ChatType.GROUP,
+            GROUP,
+            f"b{i}",
+            1_700_000_000 + i * 1000,
+            180,
+            engaged=False,
+            quoted=False,
+            replied=False,
+            silence_after=True,
+        )
+
+
+async def test_silence_backoff_holds_even_when_lifetime_is_disabled(tmp_path):
+    """hold_max_seconds=0 只关寿命：15 分钟冷场窗口仍独立生效。"""
+    service, store, brain, _ = build(tmp_path, hold_max_seconds=0, mind=MIND_ON)
+    seed_cursor(store)
+    add_messages(store, "s", 2, ts=int(time.time()) - 10)
+    seed_silent_turns(store)
+
+    await service._run_batch(ChatType.GROUP, GROUP)
+
+    assert brain.reply_calls == 0
+    assert last_decision(store)["checkpoint"] == "silence_backoff"
+
+
+async def test_silence_backoff_releases_after_fifteen_minutes(tmp_path):
+    service, store, brain, _ = build(tmp_path, hold_max_seconds=0, mind=MIND_ON)
+    seed_cursor(store)
+    add_messages(store, "s", 2, ts=int(time.time()) - 1000)
+    seed_silent_turns(store)
+
+    await service._run_batch(ChatType.GROUP, GROUP)
+
+    assert brain.reply_calls == 1
+    decision = find_checkpoint(store, "silence_backoff_expired")
+    assert decision["detail"]["age_seconds"] >= 900
+
+
+async def test_silence_backoff_disabled_keeps_the_old_behavior(tmp_path):
+    """silence_backoff_enabled=false：冷场 streak 不产生攒着，与改动前一致。"""
+    service, store, brain, _ = build(
+        tmp_path,
+        hold_max_seconds=0,
+        mind=MindConfig(enabled=True, silence_backoff_enabled=False),
+    )
+    seed_cursor(store)
+    add_messages(store, "s", 2, ts=int(time.time()) - 10)
+    seed_silent_turns(store)
+
+    await service._run_batch(ChatType.GROUP, GROUP)
+
+    assert brain.reply_calls == 1
+    assert last_decision(store)["checkpoint"] != "silence_backoff"
+
+
+async def test_mind_disabled_never_backoffs(tmp_path):
+    """mind.enabled=false（老配置）：不触发 backoff，行为逐字节不变。"""
+    service, store, brain, _ = build(tmp_path, hold_max_seconds=0)
+    seed_cursor(store)
+    add_messages(store, "s", 2, ts=int(time.time()) - 10)
+    seed_silent_turns(store)
+
+    await service._run_batch(ChatType.GROUP, GROUP)
+
+    assert brain.reply_calls == 1
+    assert last_decision(store)["checkpoint"] != "silence_backoff"

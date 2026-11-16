@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from dafeiyu.config import _build_injection
+from dafeiyu.config import MindConfig, _build_injection
 from dafeiyu.memory.context import (
     INJECTION_EPISODE_HEADER,
     INJECTION_OPEN_LOOP_HEADER,
@@ -116,6 +116,119 @@ def test_close_open_episodes_can_keep_the_new_one(store: Store) -> None:
     closed = store.close_open_episodes(GROUP, CHAT, keep_id=keep)
 
     assert closed == 1
+    assert store.latest_episode(GROUP, CHAT) is not None
+
+
+# ---- 并行 episode（GAP-4：最多 3 条 open，相似话题合并）--------------------
+
+
+def test_find_similar_open_episode_matches_topic(store: Store) -> None:
+    store.save_episode(make_episode(topic="鱼缸水草怎么养"))
+
+    hit = store.find_similar_open_episode(GROUP, CHAT, "鱼缸水草怎么养？")
+
+    assert hit is not None
+    assert hit.topic == "鱼缸水草怎么养"
+
+
+def test_find_similar_open_episode_ignores_closed_and_empty_topic(store: Store) -> None:
+    store.save_episode(make_episode(topic="鱼缸水草怎么养"))
+    store.close_open_episodes(GROUP, CHAT)
+
+    assert store.find_similar_open_episode(GROUP, CHAT, "鱼缸水草怎么养？") is None
+    assert store.find_similar_open_episode(GROUP, CHAT, "   ") is None
+
+
+def test_find_similar_open_episode_tie_prefers_larger_id(store: Store) -> None:
+    """两条 open 与 topic 同分：更新 id 更大的那条，而不是新建。"""
+    store.save_episode(make_episode(start="m1", topic="显卡驱动报错"))
+    second = store.save_episode(make_episode(start="m2", topic="显卡驱动报错"))
+
+    hit = store.find_similar_open_episode(GROUP, CHAT, "显卡驱动报错？")
+
+    assert hit is not None
+    assert hit.id == second
+
+
+def test_update_episode_progress_keeps_start_and_topic(store: Store) -> None:
+    episode_id = store.save_episode(
+        make_episode(
+            start="m1",
+            topic="鱼缸",
+            summary="旧摘要",
+            participants=(Participant("qq:2", "阿猫"),),
+            phase="opening",
+            mood="平静",
+            importance=0.3,
+        )
+    )
+
+    store.update_episode_progress(
+        episode_id,
+        last_message_id="m20",
+        summary="新摘要",
+        participants=(Participant("qq:2", "阿猫"), Participant("qq:3", "阿九")),
+        phase="climax",
+        mood="兴奋",
+        importance=0.9,
+    )
+
+    episode = store.latest_episode(GROUP, CHAT)
+    assert episode is not None
+    assert episode.id == episode_id
+    assert episode.start_message_id == "m1"  # start 键不动
+    assert episode.topic == "鱼缸"  # 相似合并不覆盖 topic
+    assert episode.summary == "新摘要"
+    assert episode.last_message_id == "m20"
+    assert [(p.user_id, p.nickname) for p in episode.participants] == [
+        ("qq:2", "阿猫"),
+        ("qq:3", "阿九"),
+    ]
+    assert (episode.phase, episode.mood, episode.importance) == (
+        "climax",
+        "兴奋",
+        0.9,
+    )
+    assert episode.status == "open"
+
+
+def test_update_episode_progress_missing_row_is_noop(store: Store) -> None:
+    assert (
+        store.update_episode_progress(
+            999,
+            last_message_id="m1",
+            summary="s",
+            participants=(),
+            phase="discussion",
+            mood="",
+            importance=0.5,
+        )
+        == 0
+    )
+
+
+def test_close_excess_open_episodes_keeps_top_three(store: Store) -> None:
+    for start, importance in (("m1", 0.9), ("m2", 0.4), ("m3", 0.7), ("m4", 0.1)):
+        store.save_episode(
+            make_episode(start=start, topic=f"话题{start}", importance=importance)
+        )
+
+    assert store.close_excess_open_episodes(GROUP, CHAT) == 1
+
+    rows = store.episodes_between(GROUP, CHAT, 0, 5000)
+    open_rows = [row for row in rows if row.status == "open"]
+    closed_rows = [row for row in rows if row.status == "closed"]
+    assert len(open_rows) == 3
+    assert {row.start_message_id for row in open_rows} == {"m1", "m2", "m3"}
+    assert len(closed_rows) == 1
+    assert closed_rows[0].start_message_id == "m4"
+
+
+def test_close_excess_open_episodes_custom_keep(store: Store) -> None:
+    for start in ("m1", "m2", "m3"):
+        store.save_episode(make_episode(start=start))
+
+    assert store.close_excess_open_episodes(GROUP, CHAT, keep=1) == 2
     assert store.latest_episode(GROUP, CHAT) is not None
 
 
@@ -271,6 +384,7 @@ def test_config_keys_are_parsed() -> None:
             "open_loop_chars": 120,
             "episode_chars": 160,
         },
+        MindConfig(enabled=True),
     )
 
     assert cfg.inject_episodes is True

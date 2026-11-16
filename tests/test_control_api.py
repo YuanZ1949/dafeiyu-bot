@@ -2039,9 +2039,45 @@ async def test_delete_user_messages_returns_count_and_is_idempotent(
         second_data = await second.json()
 
     assert first.status == 200
-    assert first_data == {"ok": True, "deleted_messages": 2}
+    assert first_data == {
+        "ok": True,
+        "deleted_messages": 2,
+        "derived": {
+            "deleted_impressions": 0,
+            "deleted_open_loops": 0,
+            "updated_episodes": 0,
+            "deleted_episodes": 0,
+            "deleted_decisions": 0,
+            "deleted_shared_facts": 0,
+        },
+        "unattributable": [
+            "summaries",
+            "weekly_summaries",
+            "reply_outcomes_detail_first_user_id",
+            "shared_facts_without_source_user_id",
+            "decisions_without_message_ids",
+        ],
+    }
     assert second.status == 200
-    assert second_data == {"ok": True, "deleted_messages": 0}
+    assert second_data == {
+        "ok": True,
+        "deleted_messages": 0,
+        "derived": {
+            "deleted_impressions": 0,
+            "deleted_open_loops": 0,
+            "updated_episodes": 0,
+            "deleted_episodes": 0,
+            "deleted_decisions": 0,
+            "deleted_shared_facts": 0,
+        },
+        "unattributable": [
+            "summaries",
+            "weekly_summaries",
+            "reply_outcomes_detail_first_user_id",
+            "shared_facts_without_source_user_id",
+            "decisions_without_message_ids",
+        ],
+    }
     assert control.store.count_messages(ChatType.GROUP, 100) == 1
     remaining = control.store.recent_messages(ChatType.GROUP, 100, 10)
     assert [message.user_id for message in remaining] == ["8"]
@@ -2076,7 +2112,7 @@ async def test_delete_user_messages_hides_store_errors(
     def boom(*_args, **_kwargs):
         raise sqlite3.OperationalError("no such column: secret_sql")
 
-    monkeypatch.setattr(control.store, "delete_user_messages", boom)
+    monkeypatch.setattr(control.store, "delete_user_data", boom)
 
     async with running(app) as client:
         resp = await client.delete(

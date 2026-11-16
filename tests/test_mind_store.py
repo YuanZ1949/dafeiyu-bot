@@ -20,6 +20,7 @@ from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message, OpenLoop
 
 GROUP = ChatType.GROUP
+PRIVATE = ChatType.PRIVATE
 CHAT = "qq:1"
 
 
@@ -83,6 +84,70 @@ def test_forget_all_clears_bot_state(store: Store) -> None:
     store.set_bot_state(focus="在意的事", mood_note="心情")
     store.forget_all()
     assert store.get_bot_state().focus == ""
+
+
+# ---- bot_state_chats（会话级状态）------------------------------------------
+
+
+def test_get_bot_state_chat_missing_returns_none(store: Store) -> None:
+    assert store.get_bot_state_chat(GROUP, CHAT) is None
+
+
+def test_set_bot_state_chat_only_touches_given_fields(store: Store) -> None:
+    row = store.set_bot_state_chat(
+        GROUP, CHAT, focus="显卡驱动那个坑", mood_note="有点懒", now_ts=1000.0
+    )
+    assert row["focus"] == "显卡驱动那个坑"
+    assert row["mood_note"] == "有点懒"
+    assert row["mood_at"] == pytest.approx(1000.0)
+
+    updated = store.set_bot_state_chat(
+        GROUP, CHAT, mood_note="被夸了一句，尾巴翘着", now_ts=2000.0
+    )
+
+    # None = 不动：focus 不能被第二次写入清空。
+    assert updated["focus"] == "显卡驱动那个坑"
+    assert updated["mood_note"] == "被夸了一句，尾巴翘着"
+    assert updated["mood_at"] == pytest.approx(2000.0)
+    assert store.get_bot_state_chat(GROUP, CHAT)["focus"] == "显卡驱动那个坑"
+
+
+def test_bot_state_chats_are_scoped_per_chat(store: Store) -> None:
+    store.set_bot_state_chat(GROUP, "qq:1", focus="A 的事", now_ts=1000.0)
+    store.set_bot_state_chat(PRIVATE, "qq:1", focus="B 的事", now_ts=1000.0)
+    store.set_bot_state_chat(GROUP, "qq:2", focus="C 的事", now_ts=1000.0)
+
+    assert store.get_bot_state_chat(GROUP, "qq:1")["focus"] == "A 的事"
+    assert store.get_bot_state_chat(PRIVATE, "qq:1")["focus"] == "B 的事"
+    assert store.get_bot_state_chat(GROUP, "qq:2")["focus"] == "C 的事"
+    assert store.count_bot_state_chats() == 3
+
+
+def test_note_bot_mood_chat_suppresses_same_note(store: Store) -> None:
+    assert store.note_bot_mood_chat(GROUP, CHAT, "被夸了，有点飘", now_ts=1000.0) is True
+    # 同一句话连续出现就抑制，且不刷新 mood_at。
+    assert store.note_bot_mood_chat(GROUP, CHAT, "被夸了，有点飘", now_ts=2000.0) is False
+    assert store.get_bot_state_chat(GROUP, CHAT)["mood_at"] == pytest.approx(1000.0)
+    assert store.note_bot_mood_chat(GROUP, CHAT, "被怼了，不太高兴", now_ts=3000.0) is True
+
+
+def test_note_bot_mood_chat_ignores_empty_note(store: Store) -> None:
+    assert store.note_bot_mood_chat(GROUP, CHAT, "   ") is False
+    assert store.get_bot_state_chat(GROUP, CHAT) is None
+
+
+def test_note_bot_mood_chat_suppression_is_per_chat(store: Store) -> None:
+    store.note_bot_mood_chat(GROUP, CHAT, "被夸了，有点飘", now_ts=1000.0)
+
+    assert store.note_bot_mood_chat(GROUP, "qq:9", "被夸了，有点飘", now_ts=2000.0) is True
+
+
+def test_count_bot_state_chats_counts_rows(store: Store) -> None:
+    assert store.count_bot_state_chats() == 0
+    store.set_bot_state_chat(GROUP, "qq:1", focus="A", now_ts=1.0)
+    store.set_bot_state_chat(GROUP, "qq:1", focus="A2", now_ts=2.0)
+
+    assert store.count_bot_state_chats() == 1
 
 
 # ---- observer_state -------------------------------------------------------
@@ -276,6 +341,7 @@ def test_upsert_outcome_is_idempotent(store: Store) -> None:
         "replied": 1,
         "silent": 0,
         "engaged_rate": 1.0,
+        "replied_rate": 1.0,
     }
 
 

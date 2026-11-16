@@ -201,6 +201,28 @@ def setup_logging(settings: Settings) -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+def log_effective_mind_memory(settings: Settings) -> None:
+    """启动时打一行生效开关：运营者不用翻配置就知道心智/注入是否真的打开。"""
+    mind = settings.mind
+    injection = settings.injection
+    log.info(
+        "mind 生效开关：mind.enabled=%s state=%s episodes=%s observer=%s "
+        "observe_private=%s emoji=%s stances=%s silence_backoff=%s | "
+        "memory.inject_episodes=%s inject_open_loops=%s recall_enabled=%s",
+        mind.enabled,
+        mind.state_enabled,
+        mind.episodes_enabled,
+        mind.observer_enabled,
+        mind.observe_private,
+        mind.emoji_reactions,
+        mind.stances_enabled,
+        mind.silence_backoff_enabled,
+        injection.inject_episodes,
+        injection.inject_open_loops,
+        injection.recall_enabled,
+    )
+
+
 async def checkpoint_loop(
     store: Store,
     interval: float = CHECKPOINT_INTERVAL_SECONDS,
@@ -342,6 +364,7 @@ def make_chat_titles() -> Callable[[str], str]:
 async def main() -> None:
     settings = load_settings()
     setup_logging(settings)
+    log_effective_mind_memory(settings)
 
     persona_path = settings.persona.prompt_file
     try:

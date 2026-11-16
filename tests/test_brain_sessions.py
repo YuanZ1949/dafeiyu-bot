@@ -97,3 +97,42 @@ def test_forget_all_clears_both_tables(tmp_path: Path) -> None:
 
     assert count(store, "brain_sessions") == 0
     assert count(store, "opencode_sessions") == 0
+
+
+def test_forget_chat_clears_chat_state_bot_state_chats_and_decisions(
+    tmp_path: Path,
+) -> None:
+    """T15：三张新表走同一份 CHAT_SCOPED_TABLES 清单，别的会话不受影响。"""
+    store = make_store(tmp_path)
+    store.save_chat_state(
+        ChatType.GROUP, "21", {"muted_until": 9999.0, "no_reply_streak": 2}
+    )
+    store.set_bot_state_chat(ChatType.GROUP, "21", focus="鱼缸", mood_note="好奇")
+    store.record_decision(
+        ChatType.GROUP,
+        "21",
+        outcome="replied",
+        read="r",
+        think="t",
+        reason="因为",
+        reply_preview="好",
+    )
+    store.save_chat_state(ChatType.GROUP, "22", {"muted_until": 1234.0})
+    store.set_bot_state_chat(ChatType.GROUP, "22", focus="别的")
+    store.record_decision(ChatType.GROUP, "22", outcome="held", reason="别的群")
+
+    store.forget_chat(ChatType.GROUP, "21")
+
+    for table in ("chat_state", "bot_state_chats", "decisions"):
+        gone = store._conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE chat_type = ? AND chat_id = ?",
+            (ChatType.GROUP.value, "21"),
+        ).fetchone()[0]
+        assert int(gone) == 0, f"{table} 该会话的行必须随 forget_chat 清空"
+    # 另一会话的三张表都原样保留。
+    other_state = store.load_chat_state(ChatType.GROUP, "22")
+    assert other_state is not None and other_state["muted_until"] == 1234.0
+    other_bot = store.get_bot_state_chat(ChatType.GROUP, "22")
+    assert other_bot is not None and other_bot["focus"] == "别的"
+    other_decisions = store.list_decisions(chat_type=ChatType.GROUP, chat_id="22")
+    assert len(other_decisions) == 1
