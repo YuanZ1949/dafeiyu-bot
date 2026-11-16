@@ -132,7 +132,7 @@ jobs:
       - name: Run pytest
         shell: pwsh
         run: |
-          & .\.ci-venv\Scripts\python.exe -m pytest -q --junitxml=junit.xml
+          & .\.ci-venv\Scripts\python.exe -m pytest -q --cov=dafeiyu --cov-report=term-missing --cov-fail-under=83 --junitxml=junit.xml
           exit $LASTEXITCODE
 
       # 真实浏览器 E2E（headless Edge + CDP）：本机没有 Edge 时用例会 skip，

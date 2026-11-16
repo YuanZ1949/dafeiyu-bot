@@ -22,6 +22,7 @@ dev = [
     "respx>=0.21",
     "ruff>=0.17",
     "basedpyright>=1.39",
+    "pytest-cov>=5",
 ]
 # 桌面微信桥的可选依赖。注意：PyPI 上的 `pyweixin` 只有 0.1.0 且没有分发文件，
 # `pip install pyweixin` 会直接 No matching distribution；上游把 import 名
