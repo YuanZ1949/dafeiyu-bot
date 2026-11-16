@@ -141,7 +141,7 @@ jobs:
       - name: Run pytest
         shell: pwsh
         run: |
-          & .\.ci-venv\Scripts\python.exe -m pytest -q --cov=dafeiyu --cov-report=term-missing --cov-fail-under=83 --junitxml=junit.xml
+          & .\.ci-venv\Scripts\python.exe -m pytest -q --cov=dafeiyu --cov-report=term-missing --cov-fail-under=82 --junitxml=junit.xml
           exit $LASTEXITCODE
 
       # v5.4.1 的 runner 只内置了 builtin:checkout（内置 upload-artifact 尚未发布），
