@@ -309,8 +309,15 @@ def _attachment_from_segment(seg_type: str, data: dict[str, Any]) -> Attachment 
         )
         if not name:
             return None
+        # 群文件定位信息：file_id/busid 供后续向 OneBot 索回；url 仅在
+        # 确实是非空字符串时保留为 source。
         return Attachment(
-            kind="file", name=name, size=_as_int(data.get("size"))
+            kind="file",
+            name=name,
+            size=_as_int(data.get("size")),
+            source=_pick_media_source(data, ("url",)),
+            file_id=str(data.get("file_id") or ""),
+            busid=str(data.get("busid") or ""),
         )
     if seg_type == "face":
         name = _clip_first(data.get("id"), _ATTACHMENT_NAME_CLIP)

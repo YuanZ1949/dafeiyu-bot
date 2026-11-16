@@ -19,7 +19,7 @@ from dafeiyu.gateway.qq import (
     _pending_forward_ids,
     parse_event,
 )
-from dafeiyu.models import ChatType, Message, NoticeEvent
+from dafeiyu.models import Attachment, ChatType, Message, NoticeEvent
 
 BOT_QQ = 10001
 
@@ -533,6 +533,48 @@ def test_media_segments_become_attachments() -> None:
     assert all(a.path == "" for a in m.attachments)
 
 
+def test_file_segment_keeps_locator_metadata() -> None:
+    atts = _attachments_from_segments(
+        [
+            {
+                "type": "file",
+                "data": {"name": "report.pdf", "size": "12", "file_id": "fid", "busid": "7"},
+            }
+        ]
+    )
+    assert atts == [
+        Attachment(kind="file", name="report.pdf", size=12, file_id="fid", busid="7")
+    ]
+    # 不产生 path；url 缺失时 source 也为空
+    assert atts[0].path == ""
+    assert atts[0].source == ""
+
+
+def test_file_segment_without_locator_defaults_and_url_source() -> None:
+    # 缺 file_id/busid → 空串，不抛异常
+    missing = _attachments_from_segments(
+        [{"type": "file", "data": {"name": "a.pdf", "size": "12"}}]
+    )
+    assert missing == [Attachment(kind="file", name="a.pdf", size=12)]
+
+    # url 是非空字符串 → 保留为 source
+    with_url = _attachments_from_segments(
+        [{"type": "file", "data": {"name": "a.pdf", "url": "https://x/a.pdf"}}]
+    )
+    assert with_url == [Attachment(kind="file", name="a.pdf", source="https://x/a.pdf")]
+
+
+def test_file_segment_ignores_non_string_url() -> None:
+    atts = _attachments_from_segments(
+        [
+            {"type": "file", "data": {"name": "a.pdf", "url": 42}},
+            {"type": "file", "data": {"name": "b.pdf", "url": "  "}},
+        ]
+    )
+    assert atts == [
+        Attachment(kind="file", name="a.pdf"),
+        Attachment(kind="file", name="b.pdf"),
+    ]
 def test_unknown_and_malformed_segments_have_no_attachments() -> None:
     m = parse_event(
         group_event(
