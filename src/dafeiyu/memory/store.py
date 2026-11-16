@@ -5097,6 +5097,31 @@ class Store:
             for row in rows
         ]
 
+    def usage_by_purpose(self, start_date: str, end_date: str) -> list[dict[str, object]]:
+        """按用途聚合区间内用量；calls 只算 reply/ambient，tokens 算全部用途。"""
+        rows = self._conn.execute(
+            """
+            SELECT purpose,
+                   SUM(CASE WHEN purpose IN ('reply', 'ambient') THEN 1 ELSE 0 END) AS calls,
+                   SUM(CASE WHEN purpose = 'error' THEN 1 ELSE 0 END) AS errors,
+                   COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens
+            FROM usage
+            WHERE date >= ? AND date <= ?
+            GROUP BY purpose
+            ORDER BY tokens DESC, purpose ASC
+            """,
+            (start_date, end_date),
+        ).fetchall()
+        return [
+            {
+                "purpose": str(row["purpose"]),
+                "calls": int(row["calls"] or 0),
+                "errors": int(row["errors"] or 0),
+                "tokens": int(row["tokens"] or 0),
+            }
+            for row in rows
+        ]
+
     # ---- decisions -------------------------------------------------
     def record_decision(
         self,

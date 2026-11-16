@@ -1821,6 +1821,7 @@ class BrainControl:
             "series": series,
             "totals": totals,
             "top": self.store.usage_top(start.isoformat(), 5),
+            "purposes": self.store.usage_by_purpose(start.isoformat(), end.isoformat()),
             "recent_errors": self.store.recent_errors(10),
         }
 
