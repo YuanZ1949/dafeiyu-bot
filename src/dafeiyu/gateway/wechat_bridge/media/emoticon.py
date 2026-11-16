@@ -282,16 +282,21 @@ def _transcode_still(
     timeout: float,
     frames: int,
 ) -> bytes | None:
-    """把 HEVC 转成单帧 PNG；两帧容器取体积最大的一帧（细节最多）。
+    """把 HEVC 转成单帧 PNG；多帧容器取体积最大的一帧（细节最多）。
 
     实测微信原图的 2 帧里首帧常是纯白，体积最大的那帧才是真正的画面。
+    这里**一次导出所有候选帧**再挑最大的：逐帧 ``select=eq(n\\,i)`` 在
+    真实的 2 帧 HEVC 流上会一帧都不输出（exit 0、无文件），结果永远只剩
+    纯白首帧——图片到对面平台变成白图就是这么来的。
     """
-    limit = frames if 0 < frames <= _STILL_FRAME_LIMIT else 1
-    best: bytes | None = None
-    for index in range(limit):
+    limit = (
+        min(frames, _STILL_FRAME_LIMIT)
+        if frames > 0
+        else _STILL_FRAME_LIMIT
+    )
+    if limit <= 1:
         # 单帧保持 ``out.png``：旧调用方/测试按这个文件名断言。
-        name = "out.png" if limit == 1 else f"still-{index}.png"
-        target = directory / name
+        targets = [directory / "out.png"]
         args = [
             binary,
             "-hide_banner",
@@ -302,24 +307,38 @@ def _transcode_still(
             "hevc",
             "-i",
             str(source),
-            "-vf",
-            f"select=eq(n\\,{index})",
-            "-vsync",
-            "0",
             "-frames:v",
             "1",
-            "-update",
-            "1",
-            str(target),
+            str(targets[0]),
         ]
-        completed = _run(args, timeout)
-        if completed.returncode != 0:
-            log.debug(
-                "ffmpeg 转码静图失败（frame=%d exit=%s）",
-                index,
-                completed.returncode,
-            )
-            continue
+    else:
+        targets = []
+        args = [
+            binary,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "hevc",
+            "-i",
+            str(source),
+            "-fps_mode",
+            "passthrough",
+            "-frames:v",
+            str(limit),
+            str(directory / "still-%02d.png"),
+        ]
+    completed = _run(args, timeout)
+    if completed.returncode != 0:
+        log.debug(
+            "ffmpeg 转码静图失败（exit=%s）", completed.returncode
+        )
+        return None
+    if not targets:
+        targets = sorted(directory.glob("still-*.png"))
+    best: bytes | None = None
+    for target in targets:
         try:
             data = target.read_bytes()
         except OSError:

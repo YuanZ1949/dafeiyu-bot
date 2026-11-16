@@ -62,6 +62,27 @@ def loop_rows(store: Store) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def insert_loop(
+    store: Store,
+    content: str,
+    kind: str = "question",
+    *,
+    age_days: float = 1,
+    chat_id: str = CHAT,
+) -> int:
+    """直接落一条历史 open 行，绕过 add_open_loop 的 24h 去重。"""
+    cur = store._conn.execute(
+        """
+        INSERT INTO open_loops (
+            chat_type, chat_id, kind, content, status, created_at
+        ) VALUES (?, ?, ?, ?, 'open', datetime('now', ?))
+        """,
+        (GROUP.value, chat_id, kind, content, f"-{age_days} days"),
+    )
+    store._conn.commit()
+    return int(cur.lastrowid or 0)
+
+
 # ---- (a) 近重复归一化去重 ---------------------------------------------------
 
 
@@ -99,6 +120,38 @@ def test_different_content_still_creates_new_row(store: Store) -> None:
     assert len(loop_rows(store)) == 2
 
 
+def test_approximate_same_kind_dedupes(store: Store) -> None:
+    """同一件事的两种说法（不是逐字相同）也只留一条。"""
+    first = store.add_open_loop(
+        OpenLoop(GROUP, CHAT, "question", "大肥鱼取代打工人你怎么看")
+    )
+    again = store.add_open_loop(
+        OpenLoop(
+            GROUP,
+            CHAT,
+            "question",
+            "问 AI（大肥鱼）取代打工人怎么看，无人接话",
+        )
+    )
+
+    assert again == first
+    rows = loop_rows(store)
+    assert len(rows) == 1
+    assert rows[0]["content"] == "大肥鱼取代打工人你怎么看"
+
+
+def test_similar_but_different_kind_is_not_merged(store: Store) -> None:
+    """plan 和 question 共用几个 bigram 也不能并：等结果 != 问看法。"""
+    plan = store.add_open_loop(OpenLoop(GROUP, CHAT, "plan", "说好周末去钓鱼"))
+    question = store.add_open_loop(
+        OpenLoop(GROUP, CHAT, "question", "周末去钓鱼吗")
+    )
+
+    assert question != plan
+    assert len(loop_rows(store)) == 2
+    assert {row["kind"] for row in loop_rows(store)} == {"plan", "question"}
+
+
 # ---- (b) 7 天 TTL 仍然生效 --------------------------------------------------
 
 
@@ -117,6 +170,73 @@ def test_week_old_open_loop_is_dropped_by_ttl(store: Store) -> None:
     row = loop_rows(store)[0]
     assert row["status"] == "dropped"
     assert row["closed_at"] is not None
+
+
+def test_question_expires_sooner_than_plan(store: Store) -> None:
+    """默认 TTL 分 kind：问题 3 天，计划 7 天；四天前的问题该走，计划该留。"""
+    question = store.add_open_loop(
+        OpenLoop(GROUP, CHAT, "question", "四天前的问题")
+    )
+    plan = store.add_open_loop(OpenLoop(GROUP, CHAT, "plan", "四天前的计划"))
+    store._conn.execute(
+        "UPDATE open_loops SET created_at = datetime('now', '-4 days') "
+        "WHERE id IN (?, ?)",
+        (question, plan),
+    )
+    store._conn.commit()
+
+    assert store.expire_open_loops(GROUP, CHAT) == 1
+    statuses = {row["id"]: row["status"] for row in loop_rows(store)}
+    assert statuses[question] == "dropped"
+    assert statuses[plan] == "open"
+
+
+def test_open_loop_cap_drops_oldest(store: Store) -> None:
+    """每群最多 6 条 open；第 7 条起最旧的自动 dropped，历史行保留。"""
+    topics = [
+        "灯怎么选",
+        "周末钓鱼",
+        "显卡推荐",
+        "房租上涨",
+        "猫粮换牌",
+        "膝盖疼痛",
+        "明天下雨",
+        "手机续航",
+    ]
+    ids = [
+        store.add_open_loop(OpenLoop(GROUP, CHAT, "question", text))
+        for text in topics
+    ]
+
+    assert len(set(ids)) == len(topics)
+    assert len(store.open_loops(GROUP, CHAT, limit=10)) == 6
+    statuses = {row["id"]: row["status"] for row in loop_rows(store)}
+    assert statuses[ids[0]] == "dropped"
+    assert statuses[ids[1]] == "dropped"
+    assert statuses[ids[-1]] == "open"
+
+
+def test_converge_merges_historical_near_duplicates(store: Store) -> None:
+    """绕过 add 的 24h 窗口直接落两条历史行：收敛时保留最新一条。"""
+    old = insert_loop(
+        store,
+        "下一个回收决断点在北京时间明天凌晨2:45，群里等结果",
+        "plan",
+        age_days=2,
+    )
+    new = insert_loop(
+        store,
+        "下一个回收决断点在北京时间明天凌晨2:45，群里仍在等结果",
+        "plan",
+        age_days=1,
+    )
+
+    assert store.converge_open_loops(GROUP, CHAT) == 1
+    rows = loop_rows(store)
+    assert len(rows) == 2  # 只改 status，不删历史
+    statuses = {row["id"]: row["status"] for row in rows}
+    assert statuses[old] == "dropped"
+    assert statuses[new] == "open"
 
 
 # ---- (c)/(d) 24 小时不重开 --------------------------------------------------

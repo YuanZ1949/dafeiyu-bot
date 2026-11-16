@@ -53,8 +53,10 @@
     --w-confirm: 190px;
     /* 卡片与间距 token：同一分区内的卡片内边距、圆角、间距共用一套数值 */
     --card-pad: 14px;
-    --card-radius: 10px;
-    --card-gap: 14px;
+    --card-radius: 12px;
+    --card-gap: 12px;
+    /* 桌面左侧栏宽度；窄屏媒体查询会把外层壳退化成单列 */
+    --side-w: 208px;
   }
   /* 浅色主题：与 :root 的调色板令牌一一对应（尺寸令牌共用，不重复）。
      正文对白底对比度 ≥ 4.5:1，边框与面板保持可分辨。默认仍是深色。 */
@@ -97,15 +99,27 @@
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 12px;
-    padding: 16px 20px;
+    gap: 10px;
+    padding: 10px 20px;
     border-bottom: 1px solid var(--line);
     background: var(--panel);
     position: sticky;
     top: 0;
     z-index: 5;
   }
-  header h1 { font-size: var(--fs-lg); margin: 0; font-weight: 600; }
+  header h1 {
+    display: flex; align-items: center; gap: 8px;
+    font-size: var(--fs-lg); margin: 0; font-weight: 600; white-space: nowrap;
+  }
+  .brand-mark {
+    width: 18px; height: 18px; flex: 0 0 auto; border-radius: 6px;
+    background: linear-gradient(135deg, var(--accent), var(--hot));
+    box-shadow: 0 0 0 3px var(--mode-glow);
+  }
+  .brand-sub {
+    color: var(--muted); font-size: var(--fs-xs); font-weight: 500;
+    letter-spacing: .14em; text-transform: uppercase;
+  }
   .spacer { flex: 1; }
   .global-banner {
     padding: 10px 20px;
@@ -137,13 +151,28 @@
   .btn.danger { background: var(--danger-deep); border-color: var(--danger-deep); }
   .btn:disabled { opacity: .7; cursor: not-allowed; }
 .btn[data-busy="1"] { opacity: .55; pointer-events: none; cursor: progress; }
-  /* minmax(0, 1fr) 而不是默认的 auto 轨道：窄屏时 auto 轨道会按内容的
-     min-content 撑宽（决策流里 nowrap 的摘要就能撑到 1000px），整页横向溢出。 */
-  main { margin: 0 auto; padding: 16px 20px 40px; display: grid; gap: var(--card-gap); max-width: 1400px; grid-template-columns: minmax(0, 1fr); }
-  @media (min-width: 1280px) {
-    main { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
-    .span-full { grid-column: 1 / -1; }
+  /* 应用外壳：桌面为「左侧栏 + 内容」两列；内容列只铺当前分区。
+     窄屏在媒体查询里退化成单列 + 顶部横向导航。 */
+  .shell {
+    display: grid;
+    grid-template-columns: var(--side-w) minmax(0, 1fr);
+    align-items: stretch;
+    max-width: 1680px;
+    margin: 0 auto;
+    min-height: calc(100vh - var(--header-h, 0px));
+    /* 侧栏列整页高都保持面板底色，滚到长页底部也不会出现一条断层。 */
+    background: linear-gradient(to right, var(--panel) var(--side-w), var(--bg) var(--side-w));
   }
+  .sidebar {
+    position: sticky; top: var(--header-h, 0px); align-self: start;
+    display: flex; flex-direction: column;
+    height: calc(100vh - var(--header-h, 0px));
+    padding: 12px 10px 16px;
+    background: var(--panel);
+    border-right: 1px solid var(--line);
+  }
+  main { min-width: 0; width: 100%; padding: 20px 24px 48px; }
+  .span-full { grid-column: 1 / -1; }
   .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--card-gap); }
   .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--card-gap); }
   .card {
@@ -151,32 +180,68 @@
     border: 1px solid var(--line);
     border-radius: var(--card-radius);
     padding: var(--card-pad);
+    transition: border-color .16s ease;
   }
-  /* 分区：每个分区占满整行，内部再按两列排版；一张卡片只归属一个分区。
-     scroll-margin-top 让「跳转分区」不会把标题藏在 sticky 顶栏 + 导航下面。 */
+  .card:hover { border-color: color-mix(in srgb, var(--line) 55%, var(--accent)); }
+  /* 单页签：一次只渲染一个分区；切换只改 .active，不动其它卡片的 DOM。 */
   .pane {
-    display: grid; gap: var(--card-gap); grid-column: 1 / -1;
+    display: none;
+    gap: var(--card-gap);
     grid-template-columns: minmax(0, 1fr);
-    scroll-margin-top: calc(var(--header-h, 0px) + 52px);
+    scroll-margin-top: calc(var(--header-h, 0px) + 16px);
   }
-  @media (min-width: 1280px) {
-    .pane { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  .pane.active { display: grid; }
+  @media (min-width: 1180px) {
+    .pane.active { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
   }
   .pane-title {
-    grid-column: 1 / -1; margin: 0;
-    padding-bottom: 6px; border-bottom: 1px solid var(--line);
-    font-size: var(--fs-sm); font-weight: 600; letter-spacing: .08em;
-    color: var(--muted);
+    grid-column: 1 / -1; margin: 0 0 2px;
+    font-size: 20px; font-weight: 600; letter-spacing: .01em;
+    color: var(--text);
   }
-  /* 分区导航：顶栏之下再吸一条，只做锚点跳转，不隐藏任何卡片。 */
+  /* 分区导航：桌面竖排在左栏内，只吸附在顶栏之下，不遮挡内容。 */
   .pane-nav {
     position: sticky; top: var(--header-h, 0px); z-index: 4;
-    display: flex; gap: 8px; overflow-x: auto;
-    padding: 8px 20px;
-    background: var(--bg); border-bottom: 1px solid var(--line);
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 4px 0;
+    overflow-y: auto;
   }
-  .pane-nav .btn { flex: 0 0 auto; }
-  .pane-nav .btn.active { border-color: var(--accent); background: var(--mode-active); }
+  .pane-nav .btn {
+    display: flex; align-items: center; gap: 10px;
+    width: 100%; padding: 8px 10px;
+    text-align: left; color: var(--muted);
+    background: transparent; border-color: transparent;
+    border-radius: 8px;
+  }
+  .pane-nav .btn:hover { color: var(--text); background: var(--panel-2); border-color: transparent; }
+  .pane-nav .btn.active { color: var(--text); border-color: var(--accent); background: var(--mode-active); }
+  .nav-icon { width: 18px; height: 18px; flex: 0 0 auto; opacity: .9; }
+  .pane-nav .btn.active .nav-icon { color: var(--accent); opacity: 1; }
+  .nav-label { font-size: 13px; letter-spacing: .01em; }
+  .side-foot {
+    margin-top: auto; padding: 12px 10px 0;
+    border-top: 1px solid var(--line);
+    color: var(--muted); font-size: var(--fs-xs); line-height: 1.7;
+  }
+  .side-foot b { color: var(--text); font-weight: 600; }
+  /* 总览 KPI：四格真实指标，比卡片更轻，首屏就能读到系统状态。 */
+  .kpi-row {
+    grid-column: 1 / -1;
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: var(--card-gap);
+  }
+  .kpi {
+    display: grid; gap: 2px; padding: 12px 14px;
+    background: var(--panel); border: 1px solid var(--line);
+    border-top: 2px solid var(--line);
+    border-radius: var(--card-radius);
+  }
+  .kpi[data-tone="ok"] { border-top-color: var(--ok); }
+  .kpi[data-tone="warn"] { border-top-color: var(--warn); }
+  .kpi[data-tone="bad"] { border-top-color: var(--bad); }
+  .kpi-label { color: var(--muted); font-size: var(--fs-xs); letter-spacing: .08em; }
+  .kpi-value { font-size: 22px; font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums; }
+  .kpi-note { color: var(--muted); font-size: var(--fs-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   /* 卡片最近一次刷新时间：默认藏在标题行，markUpdated() 写时间时现形。 */
   .card-updated {
     color: var(--muted); font-size: var(--fs-xs); white-space: nowrap;
@@ -234,6 +299,34 @@
   .mem-text { white-space: pre-wrap; word-break: break-word; }
   .mem-actions { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
   .mem-empty { color: var(--muted); font-size: var(--fs-sm); padding: 8px 4px; white-space: pre-line; }
+  /* 未了事：一条一行，kind / 会话 / 挂多久都在同一行里，右侧只留两个动作。 */
+  .open-loops-list { display: grid; gap: 6px; max-height: var(--list-h-mem); overflow: auto; }
+  .open-loop-item {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 14px;
+    align-items: center;
+    border: 1px solid var(--line); border-left: 3px solid var(--line);
+    border-radius: 8px; padding: 8px 12px; background: var(--panel-2);
+  }
+  .open-loop-item[data-kind="question"] { border-left-color: var(--accent); }
+  .open-loop-item[data-kind="promise"] { border-left-color: var(--warn); }
+  .open-loop-item[data-kind="plan"] { border-left-color: var(--ok); }
+  .open-loop-item[data-kind="running_joke"] { border-left-color: var(--hot); }
+  .open-loop-main { min-width: 0; }
+  .open-loop-meta {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    color: var(--muted); font-size: var(--fs-xs); margin-bottom: 3px;
+  }
+  .open-loop-text { white-space: pre-wrap; word-break: break-word; }
+  .open-loop-actions { display: flex; gap: 6px; }
+  .open-loop-actions .btn { padding: 4px 10px; font-size: var(--fs-xs); }
+  .kind-tag {
+    padding: 1px 7px; border-radius: 999px; font-size: 11px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .kind-tag[data-kind="question"] { color: var(--accent); border-color: var(--accent); }
+  .kind-tag[data-kind="promise"] { color: var(--warn); border-color: var(--warn); }
+  .kind-tag[data-kind="plan"] { color: var(--ok); border-color: var(--ok); }
+  .kind-tag[data-kind="running_joke"] { color: var(--hot); border-color: var(--hot); }
   .alert-item { border-left-width: 3px; border-left-style: solid; }
   .alert-item.sev-critical { border-left-color: var(--bad); }
   .alert-item.sev-warning { border-left-color: var(--warn); }
@@ -637,22 +730,44 @@
   .search-group h3 { margin: 0; font-size: var(--fs-sm); color: var(--muted); font-weight: 600; }
   .search-group .mem-list { max-height: none; }
   .search-group .mem-item { cursor: pointer; }
-  /* 手机端：窄屏单列、控件铺满、触控目标加大；桌面布局不受影响。 */
+  /* 手机端：单列壳、顶部横向页签、控件铺满、触控目标加大；桌面布局不受影响。 */
   @media (max-width: 720px) {
     /* 按钮换行后顶栏会占掉小半个屏幕，手机上让它随页面滚走。 */
     header { position: static; padding: 10px 12px; gap: 8px; }
     header h1 { width: 100%; font-size: 15px; }
+    .brand-sub { display: none; }
     header .spacer { display: none; }
     header .btn { flex: 1 1 auto; min-height: 40px; padding: 8px 10px; font-size: 13px; }
     .global-banner, .warn { padding: 8px 12px; }
-    main { padding: 10px 10px 32px; gap: 10px; }
+    /* 壳退化成单列：侧栏变顶部横向导航条。 */
+    .shell { display: block; min-height: 0; background: none; }
+    .sidebar {
+      position: sticky; top: 0; z-index: 4; height: auto;
+      padding: 6px 8px;
+      background: var(--bg); border-right: 0; border-bottom: 1px solid var(--line);
+    }
+    .pane-nav {
+      flex-direction: row; gap: 6px;
+      padding: 2px; overflow-x: auto; overflow-y: hidden;
+    }
+    .pane-nav .btn {
+      width: auto; flex: 1 1 auto; justify-content: center; gap: 6px; padding: 7px 8px;
+      border-color: var(--line); background: var(--panel);
+    }
+    /* 手机宽度只够放 6 个两字标签：图标让位，避免把「日志」挤出屏幕。 */
+    .nav-icon { display: none; }
+    .side-foot { display: none; }
+    main { padding: 12px 10px 32px; }
     .card { padding: 12px; border-radius: 8px; }
-    /* 手机上顶栏本来就随页面滚走，分区导航直接吸顶，不留 --header-h 的空隙。 */
-    .pane-nav { top: 0; padding: 8px 10px; }
+    .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .kpi { padding: 10px 12px; }
+    .kpi-value { font-size: 19px; }
+    .pane-title { font-size: 17px; }
+    /* 顶部横向导航吸顶，分区滚动不把它带走。 */
+    .pane { scroll-margin-top: 52px; }
     /* 顶栏换行后搜索框铺满一行，结果面板贴住屏幕两侧。 */
     #global-search { width: 100%; }
     #search-panel { top: 8px; left: 8px; right: 8px; width: auto; max-height: 70vh; }
-    .pane { scroll-margin-top: 52px; }
     /* 这三处 minmax 的下限大于窄屏可用宽度，必须显式收成单列，否则会横向溢出。 */
     .grid-2, .grid-3, .mem-grid { grid-template-columns: 1fr; }
     .grow { flex-basis: 100%; min-width: 0; }
@@ -687,7 +802,7 @@
 </head>
 <body>
 <header>
-  <h1>大肥鱼控制台</h1>
+  <h1><span class="brand-mark" aria-hidden="true"></span>大肥鱼控制台<span class="brand-sub">supervisor</span></h1>
   <span id="hub-state" class="pill"><span class="dot"></span><span>连接中…</span></span>
   <span class="spacer"></span>
   <input id="global-search" type="search" placeholder="搜索会话 / 消息 / 决策" autocomplete="off" aria-label="搜索会话、消息与决策" />
@@ -703,15 +818,6 @@
   <button class="btn" type="button" id="free-banner-go">去切换</button>
 </div>
 <div class="global-banner" id="global-banner" role="status" hidden></div>
-
-<nav class="pane-nav" id="pane-nav" aria-label="面板分区导航">
-  <button type="button" class="btn active" data-pane="pane-overview" aria-current="true">总览</button>
-  <button type="button" class="btn" data-pane="pane-memory">记忆</button>
-  <button type="button" class="btn" data-pane="pane-chats">会话</button>
-  <button type="button" class="btn" data-pane="pane-delivery">投递</button>
-  <button type="button" class="btn" data-pane="pane-config">配置</button>
-  <button type="button" class="btn" data-pane="pane-logs">日志</button>
-</nav>
 
 <div id="search-panel" hidden aria-label="全局搜索结果">
   <div class="kv" id="search-note">会话与决策只检索最近 200 条；消息按关键词检索。Esc 关闭。</div>
@@ -729,9 +835,66 @@
   </div>
 </div>
 
+<div class="shell">
+  <aside class="sidebar">
+    <nav class="pane-nav" id="pane-nav" aria-label="面板分区导航">
+      <button type="button" class="btn active" data-pane="pane-overview" aria-current="true">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        <span class="nav-label">总览</span>
+      </button>
+      <button type="button" class="btn" data-pane="pane-memory">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+        <span class="nav-label">记忆</span>
+      </button>
+      <button type="button" class="btn" data-pane="pane-chats">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-8 8H7l-4 3v-6.5A8 8 0 1 1 21 12Z"/><path d="M8 11h8M8 15h5"/></svg>
+        <span class="nav-label">会话</span>
+      </button>
+      <button type="button" class="btn" data-pane="pane-delivery">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4 20-7Z"/><path d="M22 2 11 13"/></svg>
+        <span class="nav-label">投递</span>
+      </button>
+      <button type="button" class="btn" data-pane="pane-config">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h9M17 18h3"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="15" cy="18" r="2"/></svg>
+        <span class="nav-label">配置</span>
+      </button>
+      <button type="button" class="btn" data-pane="pane-logs">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></svg>
+        <span class="nav-label">日志</span>
+      </button>
+    </nav>
+    <div class="side-foot">
+      <div><b>自动刷新</b> · 5s</div>
+      <div>只显示当前分区</div>
+    </div>
+  </aside>
+
 <main>
   <section class="pane" id="pane-overview">
     <h2 class="pane-title">总览</h2>
+
+    <section class="kpi-row" id="kpi-row" aria-label="关键指标">
+      <div class="kpi" id="kpi-processes">
+        <span class="kpi-label">进程</span>
+        <strong class="kpi-value">—</strong>
+        <span class="kpi-note">等待状态</span>
+      </div>
+      <div class="kpi" id="kpi-channels">
+        <span class="kpi-label">通道</span>
+        <strong class="kpi-value">—</strong>
+        <span class="kpi-note">等待健康数据</span>
+      </div>
+      <div class="kpi" id="kpi-alerts">
+        <span class="kpi-label">告警</span>
+        <strong class="kpi-value">—</strong>
+        <span class="kpi-note">等待告警数据</span>
+      </div>
+      <div class="kpi" id="kpi-memory">
+        <span class="kpi-label">记忆库</span>
+        <strong class="kpi-value">—</strong>
+        <span class="kpi-note">等待健康数据</span>
+      </div>
+    </section>
 
     <section class="grid-3 span-full" id="processes"></section>
 
@@ -798,6 +961,17 @@
 
   <section class="pane" id="pane-memory">
     <h2 class="pane-title">记忆</h2>
+
+    <section class="card span-full" data-card="open-loops" id="open-loops-card">
+      <div class="row card-head">
+        <h2>未了事</h2>
+        <span class="kv" id="open-loops-hint"></span>
+        <span class="spacer"></span>
+        <span class="kv card-updated" data-updated hidden></span>
+        <button class="btn" id="btn-refresh-open-loops">刷新</button>
+      </div>
+      <div class="open-loops-list" id="open-loops-list"></div>
+    </section>
 
     <section class="card span-full" data-card="memory">
       <div class="row card-head">
@@ -1314,6 +1488,29 @@
       <div class="kv" style="margin-top:8px">同时登录多个微信账号时必须填写，否则 hook 启动会报「多个微信账号同时登录」。保存后下次运行 scripts/start-all.ps1 时用它启动 hook。</div>
     </section>
 
+    <section class="card" id="account-card" hidden>
+      <div class="row card-head">
+        <h2>面板账号</h2>
+        <span class="kv" id="account-hint">改密后其它设备需重新登录</span>
+        <span class="spacer"></span>
+      </div>
+      <div class="debug-form">
+        <label>当前密码
+          <input type="password" id="account-current" autocomplete="current-password" aria-label="当前面板密码" />
+        </label>
+        <label>新密码（至少 12 位）
+          <input type="password" id="account-new" autocomplete="new-password" minlength="12" aria-label="新面板密码，至少 12 位" />
+        </label>
+        <label>确认新密码
+          <input type="password" id="account-confirm" autocomplete="new-password" minlength="12" aria-label="再次输入新面板密码" />
+        </label>
+      </div>
+      <div class="row mt-2">
+        <button class="btn primary" id="btn-change-password">更新密码</button>
+        <span class="kv" id="account-status" role="status" aria-live="polite"></span>
+      </div>
+    </section>
+
     <section class="card" id="security-card">
       <div class="row card-head">
         <h2>安全</h2>
@@ -1375,6 +1572,7 @@
   </section>
 
 </main>
+</div>
 
 <div class="drawer-backdrop" id="timeline-backdrop" hidden></div>
 <aside class="timeline-drawer" id="timeline-drawer" hidden role="dialog" aria-modal="true" aria-label="会话时间线">
@@ -1493,6 +1691,10 @@ const decisionExpanded = new Set();
 let usageDays = 7;
 let healthQuotaPaused = false;
 let healthReadFailed = false;
+// KPI 复用既有轮询结果：健康帧里的通道/记忆库、告警摘要，不额外发请求。
+let healthChannels = null;
+let healthMemory = null;
+let alertsSummary = null;
 // 最近 7 天缺摘要的天数：由记忆体检接口写入，顶部横幅据此提醒。
 let memoryPendingDays = 0;
 let lastQrKey = "";
@@ -1570,37 +1772,47 @@ function initPaneNav() {
   const nav = $("pane-nav");
   if (!nav) return;
   const buttons = Array.from(nav.querySelectorAll("[data-pane]"));
+  const panes = Array.from(document.querySelectorAll(".pane"));
+  const paneFromHash = () => {
+    const id = (location.hash || "").replace(/^#/, "");
+    return panes.some((pane) => pane.id === id) ? id : "";
+  };
   const markActive = (paneId) => {
+    const target = panes.find((pane) => pane.id === paneId);
+    if (!target) return;
+    // 单页签：只切 .active，其它分区保持原样，切回来时列表/滚动位置都还在。
+    panes.forEach((pane) => pane.classList.toggle("active", pane === target));
     buttons.forEach((button) => {
       const on = button.dataset.pane === paneId;
       button.classList.toggle("active", on);
       if (on) button.setAttribute("aria-current", "true");
       else button.removeAttribute("aria-current");
     });
+    return target;
+  };
+  const activate = (paneId, { updateHash = true, scroll = true } = {}) => {
+    const target = markActive(paneId);
+    if (!target) return;
+    if (updateHash && location.hash !== `#${paneId}`) {
+      // replaceState 不触发 hashchange，也不往历史里堆栈；刷新后仍停在这个分区。
+      history.replaceState(null, "", `#${paneId}`);
+    }
+    // 切到新分区后回到内容顶部；单页签下这一跳就是「翻页」的落点。
+    if (scroll) target.scrollIntoView({ behavior: "smooth", block: "start" });
   };
   buttons.forEach((button) => {
-    button.addEventListener("click", () => {
-      const pane = $(button.dataset.pane);
-      if (!pane) return;
-      markActive(button.dataset.pane);
-      pane.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
+    button.addEventListener("click", () => activate(button.dataset.pane));
   });
-  const panes = buttons.map((button) => $(button.dataset.pane)).filter(Boolean);
-  if (!panes.length || !("IntersectionObserver" in window)) return;
-  const observer = new IntersectionObserver(
-    (entries) => {
-      // 只看进入「顶栏下方那一条」的分区，取最靠上的一个作为当前分区。
-      const visible = entries
-        .filter((entry) => entry.isIntersecting)
-        .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
-      if (visible.length) markActive(visible[0].target.id);
-    },
-    { rootMargin: "-20% 0px -65% 0px", threshold: 0 },
-  );
-  panes.forEach((pane) => observer.observe(pane));
+  window.addEventListener("hashchange", () => {
+    const paneId = paneFromHash();
+    if (paneId) activate(paneId, { updateHash: false });
+  });
+  // 先量顶栏高度，scroll-margin-top 才是准确值；首屏无 hash 时不要滚动，
+  // 否则手机上会把静态顶栏滚走、只留下吸顶的横向导航。
   syncHeaderHeight();
   window.addEventListener("resize", syncHeaderHeight);
+  const initial = paneFromHash();
+  activate(initial || "pane-overview", { updateHash: false, scroll: Boolean(initial) });
 }
 
 // 登录二维码卡：未登录时照旧露二维码；已登录时收成一行，点标题再展开。
@@ -1758,7 +1970,54 @@ async function loadAuthSession() {
       } catch (_) { /* api() 已处理 401 */ }
       location.replace("/login");
     });
+    initPasswordForm(data.user);
   } catch (_) { /* api() 已在 401 时跳转 */ }
+}
+
+function initPasswordForm(user) {
+  $("account-card").hidden = false;
+  if (user) $("account-hint").textContent = `${user} · 改密后其它设备需重新登录`;
+  const status = $("account-status");
+  const setStatus = (text, isError = false) => {
+    status.textContent = text;
+    status.style.color = isError ? "var(--bad)" : "";
+  };
+  const submit = async () => {
+    const current = $("account-current").value;
+    const next = $("account-new").value;
+    const confirm = $("account-confirm").value;
+    if (next.length < 12) {
+      setStatus("新密码至少 12 位", true);
+      return;
+    }
+    if (next !== confirm) {
+      setStatus("两次输入的新密码不一致", true);
+      return;
+    }
+    setStatus("更新中…");
+    try {
+      await api("/api/auth/password", {
+        method: "POST",
+        body: JSON.stringify({ current, new: next, confirm }),
+      });
+      $("account-current").value = "";
+      $("account-new").value = "";
+      $("account-confirm").value = "";
+      setStatus("已更新；其它设备需重新登录");
+      toast("面板密码已更新");
+    } catch (err) {
+      setStatus(err.message || "更新失败", true);
+    }
+  };
+  $("btn-change-password").addEventListener("click", submit);
+  for (const id of ["account-current", "account-new", "account-confirm"]) {
+    $(id).addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        submit();
+      }
+    });
+  }
 }
 
 async function runTriggerDebug() {
@@ -2199,6 +2458,7 @@ function applyStatus(data) {
   markUpdated("login");
   renderGlobalBanner(data);
   renderFreeBanner(data);
+  renderKpi();
 }
 
 // 免费档降级提示：只有自检明确给出 false 时才亮黄条。
@@ -2388,11 +2648,80 @@ function renderKeepalive(item) {
   ].forEach(([label, value]) => box.appendChild(healthKv(label, value)));
 }
 
+// KPI 只读既有轮询结果：缺数据时保留占位，不把「未知」伪造成 0。
+function kpiSet(id, value, note, tone) {
+  const box = $(id);
+  if (!box) return;
+  box.querySelector(".kpi-value").textContent = value;
+  box.querySelector(".kpi-note").textContent = note;
+  if (tone) box.dataset.tone = tone;
+  else delete box.dataset.tone;
+}
+
+function renderKpi() {
+  const processes = (state && state.processes) || [];
+  if (processes.length) {
+    const running = processes.filter((item) => item.status === "running").length;
+    const down = processes.filter((item) => item.status !== "running").map((item) => item.name);
+    kpiSet(
+      "kpi-processes",
+      `${running}/${processes.length}`,
+      down.length ? `${down.join(" · ")} 未运行` : "全部运行",
+      down.length ? "warn" : "ok",
+    );
+  } else {
+    kpiSet("kpi-processes", "—", "等待状态", "");
+  }
+
+  if (healthReadFailed || !healthChannels) {
+    const note = healthReadFailed ? "健康数据读取失败" : "等待健康数据";
+    kpiSet("kpi-channels", "—", note, healthReadFailed ? "bad" : "");
+    kpiSet("kpi-memory", "—", note, healthReadFailed ? "bad" : "");
+  } else {
+    const names = { qq: "QQ", wechat: "微信" };
+    const entries = ["qq", "wechat"].filter((name) => healthChannels[name]);
+    const connected = entries.filter((name) => healthChannels[name].connected);
+    const down = entries.filter((name) => !healthChannels[name].connected);
+    kpiSet(
+      "kpi-channels",
+      `${connected.length}/${entries.length}`,
+      entries.length === 0
+        ? "未启用任何通道"
+        : down.length
+          ? `${down.map((name) => names[name]).join(" · ")} 未连接`
+          : `${connected.map((name) => names[name]).join(" · ")} 已连接`,
+      entries.length === 0 ? "" : down.length ? "warn" : "ok",
+    );
+    const memory = healthMemory || {};
+    if (memory.message_count === undefined || memory.message_count === null) {
+      kpiSet("kpi-memory", "—", "无记忆库数据", "");
+    } else {
+      kpiSet("kpi-memory", `${memory.message_count} 条`, `库 ${fmtBytes(memory.db_bytes)}`, "ok");
+    }
+  }
+
+  if (alertsDisabled) {
+    kpiSet("kpi-alerts", "—", "告警未启用", "");
+  } else if (alertsSummary) {
+    const firing = Number(alertsSummary.firing) || 0;
+    kpiSet(
+      "kpi-alerts",
+      String(firing),
+      firing ? "有活动告警" : `24h 恢复 ${alertsSummary.resolved_24h ?? 0}`,
+      firing ? "bad" : "ok",
+    );
+  } else {
+    kpiSet("kpi-alerts", "—", "等待告警数据", "");
+  }
+}
+
 function renderHealth(data) {
   // /api/health/detail 把 bot 的健康帧嵌在 data.bot 下（uptime/version/gateway/
   // channels/traffic/scheduler/quota/memory），而 ok/generated_at/processes/
   // disk/napcat/backups/alerts 仍在顶层。bot 帧缺失时回退到 data，兼容旧响应。
   const bot = (data && data.bot && typeof data.bot === "object") ? data.bot : (data || {});
+  healthChannels = bot.channels || null;
+  healthMemory = bot.memory || null;
   renderKeepalive(bot.keepalive);
   markUpdated("keepalive-card");
   const ok = !!(data && data.ok);
@@ -2492,6 +2821,7 @@ function renderHealth(data) {
   renderChannel("qq", qqEntry);
   renderChannel("wechat", wechatEntry);
   $("wechat-kill-row").hidden = !wechatEntry;
+  renderKpi();
 }
 
 async function refreshHealth() {
@@ -2501,6 +2831,9 @@ async function refreshHealth() {
     markUpdated("health-card");
   } catch (err) {
     healthReadFailed = true;
+    healthChannels = null;
+    healthMemory = null;
+    renderKpi();
     $("health-state").className = "pill st-failed";
     $("health-state").innerHTML = '<span class="dot"></span>读取失败';
     $("health-hint").textContent = `读取失败：${err.message}`;
@@ -2683,8 +3016,10 @@ let alertsDisabled = false;
 
 function disableAlertsCard() {
   alertsDisabled = true;
+  alertsSummary = null;
   const card = $("alerts-card");
   if (card) card.hidden = true;
+  renderKpi();
 }
 
 async function refreshAlerts() {
@@ -2697,6 +3032,8 @@ async function refreshAlerts() {
     markUpdated("alerts-card");
     const events = data.events || [];
     const summary = data.summary || {};
+    alertsSummary = summary;
+    renderKpi();
     $("alerts-hint").textContent = events.length
       ? `活动 ${summary.firing ?? 0} · 24 小时内恢复 ${summary.resolved_24h ?? 0}`
       : "暂无活动事件";
@@ -2728,6 +3065,8 @@ async function refreshAlerts() {
       disableAlertsCard();
       return;
     }
+    alertsSummary = null;
+    renderKpi();
     $("alerts-hint").textContent = `读取失败：${err.message}`;
   }
 }
@@ -3081,6 +3420,7 @@ async function loadMemory() {
     $("btn-more-memory").disabled = memoryLimit >= memoryPageMax;
   }
   loadMemoryHealth();
+  loadOpenLoops();
 }
 
 // 缺口明细：后端给 { chat_type, chat_id, date, messages }，date 已是
@@ -3138,6 +3478,130 @@ async function loadMemoryHealth() {
     box.style.color = "var(--warn)";
   }
   if (state) renderGlobalBanner(state);
+}
+
+// 未了事（open_loops）：面板只读列出所有挂着的条目，手动关掉已经解决/不再追的。
+// kind 用中文短标签，避免把 question/promise 这类内部枚举直接摊给用户。
+const OPEN_LOOP_KIND_LABELS = {
+  question: "等待",
+  promise: "等兑现",
+  plan: "等结果",
+  running_joke: "在玩梗",
+};
+const OPEN_LOOP_KIND_HINTS = {
+  question: "抛出后还没人接",
+  promise: "说过要做，还没兑现",
+  plan: "定了要做，还没结果",
+  running_joke: "群里的梗，还在玩",
+};
+
+function openLoopAge(hours) {
+  const value = Number(hours);
+  if (!Number.isFinite(value) || value < 0) return "";
+  if (value < 1) return "刚刚";
+  if (value < 48) return `${Math.round(value)} 小时前`;
+  return `${Math.round(value / 24)} 天前`;
+}
+
+function openLoopItem(loop) {
+  const item = document.createElement("div");
+  item.className = "open-loop-item";
+  item.dataset.loopId = String(loop.id);
+  item.dataset.kind = loop.kind;
+
+  const main = document.createElement("div");
+  main.className = "open-loop-main";
+  const meta = document.createElement("div");
+  meta.className = "open-loop-meta";
+  const kind = document.createElement("span");
+  kind.className = "kind-tag";
+  kind.dataset.kind = loop.kind;
+  kind.textContent = OPEN_LOOP_KIND_LABELS[loop.kind] || loop.kind;
+  kind.title = OPEN_LOOP_KIND_HINTS[loop.kind] || "未了事";
+  const chan = document.createElement("span");
+  chan.className = "chan-tag";
+  chan.dataset.channel = channelOfId(loop.chat_id);
+  chan.textContent = channelLabelOf(loop.chat_id);
+  const chat = document.createElement("span");
+  chat.textContent = chatLabel(loop);
+  meta.append(kind, chan, chat);
+  const age = openLoopAge(loop.age_hours);
+  if (age) {
+    const when = document.createElement("span");
+    when.textContent = age;
+    meta.append(when);
+  }
+  const text = document.createElement("div");
+  text.className = "open-loop-text";
+  text.textContent = loop.content;
+  main.append(meta, text);
+
+  const actions = document.createElement("div");
+  actions.className = "open-loop-actions";
+  const makeButton = (label, status, hint) => {
+    const button = document.createElement("button");
+    button.className = "btn";
+    button.textContent = label;
+    button.title = hint;
+    button.setAttribute("aria-label", `${hint}：${loop.content}`);
+    button.addEventListener("click", (ev) =>
+      withBusy(ev.currentTarget, () => closeOpenLoop(loop, status, item)),
+    );
+    return button;
+  };
+  actions.append(
+    makeButton("完成", "done", "已有下文，标记完成"),
+    makeButton("忽略", "dropped", "不再追这条"),
+  );
+  item.append(main, actions);
+  return item;
+}
+
+function renderOpenLoops(data) {
+  const loops = (data && data.loops) || [];
+  const box = $("open-loops-list");
+  box.replaceChildren();
+  if (!loops.length) {
+    box.appendChild(emptyState("没有挂着的未了事。"));
+  } else {
+    loops.forEach((loop) => box.appendChild(openLoopItem(loop)));
+  }
+  const total = Number(data && data.total);
+  const shown = loops.length;
+  $("open-loops-hint").textContent =
+    Number.isFinite(total) && total > shown
+      ? `显示 ${shown}/${total} 条 · 点完成或忽略即可关掉`
+      : `${shown} 条 · 点完成或忽略即可关掉`;
+}
+
+async function closeOpenLoop(loop, status, item) {
+  const verb = status === "done" ? "完成" : "忽略";
+  try {
+    await api(`/api/open-loops/${loop.id}/close`, {
+      method: "POST",
+      body: JSON.stringify({ status }),
+    });
+    // 先本地移除再重拉：即使重拉失败，也不会把刚关掉的行闪回来。
+    item.remove();
+    if (!$("open-loops-list").children.length) {
+      $("open-loops-list").appendChild(emptyState("没有挂着的未了事。"));
+    }
+    toast(`已${verb}：${String(loop.content).slice(0, 24)}`);
+    loadOpenLoops();
+  } catch (err) {
+    toast(`没关成功：${err.message}`, true);
+  }
+}
+
+async function loadOpenLoops() {
+  if (document.hidden) return;
+  try {
+    renderOpenLoops(await api("/api/open-loops?limit=100"));
+    markUpdated("open-loops");
+  } catch (err) {
+    $("open-loops-list").replaceChildren();
+    $("open-loops-hint").textContent = `读取失败：${err.message}`;
+  }
 }
 
 // 手动解除配额熔断：清空后立刻重读体检，按钮会随 paused=false 自动隐藏。
@@ -5027,6 +5491,7 @@ $("btn-backup-now").addEventListener("click", createBackup);
 $("btn-backup-restore").addEventListener("click", restoreBackup);
 $("btn-rotate-token").addEventListener("click", rotateControlToken);
 $("btn-refresh-memory").addEventListener("click", loadMemory);
+$("btn-refresh-open-loops").addEventListener("click", loadOpenLoops);
 $("btn-memory-unblock").addEventListener("click", (ev) => withBusy(ev.currentTarget, unblockMemoryQuota));
 $("delete-user-form").addEventListener("submit", deleteUserMessages);
 $("btn-summarize").addEventListener("click", (ev) => withBusy(ev.currentTarget, triggerSummary));

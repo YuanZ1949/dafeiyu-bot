@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from dafeiyu.textwidth import display_width, pad_to_width, wrap_by_width
+from dafeiyu.textwidth import (
+    PixelMetrics,
+    display_width,
+    pad_to_width,
+    wrap_by_width,
+)
 
 
 def test_display_width_pure_chinese_is_two_columns_per_char() -> None:
@@ -71,3 +76,67 @@ def test_pad_to_width_pads_with_spaces_to_display_width() -> None:
     assert pad_to_width("ab", 4) == "ab  "
     assert pad_to_width("好", 2) == "好"
     assert display_width(pad_to_width("好 c", 6)) == 6
+
+
+# ------------------------------------------------------- 真实字体像素度量
+
+
+class _FakeMask:
+    def __init__(self, payload: bytes) -> None:
+        self.size = (8, 8)
+        self._payload = payload
+
+    def __bytes__(self) -> bytes:
+        return self._payload
+
+
+class _FakeFont:
+    """只实现 getlength / getmask：宽度表里有的算有字形，否则是 .notdef。"""
+
+    def __init__(self, widths: dict[str, int], notdef: int = 11) -> None:
+        self._widths = widths
+        self._notdef = notdef
+
+    def getlength(self, text: str) -> float:
+        return float(sum(self._widths.get(ch, self._notdef) for ch in text))
+
+    def getmask(self, ch: str) -> _FakeMask:
+        if ch in self._widths:
+            return _FakeMask(b"glyph")
+        return _FakeMask(b"notdef")
+
+
+def test_pixel_metrics_measures_with_primary_font() -> None:
+    metrics = PixelMetrics(_FakeFont({"a": 4, "阿": 16}))
+    assert metrics.width("a阿") == 20
+    assert metrics.width("") == 0
+
+
+def test_pixel_metrics_corrects_missing_glyph_with_fallback() -> None:
+    primary = _FakeFont({"a": 4})
+    emoji = _FakeFont({"😏": 22}, notdef=10)
+    metrics = PixelMetrics(primary, (emoji,))
+    # 主字体按 .notdef 11px 计，再修正成回退字体的 22px。
+    assert metrics.width("a😏") == 4 + 22
+
+
+def test_pixel_metrics_corrects_every_occurrence() -> None:
+    """同一缺字字符出现多次时，每次都要修正（不是每个字符只改一次）。"""
+    primary = _FakeFont({"a": 4})
+    emoji = _FakeFont({"😏": 22}, notdef=10)
+    metrics = PixelMetrics(primary, (emoji,))
+    assert metrics.width("😏😏") == 44
+
+
+def test_pixel_metrics_uses_first_fallback_that_has_the_glyph() -> None:
+    primary = _FakeFont({})
+    empty = _FakeFont({})
+    symbol = _FakeFont({"𓁹": 16}, notdef=10)
+    metrics = PixelMetrics(primary, (empty, symbol))
+    assert metrics.width("𓁹") == 16
+
+
+def test_pixel_metrics_ignores_variation_selectors() -> None:
+    metrics = PixelMetrics(_FakeFont({"a": 4}))
+    # U+FE0F 是变体选择符：不占宽度，也不触发缺字回退。
+    assert metrics.width("a\ufe0f") == 4

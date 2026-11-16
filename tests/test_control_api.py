@@ -23,7 +23,7 @@ from dafeiyu.config import GroupsConfig, MirrorPairConfig, load_settings
 from dafeiyu.control import BrainControl, MemoryActions, create_app
 from dafeiyu.hotconfig import WeChatRuntime, WeChatRuntimeView
 from dafeiyu.memory.store import MAX_MEMORY_PAGE, Store
-from dafeiyu.models import ChatType, Message
+from dafeiyu.models import ChatType, Message, OpenLoop
 from dafeiyu.runtime import RuntimeState
 from dafeiyu.settings_local import read_overrides, write_overrides
 from dafeiyu.workers.failure import QUOTA_KEY, MemoryPaused
@@ -2155,3 +2155,68 @@ async def test_holds_endpoint_drops_delivered_chats(tmp_path: Path) -> None:
 
     assert before["total"] == 1
     assert after == {"items": [], "total": 0}
+
+
+async def test_open_loops_list_and_close_lifecycle(tmp_path: Path) -> None:
+    control, _, app = make_control(tmp_path)
+    first = control.store.add_open_loop(
+        OpenLoop(ChatType.GROUP, "qq:1", "question", "灯怎么选")
+    )
+    second = control.store.add_open_loop(
+        OpenLoop(ChatType.GROUP, "qq:1", "plan", "周末去钓鱼")
+    )
+
+    async with running(app) as client:
+        resp = await client.get("/api/open-loops")
+        data = await resp.json()
+        assert resp.status == 200
+        assert data["total"] == 2
+        assert {item["id"] for item in data["loops"]} == {first, second}
+        item = next(i for i in data["loops"] if i["id"] == first)
+        assert item["kind"] == "question"
+        assert item["chat_type"] == "group"
+        assert item["chat_id"] == "qq:1"
+        assert item["age_hours"] is not None
+
+        closed = await client.post(
+            f"/api/open-loops/{first}/close", json={"status": "done"}
+        )
+        assert closed.status == 200
+        assert (await closed.json())["status"] == "done"
+
+        # 已关闭的行再关一次必须是 404，不能把 done 悄悄改成 dropped。
+        again = await client.post(
+            f"/api/open-loops/{first}/close", json={"status": "dropped"}
+        )
+        assert again.status == 404
+
+        after = await (await client.get("/api/open-loops")).json()
+        assert after["total"] == 1
+        assert [i["id"] for i in after["loops"]] == [second]
+
+
+async def test_close_open_loop_rejects_bad_status_and_unknown_id(
+    tmp_path: Path,
+) -> None:
+    control, _, app = make_control(tmp_path)
+    loop_id = control.store.add_open_loop(
+        OpenLoop(ChatType.GROUP, "qq:1", "question", "灯怎么选")
+    )
+
+    async with running(app) as client:
+        bad = await client.post(
+            f"/api/open-loops/{loop_id}/close", json={"status": "later"}
+        )
+        assert bad.status == 400
+        nonint = await client.post(
+            "/api/open-loops/abc/close", json={"status": "dropped"}
+        )
+        assert nonint.status == 400
+        missing = await client.post(
+            "/api/open-loops/999999/close", json={"status": "dropped"}
+        )
+        assert missing.status == 404
+
+    # 非法请求不能改库。
+    rows = control.store.open_loops(ChatType.GROUP, "qq:1", limit=10)
+    assert [loop.id for loop in rows] == [loop_id]

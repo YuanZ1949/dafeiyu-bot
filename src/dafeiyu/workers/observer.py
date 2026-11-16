@@ -67,7 +67,6 @@ MAX_CLOSED_LOOP_IDS = 5
 MAX_LINE_CHARS = 200
 # 超过这个空档就视为换了一段对话：新 episode 重新开一行，而不是把上午的事续上。
 EPISODE_GAP_SECONDS = 1800
-OPEN_LOOP_TTL_DAYS = 7
 OBSERVER_MAX_TOKENS = 600
 
 
@@ -203,10 +202,9 @@ class ObserverWorker:
         if self._backoff.should_skip(key):
             return False
 
-        # 顺手清掉过期未了事：即使这轮不调用模型也要做。
-        self.store.expire_open_loops(
-            chat_type, chat_id, days=OPEN_LOOP_TTL_DAYS
-        )
+        # 顺手收敛这个群的未了事：过期、近似重复、每群上限。即使这轮
+        # 不调用模型也要做，避免旧行一直挂到下一次观察。
+        self.store.converge_open_loops(chat_type, chat_id)
 
         total = self.store.count_messages(chat_type, chat_id)
         cursor = self.store.observer_cursor(chat_type, chat_id)
@@ -521,19 +519,23 @@ async def observer_loop(
             pass
 
 
-def expire_open_loops_once(
-    store: Store, *, days: int = OPEN_LOOP_TTL_DAYS
-) -> int:
-    """全会话清一次过期未了事，返回 drop 掉的条数。
+def expire_open_loops_once(store: Store, *, days: int | None = None) -> int:
+    """全会话收敛一次未了事，返回 drop 掉的条数。
 
-    ``observe_chat`` 只在访问到某个群时顺手过期该群的未了事；一个群
-    没人说话就永远轮不到。这里直接扫所有还挂着 open loop 的会话，
-    不依赖活跃列表。
+    ``observe_chat`` 只在访问到某个群时顺手收敛该群；一个群没人说话就
+    永远轮不到。这里直接扫所有还挂着 open loop 的会话，不依赖活跃列表。
+    默认按 kind 分档 TTL + 近似去重 + 每群上限；``days`` 显式给出时只做
+    统一过期（既有测试/调用口径）。
     """
     expired = 0
     for chat_type, chat_id in store.open_chats_with_open_loops():
         try:
-            expired += store.expire_open_loops(chat_type, chat_id, days=days)
+            if days is None:
+                expired += store.converge_open_loops(chat_type, chat_id)
+            else:
+                expired += store.expire_open_loops(
+                    chat_type, chat_id, days=days
+                )
         except Exception:
             log.exception("open_loops 过期失败：%s %s", chat_type.value, chat_id)
     return expired

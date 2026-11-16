@@ -29,12 +29,17 @@ from ..gateway.channels import qq_enabled_for, wechat_enabled_for
 from ..timeutil import now_shanghai
 from .alerts import AlertChannel, AlertManager, QQAdminChannel, WebhookChannel
 from .audit import AuditLog
+from .auth import DashboardAuth
 from .backup import BackupManager
 from .control_token import TOKEN_PATH, ControlToken
 from .dashboard import serve
 from .health import HealthMonitor
 from .lan_access import PASSWORD_PATH as DASHBOARD_PASSWORD_PATH
-from .lan_access import dashboard_urls, ensure_dashboard_password
+from .lan_access import (
+    dashboard_urls,
+    ensure_dashboard_password,
+    ensure_dashboard_secret,
+)
 from .logs import LogHub
 from .manager import ProcSpec, Supervisor, pid_alive, port_owner
 from .napcat_login import NapCatLogin, load_webui_auth
@@ -129,9 +134,12 @@ def _report_dashboard_password(
     if not password:
         return
     if existed:
-        logs.write("supervisor", f"面板口令读取自 {path}")
+        logs.write("supervisor", f"面板口令读取自 {path}（文件优先于 .env）")
     elif path.exists():
-        logs.write("supervisor", f"面板口令已生成，见 {path}（可用 .env 覆盖）")
+        logs.write(
+            "supervisor",
+            f"面板口令已生成，见 {path}（可在面板「配置」页改密）",
+        )
     else:
         logs.write("supervisor", f"面板口令已生成，但写盘失败（仅本次生效），见 {path}")
 
@@ -645,6 +653,19 @@ async def run() -> int:
             path=DASHBOARD_PASSWORD_PATH,
         )
 
+    # 鉴权开启时把会话密钥与改密落盘路径固定下来：否则每次重启都换密钥，
+    # 所有浏览器都要重新登录，面板内改的密码也会被进程重启覆盖。
+    dashboard_auth: DashboardAuth | None = None
+    if settings.supervisor.dashboard.auth_required:
+        dashboard_auth = DashboardAuth(
+            enabled=True,
+            username=settings.supervisor.dashboard.username,
+            password=dashboard_password,
+            session_seconds=settings.supervisor.dashboard.session_hours * 3600,
+            secret=ensure_dashboard_secret(),
+            password_path=DASHBOARD_PASSWORD_PATH,
+        )
+
     try:
         specs = build_specs(settings, holder.value)
     except ConfigError as exc:
@@ -749,6 +770,7 @@ async def run() -> int:
         napcat_login=napcat_login,
         ops=ops,
         control_token=holder,
+        auth=dashboard_auth,
     )
 
     urls = dashboard_urls(

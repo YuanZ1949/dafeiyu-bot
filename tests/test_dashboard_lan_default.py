@@ -6,7 +6,11 @@ import pytest
 from conftest import TEST_CONFIG_YAML
 
 from dafeiyu.config import DashboardConfig, load_settings
-from dafeiyu.supervisor.lan_access import dashboard_urls, ensure_dashboard_password
+from dafeiyu.supervisor.lan_access import (
+    dashboard_urls,
+    ensure_dashboard_password,
+    ensure_dashboard_secret,
+)
 
 LAN_HOST = "0.0.0.0"
 
@@ -104,6 +108,32 @@ def test_ensure_password_prefers_env_value(tmp_path: Path) -> None:
         == "from-env-123456"
     )
     assert not path.exists()
+
+
+def test_ensure_password_prefers_panel_file_over_env(tmp_path: Path) -> None:
+    """面板内改密写回文件后，重启不能被 .env 里的旧引导口令覆盖。"""
+    path = tmp_path / "dashboard.password"
+    path.write_text("changed-in-panel-123\n", encoding="utf-8")
+
+    assert (
+        ensure_dashboard_password(
+            DashboardConfig(host=LAN_HOST, password="from-env-123456"), path=path
+        )
+        == "changed-in-panel-123"
+    )
+    assert path.read_text(encoding="utf-8").strip() == "changed-in-panel-123"
+
+
+def test_ensure_secret_persists_across_restarts(tmp_path: Path) -> None:
+    path = tmp_path / "dashboard.secret"
+
+    first = ensure_dashboard_secret(path=path)
+    second = ensure_dashboard_secret(path=path)
+
+    assert len(first) == 32
+    assert path.read_text(encoding="utf-8").strip() == first.decode("ascii")
+    # 每次重启都换密钥等于每次重启踢掉所有浏览器。
+    assert second == first
 
 
 def test_ensure_password_skipped_when_auth_not_required(tmp_path: Path) -> None:

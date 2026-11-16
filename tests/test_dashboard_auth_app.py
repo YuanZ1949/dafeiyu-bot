@@ -184,6 +184,133 @@ async def test_login_sets_secure_cookie_and_grants_access(tmp_path: Path) -> Non
         await client.close()
 
 
+async def test_change_password_rotates_cookie_and_persists(tmp_path: Path) -> None:
+    password_file = tmp_path / "dashboard.password"
+    auth = make_auth(password_path=password_file)
+    app, _ = make_app(tmp_path, auth=auth)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    new_password = "brand-new-password-42"
+    old_token = auth.issue_cookie()
+    try:
+        resp = await client.post(
+            "/api/auth/password",
+            json={
+                "current": PASSWORD,
+                "new": new_password,
+                "confirm": new_password,
+            },
+            cookies={COOKIE_NAME: old_token},
+        )
+        assert resp.status == 204
+        assert password_file.read_text(encoding="utf-8").strip() == new_password
+
+        new_token = resp.cookies[COOKIE_NAME].value
+        assert new_token and new_token != old_token
+        assert auth.verify_cookie(old_token) is False
+        assert auth.verify_cookie(new_token) is True
+
+        # 其它设备手里的旧 cookie 立刻失效；当前设备拿新 cookie 继续用。
+        denied = await client.get("/api/status", cookies={COOKIE_NAME: old_token})
+        assert denied.status == 401
+        allowed = await client.get("/api/status", cookies={COOKIE_NAME: new_token})
+        assert allowed.status == 200
+
+        # 登出后旧密码不能再登录，新密码可以。
+        await client.post("/api/auth/logout", json={})
+        old_login = await client.post(
+            "/api/auth/login", json={"username": "admin", "password": PASSWORD}
+        )
+        assert old_login.status == 401
+        new_login = await client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": new_password},
+        )
+        assert new_login.status == 204
+    finally:
+        await client.close()
+
+
+async def test_change_password_rejects_wrong_current_password(
+    tmp_path: Path,
+) -> None:
+    password_file = tmp_path / "dashboard.password"
+    auth = make_auth(password_path=password_file)
+    app, _ = make_app(tmp_path, auth=auth)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/api/auth/password",
+            json={
+                "current": "not-the-password",
+                "new": "brand-new-password-42",
+                "confirm": "brand-new-password-42",
+            },
+            cookies={COOKIE_NAME: auth.issue_cookie()},
+        )
+        # 403 而不是 401：前端 api() 会把 401 当成会话过期直接跳登录页。
+        assert resp.status == 403
+        assert "当前密码错误" in (await resp.json())["error"]
+        assert not password_file.exists()
+        assert auth.password == PASSWORD
+        assert auth.verify_cookie(auth.issue_cookie()) is True
+    finally:
+        await client.close()
+
+
+async def test_change_password_validates_new_password(tmp_path: Path) -> None:
+    auth = make_auth(password_path=tmp_path / "dashboard.password")
+    app, _ = make_app(tmp_path, auth=auth)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    token = auth.issue_cookie()
+    try:
+        short = await client.post(
+            "/api/auth/password",
+            json={"current": PASSWORD, "new": "short", "confirm": "short"},
+            cookies={COOKIE_NAME: token},
+        )
+        assert short.status == 400
+        assert "至少 12 位" in (await short.json())["error"]
+
+        mismatch = await client.post(
+            "/api/auth/password",
+            json={
+                "current": PASSWORD,
+                "new": "brand-new-password-42",
+                "confirm": "brand-new-password-43",
+            },
+            cookies={COOKIE_NAME: token},
+        )
+        assert mismatch.status == 400
+        assert "不一致" in (await mismatch.json())["error"]
+        assert auth.password == PASSWORD
+    finally:
+        await client.close()
+
+
+async def test_change_password_needs_a_persistent_path(tmp_path: Path) -> None:
+    auth = make_auth()  # password_path=None：只读部署
+    app, _ = make_app(tmp_path, auth=auth)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/api/auth/password",
+            json={
+                "current": PASSWORD,
+                "new": "brand-new-password-42",
+                "confirm": "brand-new-password-42",
+            },
+            cookies={COOKIE_NAME: auth.issue_cookie()},
+        )
+        assert resp.status == 503
+        assert auth.password == PASSWORD
+    finally:
+        await client.close()
+
+
 async def test_authenticated_backup_is_proxied(tmp_path: Path) -> None:
     async def backup(_: web.Request) -> web.Response:
         return web.Response(

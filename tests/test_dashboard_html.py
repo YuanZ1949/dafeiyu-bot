@@ -661,14 +661,15 @@ def test_html_every_card_belongs_to_exactly_one_pane() -> None:
     """分区只加一层壳：卡片不重复、不丢失，卡片 id 一个都不改。
 
     22 是 todo 13 重排时的存量卡片数；W5 新增了「正在攒着」（todo 17）、「话题状态」（todo 19）
-    与「保活」（todo 20）三张卡，所以这里跟着 +3。断言仍是「main 里的卡片数 == 各分区内卡片数之和」。
+    与「保活」（todo 20）三张卡；open_loops 收敛又新增了「未了事」一张，所以这里跟着 +4。
+    断言仍是「main 里的卡片数 == 各分区内卡片数之和」。
     """
     main = main_block()
     in_main = len(re.findall(r'<section class="card', main))
     in_panes = sum(
         len(re.findall(r'<section class="card', body)) for body in pane_blocks().values()
     )
-    assert in_main == in_panes == 25
+    assert in_main == in_panes == 27
     assert 'id="processes"' in main
     # 卡片自己的 id 仍然原样在（分区不改 id，只加壳）。
     for card_id in (
@@ -677,6 +678,7 @@ def test_html_every_card_belongs_to_exactly_one_pane() -> None:
         "alerts-card",
         "backups-card",
         "security-card",
+        "account-card",
         "brain-card",
         "evals-card",
         "trigger-debug",
@@ -685,22 +687,68 @@ def test_html_every_card_belongs_to_exactly_one_pane() -> None:
         assert f'id="{card_id}"' in main
 
 
-def test_html_pane_nav_jumps_to_every_pane() -> None:
+def test_html_pane_nav_switches_a_single_pane() -> None:
+    """单页签：点击只切 .active，hash 记住当前分区；不再用滚动联动。"""
     html = read_html()
+    style = style_block()
     nav = html[html.index('<nav class="pane-nav"') : html.index("</nav>")]
     assert 'id="pane-nav"' in nav
     targets = re.findall(r'data-pane="(pane-[a-z]+)"', nav)
     assert tuple(targets) == PANE_IDS
     assert nav.count("<button") == 6
     assert 'aria-current="true"' in nav
-    # 点击跳转 + 滚动联动，必须都在 initPaneNav 自己的函数体里。
+    # 切换逻辑必须在 initPaneNav 自己的函数体里，能被直接断言。
     match = re.search(r"function initPaneNav\(\) \{(.*?)\n\}", html, re.DOTALL)
     assert match is not None, "initPaneNav 必须是一段可直接断言的函数体"
     body = match.group(1)
-    assert 'pane.scrollIntoView({ behavior: "smooth", block: "start" })' in body
-    assert "new IntersectionObserver" in body
+    assert 'pane.classList.toggle("active"' in body
+    assert "history.replaceState" in body
+    assert "hashchange" in body
+    assert 'target.scrollIntoView({ behavior: "smooth", block: "start" })' in body
     assert "aria-current" in body
     assert "initPaneNav();" in html
+    # 一次只显示一个分区：默认隐藏，active 才铺开。
+    pane = css_rule(style, ".pane")
+    assert "display: none" in pane
+    assert ".pane.active { display: grid; }" in style
+
+
+def test_html_account_card_changes_password_through_auth_endpoint() -> None:
+    """面板内改密：三个密码框 + 单一提交入口，成功后当前设备续签。"""
+    html = read_html()
+    # 默认隐藏：会话接口确认鉴权启用后才由 JS 显示。
+    assert 'id="account-card" hidden' in html
+    for element_id in (
+        "account-current",
+        "account-new",
+        "account-confirm",
+        "btn-change-password",
+        "account-status",
+    ):
+        assert f'id="{element_id}"' in html, element_id
+    assert "initPasswordForm(data.user)" in html
+
+    match = re.search(r"function initPasswordForm\(user\) \{(.*?)\n\}", html, re.DOTALL)
+    assert match is not None, "initPasswordForm 必须是一段可直接断言的函数体"
+    body = match.group(1)
+    assert 'api("/api/auth/password"' in body
+    assert "JSON.stringify({ current, new: next, confirm })" in body
+    assert "新密码至少 12 位" in body
+    assert "两次输入的新密码不一致" in body
+
+
+def test_html_overview_kpis_reuse_existing_polls() -> None:
+    """总览 4 个 KPI 只消费既有轮询结果，不另开请求。"""
+    html = read_html()
+    assert 'id="kpi-row"' in html
+    for kpi in ("kpi-processes", "kpi-channels", "kpi-alerts", "kpi-memory"):
+        assert f'id="{kpi}"' in html
+    match = re.search(r"function renderKpi\(\) \{(.*?)\n\}", html, re.DOTALL)
+    assert match is not None, "renderKpi 必须是一段可直接断言的函数体"
+    body = match.group(1)
+    assert 'fetch(' not in body and 'api(' not in body
+    # 三个轮询入口都要把结果喂给 KPI。
+    assert html.count("renderKpi();") >= 5
 
 
 def test_html_card_spacing_tokens_are_shared() -> None:
@@ -928,3 +976,34 @@ def test_html_keepalive_card_reuses_health_detail() -> None:
     # 不新增端点、不提供开关。
     assert "/api/keepalive" not in html
     assert 'id="btn-keepalive' not in html
+
+
+def test_html_open_loops_card_lists_and_closes_loops() -> None:
+    """未了事卡：列出 open 行，点完成/忽略走关闭接口，卡片在记忆页顶部。"""
+    html = read_html()
+    assert 'data-card="open-loops"' in html
+    assert 'id="open-loops-list"' in html
+    assert 'id="open-loops-hint"' in html
+    assert 'id="btn-refresh-open-loops"' in html
+    assert "function loadOpenLoops(" in html
+    assert 'api("/api/open-loops?limit=100")' in html
+    # 记忆刷新与手动刷新都要拉一次未了事，不用另开定时器。
+    assert "loadOpenLoops();" in html
+
+    match = re.search(
+        r"async function closeOpenLoop\(loop, status, item\) \{(.*?)\n\}",
+        html,
+        re.DOTALL,
+    )
+    assert match is not None, "closeOpenLoop 必须是一段可直接断言的函数体"
+    body = match.group(1)
+    assert "/api/open-loops/${loop.id}/close" in body
+    assert "JSON.stringify({ status })" in body
+    # 两个动作与两种终态都要在：完成 -> done，忽略 -> dropped。
+    for token in ('"完成"', '"忽略"', '"done"', '"dropped"'):
+        assert token in html, token
+    # 卡片在记忆页顶部：先于记忆卡。
+    assert html.index('data-card="open-loops"') < html.index('data-card="memory"')
+    # kind 用中文短标签，不把枚举原文摊给用户。
+    for label in ("等待", "等兑现", "等结果", "在玩梗"):
+        assert label in html, label

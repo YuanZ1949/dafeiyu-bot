@@ -80,12 +80,22 @@ class ControlToken:
     def value(self) -> str:
         return self._value
 
-    def load_or_create(self) -> str:
+    def load(self) -> str:
+        """只读已有文件并加固；文件不存在时返回空串，绝不创建。
+
+        面板改密后 ``data/dashboard.password`` 优先于 ``.env``，启动时只需要
+        「读到就用」，不能因为读一次就顺手生成一个空文件把 env 引导顶掉。
+        """
         existing = self._read_existing()
         if existing:
             self._value = existing
             # 已有文件同样收紧，不能只保护新生成的文件。
             harden_token_file(self.path)
+        return existing
+
+    def load_or_create(self) -> str:
+        existing = self.load()
+        if existing:
             return existing
 
         token = secrets.token_urlsafe(24)

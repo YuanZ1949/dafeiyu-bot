@@ -7,12 +7,14 @@ import json
 import secrets
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 COOKIE_NAME = "dafeiyu_dashboard_session"
 PUBLIC_PATHS = frozenset({"/login", "/api/auth/login", "/favicon.ico"})
 FAILURE_LIMIT = 5
 FAILURE_WINDOW_SECONDS = 300
+MIN_PASSWORD_LENGTH = 12
 
 
 def _b64encode(raw: bytes) -> str:
@@ -56,9 +58,20 @@ class DashboardAuth:
         default_factory=lambda: secrets.token_bytes(32), repr=False
     )
     _failures: dict[str, list[float]] = field(default_factory=dict, repr=False)
+    # 面板内改密写回的文件；None 表示只读（改密接口返回 503）。
+    password_path: Path | None = field(default=None, repr=False)
 
     def is_public(self, path: str) -> bool:
         return path in PUBLIC_PATHS
+
+    def credential_version(self) -> str:
+        """密码变更后旧 cookie 自动失效的版本号；不含密码原文。"""
+        raw = f"{self.username}\0{self.password}".encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:16]
+
+    def set_password(self, password: str) -> None:
+        """更新内存口令；下一次 issue_cookie 会带上新的 credential_version。"""
+        self.password = password
 
     def verify_credentials(self, username: str, password: str) -> bool:
         if not self.enabled:
@@ -76,6 +89,7 @@ class DashboardAuth:
         payload = json.dumps(
             {
                 "u": self.username,
+                "v": self.credential_version(),
                 "iat": issued_at,
                 "exp": issued_at + int(self.session_seconds),
             },
@@ -96,6 +110,8 @@ class DashboardAuth:
                 return False
             data = json.loads(payload)
             if not isinstance(data, dict) or data.get("u") != self.username:
+                return False
+            if data.get("v") != self.credential_version():
                 return False
             issued_at = int(data.get("iat", 0))
             expires_at = int(data.get("exp", 0))

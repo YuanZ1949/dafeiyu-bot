@@ -35,6 +35,12 @@ from dafeiyu.textwidth import display_width
 QQ = "qq:1001"
 WXG = "wxg:group"
 
+
+@pytest.fixture(autouse=True)
+def _column_aligned_bubbles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """本文件的硬编码期望串按显示列对齐；像素对齐由专门用例注入假字体度量。"""
+    monkeypatch.setattr(mirror_module.MirrorRouter, "_bubble_metrics", lambda self: None)
+
 # 他人转发消息的线上形态（wire）：三行圆角气泡。
 # 期望串全部硬编码，不靠被测实现生成；宽度按 display_width 手算对齐。
 WIRE_SHUNLU = "╭────────────╮\n│ 阿鱼：顺路 │\n╰────────────╯"
@@ -489,6 +495,79 @@ def test_wire_bubble_rows_align_with_mixed_scripts(tmp_path: Path) -> None:
         assert len(widths) == 1
     # 入库形态不受气泡影响：与改动前逐字节一致。
     assert render(router, make_msg(QQ, content)) == ["阿鱼：" + content]
+
+
+class _PixelMetrics:
+    """雅黑 16px 的实测宽度表；未列出的字符按 CJK 16px 算。"""
+
+    _WIDTHS = {
+        " ": 5,
+        "\u200a": 2,
+        "─": 11,
+        "│": 11,
+        "╭": 10,
+        "╮": 10,
+        "╰": 10,
+        "╯": 10,
+    }
+
+    def width(self, text: str) -> int:
+        return sum(self._WIDTHS.get(ch, 16) for ch in text)
+
+
+def test_pixel_bubble_keeps_both_borders_aligned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """比例字体下顶/底栏与内容行的像素宽度差 ≤1px，左右边框都保留。"""
+    metrics = _PixelMetrics()
+    monkeypatch.setattr(mirror_module.MirrorRouter, "_bubble_metrics", lambda self: metrics)
+    router, _store, _adapters = make_router(tmp_path)
+    content = (
+        "这图糊得跟被鲸鱼尾巴扫过似的，本鱼只看出是一张截图，一个字都认不出来。"
+        "原帖链接甩一个过来吧，别让我凭空猜。"
+    )
+
+    wire = render_wire(router, make_msg(QQ, content))
+
+    for entry in wire:
+        rows = entry.splitlines()
+        assert rows[0].startswith("╭") and rows[0].endswith("╮")
+        assert rows[-1].startswith("╰") and rows[-1].endswith("╯")
+        assert all(row.startswith("│") and row.endswith("│") for row in rows[1:-1])
+        widths = [metrics.width(row) for row in rows]
+        assert max(widths) - min(widths) <= 1
+
+
+def test_pixel_pad_hits_every_residue_without_tofu() -> None:
+    """空格 5px + U+200A 2px 能补到任意目标宽度（最多多 1px），不靠缺字形。"""
+    metrics = _PixelMetrics()
+    for delta in range(0, 200):
+        pad = mirror_module._pixel_pad(delta, metrics)
+        assert pad.strip("\u200a ") == ""
+        assert delta <= metrics.width(pad) <= delta + 1
+        # 发丝空格是唯一「可能被客户端吞掉」的补白：每行最多 2 个。
+        assert pad.count("\u200a") <= 2
+
+
+def test_pixel_bubble_survives_clients_that_swallow_hair_space(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """极端客户端把 U+200A 渲染成零宽时，右边框最坏偏差仍 ≤4px（改动前 8px）。"""
+    metrics = _PixelMetrics()
+    monkeypatch.setattr(
+        mirror_module.MirrorRouter, "_bubble_metrics", lambda self: metrics
+    )
+    router, _store, _adapters = make_router(tmp_path)
+    content = (
+        "这图糊得跟被鲸鱼尾巴扫过似的，本鱼只看出是一张截图，一个字都认不出来。"
+        "原帖链接甩一个过来吧，别让我凭空猜。"
+    )
+
+    for entry in render_wire(router, make_msg(QQ, content)):
+        rows = entry.splitlines()
+        assert all(row.count("\u200a") <= 2 for row in rows)
+        collapsed = [metrics.width(row.replace("\u200a", "")) for row in rows]
+        assert max(collapsed) - min(collapsed) <= 4
 
 
 def test_store_matches_pre_bubble_baseline(tmp_path: Path) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 import threading
 from pathlib import Path
@@ -584,13 +585,25 @@ async def test_recover_pattern_restarts_once_then_cools_down(
     }
     supervisor, hub = make_supervisor(tmp_path, specs)
     await supervisor.start("napcat")
+    first = supervisor.states["napcat"].proc
+    assert first is not None
 
-    lines = await wait_for_log_line(hub, "napcat", "命中自愈模式")
-    assert any("清理残留并重启" in line for line in lines)
+    try:
+        lines = await wait_for_log_line(hub, "napcat", "命中自愈模式")
+        assert any("清理残留并重启" in line for line in lines)
 
-    lines = await wait_for_log_line(hub, "napcat", "冷却中", timeout=10.0)
-    assert any("冷却中" in line for line in lines)
-    await supervisor.stop("napcat")
+        lines = await wait_for_log_line(hub, "napcat", "冷却中", timeout=10.0)
+        assert any("冷却中" in line for line in lines)
+    finally:
+        await supervisor.stop("napcat")
+        # _kill_tree 被换成「只回 True」的替身，自愈不会真的杀掉换下来的首个
+        # 进程；它会带着未关闭的 stdout/stderr 管道活过测试会话，GC 时报
+        # ResourceWarning。这里按真实停止语义收尾。
+        if first.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                first.terminate()
+            with contextlib.suppress(ProcessLookupError, TimeoutError):
+                await asyncio.wait_for(first.wait(), timeout=5.0)
 
 
 async def test_recover_is_ignored_without_patterns(tmp_path: Path) -> None:

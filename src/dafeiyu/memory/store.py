@@ -55,6 +55,18 @@ INJECTABLE_EPISODE_PHASES: tuple[str, ...] = tuple(
     phase for phase in EPISODE_PHASES if phase != "closed"
 )
 OPEN_LOOP_KINDS: tuple[str, ...] = ("question", "promise", "plan", "running_joke")
+# open_loops 收敛口径：同群同 kind 的近似内容只留一条；问题/玩梗短命，
+# 计划/承诺需要更长观察窗口。阈值集中在这里，调用方不要再写魔法数。
+OPEN_LOOP_SIMILARITY = 0.5
+OPEN_LOOP_MAX_PER_CHAT = 6
+OPEN_LOOP_TTL_DAYS: dict[str, int] = {
+    "question": 3,
+    "running_joke": 3,
+    "promise": 7,
+    "plan": 7,
+}
+# 旧库里的未知 kind 按最长窗口处理，宁可多留一天也不要提前丢掉承诺。
+OPEN_LOOP_FALLBACK_TTL_DAYS = 7
 
 # 所有带 chat_type / chat_id 列的「会话派生表」：forget_chat 逐表按会话清除。
 # 新增会话级表只需在这里加一行；forget_all 全局清空也走这份清单。
@@ -3190,13 +3202,16 @@ class Store:
         return compact
 
     def add_open_loop(self, loop: OpenLoop) -> int:
-        """记一条「没有下文的事」；同群归一化后相同且还 open 的不重复记。
+        """记一条「没有下文的事」；同群归一化后相同或近似的 open 不重复记。
 
         归一化：去空白与中英文标点、剥「（，）无人回应」类模板尾巴、
-        剥「问/追问/反问」类前缀词后比较。返回行 id：
-        - 存在 24 小时内的同内容 open 行 → 直接返回那行的 id（不新建）；
-        - 同内容 open 行已超过 24 小时 → 先把老行标 dropped（历史保留），
-          再新建一行，让重新被观察到的事拿到新的时间起点。
+        剥「问/追问/反问」类前缀词后比较。近似判定只在**同 kind** 之间做：
+        「等结果」和「问看法」是两件事，不能因为共用几个 bigram 就并掉。
+        返回行 id：
+        - 存在 24 小时内的同内容/近似 open 行 → 直接返回那行的 id（不新建）；
+        - 已超过 24 小时 → 先把老行标 dropped（历史保留），再新建一行，
+          让重新被观察到的事拿到新的时间起点；
+        - 新建后超过每群上限 → 最旧的 open 行标 dropped。
         content 为空直接拒绝——空字符串进了注入就是一行没意义的破折号。
         """
         kind = loop.kind if loop.kind in OPEN_LOOP_KINDS else "question"
@@ -3207,7 +3222,7 @@ class Store:
         if normalized:
             rows = self._conn.execute(
                 """
-                SELECT id, content,
+                SELECT id, kind, content,
                        (created_at >= datetime('now', '-24 hours')) AS fresh
                 FROM open_loops
                 WHERE chat_type = ? AND chat_id = ? AND status = 'open'
@@ -3217,7 +3232,14 @@ class Store:
             ).fetchall()
             stale_ids: list[int] = []
             for row in rows:
-                if self._normalize_loop_text(row["content"]) != normalized:
+                row_normalized = self._normalize_loop_text(row["content"])
+                same = row_normalized == normalized
+                if not same and row["kind"] == kind:
+                    same = (
+                        shared_facts.similarity(row_normalized, normalized)
+                        >= OPEN_LOOP_SIMILARITY
+                    )
+                if not same:
                     continue
                 if row["fresh"]:
                     # 24 小时内重复被观察到：不新建，也不 drop。
@@ -3242,7 +3264,108 @@ class Store:
             ),
         )
         self._conn.commit()
-        return int(cur.lastrowid or 0)
+        loop_id = int(cur.lastrowid or 0)
+        self._drop_excess_open_loops(loop.chat_type, loop.chat_id)
+        return loop_id
+
+    def _drop_excess_open_loops(
+        self, chat_type: ChatType, chat_id: str
+    ) -> int:
+        """每群只留最新的 N 条 open；超出的最旧行标 dropped，不删历史。"""
+        rows = self._conn.execute(
+            """
+            SELECT id FROM open_loops
+            WHERE chat_type = ? AND chat_id = ? AND status = 'open'
+            ORDER BY id DESC
+            LIMIT -1 OFFSET ?
+            """,
+            (chat_type.value, chat_id, OPEN_LOOP_MAX_PER_CHAT),
+        ).fetchall()
+        dropped = 0
+        for row in rows:
+            if self.close_open_loop(int(row["id"]), status="dropped"):
+                dropped += 1
+        return dropped
+
+    def converge_open_loops(self, chat_type: ChatType, chat_id: str) -> int:
+        """收敛一个会话的未了事：过期、近似重复、每群上限，返回 drop 条数。
+
+        近重复按「新的在前」贪心保留：最新一条留下，旧的近似重复标 dropped。
+        只改 status/closed_at，不删除任何历史行。先过期再做相似度，避免拿
+        已经该消失的旧行去并掉还新鲜的行。
+        """
+        dropped = self.expire_open_loops(chat_type, chat_id)
+        rows = self._conn.execute(
+            """
+            SELECT id, kind, content FROM open_loops
+            WHERE chat_type = ? AND chat_id = ? AND status = 'open'
+            ORDER BY id DESC
+            """,
+            (chat_type.value, chat_id),
+        ).fetchall()
+        kept: list[tuple[int, str, str]] = []
+        for row in rows:
+            normalized = self._normalize_loop_text(row["content"])
+            duplicate = False
+            for _, kept_kind, kept_normalized in kept:
+                if normalized == kept_normalized:
+                    duplicate = True
+                    break
+                if kept_kind != row["kind"]:
+                    continue
+                if (
+                    shared_facts.similarity(normalized, kept_normalized)
+                    >= OPEN_LOOP_SIMILARITY
+                ):
+                    duplicate = True
+                    break
+            if duplicate:
+                if self.close_open_loop(int(row["id"]), status="dropped"):
+                    dropped += 1
+                continue
+            kept.append((int(row["id"]), row["kind"], normalized))
+        for loop_id, _, _ in kept[OPEN_LOOP_MAX_PER_CHAT:]:
+            if self.close_open_loop(loop_id, status="dropped"):
+                dropped += 1
+        return dropped
+
+    def list_open_loops(
+        self,
+        *,
+        limit: int = 100,
+        chat_type: ChatType | None = None,
+        chat_id: str | None = None,
+    ) -> list[OpenLoop]:
+        """面板只读列表：全部会话的 open 行，新的在前。"""
+        sql = ["SELECT * FROM open_loops WHERE status = 'open'"]
+        params: list[Any] = []
+        if chat_type is not None:
+            sql.append("AND chat_type = ?")
+            params.append(chat_type.value)
+        if chat_id is not None:
+            sql.append("AND chat_id = ?")
+            params.append(chat_id)
+        sql.append("ORDER BY created_at DESC, id DESC LIMIT ?")
+        params.append(max(0, int(limit)))
+        rows = self._conn.execute(" ".join(sql), params).fetchall()
+        return [self._row_to_open_loop(row) for row in rows]
+
+    def count_open_loops(
+        self,
+        *,
+        chat_type: ChatType | None = None,
+        chat_id: str | None = None,
+    ) -> int:
+        sql = ["SELECT COUNT(*) AS n FROM open_loops WHERE status = 'open'"]
+        params: list[Any] = []
+        if chat_type is not None:
+            sql.append("AND chat_type = ?")
+            params.append(chat_type.value)
+        if chat_id is not None:
+            sql.append("AND chat_id = ?")
+            params.append(chat_id)
+        row = self._conn.execute(" ".join(sql), params).fetchone()
+        return int(row["n"]) if row is not None else 0
 
     def open_loops(
         self, chat_type: ChatType, chat_id: str, limit: int = 3
@@ -3322,22 +3445,67 @@ class Store:
         return cur.rowcount > 0
 
     def expire_open_loops(
-        self, chat_type: ChatType, chat_id: str, *, days: int = 7
+        self, chat_type: ChatType, chat_id: str, *, days: int | None = None
     ) -> int:
-        """太久没下文的事自动 dropped，避免「去年问的问题」一直挂在嘴上。"""
-        if days <= 0:
-            return 0
+        """太久没下文的事自动 dropped，避免「去年问的问题」一直挂在嘴上。
+
+        ``days`` 显式给出时按统一窗口处理（既有调用/测试口径）；为 None 时
+        按 kind 分档：question/running_joke 3 天，plan/promise 7 天。历史行
+        只改 status/closed_at，不删除。
+        """
+        if days is not None:
+            if days <= 0:
+                return 0
+            cur = self._conn.execute(
+                """
+                UPDATE open_loops
+                SET status = 'dropped', closed_at = datetime('now')
+                WHERE chat_type = ? AND chat_id = ? AND status = 'open'
+                  AND created_at < datetime('now', ?)
+                """,
+                (chat_type.value, chat_id, f"-{int(days)} days"),
+            )
+            self._conn.commit()
+            return max(cur.rowcount, 0)
+        total = 0
+        for ttl in sorted(set(OPEN_LOOP_TTL_DAYS.values())):
+            kinds = tuple(
+                kind for kind, value in OPEN_LOOP_TTL_DAYS.items() if value == ttl
+            )
+            if not kinds:
+                continue
+            placeholders = ", ".join("?" * len(kinds))
+            cur = self._conn.execute(
+                f"""
+                UPDATE open_loops
+                SET status = 'dropped', closed_at = datetime('now')
+                WHERE chat_type = ? AND chat_id = ? AND status = 'open'
+                  AND kind IN ({placeholders})
+                  AND created_at < datetime('now', ?)
+                """,
+                (chat_type.value, chat_id, *kinds, f"-{int(ttl)} days"),
+            )
+            total += max(cur.rowcount, 0)
+        # 旧库里的未知 kind 没有档位可查，按最长窗口兜底。
+        placeholders = ", ".join("?" * len(OPEN_LOOP_KINDS))
         cur = self._conn.execute(
-            """
+            f"""
             UPDATE open_loops
             SET status = 'dropped', closed_at = datetime('now')
             WHERE chat_type = ? AND chat_id = ? AND status = 'open'
+              AND kind NOT IN ({placeholders})
               AND created_at < datetime('now', ?)
             """,
-            (chat_type.value, chat_id, f"-{int(days)} days"),
+            (
+                chat_type.value,
+                chat_id,
+                *OPEN_LOOP_KINDS,
+                f"-{OPEN_LOOP_FALLBACK_TTL_DAYS} days",
+            ),
         )
+        total += max(cur.rowcount, 0)
         self._conn.commit()
-        return max(cur.rowcount, 0)
+        return total
 
     def open_chats_with_open_loops(self) -> list[tuple[ChatType, str]]:
         """还挂着 open loop 的全部会话（去重，任意顺序）。

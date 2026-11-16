@@ -1649,6 +1649,59 @@ class BrainControl:
             },
         }
 
+    def open_loops_snapshot(
+        self,
+        limit: int = 100,
+        chat_type: ChatType | None = None,
+        chat_id: str | None = None,
+    ) -> dict[str, Any]:
+        """面板「未了事」卡的数据源：全部会话的 open 行，新的在前。
+
+        ``age_hours`` 由后端算：SQLite 的 created_at 是不带时区的 UTC 文本，
+        交给前端解析容易按本地时区算错一天。
+        """
+        limit = max(1, min(MAX_MEMORY_PAGE, int(limit)))
+        loops = self.store.list_open_loops(
+            limit=limit, chat_type=chat_type, chat_id=chat_id
+        )
+        now = datetime.now(timezone.utc)
+        items: list[dict[str, Any]] = []
+        for loop in loops:
+            age_hours: float | None = None
+            try:
+                created = datetime.strptime(
+                    loop.created_at, "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                pass
+            else:
+                age_hours = round((now - created).total_seconds() / 3600, 1)
+            items.append(
+                {
+                    "id": loop.id,
+                    "chat_type": loop.chat_type.value,
+                    "chat_id": loop.chat_id,
+                    "kind": loop.kind,
+                    "content": loop.content,
+                    "subject_user_id": loop.subject_user_id,
+                    "source_message_id": loop.source_message_id,
+                    "created_at": loop.created_at,
+                    "age_hours": age_hours,
+                }
+            )
+        total = self.store.count_open_loops(
+            chat_type=chat_type, chat_id=chat_id
+        )
+        return {
+            "loops": items,
+            "total": total,
+            "limit_max": MAX_MEMORY_PAGE,
+        }
+
+    def close_open_loop(self, loop_id: int, *, status: str = "dropped") -> bool:
+        """手动关掉一条未了事；done=已经解决，dropped=不再追。"""
+        return self.store.close_open_loop(loop_id, status=status)
+
     def memory_health(self, *, now: datetime | None = None) -> dict[str, Any]:
         """记忆链路体检：最近几天有缺口、最近一条摘要、是否熔断。
 
@@ -2835,6 +2888,72 @@ def create_app(
                 {"error": f"读取记忆失败：{exc.__class__.__name__}"}, status=500
             )
 
+    async def open_loops(request: web.Request) -> web.Response:
+        try:
+            limit = _query_int(request, "limit", 100)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        if not 1 <= limit <= MAX_MEMORY_PAGE:
+            return web.json_response(
+                {"error": f"limit 必须在 1..{MAX_MEMORY_PAGE} 之间"}, status=400
+            )
+        raw_chat_type = (request.query.get("chat_type") or "").strip()
+        chat_type: ChatType | None = None
+        if raw_chat_type:
+            try:
+                chat_type = ChatType(raw_chat_type)
+            except ValueError:
+                return web.json_response(
+                    {"error": "chat_type 必须是 group 或 private"}, status=400
+                )
+        chat_id: str | None = None
+        raw_chat_id = (request.query.get("chat_id") or "").strip()
+        if raw_chat_id:
+            try:
+                chat_id = normalize_chat_id(raw_chat_id)
+            except ValueError as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+        try:
+            return web.json_response(
+                control.open_loops_snapshot(limit, chat_type, chat_id)
+            )
+        except Exception as exc:  # noqa: BLE001 - 读库失败不能把控制口打挂
+            log.warning("读取未了事失败：%s", exc)
+            return web.json_response(
+                {"error": f"读取未了事失败：{exc.__class__.__name__}"}, status=500
+            )
+
+    async def close_open_loop(request: web.Request) -> web.Response:
+        raw_id = request.match_info.get("loop_id", "")
+        try:
+            loop_id = int(raw_id)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "loop_id 必须是正整数"}, status=400)
+        if loop_id <= 0:
+            return web.json_response({"error": "loop_id 必须是正整数"}, status=400)
+        payload, error = await _read_json_object(request)
+        if error is not None:
+            return error
+        if payload is None:  # 防御：正常分支由 error 兜住，这里只帮类型收窄
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        status = str(payload.get("status") or "dropped").strip()
+        if status not in ("done", "dropped"):
+            return web.json_response(
+                {"error": "status 必须是 done 或 dropped"}, status=400
+            )
+        try:
+            closed = control.close_open_loop(loop_id, status=status)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("关闭未了事失败：%s", exc)
+            return web.json_response(
+                {"error": f"关闭未了事失败：{exc.__class__.__name__}"}, status=500
+            )
+        if not closed:
+            return web.json_response(
+                {"error": "未了事不存在或已关闭"}, status=404
+            )
+        return web.json_response({"ok": True, "id": loop_id, "status": status})
+
     async def memory_health(request: web.Request) -> web.Response:
         try:
             return web.json_response(control.memory_health())
@@ -3583,6 +3702,8 @@ def create_app(
     app.router.add_post("/api/debug/batch", debug_batch)
     app.router.add_get("/api/memory", memory)
     app.router.add_get("/api/memory/health", memory_health)
+    app.router.add_get("/api/open-loops", open_loops)
+    app.router.add_post("/api/open-loops/{loop_id}/close", close_open_loop)
     app.router.add_post("/api/memory/unblock", memory_unblock)
     app.router.add_post("/api/memory/summaries", post_summary)
     app.router.add_post("/api/memory/impressions", post_impressions)

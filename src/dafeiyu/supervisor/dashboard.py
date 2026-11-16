@@ -19,7 +19,12 @@ from aiohttp.multipart import BodyPartReader
 
 from ..config import Settings
 from ..ids import normalize_chat_id
-from .auth import COOKIE_NAME, DashboardAuth, safe_next_path
+from .auth import (
+    COOKIE_NAME,
+    MIN_PASSWORD_LENGTH,
+    DashboardAuth,
+    safe_next_path,
+)
 from .backup import REASONS, BackupError
 from .control_token import ControlToken
 from .logs import SOURCES, LogHub
@@ -307,16 +312,7 @@ def create_app(
         response = web.Response(
             status=204, headers={"Cache-Control": "no-store"}
         )
-        response.set_cookie(
-            COOKIE_NAME,
-            auth_config.issue_cookie(),
-            max_age=auth_config.session_seconds,
-            httponly=True,
-            samesite="Strict",
-            secure=_is_https(request),
-            path="/",
-        )
-        return response
+        return set_session_cookie(request, response)
 
     async def logout(request: web.Request) -> web.Response:
         write_audit(request, "auth.logout")
@@ -338,6 +334,78 @@ def create_app(
                 "user": auth_config.username,
             }
         )
+
+    def set_session_cookie(
+        request: web.Request, response: web.Response
+    ) -> web.Response:
+        response.set_cookie(
+            COOKIE_NAME,
+            auth_config.issue_cookie(),
+            max_age=auth_config.session_seconds,
+            httponly=True,
+            samesite="Strict",
+            secure=_is_https(request),
+            path="/",
+        )
+        return response
+
+    async def change_password(request: web.Request) -> web.Response:
+        if not auth_config.enabled:
+            return web.json_response({"error": "登录未启用"}, status=400)
+        if auth_config.password_path is None:
+            return web.json_response(
+                {"error": "当前部署未启用面板改密（缺少持久化路径）"}, status=503
+            )
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        ip = request.remote or "unknown"
+        # 与登录失败分开计数：登录限流被触发时不能顺带锁死改密入口。
+        limit_key = f"pw:{ip}"
+        if auth_config.is_rate_limited(limit_key):
+            write_audit(
+                request,
+                "auth.password",
+                result="error",
+                detail={"reason": "rate_limited"},
+            )
+            return web.json_response(
+                {"error": "尝试次数过多，请 5 分钟后再试"}, status=429
+            )
+        current = str(payload.get("current") or "")
+        new_password = str(payload.get("new") or "").strip()
+        confirm = str(payload.get("confirm") or "").strip()
+        if not auth_config.verify_credentials(auth_config.username, current):
+            auth_config.record_failure(limit_key)
+            write_audit(
+                request,
+                "auth.password",
+                result="error",
+                detail={"reason": "bad_password"},
+            )
+            # 故意用 403 而不是 401：前端 api() 把 401 当成会话过期直接跳登录页。
+            return web.json_response({"error": "当前密码错误"}, status=403)
+        if len(new_password) < MIN_PASSWORD_LENGTH:
+            return web.json_response(
+                {"error": f"新密码至少 {MIN_PASSWORD_LENGTH} 位"}, status=400
+            )
+        if new_password != confirm:
+            return web.json_response({"error": "两次输入的新密码不一致"}, status=400)
+        try:
+            ControlToken(auth_config.password_path).set(new_password)
+        except OSError as exc:
+            log.warning("面板口令写盘失败：%s", exc)
+            return web.json_response(
+                {"error": "口令写盘失败，请检查 data 目录权限"}, status=500
+            )
+        auth_config.set_password(new_password)
+        auth_config.clear_failures(limit_key)
+        write_audit(request, "auth.password", target=auth_config.username)
+        response = web.Response(
+            status=204, headers={"Cache-Control": "no-store"}
+        )
+        # 密码变了 credential version 也变：当前设备必须续签，其它设备自然失效。
+        return set_session_cookie(request, response)
 
     async def index(_: web.Request) -> web.StreamResponse:
         # 面板单文件、改动频繁：不缓存，改完刷新就能看到新版（与 login.html 同款）。
@@ -744,6 +812,21 @@ def create_app(
 
     async def memory_health(request: web.Request) -> web.Response:
         return await proxy_get(request, "/api/memory/health")
+
+    async def open_loops(request: web.Request) -> web.Response:
+        return await proxy_get(request, "/api/open-loops")
+
+    async def close_open_loop(request: web.Request) -> web.Response:
+        loop_id = request.match_info.get("loop_id", "")
+        if not loop_id.isdigit() or int(loop_id) <= 0:
+            return web.json_response({"error": "loop_id 必须是正整数"}, status=400)
+        payload = await _json_body(request)
+        if payload is None:
+            return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+        code, data = await bot_call(
+            "POST", f"/api/open-loops/{loop_id}/close", payload
+        )
+        return web.json_response(data, status=code)
 
     async def memory_unblock(request: web.Request) -> web.Response:
         payload = await _json_body(request)
@@ -1249,6 +1332,7 @@ def create_app(
     app.router.add_get("/favicon.ico", favicon)
     app.router.add_get("/login", login_page)
     app.router.add_post("/api/auth/login", login_submit)
+    app.router.add_post("/api/auth/password", change_password)
     app.router.add_post("/api/auth/logout", logout)
     app.router.add_get("/api/auth/session", session_info)
     app.router.add_get("/api/health", health)
@@ -1277,6 +1361,8 @@ def create_app(
     app.router.add_get("/api/decisions", decisions)
     app.router.add_get("/api/memory/search", memory_search)
     app.router.add_get("/api/memory/health", memory_health)
+    app.router.add_get("/api/open-loops", open_loops)
+    app.router.add_post("/api/open-loops/{loop_id}/close", close_open_loop)
     app.router.add_post("/api/memory/unblock", memory_unblock)
     app.router.add_get("/api/memory/export", memory_export)
     app.router.add_get("/api/sessions", sessions)
@@ -1368,6 +1454,7 @@ async def serve(
     napcat_login: NapCatLogin | None = None,
     ops: OpsServices | None = None,
     control_token: ControlToken | None = None,
+    auth: DashboardAuth | None = None,
 ) -> web.AppRunner:
     app = create_app(
         supervisor,
@@ -1378,6 +1465,7 @@ async def serve(
         token,
         on_shutdown,
         napcat_login,
+        auth=auth,
         ops=ops,
         control_token=control_token,
     )

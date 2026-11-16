@@ -177,14 +177,15 @@ def test_transcode_multi_frame_outputs_gif(monkeypatch: pytest.MonkeyPatch) -> N
 def test_transcode_two_frames_outputs_best_still_png(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """微信原图实测 2 帧且首帧纯白：只出 PNG，并挑体积最大的一帧。"""
+    """微信原图实测 2 帧且首帧纯白：一次导出全部候选帧，挑体积最大的。"""
     calls: list[list[str]] = []
 
     def fake_run(args: list[str], timeout: float) -> SimpleNamespace:
         calls.append(args)
-        target = Path(args[-1])
+        pattern = Path(args[-1])
         # 第二帧更大 = 细节更多；静图判定应选它。
-        target.write_bytes(PNG if target.name == "still-0.png" else PNG + b"x" * 32)
+        (pattern.parent / "still-01.png").write_bytes(PNG)
+        (pattern.parent / "still-02.png").write_bytes(PNG + b"x" * 32)
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(emoticon, "_locate", lambda name: name)
@@ -192,11 +193,10 @@ def test_transcode_two_frames_outputs_best_still_png(
     monkeypatch.setattr(emoticon, "_frame_count", lambda *_a, **_k: 2)
 
     assert transcode(STREAM) == PNG + b"x" * 32
-    assert [Path(args[-1]).name for args in calls] == [
-        "still-0.png",
-        "still-1.png",
-    ]
-    assert all("-frames:v" in args for args in calls)
+    # 回归：不能再逐帧 select —— 真实流上 select 会一帧都不输出。
+    assert len(calls) == 1
+    assert not any("select" in str(part) for part in calls[0])
+    assert str(calls[0][-1]).endswith("still-%02d.png")
 
 
 def test_transcode_still_forces_single_png(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -205,7 +205,7 @@ def test_transcode_still_forces_single_png(monkeypatch: pytest.MonkeyPatch) -> N
 
     def fake_run(args: list[str], timeout: float) -> SimpleNamespace:
         captured["args"] = args
-        Path(args[-1]).write_bytes(PNG)
+        (Path(args[-1]).parent / "still-01.png").write_bytes(PNG)
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(emoticon, "_locate", lambda name: name)
@@ -215,8 +215,10 @@ def test_transcode_still_forces_single_png(monkeypatch: pytest.MonkeyPatch) -> N
     assert transcode(STREAM, still=True) == PNG
     args = captured["args"]
     assert isinstance(args, list)
-    assert str(args[-1]).endswith("out.png")
+    # 多帧仍只取前两帧候选（首帧可能纯白），但绝不走 GIF。
+    assert str(args[-1]).endswith("still-%02d.png")
     assert "-loop" not in args
+    assert args[args.index("-frames:v") + 1] == "2"
 
 
 def test_transcode_without_ffmpeg_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:

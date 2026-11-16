@@ -17,6 +17,28 @@ def make_auth(**kwargs) -> DashboardAuth:
     return DashboardAuth(**options)
 
 
+def test_set_password_invalidates_previously_issued_cookies() -> None:
+    auth = make_auth()
+    old = auth.issue_cookie(now=1_000)
+    assert auth.verify_cookie(old, now=1_001) is True
+
+    auth.set_password("another-long-password")
+
+    assert auth.verify_cookie(old, now=1_002) is False
+    assert auth.verify_cookie(auth.issue_cookie(now=1_003), now=1_004) is True
+
+
+def test_credential_version_changes_without_leaking_the_password() -> None:
+    auth = make_auth()
+    before = auth.credential_version()
+
+    assert len(before) == 16
+    assert auth.password not in before
+
+    auth.set_password("another-long-password")
+    assert auth.credential_version() != before
+
+
 def test_session_cookie_round_trip_and_expiry() -> None:
     auth = make_auth()
 

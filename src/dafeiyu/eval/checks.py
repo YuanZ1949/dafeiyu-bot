@@ -13,7 +13,7 @@ from typing import cast
 from dafeiyu.brain.client import BrainReply
 from dafeiyu.config import MirrorConfig, Settings
 from dafeiyu.mirror import MirrorItem, MirrorRouter, RenderedLines
-from dafeiyu.textwidth import display_width
+from dafeiyu.textwidth import PixelMetrics, display_width
 
 from .models import EvalBubble, EvalCase, EvalCheck
 
@@ -82,6 +82,14 @@ class _BubbleProbe(MirrorRouter):
             created_at=0.0,
         )
         return self._render(item)
+
+    def _bubble_metrics(self) -> PixelMetrics | None:
+        """评估证据要跨机器逐字节一致：按显示列对齐，不随系统字体变化。
+
+        线上气泡的像素对齐由 ``tests/test_bubble_pixels.py`` 与
+        ``tests/test_mirror.py`` 覆盖；这里只锁定气泡形态与换行。
+        """
+        return None
 
 
 def _check(

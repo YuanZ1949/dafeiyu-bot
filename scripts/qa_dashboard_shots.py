@@ -485,7 +485,9 @@ _TIMELINE_METRICS_JS = """(() => {
       right: box.right,
       top: box.top,
       textLength: (text ? text.textContent : '').length,
-      preview: (text ? text.textContent : '').slice(0, 40),
+      // 按码点截断：slice(0, 40) 可能把 emoji 的代理对切成孤立半字符，
+      // metrics.json 写 UTF-8 时会直接抛 UnicodeEncodeError。
+      preview: Array.from(text ? text.textContent : '').slice(0, 40).join(''),
       justifySelf: cs.justifySelf,
       maxWidth: cs.maxWidth,
       borderTopColor: cs.borderTopColor,
