@@ -113,7 +113,10 @@ def make_message_db(
     name2id: dict[int, str],
     tables: dict[str, list[tuple]],
 ) -> None:
-    """``tables``: username -> [(local_type, real_sender_id, create_time, content, ct)]"""
+    """``tables``: username -> [(local_type, real_sender_id, create_time, content, ct)]
+
+    行可以是 5 元组（server_id 落 NULL）或 6 元组（末位是 server_id）。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as con:
         con.execute(NAME2ID_DDL)
@@ -125,19 +128,26 @@ def make_message_db(
         for username, rows in tables.items():
             table = message_table_name(username)
             con.execute(MESSAGE_DDL.format(table=table))
-            for local_type, sender, created, content, ct in rows:
+            for row in rows:
+                local_type, sender, created, content, ct = row[:5]
+                server_id = row[5] if len(row) > 5 else None
                 con.execute(
                     f'INSERT INTO "{table}" '
                     "(local_type, real_sender_id, create_time, message_content, "
-                    "WCDB_CT_message_content) VALUES (?, ?, ?, ?, ?)",
-                    (local_type, sender, created, content, ct),
+                    "WCDB_CT_message_content, server_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    (local_type, sender, created, content, ct, server_id),
                 )
 
 
 def text_row(
-    sender: int, content: str, *, created: int = 1000, local_type: int = 1
+    sender: int,
+    content: str,
+    *,
+    created: int = 1000,
+    local_type: int = 1,
+    server_id: int | None = None,
 ) -> tuple:
-    return (local_type, sender, created, content, 0)
+    return (local_type, sender, created, content, 0, server_id)
 
 
 def make_store(
@@ -777,6 +787,184 @@ def test_system_messages_are_dropped(tmp_path: Path) -> None:
     assert ref is not None
 
     assert [entry["text"] for entry in store.recent(ref)] == ["正常一", "正常二"]
+
+
+# ---------------------------------------------- todo 6: 事件行 + server_id 暴露
+def build_event_store(tmp_path: Path) -> LocalMessageStore:
+    root = tmp_path / "mirror"
+    make_contact_db(root / "contact/contact.db", contacts=[(GROUP, "", GROUP_NAME)])
+    make_message_db(
+        root / "message/message_0.db",
+        name2id={1: GROUP, 3: "wxid_a"},
+        tables={
+            GROUP: [
+                text_row(3, "wxid_a:\n正常一", created=1001, server_id=7001),
+                text_row(
+                    3, "<sysmsg>你已加入群聊</sysmsg>", created=1002,
+                    local_type=10000, server_id=7002,
+                ),
+                text_row(
+                    3, "甲撤回了一条消息", created=1003,
+                    local_type=10002, server_id=7003,
+                ),
+                text_row(
+                    3, "请求添加好友", created=1004, local_type=37, server_id=7004
+                ),
+                text_row(3, "wxid_a:\n正常二", created=1005, server_id=7005),
+            ]
+        },
+    )
+    return make_store(root)
+
+
+def test_recent_drops_event_types_but_keeps_server_id(tmp_path: Path) -> None:
+    store = build_event_store(tmp_path)
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+
+    entries = store.recent(ref)
+
+    # 10000/10002/37 仍然不进对齐序列；server_id 随正常行一起带出。
+    assert [entry["text"] for entry in entries] == ["正常一", "正常二"]
+    assert [entry["server_id"] for entry in entries] == [7001, 7005]
+
+
+def test_event_rows_returns_event_types_in_local_id_order(tmp_path: Path) -> None:
+    store = build_event_store(tmp_path)
+
+    rows = store.event_rows(GROUP, types=(10000, 10002, 37))
+
+    assert [row["local_type"] for row in rows] == [10000, 10002, 37]
+    assert [row["server_id"] for row in rows] == [7002, 7003, 7004]
+    assert rows[0]["content"] == "<sysmsg>你已加入群聊</sysmsg>"
+    assert rows[1]["content"] == "甲撤回了一条消息"
+    assert rows[2]["content"] == "请求添加好友"
+    local_ids = [row["local_id"] for row in rows]
+    assert local_ids == sorted(local_ids)
+
+
+def test_recent_system_events_and_friend_request_rows_wrap_event_rows(
+    tmp_path: Path,
+) -> None:
+    store = build_event_store(tmp_path)
+
+    system = store.recent_system_events(GROUP)
+    assert [row["local_type"] for row in system] == [10000, 10002]
+    assert system[0]["content"] == "<sysmsg>你已加入群聊</sysmsg>"
+
+    requests = store.friend_request_rows(GROUP)
+    assert [row["local_type"] for row in requests] == [37]
+    assert requests[0]["content"] == "请求添加好友"
+
+
+def test_event_rows_respects_since_and_limit(tmp_path: Path) -> None:
+    store = build_event_store(tmp_path)
+
+    rows = store.event_rows(GROUP, types=(10000, 10002, 37), since_local_id=2)
+    assert [row["local_id"] for row in rows] == [3, 4]
+
+    limited = store.event_rows(GROUP, types=(10000, 10002, 37), limit=1)
+    assert len(limited) == 1
+    assert limited[0]["local_id"] == 2
+
+
+def test_event_rows_missing_shard_or_invalid_args_return_empty(
+    tmp_path: Path,
+) -> None:
+    store = build_event_store(tmp_path)
+
+    assert store.event_rows("wxid_nobody@chatroom", types=(10000,)) == []
+    assert store.recent_system_events("wxid_nobody@chatroom") == []
+    assert store.friend_request_rows("") == []
+    assert store.event_rows(GROUP, types=()) == []
+    assert store.event_rows(GROUP, types=(10000,), limit=0) == []
+
+
+def build_store_without_server_id_column(tmp_path: Path) -> LocalMessageStore:
+    """消息表只有 ``_REQUIRED_COLUMNS``：没有 server_id 列的旧 schema。"""
+    root = tmp_path / "mirror"
+    make_contact_db(root / "contact/contact.db", contacts=[(GROUP, "", GROUP_NAME)])
+    path = root / "message/message_0.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table = message_table_name(GROUP)
+    with sqlite3.connect(path) as con:
+        con.execute(NAME2ID_DDL)
+        con.execute(
+            f'CREATE TABLE "{table}"('
+            "local_id INTEGER PRIMARY KEY AUTOINCREMENT, local_type INTEGER, "
+            "real_sender_id INTEGER, create_time INTEGER, message_content TEXT, "
+            "WCDB_CT_message_content INTEGER)"
+        )
+        con.execute(
+            f'INSERT INTO "{table}" '
+            "(local_type, real_sender_id, create_time, message_content, "
+            "WCDB_CT_message_content) VALUES (1, 3, 1000, ?, 0)",
+            ("wxid_a:\n旧 schema",),
+        )
+    return make_store(root)
+
+
+def test_recent_and_event_rows_without_server_id_column_yield_zero(
+    tmp_path: Path,
+) -> None:
+    store = build_store_without_server_id_column(tmp_path)
+    ref = ChatRef(GROUP_NAME, GROUP, "message/message_0.db", message_table_name(GROUP))
+
+    entries = store.recent(ref)
+    # Name2Id 没有插入映射：前缀无法确认归属，正文保持原样（fail-closed）。
+    assert entries[0]["text"] == "wxid_a:\n旧 schema"
+    assert entries[0]["server_id"] == 0
+
+    rows = store.event_rows(GROUP, types=(1,))
+    assert len(rows) == 1
+    assert rows[0]["server_id"] == 0
+    assert rows[0]["content"] == "wxid_a:\n旧 schema"
+
+
+def test_event_rows_corrupt_zstd_content_degrades_without_raise(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "mirror"
+    make_contact_db(root / "contact/contact.db", contacts=[(GROUP, "", GROUP_NAME)])
+    make_message_db(
+        root / "message/message_0.db",
+        name2id={1: GROUP},
+        tables={
+            # ct=4（zstd）+ 非 zstd 字节：6 元组直接给，text_row 的 ct 固定是 0。
+            GROUP: [(10002, 3, 1001, b"not-a-zstd-frame", 4, 7002)]
+        },
+    )
+    store = make_store(root)
+
+    rows = store.event_rows(GROUP, types=(10002,))
+
+    # 坏 zstd 帧走现有 `_decode_content` 降级：解不出就空串，绝不抛异常。
+    assert len(rows) == 1
+    assert rows[0]["server_id"] == 7002
+    assert rows[0]["content"] == ""
+
+
+def test_source_event_rows_forwards_and_never_raises(tmp_path: Path) -> None:
+    from dafeiyu.gateway.wechat_bridge.localdb.source import LocalDbSource
+
+    source = LocalDbSource(mirror_dir=tmp_path / "mirror")
+    source._store = build_event_store(tmp_path)
+
+    rows = source.event_rows(GROUP, types=(10000, 10002, 37))
+    assert [row["local_type"] for row in rows] == [10000, 10002, 37]
+    assert [row["server_id"] for row in rows] == [7002, 7003, 7004]
+
+    # 本地库不可用：返回空列表，不抛异常（冷却期内不触发建库）。
+    unavailable = LocalDbSource(mirror_dir=tmp_path / "nothing")
+    unavailable._next_retry = float("inf")
+    assert unavailable.event_rows(GROUP, types=(10000,)) == []
+
+    class Broken:
+        def event_rows(self, *_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+            raise RuntimeError("镜像坏了")
+
+    source._store = Broken()  # pyright: ignore[reportAttributeAccessIssue]
+    assert source.event_rows(GROUP, types=(10000,)) == []
 
 
 # --------------------------------------------------------------- fail-open

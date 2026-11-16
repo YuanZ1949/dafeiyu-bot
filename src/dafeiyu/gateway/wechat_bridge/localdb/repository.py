@@ -82,6 +82,13 @@ _CONTENT_ZSTD = 4
 #: 支持的稳定消息类型（10000/10002/未知类型一律丢弃）。
 _SUPPORTED_TYPES = frozenset({1, 3, 34, 42, 43, 47, 48, 49, 50})
 
+#: 事件行类型：10000（系统提示）、10002（撤回/系统通知）。
+#: `recent` 仍丢弃它们；事件桥接层经 :meth:`LocalMessageStore.event_rows` 单独读。
+_SYSTEM_EVENT_TYPES = (10000, 10002)
+
+#: 好友请求消息类型（同上：不进 `recent`，经 `friend_request_rows` 读）。
+_FRIEND_REQUEST_TYPES = (37,)
+
 #: 非文本类型的占位文本；49（appmsg）单独取 `<title>`。
 _PLACEHOLDER_BY_TYPE: dict[int, tuple[str, str]] = {
     3: ("image", "[图片]"),
@@ -422,9 +429,15 @@ class LocalMessageStore:
                 ("name2id", shard), lambda: _name2id(con)
             )
             contacts, strangers = self._display_indexes()
+            # server_id 列是 4.x 中后期才有的：schema 里没有就查 0，保持行宽一致。
+            server_select = (
+                '"server_id"'
+                if _has_column(con, table, "server_id")
+                else "0 AS server_id"
+            )
             query = (
                 f"SELECT local_id, local_type, real_sender_id, create_time, "
-                f"message_content, WCDB_CT_message_content "
+                f"message_content, WCDB_CT_message_content, {server_select} "
                 f'FROM "{_quote_ident(table)}" '
             )
             params: list[Any] = [count]
@@ -494,6 +507,107 @@ class LocalMessageStore:
             return entry
         return None
 
+    def event_rows(
+        self,
+        username: str,
+        *,
+        types: tuple[int, ...],
+        since_local_id: int = 0,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """读 ``username`` 会话里指定类型的**事件行**，``local_id`` 正序。
+
+        与 :meth:`recent` 不同：不过 ``_SUPPORTED_TYPES`` 过滤、不走渲染
+        管线，只把正文按 ``_decode_content`` 解出来原样返回（系统提示/
+        撤回通知/好友请求的 XML 由调用方自行解析）。行形状::
+
+            {"local_id": int, "local_type": int, "real_sender_id": int,
+             "create_time": int, "server_id": int, "content": str}
+
+        ``server_id`` 列不存在时恒为 0。库缺失/分库找不到/schema 不符/
+        参数非法一律返回空列表（fail-open）。
+        """
+        count = _positive_int(limit)
+        wanted: list[int] = []
+        for value in types:
+            base = _base_type(value)
+            if base is not None and base not in wanted:
+                wanted.append(base)
+        if not wanted or count is None:
+            log.debug(
+                "event_rows 参数非法（types=%r, limit=%r），返回空列表", types, limit
+            )
+            return []
+        name = str(username or "").strip()
+        if not name:
+            return []
+        table = message_table_name(name)
+        shard = self._find_shard(table)
+        if shard is None:
+            log.debug("会话 %r 的消息表 %s 不在任何分库里", name, table)
+            return []
+        path = self._mirror_path(shard)
+        if path is None:
+            return []
+        try:
+            con = _connect(path)
+        except (sqlite3.Error, OSError) as exc:
+            log.debug("打开消息分库 %s 失败：%s", shard, exc)
+            return []
+        with closing(con):
+            if not _has_columns(con, table):
+                log.debug("%s 里的表 %s 缺失或 schema 不符，返回空列表", shard, table)
+                return []
+            server_select = (
+                '"server_id"'
+                if _has_column(con, table, "server_id")
+                else "0 AS server_id"
+            )
+            placeholders = ",".join("?" for _ in wanted)
+            query = (
+                f"SELECT local_id, local_type, real_sender_id, create_time, "
+                f"message_content, WCDB_CT_message_content, {server_select} "
+                f'FROM "{_quote_ident(table)}" '
+                f"WHERE (local_type & {_TYPE_MASK}) IN ({placeholders}) "
+                f"AND local_id > ? ORDER BY local_id ASC LIMIT ?"
+            )
+            try:
+                rows = con.execute(
+                    query, (*wanted, _safe_int(since_local_id), count)
+                ).fetchall()
+            except sqlite3.Error as exc:
+                log.debug("读取 %s.%s 失败：%s", shard, table, exc)
+                return []
+        return [
+            {
+                "local_id": _safe_int(row[0]),
+                "local_type": _base_type(row[1]),
+                "real_sender_id": _safe_int(row[2]),
+                "create_time": _safe_int(row[3]),
+                "server_id": _safe_int(row[6]),
+                "content": self._decode_content(row[4], _safe_int(row[5])),
+            }
+            for row in rows
+        ]
+
+    def recent_system_events(
+        self, username: str, *, since_local_id: int = 0, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """系统事件行（10000 提示 / 10002 撤回通知），见 :meth:`event_rows`。"""
+        return self.event_rows(
+            username, types=_SYSTEM_EVENT_TYPES, since_local_id=since_local_id,
+            limit=limit,
+        )
+
+    def friend_request_rows(
+        self, username: str, *, since_local_id: int = 0, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """好友请求行（local_type 37），见 :meth:`event_rows`。"""
+        return self.event_rows(
+            username, types=_FRIEND_REQUEST_TYPES, since_local_id=since_local_id,
+            limit=limit,
+        )
+
     # ------------------------------------------------------------- 行规整
     def _entry_from_row(
         self,
@@ -544,6 +658,7 @@ class LocalMessageStore:
             "reply_to": reply_to,
             "reply_author": reply_author,
             "ts": _safe_int(row[3]),
+            "server_id": _safe_int(row[6]),
         }
         if media is not None:
             entry["media"] = media
@@ -1256,14 +1371,22 @@ def _shard_order(rel: str) -> tuple[int, str]:
 
 
 def _has_columns(con: sqlite3.Connection, table: str) -> bool:
+    return _REQUIRED_COLUMNS.issubset(_column_names(con, table))
+
+
+def _has_column(con: sqlite3.Connection, table: str, column: str) -> bool:
+    """单个列存在性检查（``server_id`` 这类后期新增列需要 feature-detect）。"""
+    return column in _column_names(con, table)
+
+
+def _column_names(con: sqlite3.Connection, table: str) -> set[str]:
+    """``table`` 的列名集合；读不到 schema 返回空集（当作什么列都没有）。"""
     try:
         info = con.execute(f'PRAGMA table_info("{_quote_ident(table)}")').fetchall()
     except sqlite3.Error as exc:
         log.debug("读取表 %s 的 schema 失败：%s", table, exc)
-        return False
-    if not info:
-        return False
-    return _REQUIRED_COLUMNS.issubset({str(row[1]) for row in info})
+        return set()
+    return {str(row[1]) for row in info if len(row) > 1}
 
 
 def _table_columns(con: sqlite3.Connection) -> dict[str, set[str]]:

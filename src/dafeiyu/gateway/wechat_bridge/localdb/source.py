@@ -211,6 +211,33 @@ class LocalDbSource:
             log.debug("本地库回读自己消息失败（%r）：%s", name, exc)
             return None
 
+    def event_rows(
+        self,
+        username: str,
+        *,
+        types: tuple[int, ...],
+        since_local_id: int = 0,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """按 username 读事件行（系统消息/好友请求等）；任何失败都返回空列表。
+
+        与 :meth:`snapshot` 不同：入参直接是 username（事件桥接层已从
+        ``resolve_username`` 拿到它），不再按显示名二次解析。
+        """
+        store = self._ensure()
+        if store is None:
+            return []
+        name = str(username or "").strip()
+        if not name:
+            return []
+        try:
+            return store.event_rows(
+                name, types=types, since_local_id=since_local_id, limit=limit
+            )
+        except Exception as exc:  # noqa: BLE001 - 事件行读失败不能打断调用方
+            log.debug("本地库读取事件行失败（%r）：%s", name, exc)
+            return []
+
     # ------------------------------------------------------------- 内部
     def _ensure(self) -> LocalMessageStore | None:
         if self._store is not None:
