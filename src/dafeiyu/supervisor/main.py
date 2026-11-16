@@ -415,7 +415,10 @@ def build_ops(
         bot_url=bot_url,
         token=initial_token,
         backups=backups,
-        napcat_login=napcat_login,
+        # HealthMonitor 声明的是 Callable[[], Any]；绑定的 .state 方法与
+        # health._napcat_state 里对 NapCatLogin 对象走的 target.state() 等价
+        #（callable 分支调用后 isawaitable 再 await），结果一致。
+        napcat_login=(napcat_login.state if napcat_login is not None else None),
     )
 
     alerts: AlertManager | None = None

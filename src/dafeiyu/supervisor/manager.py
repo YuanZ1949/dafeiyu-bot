@@ -68,8 +68,8 @@ class ProcState:
     started_at: float = 0.0
     manual_stop: bool = False
     external_pid: int | None = None
-    drains: list[asyncio.Task] = field(default_factory=list)
-    watcher: asyncio.Task | None = None
+    drains: list[asyncio.Task[None]] = field(default_factory=list)
+    watcher: asyncio.Task[None] | None = None
     # 自愈：上次触发时间、正在跑、已排队；三者一起防重复重启。
     last_recover_at: float = 0.0
     recovering: bool = False
@@ -113,7 +113,7 @@ class Supervisor:
             name: ProcState(name=name, spec=spec) for name, spec in specs.items()
         }
         self._closing = False
-        self._external_watch: asyncio.Task | None = None
+        self._external_watch: asyncio.Task[None] | None = None
         self.external_poll = 2.0
 
     async def _default_probe(self, url: str) -> bool:

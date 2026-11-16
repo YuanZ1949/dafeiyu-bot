@@ -192,9 +192,15 @@ def _audit_lock(path: Path) -> Iterator[None]:
         if locked:
             try:
                 if os.name == "nt":
+                    # 平台分支内重新 import（sys.modules 缓存后是无操作），
+                    # 让每个引用在自己的分支内确定已绑定。
+                    import msvcrt
+
                     os.lseek(fd, 0, os.SEEK_SET)
                     msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
                 else:
+                    import fcntl
+
                     fcntl.flock(fd, fcntl.LOCK_UN)
             except OSError:
                 pass

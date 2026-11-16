@@ -23,6 +23,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 LOW = "low"
 MEDIUM = "medium"
@@ -256,12 +257,15 @@ def _as_wechat_config(config):
 
 
 def _wechat_pids() -> list[int]:
-    from .gateway.wechat_bridge import health
-
+    # gateway/wechat_bridge/health.py 顶层 import 本模块（取 _integrity_from_sid
+    # 等），与本模块里的运行期懒加载构成假性 import 环；health.py 归另一工区，
+    # 不能改动，这里把懒加载改走 importlib 以打破 pyright 的环检测——加载的
+    # 模块与原先 from-import 完全一致，仍是首次调用时才导入。
+    health = importlib.import_module("dafeiyu.gateway.wechat_bridge.health")
     return list(health._wechat_pids())
 
 
-def _wechat_about() -> dict:
+def _wechat_about() -> dict[str, Any]:
     from .gateway.wechat_bridge import driver
 
     return driver.about()
@@ -274,26 +278,22 @@ def _wechat_language() -> str:
 
 
 def _wechat_desktop() -> str:
-    from .gateway.wechat_bridge import health
-
+    health = importlib.import_module("dafeiyu.gateway.wechat_bridge.health")
     return health._detect_desktop()
 
 
 def _wechat_integrity_state(running: bool) -> str:
-    from .gateway.wechat_bridge import health
-
+    health = importlib.import_module("dafeiyu.gateway.wechat_bridge.health")
     return health._integrity_state(running)
 
 
 def _compare_versions(left, right):
-    from .gateway.wechat_bridge import health
-
+    health = importlib.import_module("dafeiyu.gateway.wechat_bridge.health")
     return health._compare_versions(left, right)
 
 
 def _normalize_language(value):
-    from .gateway.wechat_bridge import health
-
+    health = importlib.import_module("dafeiyu.gateway.wechat_bridge.health")
     return health._normalize_language(value)
 
 

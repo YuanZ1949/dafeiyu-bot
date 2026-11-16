@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -124,7 +124,7 @@ def create_app(
     qr_path: Path,
     bot_url: str,
     token: str | Callable[[], str] = "",
-    on_shutdown: Callable[..., Awaitable[None]] | None = None,
+    on_shutdown: Callable[..., Coroutine[Any, Any, None]] | None = None,
     napcat_login: NapCatLogin | None = None,
     auth: DashboardAuth | None = None,
     ops: OpsServices | None = None,
@@ -1237,6 +1237,8 @@ def create_app(
     async def rotate_control_token(request: web.Request) -> web.Response:
         if control_token is None:
             return ops_unavailable()
+        # 嵌套函数里 pyright 不继承外层的 None 收窄，取一个非 None 别名。
+        token_ctl = control_token
         payload = await _json_body(request)
         if payload is None:
             return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
@@ -1259,7 +1261,7 @@ def create_app(
             def rollback() -> None:
                 # 即使 old 为空也要尝试回写，避免 holder / 磁盘 / env / health 分裂。
                 try:
-                    control_token.set(old)
+                    token_ctl.set(old)
                 except Exception as rollback_exc:  # noqa: BLE001
                     log.critical("control token 回滚写盘失败：%s", rollback_exc)
                 env["DAFEIYU_CONTROL_TOKEN"] = old_env
@@ -1322,9 +1324,11 @@ def create_app(
         loop = asyncio.get_running_loop()
         # actor 必须在 handler 返回前算好：call_later 里的 request 对象可能已释放。
         actor = audit_actor(request)
+        # lambda 里 pyright 不继承外层的 None 收窄，先绑定到非 None 局部名。
+        shutdown_cb = on_shutdown
         loop.call_later(
             0.3,
-            lambda: asyncio.create_task(on_shutdown(reason="dashboard", actor=actor)),
+            lambda: asyncio.create_task(shutdown_cb(reason="dashboard", actor=actor)),
         )
         return web.json_response({"ok": True, "message": "正在关闭所有进程"})
 
@@ -1435,7 +1439,7 @@ def _sse(line: str, event_id: int | None = None) -> bytes:
     return f"{prefix}data: {json.dumps(line, ensure_ascii=False)}\n\n".encode()
 
 
-async def _json_body(request: web.Request) -> dict | None:
+async def _json_body(request: web.Request) -> dict[str, Any] | None:
     try:
         payload = await request.json()
     except (ValueError, TypeError):
@@ -1450,7 +1454,7 @@ async def serve(
     qr_path: Path,
     bot_url: str,
     token: str | Callable[[], str] = "",
-    on_shutdown: Callable[..., Awaitable[None]] | None = None,
+    on_shutdown: Callable[..., Coroutine[Any, Any, None]] | None = None,
     napcat_login: NapCatLogin | None = None,
     ops: OpsServices | None = None,
     control_token: ControlToken | None = None,

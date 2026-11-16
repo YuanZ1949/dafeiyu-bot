@@ -23,6 +23,7 @@ import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -83,7 +84,7 @@ def _ext_from_url(url: str) -> str:
     return suffix if suffix in _URL_SUFFIXES else ""
 
 
-def _source(data: dict) -> tuple[str, str]:
+def _source(data: dict[str, Any]) -> tuple[str, str]:
     """从 image 段 data 里挑可用来源，返回 (kind, value)；无可用来源 ("", "")。
 
     优先级：http(s) url → http(s) file → 本地存在文件 → base64。
