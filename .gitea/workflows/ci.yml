@@ -129,18 +129,19 @@ jobs:
           & .\.ci-venv\Scripts\basedpyright.exe --level error src
           exit $LASTEXITCODE
 
-      - name: Run pytest
-        shell: pwsh
-        run: |
-          & .\.ci-venv\Scripts\python.exe -m pytest -q --cov=dafeiyu --cov-report=term-missing --cov-fail-under=83 --junitxml=junit.xml
-          exit $LASTEXITCODE
-
       # 真实浏览器 E2E（headless Edge + CDP）：本机没有 Edge 时用例会 skip，
       # 所以主 pytest 不含它（addopts 里 -m 'not e2e'），单独用 -m e2e 跑一次。
+      # 放在主 pytest 之前：E2E 只跑 7–10s，先失败先定位，不必等完整个单测。
       - name: Dashboard E2E
         shell: pwsh
         run: |
           & .\.ci-venv\Scripts\python.exe -m pytest -q -m e2e tests/test_dashboard_e2e.py
+          exit $LASTEXITCODE
+
+      - name: Run pytest
+        shell: pwsh
+        run: |
+          & .\.ci-venv\Scripts\python.exe -m pytest -q --cov=dafeiyu --cov-report=term-missing --cov-fail-under=83 --junitxml=junit.xml
           exit $LASTEXITCODE
 
       # v5.4.1 的 runner 只内置了 builtin:checkout（内置 upload-artifact 尚未发布），
