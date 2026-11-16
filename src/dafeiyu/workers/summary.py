@@ -41,7 +41,7 @@ MAX_SOURCE_LINES = 400
 MAX_CHUNK_TOKENS = 1200
 # 递归深度上限：切两层还超时就放弃，避免在小模型上无限重试烧配额。
 MAX_SPLIT_DEPTH = 2
-# 回补窗口：worker 每轮除了昨天，还会捡最近 7 天里漏掉的 (会话, 日期)。
+# 回补窗口：worker 每轮除了昨天，还会捡最近 14 天里漏掉的 (会话, 日期)。
 BACKFILL_DAYS = 14
 # 每轮最多补几个槽位：一次补太多会顶满当轮预算，剩下的留给下一轮。
 MAX_BACKFILL_PER_RUN = 3
@@ -449,7 +449,7 @@ class SummaryScheduler:
             return 0
 
         # 只补「昨天」的话，某天失败后目标日期就永久前移，那一整天再也没人补。
-        # 这里把最近 7 天的缺口一起捞出来（截止昨天，今天本来就不该有摘要）。
+        # 这里把最近 14 天的缺口一起捞出来（截止昨天，今天本来就不该有摘要）。
         until = (now.date() - timedelta(days=1)).isoformat()
         slots = self._store.pending_summary_slots(BACKFILL_DAYS, until=until)
         created = 0
