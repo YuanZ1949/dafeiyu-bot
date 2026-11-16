@@ -98,7 +98,7 @@ class ImpressionWorker:
         self.store = store
         self.brain = brain
         self.every = max(1, every)
-        self._last_count: dict[tuple[ChatType, int], int] = {}
+        self._last_count: dict[tuple[ChatType, str], int] = {}
         self._backoff = backoff or FailureBackoff(backoff_seconds, monotonic)
         # dashboard 换脑只更新 Service.brain，拿不到 worker 手里的引用；
         # 有 getter 就每次现取，否则印象抽取会一直用启动时的 provider。
@@ -136,7 +136,7 @@ class ImpressionWorker:
         self.store.set_impression_cursor(chat_type, chat_id, count)
         return added
 
-    def _last_count_for(self, key: tuple[ChatType, int]) -> int:
+    def _last_count_for(self, key: tuple[ChatType, str]) -> int:
         """游标落库：重启后从上次抽到的位置继续，而不是从 0 重跑一遍。"""
         if key not in self._last_count:
             self._last_count[key] = self.store.get_impression_cursor(*key)

@@ -10,6 +10,7 @@ from typing import Any
 
 from dafeiyu.budget import BudgetAction, BudgetGuard
 from dafeiyu.config import Settings
+from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.timeutil import SHANGHAI, now_shanghai  # noqa: F401 - 兼容旧导入路径
 
@@ -258,11 +259,11 @@ def _check_detail(
 @dataclass
 class Router:
     settings: Settings
-    store: object
+    store: Store
     clock: Callable[[], datetime] = now_shanghai
     rng: random.Random | None = None
-    _states: dict[tuple[ChatType, int], _ChatState] = field(default_factory=dict, init=False)
-    _loaded: set[tuple[ChatType, int]] = field(default_factory=set, init=False, repr=False)
+    _states: dict[tuple[ChatType, str], _ChatState] = field(default_factory=dict, init=False)
+    _loaded: set[tuple[ChatType, str]] = field(default_factory=set, init=False, repr=False)
     _persist_enabled: bool = field(default=True, init=False, repr=False)
     _rng: random.Random = field(init=False, repr=False)
     budget_guard: BudgetGuard = field(init=False, repr=False)
