@@ -29,6 +29,7 @@ import os
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from ..config import ConfigError
 from .provider_config import (
@@ -57,7 +58,16 @@ MINIMAL_CONFIG: dict[str, object] = {
 _LEGACY_MINIMAL = json.dumps(MINIMAL_CONFIG, ensure_ascii=False, indent=2)
 
 # 本次调用备份出的文件；没备份时为 None。Task 19 的 doctor 据此提示用户。
-LAST_BACKUP: Path | None = None
+# 真实状态存在小写的 `_last_backup` 里（函数内要反复赋值，大写名会被
+# basedpyright 视为常量而报 reportConstantRedefinition）；`LAST_BACKUP`
+# 通过模块级 __getattr__（PEP 562）以只读形式暴露，既有调用方与测试不变。
+_last_backup: Path | None = None
+
+
+def __getattr__(name: str) -> Any:
+    if name == "LAST_BACKUP":
+        return _last_backup
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _is_generated(text: str) -> bool:
@@ -85,8 +95,8 @@ def ensure_isolated_config(config_home: str | Path) -> Path:
     相对路径按当前工作目录解析，与 ``workspace.dir`` 一致。
     """
 
-    global LAST_BACKUP
-    LAST_BACKUP = None
+    global _last_backup
+    _last_backup = None
 
     root = Path(config_home).expanduser().resolve()
     config_file = config_path(str(root))
@@ -110,7 +120,7 @@ def ensure_isolated_config(config_home: str | Path) -> Path:
     stamp = datetime.now(UTC).astimezone().strftime("%Y%m%d-%H%M%S")
     backup = config_file.with_name(f"{config_file.name}.bak.{stamp}")
     shutil.copy2(config_file, backup)
-    LAST_BACKUP = backup
+    _last_backup = backup
     config_file.write_text(content, encoding="utf-8", newline="\n")
     log.warning("opencode 隔离配置被手改过，已备份到 %s 并恢复为生成的兜底配置", backup)
     return root

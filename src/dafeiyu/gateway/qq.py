@@ -196,6 +196,9 @@ def _render_rich_segment(seg_type: str, data: dict[str, Any]) -> str:
         return f"[骰子:{data.get('result', '?')}]"
     if seg_type == "rps":
         result = data.get("result")
+        if result is None:
+            # 原实现 int(None) 抛 TypeError 落兜底，固定渲染 "?"；提前短路，行为不变。
+            return "[猜拳:?]"
         try:
             name = _RPS_NAMES.get(int(result), str(result))
         except (TypeError, ValueError):

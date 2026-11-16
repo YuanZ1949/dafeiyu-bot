@@ -140,7 +140,9 @@ class _UiThreadDriver:
         if threading.get_ident() == getattr(ui, "thread_ident", None):
             raise DriverError("deadlock_guard", f"{label}: 不能从 UIA 线程再投递")
         try:
-            enqueue = getattr(self._poller, "enqueue_send", None)
+            enqueue: Callable[
+                [Callable[[], Any]], concurrent.futures.Future[Any]
+            ] | None = getattr(self._poller, "enqueue_send", None)
             if callable(enqueue):
                 future = enqueue(fn)
             else:
@@ -626,20 +628,25 @@ async def run(
     try:
         if frame_source is None:
             # UI 线程必须在服务器监听之后启动；它只通过 PollingLoop 的队列被使用。
-            poller = (poller_factory or _default_poller_factory)(wechat, driver)
-            poller_holder.append(poller)
-            await asyncio.wait_for(poller.start(), _AWAIT_TIMEOUT)
-            _warmup_localdb(poller)
+            new_poller: Any = (poller_factory or _default_poller_factory)(
+                wechat, driver
+            )
+            # `poller` 的声明类型是 `Any | None`，直接 `.start()` / `.frames()`
+            # 会报 Optional 成员访问；块内统一用非 Optional 的 `new_poller`。
+            poller = new_poller
+            poller_holder.append(new_poller)
+            await asyncio.wait_for(new_poller.start(), _AWAIT_TIMEOUT)
+            _warmup_localdb(new_poller)
             # 默认指令处理器 = 内置发送路径；注入 handler 时由调用方全权接管，
             # 注入 frame_source 时没有轮询循环，也就没有可解析的 alias。
             if command_handler is None:
                 sender = (sender_factory or _default_sender_factory)(
-                    wechat, poller, driver
+                    wechat, new_poller, driver
                 )
                 sender_holder.append(sender)
-                receipt_verifier = _default_receipt_verifier(wechat, poller)
-            startup_health = await _startup_health_frame(poller, wechat, driver)
-            source = poller.frames()
+                receipt_verifier = _default_receipt_verifier(wechat, new_poller)
+            startup_health = await _startup_health_frame(new_poller, wechat, driver)
+            source = new_poller.frames()
         else:
             startup_health = _fallback_health_frame(connected=True)
             source = frame_source
@@ -915,7 +922,9 @@ def _build_localdb_source(wechat: WeChatConfig) -> Any | None:
 def _warmup_localdb(poller: Any) -> None:
     """后台预热：扫进程内存提密钥可能要几十秒，绝不阻塞轮询启动。"""
     source = getattr(poller, "localdb", None)
-    prepare = getattr(source, "prepare_async", None)
+    prepare: Callable[[], Awaitable[Any]] | None = getattr(
+        source, "prepare_async", None
+    )
     if not callable(prepare):
         return
     task = asyncio.ensure_future(prepare())

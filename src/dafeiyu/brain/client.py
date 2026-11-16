@@ -271,7 +271,7 @@ def _voice_field(raw: object) -> bool:
     return False
 
 
-def _reply_from_dict(data: dict) -> tuple[bool, str] | None:
+def _reply_from_dict(data: dict[str, Any]) -> tuple[bool, str] | None:
     raw_speak = data.get("speak", True)
     if isinstance(raw_speak, str):
         # 模型偶尔把布尔值写成字符串，bool("false") 会是 True，必须显式归一。
@@ -456,7 +456,7 @@ class BrainClient:
     async def decide(
         self,
         system: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         max_tokens: int | None = None,
     ) -> BrainReply:
         payload = {
@@ -487,7 +487,7 @@ class BrainClient:
         prompt: str,
         *,
         system: str = "",
-        history: list[dict] | None = None,
+        history: list[dict[str, Any]] | None = None,
         on_tool: object = None,
     ) -> BrainReply:
         """与 OpenCode 对齐的入口：无状态端点靠显式历史获得连续性。
@@ -506,7 +506,7 @@ class BrainClient:
     async def complete(
         self,
         system: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         max_tokens: int = 400,
         temperature: float = 0.2,
     ) -> str:
@@ -519,7 +519,7 @@ class BrainClient:
     async def complete_detailed(
         self,
         system: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         max_tokens: int = 400,
         temperature: float = 0.2,
     ) -> tuple[str, int, int]:
@@ -536,7 +536,7 @@ class BrainClient:
             raise BrainError("DeepSeek 补全被截断（finish_reason=length）")
         return _strip_fence(content), prompt_tokens, completion_tokens
 
-    async def _call(self, payload: dict) -> tuple[str, int, int, str]:
+    async def _call(self, payload: dict[str, Any]) -> tuple[str, int, int, str]:
         if self.reasoning_effort:
             payload = {**payload, "reasoning_effort": self.reasoning_effort}
         for attempt in range(2):
@@ -552,7 +552,7 @@ class BrainClient:
 
         raise BrainError("DeepSeek 请求失败：未知原因")
 
-    async def _request_raw(self, payload: dict) -> tuple[str, int, int, str]:
+    async def _request_raw(self, payload: dict[str, Any]) -> tuple[str, int, int, str]:
         url = f"{self.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:

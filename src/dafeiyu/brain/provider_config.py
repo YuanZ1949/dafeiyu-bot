@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from string import Template
-from typing import Any
+from typing import Any, final
 
 from ..config import BrainConfig, LocalModelConfig, Settings
 from .persona import (
@@ -134,6 +134,7 @@ def _local_config(
     }
 
 
+@final
 class _UnsetKeyRel:
     """哨兵：区分「未传 key_rel」与「显式传 None」。
 
@@ -179,16 +180,22 @@ def build_config(
             "websearch": {"provider": WEBSEARCH_PROVIDER},
         }
     if mode == "key":
-        resolved = DEFAULT_KEY_REL if key_rel is _UNSET_KEY_REL else key_rel
+        # key_rel 只可能是哨兵 / str / None；isinstance 把 str | None 归一出来，
+        # 行为与直接传 key_rel 一致（显式 None 时两档都不写 apiKey）。
+        resolved = (
+            DEFAULT_KEY_REL
+            if key_rel is _UNSET_KEY_REL
+            else (key_rel if isinstance(key_rel, str) else None)
+        )
         return _key_config(cfg, resolved)
     if mode == "local_model":
-        resolved = None if key_rel is _UNSET_KEY_REL else key_rel
+        resolved = key_rel if isinstance(key_rel, str) else None
         return _local_config(local, resolved)
     supported = " / ".join(SUPPORTED_MODES)
     raise ValueError(f"不支持的大脑模式：{mode}（仅支持 {supported}）")
 
 
-def render_config(data: dict) -> str:
+def render_config(data: dict[str, Any]) -> str:
     """渲染成落盘文本：首行标记 + 缩进 2 的 JSON，末尾带换行。"""
     return f"{GENERATED_MARK}\n{json.dumps(data, indent=2, ensure_ascii=False)}\n"
 

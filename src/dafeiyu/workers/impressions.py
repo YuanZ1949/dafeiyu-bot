@@ -42,7 +42,7 @@ def _strip_fence(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _parse_items(raw: str) -> list[dict]:
+def _parse_items(raw: str) -> list[dict[str, Any]]:
     try:
         data = json.loads(_strip_fence(raw))
     except ValueError:
@@ -52,7 +52,7 @@ def _parse_items(raw: str) -> list[dict]:
     return [item for item in data if isinstance(item, dict)]
 
 
-def _valid_item(item: dict) -> tuple[str, str, str, float] | None:
+def _valid_item(item: dict[str, Any]) -> tuple[str, str, str, float] | None:
     user_id = item.get("user_id")
     kind = item.get("kind")
     content = item.get("content")
