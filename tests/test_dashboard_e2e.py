@@ -4,7 +4,7 @@
 排除在默认运行外，CI 的 Dashboard E2E 步骤用 ``-m e2e`` 单独执行。机器上
 没有 Edge 时整模块干净 skip（跳过 ≠ 通过，输出里必须能看到 skipped）。
 
-覆盖四个真实 DOM 行为（不 mock 前端 JS，走 create_app 的真路由）：
+覆盖五个真实 DOM 行为（不 mock 前端 JS，走 create_app 的真路由）：
 
 1. 主题持久化：点 #btn-theme 翻转 documentElement.dataset.theme，
    localStorage 写入，重载页面后主题仍在；
@@ -12,13 +12,16 @@
    .pane.active 且 id 与点击目标一致；
 3. 会话时间线抽屉：点会话行的「查看时间线」让抽屉可见，点关闭按钮再隐藏；
 4. 用量趋势：点 #btn-refresh-usage 后 #usage-bars 渲染出柱子，且 dashboard
-   的 GET /api/usage（经 TestClient）透传 200 + series 数组。
+   的 GET /api/usage（经 TestClient）透传 200 + series 数组；
+5. 用量按用途：真实 BrainControl 临时 Store 里种下四行 usage，页面
+   #usage-purposes 渲染出带 data-purpose 的行，reply 行可被选中。
 
 实现说明：dashboard 的 /api/usage、/api/sessions、timeline 都是透传给 bot
 进程的代理（见 supervisor/dashboard.py 的 bot_call），所以旁边起一个最小
-aiohttp 桩 bot 提供这三个端点，避免依赖真实 bot。浏览器只经
-``tests/_dashboard_cdp.browser_page``（headless Edge + CDP），不引入
-playwright / selenium；每次等待都有界（轮询 + 超时断言），无裸 sleep。
+aiohttp 桩 bot 提供这三个端点，避免依赖真实 bot；用例 5 例外，它直接把
+BrainControl 应用当作 bot，让 /api/usage 从临时 Store 读回种下的行。
+浏览器只经 ``tests/_dashboard_cdp.browser_page``（headless Edge + CDP），
+不引入 playwright / selenium；每次等待都有界（轮询 + 超时断言），无裸 sleep。
 """
 
 from __future__ import annotations
@@ -32,7 +35,9 @@ import pytest
 from _dashboard_cdp import QaError, browser_page, browser_path
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from test_control_api import make_control
 
+from dafeiyu.models import ChatType
 from dafeiyu.supervisor.dashboard import create_app
 from dafeiyu.supervisor.logs import LogHub
 
@@ -110,12 +115,16 @@ def make_bot_app() -> web.Application:
     return app
 
 
-async def make_clients(tmp_path: Path) -> tuple[TestClient, TestClient]:
+async def make_clients(
+    tmp_path: Path, bot_app: web.Application | None = None
+) -> tuple[TestClient, TestClient]:
     """起桩 bot + dashboard（127.0.0.1 TestServer），返回两个已启动的 client。
 
     settings=None ⇒ auth 关闭（见 _auth_from_settings），浏览器直开首页即登录态。
+    ``bot_app`` 缺省用只提供四个用例所需端点的桩；按用途用例传入真实
+    BrainControl 应用，让 /api/usage 从临时 Store 里读回种下的行。
     """
-    bot_client = TestClient(TestServer(make_bot_app()))
+    bot_client = TestClient(TestServer(bot_app if bot_app is not None else make_bot_app()))
     await bot_client.start_server()
     bot_url = str(bot_client.server.make_url("/")).rstrip("/")
     app = create_app(
@@ -133,6 +142,8 @@ async def make_clients(tmp_path: Path) -> tuple[TestClient, TestClient]:
 @asynccontextmanager
 async def dashboard_page(
     tmp_path: Path,
+    *,
+    bot_app: web.Application | None = None,
 ) -> AsyncIterator[tuple[TestClient, "object"]]:
     """dashboard TestClient + headless 浏览器页面；无 Edge 时整用例 skip。"""
     try:
@@ -141,7 +152,7 @@ async def dashboard_page(
         import pytest
 
         pytest.skip(f"本机没有可用的浏览器（Edge）：{exc.message}")
-    dash_client, bot_client = await make_clients(tmp_path)
+    dash_client, bot_client = await make_clients(tmp_path, bot_app)
     try:
         url = str(dash_client.server.make_url("/"))
         async with browser_page(url) as page:
@@ -271,9 +282,61 @@ async def test_e2e_usage_bars_render_and_api_returns_series(tmp_path: Path) -> N
         )
         assert bars > 0
 
+        # 桩 payload 没有 purposes（旧后端形态）：按用途段落到空态，
+        # 而不是抛错或把卡片已有内容清空。
+        assert (
+            await page.eval_js(
+                "document.getElementById('usage-purposes').childElementCount"
+            )
+            == 1
+        )
+
         # 同一个 dashboard 实例走 TestClient 再验一次代理契约。
         resp = await client.get("/api/usage")
         assert resp.status == 200
         data = await resp.json()
         assert isinstance(data.get("series"), list)
         assert len(data["series"]) > 0
+
+
+# ------------------------------------------------------- 用例 5：按用途拆分
+
+
+def make_control_bot_app(tmp_path: Path) -> web.Application:
+    """真实 BrainControl 应用 + 临时 Store：/api/usage 读的是种下的行。
+
+    与 tests/test_store_usage_purpose.py::test_usage_endpoint_exposes_purposes
+    同一套种子（reply / ambient / summary / error），确保 purposes 非空。
+    """
+    control, _service, app = make_control(tmp_path)
+    control.store.record_usage(ChatType.GROUP, 100, "reply", 10, 5)
+    control.store.record_usage(ChatType.GROUP, 100, "ambient", 2, 1)
+    control.store.record_usage(ChatType.GROUP, 100, "summary", 4, 2)
+    control.store.record_usage(ChatType.GROUP, 100, "error", 0, 0)
+    return app
+
+
+async def test_e2e_usage_purposes_render_from_control_store(tmp_path: Path) -> None:
+    """按用途段真的消费 /api/usage.purposes：DOM 里每行带 data-purpose。"""
+    bot_app = make_control_bot_app(tmp_path)
+    async with dashboard_page(tmp_path, bot_app=bot_app) as (_client, page):
+        await page.click("#btn-refresh-usage")
+        await wait_until(
+            page,
+            "document.querySelectorAll('#usage-purposes > [data-purpose]').length > 0",
+            description="按用途容器应渲染出带 data-purpose 的行",
+        )
+        purposes = await page.eval_js(
+            "[...document.querySelectorAll('#usage-purposes > [data-purpose]')]"
+            ".map((el) => el.getAttribute('data-purpose'))"
+        )
+        assert "reply" in purposes, purposes
+        reply = await page.eval_js(
+            "(() => { const el = document.querySelector("
+            "'#usage-purposes > [data-purpose=\"reply\"]');"
+            "return el ? el.getAttribute('data-purpose') : null; })()"
+        )
+        assert reply == "reply"
+
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        await page.screenshot(EVIDENCE_DIR / "qg-e2e-usage-purposes.png")

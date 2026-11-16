@@ -1387,6 +1387,13 @@
             <span class="legend-key"><span class="legend-seg err"></span>错误</span>
           </div>
           <div class="row kv usage-totals" id="usage-totals"></div>
+          <div class="row" style="margin:12px 0 4px">
+            <h3>按用途</h3>
+            <span class="spacer"></span>
+            <span class="kv">Token 占比</span>
+          </div>
+          <div class="usage-legend" id="usage-purposes-legend"></div>
+          <div class="mem-list list-h-sm" id="usage-purposes"></div>
           <div class="budget-panel" id="budget-panel">
             <div class="row budget-head">
               <h3>预算</h3>
@@ -4151,6 +4158,57 @@ function fmtTokens(n) {
   return String(value);
 }
 
+// 用量按用途拆分：后端给英文 purpose，面板只负责翻译；表外的 purpose 原样显示。
+const USAGE_PURPOSE_LABELS = {
+  reply: "主回复",
+  ambient: "旁路插话",
+  summary: "摘要",
+  impression: "印象",
+  observer: "观察",
+  reflector: "反思",
+  error: "错误",
+  complete: "补全",
+};
+
+function usagePurposeLabel(purpose) {
+  const key = String(purpose || "");
+  return USAGE_PURPOSE_LABELS[key] || key || "—";
+}
+
+function renderUsagePurposeLegend() {
+  const box = $("usage-purposes-legend");
+  if (!box) return;
+  box.innerHTML = Object.entries(USAGE_PURPOSE_LABELS).map(([purpose, label]) =>
+    `<span class="legend-key"><span class="legend-seg${purpose === "error" ? " err" : ""}"></span>${label}</span>`
+  ).join("");
+}
+
+function renderUsagePurposes(purposes) {
+  const box = $("usage-purposes");
+  if (!box) return;
+  // 旧后端没有 purposes；非数组一律当空，不能把已有的卡片内容清掉。
+  const rows = Array.isArray(purposes) ? purposes : [];
+  if (!rows.length) {
+    box.innerHTML = '<div class="mem-empty">暂无数据</div>';
+    return;
+  }
+  const total = rows.reduce((sum, row) => sum + (Number(row.tokens) || 0), 0);
+  box.innerHTML = rows.map((row) => {
+    const purpose = String(row.purpose || "");
+    const tokens = Number(row.tokens) || 0;
+    const share = total > 0 ? (tokens / total) * 100 : 0;
+    const width = Math.max(0, Math.min(100, share)).toFixed(2);
+    const fill = purpose === "error" ? "var(--bad)" : "var(--accent)";
+    return `<div data-purpose="${escapeHtml(purpose)}" style="display:grid;grid-template-columns:5.5em 1fr auto;gap:8px;align-items:center">
+      <span>${escapeHtml(usagePurposeLabel(purpose))}</span>
+      <span style="height:6px;border-radius:999px;background:var(--panel-2);border:1px solid var(--line);overflow:hidden">
+        <span style="display:block;height:100%;width:${width}%;background:${fill}"></span>
+      </span>
+      <span class="kv">${fmtTokens(tokens)}</span>
+    </div>`;
+  }).join("");
+}
+
 async function loadUsage() {
   try {
     const data = await api(`/api/usage?days=${usageDays}`);
@@ -4178,6 +4236,7 @@ async function loadUsage() {
       `<span>回复 <b>${totals.calls || 0}</b></span>` +
       `<span>错误 <b>${totals.errors || 0}</b></span>` +
       `<span>Token <b>${fmtTokens(totals.tokens)}</b></span>`;
+    renderUsagePurposes(data.purposes);
 
     const top = data.top || [];
     $("usage-top").innerHTML = top.length
@@ -6003,6 +6062,7 @@ loadDecisions();
 refreshAlerts();
 refreshBackups();
 loadMemory();
+renderUsagePurposeLegend();
 loadUsage();
 loadEvals();
 loadBudget();

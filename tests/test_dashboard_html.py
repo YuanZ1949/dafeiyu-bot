@@ -1007,3 +1007,50 @@ def test_html_open_loops_card_lists_and_closes_loops() -> None:
     # kind 用中文短标签，不把枚举原文摊给用户。
     for label in ("等待", "等兑现", "等结果", "在玩梗"):
         assert label in html, label
+
+
+# ------------------------------------------------------ 用量按用途拆分契约
+
+#: 后端 purpose -> 面板中文标签；表外 purpose 必须原样显示，不能崩、不能空行。
+USAGE_PURPOSE_LABELS = {
+    "reply": "主回复",
+    "ambient": "旁路插话",
+    "summary": "摘要",
+    "impression": "印象",
+    "observer": "观察",
+    "reflector": "反思",
+    "error": "错误",
+    "complete": "补全",
+}
+
+
+def test_html_usage_card_breaks_tokens_down_by_purpose() -> None:
+    """用量卡里新增「按用途」段：容器在两根柱子之后，标签表八个键都在。"""
+    html = read_html()
+    assert 'id="usage-purposes"' in html
+    assert html.index('id="usage-purposes"') > html.index('id="usage-bars"')
+    assert 'id="usage-purposes-legend"' in html
+    for purpose, label in USAGE_PURPOSE_LABELS.items():
+        assert f'{purpose}: "{label}"' in html, purpose
+
+
+def test_html_usage_purposes_render_defensively_and_reuse_tokens() -> None:
+    """purposes 缺失/非数组当空；比例条用既有 CSS 令牌，不新增色值。"""
+    html = read_html()
+    match = re.search(
+        r"function renderUsagePurposes\(purposes\) \{\n(.*?)\n\}", html, re.DOTALL
+    )
+    assert match is not None, "renderUsagePurposes 必须仍是一段可直接断言的函数体"
+    body = match.group(1)
+    assert "Array.isArray(purposes)" in body
+    assert "暂无数据" in body
+    assert 'data-purpose="${escapeHtml(purpose)}"' in body
+    assert "fmtTokens(tokens)" in body
+    # 分母是区间 token 总量；0 时宽度为 0，不能除零。
+    assert "total > 0" in body
+    assert "var(--accent)" in body and "var(--bad)" in body
+    assert not re.search(r"#[0-9a-fA-F]{3,8}\b", body)
+
+    load_usage = re.search(r"async function loadUsage\(\) \{\n(.*?)\n\}", html, re.DOTALL)
+    assert load_usage is not None
+    assert "renderUsagePurposes(data.purposes)" in load_usage.group(1)
