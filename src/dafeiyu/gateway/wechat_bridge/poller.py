@@ -57,8 +57,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from .align import SessionAligner
 from ...hotconfig import WeChatRuntime
+from .align import SessionAligner
 
 logger = logging.getLogger(__name__)
 

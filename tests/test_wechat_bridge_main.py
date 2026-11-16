@@ -1674,7 +1674,7 @@ async def test_corrupt_state_file_treated_as_zero_without_crash(
     assert server._inbound_seq == 0
     assert server._inbound_acked == 0
     with caplog.at_level("WARNING", logger="dafeiyu.gateway.wechat_bridge.server"):
-        port = await asyncio.wait_for(server.start(), STEP)
+        await asyncio.wait_for(server.start(), STEP)
     try:
         assert await asyncio.wait_for(server.broadcast(_bridge_msg("m1")), STEP) == 0
         assert server._inbound_seq == 1

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from dafeiyu.memory.store import Store, UNATTRIBUTABLE_TABLES
+from dafeiyu.memory.store import UNATTRIBUTABLE_TABLES, Store
 from dafeiyu.models import ChatType, Episode, Message, OpenLoop, Participant
 
 

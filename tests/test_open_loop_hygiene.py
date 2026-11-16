@@ -33,7 +33,7 @@ from dafeiyu.config import (
 )
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message, OpenLoop
-from dafeiyu.router import Router, now_shanghai
+from dafeiyu.router import Router
 from dafeiyu.service import Service
 from dafeiyu.workers.observer import expire_open_loops_once, open_loop_expiry_loop
 

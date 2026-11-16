@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from dafeiyu.gateway.wechat_bridge.sender import Prepared, SendResult, Sender
+from dafeiyu.gateway.wechat_bridge.sender import Prepared, Sender, SendResult
 
 CHAT = "测试群"
 

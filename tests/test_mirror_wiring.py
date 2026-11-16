@@ -28,7 +28,7 @@ from dafeiyu.config import (
 )
 from dafeiyu.gateway.base import GatewayError
 from dafeiyu.memory.store import Store
-from dafeiyu.mirror import MediaBox, MirrorItem, MirrorRouter, MirroredAdapter
+from dafeiyu.mirror import MediaBox, MirroredAdapter, MirrorItem, MirrorRouter
 from dafeiyu.models import Attachment, ChatType, Message, Segment
 from dafeiyu.router import Router
 from dafeiyu.service import Service

@@ -24,7 +24,6 @@ from dafeiyu.config import (
     MemoryConfig,
     PersonaConfig,
     Settings,
-    SocialConfig,
     SpeechConfig,
     TriggerConfig,
     WorkspaceConfig,

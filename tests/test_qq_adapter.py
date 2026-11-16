@@ -854,7 +854,7 @@ async def test_old_connection_disconnect_keeps_new_connection_send_alive() -> No
             old_task = asyncio.create_task(
                 adapter.send(ChatType.GROUP, "qq:1", "旧连接")
             )
-            old_echo = json.loads(await asyncio.wait_for(old.recv(), 2))["echo"]
+            json.loads(await asyncio.wait_for(old.recv(), 2))["echo"]
 
             async with websockets.connect(uri, additional_headers=headers) as new:
                 await _until(lambda: adapter._generation >= 2, "新连接未被接管")

@@ -20,6 +20,7 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "respx>=0.21",
+    "ruff>=0.17",
 ]
 # 桌面微信桥的可选依赖。注意：PyPI 上的 `pyweixin` 只有 0.1.0 且没有分发文件，
 # `pip install pyweixin` 会直接 No matching distribution；上游把 import 名
@@ -65,3 +66,10 @@ dafeiyu = ["brain/persona.md", "brain/agent_template.md", "supervisor/dashboard/
 asyncio_mode = "auto"
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E9", "F", "I"]

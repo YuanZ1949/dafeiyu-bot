@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import pytest
 
+import dafeiyu.service as service_module
 from dafeiyu.brain.client import BrainError, BrainReply
 from dafeiyu.config import (
     BudgetConfig,
@@ -19,7 +20,6 @@ from dafeiyu.memory.store import Store
 from dafeiyu.mirror import MediaBox
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router, TriggerDecision, now_shanghai
-import dafeiyu.service as service_module
 from dafeiyu.service import FORGET_REPLY, Service
 from dafeiyu.workers.failure import QUOTA_KEY
 

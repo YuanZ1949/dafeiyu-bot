@@ -41,7 +41,6 @@ from dafeiyu.config import (
 )
 from dafeiyu.images import materialize_relay
 from dafeiyu.media import (
-    materialize_attachments,
     materialize_relay_attachments,
     resolve_media_path,
 )

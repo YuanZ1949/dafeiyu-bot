@@ -29,7 +29,7 @@ from .gateway.qq import QQAdapter
 from .gateway.wechat import WeChatAdapter
 from .memory.store import Store
 from .memory.workspace import Workspace
-from .mirror import MirrorRouter, MirroredAdapter
+from .mirror import MirroredAdapter, MirrorRouter
 from .models import ChatType
 from .router import Router
 from .runtime import load_runtime

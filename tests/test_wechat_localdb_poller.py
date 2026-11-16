@@ -319,10 +319,10 @@ def test_private_source_snapshot_feeds_aligner(tmp_path: Any) -> None:
     from dafeiyu.gateway.wechat_bridge.localdb.source import LocalDbSource
     from tests.test_wechat_localdb_repository import (
         FILE_TITLE,
-        IMG_PAYLOAD,
-        QUOTED_ORIGINAL,
-        QUOTE_REPLY,
         FRIEND_NAME,
+        IMG_PAYLOAD,
+        QUOTE_REPLY,
+        QUOTED_ORIGINAL,
         build_friend_media_store,
     )
 

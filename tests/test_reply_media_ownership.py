@@ -21,7 +21,6 @@ from dafeiyu.config import Settings, WorkspaceConfig
 from dafeiyu.memory.store import Store
 from dafeiyu.models import Attachment, ChatType, Message
 from dafeiyu.reply_media import resolve_attachments
-
 from tests.test_reply_media import PNG_BYTES, make_reply, make_settings
 
 GROUP = ChatType.GROUP

@@ -23,7 +23,6 @@ from typing import Any
 import httpx
 import pytest
 
-import dafeiyu.links_browser as links_browser
 from dafeiyu.config import LinkBrowserConfig
 from dafeiyu.links_browser import BrowserRenderer, _DefaultCdpConnector
 
