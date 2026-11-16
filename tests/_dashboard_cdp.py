@@ -206,11 +206,11 @@ async def browser_page(url: str, *, width: int = 1280, height: int = 900):
         try:
             proc.terminate()
             proc.wait(timeout=5)
-        except Exception:  # noqa: BLE001 - terminate 失败补一刀 kill，不掩盖原异常
+        except Exception:  # terminate 失败补一刀 kill，不掩盖原异常
             try:
                 proc.kill()
                 proc.wait(timeout=3)
-            except Exception:  # noqa: BLE001, S110 - 进程已消失时忽略
+            except Exception:  # 进程已消失时忽略
                 pass
         shutil.rmtree(profile_dir, ignore_errors=True)
 
