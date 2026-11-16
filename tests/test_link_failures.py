@@ -14,8 +14,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from dafeiyu.config import LinkBrowserConfig, LinkConfig
 from dafeiyu.links import (
+    _TRANSIENT_BROWSER_REASONS,
     LINK_UNREADABLE,
     LinkPromptResolver,
     LinkResolution,
@@ -225,6 +228,99 @@ async def test_needs_browser_with_browser_disabled_sends_no_request(
     assert blocks[0].ok is False
     assert blocks[0].failure_layer == "http"
     assert blocks[0].reason == NEEDS_BROWSER
+
+
+# ---- 本机侧浏览器失败不得给站点判死刑 ----------------------------------------
+
+
+async def test_browser_error_keeps_needs_browser_and_retries_next_time(
+    tmp_path: Path,
+) -> None:
+    """本机侧失败（Edge 冷启动/CDP 抖动）只影响这次回复，不给站点判死刑。"""
+    engine, store, http, browser, config, clock = build(tmp_path)
+    await engine.resolve_for_prompt([URL])
+    first = require(store)
+    assert first.verdict == NEEDS_BROWSER
+
+    # 第二次：HTTP 被跳过，浏览器层以本机侧失败告败。
+    clock.advance(60.0)
+    browser.result = BrowserResult(ok=False, url=URL, reason="browser_error")
+    blocks = await engine.resolve_for_prompt([URL])
+
+    assert http.calls == [URL], "命中 needs_browser 后不得再发 HTTP 请求"
+    assert browser.calls == [URL, URL], "应直接从浏览器层重试一次"
+    assert blocks[0].ok is False
+    assert blocks[0].failure_layer == "browser"
+    assert blocks[0].reason == "browser_error"
+
+    # 本机失败不写站点结论：账本仍是 HTTP 层那条 needs_browser（不是 search_only）。
+    verdict = require(store)
+    assert verdict.verdict == NEEDS_BROWSER, "本机失败不得升级成 search_only"
+    assert verdict.layer == "http"
+    assert verdict.shape == "403"
+    assert verdict.reason == "http_403"
+    assert verdict.updated_at == first.updated_at, "本机失败不得刷新站点结论时间戳"
+    assert len(read_ledger_hosts(config)) == 1
+
+    # 第三次：仍然直接进浏览器层（没被永久跳过），HTTP 层继续不参与。
+    http_before, browser_before = len(http.calls), len(browser.calls)
+    clock.advance(60.0)
+    blocks = await engine.resolve_for_prompt([URL])
+
+    assert len(http.calls) == http_before, "HTTP 层仍应被跳过"
+    assert len(browser.calls) == browser_before + 1, "本机失败后下次仍要重试浏览器层"
+    assert blocks[0].ok is False
+    assert blocks[0].failure_layer == "browser"
+    assert blocks[0].reason == "browser_error"
+
+
+@pytest.mark.parametrize(
+    "reason", ["browser_error", "browser_launch_failed", "browser_no_target"]
+)
+async def test_transient_browser_reason_never_upgrades_to_search_only(
+    tmp_path: Path, reason: str
+) -> None:
+    """三个本机侧 reason 一律不进账本（参数化覆盖，防止只修其中一条）。"""
+    engine, store, http, browser, _, clock = build(tmp_path)
+    await engine.resolve_for_prompt([URL])
+
+    clock.advance(60.0)
+    browser.result = BrowserResult(ok=False, url=URL, reason=reason)
+    blocks = await engine.resolve_for_prompt([URL])
+
+    assert blocks[0].failure_layer == "browser"
+    assert blocks[0].reason == reason
+    verdict = require(store)
+    assert verdict.verdict == NEEDS_BROWSER
+    assert verdict.layer == "http"
+    assert verdict.shape == "403"
+
+    # 下一次仍会进浏览器层，HTTP 层仍被跳过。
+    http_before, browser_before = len(http.calls), len(browser.calls)
+    clock.advance(60.0)
+    await engine.resolve_for_prompt([URL])
+    assert len(http.calls) == http_before
+    assert len(browser.calls) == browser_before + 1
+
+
+async def test_site_side_failures_still_upgrade_to_search_only(tmp_path: Path) -> None:
+    """反向守卫：站点侧失败（timeout / empty）必须继续记账，不得被当成 transient。"""
+    assert "browser_timeout" not in _TRANSIENT_BROWSER_REASONS
+    assert "empty" not in _TRANSIENT_BROWSER_REASONS
+
+    engine, store, _, browser, _, clock = build(tmp_path)
+    await engine.resolve_for_prompt([URL])
+    clock.advance(60.0)
+    browser.result = BrowserResult(ok=False, url=URL, reason="browser_timeout")
+
+    blocks = await engine.resolve_for_prompt([URL])
+
+    assert blocks[0].failure_layer == "browser"
+    assert blocks[0].reason == "browser_timeout"
+    verdict = require(store)
+    assert verdict.verdict == SEARCH_ONLY
+    assert verdict.layer == "browser"
+    assert verdict.shape == "timeout"
 
 
 # ---- TTL：过期后允许重试并刷新结论 ------------------------------------------

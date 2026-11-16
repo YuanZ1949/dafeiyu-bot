@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import importlib
 import json
+import logging
 import os
 import re
 import time
@@ -48,6 +49,8 @@ __all__ = [
     "resolve_for_prompt",
     "resolve_url",
 ]
+
+log = logging.getLogger(__name__)
 
 #: 为什么必须浏览器级头：本机实测（.omo/evidence/chat-audit-2026-11-14/
 #: _probe403.py.txt）B 站对 httpx 默认 UA 回 412，换真实 Edge UA 即 200；
@@ -466,6 +469,16 @@ _LINK_FALLBACK_INSTRUCTION = (
 )
 
 
+#: 浏览器层的**本机侧**失败原因：Edge 起不来 / CDP ws 抖动 / profile 锁 /
+#: 建 target 失败。它们说明的是「这台机器这次没跑起来」，与「这个站读不读得到」
+#: 无关——绝不能据此把 host 升级成 ``search_only``（线上事故：11-16 知乎 403
+#: 后浏览器层冷启动抖动，被记成 7 天的 search_only，整周读不到）。
+#: 站点侧失败（``browser_timeout`` / ``empty`` / 其它）仍然照常记账。
+_TRANSIENT_BROWSER_REASONS = frozenset(
+    {"browser_error", "browser_launch_failed", "browser_no_target"}
+)
+
+
 def _unreadable(url: str, layer: str, reason: str) -> LinkBlock:
     return LinkBlock(url=url, ok=False, failure_layer=layer, reason=reason)
 
@@ -612,7 +625,13 @@ class LinkPromptResolver:
         return await self._render(url, host, deadline)
 
     async def _render(self, url: str, host: str, deadline: float) -> LinkBlock:
-        """浏览器层：成功照常返回；失败把该 host 升级为 search_only。"""
+        """浏览器层：成功照常返回；失败按归因决定要不要给 host 判死刑。
+
+        只有**站点侧**失败（``browser_timeout`` / ``empty`` / 其它）才把该 host
+        升级为 ``search_only``；**本机侧**失败（``browser_error`` /
+        ``browser_launch_failed`` / ``browser_no_target``）与站点可读性无关，
+        不记任何站点结论，下次仍直接进浏览器层重试。
+        """
         try:
             browser = await self._within(self._browser().render(url), deadline, "browser")
         except _BudgetExhausted:
@@ -628,7 +647,16 @@ class LinkPromptResolver:
                 reason="ok",
             )
         reason = browser.reason or "browser_error"
-        # 浏览器层也失败：同一条记录升级为 search_only（不是新增第二条）。
+        if reason in _TRANSIENT_BROWSER_REASONS:
+            # 本机失败（Edge 起不来 / CDP 抖动 / 建 target 失败）：不记站点结论，
+            # 下次仍直接进浏览器层重试——绝不能让一次冷启动抖动变成 7 天的死刑。
+            log.info(
+                "浏览器层本机失败（host=%s, reason=%s）：不记站点结论，下次仍直接进浏览器层重试",
+                host,
+                reason,
+            )
+            return _unreadable(url, "browser", reason)
+        # 浏览器层也失败（站点侧）：同一条记录升级为 search_only（不是新增第二条）。
         self._record_browser(host, reason)
         return _unreadable(url, "browser", reason)
 

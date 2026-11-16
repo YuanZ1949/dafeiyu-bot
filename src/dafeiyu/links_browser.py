@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import socket
 import subprocess
@@ -41,6 +42,8 @@ from dafeiyu.links import extract_title, html_to_text
 from dafeiyu.netssl import default_ssl_context
 
 __all__ = ["BrowserResult", "BrowserRenderer"]
+
+log = logging.getLogger(__name__)
 
 #: 等待 CDP 端点 / 命令回包时，注入时钟（测试）与真实时钟共用的轮询切片（秒）。
 #: 注入时钟不会随真实时间前进，切片必须短到测试能在几步内看到时钟被推进。
@@ -358,7 +361,15 @@ class BrowserRenderer:
             target_id = ""
             kill = False
             try:
-                if not await self._ensure_running():
+                try:
+                    running = await self._ensure_running()
+                except TimeoutError:
+                    # 端口没就绪是本机侧起不来（Edge 冷启动 / CDP 握手抖动 /
+                    # profile 锁），不是站点慢：归 launch_failed，并让 finally
+                    # 回收这个半死的进程；绝不能落到下面的 browser_timeout。
+                    kill = True
+                    return self._failure(url, "browser_launch_failed")
+                if not running:
                     return self._failure(url, "browser_launch_failed")
                 target_id, ws_url = await self._new_target()
                 session = await self._connector.connect(ws_url)
@@ -392,6 +403,8 @@ class BrowserRenderer:
             except _NoTarget:
                 return self._failure(url, "browser_no_target")
             except Exception:  # noqa: BLE001 - 失败路径一律折成结果不抛
+                # 静默折成 browser_error 曾让线上故障查不到异常类型：这里必须留痕。
+                log.warning("浏览器渲染异常，按 browser_error 降级：%s", url, exc_info=True)
                 return self._failure(url, "browser_error")
             finally:
                 await self._teardown(session, target_id, kill=kill)

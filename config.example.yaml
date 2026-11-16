@@ -216,6 +216,7 @@ link:
   # 「服务器读不到」，不得拖住回复主链路。
   total_budget_seconds: 20
   # 按 host 记录的失败结论保留时长（秒）；默认 604800（7 天），过期后允许重试。
+  # 只有站点侧失败才会升级成 search_only；本机侧失败（Edge 起不来/CDP 抖动）不记账。
   # 设 0 不合法（必须 >=1）；想尽快忘掉失败结论就调小。
   host_failure_ttl_seconds: 604800
   browser:

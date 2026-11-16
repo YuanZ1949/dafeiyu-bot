@@ -25,6 +25,12 @@ SQLite、不动任何表结构**），供 ``LinkPromptResolver`` 解析前查表
 两种结论：``needs_browser``（HTTP 层不行，直接进浏览器层）与
 ``search_only``（本机两层都到不了，直接产出模型侧兜底指令）。
 
+**只有站点侧失败才进账本**：浏览器层的 ``browser_error`` /
+``browser_launch_failed`` / ``browser_no_target`` 是本机侧失败（Edge 起不来、
+CDP 握手抖动、profile 锁、建 target 失败），与「这个站读不读得到」无关，
+调用方（``LinkPromptResolver._render``）不会把它们写进来——一次冷启动抖动
+不该换来 7 天的 ``search_only``。
+
 读写都必须「坏文件绝不打断回复主链路」：解析失败按空表处理，写失败静默
 放弃；写盘沿用 ``workspace.enforce_limit`` 的临时文件 + ``os.replace`` 范式，
 进程中途崩溃不会留下半截 JSON。

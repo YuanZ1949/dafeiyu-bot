@@ -212,6 +212,14 @@ class FakeConnector:
         self.active = max(self.active - 1, 0)
 
 
+class NeverReadyConnector(FakeConnector):
+    """版本端点永远不就绪：模拟 Edge 冷启动时 CDP 握手迟迟不上（本机侧失败）。"""
+
+    async def version(self, port: int) -> dict[str, Any]:
+        self.version_calls += 1
+        return {}
+
+
 _INITIAL_DATA = json.dumps(
     {
         "state": {
@@ -444,6 +452,28 @@ async def test_launcher_failure_returns_launch_failed(tmp_path: Path) -> None:
 
     assert result.ok is False
     assert result.reason == "browser_launch_failed"
+
+
+async def test_version_endpoint_never_ready_is_launch_failed(tmp_path: Path) -> None:
+    """CDP 端点迟迟不就绪是本机起不来（不是站点慢）：归 browser_launch_failed。"""
+    config = make_config(tmp_path, timeout_seconds=0.3)
+    clock = FakeClock(step=0.1)  # 每次读时钟推进，注入时钟几步内越过 deadline
+    launcher = FakeLauncher()
+    connector = NeverReadyConnector(FakeBehavior())
+    renderer = BrowserRenderer(
+        config, clock=clock, launcher=launcher, connector=connector
+    )
+
+    result = await asyncio.wait_for(
+        renderer.render("http://example.test/never-ready"), timeout=10.0
+    )
+
+    assert result.ok is False
+    assert result.reason == "browser_launch_failed"
+    # 半死的进程必须被回收（kill=True 走 finally → _terminate），只回收一次。
+    assert launcher.processes[0].terminate_calls == 1
+    # 端点没就绪就不该去建 target。
+    assert connector.create_calls == 0
 
 
 # ---- 默认 connector：PUT /json/new，405 → GET 回退 --------------------------------
