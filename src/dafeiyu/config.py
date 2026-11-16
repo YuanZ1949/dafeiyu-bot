@@ -146,7 +146,8 @@ class MindConfig:
     # 单群每天观察/自省总调用上限，与 reply 预算分开。
     observer_daily_calls: int = 24
     reflection_hour: int = 5
-    # QQ 表情回应：默认关闭；打开后仅在发送成功后尝试调用，失败只记日志。
+    # QQ 表情回应总闸：默认关闭；打开后允许模型在自己的回复 JSON 里用
+    # reaction 字段要求贴一个 QQ 表情（失败只记日志），默认不再每条自动贴。
     # emoji id 的具体取值需按 NapCat/QQ 版本验证，先留成配置项。
     emoji_reactions: bool = False
     emoji_reaction_id: str = "128"

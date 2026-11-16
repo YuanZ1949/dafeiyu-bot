@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 from .behavior import BehaviorSettings
-from .brain.client import BrainError, BrainReply
+from .brain.client import REACTION_DEFAULT, BrainError, BrainReply
 from .brain.guard import (
     REPEAT_WINDOW,
     has_leading_os,
@@ -30,6 +30,7 @@ from .budget import BudgetAction, BudgetDecision, BudgetReport, estimate_cost
 from .commands import PRIVATE_UNRESTRICTED, CommandRegistry, CommandSpec
 from .config import GroupsConfig, InjectionConfig, Settings
 from .delivery.scheduler import BatchScheduler
+from .faces import face_id
 from .gateway.base import Adapter
 from .hotconfig import WeChatRuntime, WeChatRuntimeView
 from .images import materialize
@@ -2715,12 +2716,16 @@ class Service:
         message_id: str | None,
         *,
         gate: str = "outbound",
+        emoji: str | None = None,
     ) -> None:
         """给一条 QQ 消息贴表情回应；失败只记 debug，不影响主流程。
 
-        ``gate="outbound"`` 受 ``mind.emoji_reactions`` 控制（回的是自己刚发的
-        消息）；``gate="inbound"`` 受 ``mind.inbound_media_reactions`` 控制
-        （听到语音/看到图片先给个反应，P3）。
+        ``gate="outbound"`` 受 ``mind.emoji_reactions`` 控制：默认不贴，只有
+        模型在回复 JSON 里显式写 ``reaction`` 才会走到这里；``emoji`` 是模型
+        给的表情名或数字 id，``None``/``REACTION_DEFAULT`` 用配置项
+        ``mind.emoji_reaction_id``。
+        ``gate="inbound"`` 受 ``mind.inbound_media_reactions`` 控制
+        （听到语音/看到图片先给个反应，P3），与模型无关。
         """
         if not message_id:
             return
@@ -2737,9 +2742,21 @@ class Service:
         )
         if not callable(react):
             return
-        emoji = str(getattr(mind, "emoji_reaction_id", "128") or "128")
+        emoji_id = str(getattr(mind, "emoji_reaction_id", "128") or "128")
+        wanted = (emoji or "").strip()
+        if wanted and wanted != REACTION_DEFAULT:
+            if wanted.isdigit():
+                emoji_id = wanted
+            else:
+                resolved = face_id(wanted)
+                if resolved is None:
+                    log.info(
+                        "表情回应名称未收录 %s name=%s", chat_id, wanted
+                    )
+                    return
+                emoji_id = resolved
         try:
-            ok = await react(chat_type, chat_id, str(message_id), emoji)
+            ok = await react(chat_type, chat_id, str(message_id), emoji_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - 表情回应是加法项
@@ -3371,7 +3388,11 @@ class Service:
                         defer += 1
                 break
             sent.append((chunk, message_id))
-            await self._maybe_emoji_reaction(chat_type, chat_id, message_id)
+        if reply.reaction and sent and sent[0][1]:
+            # 模型显式要求才贴，且每轮只贴最先发出去的那条；默认不贴。
+            await self._maybe_emoji_reaction(
+                chat_type, chat_id, sent[0][1], emoji=reply.reaction
+            )
         if defer:
             log.info("发送失败，待发队列 +%d %s/%s", defer, chat_id, batch[-1].message_id)
         else:
@@ -4318,7 +4339,11 @@ class Service:
                         defer += 1
                 break
             sent.append((chunk, message_id))
-            await self._maybe_emoji_reaction(msg.chat_type, msg.chat_id, message_id)
+        if reply.reaction and sent and sent[0][1]:
+            # 与批次路径同语义：模型显式要求才贴，且每轮只贴第一条。
+            await self._maybe_emoji_reaction(
+                msg.chat_type, msg.chat_id, sent[0][1], emoji=reply.reaction
+            )
         if defer:
             log.info("发送失败，待发队列 +%d %s/%s", defer, msg.chat_id, msg.message_id)
         else:

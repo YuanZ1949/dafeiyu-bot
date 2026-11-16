@@ -481,7 +481,8 @@ mind:
   observer_daily_calls: 24
   # 每天几点之后跑自省（0-23，上海时区）。
   reflection_hour: 5
-  # QQ 表情回应：默认关闭；开启后机器人发出消息会尝试贴一个表情（失败只记日志）。
+  # QQ 表情回应总闸：默认关闭；打开后允许模型在自己的回复 JSON 里用
+  # reaction 字段要求贴一个 QQ 表情（失败只记日志），默认不再每条自动贴。
   # emoji id 与 NapCat/QQ 版本相关，上线前先用真实环境验证。
   emoji_reactions: false
   emoji_reaction_id: "128"

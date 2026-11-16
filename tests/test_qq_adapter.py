@@ -625,6 +625,34 @@ async def test_maybe_emoji_reaction_respects_config(monkeypatch) -> None:
     await service._maybe_emoji_reaction(ChatType.GROUP, "qq:123", "88")
     assert calls == [(ChatType.GROUP, "qq:123", "88", "128")]
 
+    # 模型显式给名称：走 faces 表解析成数字 id。
+    await service._maybe_emoji_reaction(ChatType.GROUP, "qq:123", "88", emoji="微笑")
+    assert calls[-1] == (ChatType.GROUP, "qq:123", "88", "14")
+
+    # 模型直接给数字 id：原样使用。
+    await service._maybe_emoji_reaction(ChatType.GROUP, "qq:123", "88", emoji="128")
+    assert calls[-1] == (ChatType.GROUP, "qq:123", "88", "128")
+
+    # reaction: true → REACTION_DEFAULT → 用配置项 mind.emoji_reaction_id。
+    service.settings = cast(
+        Any,
+        SimpleNamespace(
+            mind=SimpleNamespace(emoji_reactions=True, emoji_reaction_id="200")
+        ),
+    )
+    await service._maybe_emoji_reaction(
+        ChatType.GROUP, "qq:123", "88", emoji="default"
+    )
+    assert calls[-1] == (ChatType.GROUP, "qq:123", "88", "200")
+
+    # 表里没有的名字：不调用、不报错。
+    before = len(calls)
+    await service._maybe_emoji_reaction(
+        ChatType.GROUP, "qq:123", "88", emoji="不存在的表情"
+    )
+    assert len(calls) == before
+
+    # 总闸关闭：即使模型显式要求也不发。
     service.settings = cast(
         Any,
         SimpleNamespace(
@@ -632,7 +660,14 @@ async def test_maybe_emoji_reaction_respects_config(monkeypatch) -> None:
         ),
     )
     await service._maybe_emoji_reaction(ChatType.GROUP, "qq:123", "88")
-    assert calls == [(ChatType.GROUP, "qq:123", "88", "128")]
+    assert calls == [
+        (ChatType.GROUP, "qq:123", "88", "128"),
+        (ChatType.GROUP, "qq:123", "88", "14"),
+        (ChatType.GROUP, "qq:123", "88", "128"),
+        (ChatType.GROUP, "qq:123", "88", "200"),
+    ]
+    await service._maybe_emoji_reaction(ChatType.GROUP, "qq:123", "88", emoji="微笑")
+    assert len(calls) == before
 
 
 # --- 只带 id 的合并转发：主动拉取节点 ---

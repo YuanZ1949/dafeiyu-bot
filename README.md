@@ -286,6 +286,7 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `mind.observer_daily_calls` | `24` | 单群每天「观察 + 自省」总调用的**估算上限**，与回复预算分开；实际 Observer 可用次数为 `daily-1`，最后 1 次留给 Reflector |
 | `mind.reflection_hour` | `5` | 每天几点之后跑夜间自省（0-23，上海时区） |
 | `mind.stances_enabled` | `true` | 总闸打开时是否注入「我的立场」（Reflector 每晚写入，同一话题覆盖旧观点） |
+| `mind.emoji_reactions` | `false` | 允许模型用回复 JSON 的 `reaction` 字段给自己这条回复贴一个 QQ 表情；默认不贴，不是每条自动贴 |
 | `mind.inbound_media_reactions` | `false` | 群里的语音/图片到达时先贴个表情回应（旁路，失败只记日志） |
 | `mind.inbound_media_reaction_cooldown_seconds` | `600` | 同一会话两次入站反应的最小间隔（秒） |
 | `mind.proactive_followup` | `false` | 承诺跟进：只对 `kind=promise` 且超过 `followup_after_hours` 的未了事主动追问一句；默认关，开启后仍受静音与预算门控，不调用模型 |

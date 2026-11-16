@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dafeiyu.brain.client import (
     OUTPUT_INSTRUCTION,
+    REACTION_DEFAULT,
     BrainReply,
     parse_at,
     parse_brain_reply,
@@ -238,6 +239,57 @@ def test_output_instruction_keeps_voice_field() -> None:
         '"voice": true|false 表示这条回复是否发成语音消息，默认 false（发文字）'
         in OUTPUT_INSTRUCTION
     )
+    # 表情回应是可选项：提示词里必须有 reaction，且明确「绝大多数情况省略」。
+    assert '"reaction"' in OUTPUT_INSTRUCTION
+    assert "不要每条都贴" in OUTPUT_INSTRUCTION
+
+
+def test_reaction_field_parses_name_and_default() -> None:
+    named = parse_brain_reply('{"speak": true, "reply": "在", "reaction": "微笑"}')
+    assert named.reaction == "微笑"
+
+    default = parse_brain_reply('{"speak": true, "reply": "在", "reaction": true}')
+    assert default.reaction == REACTION_DEFAULT
+
+    assert parse_brain_reply(
+        '{"speak": true, "reply": "在", "reaction": "无"}'
+    ).reaction == ""
+    assert parse_brain_reply('{"speak": true, "reply": "在"}').reaction == ""
+    assert parse_brain_reply(
+        '{"speak": true, "reply": "在", "reaction": 123}'
+    ).reaction == ""
+
+
+def test_reaction_field_is_optional_and_bounded() -> None:
+    # 明确的否定写法一律不贴（含英文/中文），其它非字符串也不贴。
+    for raw in (
+        '"false"',
+        '"NO"',
+        '"0"',
+        '"off"',
+        '"none"',
+        '"不贴"',
+        '"不要"',
+        "false",
+        "null",
+        "[]",
+        "{}",
+    ):
+        reply = parse_brain_reply(
+            '{"speak": true, "reply": "在", "reaction": ' + raw + "}"
+        )
+        assert reply.reaction == "", raw
+
+    long_name = parse_brain_reply(
+        '{"speak": true, "reply": "在", "reaction": "' + "名" * 30 + '"}'
+    )
+    assert len(long_name.reaction) == 20
+
+
+def test_brain_reply_reaction_defaults_and_positional_compat() -> None:
+    legacy = BrainReply(True, "hi", "为什么", 10, 5, False)
+    assert legacy.reaction == ""
+    assert legacy.voice is False
 
 
 def test_voice_true_parsed() -> None:

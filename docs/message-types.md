@@ -47,6 +47,8 @@
 - 文件必须非空且不超过 **10 MiB**；
 - 工作区关闭、目标缺失、解析失败一律跳过并留 warning，绝不抛错，也不读取/发送模型给的任意路径。
 
+回复 JSON 还有一个可选字段 `reaction`：写表情名（如 `微笑`）或数字 id，表示给本轮第一条发出成功的回复贴一个表情回应；默认省略，不写就完全不贴。
+
 QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。表情用 `{"type": "sticker", "name": "...", "path": "可选"}`：`name` 为 1–6 位非 0 数字或内置表情名称（如 微笑）时出 `face` 段，其它文本出 `mface` 摘要段（mface 只有 summary，best-effort，没有 url/key/emoji_id）；只校验名字非空。带 `path` 的贴纸先走与图片相同的路径白名单（`replies/` 或已归属的 `images/`，GIF/大小限制由 hook 侧校验，非 GIF/超限降级为图片）；`path` 合法但 `name` 为空的贴纸不发 QQ 表情段（不拿文件名伪装 mface）。
 微信侧分两种后端：**hook** 后端走 `send_media`，支持图片/语音/文件/贴纸（贴纸要求 `path` 指向真实 GIF）；**UIA** 后端对**所有媒体**（图片/语音/视频/文件/贴纸）都明确返回 `unsupported_media`（`gateway/wechat_bridge/sender.py`），没有 sticker→image 这类降级链，客户端不重试，调用方继续发文本；不做剪贴板发图。
 

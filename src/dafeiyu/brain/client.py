@@ -28,7 +28,7 @@ OUTPUT_INSTRUCTION = """\
 {"read": "这轮大家在聊什么、情绪如何（≤40 字）", "think": "你打算怎么接、为什么（≤40 字）", "speak": true 或 false, "reply": "要对群里说的话", "reason": "一句话理由"}
 speak=false 时 reply 留空。read/think 写给自己看，不会发到群里；旧格式只有 speak/reply/reason 也认。
 "reply" 可以是字符串，也可以是字符串数组：想分几条发就把每条放进数组，数组元素就是发送边界；不想分条就用字符串。单条尽量 ≤500 字，整轮 ≤2000 字，别为凑长度硬撑。
-可选字段："to": "me"|"other"|"topic"|"unknown" 表示这句话在跟谁说（第一版只记日志，不强制）；"voice": true|false 表示这条回复是否发成语音消息，默认 false（发文字）；"at": ["昵称"] 表示这条回复要 @ 谁；"attachments": [{"type": "image"|"file"|"voice"|"video", "path": "replies/xxx.png", "name": "可选"}] 只在确实产出文件时填写，path 必须相对 workspace，可放 replies/... 或本会话最近消息里出现过的 images/...，拿不准就省略；想发表情时用 {"type": "sticker", "name": "表情名或数字 id", "path": "可选"}，QQ 内置表情用名称（如 "微笑"）或数字 id，微信贴纸可另带 "path": "replies/xxx.gif" 或本会话收到过的 "images/xxx.gif"，非 GIF 会降级为图片；需要转发聊天记录时用 {"type": "forward", "nodes": [{"name": "谁", "content": "一句原话"}]}（最多 5 条）"""
+可选字段："to": "me"|"other"|"topic"|"unknown" 表示这句话在跟谁说（第一版只记日志，不强制）；"voice": true|false 表示这条回复是否发成语音消息，默认 false（发文字）；"at": ["昵称"] 表示这条回复要 @ 谁；"attachments": [{"type": "image"|"file"|"voice"|"video", "path": "replies/xxx.png", "name": "可选"}] 只在确实产出文件时填写，path 必须相对 workspace，可放 replies/... 或本会话最近消息里出现过的 images/...，拿不准就省略；想发表情时用 {"type": "sticker", "name": "表情名或数字 id", "path": "可选"}，QQ 内置表情用名称（如 "微笑"）或数字 id，微信贴纸可另带 "path": "replies/xxx.gif" 或本会话收到过的 "images/xxx.gif"，非 GIF 会降级为图片；需要转发聊天记录时用 {"type": "forward", "nodes": [{"name": "谁", "content": "一句原话"}]}（最多 5 条）；"reaction": 可选，只有偶尔想给自己这条回复贴个 QQ 表情时才填，写表情名（如「微笑」「doge」）或数字 id；绝大多数情况省略，不要每条都贴。"""
 
 FALLBACK_REPLY = "本鱼刚刚游神了…你再说一遍？🐋"
 
@@ -72,6 +72,8 @@ class BrainReply:
     target: str = ""
     # 可选意图：这条回复发成语音消息，而不是文字。默认关。
     voice: bool = False
+    # 可选意图：给这条 QQ 回复贴个表情，空串 = 不贴（默认）。写表情名或数字 id。
+    reaction: str = ""
 
 
 def _strip_fence(text: str) -> str:
@@ -271,6 +273,32 @@ def _voice_field(raw: object) -> bool:
     return False
 
 
+#: ``reaction: true`` 的语义：用配置项 ``mind.emoji_reaction_id``（默认 128）。
+REACTION_DEFAULT = "default"
+#: 这些写法等于「不贴」。默认就是空串，这里只是把模型的明确否定也归一掉。
+_REACTION_FALSE = frozenset(
+    {"false", "no", "0", "off", "none", "无", "不贴", "不要"}
+)
+MAX_REACTION_NAME = 20
+
+
+def _reaction_field(raw: object) -> str:
+    """reaction 是可选意图：解析成表情名 / 数字 id，空串表示不贴。
+
+    默认不贴（字段缺省、false、否定词、非字符串一律空串），所以旧输出协议
+    与「模型没要求」的回复完全不贴表情。超长值截断而不是抛错：模型输出不
+    可信，一条坏字段不该拖垮整轮回复。
+    """
+    if raw is True:
+        return REACTION_DEFAULT
+    if not isinstance(raw, str):
+        return ""
+    text = raw.strip()
+    if not text or text.casefold() in _REACTION_FALSE:
+        return ""
+    return text[:MAX_REACTION_NAME]
+
+
 def _reply_from_dict(data: dict[str, Any]) -> tuple[bool, str] | None:
     raw_speak = data.get("speak", True)
     if isinstance(raw_speak, str):
@@ -419,6 +447,7 @@ def parse_brain_reply(
         parts=parts,
         target=_target_field(data.get("to")),
         voice=_voice_field(data.get("voice")),
+        reaction=_reaction_field(data.get("reaction")),
     )
 
 
