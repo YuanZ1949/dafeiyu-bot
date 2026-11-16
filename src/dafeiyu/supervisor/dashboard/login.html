@@ -6,14 +6,18 @@
 <title>大肥鱼控制台 · 登录</title>
 <style>
   :root {
-    --bg: #0f1117;
-    --panel: #171a23;
-    --panel-2: #1e2230;
-    --line: #2a3040;
-    --text: #dfe4ee;
-    --muted: #8b93a7;
-    --bad: #f87171;
-    --accent: #60a5fa;
+    --bg: #080b11;
+    --panel: #10151f;
+    --panel-2: #18202e;
+    --line: #273144;
+    --text: #e9eefb;
+    --muted: #8d97ab;
+    --bad: #ff6b6b;
+    --accent: #58a6ff;
+    --accent-hot: #2563eb;
+    --hot: #ff9f5a;
+    --mode-glow: rgba(88, 166, 255, .20);
+    --shadow: rgba(0, 0, 0, .55);
   }
   * { box-sizing: border-box; }
   body {
@@ -21,47 +25,69 @@
     min-height: 100vh;
     display: grid;
     place-items: center;
-    background: radial-gradient(circle at 50% 0%, #1b2436 0, var(--bg) 55%);
+    padding: 24px 16px;
+    background:
+      radial-gradient(620px 340px at 50% -6%, var(--mode-glow), transparent 70%),
+      radial-gradient(520px 300px at 92% 8%, color-mix(in srgb, var(--hot) 10%, transparent), transparent 66%),
+      var(--bg);
     color: var(--text);
     font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   }
   .login-card {
-    width: min(380px, calc(100vw - 32px));
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 28px;
-    box-shadow: 0 18px 50px rgba(0, 0, 0, .35);
+    width: min(400px, calc(100vw - 32px));
+    background: linear-gradient(180deg, color-mix(in srgb, var(--panel-2) 42%, var(--panel)), var(--panel) 180px);
+    border: 1px solid color-mix(in srgb, var(--line) 84%, var(--text) 8%);
+    border-radius: 20px;
+    padding: 30px;
+    box-shadow: 0 1px 2px color-mix(in srgb, var(--shadow) 50%, transparent),
+                0 30px 70px -40px var(--shadow);
   }
-  h1 { margin: 0; font-size: 20px; font-weight: 600; }
-  .sub { margin: 6px 0 22px; color: var(--muted); font-size: 12px; }
-  label { display: grid; gap: 6px; margin-bottom: 14px; color: var(--muted); font-size: 12px; }
+  h1 {
+    display: flex; align-items: center; gap: 10px;
+    margin: 0; font-size: 21px; font-weight: 700; letter-spacing: -.01em;
+  }
+  h1::before {
+    content: ""; width: 22px; height: 22px; flex: 0 0 auto; border-radius: 8px;
+    background: linear-gradient(135deg, var(--accent) 8%, var(--hot) 62%, var(--accent-hot));
+    box-shadow: 0 0 0 3px var(--mode-glow), 0 8px 20px -8px var(--mode-glow);
+  }
+  .sub { margin: 10px 0 24px; color: var(--muted); font-size: 12.5px; }
+  label { display: grid; gap: 7px; margin-bottom: 15px; color: var(--muted); font-size: 12.5px; letter-spacing: .02em; }
   input {
     width: 100%;
-    background: var(--panel-2);
+    background: color-mix(in srgb, var(--panel-2) 82%, var(--bg));
     color: var(--text);
-    border: 1px solid var(--line);
-    border-radius: 7px;
-    padding: 9px 10px;
+    border: 1px solid color-mix(in srgb, var(--line) 86%, var(--text) 6%);
+    border-radius: 10px;
+    padding: 10px 12px;
     font: inherit;
+    transition: border-color .15s ease, background .15s ease;
   }
-  input:focus { outline: 1px solid var(--accent); }
+  input:hover { border-color: color-mix(in srgb, var(--line) 56%, var(--accent)); }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
   button {
     width: 100%;
-    margin-top: 4px;
-    background: #1d4ed8;
+    margin-top: 6px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-hot));
     color: #fff;
-    border: 1px solid #1d4ed8;
-    border-radius: 7px;
-    padding: 9px 12px;
+    border: 1px solid color-mix(in srgb, var(--accent-hot) 72%, var(--accent));
+    border-radius: 10px;
+    padding: 10px 12px;
     cursor: pointer;
     font: inherit;
     font-weight: 600;
+    box-shadow: 0 12px 26px -18px var(--accent-hot);
+    transition: filter .15s ease, transform .15s ease;
   }
-  button:hover { background: #2563eb; }
-  button:disabled { opacity: .55; cursor: not-allowed; }
-  .error { min-height: 20px; margin-top: 12px; color: var(--bad); font-size: 12px; }
-  .foot { margin-top: 18px; color: var(--muted); font-size: 11px; }
+  button:hover { filter: brightness(1.07); transform: translateY(-1px); }
+  button:active { transform: none; }
+  button:disabled { opacity: .55; cursor: not-allowed; transform: none; }
+  .error { min-height: 20px; margin-top: 12px; color: var(--bad); font-size: 12.5px; }
+  .foot {
+    margin-top: 20px; padding-top: 14px;
+    border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+    color: var(--muted); font-size: 11.5px; line-height: 1.7;
+  }
   @media (max-width: 420px) {
     .login-card { padding: 22px 18px; }
     /* 16px 是 iOS Safari 不自动放大输入框的下限。 */
