@@ -261,27 +261,44 @@ def read_eval_results(directory: Path | None = None) -> dict[str, Any]:
     return {"items": items[:EVALS_TREND_LIMIT]}
 
 
-def _parse_impression_id(raw: str) -> tuple[int | None, web.Response | None]:
+def _parse_impression_id(raw: str) -> int | web.Response:
     try:
         impression_id = int(raw)
     except ValueError:
-        return None, web.json_response({"error": "印象 id 必须是整数"}, status=400)
+        return web.json_response({"error": "印象 id 必须是整数"}, status=400)
     if impression_id <= 0:
-        return None, web.json_response({"error": "印象 id 必须是正整数"}, status=400)
-    return impression_id, None
+        return web.json_response({"error": "印象 id 必须是正整数"}, status=400)
+    return impression_id
 
 
-def _parse_impression_content(value: Any) -> tuple[str | None, web.Response | None]:
+def _parse_impression_content(value: Any) -> str | web.Response:
     if not isinstance(value, str):
-        return None, web.json_response({"error": "content 必须是字符串"}, status=400)
+        return web.json_response({"error": "content 必须是字符串"}, status=400)
     content = value.strip()
     if not content:
-        return None, web.json_response({"error": "content 不能为空"}, status=400)
+        return web.json_response({"error": "content 不能为空"}, status=400)
     if len(content) > MAX_IMPRESSION_CHARS:
-        return None, web.json_response(
+        return web.json_response(
             {"error": f"content 不能超过 {MAX_IMPRESSION_CHARS} 字"}, status=400
         )
-    return content, None
+    return content
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    """把 store 返回的杂值转成 int，等价于 ``int(value or default)``。
+
+    SQLite 只会给 None/int/float/str：falsy 归 default，合法字符串沿用
+    int() 的行为（非法字符串照样抛 ValueError，与原实现一致）。
+    """
+    if not value:
+        return default
+    if isinstance(value, int):
+        return int(value)  # bool 也归一成 0/1，与 int(value or default) 等价
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        return int(value)
+    return default
 
 
 class MemoryActions:
@@ -301,53 +318,47 @@ class MemoryActions:
         self.unblock = unblock
 
 
-def _json_ok(payload: Any) -> str | None:
-    if not isinstance(payload, dict):
-        return "请求体必须是对象"
-    return None
-
-
 async def _read_json_object(
     request: web.Request,
-) -> tuple[dict[str, Any] | None, web.Response | None]:
+) -> dict[str, Any] | web.Response:
+    """非对象请求体直接回 400 响应，调用方用 isinstance 收窄。"""
     try:
         payload = await request.json()
     except ValueError:
-        return None, web.json_response({"error": "请求体必须是 JSON"}, status=400)
-    error = _json_ok(payload)
-    if error is not None:
-        return None, web.json_response({"error": error}, status=400)
-    return payload, None
+        return web.json_response({"error": "请求体必须是 JSON"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "请求体必须是对象"}, status=400)
+    return payload
 
 
 def _chat_target(
     payload: dict[str, Any],
-) -> tuple[ChatType | None, str | None, web.Response | None]:
+) -> tuple[ChatType, str] | web.Response:
     raw_type = str(payload.get("chat_type") or "").strip()
     if raw_type not in ("group", "private"):
-        return None, None, web.json_response(
+        return web.json_response(
             {"error": "chat_type 必须是 group 或 private"}, status=400
         )
     try:
         chat_id = normalize_chat_id(payload.get("chat_id"))
     except ValueError as exc:
-        return None, None, web.json_response({"error": str(exc)}, status=400)
-    return ChatType(raw_type), chat_id, None
+        return web.json_response({"error": str(exc)}, status=400)
+    return ChatType(raw_type), chat_id
 
 
-def _summary_date(payload: dict[str, Any]) -> tuple[str | None, web.Response | None]:
+def _summary_date(payload: dict[str, Any]) -> str | web.Response:
     raw = str(payload.get("date") or "").strip()
     if not raw:
         return (
             datetime.now(SHANGHAI).date() - timedelta(days=1)
-        ).isoformat(), None
+        ).isoformat()
     try:
         datetime.strptime(raw, "%Y-%m-%d")
     except ValueError:
-        return None, web.json_response(
+        return web.json_response(
             {"error": "date 必须是 YYYY-MM-DD"}, status=400
         )
-    return raw, None
+    return raw
 
 
 class SwitchError(Exception):
@@ -601,50 +612,50 @@ def _query_scope(
 
 def _path_target(
     request: web.Request,
-) -> tuple[ChatType | None, str | None, web.Response | None]:
+) -> tuple[ChatType, str] | web.Response:
     raw_type = request.match_info.get("chat_type", "")
     try:
         chat_type = ChatType(raw_type)
     except ValueError:
-        return None, None, web.json_response(
+        return web.json_response(
             {"error": "chat_type 必须是 group 或 private"}, status=400
         )
     raw_id = request.match_info.get("chat_id", "")
     try:
         chat_id = normalize_chat_id(raw_id)
     except ValueError as exc:
-        return None, None, web.json_response({"error": str(exc)}, status=400)
-    return chat_type, chat_id, None
+        return web.json_response({"error": str(exc)}, status=400)
+    return chat_type, chat_id
 
 
 def _path_id(
     request: web.Request, name: str, label: str
-) -> tuple[str | None, web.Response | None]:
+) -> str | web.Response:
     raw = request.match_info.get(name, "")
     try:
         value = normalize_chat_id(raw, label=label)
     except ValueError as exc:
-        return None, web.json_response({"error": str(exc)}, status=400)
-    return value, None
+        return web.json_response({"error": str(exc)}, status=400)
+    return value
 
 
 def _user_target(
     request: web.Request,
-) -> tuple[ChatType | None, str | None, str | None, web.Response | None]:
+) -> tuple[ChatType, str, str] | web.Response:
     raw_type = request.match_info.get("chat_type", "")
     try:
         chat_type = ChatType(raw_type)
     except ValueError:
-        return None, None, None, web.json_response(
+        return web.json_response(
             {"error": "chat_type 必须是 group 或 private"}, status=400
         )
-    chat_id, error = _path_id(request, "chat_id", "chat_id")
-    if error is not None:
-        return None, None, None, error
-    user_id, error = _path_id(request, "user_id", "user_id")
-    if error is not None:
-        return None, None, None, error
-    return chat_type, chat_id, user_id, None
+    chat_id = _path_id(request, "chat_id", "chat_id")
+    if isinstance(chat_id, web.Response):
+        return chat_id
+    user_id = _path_id(request, "user_id", "user_id")
+    if isinstance(user_id, web.Response):
+        return user_id
+    return chat_type, chat_id, user_id
 
 
 def _wechat_adapter(control: Any) -> Any | None:
@@ -759,7 +770,7 @@ class BrainControl:
         # 免费档自检：结果只留在内存（RuntimeState），启动时探一次，之后按
         # FREE_PROBE_TTL 懒刷新。_free_probe_at 用单调时钟，不落盘。
         self._free_probe_at = 0.0
-        self._free_probe_task: asyncio.Task | None = None
+        self._free_probe_task: asyncio.Task[None] | None = None
 
     def _initial_mode_model(self) -> str:
         """启动时按当前档位重算展示用模型名（free/key/local_model 三档同源）。
@@ -806,8 +817,12 @@ class BrainControl:
         probe = getattr(client, "get", None)
         if not callable(probe):
             return None
+        # callable() 会把 Any 收窄成 Callable[..., object]，重新声明回 Any 才能 await。
+        probe_any: Any = probe
         try:
-            response = await probe("/api/info", timeout=FREE_PROBE_READY_TIMEOUT)
+            response = await probe_any(
+                "/api/info", timeout=FREE_PROBE_READY_TIMEOUT
+            )
         except Exception:  # noqa: BLE001 - 连不上就是没就绪
             return False
         status = getattr(response, "status_code", None)
@@ -998,15 +1013,18 @@ class BrainControl:
             errors["last_error_at"] = generated_at
             log.warning("读取健康快照统计失败：%s", exc)
 
-        quota_paused = bool(quota_until and float(quota_until) > time.time())
+        quota_until_ts = float(quota_until) if quota_until else None
+        quota_paused = quota_until_ts is not None and quota_until_ts > time.time()
         scheduler = getattr(self.service, "scheduler", None)
 
         def _count(name: str) -> int:
             counter = getattr(scheduler, name, None)
             if not callable(counter):
                 return 0
+            # callable() 收窄成 Callable[..., object]，重新声明回 Any 才能转 int。
+            counter_any: Any = counter
             try:
-                return int(counter())
+                return int(counter_any())
             except Exception:  # noqa: BLE001 - 计数失败只降级为 0
                 return 0
 
@@ -1039,7 +1057,10 @@ class BrainControl:
             "warnings": [],
         }
         try:
-            report = self.budget_guard.report(ChatType.GROUP, 0)
+            # 既有行为：占位 chat_id 传的是 int 0（SQL 里 chat_id 是 TEXT，
+            # 等于不过滤）；cast 仅向类型检查器声明，不改运行时值。
+            # 直接 cast(str, 0) 会报 reportInvalidCast，先过一层 Any。
+            report = self.budget_guard.report(ChatType.GROUP, cast(Any, 0))
         except Exception as exc:  # noqa: BLE001 - 健康快照必须保持可用
             budget["warnings"] = [
                 {"scope": "storage_error", "ratio": 1.0, "calls": 0, "limit": 0}
@@ -1178,7 +1199,7 @@ class BrainControl:
             },
             "budget": budget,
             "quota": {
-                "paused_until": float(quota_until) if quota_paused else None,
+                "paused_until": quota_until_ts if quota_paused else None,
                 "reason": "额度熔断" if quota_paused else "",
             },
             "brain": {"provider": state["provider"], "model": state["model"]},
@@ -1405,7 +1426,8 @@ class BrainControl:
             agent_root = Path(project_dir) if project_dir else Path(INSTALL_ROOT)
             # 配置目录与 ensure_isolated_config 的解析方式一致（空 config_home
             # = 当前工作目录），密钥引用据此现算。
-            config_dir = config_path(Path(config_home or ".")).resolve().parent
+            # config_path 内部就是 Path(config_home) 再拼子路径，直接传字符串等价。
+            config_dir = config_path(config_home or ".").resolve().parent
             secret_path = LOCAL_KEY_PATH if mode == "local_model" else KEY_PATH
             key_rel = _key_reference(config_dir, secret_path)
             use_key_ref = mode == "key" or (mode == "local_model" and local_has_key)
@@ -1462,7 +1484,9 @@ class BrainControl:
 
             try:
                 backed_up = write_generated(
-                    config_path(ensure_isolated_config(config_home)),
+                    # ensure_isolated_config 返回 Path；config_path 只是 Path(x) 拼接，
+                    # 转回 str 后结果路径一致。
+                    config_path(str(ensure_isolated_config(config_home))),
                     render_config(data),
                 )
                 backed_up = (
@@ -1632,7 +1656,8 @@ class BrainControl:
         impression_total = self.store.count_impressions(chat_type, chat_id)
         # 熔断状态只有库里有真值：进程重启后仍然延续，面板不该比 worker 更乐观。
         quota_until = self.store.load_backoff().get(QUOTA_KEY)
-        quota_paused = bool(quota_until and float(quota_until) > time.time())
+        quota_until_ts = float(quota_until) if quota_until else None
+        quota_paused = quota_until_ts is not None and quota_until_ts > time.time()
         return {
             "summaries": summaries,
             "impressions": impressions,
@@ -1645,7 +1670,7 @@ class BrainControl:
             # 配额熔断中时面板要说明「为什么记忆不动」，别让人以为坏了。
             "quota": {
                 "paused": quota_paused,
-                "until": float(quota_until) if quota_paused else None,
+                "until": quota_until_ts if quota_paused else None,
             },
         }
 
@@ -1715,7 +1740,8 @@ class BrainControl:
         pending, slots = self._pending_summary_state(now)
         latest = self.store.recent_summaries(1, 0)
         quota_until = self.store.load_backoff().get(QUOTA_KEY)
-        quota_paused = bool(quota_until and float(quota_until) > time.time())
+        quota_until_ts = float(quota_until) if quota_until else None
+        quota_paused = quota_until_ts is not None and quota_until_ts > time.time()
         last = latest[0] if latest else None
         return {
             "ok": not pending and not quota_paused,
@@ -1742,7 +1768,7 @@ class BrainControl:
             },
             "quota": {
                 "paused": quota_paused,
-                "until": float(quota_until) if quota_paused else None,
+                "until": quota_until_ts if quota_paused else None,
             },
         }
 
@@ -1780,14 +1806,13 @@ class BrainControl:
         for offset in range(days):
             date = (start + timedelta(days=offset)).isoformat()
             row = rows.get(date) or {}
-            item = {
-                "date": date,
-                "calls": int(row.get("calls") or 0),
-                "errors": int(row.get("errors") or 0),
-                "tokens": int(row.get("tokens") or 0),
-            }
-            for key in totals:
-                totals[key] += item[key]
+            calls = _as_int(row.get("calls"))
+            errors = _as_int(row.get("errors"))
+            tokens = _as_int(row.get("tokens"))
+            item = {"date": date, "calls": calls, "errors": errors, "tokens": tokens}
+            totals["calls"] += calls
+            totals["errors"] += errors
+            totals["tokens"] += tokens
             series.append(item)
         return {
             "days": days,
@@ -2128,7 +2153,7 @@ class BrainControl:
                     "chat_id": chat_id,
                     "channel": channel,
                     "title": title,
-                    "message_count": int(item.get("message_count") or 0),
+                    "message_count": _as_int(item.get("message_count")),
                     "last_message_at": item.get("last_message_at"),
                 }
             )
@@ -2582,9 +2607,9 @@ def create_app(
         return web.json_response(control.health_snapshot())
 
     async def notify_admin(request: web.Request) -> web.Response:
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
         raw_text = payload.get("text")
         if not isinstance(raw_text, str):
             return web.json_response({"error": "text 必须是字符串"}, status=400)
@@ -2668,8 +2693,10 @@ def create_app(
         resume = getattr(adapter, "resume", None)
         if not callable(resume):
             raise web.HTTPNotFound()
+        # callable() 收窄成 Callable[..., object]，重新声明回 Any 才能 await。
+        resume_any: Any = resume
         try:
-            await resume()
+            await resume_any()
         except GatewayError as exc:
             return web.json_response({"error": str(exc)}, status=503)
         return web.json_response({"ok": True, "event": "wechat_resumed"})
@@ -2685,9 +2712,9 @@ def create_app(
             return web.json_response(
                 {"error": "微信通道已急停或未连接"}, status=409
             )
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
         await adapter.dispatch_envelope(payload)
         return web.json_response({"ok": True})
 
@@ -2725,12 +2752,13 @@ def create_app(
             return web.json_response({"error": exc.reason}, status=exc.status)
 
     async def debug_trigger(request: web.Request) -> web.Response:
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
-        chat_type, chat_id, error = _chat_target(payload)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
+        target = _chat_target(payload)
+        if isinstance(target, web.Response):
+            return target
+        chat_type, chat_id = target
 
         raw_content = payload.get("content")
         if not isinstance(raw_content, str):
@@ -2801,12 +2829,13 @@ def create_app(
             )
 
     async def debug_batch(request: web.Request) -> web.Response:
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
-        chat_type, chat_id, error = _chat_target(payload or {})
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
+        target = _chat_target(payload or {})
+        if isinstance(target, web.Response):
+            return target
+        chat_type, chat_id = target
         try:
             return web.json_response(control.preview_batch(chat_type, chat_id))
         except NotImplementedError as exc:
@@ -2826,9 +2855,9 @@ def create_app(
         base_url = (request.query.get("base_url") or "").strip()
         api_key = (request.query.get("api_key") or "").strip()
         if request.can_read_body:
-            payload, error = await _read_json_object(request)
-            if error is not None:
-                return error
+            payload = await _read_json_object(request)
+            if isinstance(payload, web.Response):
+                return payload
             base_url = str(payload.get("base_url") or base_url).strip()
             api_key = str(payload.get("api_key") or api_key).strip()
         try:
@@ -2931,9 +2960,9 @@ def create_app(
             return web.json_response({"error": "loop_id 必须是正整数"}, status=400)
         if loop_id <= 0:
             return web.json_response({"error": "loop_id 必须是正整数"}, status=400)
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
         if payload is None:  # 防御：正常分支由 error 兜住，这里只帮类型收窄
             return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
         status = str(payload.get("status") or "dropped").strip()
@@ -2984,15 +3013,17 @@ def create_app(
     async def post_summary(request: web.Request) -> web.Response:
         if memory_actions is None:
             return web.json_response({"error": "记忆操作未启用"}, status=503)
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
-        chat_type, chat_id, error = _chat_target(payload)
-        if error is not None:
-            return error
-        date, error = _summary_date(payload)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
+        target = _chat_target(payload)
+        if isinstance(target, web.Response):
+            return target
+        chat_type, chat_id = target
+        parsed_date = _summary_date(payload)
+        if isinstance(parsed_date, web.Response):
+            return parsed_date
+        date = parsed_date
         try:
             text = await memory_actions.summarize(chat_type, chat_id, date)
         except MemoryPaused as exc:
@@ -3009,12 +3040,13 @@ def create_app(
     async def post_impressions(request: web.Request) -> web.Response:
         if memory_actions is None:
             return web.json_response({"error": "记忆操作未启用"}, status=503)
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
-        chat_type, chat_id, error = _chat_target(payload)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
+        target = _chat_target(payload)
+        if isinstance(target, web.Response):
+            return target
+        chat_type, chat_id = target
         try:
             added = await memory_actions.extract(chat_type, chat_id)
         except MemoryPaused as exc:
@@ -3029,21 +3061,23 @@ def create_app(
         return web.json_response({"ok": True, "added": added})
 
     async def patch_impression(request: web.Request) -> web.Response:
-        impression_id, error = _parse_impression_id(
+        parsed_id = _parse_impression_id(
             request.match_info.get("impression_id", "")
         )
-        if error is not None:
-            return error
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
+        if isinstance(parsed_id, web.Response):
+            return parsed_id
+        impression_id = parsed_id
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
         content: str | None = None
         confidence: float | None = None
         kind: str | None = None
         if "content" in payload:
-            content, error = _parse_impression_content(payload["content"])
-            if error is not None:
-                return error
+            parsed_content = _parse_impression_content(payload["content"])
+            if isinstance(parsed_content, web.Response):
+                return parsed_content
+            content = parsed_content
         if "confidence" in payload:
             raw = payload["confidence"]
             if isinstance(raw, bool):
@@ -3074,9 +3108,9 @@ def create_app(
         return web.json_response({"ok": True, "impression": _impression_json(impression)})
 
     async def merge_impressions(request: web.Request) -> web.Response:
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
         raw_ids = payload.get("ids")
         if not isinstance(raw_ids, list) or len(raw_ids) < 2:
             return web.json_response({"error": "ids 至少需要两条印象"}, status=400)
@@ -3090,9 +3124,10 @@ def create_app(
             return web.json_response({"error": "ids 至少需要两条不同的印象"}, status=400)
         content: str | None = None
         if "content" in payload:
-            content, error = _parse_impression_content(payload["content"])
-            if error is not None:
-                return error
+            parsed_content = _parse_impression_content(payload["content"])
+            if isinstance(parsed_content, web.Response):
+                return parsed_content
+            content = parsed_content
         try:
             impression = control.store.merge_impressions(ids, content)
         except ValueError as exc:
@@ -3106,11 +3141,12 @@ def create_app(
     async def delete_impression(request: web.Request) -> web.Response:
         if memory_actions is None:
             return web.json_response({"error": "记忆操作未启用"}, status=503)
-        impression_id, error = _parse_impression_id(
+        parsed_id = _parse_impression_id(
             request.match_info.get("impression_id", "")
         )
-        if error is not None:
-            return error
+        if isinstance(parsed_id, web.Response):
+            return parsed_id
+        impression_id = parsed_id
         try:
             deleted = memory_actions.delete_impression(impression_id)
         except Exception as exc:  # noqa: BLE001
@@ -3123,12 +3159,13 @@ def create_app(
         return web.json_response({"ok": True, "deleted": impression_id})
 
     async def delete_user_messages(request: web.Request) -> web.Response:
-        chat_type, chat_id, user_id, error = _user_target(request)
-        if error is not None:
-            return error
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
+        target = _user_target(request)
+        if isinstance(target, web.Response):
+            return target
+        chat_type, chat_id, user_id = target
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
         if str(payload.get("confirm") or "") != "DELETE_USER":
             return web.json_response(
                 {"error": "confirm 必须是 DELETE_USER"}, status=400
@@ -3360,9 +3397,10 @@ def create_app(
             )
 
     async def timeline(request: web.Request) -> web.Response:
-        chat_type, chat_id, error = _path_target(request)
-        if error is not None:
-            return error
+        target = _path_target(request)
+        if isinstance(target, web.Response):
+            return target
+        chat_type, chat_id = target
         try:
             limit = _query_int(request, "limit", 50)
         except ValueError as exc:
@@ -3411,9 +3449,10 @@ def create_app(
             )
 
     async def session_action(request: web.Request) -> web.Response:
-        chat_type, chat_id, error = _path_target(request)
-        if error is not None:
-            return error
+        target = _path_target(request)
+        if isinstance(target, web.Response):
+            return target
+        chat_type, chat_id = target
         action = request.match_info.get("action", "")
         if action not in ("new", "forget", "release", "discard"):
             return web.json_response({"error": "未知会话操作"}, status=400)
@@ -3428,9 +3467,10 @@ def create_app(
             )
 
     async def delete_session(request: web.Request) -> web.Response:
-        chat_type, chat_id, error = _path_target(request)
-        if error is not None:
-            return error
+        target = _path_target(request)
+        if isinstance(target, web.Response):
+            return target
+        chat_type, chat_id = target
         try:
             return web.json_response(
                 await control.session_action("delete", chat_type, chat_id)
@@ -3460,9 +3500,9 @@ def create_app(
             )
 
     async def put_behavior(request: web.Request) -> web.Response:
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
         try:
             return web.json_response(control.save_behavior(payload))
         except BehaviorError as exc:
@@ -3491,9 +3531,9 @@ def create_app(
             )
 
     async def put_groups(request: web.Request) -> web.Response:
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
         if payload is None:
             return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
         try:
@@ -3525,9 +3565,9 @@ def create_app(
             )
 
     async def put_mirror(request: web.Request) -> web.Response:
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
         if payload is None:
             return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
         try:
@@ -3570,9 +3610,9 @@ def create_app(
             )
 
     async def put_private_settings(request: web.Request) -> web.Response:
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
         if payload is None:
             return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
         try:
@@ -3596,9 +3636,9 @@ def create_app(
             )
 
     async def put_wechat_account(request: web.Request) -> web.Response:
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
         if payload is None:
             return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
         try:
@@ -3625,9 +3665,9 @@ def create_app(
             )
 
     async def put_mind(request: web.Request) -> web.Response:
-        payload, error = await _read_json_object(request)
-        if error is not None:
-            return error
+        payload = await _read_json_object(request)
+        if isinstance(payload, web.Response):
+            return payload
         if payload is None:
             return web.json_response({"error": "请求体必须是 JSON 对象"}, status=400)
         try:
