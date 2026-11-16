@@ -66,6 +66,10 @@ dafeiyu = ["brain/persona.md", "brain/agent_template.md", "supervisor/dashboard/
 asyncio_mode = "auto"
 pythonpath = ["src"]
 testpaths = ["tests"]
+# 真实浏览器 E2E（tests/test_dashboard_e2e.py）默认不跑：机器上没有 Edge 时
+# 会 skip，且拉浏览器较慢；CI 的 Dashboard E2E 步骤用 -m e2e 单独执行。
+addopts = "-m 'not e2e'"
+markers = ["e2e: 需要真实浏览器"]
 
 [tool.ruff]
 target-version = "py311"

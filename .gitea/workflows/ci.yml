@@ -127,6 +127,14 @@ jobs:
           & .\.ci-venv\Scripts\python.exe -m pytest -q --junitxml=junit.xml
           exit $LASTEXITCODE
 
+      # 真实浏览器 E2E（headless Edge + CDP）：本机没有 Edge 时用例会 skip，
+      # 所以主 pytest 不含它（addopts 里 -m 'not e2e'），单独用 -m e2e 跑一次。
+      - name: Dashboard E2E
+        shell: pwsh
+        run: |
+          & .\.ci-venv\Scripts\python.exe -m pytest -q -m e2e tests/test_dashboard_e2e.py
+          exit $LASTEXITCODE
+
       # v5.4.1 的 runner 只内置了 builtin:checkout（内置 upload-artifact 尚未发布），
       # 所以不依赖外部 action，也不上传 artifact：失败时直接把 JUnit 打到 job 日志里。
       - name: Show JUnit summary on failure
