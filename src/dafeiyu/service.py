@@ -496,9 +496,9 @@ class Service:
         self._command_clock: Callable[[], float] = time.monotonic
         self._command_last: dict[tuple[str, str, str], float] = {}
         self.scheduler: BatchScheduler | None = None
-        self._scheduler_task: asyncio.Task | None = None
+        self._scheduler_task: asyncio.Task[None] | None = None
         self.keepalive: Keepalive | None = None
-        self._keepalive_task: asyncio.Task | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
         self._locks: dict[tuple[ChatType, str], asyncio.Lock] = {}
         self._batch_locks: dict[tuple[ChatType, str], asyncio.Lock] = {}
         self._started_at = time.monotonic()
@@ -547,7 +547,9 @@ class Service:
         """每个通道的状态快照；未实现 snapshot 的适配器回落到裸属性。"""
         status: dict[str, dict[str, Any]] = {}
         for channel, adapter in self.adapters.items():
-            snapshot = getattr(adapter, "snapshot", None)
+            snapshot: Callable[[], dict[str, Any]] | None = getattr(
+                adapter, "snapshot", None
+            )
             if callable(snapshot):
                 try:
                     status[channel] = dict(snapshot())
@@ -564,9 +566,9 @@ class Service:
             # 微信形态的适配器额外暴露登录态/桌面状态；QQ 没有这两个属性，
             # 保持原来的 5 键，避免健康快照凭空多出字段。
             if hasattr(adapter, "logged_in"):
-                status[channel]["logged_in"] = adapter.logged_in
+                status[channel]["logged_in"] = getattr(adapter, "logged_in")
             if hasattr(adapter, "desktop"):
-                status[channel]["desktop"] = adapter.desktop
+                status[channel]["desktop"] = getattr(adapter, "desktop")
                 # 桌面锁定是否真的影响出站：hook/auto 后端为 False，只有 uia 为 True。
                 if hasattr(adapter, "desktop_required"):
                     status[channel]["desktop_required"] = bool(
@@ -3678,7 +3680,9 @@ class Service:
             adapter = self._adapter_for(chat_id)
         except KeyError:
             return ""
-        call = getattr(adapter, "call_action", None)
+        call: Callable[..., Awaitable[Any]] | None = getattr(
+            adapter, "call_action", None
+        )
         if not callable(call):
             return ""
         bare = chat_id.removeprefix(QQ_PREFIX)
@@ -4033,7 +4037,9 @@ class Service:
         on_tool: Any = None,
     ) -> BrainReply:
         """唯一的大脑调用入口；会话型与无状态型的差异都收在这里。"""
-        responder = getattr(self.brain, "reply", None)
+        responder: Callable[..., Awaitable[BrainReply]] | None = getattr(
+            self.brain, "reply", None
+        )
         if not callable(responder):
             # 旧 brain 只有 decide：保留兜底，切换期也不至于直接崩。
             return await self.brain.decide(
@@ -4087,7 +4093,9 @@ class Service:
             or is_agent_missing_error(exc)
         ):
             raise exc
-        fresh = getattr(self.brain, "reply_fresh", None)
+        fresh: Callable[..., Awaitable[BrainReply]] | None = getattr(
+            self.brain, "reply_fresh", None
+        )
         if not callable(fresh):
             raise exc
         log.warning("大脑调用失败，换新会话重放历史再试一次：%s", exc)
@@ -4585,7 +4593,7 @@ class Service:
             scheduler = self.scheduler
             if scheduler is None:
                 return 0
-            value = getattr(scheduler, name, 0)
+            value: Any = getattr(scheduler, name, 0)
             if callable(value):
                 try:
                     value = value()
@@ -4602,7 +4610,9 @@ class Service:
             log.warning("读取配额状态失败：%s", exc)
             quota_until = None
         paused = bool(quota_until and float(quota_until) > time.time())
-        if paused:
+        # paused 为真时 quota_until 必为非空时间戳；补上 None 检查只为让
+        # pyright 的窄化穿过 bool() 存活，运行时行为不变。
+        if paused and quota_until is not None:
             remaining = max(0, int(float(quota_until) - time.time()))
             quota_text = f"暂停中（剩余 {remaining} 秒）"
         else:

@@ -30,6 +30,11 @@ class GatewayError(Exception):
 
 
 class Adapter(Protocol):
+    @property
+    def bot_id(self) -> str:
+        """机器人自己的账号 id（带通道前缀，与 Message.user_id 同一形态）。"""
+        ...
+
     async def start(self) -> None: ...
 
     async def stop(self) -> None: ...
