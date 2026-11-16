@@ -121,6 +121,14 @@ jobs:
           & .\.ci-venv\Scripts\ruff.exe check src tests
           exit $LASTEXITCODE
 
+      # basedpyright 随 Install 步骤的 dev extra 一起装进 .ci-venv，
+      # 用 exit 透出退出码，防止 139 -> 0 的类型清理回退。
+      - name: Type check
+        shell: pwsh
+        run: |
+          & .\.ci-venv\Scripts\basedpyright.exe --level error src
+          exit $LASTEXITCODE
+
       - name: Run pytest
         shell: pwsh
         run: |
