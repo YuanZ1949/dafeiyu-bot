@@ -339,7 +339,7 @@ class Router:
     def _epoch(value: datetime | None) -> float | None:
         return None if value is None else value.timestamp()
 
-    def _from_epoch(self, value: object) -> datetime | None:
+    def _from_epoch(self, value: float | int | str | None) -> datetime | None:
         if value is None:
             return None
         try:

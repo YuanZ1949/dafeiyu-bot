@@ -31,7 +31,7 @@ def channel_of(chat_id: str) -> str:
 @dataclass
 class Segment:
     type: str
-    data: dict
+    data: dict[str, Any]
 
 
 @dataclass(frozen=True)

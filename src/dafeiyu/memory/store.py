@@ -1014,8 +1014,9 @@ class Store:
         for row in index_sql:
             conn.execute(row["sql"])
         for name in ("messages_fts", "impressions_fts"):
-            if fts_sql[name] is not None:
-                conn.execute(fts_sql[name])
+            fts_ddl = fts_sql[name]
+            if fts_ddl is not None:
+                conn.execute(fts_ddl)
         for row in trigger_sql:
             conn.execute(row["sql"])
         for name in ("messages_fts", "impressions_fts"):
@@ -3198,7 +3199,7 @@ class Store:
         self,
         chat_type: ChatType,
         chat_id: str,
-        state: dict[str, object],
+        state: dict[str, Any],
     ) -> None:
         self._conn.execute(
             """
@@ -4042,7 +4043,9 @@ class Store:
         self.set_bot_state(mood_note=text)
         return True
 
-    def get_bot_state_chat(self, chat_type: ChatType, chat_id: str) -> dict | None:
+    def get_bot_state_chat(
+        self, chat_type: ChatType, chat_id: str
+    ) -> dict[str, Any] | None:
         """会话级状态行；没写过时返回 None（调用方据此决定是否回退全局）。"""
         row = self._conn.execute(
             """
@@ -4069,7 +4072,7 @@ class Store:
         focus: str | None = None,
         mood_note: str | None = None,
         now_ts: float | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """只覆盖传入的字段（None = 不动），每次都刷新 mood_at，返回当前行。"""
         base = self.get_bot_state_chat(chat_type, chat_id) or {
             "focus": "",
@@ -5500,15 +5503,15 @@ class Store:
         ]
 
     # ---- sessions / forgetting ------------------------------------
-    def chat_overview(self) -> list[dict[str, object]]:
+    def chat_overview(self) -> list[dict[str, Any]]:
         """会话总览：消息/摘要/印象计数 + 当前 brain session 元信息。
 
         以消息、摘要、印象、brain_sessions 的并集为会话集合，避免“只剩摘要”的会话消失。
         按最近消息时间倒序，没有消息的排最后。
         """
-        chats: dict[tuple[str, str], dict[str, object]] = {}
+        chats: dict[tuple[str, str], dict[str, Any]] = {}
 
-        def bucket(raw_type: str, raw_id: str) -> dict[str, object]:
+        def bucket(raw_type: str, raw_id: str) -> dict[str, Any]:
             key = (raw_type, raw_id)
             return chats.setdefault(
                 key,
