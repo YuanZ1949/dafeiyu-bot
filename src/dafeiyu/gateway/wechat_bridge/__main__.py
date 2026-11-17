@@ -866,7 +866,7 @@ def _default_poller_factory(wechat: WeChatConfig, driver: Any) -> Any:
     """默认轮询循环：`PollingLoop` 的 import 也留在函数体内，保持入口轻量。"""
     from ...hotconfig import WeChatRuntime
     from .panel import PanelGroups, PanelRuntime
-    from .poller import DEFAULT_ALIGN_STATE, PollingLoop
+    from .poller import DEFAULT_ALIGN_STATE, DEFAULT_EVENT_STATE, PollingLoop
 
     localdb = _build_localdb_source(wechat)
     # 覆盖层缺 `wechat:` 段（或没有覆盖层）时必须回落到 `config.yaml` 的值；
@@ -889,6 +889,8 @@ def _default_poller_factory(wechat: WeChatConfig, driver: Any) -> Any:
         runtime=PanelRuntime(defaults=startup).wechat,
         # 对齐窗口落盘：桥崩溃重启后把停机期间的新消息补出来。
         align_state_path=DEFAULT_ALIGN_STATE,
+        # 事件水位落盘：撤回/群系统/好友申请事件重启后不重放、不漏发。
+        event_state_path=DEFAULT_EVENT_STATE,
         # 启动默认值：热开关读不出来时 `PollingLoop` 用它兜底。
         private_enabled=startup.private_enabled,
     )

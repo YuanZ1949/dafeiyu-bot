@@ -6,10 +6,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+import dafeiyu.gateway.wechat_bridge.localdb.helper_parsers as helper_parsers
 from dafeiyu.config import WeChatConfig
 from dafeiyu.gateway.wechat_bridge.driver import ChatHandle
 from dafeiyu.gateway.wechat_bridge.poller import PollingLoop
@@ -402,3 +405,354 @@ def test_source_snapshot_passes_backfill_limit(tmp_path: Any) -> None:
     }
 
     assert store.limits == [50, 200]
+
+
+# ================================ todo 13: 事件桥接（撤回 / 群系统 / 好友申请）
+GROUP_NAME_EVENT = "老友群"
+EVENT_USERNAME = "111@chatroom"
+
+
+class EventLocalDb:
+    """快照 + 事件行（10000/10002/37）都能读的假本地库；解析在测试里打桩。"""
+
+    available = True
+
+    def __init__(self) -> None:
+        self.snapshots: dict[str, list[dict[str, Any]]] = {GROUP_NAME_EVENT: []}
+        self.events: dict[str, list[dict[str, Any]]] = {}
+        self.event_calls: list[tuple[str, tuple[int, ...], int]] = []
+        self.event_error: BaseException | None = None
+
+    def group_names(self) -> list[str]:
+        return list(self.snapshots)
+
+    def resolve_username(self, name: str) -> str | None:
+        return EVENT_USERNAME if name in self.snapshots else None
+
+    def peer_kind(self, name: str) -> str | None:
+        return "group" if name in self.snapshots else None
+
+    def self_username(self) -> str:
+        return "self_wxid"
+
+    def snapshot(self, name: str, *, limit: int = 50) -> dict[str, Any]:
+        return {"chat_name": name, "messages": list(self.snapshots.get(name, []))}
+
+    def event_rows(
+        self,
+        username: str,
+        *,
+        types: tuple[int, ...],
+        since_local_id: int = 0,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        self.event_calls.append((username, types, since_local_id))
+        if self.event_error is not None:
+            raise self.event_error
+        rows = self.events.get(username, [])
+        return [
+            dict(row)
+            for row in rows
+            if row["local_id"] > since_local_id and row["local_type"] in types
+        ]
+
+
+def _fake_group_system(content: str, msg_type: int, room_id: str, self_id: str = "") -> tuple[dict[str, str], ...]:
+    if msg_type != 10000 or not room_id.endswith("@chatroom"):
+        return ()
+    if content == "<join>阿猫</join>":
+        return (
+            {
+                "kind": "join",
+                "room_id": room_id,
+                "member_id": "wxid_cat",
+                "nickname": "阿猫",
+                "source": "system_structured",
+            },
+        )
+    if content == "<leave>阿狗</leave>":
+        return (
+            {
+                "kind": "leave",
+                "room_id": room_id,
+                "member_id": "",
+                "nickname": "阿狗",
+                "source": "system_text",
+            },
+        )
+    return ()
+
+
+def _fake_recall(content: str, chat_id: str) -> dict[str, str] | None:
+    """内容形如 ``revoke|<session>|<newmsgid>``；故意不按 session 过滤，
+    让轮询侧的「不匹配就跳过」逻辑被真实执行。"""
+    prefix, sep, tail = content.partition("|")
+    if not sep or prefix != "revoke":
+        return None
+    session, sep2, newmsgid = tail.partition("|")
+    if not sep2 or not newmsgid:
+        return None
+    return {"message_id": newmsgid, "chat_id": session, "notice": ""}
+
+
+def _fake_friend_request(content: str) -> dict[str, str | int] | None:
+    """内容形如 ``req:<opcode>:<nickname>:<verification>``。"""
+    parts = content.split(":", 3)
+    if len(parts) != 4 or parts[0] != "req":
+        return None
+    try:
+        opcode = int(parts[1])
+    except ValueError:
+        return None
+    return {
+        "sender_id": "wxid_new",
+        "nickname": parts[2],
+        "verification": parts[3],
+        "scene": 14,
+        "opcode": opcode,
+    }
+
+
+@pytest.fixture
+def fake_parsers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(helper_parsers, "parse_group_system_message", _fake_group_system)
+    monkeypatch.setattr(helper_parsers, "parse_recall", _fake_recall)
+    monkeypatch.setattr(helper_parsers, "parse_friend_request", _fake_friend_request)
+
+
+def _event_loop(
+    tmp_path: Path,
+    localdb: Any,
+    **overrides: Any,
+) -> PollingLoop:
+    defaults: dict[str, Any] = {
+        "probe": _probe,
+        "registry": _Registry(),
+        "localdb": localdb,
+        "panel": _all_groups_panel,
+        "clock": lambda: 1.0,
+        "align_state_path": tmp_path / "align-state.json",
+        "event_state_path": tmp_path / "event_state.json",
+    }
+    defaults.update(overrides)
+    return PollingLoop(
+        _wechat(tmp_path),
+        FakeDriver(),
+        **defaults,
+    )
+
+
+def _event_rows() -> list[dict[str, Any]]:
+    """撤回（newmsgid=99，与消息 server_id 对上）+ 进群 + 退群 + 畸形行。"""
+    return [
+        {"local_id": 10, "local_type": 10000, "real_sender_id": 3,
+         "create_time": 1, "server_id": 0, "content": "<join>阿猫</join>"},
+        {"local_id": 11, "local_type": 10002, "real_sender_id": 3,
+         "create_time": 2, "server_id": 0, "content": f"revoke|{EVENT_USERNAME}|99"},
+        {"local_id": 12, "local_type": 10000, "real_sender_id": 3,
+         "create_time": 3, "server_id": 0, "content": "<leave>阿狗</leave>"},
+    ]
+
+
+def _fmessage_rows() -> list[dict[str, Any]]:
+    """一条 opcode=2 的申请 + 一条其他 opcode + 一条解析不出来的垃圾行。"""
+    return [
+        {"local_id": 20, "local_type": 37, "real_sender_id": 1,
+         "create_time": 4, "server_id": 0, "content": "req:2:阿新:我是阿新"},
+        {"local_id": 21, "local_type": 37, "real_sender_id": 1,
+         "create_time": 5, "server_id": 0, "content": "req:3:阿回执:系统"},
+        {"local_id": 22, "local_type": 37, "real_sender_id": 1,
+         "create_time": 6, "server_id": 0, "content": "not-a-request"},
+    ]
+
+
+def _events_of(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [f for f in frames if f.get("type") in ("notice", "recall")]
+
+
+async def test_events_emitted_once_and_persisted(
+    tmp_path: Path, fake_parsers: None
+) -> None:
+    """第一轮建基线；第二轮撤回 + 进/退群 + 好友申请；第三轮与重启后都不再发。"""
+    db = EventLocalDb()
+    state_path = tmp_path / "event_state.json"
+    loop = _event_loop(tmp_path, db, event_state_path=state_path)
+    await loop.start()
+    try:
+        # 对齐器需要非空基线：首轮快照里放一条「开场」，事件行仍为空。
+        db.snapshots[GROUP_NAME_EVENT].append(
+            {"nickname": "甲", "text": "开场", "server_id": 0}
+        )
+        # 轮 1：基线 —— 没有任何事件行，只建水位（0）。
+        first = await _drain_round(loop)
+        assert _events_of(first) == []
+        assert (EVENT_USERNAME, (10000, 10002), 0) in db.event_calls
+        assert ("fmessage", (37,), 0) in db.event_calls
+
+        # 轮 2：消息（server_id=99）+ 三类事件帧，撤回要关联到消息帧的 message_id。
+        db.snapshots[GROUP_NAME_EVENT].append(
+            {"nickname": "乙", "text": "要被撤回的", "server_id": 99}
+        )
+        db.events[EVENT_USERNAME] = _event_rows()
+        db.events["fmessage"] = _fmessage_rows()
+        second = await _drain_round(loop)
+        messages = [f for f in second if f.get("type") == "message"]
+        assert len(messages) == 1
+        message_id = messages[0]["message_id"]
+        assert messages[0]["server_id"] == 99
+
+        events = _events_of(second)
+        assert [f["type"] for f in events] == [
+            "notice", "recall", "notice", "notice",
+        ]
+        increase, recall, decrease, request = events
+        assert increase["kind"] == "group_increase"
+        assert increase["chat_id"] == f"wxg:{GROUP_NAME_EVENT}"
+        assert increase["user_id"] == "wxid_cat"
+        assert increase["nickname"] == "阿猫"
+        assert increase["event_id"] == "wechat:sys:10"
+        assert recall["message_id"] == message_id, "撤回应通过 server_id=99 关联"
+        assert recall["chat_id"] == f"wxg:{GROUP_NAME_EVENT}"
+        assert recall["user_id"] == ""
+        assert decrease["kind"] == "group_decrease"
+        assert decrease["event_id"] == "wechat:sys:12"
+        assert request["kind"] == "friend_request"
+        assert request["chat_id"] == "wxg:fmessage"
+        assert request["nickname"] == "阿新"
+        assert request["comment"] == "我是阿新"
+        assert request["event_id"] == "fmessage:20"
+
+        # 轮 2 结束后水位落盘：schema + server_id 映射。
+        assert state_path.exists()
+        state = json.loads(state_path.read_text("utf-8"))
+        assert state["version"] == 1
+        assert state["watermarks"][EVENT_USERNAME] == 12
+        assert state["watermarks"]["fmessage"] == 22
+        assert state["server_ids"] == {"99": message_id}
+
+        # 轮 3：没有新行 → 一个事件帧都不发（水位去重）。
+        third = await _drain_round(loop)
+        assert _events_of(third) == []
+    finally:
+        await asyncio.to_thread(loop.stop)
+
+    # 重启：从落盘的水位继续，老事件不重放。
+    fresh = _event_loop(tmp_path, db, event_state_path=state_path)
+    assert fresh._event_watermarks[EVENT_USERNAME] == 12
+    assert fresh._event_server_ids == {"99": message_id}
+    await fresh.start()
+    try:
+        again = await _drain_round(fresh)
+        assert _events_of(again) == []
+        assert fresh._event_watermarks[EVENT_USERNAME] == 12
+    finally:
+        await asyncio.to_thread(fresh.stop)
+
+
+async def test_baseline_observation_emits_nothing(
+    tmp_path: Path, fake_parsers: None
+) -> None:
+    """首次观察（水位尚未建立）只建水位：积压事件不补发。"""
+    db = EventLocalDb()
+    db.events[EVENT_USERNAME] = _event_rows()
+    db.events["fmessage"] = _fmessage_rows()
+    loop = _event_loop(tmp_path, db)
+    await loop.start()
+    try:
+        first = await _drain_round(loop)
+        assert _events_of(first) == []
+        assert loop._event_watermarks[EVENT_USERNAME] == 12
+        assert loop._event_watermarks["fmessage"] == 22
+    finally:
+        await asyncio.to_thread(loop.stop)
+
+
+async def test_event_rows_failure_is_skipped_not_fatal(
+    tmp_path: Path, fake_parsers: None
+) -> None:
+    """event_rows 抛错：该会话跳过本轮事件，轮询本身不炸。"""
+    db = EventLocalDb()
+    db.event_error = RuntimeError("镜像被占用")
+    loop = _event_loop(tmp_path, db)
+    await loop.start()
+    try:
+        frames = await asyncio.wait_for(_drain_round(loop), 5.0)
+        assert _events_of(frames) == []
+        assert any(f["type"] == "health" for f in frames)
+    finally:
+        await asyncio.to_thread(loop.stop)
+
+
+async def test_malformed_and_foreign_rows_advance_watermark_silently(
+    tmp_path: Path, fake_parsers: None
+) -> None:
+    """畸形系统消息 / 别的会话的撤回 / 未映射撤回：跳过或兜底，水位照常推进。"""
+    db = EventLocalDb()
+    loop = _event_loop(tmp_path, db)
+    await loop.start()
+    try:
+        # 轮 1 建基线。
+        db.events[EVENT_USERNAME] = []
+        await _drain_round(loop)
+
+        db.events[EVENT_USERNAME] = [
+            {"local_id": 30, "local_type": 10000, "real_sender_id": 3,
+             "create_time": 1, "server_id": 0, "content": "<broken"},
+            {"local_id": 31, "local_type": 10002, "real_sender_id": 3,
+             "create_time": 2, "server_id": 0, "content": "revoke|999@chatroom|5"},
+            {"local_id": 32, "local_type": 10002, "real_sender_id": 3,
+             "create_time": 3, "server_id": 0, "content": f"revoke|{EVENT_USERNAME}|777"},
+        ]
+        second = await _drain_round(loop)
+        recalls = [f for f in second if f.get("type") == "recall"]
+        assert [f["message_id"] for f in recalls] == ["wechat:777"], (
+            "别的会话的撤回要跳过；未映射的撤回退回合成 id",
+        )
+        assert all(f.get("kind") != "group_increase" for f in _events_of(second))
+        # 水位推过整批（含被跳过的行），下一轮不重放。
+        assert loop._event_watermarks[EVENT_USERNAME] == 32
+        third = await _drain_round(loop)
+        assert _events_of(third) == []
+    finally:
+        await asyncio.to_thread(loop.stop)
+
+
+def test_server_id_map_evicts_oldest_beyond_limit(tmp_path: Path) -> None:
+    """server_id 映射 5000 条 FIFO 上限：最旧的先被淘汰。"""
+    loop = _event_loop(tmp_path, EventLocalDb())
+    for sid in range(6000):
+        loop._remember_server_id(sid, f"m{sid}")
+
+    assert len(loop._event_server_ids) == 5000
+    assert "0" not in loop._event_server_ids
+    assert "999" not in loop._event_server_ids
+    assert loop._event_server_ids["5999"] == "m5999"
+
+
+def test_corrupt_event_state_starts_empty(tmp_path: Path) -> None:
+    """损坏的事件水位文件：debug 记一条、按空状态启动、绝不抛错。"""
+    path = tmp_path / "event_state.json"
+    path.write_text("{not json", encoding="utf-8")
+
+    loop = _event_loop(tmp_path, EventLocalDb(), event_state_path=path)
+
+    assert loop._event_watermarks == {}
+    assert loop._event_server_ids == {}
+
+
+def test_store_recent_still_drops_event_rows(tmp_path: Path) -> None:
+    """回归：事件行（10000/10002/37）仍然不进 store.recent() 的对齐序列。"""
+    from tests.test_wechat_localdb_repository import (
+        GROUP_NAME,
+        build_event_store,
+    )
+
+    store = build_event_store(tmp_path)
+    ref = store.resolve(GROUP_NAME)
+    assert ref is not None
+
+    entries = store.recent(ref)
+
+    assert all(entry.get("server_id") != 7002 for entry in entries)
+    assert all(entry.get("server_id") != 7003 for entry in entries)
+    assert all(entry.get("server_id") != 7004 for entry in entries)

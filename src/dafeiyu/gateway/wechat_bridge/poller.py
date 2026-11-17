@@ -59,17 +59,51 @@ from typing import Any, cast
 
 from ...hotconfig import WeChatRuntime
 from .align import SessionAligner
+from .localdb import helper_parsers
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "BACKFILL_LIMIT",
+    "DEFAULT_EVENT_STATE",
     "INBOUND_LOCALDB_REASON",
     "KILL_SWITCH_REASON",
     "MAX_AWAIT",
     "PollingLoop",
     "UiThread",
 ]
+
+#: 群系统事件 -> notice kind 的映射（helper 的 kind 值 -> 协议字段值）。
+_GROUP_EVENT_KINDS = {"join": "group_increase", "leave": "group_decrease"}
+
+#: server_id -> message_id 映射的容量上限；FIFO 淘汰最旧的映射。
+_SERVER_ID_MAP_LIMIT = 5000
+
+#: 只记一次的告警闩锁（进程级）：事件行读取失败等避免每轮刷屏。
+_once_logged: set[str] = set()
+
+
+def _log_once(level: int, key: str, message: str, *args: object) -> None:
+    """同一 key 只记一条日志；重启进程后闩锁清零。"""
+    if key in _once_logged:
+        return
+    _once_logged.add(key)
+    logger.log(level, message, *args)
+
+
+def _row_local_id(row: Any) -> int:
+    """事件行的 local_id；没有/解析失败一律按 0（会被跳过但仍推进水位）。"""
+    try:
+        return int(row.get("local_id") or 0)  # type: ignore[union-attr]
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def _max_local_id(rows: Any) -> int:
+    """一批事件行里的最大 local_id（含畸形行）；空批/坏批返回 0。"""
+    if not isinstance(rows, list):
+        return 0
+    return max((_row_local_id(row) for row in rows), default=0)
 
 
 def _alias_of(chat_id: str) -> str | None:
@@ -131,6 +165,10 @@ DEFAULT_KILL_SWITCH = "data/wechat.stop"
 
 #: 对齐窗口的落盘点：桥崩溃重启后靠它把停机期间的新消息 diff 出来。
 DEFAULT_ALIGN_STATE = "data/wechat-bridge/align-state.json"
+
+#: 事件水位的落盘点（与对齐窗口分开）：记录每个 username 的 local_id 水位与
+#: server_id -> 机器人 message_id 映射，重启后撤回/系统事件不会重放也不会漏。
+DEFAULT_EVENT_STATE = "data/wechat-bridge/event_state.json"
 
 _JOB_POLL = "poll"
 _JOB_SEND = "send"
@@ -371,6 +409,7 @@ class PollingLoop:
         localdb: Any | None = None,
         panel: Callable[[], frozenset[str] | None] | None = None,
         align_state_path: str | Path | None = None,
+        event_state_path: str | Path | None = None,
         private_enabled: bool | None = None,
         runtime: Callable[[], WeChatRuntime | None] | None = None,
     ) -> None:
@@ -456,6 +495,15 @@ class PollingLoop:
         )
         self._align_state = self._load_align_state()
         self._align_dirty = False
+        # 事件水位落盘：撤回/群系统/好友申请事件的 per-username local_id 水位，
+        # 以及 server_id -> 机器人 message_id 映射（撤回关联用）。
+        self.event_state_path = (
+            Path(str(event_state_path)) if event_state_path else None
+        )
+        event_state = self._load_event_state()
+        self._event_watermarks: dict[str, int] = event_state["watermarks"]
+        self._event_server_ids: dict[str, str] = event_state["server_ids"]
+        self._event_dirty = False
         # 上一次成功的健康帧：探测超时时用它兜底（尤其是 desktop 字段，
         # bot 侧据此决定能不能发送）。
         self._last_health: dict[str, Any] | None = None
@@ -891,9 +939,22 @@ class PollingLoop:
                 # 上。3 个群串行一轮 15s+，若只在轮末发心跳，帧泵的空转看门狗就会
                 # 把健康的多群轮询误判成卡死。
                 yield await self._health_frame(connected=True)
+            # 好友申请（fmessage 的 type=37 行）不属于任何被轮询的会话，
+            # 每轮收尾时统一读一次；纯 UIA 模式没有本地库，跳过。
+            if self._uses_localdb():
+                try:
+                    fmessage_frames = await self._poll_fmessage()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 事件失败不打断轮询
+                    logger.warning("轮询好友申请事件失败，跳过：%s", exc)
+                else:
+                    for frame in fmessage_frames:
+                        yield frame
         finally:
-            # 一轮结束（含被取消/提前 return）统一落盘对齐窗口。
+            # 一轮结束（含被取消/提前 return）统一落盘对齐窗口与事件水位。
             self._save_align_state()
+            self._save_event_state()
 
     async def _poll_group(self, group: str) -> list[dict[str, Any]]:
         uses_localdb = self._uses_localdb()
@@ -930,6 +991,282 @@ class PollingLoop:
         frames = list(result.messages)
         if result.resync is not None:
             frames.append(result.resync)
+        if uses_localdb:
+            self._remember_frame_server_ids(frames)
+            frames.extend(await self._poll_events(group, kind))
+        return frames
+
+    def _remember_frame_server_ids(self, frames: Iterable[Any]) -> None:
+        """把本轮消息帧的 server_id 记进映射，供后续撤回关联到 message_id。"""
+        for frame in frames:
+            if not isinstance(frame, dict) or frame.get("type") != "message":
+                continue
+            try:
+                sid = int(frame.get("server_id") or 0)
+            except (TypeError, ValueError):
+                sid = 0
+            message_id = frame.get("message_id")
+            if sid > 0 and message_id:
+                self._remember_server_id(sid, message_id)
+
+    def _remember_server_id(self, server_id: int, message_id: Any) -> None:
+        """记录 server_id -> 机器人 message_id；超过上限 FIFO 淘汰最旧的。"""
+        key = str(server_id)
+        value = str(message_id)
+        if self._event_server_ids.get(key) == value:
+            return
+        self._event_server_ids[key] = value
+        self._event_dirty = True
+        while len(self._event_server_ids) > _SERVER_ID_MAP_LIMIT:
+            self._event_server_ids.pop(next(iter(self._event_server_ids)))
+
+    # ------------------------------------------------- 事件桥接：撤回/系统/好友申请
+    async def _poll_events(self, group: str, kind: str) -> list[dict[str, Any]]:
+        """读本地库该会话的 10000/10002 事件行，产出 notice/recall 帧。
+
+        纯本地库（`_uses_localdb`）模式才会被调用；基线规则：第一次观察到某个
+        username 时只建水位、不补发历史事件，重启后靠落盘的水位不重放。
+        """
+        source = self.localdb
+        if source is None:
+            return []
+        try:
+            username = await asyncio.wait_for(
+                asyncio.to_thread(source.resolve_username, group), MAX_AWAIT
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 解析失败按「没有事件」处理
+            _log_once(
+                logging.DEBUG, f"resolve:{group}",
+                "解析会话 %r 的本地库 username 失败，跳过事件：%s", group, exc,
+            )
+            return []
+        if not username:
+            return []
+        try:
+            chat_id = str(self.registry.chat_id(group, kind=kind))
+        except Exception as exc:  # noqa: BLE001 - 身份歧义时跳过该会话的事件
+            logger.warning("会话 %r 无法解析稳定会话 id，跳过事件：%s", group, exc)
+            return []
+        watermark = self._event_watermarks.get(username)
+        try:
+            rows = await asyncio.wait_for(
+                asyncio.to_thread(
+                    source.event_rows,
+                    username,
+                    types=(10000, 10002),
+                    since_local_id=watermark or 0,
+                ),
+                MAX_AWAIT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 读取失败只降级
+            _log_once(
+                logging.WARNING, f"event_rows:{username}",
+                "读取会话 %r 的本地事件行失败，本轮跳过：%s", group, exc,
+            )
+            return []
+        if not isinstance(rows, list):
+            _log_once(
+                logging.WARNING, f"event_rows:{username}",
+                "本地事件行不是列表（%r），本轮跳过", type(rows).__name__,
+            )
+            return []
+        if watermark is None:
+            # 基线：历史事件不补发，只把水位推到当前最大（空批就是 0）。
+            self._event_watermarks[username] = _max_local_id(rows)
+            self._event_dirty = True
+            return []
+        try:
+            frames = self._build_event_frames(
+                rows,
+                username=username,
+                chat_id=chat_id,
+                chat_type="private" if kind == "friend" else "group",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 解析坏了只丢这批帧，不丢水位
+            logger.warning("构建会话 %r 的事件帧失败：%s", group, exc)
+            frames = []
+        # 水位推到这批的最大 local_id（含被跳过的畸形行），且永不回退。
+        reached = _max_local_id(rows)
+        if reached > watermark:
+            self._event_watermarks[username] = reached
+            self._event_dirty = True
+        return frames
+
+    def _build_event_frames(
+        self,
+        rows: list[Any],
+        *,
+        username: str,
+        chat_id: str,
+        chat_type: str,
+    ) -> list[dict[str, Any]]:
+        """把 10000/10002 行翻译成 notice/recall 帧；按 local_id 升序。"""
+        self_id = ""
+        self_getter = getattr(self.localdb, "self_username", None)
+        if callable(self_getter):
+            try:
+                self_id = str(self_getter() or "")
+            except Exception as exc:  # noqa: BLE001 - self_id 只是辅助信号
+                logger.debug("读取本地库 self_username 失败：%s", exc)
+        frames: list[dict[str, Any]] = []
+        for row in sorted((row for row in rows if isinstance(row, dict)), key=_row_local_id):
+            local_id = _row_local_id(row)
+            if local_id <= 0:
+                continue
+            content = str(row.get("content") or "")
+            try:
+                local_type = int(row.get("local_type") or 0)
+            except (TypeError, ValueError):
+                continue
+            if local_type == 10000:
+                events = helper_parsers.parse_group_system_message(
+                    content, 10000, username, self_id
+                )
+                for event in events or ():
+                    if not isinstance(event, dict):
+                        continue
+                    notice_kind = _GROUP_EVENT_KINDS.get(str(event.get("kind") or ""))
+                    if notice_kind is None:
+                        continue
+                    frame: dict[str, Any] = {
+                        "v": 1,
+                        "type": "notice",
+                        "channel": "wechat",
+                        "chat_type": chat_type,
+                        "chat_id": chat_id,
+                        "kind": notice_kind,
+                        "user_id": str(event.get("member_id") or ""),
+                        "nickname": str(event.get("nickname") or ""),
+                        "event_id": f"wechat:sys:{local_id}",
+                    }
+                    operator_id = str(event.get("operator_id") or "")
+                    if operator_id:
+                        frame["operator_id"] = operator_id
+                    sub_type = str(event.get("sub_type") or "")
+                    if sub_type:
+                        frame["sub_type"] = sub_type
+                    frames.append(frame)
+            elif local_type == 10002:
+                parsed = helper_parsers.parse_recall(content, username)
+                if not isinstance(parsed, dict):
+                    continue
+                if str(parsed.get("chat_id") or "") != username:
+                    # 撤回指向别的会话：这条 row 不属于本会话，跳过。
+                    continue
+                newmsgid = str(parsed.get("message_id") or "")
+                if not newmsgid:
+                    continue
+                mapped = self._event_server_ids.get(newmsgid)
+                if mapped:
+                    message_id = mapped
+                else:
+                    message_id = f"wechat:{newmsgid}"
+                    _log_once(
+                        logging.DEBUG, f"recall-unmapped:{newmsgid}",
+                        "撤回通知 newmsgid=%s 没有匹配的 server_id 映射，退回合成 id",
+                        newmsgid,
+                    )
+                frames.append(
+                    {
+                        "v": 1,
+                        "type": "recall",
+                        "channel": "wechat",
+                        "chat_type": chat_type,
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "user_id": str(parsed.get("operator_id") or ""),
+                    }
+                )
+        return frames
+
+    async def _poll_fmessage(self) -> list[dict[str, Any]]:
+        """读 fmessage 的 type=37 行，只把「收到好友申请」（opcode=2）转成 notice。
+
+        其他 opcode（已同意/已过期等回执）跳过；申请凭据（ticket/
+        encryptusername/原始 XML）不进结果也不进日志。
+        """
+        source = self.localdb
+        if source is None:
+            return []
+        watermark = self._event_watermarks.get("fmessage")
+        try:
+            rows = await asyncio.wait_for(
+                asyncio.to_thread(
+                    source.event_rows,
+                    "fmessage",
+                    types=(37,),
+                    since_local_id=watermark or 0,
+                ),
+                MAX_AWAIT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 读取失败只降级
+            _log_once(
+                logging.WARNING, "fmessage:event_rows",
+                "读取好友申请事件行失败，本轮跳过：%s", exc,
+            )
+            return []
+        if not isinstance(rows, list):
+            _log_once(
+                logging.WARNING, "fmessage:event_rows",
+                "好友申请事件行不是列表（%s），本轮跳过", type(rows).__name__,
+            )
+            return []
+        if watermark is None:
+            # 基线：历史申请不补发，只建水位。
+            self._event_watermarks["fmessage"] = _max_local_id(rows)
+            self._event_dirty = True
+            return []
+        try:
+            frames = self._build_fmessage_frames(rows)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 解析坏了只丢这批帧
+            logger.warning("构建好友申请帧失败：%s", exc)
+            frames = []
+        reached = _max_local_id(rows)
+        if reached > watermark:
+            self._event_watermarks["fmessage"] = reached
+            self._event_dirty = True
+        return frames
+
+    def _build_fmessage_frames(self, rows: list[Any]) -> list[dict[str, Any]]:
+        """把 opcode=2 的 type=37 行翻译成 friend_request notice。"""
+        frames: list[dict[str, Any]] = []
+        for row in sorted((row for row in rows if isinstance(row, dict)), key=_row_local_id):
+            local_id = _row_local_id(row)
+            if local_id <= 0:
+                continue
+            parsed = helper_parsers.parse_friend_request(str(row.get("content") or ""))
+            if not isinstance(parsed, dict):
+                continue
+            try:
+                opcode = int(parsed.get("opcode") or 0)
+            except (TypeError, ValueError):
+                opcode = 0
+            if opcode != 2:
+                logger.debug("忽略非「收到好友申请」的 fmessage 行（opcode=%s）", opcode)
+                continue
+            frames.append(
+                {
+                    "v": 1,
+                    "type": "notice",
+                    "channel": "wechat",
+                    "chat_type": "private",
+                    "chat_id": "wxg:fmessage",
+                    "kind": "friend_request",
+                    "nickname": str(parsed.get("nickname") or ""),
+                    "comment": str(parsed.get("verification") or ""),
+                    "event_id": f"fmessage:{local_id}",
+                }
+            )
         return frames
 
     def _uses_localdb(self) -> bool:
@@ -1057,6 +1394,61 @@ class PollingLoop:
             self._align_dirty = False
         except Exception as exc:  # noqa: BLE001 - 磁盘问题只影响续跑，不影响轮询
             logger.debug("保存对齐状态失败：%s", exc)
+
+    def _load_event_state(self) -> dict[str, dict[str, Any]]:
+        """读事件水位文件；缺失/损坏按空状态处理（debug 记一条，绝不抛错）。"""
+        empty: dict[str, dict[str, Any]] = {"watermarks": {}, "server_ids": {}}
+        path = self.event_state_path
+        if path is None or not path.exists():
+            return empty
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - 状态坏了按首次启动处理
+            logger.debug("读取事件水位失败，按空状态处理：%s", exc)
+            return empty
+        if not isinstance(raw, dict):
+            logger.debug("事件水位文件格式不对，按空状态处理")
+            return empty
+        watermarks: dict[str, int] = {}
+        raw_watermarks = raw.get("watermarks")
+        if isinstance(raw_watermarks, dict):
+            for name, value in raw_watermarks.items():
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    watermarks[str(name)] = number
+        server_ids: dict[str, str] = {}
+        raw_server_ids = raw.get("server_ids")
+        if isinstance(raw_server_ids, dict):
+            for key, value in raw_server_ids.items():
+                sid = str(key).strip()
+                message_id = str(value or "").strip()
+                if sid and message_id:
+                    server_ids[sid] = message_id
+        while len(server_ids) > _SERVER_ID_MAP_LIMIT:
+            server_ids.pop(next(iter(server_ids)))
+        return {"watermarks": watermarks, "server_ids": server_ids}
+
+    def _save_event_state(self) -> None:
+        """只有脏了才落盘；原子替换，写失败只影响续跑不影响轮询。"""
+        path = self.event_state_path
+        if path is None or not self._event_dirty:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "watermarks": self._event_watermarks,
+                "server_ids": self._event_server_ids,
+            }
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), "utf-8")
+            os.replace(tmp, path)
+            self._event_dirty = False
+        except Exception as exc:  # noqa: BLE001 - 磁盘问题只影响续跑，不影响轮询
+            logger.debug("保存事件水位失败：%s", exc)
 
     # ------------------------------------------------------------- 健康
     async def _health_frame(self, *, connected: bool) -> dict[str, Any]:

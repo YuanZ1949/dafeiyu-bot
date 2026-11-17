@@ -1289,3 +1289,32 @@ def test_private_allow_fail_closed_when_registry_unresolvable(tmp_path: Path) ->
     # 好友解析不出稳定 id：allow 非空时 fail-closed，只轮询群。
     assert poller._scope() == (GN,)
     assert poller.allows_chat("wxg:g1") is True
+
+
+# ------------------------------------------------ (l) 事件水位落盘接线
+def test_default_poller_factory_passes_event_state_path(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """接线回归：默认工厂把 event_state_path 指到独立的事件水位文件。"""
+    import dafeiyu.gateway.wechat_bridge.identity as bridge_identity
+    import dafeiyu.gateway.wechat_bridge.panel as bridge_panel
+    import dafeiyu.gateway.wechat_bridge.poller as bridge_poller
+
+    overlay = tmp_path / "settings.local.yaml"
+    overlay.write_text("brain:\n  mode: key\n", encoding="utf-8")
+    monkeypatch.setattr(bridge_panel, "DEFAULT_PATH", overlay)
+    monkeypatch.setattr(bridge_main, "_build_localdb_source", lambda wechat: None)
+    monkeypatch.setattr(
+        bridge_poller, "DEFAULT_ALIGN_STATE", str(tmp_path / "align-state.json")
+    )
+    monkeypatch.setattr(
+        bridge_poller, "DEFAULT_EVENT_STATE", str(tmp_path / "event_state.json")
+    )
+    monkeypatch.setattr(bridge_identity, "PeerRegistry", lambda: _Registry())
+
+    loop = bridge_main._default_poller_factory(_wechat(tmp_path), FakeDriver())
+
+    assert loop.event_state_path == tmp_path / "event_state.json"
+    assert loop.event_state_path != loop.align_state_path
+    assert loop._event_watermarks == {}
+    assert loop._event_server_ids == {}
