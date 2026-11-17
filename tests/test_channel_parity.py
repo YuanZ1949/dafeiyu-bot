@@ -98,6 +98,7 @@ def build(
     qq_segments_error: Exception | None = None,
     qq_notice: bool = False,
     wx_media: bool = False,
+    wx_notice: bool = False,
     wx_media_ok: bool = True,
     wx_media_error: Exception | None = None,
     poke_enabled: bool = False,
@@ -136,6 +137,7 @@ def build(
         media=wx_media,
         media_ok=wx_media_ok,
         media_error=wx_media_error,
+        notice=wx_notice,
     )
     router = Router(settings, store, clock=clock or (lambda: NOON))
     service = Service(
@@ -525,27 +527,39 @@ async def test_wechat_unsupported_media_falls_back_to_text(
 # ---------------------------------------------------------------- 社交/提醒
 
 
-async def test_poke_notice_is_qq_only_but_service_gating_is_shared(tmp_path):
-    """poke 的通道边界：微信桥协议没有 notice 事件。
+async def test_poke_replies_stay_qq_only_while_notice_registration_is_shared(tmp_path):
+    """notice 注册是共享能力，poke 回应仍只属于 QQ 通道。
 
-    ``WeChatAdapter`` 不实现 ``on_notice``，所以 ``Service.start()`` 只会给
-    QQ 适配器注册 notice 处理器——微信私聊根本收不到 poke 回应（不是
-    「收到了却不发」）。真正的门控（静音/强度/预算/冷却/每日上限）在
-    ``Service._handle_poke`` 里与 ``chat_id`` 前缀无关，两条通道共用同一份；
-    这里用 QQ 私聊 poke 证明它只发一条固定短句且绝不调用模型。
+    任务 7 之后 ``WeChatAdapter`` 也实现了 ``on_notice``，``Service.start()``
+    对任何暴露 ``on_notice`` 的适配器都注册 ``handle_notice``：这里对 QQ
+    替身、开着 notice 能力的微信替身各断言恰好一条注册，再放一个没开
+    能力的替身断言它一条都不注册。但 poke 回应在真实运行里只出现在 QQ
+    通道——微信桥协议从不产生 ``group_poke``/``friend_poke``（协议层事实，
+    ``gateway/wechat.py`` 没有 poke 解析，见 ``tests/test_wechat_adapter.py``
+    的 notice 帧用例），注册了 handler ≠ 会收到 poke。门控（静音/强度/
+    预算/冷却/每日上限）在 ``Service._handle_poke`` 里与 ``chat_id`` 前缀
+    无关，两条通道共用同一份；用 QQ 私聊 poke 证明它只发一条固定短句且
+    绝不调用模型。
     """
     from dafeiyu.gateway.wechat import WeChatAdapter
 
-    assert not hasattr(WeChatAdapter, "on_notice")
+    # 新协议面：微信适配器实现了 notice 通道（进退群/申请）；桥不产生 poke
+    # 是协议层事实，由 wechat 适配器自身的用例覆盖，这里只锁「实现了」。
+    assert callable(WeChatAdapter.on_notice)
 
     service, _store, brain, qq, wx = build(
-        tmp_path, qq_notice=True, poke_enabled=True
+        tmp_path, qq_notice=True, wx_notice=True, poke_enabled=True
     )
+
+    # 没开 notice 能力的替身（即旧「微信形态」）：start() 不会给它注册。
+    bare = FakeChannelAdapter(bot_id="qq:0", chat_id=QQ_CHAT)
+    service.adapters["bare"] = bare
 
     await service.start()
     try:
         assert qq.notice_handlers == [service.handle_notice]
-        assert not callable(getattr(wx, "on_notice", None))
+        assert wx.notice_handlers == [service.handle_notice]
+        assert bare.notice_handlers == []
         await qq.emit_notice(
             NoticeEvent(
                 kind="friend_poke",
@@ -562,7 +576,8 @@ async def test_poke_notice_is_qq_only_but_service_gating_is_shared(tmp_path):
     _chat_type, chat_id, text = qq.sent[0]
     assert chat_id == QQ_PRIVATE
     assert text in POKE_REPLIES
-    # 微信侧一个字节都没发：notice 根本进不了微信适配器。
+    # 微信侧一条都不发：桥的 notice 只映射进退群/申请，永远不产生 poke，
+    # 所以这个 QQ poke 不会有任何跨通道回声（注册了 handler ≠ 会收到 poke）。
     assert wx.sent == []
     assert brain.calls == []
 
