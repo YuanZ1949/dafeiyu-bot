@@ -241,6 +241,57 @@ def test_health_snapshot_passes_desktop_required(tmp_path: Path) -> None:
     assert "desktop_required" not in channels["qq"]
 
 
+def test_health_snapshot_carries_helper_compat(tmp_path: Path) -> None:
+    control, _adapter, _store, _app = make_control(tmp_path)
+    control.service.channel_status = lambda: {
+        "qq": {"connected": True, "degraded": False},
+        "wechat": {
+            "connected": True,
+            "degraded": False,
+            "helper_version": "2026.11.17",
+            "helper_compat": "unsupported",
+            "helper_supported_versions": ["4.1.15.13"],
+            "helper_fingerprint_available": False,
+        },
+    }
+
+    snapshot = control.health_snapshot()
+
+    wechat = snapshot["channels"]["wechat"]
+    assert wechat["helper_version"] == "2026.11.17"
+    assert wechat["helper_compat"] == "unsupported"
+    assert wechat["helper_supported_versions"] == ["4.1.15.13"]
+    assert wechat["helper_fingerprint_available"] is False
+
+    # QQ 条目不因微信有这些键就凭空长出字段。
+    qq = snapshot["channels"]["qq"]
+    for key in (
+        "helper_version",
+        "helper_compat",
+        "helper_supported_versions",
+        "helper_fingerprint_available",
+    ):
+        assert key not in qq
+
+
+def test_health_snapshot_qq_only_has_no_helper_fields(tmp_path: Path) -> None:
+    control, _adapter, _store, _app = make_control(tmp_path)
+    control.service.channel_status = lambda: {
+        "qq": {"connected": True, "degraded": False}
+    }
+
+    snapshot = control.health_snapshot()
+
+    entry = snapshot["channels"]["qq"]
+    for key in (
+        "helper_version",
+        "helper_compat",
+        "helper_supported_versions",
+        "helper_fingerprint_available",
+    ):
+        assert key not in entry
+
+
 def test_health_snapshot_passes_wechat_receipt_counts(tmp_path: Path) -> None:
     control, _adapter, _store, _app = make_control(tmp_path)
     receipts = {

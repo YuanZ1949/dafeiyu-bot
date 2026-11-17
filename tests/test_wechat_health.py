@@ -28,7 +28,26 @@ REQUIRED_KEYS = {
     "last_send_at",
     "degraded",
     "reason",
+    "helper_version",
+    "helper_compat",
+    "helper_supported_versions",
+    "helper_fingerprint_available",
 }
+
+HELPER_UNKNOWN = {
+    "helper_version": "",
+    "helper_compat": "unknown",
+    "helper_supported_versions": [],
+    "helper_fingerprint_available": False,
+}
+
+
+@pytest.fixture(autouse=True)
+def _reset_helper_snapshot():
+    """模块级助手快照是进程状态：每个用例前后都清掉，保证顺序无关。"""
+    health.set_helper_snapshot(None)
+    yield
+    health.set_helper_snapshot(None)
 
 
 def make_config(**overrides: object) -> WeChatConfig:
@@ -523,3 +542,69 @@ def test_hook_outbound_still_fails_when_wechat_not_running(healthy, monkeypatch)
     assert frame["desktop"] == "no_wechat"
     assert frame["degraded"] is True
     assert frame["reason"] == "no_wechat"
+
+
+# ---- 助手兼容性（GAP-9 / GAP-15） ------------------------------------
+def test_probe_reports_helper_unknown_by_default(healthy) -> None:
+    frame = health.probe(make_config())
+
+    assert {key: frame[key] for key in HELPER_UNKNOWN} == HELPER_UNKNOWN
+    assert health.helper_info() == HELPER_UNKNOWN
+
+
+def test_set_helper_snapshot_feeds_probe(healthy) -> None:
+    health.set_helper_snapshot(
+        {
+            "helper_version": "2026.11.17",
+            "helper_compat": "ok",
+            "supported_versions": ["4.1.15.13"],
+        }
+    )
+
+    frame = health.probe(make_config())
+
+    assert frame["helper_version"] == "2026.11.17"
+    assert frame["helper_compat"] == "ok"
+    assert frame["helper_supported_versions"] == ["4.1.15.13"]
+    assert frame["helper_fingerprint_available"] is False
+    # 帧里拿到的是副本：改帧不能污染模块状态。
+    frame["helper_supported_versions"].append("9.9.9")
+    assert health.helper_info()["helper_supported_versions"] == ["4.1.15.13"]
+
+
+def test_set_helper_snapshot_none_resets_to_unknown(healthy) -> None:
+    health.set_helper_snapshot(
+        {"helper_version": "2026.11.17", "helper_compat": "unsupported"}
+    )
+    assert health.helper_info()["helper_compat"] == "unsupported"
+
+    health.set_helper_snapshot(None)
+
+    assert health.probe(make_config())["helper_compat"] == "unknown"
+    assert health.helper_info() == HELPER_UNKNOWN
+
+
+def test_set_helper_snapshot_normalizes_bad_payload() -> None:
+    health.set_helper_snapshot(
+        {
+            "helper_version": 20261117,
+            "helper_compat": "bogus",
+            "supported_versions": "4.1.15.13",
+        }
+    )
+
+    assert health.helper_info() == HELPER_UNKNOWN
+
+
+def test_set_helper_snapshot_never_exposes_fingerprint() -> None:
+    health.set_helper_snapshot(
+        {
+            "helper_version": "2026.11.17",
+            "helper_compat": "ok",
+            "helper_supported_versions": ["4.1.15.13"],
+            "helper_fingerprint_available": True,
+        }
+    )
+
+    assert health.helper_info()["helper_fingerprint_available"] is False
+

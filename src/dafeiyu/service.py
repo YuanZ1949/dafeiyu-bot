@@ -584,6 +584,21 @@ class Service:
                     status[channel]["desktop_required"] = bool(
                         getattr(adapter, "desktop_required")
                     )
+            # 助手兼容性同样是「有才补」：QQ 适配器没有这些属性，不凭空造字段。
+            if hasattr(adapter, "helper_version"):
+                status[channel]["helper_version"] = getattr(
+                    adapter, "helper_version"
+                )
+            if hasattr(adapter, "helper_compat"):
+                status[channel]["helper_compat"] = getattr(adapter, "helper_compat")
+            if hasattr(adapter, "helper_supported_versions"):
+                status[channel]["helper_supported_versions"] = list(
+                    getattr(adapter, "helper_supported_versions") or ()
+                )
+            if hasattr(adapter, "helper_fingerprint_available"):
+                status[channel]["helper_fingerprint_available"] = bool(
+                    getattr(adapter, "helper_fingerprint_available")
+                )
             # 降级原因（如 hook 模式本地库不可用）：有才补，空串不带键，
             # 保持 QQ 通道与旧快照的字段形状不变。
             health_reason = getattr(adapter, "health_reason", "")

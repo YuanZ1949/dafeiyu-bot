@@ -1485,6 +1485,11 @@ class PollingLoop:
             if INBOUND_LOCALDB_REASON not in reasons:
                 reasons.append(INBOUND_LOCALDB_REASON)
             out["reason"] = ";".join(reasons)
+        # 助手兼容性：探针已经带上的字段优先，缺的用最近一次 hook /health 快照。
+        from . import health
+
+        for key, value in health.helper_info().items():
+            out.setdefault(key, value)
         return out
 
     async def _kill_switch_frame(self) -> dict[str, Any]:

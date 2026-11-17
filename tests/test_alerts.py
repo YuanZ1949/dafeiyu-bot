@@ -347,6 +347,80 @@ async def test_bridge_gap_silent_without_gap(tmp_path: Path) -> None:
     assert all(incident.rule != "bridge_gap" for incident, _event in channel.sent)
 
 
+@pytest.mark.parametrize("compat", ["unsupported", "unknown"])
+async def test_wechat_helper_compat_warns(
+    tmp_path: Path, compat: str
+) -> None:
+    """助手没确认兼容（unsupported/unknown）只报警告，绝不算通道不可用。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = wechat_snapshot(
+        wechat={
+            "connected": True,
+            "degraded": False,
+            "logged_in": True,
+            "desktop": "interactive",
+            "helper_version": "2026.11.17",
+            "helper_compat": compat,
+            "helper_supported_versions": ["4.1.15.13"],
+            "helper_fingerprint_available": False,
+        }
+    )
+
+    await mgr.evaluate(snapshot)
+
+    assert len(channel.sent) == 1
+    incident, event = channel.sent[0]
+    assert event == "firing"
+    assert incident.rule == "wechat_helper_compat"
+    assert incident.severity == "warning"
+    assert incident.title == "微信助手版本需要确认"
+    assert compat in incident.detail
+    assert "4.1.15.13" in incident.detail
+    assert incident.data == {
+        "helper_compat": compat,
+        "supported": ["4.1.15.13"],
+    }
+
+
+async def test_wechat_helper_compat_ok_is_silent(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = wechat_snapshot(
+        wechat={
+            "connected": True,
+            "degraded": False,
+            "logged_in": True,
+            "desktop": "interactive",
+            "helper_version": "2026.11.17",
+            "helper_compat": "ok",
+            "helper_supported_versions": ["4.1.15.13"],
+        }
+    )
+
+    await mgr.evaluate(snapshot)
+
+    assert all(
+        incident.rule != "wechat_helper_compat" for incident, _event in channel.sent
+    )
+
+
+async def test_wechat_helper_compat_qq_only_is_silent(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = base_snapshot()
+    snapshot["bot"]["channels"] = {"qq": {"connected": True, "degraded": False}}
+
+    await mgr.evaluate(snapshot)
+
+    assert all(
+        incident.rule != "wechat_helper_compat" for incident, _event in channel.sent
+    )
+
+
 @pytest.mark.parametrize(
     ("snapshot_kwargs", "expected"),
     [

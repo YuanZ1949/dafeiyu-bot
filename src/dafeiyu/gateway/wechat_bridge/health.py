@@ -39,7 +39,9 @@ __all__ = [
     "INTEGRITY_MISMATCHED",
     "INTEGRITY_UNKNOWN",
     "HealthProbe",
+    "helper_info",
     "probe",
+    "set_helper_snapshot",
 ]
 
 PROTOCOL_VERSION = 1
@@ -551,6 +553,70 @@ def _integrity_state(running: bool) -> str:
     return INTEGRITY_MATCHING if saw_match else INTEGRITY_UNKNOWN
 
 
+# ---- 微信助手（hook）兼容性 ------------------------------------------
+# 助手侧 /health 报什么由它自己决定；bot 只缓存最近一次快照，供健康帧/面板/
+# 告警透传。助手没有指纹，所以 ``helper_fingerprint_available`` 恒为 False——
+# 这里唯一一次定义，之后任何帧/快照都不许把它改成 True。
+_HELPER_COMPAT_VALUES = frozenset({"ok", "unsupported", "unknown"})
+
+_HELPER_INFO: dict[str, Any] = {}
+
+
+def _helper_defaults() -> dict[str, Any]:
+    """每次返回新的默认字典（含新的 list），避免调用方改到共享状态。"""
+    return {
+        "helper_version": "",
+        "helper_compat": "unknown",
+        "helper_supported_versions": [],
+        "helper_fingerprint_available": False,
+    }
+
+
+def set_helper_snapshot(payload: dict[str, Any] | None) -> None:
+    """缓存助手 ``/health`` 的兼容性字段；``None``/坏数据一律回到 unknown。
+
+    入参就是助手 /health 的 JSON。本函数绝不抛异常：保活探测不能因为助手
+    返回了畸形字段就把桥带崩。``helper_fingerprint_available`` 恒为 False
+    （助手不暴露指纹）。
+    """
+    info = _helper_defaults()
+    try:
+        if isinstance(payload, dict):
+            version = payload.get("helper_version")
+            if isinstance(version, str):
+                info["helper_version"] = version.strip()
+            compat = payload.get("helper_compat")
+            if isinstance(compat, str) and (
+                compat.strip().lower() in _HELPER_COMPAT_VALUES
+            ):
+                info["helper_compat"] = compat.strip().lower()
+            raw_versions = payload.get("supported_versions")
+            if not isinstance(raw_versions, (list, tuple)):
+                raw_versions = payload.get("helper_supported_versions")
+            if isinstance(raw_versions, (list, tuple)):
+                info["helper_supported_versions"] = [
+                    item for item in raw_versions if isinstance(item, str) and item
+                ]
+    except Exception:  # noqa: BLE001 - 畸形载荷只能降级，不能打断调用方
+        info = _helper_defaults()
+    _HELPER_INFO.clear()
+    _HELPER_INFO.update(info)
+
+
+def helper_info() -> dict[str, Any]:
+    """当前助手兼容性快照的**副本**；未记录过时返回 unknown 默认值。"""
+    info = _helper_defaults()
+    try:
+        info.update(_HELPER_INFO)
+    except Exception:  # pragma: no cover - 防御性兜底，快照读取不许抛
+        info = _helper_defaults()
+    info["helper_fingerprint_available"] = False  # 助手无指纹，永远是 False
+    info["helper_supported_versions"] = list(
+        info.get("helper_supported_versions") or []
+    )
+    return info
+
+
 # ---- 探测与发送闸门 ---------------------------------------------------
 def probe(
     config: WeChatConfig | None = None,
@@ -668,6 +734,7 @@ def probe(
         "last_send_at": _as_int_or_none(last_send_at),
         "degraded": bool(unique_reasons),
         "reason": ";".join(unique_reasons) if unique_reasons else None,
+        **helper_info(),
     }
 
 

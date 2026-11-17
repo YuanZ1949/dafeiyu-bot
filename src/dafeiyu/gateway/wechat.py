@@ -130,6 +130,11 @@ class WeChatAdapter:
         self.queue_depth = 0
         self.wechat_version: str | None = None
         self.language: str | None = None
+        # 助手（hook）兼容性：桥上报什么就存什么；助手不暴露指纹，恒 False。
+        self.helper_version: str | None = None
+        self.helper_compat: str | None = None
+        self.helper_supported_versions: tuple[str, ...] = ()
+        self.helper_fingerprint_available = False
         self.last_event_at: float | None = None
         self.last_disconnect_at: float | None = None
         self.last_send_at: float | None = None
@@ -734,6 +739,21 @@ class WeChatAdapter:
         self.wechat_version = str(version) if version is not None else None
         language = envelope.get("language")
         self.language = str(language) if language is not None else None
+        helper_version = envelope.get("helper_version")
+        self.helper_version = (
+            str(helper_version) if helper_version is not None else None
+        )
+        helper_compat = envelope.get("helper_compat")
+        self.helper_compat = (
+            str(helper_compat) if helper_compat is not None else None
+        )
+        supported = envelope.get("helper_supported_versions")
+        if isinstance(supported, (list, tuple)):
+            self.helper_supported_versions = tuple(
+                str(item) for item in supported if isinstance(item, str)
+            )
+        # 助手没有指纹可暴露：无论帧里写什么，这里都强制 False。
+        self.helper_fingerprint_available = False
         event_at = _float_or_none(envelope.get("last_event_at"))
         if event_at is not None and (
             self.last_event_at is None or event_at > self.last_event_at

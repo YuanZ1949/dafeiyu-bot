@@ -334,6 +334,28 @@ class AlertManager:
                         ),
                         {"gap_from": gap_from},
                     )
+            # 助手兼容性：unsupported/unknown 都代表「没确认能和当前微信配合」，
+            # 只报警告（unknown 不等于坏，绝不升级成 critical）；ok 或旧版快照
+            # 没有该键时保持静默。
+            helper_compat = wechat.get("helper_compat")
+            if helper_compat in ("unsupported", "unknown"):
+                raw_supported = wechat.get("helper_supported_versions")
+                supported = (
+                    [item for item in raw_supported if isinstance(item, str)]
+                    if isinstance(raw_supported, (list, tuple))
+                    else []
+                )
+                supported_text = "、".join(supported) if supported else "未知"
+                conditions["wechat_helper_compat"] = Condition(
+                    True,
+                    "warning",
+                    "微信助手版本需要确认",
+                    (
+                        f"微信助手兼容性：{helper_compat}"
+                        f"（已支持版本：{supported_text}）"
+                    ),
+                    {"helper_compat": helper_compat, "supported": supported},
+                )
 
         napcat = snapshot.get("napcat") or {}
         if not isinstance(napcat, dict):

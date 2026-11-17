@@ -34,6 +34,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import contextlib
+import json
 import logging
 import signal
 import sys
@@ -259,12 +260,28 @@ def _hook_health_url(hook_url: str) -> str:
 
 
 async def _probe_hook_health(url: str, *, timeout: float = _KEEPALIVE_TIMEOUT) -> bool:
-    """探测一次 hook 健康口；阻塞 IO 放线程里，不卡事件循环。"""
+    """探测一次 hook 健康口；阻塞 IO 放线程里，不卡事件循环。
+
+    2xx 时顺便把助手 /health 里的版本兼容字段记进 ``health`` 模块，供后续
+    健康帧/面板/告警透传。非 2xx、连接失败、JSON 坏掉一律记为 unknown，
+    探测本身只回 bool（保活语义不变）。
+    """
 
     def _get() -> bool:
-        with urlopen(url, timeout=timeout) as response:  # noqa: S310 - 仅本机 hook
-            status = getattr(response, "status", None) or response.getcode()
-            return 200 <= int(status) < 300
+        from . import health
+
+        try:
+            with urlopen(url, timeout=timeout) as response:  # noqa: S310 - 仅本机 hook
+                status = getattr(response, "status", None) or response.getcode()
+                if not 200 <= int(status) < 300:
+                    health.set_helper_snapshot(None)
+                    return False
+                payload = json.loads(response.read() or b"{}")
+        except Exception:  # noqa: BLE001 - 保活探测失败只告警，不能拖垮桥
+            health.set_helper_snapshot(None)
+            return False
+        health.set_helper_snapshot(payload if isinstance(payload, dict) else None)
+        return True
 
     return await asyncio.to_thread(_get)
 
@@ -720,6 +737,7 @@ def _health_frame(
     ``driver_impl`` 传生产驱动的真实实现；调用方负责把它跑在 UI 线程上。
     """
     try:
+        from . import health
         from .health import probe
 
         frame = probe(wechat, connected=connected, driver_impl=driver_impl)
@@ -729,6 +747,9 @@ def _health_frame(
             snapshot.setdefault("type", "health")
             snapshot.setdefault("channel", "wechat")
             snapshot["connected"] = bool(connected)
+            # 助手兼容性：探针自己给了就用它的，否则补最近一次 /health 快照。
+            for key, value in health.helper_info().items():
+                snapshot.setdefault(key, value)
             return snapshot
     except Exception:
         logger.warning("微信桥健康探测不可用，按 fail-closed 降级", exc_info=True)
@@ -746,6 +767,11 @@ def _fallback_health_frame(*, connected: bool) -> dict[str, Any]:
         "wechat_version": None,
         "language": None,
         "queue_depth": 0,
+        # 探测不可用时也不能断言助手兼容：一律 unknown，指纹恒 False。
+        "helper_version": "",
+        "helper_compat": "unknown",
+        "helper_supported_versions": [],
+        "helper_fingerprint_available": False,
     }
 
 

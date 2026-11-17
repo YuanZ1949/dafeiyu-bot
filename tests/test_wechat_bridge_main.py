@@ -41,6 +41,7 @@ from dafeiyu.config import (
     TriggerConfig,
     WeChatConfig,
 )
+from dafeiyu.gateway.wechat_bridge import health as bridge_health
 from dafeiyu.gateway.wechat_bridge.sender import SendResult
 from dafeiyu.gateway.wechat_bridge.server import BridgeServer, pump_frames
 
@@ -2221,3 +2222,143 @@ async def test_builtin_send_media_maps_sticker_to_emoticon() -> None:
             run_task.cancel()
             with contextlib.suppress(BaseException):
                 await asyncio.wait_for(run_task, STEP)
+
+
+# ------------------------------------- 助手兼容性（GAP-9 / GAP-15）
+class _HealthResponse:
+    """最小 urlopen 响应替身：足够让 _probe_hook_health 读 status + body。"""
+
+    def __init__(self, body: bytes, status: int = 200) -> None:
+        self._body = body
+        self.status = status
+
+    def getcode(self) -> int:
+        return self.status
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_HealthResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+def test_health_frame_carries_unknown_helper_fields(monkeypatch) -> None:
+    monkeypatch.setattr(
+        bridge_health,
+        "probe",
+        lambda *args, **kwargs: {"desktop": "interactive", "logged_in": True},
+    )
+
+    frame = bridge_main._health_frame(_wechat(), connected=True)
+
+    assert frame["helper_version"] == ""
+    assert frame["helper_compat"] == "unknown"
+    assert frame["helper_supported_versions"] == []
+    assert frame["helper_fingerprint_available"] is False
+
+
+def test_health_frame_fills_helper_fields_from_snapshot(monkeypatch) -> None:
+    bridge_health.set_helper_snapshot(
+        {
+            "helper_version": "2026.11.17",
+            "helper_compat": "ok",
+            "supported_versions": ["4.1.15.13"],
+        }
+    )
+    monkeypatch.setattr(
+        bridge_health, "probe", lambda *args, **kwargs: {"desktop": "interactive"}
+    )
+    try:
+        frame = bridge_main._health_frame(_wechat(), connected=True)
+    finally:
+        bridge_health.set_helper_snapshot(None)
+
+    # 探针不带助手字段时，用最近一次 hook /health 快照补齐。
+    assert frame["helper_version"] == "2026.11.17"
+    assert frame["helper_compat"] == "ok"
+    assert frame["helper_supported_versions"] == ["4.1.15.13"]
+    assert frame["helper_fingerprint_available"] is False
+
+
+def test_health_frame_keeps_probe_helper_fields(monkeypatch) -> None:
+    bridge_health.set_helper_snapshot(
+        {"helper_version": "stale", "helper_compat": "unsupported"}
+    )
+    monkeypatch.setattr(
+        bridge_health,
+        "probe",
+        lambda *args, **kwargs: {
+            "helper_version": "2026.11.17",
+            "helper_compat": "ok",
+            "helper_supported_versions": ["4.1.15.13"],
+            "helper_fingerprint_available": False,
+        },
+    )
+    try:
+        frame = bridge_main._health_frame(_wechat(), connected=True)
+    finally:
+        bridge_health.set_helper_snapshot(None)
+
+    # 探针自己给出的字段优先，绝不被模块快照覆盖。
+    assert frame["helper_version"] == "2026.11.17"
+    assert frame["helper_compat"] == "ok"
+    assert frame["helper_supported_versions"] == ["4.1.15.13"]
+
+
+def test_fallback_health_frame_has_unknown_helper_fields() -> None:
+    frame = bridge_main._fallback_health_frame(connected=False)
+
+    assert frame["helper_version"] == ""
+    assert frame["helper_compat"] == "unknown"
+    assert frame["helper_supported_versions"] == []
+    assert frame["helper_fingerprint_available"] is False
+
+
+async def test_probe_hook_health_records_helper_snapshot(monkeypatch) -> None:
+    body = json.dumps(
+        {
+            "helper_version": "2026.11.17",
+            "helper_compat": "ok",
+            "supported_versions": ["4.1.15.13"],
+        }
+    ).encode()
+    monkeypatch.setattr(
+        bridge_main, "urlopen", lambda url, timeout=None: _HealthResponse(body)
+    )
+
+    try:
+        ok = await bridge_main._probe_hook_health("http://127.0.0.1:9/health")
+        info = bridge_health.helper_info()
+    finally:
+        bridge_health.set_helper_snapshot(None)
+
+    assert ok is True
+    assert info["helper_version"] == "2026.11.17"
+    assert info["helper_compat"] == "ok"
+    assert info["helper_supported_versions"] == ["4.1.15.13"]
+    assert info["helper_fingerprint_available"] is False
+
+
+async def test_probe_hook_health_failure_resets_helper_snapshot(monkeypatch) -> None:
+    bridge_health.set_helper_snapshot(
+        {"helper_version": "2026.11.17", "helper_compat": "ok"}
+    )
+
+    def boom(url, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(bridge_main, "urlopen", boom)
+
+    try:
+        ok = await bridge_main._probe_hook_health("http://127.0.0.1:9/health")
+        info = bridge_health.helper_info()
+    finally:
+        bridge_health.set_helper_snapshot(None)
+
+    assert ok is False
+    assert info["helper_compat"] == "unknown"
+    assert info["helper_version"] == ""
+

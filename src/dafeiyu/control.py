@@ -1096,13 +1096,31 @@ class BrainControl:
                         # 微信适配器额外暴露登录态与桌面状态（含「桌面锁定是否
                         # 真会拦发送」）；QQ 没有这些属性，只按状态字典里真实存在
                         # 的键补，避免凭空造字段。
-                        for extra in ("logged_in", "desktop", "desktop_required"):
+                        for extra in (
+                            "logged_in",
+                            "desktop",
+                            "desktop_required",
+                            "helper_version",
+                            "helper_compat",
+                            "helper_fingerprint_available",
+                        ):
                             if extra in item:
-                                if extra == "desktop_required":
+                                if extra in (
+                                    "desktop_required",
+                                    "helper_fingerprint_available",
+                                ):
                                     # 告警规则按布尔值判断，这里强制收敛为 bool。
                                     entry[extra] = bool(item[extra])
                                 else:
                                     entry[extra] = item[extra]
+                        # 助手支持版本只在微信条目出现时透传，且只保留字符串项。
+                        raw_supported = item.get("helper_supported_versions")
+                        if isinstance(raw_supported, (list, tuple)):
+                            entry["helper_supported_versions"] = [
+                                version
+                                for version in raw_supported
+                                if isinstance(version, str)
+                            ]
                         reason = item.get("reason")
                         if isinstance(reason, str) and reason.strip():
                             entry["reason"] = reason.strip()

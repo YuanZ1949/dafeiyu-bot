@@ -208,6 +208,17 @@ class _BrokenInboundStatusAdapter(_RawStatusAdapter):
         raise RuntimeError("入站水位坏了")
 
 
+class _HelperStatusAdapter(_RawStatusAdapter):
+    """带助手兼容性属性的微信形态适配器（GAP-9 / GAP-15）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.helper_version = "2026.11.17"
+        self.helper_compat = "ok"
+        self.helper_supported_versions = ("4.1.15.13",)
+        self.helper_fingerprint_available = False
+
+
 def _service_with_adapters(tmp_path, adapters):
     store = Store(str(tmp_path / "t.db"))
     store.init_schema()
@@ -316,6 +327,29 @@ def test_channel_status_inbound_stats_error_keeps_other_fields(tmp_path):
 
     assert "inbound" not in status["wechat"]
     assert status["wechat"]["connected"] is True
+
+
+def test_channel_status_fallback_exposes_helper_compat(tmp_path):
+    service, _store = _service_with_adapters(
+        tmp_path,
+        {
+            "qq": _RawStatusAdapter(),
+            "wechat": _HelperStatusAdapter(),
+        },
+    )
+
+    status = service.channel_status()
+
+    assert status["wechat"]["helper_version"] == "2026.11.17"
+    assert status["wechat"]["helper_compat"] == "ok"
+    # 适配器存的是 tuple，快照统一成 list 便于 JSON 序列化。
+    assert status["wechat"]["helper_supported_versions"] == ["4.1.15.13"]
+    assert status["wechat"]["helper_fingerprint_available"] is False
+    # QQ 没有这些属性：不得凭空造字段。
+    assert "helper_version" not in status["qq"]
+    assert "helper_compat" not in status["qq"]
+    assert "helper_supported_versions" not in status["qq"]
+    assert "helper_fingerprint_available" not in status["qq"]
 
 
 
