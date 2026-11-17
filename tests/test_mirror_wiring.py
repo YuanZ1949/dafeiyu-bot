@@ -637,7 +637,9 @@ def _noop_materializers(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_materialize(msg, settings, annotate=True) -> None:
         return None
 
-    async def fake_attachments(msg, settings, decode=None, annotate=True) -> None:
+    async def fake_attachments(
+        msg, settings, decode=None, annotate=True, resolve_file=None
+    ) -> None:
         return None
 
     monkeypatch.setattr("dafeiyu.service.materialize", fake_materialize)
@@ -670,7 +672,9 @@ async def test_service_handle_enqueues_before_materialize(
     async def fake_materialize(msg, settings, annotate=True) -> None:
         order.append(("materialize", msg.message_id))
 
-    async def fake_attachments(msg, settings, decode=None, annotate=True) -> None:
+    async def fake_attachments(
+        msg, settings, decode=None, annotate=True, resolve_file=None
+    ) -> None:
         order.append(("materialize_attachments", msg.message_id))
 
     monkeypatch.setattr("dafeiyu.service.materialize", fake_materialize)
@@ -719,7 +723,9 @@ async def test_service_handle_ordering_text_image_text(
     async def blocking_materialize(msg, settings, annotate=True) -> None:
         await gate.wait()
 
-    async def fake_attachments(msg, settings, decode=None, annotate=True) -> None:
+    async def fake_attachments(
+        msg, settings, decode=None, annotate=True, resolve_file=None
+    ) -> None:
         return None
 
     monkeypatch.setattr("dafeiyu.service.materialize", blocking_materialize)
