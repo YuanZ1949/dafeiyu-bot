@@ -227,9 +227,11 @@ def _voice_target(directory: Path, source: str, data: bytes) -> Path:
 
 
 def _has_media_source(attachment: Attachment) -> bool:
-    """带本地路径的附件，或只有 http(s) 来源的语音/视频（QQ）。"""
+    """带本地路径的附件，或只有 http(s) 来源的语音/视频/文件（QQ）。"""
     if attachment.path:
         return True
+    if attachment.kind == "file":
+        return bool(_HTTP_RE.match((attachment.source or "").strip()))
     if attachment.kind not in ("voice", "record", "video", "image"):
         return False
     return bool(_HTTP_RE.match((attachment.source or "").strip()))
@@ -302,6 +304,72 @@ async def _download_image(
         )
         return None
     return data
+
+
+def _file_suffix_from_name(name: str) -> str:
+    """从文件名取扩展名：只留字母数字、去前导点、最多 10 位；认不出为空。"""
+    suffix = Path(name or "").suffix.lstrip(".")
+    cleaned = "".join(ch for ch in suffix if ch.isascii() and ch.isalnum())
+    cleaned = cleaned[:10].lower()
+    return f".{cleaned}" if cleaned else ""
+
+
+async def _materialize_file(
+    attachment: Attachment,
+    *,
+    root: Path,
+    settings: Settings,
+    fetch: FetchFn,
+) -> Path | None:
+    """把 QQ 文件（http(s) URL）下载到 ``files/``；失败/超限返回 ``None``。
+
+    与 ``images/`` 完全隔离：不降采样、不抽帧，只按原始字节落盘。
+    """
+    images_cfg = getattr(settings, "images", None)
+    timeout = float(getattr(images_cfg, "timeout_seconds", 8.0) or 8.0)
+    limit = int(getattr(images_cfg, "file_max_bytes", 0) or 0)
+    if limit <= 0:
+        limit = 50 * 1024 * 1024
+    source = (attachment.source or "").strip()
+    try:
+        data = await fetch(source, timeout, limit)
+    except Exception:
+        log.info("文件下载失败，保持占位：%s", attachment.name, exc_info=True)
+        return None
+    if not data or len(data) > limit:
+        log.info(
+            "文件大小不可接受（%d 字节，上限 %d），保持占位：%s",
+            len(data) if data else 0,
+            limit,
+            attachment.name,
+        )
+        return None
+    suffix = _sniff_ext(data) or _file_suffix_from_name(attachment.name)
+    files_dir = root / "files"
+    try:
+        files_dir.mkdir(parents=True, exist_ok=True)
+        _cleanup(files_dir, int(getattr(images_cfg, "retention_days", 0) or 0))
+        target = _target(files_dir, source, data, suffix)
+        await asyncio.to_thread(target.write_bytes, data)
+    except OSError:
+        log.info("文件写盘失败，保持占位：%s", attachment.name, exc_info=True)
+        return None
+    return target
+
+
+def _upsert_file_note(content: str, name: str, note: str) -> str:
+    """把文件注记写进 content：已有 ``[文件] <name>`` 行就原位替换，否则追加。
+
+    todo-9 的解析层已把文件消息渲染成 ``[文件] <name>`` 占位行；下载成功后
+    把那一行升级成带 ``files/`` 路径的注记，绝不出现两行。
+    """
+    prefix = f"{_FILE_PREFIX} {name}"
+    lines = content.split("\n") if content else []
+    for index, line in enumerate(lines):
+        if line.startswith(prefix):
+            lines[index] = note
+            return "\n".join(lines)
+    return f"{content}\n{note}" if content else note
 
 
 async def _materialize_voice(
@@ -859,6 +927,8 @@ async def materialize_attachments(
     decode: Decode | None = None,
     annotate: bool = True,
     fetch: FetchFn | None = None,
+    resolve_file: Callable[[Attachment, Message], Awaitable[Attachment | None]]
+    | None = None,
     keep_original: bool = False,
 ) -> int:
     """把附件物化进 workspace，返回成功写盘的图片数量。
@@ -871,6 +941,10 @@ async def materialize_attachments(
       时用 ffmpeg 抽帧到 ``images/``；URL 来源先下载到临时文件。
 
     ``decode`` 对微信 ``.dat`` 图片与表情缓存生效；``fetch`` 可注入下载函数。
+    ``resolve_file`` 把 QQ 文件（只有 file_id/busid，没有 URL）解析成带回链
+    URL 的附件：返回 ``None`` 就保留原占位；解析出的 URL 仍受
+    ``images.enabled`` + ``images.file_download`` 双重门控，下载上限是
+    ``images.file_max_bytes``，落盘到 ``files/``（与 ``images/`` 互不干扰）。
     ``keep_original`` 为真时图片落盘后不降采样（镜像直传原图）；默认 ``False``
     保持模型侧入站按 ``images.max_edge`` 缩小的旧行为。
     任何失败都保留原占位，绝不抛出。
@@ -893,7 +967,18 @@ async def materialize_attachments(
         if not path_enabled and not url_enabled:
             return 0
 
-        attachments = [item for item in msg.attachments if _has_media_source(item)]
+        attachments = [
+            item
+            for item in msg.attachments
+            if _has_media_source(item)
+            # 只有 file_id/busid 的 QQ 文件：有解析器时才进物化流程。
+            or (
+                item.kind == "file"
+                and resolve_file is not None
+                and bool(item.file_id)
+                and bool(item.busid)
+            )
+        ]
         if not attachments:
             return 0
 
@@ -903,6 +988,8 @@ async def materialize_attachments(
         prepared = False
         done = 0
         updated: list[Attachment] = []
+        # QQ 文件下载开关：与 images.enabled 一起构成双重门控。
+        file_download_enabled = bool(getattr(images_cfg, "file_download", True))
 
         for attachment in attachments:
             attachment_path = (attachment.path or "").strip()
@@ -930,13 +1017,62 @@ async def materialize_attachments(
                     continue
                 source = source_url
                 source_path = None
+            elif (
+                attachment.kind == "file"
+                and file_download_enabled
+                and resolve_file is not None
+            ):
+                # QQ 文件只有 file_id/busid：先向 OneBot 索回下载地址。
+                if not url_enabled:
+                    updated.append(attachment)
+                    continue
+                try:
+                    resolved = await resolve_file(attachment, msg)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.debug(
+                        "QQ 文件解析失败，保持占位：msg=%s",
+                        msg.message_id,
+                        exc_info=True,
+                    )
+                    resolved = None
+                if resolved is None or not _HTTP_RE.match(
+                    (resolved.source or "").strip()
+                ):
+                    updated.append(attachment)
+                    continue
+                attachment = resolved
+                source_url = (resolved.source or "").strip()
+                source = source_url
+                source_path = None
             else:
                 updated.append(attachment)
                 continue
 
             if attachment.kind == "file":
                 if source_path is None:
-                    updated.append(attachment)
+                    # URL 来源的 QQ 文件：受 images.enabled + file_download 门控。
+                    if not (url_enabled and file_download_enabled):
+                        updated.append(attachment)
+                        continue
+                    target = await _materialize_file(
+                        attachment, root=root, settings=settings, fetch=fetch_fn
+                    )
+                    if target is None:
+                        updated.append(attachment)
+                        continue
+                    name = attachment.name or target.name
+                    note = f"{_FILE_PREFIX} {name} (files/{target.name})"
+                    msg.content = _upsert_file_note(msg.content, name, note)
+                    try:
+                        size = target.stat().st_size
+                    except OSError:
+                        size = 0
+                    updated.append(
+                        replace(attachment, path=f"files/{target.name}", size=size)
+                    )
+                    done += 1
                     continue
                 note = _file_note(attachment)
                 if note not in msg.content:

@@ -283,6 +283,10 @@ class ImagesConfig:
     retention_days: int = 7
     #: 入站图片最长边上限；超过则用 ffmpeg 等比缩小。0 = 不降采样。
     max_edge: int = 1280
+    # QQ 文件下载开关（微信文件消息不走这里）。
+    file_download: bool = True
+    # QQ 文件下载大小上限（字节）：超过就保持 [文件] 占位，不落盘。
+    file_max_bytes: int = 50 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -1021,6 +1025,10 @@ def _build_images(raw: dict[str, Any]) -> ImagesConfig:
         ),
         max_edge=_non_negative_int(
             raw.get("max_edge"), "images.max_edge", 1280
+        ),
+        file_download=bool(raw.get("file_download", True)),
+        file_max_bytes=_positive_int(
+            raw.get("file_max_bytes"), "images.file_max_bytes", 50 * 1024 * 1024
         ),
     )
 

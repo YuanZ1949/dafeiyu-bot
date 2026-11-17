@@ -1013,6 +1013,68 @@ class Service:
         media = getattr(getattr(self.settings, "wechat", None), "media", None)
         return bool(getattr(media, "enabled", False))
 
+    def _qq_file_resolver(
+        self, msg: Message
+    ) -> Callable[[Attachment, Message], Awaitable[Attachment | None]] | None:
+        """QQ 文件物化用的 URL 解析器；非 QQ / ``file_download`` 关闭时 ``None``。
+
+        只做一次 OneBot 查询：群聊 ``get_group_file_url``，私聊
+        ``get_private_file_url``。任何失败都返回 ``None`` 绝不抛出；日志里
+        不出现 URL（查询串可能带票据）。
+        """
+        if channel_of(msg.chat_id) != "qq":
+            return None
+        if not bool(getattr(self.settings.images, "file_download", True)):
+            return None
+
+        async def resolve(
+            attachment: Attachment, message: Message
+        ) -> Attachment | None:
+            adapter = self.adapters.get("qq")
+            if adapter is None or not getattr(adapter, "connected", False):
+                return None
+            # call_action 是 QQ 适配器独有的通用动作入口：微信适配器没有。
+            call_action = cast(
+                "Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None",
+                getattr(adapter, "call_action", None),
+            )
+            if call_action is None:
+                return None
+            if not bool(getattr(self.settings.images, "enabled", False)):
+                return None
+            file_id = attachment.file_id
+            busid = attachment.busid
+            if not file_id or not busid:
+                return None
+            bare = message.chat_id.removeprefix(QQ_PREFIX)
+            try:
+                target_id = int(bare)
+                if message.chat_type is ChatType.GROUP:
+                    action = "get_group_file_url"
+                    params: dict[str, Any] = {
+                        "group_id": target_id,
+                        "file_id": file_id,
+                    }
+                else:
+                    action = "get_private_file_url"
+                    params = {"user_id": target_id, "file_id": file_id}
+                params["busid"] = int(busid) if busid.isdigit() else busid
+                data = await call_action(action, params)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug(
+                    "QQ 文件 URL 解析失败：msg=%s", message.message_id, exc_info=True
+                )
+                return None
+            url = str(data.get("url") or data.get("file") or "").strip()
+            if not url.startswith(("http://", "https://")):
+                log.debug("QQ 文件回执没有可用 URL：msg=%s", message.message_id)
+                return None
+            return replace(attachment, source=url)
+
+        return resolve
+
     def _media_key_resolver(self) -> Any:
         """懒建微信图片密钥解析器；未启用 / 导入失败时返回 ``None``。
 
@@ -1231,6 +1293,9 @@ class Service:
                 media_box = None
                 log.warning("镜像入队失败：%s", msg.message_id, exc_info=True)
         annotate = self._tools_enabled()
+        # QQ 文件（只有 file_id/busid）要先向 OneBot 索回 URL 才能下载；
+        # 非 QQ 通道或 file_download 关闭时保持 None，物化层只留 [文件] 占位。
+        resolve_file = self._qq_file_resolver(msg)
         # 图片物化必须在入库前：content 字符串是图片路径到达大脑的唯一载体。
         # materialize 内部永不抛异常，失败保持 [图片] 占位。
         # 没有 read 工具的大脑看不到图，路径字符串只是噪音：直接跳过物化。
@@ -1239,7 +1304,13 @@ class Service:
             # 微信图片解码依赖 read 工具；QQ 语音/视频的门控在 media 内部按来源判断，
             # 不能被 annotate 或 wechat.media.enabled 一起挡掉。
             decode = self._decode_wechat_dat if (annotate and self._wechat_media_enabled()) else None
-            await materialize_attachments(msg, self.settings, decode=decode, annotate=annotate)
+            await materialize_attachments(
+                msg,
+                self.settings,
+                decode=decode,
+                annotate=annotate,
+                resolve_file=resolve_file,
+            )
         finally:
             # 镜像 worker 在等这次回填；异常时也要放行，别让它白等满超时。
             if media_box is not None:

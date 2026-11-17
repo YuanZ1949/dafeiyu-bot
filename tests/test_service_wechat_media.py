@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 from dafeiyu.gateway.base import GatewayError
 from dafeiyu.gateway.wechat_bridge.media.aes import aes_ecb_encrypt
 from dafeiyu.gateway.wechat_bridge.media.keygen import MediaKey
-from dafeiyu.models import Attachment, ChatType
+from dafeiyu.models import Attachment, ChatType, Message
 from dafeiyu.service import Service
 
 SIGNATURE = b"\x07\x08V2\x08\x07"
@@ -406,3 +407,226 @@ async def test_wechat_file_fallback_failure_still_sends_text() -> None:
     assert result == "plain"
     assert disconnected.media_calls == [("file", "C:/ws/replies/a.mp4", "")]
     assert disconnected.sent == [(ChatType.GROUP, "wxg:abc123", "视频在这")]
+
+
+# ---- 入站 QQ 文件下载：file_id/busid -> OneBot 索回 URL -> files/ 落盘 -------
+class _QQFileAdapter:
+    """QQ 形态的假适配器：connected 恒真，call_action 回执可注入。"""
+
+    connected = True
+
+    def __init__(self, response: dict[str, object] | Exception | None = None) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self._response = response
+
+    async def call_action(
+        self, action: str, params: dict[str, object]
+    ) -> dict[str, object]:
+        self.calls.append((action, dict(params)))
+        if isinstance(self._response, Exception):
+            raise self._response
+        return dict(self._response or {})
+
+
+def _file_message(chat_id: str = "qq:123456") -> Message:
+    """todo-9 解析产物：content 只有一行 [文件] 占位，附件带定位信息。"""
+    return Message(
+        chat_type=ChatType.GROUP,
+        chat_id=chat_id,
+        user_id="654321",
+        nickname="tester",
+        content="[文件] report.pdf",
+        message_id="m-file-1",
+        attachments=[
+            Attachment(
+                kind="file",
+                name="report.pdf",
+                size=10,
+                file_id="f-123",
+                busid="456",
+            )
+        ],
+    )
+
+
+def _handle_service(
+    tmp_path: Path,
+    adapter: _QQFileAdapter,
+    *,
+    file_download: bool = True,
+    images_enabled: bool = True,
+    file_max_bytes: int = 50 * 1024 * 1024,
+) -> Service:
+    """只装 handle() 前半段需要的属性：物化后 add_message 立刻短路。"""
+    service = object.__new__(Service)
+    setattr(service, "mirror", None)
+    setattr(service, "brain", SimpleNamespace(supports_tools=False))
+    setattr(service, "workspace", None)
+    setattr(service, "adapters", {"qq": adapter})
+    setattr(
+        service,
+        "settings",
+        SimpleNamespace(
+            images=SimpleNamespace(
+                enabled=images_enabled,
+                max_bytes=10 * 1024 * 1024,
+                timeout_seconds=1.0,
+                retention_days=0,
+                max_edge=0,
+                file_download=file_download,
+                file_max_bytes=file_max_bytes,
+            ),
+            wechat=SimpleNamespace(
+                media=SimpleNamespace(enabled=False, max_bytes=0, storage_root="")
+            ),
+            workspace=SimpleNamespace(enabled=True, dir=str(tmp_path)),
+        ),
+    )
+    setattr(service, "store", SimpleNamespace(add_message=lambda msg: False))
+    return service
+
+
+async def test_qq_file_download_replaces_placeholder_once(tmp_path, monkeypatch) -> None:
+    """file_id/busid -> OneBot 索回 URL -> 落盘 files/，占位行原位替换且仅一行。"""
+    adapter = _QQFileAdapter({"url": "https://cdn.example.com/f.pdf?sig=ticket"})
+    service = _handle_service(tmp_path, adapter)
+    fetch_calls: list[tuple[str, float, int]] = []
+
+    async def fake_fetch(url: str, timeout: float, max_bytes: int) -> bytes:
+        fetch_calls.append((url, timeout, max_bytes))
+        return PNG
+
+    monkeypatch.setattr("dafeiyu.media._default_fetch", fake_fetch)
+    msg = _file_message()
+
+    await service.handle(msg)
+
+    assert adapter.calls == [
+        (
+            "get_group_file_url",
+            {"group_id": 123456, "file_id": "f-123", "busid": 456},
+        )
+    ]
+    assert len(fetch_calls) == 1
+    assert fetch_calls[0][0] == "https://cdn.example.com/f.pdf?sig=ticket"
+    assert fetch_calls[0][2] == 50 * 1024 * 1024
+    attachment = msg.attachments[0]
+    assert attachment.path.startswith("files/")
+    assert attachment.file_id == "f-123"
+    assert attachment.busid == "456"
+    assert attachment.name == "report.pdf"
+    assert attachment.size == len(PNG)
+    # todo-9 的 [文件] report.pdf 占位行被原位替换，不会出现第二行 [文件]。
+    assert msg.content == f"[文件] report.pdf (files/{Path(attachment.path).name})"
+    assert msg.content.count("[文件] report.pdf") == 1
+    # 落盘文件真实存在且字节一致（与 images/ 互不干扰）。
+    stored = tmp_path / attachment.path
+    assert stored.is_file() and stored.stat().st_size == len(PNG)
+
+
+async def test_qq_file_fetch_failure_keeps_placeholder(tmp_path, monkeypatch) -> None:
+    """下载抛异常：content 保持裸 [文件] 占位，附件不带路径，也绝不抛出。"""
+
+    async def failing_fetch(url: str, timeout: float, max_bytes: int) -> bytes:
+        raise RuntimeError("download broke")
+
+    monkeypatch.setattr("dafeiyu.media._default_fetch", failing_fetch)
+    adapter = _QQFileAdapter({"url": "https://cdn.example.com/f.pdf"})
+    msg = _file_message()
+
+    await _handle_service(tmp_path, adapter).handle(msg)
+
+    assert len(adapter.calls) == 1
+    assert msg.content == "[文件] report.pdf"
+    assert msg.attachments[0].path == ""
+    assert msg.attachments[0].file_id == "f-123"
+    assert not (tmp_path / "files").exists()
+
+
+async def test_qq_file_oversize_keeps_placeholder(tmp_path, monkeypatch) -> None:
+    """回包超过 file_max_bytes：保持占位，不落盘，不抛异常。"""
+
+    async def big_fetch(url: str, timeout: float, max_bytes: int) -> bytes:
+        return PNG * 4
+
+    monkeypatch.setattr("dafeiyu.media._default_fetch", big_fetch)
+    adapter = _QQFileAdapter({"url": "https://cdn.example.com/f.pdf"})
+    msg = _file_message()
+
+    await _handle_service(tmp_path, adapter, file_max_bytes=len(PNG) - 1).handle(msg)
+
+    assert msg.content == "[文件] report.pdf"
+    assert msg.attachments[0].path == ""
+    assert not (tmp_path / "files").exists()
+
+
+async def test_qq_file_download_disabled_never_resolves_or_fetches(
+    tmp_path, monkeypatch
+) -> None:
+    """file_download=false：解析器不被接线，OneBot 与 fetch 都不发生。"""
+    fetch_calls: list[str] = []
+
+    async def fake_fetch(url: str, timeout: float, max_bytes: int) -> bytes:
+        fetch_calls.append(url)
+        return PNG
+
+    monkeypatch.setattr("dafeiyu.media._default_fetch", fake_fetch)
+    adapter = _QQFileAdapter({"url": "https://cdn.example.com/f.pdf"})
+    msg = _file_message()
+
+    await _handle_service(tmp_path, adapter, file_download=False).handle(msg)
+
+    assert adapter.calls == []
+    assert fetch_calls == []
+    assert msg.content == "[文件] report.pdf"
+    assert msg.attachments[0].file_id == "f-123"
+    assert msg.attachments[0].busid == "456"
+
+
+async def test_non_qq_file_never_resolves_or_fetches(tmp_path, monkeypatch) -> None:
+    """非 QQ 通道不接解析器：即使附件带着 file_id/busid 也不下载。"""
+    fetch_calls: list[str] = []
+
+    async def fake_fetch(url: str, timeout: float, max_bytes: int) -> bytes:
+        fetch_calls.append(url)
+        return PNG
+
+    monkeypatch.setattr("dafeiyu.media._default_fetch", fake_fetch)
+    adapter = _QQFileAdapter({"url": "https://cdn.example.com/f.pdf"})
+    msg = _file_message(chat_id="wxg:888")
+
+    await _handle_service(tmp_path, adapter).handle(msg)
+
+    assert adapter.calls == []
+    assert fetch_calls == []
+    assert msg.content == "[文件] report.pdf"
+    assert msg.attachments[0].path == ""
+
+
+async def test_qq_file_resolver_none_keeps_metadata(tmp_path, monkeypatch) -> None:
+    """解析器返回 None（回执无 url）：附件元数据原样保留，绝不下载。"""
+    fetch_calls: list[str] = []
+
+    async def fake_fetch(url: str, timeout: float, max_bytes: int) -> bytes:
+        fetch_calls.append(url)
+        return PNG
+
+    monkeypatch.setattr("dafeiyu.media._default_fetch", fake_fetch)
+    adapter = _QQFileAdapter({})
+    msg = _file_message()
+
+    await _handle_service(tmp_path, adapter).handle(msg)
+
+    assert adapter.calls == [
+        (
+            "get_group_file_url",
+            {"group_id": 123456, "file_id": "f-123", "busid": 456},
+        )
+    ]
+    assert fetch_calls == []
+    attachment = msg.attachments[0]
+    assert attachment.file_id == "f-123"
+    assert attachment.busid == "456"
+    assert attachment.name == "report.pdf"
+    assert attachment.path == ""
+    assert msg.content == "[文件] report.pdf"

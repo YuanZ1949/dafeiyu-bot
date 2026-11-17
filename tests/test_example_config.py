@@ -49,6 +49,30 @@ def test_example_config_images_max_edge(tmp_path, monkeypatch):
     assert settings.images.max_edge == 1280
 
 
+def test_example_config_images_file_download_defaults(tmp_path, monkeypatch):
+    """QQ 文件下载默认开启，上限 50 MB（模板里两键与代码默认一致）。"""
+    settings = _load_example(tmp_path, monkeypatch)
+
+    assert settings.images.file_download is True
+    assert settings.images.file_max_bytes == 50 * 1024 * 1024
+
+
+def test_images_file_max_bytes_explicit_value_honored(tmp_path, monkeypatch):
+    """显式配置 images.file_max_bytes 必须生效（非负校验走 _positive_int）。"""
+    monkeypatch.chdir(tmp_path)
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["images"]["file_max_bytes"] = 1024
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text("BOT_QQ=10001\n", encoding="utf-8")
+
+    settings = load_settings(env_file=env_file, config_file=config)
+
+    assert settings.images.file_max_bytes == 1024
+    assert settings.images.file_download is True
+
+
 def test_example_config_media_and_observer_default_off(tmp_path, monkeypatch):
     """新增的媒体/观察者开关在模板里必须显式关闭（软回滚前提）。"""
     settings = _load_example(tmp_path, monkeypatch)
