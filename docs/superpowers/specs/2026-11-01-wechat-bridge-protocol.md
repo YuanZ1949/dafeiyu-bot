@@ -16,14 +16,14 @@
 
 ## 2. 事件信封 event（桥 → 主进程）
 
-`type` 四选一：`"message"`（普通消息）、`"recall"`（撤回）、`"health"`（健康快照，字段见 §5，另行成节）、`"resync"`（桥重启/失联恢复后要求主进程重放会话）。v2 增量追加第五类 `"notice"`（非撤回群/好友事件，见 §10.4）。
+`type` 五选一：`"message"`（普通消息）、`"recall"`（撤回）、`"health"`（健康快照，字段见 §5，另行成节）、`"resync"`（桥重启/失联恢复后要求主进程重放会话）、`"notice"`（v2 增量的非撤回群/好友事件，见 §10.4）。
 
 ### 2.1 字段表
 
 | 字段 | 类型 | 必填 | 含义 | 缺失时下游会坏在哪 |
 | --- | --- | --- | --- | --- |
 | `v` | int | 是 | 协议版本，v1 恒为 `1` | 主进程无法判定兼容性；未知大版本必须拒绝连接并告警 |
-| `type` | string 枚举 `"message"\|"recall"\|"health"\|"resync"` | 是 | 信封种类 | 主进程按 `type` 分发解析路径，缺了整条消息只能丢弃并告警 |
+| `type` | string 枚举 `"message"\|"recall"\|"health"\|"resync"\|"notice"` | 是 | 信封种类（`notice` 为 v2 增量的非撤回群/好友事件，字段见 §10.4） | 主进程按 `type` 分发解析路径，缺了整条消息只能丢弃并告警 |
 | `channel` | string 恒 `"wechat"` | 是 | 通道标识；主进程按它选 adapter | 主进程只能按连接猜通道；多桥并存时路由错串 |
 | `chat_type` | string 枚举 `"group"\|"private"` | 是 | 群聊或私聊；与 `models.ChatType` 对齐 | 会话落库时 `ChatType` 无法取值；群/私聊差异逻辑（@判定、静默策略）全废 |
 | `chat_id` | string `"wxg:<alias>"` | 是 | 会话稳定内部键（别名，见 §2.2） | `models.chat_id` 前缀派生 `channel` 直接抛 `ValueError`；消息无法入库，记忆/摘要都指向不存在会话 |
@@ -101,6 +101,8 @@
 | `queue_depth` | int | 是 | 桥内待处理指令数 | 积压不被看见，主进程会继续加塞，最后整个发送链路僵死 |
 | `last_event_at` | int \| null | 是（未收到过事件时为 `null`） | 最近一次事件时间戳（unix 秒） | 主进程无法判「桥是不是死了」，电话拨号式重连不会触发 |
 | `last_send_at` | int \| null | 是（未发送过时为 `null`） | 最近一次成功发送时间戳（unix 秒） | 「别名失效」与「根本连不上」无法区分，resync 不会适时触发 |
+
+v2 增量：health 帧另带四个自 hook `/health` 透传的 helper 兼容性字段（`helper_version` 等，均为 additive），见 §10.5。
 
 ## 6. 版本与向后兼容规则
 
@@ -309,20 +311,34 @@ text, image, voice, video, file, sticker, card, location, call, link, quote, rec
 | 字段 | 类型 | 必填 | 含义 |
 | --- | --- | --- | --- |
 | `v` / `type` / `channel` | 同 §2.1 | 是 | `type` 恒 `"notice"` |
-| `kind` | string | 是（非空） | 事件种类，如 `group_increase` / `group_decrease` / `group_ban` / `group_poke` / `friend_poke`；空或缺失 → 坏帧 |
-| `chat_id` | string `"wxg:<alias>"` | 是 | 事件所属会话；缺前缀或缺失 → 坏帧 |
-| `chat_type` | string 枚举 `"group"\|"private"` | 是 | 与 `models.ChatType` 对齐；未知值 → 坏帧 |
+| `kind` | string | 是（非空） | 事件种类，如 `group_increase` / `group_decrease` / `group_ban` / `group_poke` / `friend_poke` / `friend_request`；空或缺失 → 坏帧 |
+| `chat_id` | string `"wxg:<alias>"` | 是 | 事件所属会话（群事件即群别名）；缺前缀或缺失 → 坏帧。**例外**：`friend_request` 恒为 `"wxg:fmessage"`（好友申请不属于任何群会话的虚拟键） |
+| `chat_type` | string 枚举 `"group"\|"private"` | 是 | 与 `models.ChatType` 对齐；未知值 → 坏帧。`friend_request` 恒 `"private"` |
 | `user_id` | string `"wxg:<alias>"` | 否 | 事件主体（进/退群者、被戳者、被禁言者） |
 | `operator_id` | string `"wxg:<alias>"` | 否 | 操作者/发起者 |
 | `sub_type` | string | 否 | 细分类型，透传 |
 | `duration` | int | 否 | 禁言时长（秒）；负值按 0 处理 |
-| `nickname` | string | 否 | 申请类事件里申请者的昵称 |
-| `comment` | string | 否 | 申请类事件的验证消息 |
-| `event_id` | string | 否 | 申请类事件的响应定位符（同 QQ 的 flag） |
+| `nickname` | string | 否 | 申请类事件（`friend_request`）里申请者的昵称 |
+| `comment` | string | 否 | `friend_request` 的验证消息文本。**只准放验证文本本身**——绝不携带原始 XML、ticket、encryptusername 等任何协议凭据 |
+| `event_id` | string | 否 | 事件稳定定位符（同 QQ 的 flag）：群系统事件为 `wechat:sys:<local_id>`、好友申请为 `fmessage:<local_id>`（`local_id` 是桥数据库里的行号）；主进程只许比对相等，不许解析 |
 
 seq/ack 语义与 `recall` **完全一致**（P3-10/P3-11）：
 
 - 桥端 `broadcast` 对 `message`/`recall`/`notice` 一视同仁地发号 `seq` 并进未确认缓冲；
 - 客户端 `dispatch_envelope` 收到 `notice`：先记 `last_seq` 高水位；坏帧（缺 `chat_id`/`kind`、`chat_type` 未知）当场 ack 消化；有 handler 且注册了就调用（与 `recall` 一样经 `_schedule_inbound` 转后台任务，不阻塞收帧循环），**handler 成功后才 ack**；没注册 handler 也 ack；handler 抛异常绝不 ack，帧留在桥的未确认缓冲等重投，异常由后台任务记日志、绝不拆掉连接；
 - `notice` 只转成 `NoticeEvent`（仅用于日志与后续接入），**绝不**按 `message` 处理、不触发模型回复、不进批次调度。
+- **`friend_request` 绝不会被自动接受**：桥只上报通知（`nickname` / `comment` / `event_id`），绝不在桥侧替用户点「接受/添加好友」；当前实现只把该事件转成 `NoticeEvent` 记日志，接受与否由人工在微信里决定，`event_id` 留作后续接入时的响应定位符。
+
+### 10.5 health 帧新增字段（hook `/health` 透传）
+
+桥侧 `wechat_bridge.health.set_helper_snapshot` 缓存 hook `/health` 的兼容性快照（畸形/缺失载荷一律回落默认值），并把以下四个字段**原样透传**进 health 帧：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `helper_version` | string | helper 当前版本号；hook 未报或无法解析时为 `""` |
+| `helper_compat` | string 枚举 `"ok"\|"unsupported"\|"unknown"` | helper 与当前微信版本的兼容判定；默认 `"unknown"` |
+| `helper_supported_versions` | list[str] | helper 声明支持的微信版本列表；无有效项时为 `[]` |
+| `helper_fingerprint_available` | bool | **恒为 `false`**——helper 不暴露指纹，任何快照/帧都不许把它写成 `true` |
+
+这四个字段是 **additive**：旧对端按 §6 规则 2 忽略未知字段即可，线协议 `v` 仍为 `1`。当前唯一的消费方是 supervisor 告警：`helper_compat` 为 `"unsupported"` 或 `"unknown"` 时发 `wechat_helper_compat`（warning，正文附 `helper_supported_versions`；`"ok"` 时不告警）。
 

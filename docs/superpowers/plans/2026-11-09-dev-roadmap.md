@@ -456,7 +456,9 @@ Job succeeded  (EXEC_EXIT_CODE=0)
 
 ---
 
-### P3-4 微信 helper 版本不匹配告警
+### P3-4 微信 helper 版本不匹配告警（已完成：hook /health 字段透传 + supervisor 告警）
+
+> 状态：**已完成**（2026-11-17）。hook `/health` 的兼容性快照由 `wechat_bridge.health.set_helper_snapshot` 缓存并透传进 health 帧四个 additive 字段：`helper_version`（未知为 `""`）、`helper_compat`（`ok` / `unsupported` / `unknown`，默认 `unknown`）、`helper_supported_versions`（list[str]）、`helper_fingerprint_available`（**恒 `false`**，helper 不暴露指纹）；字段冻结见协议规范 §10.5。`supervisor/alerts.py` 在 `helper_compat` 为 `unsupported` / `unknown` 时发 `wechat_helper_compat` 告警（warning，正文附支持版本列表；`ok` 时安静）。原验收「人为改指纹后告警」作废：helper 实际不暴露指纹，不匹配检测走 `helper_compat` 版本判定而非指纹。
 
 **现状**：helper 用 `Weixin.dll` size + SHA-256 指纹（`helper/native/compatibility.json`）；版本不匹配时目前靠日志/健康帧。
 
