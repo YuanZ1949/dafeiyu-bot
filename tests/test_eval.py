@@ -661,7 +661,7 @@ def test_record_does_not_call_model(
 # ---- T10: 链接解析 / 消息泡 / 批次头部 -------------------------------------
 
 #: 他人转发「顺路」的线上形态；字体无关的左锚气泡（与 test_mirror 同串）。
-WIRE_SHUNLU = "╭ 阿鱼：顺路\n╰"
+WIRE_SHUNLU = "╭ 阿鱼\n│ 顺路\n╰"
 
 #: T10 新增的回归 case：链接三态、批次头部三要素、气泡两态。
 NEW_CASE_IDS = frozenset(
@@ -713,7 +713,8 @@ def test_loader_reads_links_and_evidence_expectations(tmp_path):
       nickname: 阿鱼
       content: 顺路
       wire: |
-        ╭ 阿鱼：顺路
+        ╭ 阿鱼
+        │ 顺路
         ╰
 """,
     )
@@ -785,7 +786,9 @@ def test_check_evidence_bubble_passes_for_shipped_render():
 
 
 def test_check_evidence_bubble_detects_width_drift(monkeypatch):
-    case = evidence_case(bubble=EvalBubble("阿鱼", "顺路", WIRE_SHUNLU))
+    # 正文 8 列：宽度收到 6 列后必然换行，与按 30 列产出的期望气泡不一致。
+    wire = "╭ 阿鱼\n│ 今天顺路\n╰"
+    case = evidence_case(bubble=EvalBubble("阿鱼", "今天顺路", wire))
     monkeypatch.setattr(eval_checks, "BUBBLE_WIDTH", 6)
     check = evidence_checks(case, "提示词")["evidence"]
     assert not check.passed

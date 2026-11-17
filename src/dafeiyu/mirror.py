@@ -1493,6 +1493,9 @@ class MirrorRouter:
         """把一个镜像条目一次性算出两套形态：线上气泡与入库单行。
 
         ``store`` 与历史版本逐字节一致（``昵称：正文``，bot 无前缀）。
+        ``wire`` 把昵称**单独放在第一行**（``昵称\\n正文``）：网关把整段文本当
+        一条气泡，昵称挤在正文前面会让长消息读起来像没有换行。``：`` 与换行
+        都是一个字符，所以按 ``MAX_CHUNK`` 切出来的每块长度与入库形态一致。
         ``wire`` 只在「别人转来的 + bubble_enabled」时套**一个**完整气泡：
         一条消息 = 一个气泡，绝不把一条长消息拆成多条。只有整段套框后超过
         ``WIRE_MAX_CHARS``（平台单条保守上限）才退回按 ``MAX_CHUNK`` 分块，
@@ -1511,14 +1514,20 @@ class MirrorRouter:
             body = f"{item.reply_hint} {body}" if body else item.reply_hint
         if not body.strip():
             return RenderedLines([], [])
-        prefix = "" if item.is_bot else f"{self._display_nickname(item)}："
-        full = f"{prefix}{body}" if prefix else body
+        # 昵称单独占第一行（线上形态）；入库形态保持 ``昵称：正文`` 的历史契约。
+        nick = "" if item.is_bot else self._display_nickname(item)
+        full = f"{nick}：{body}" if nick else body
+        wire_full = f"{nick}\n{body}" if nick else body
         if not full.strip():
             return RenderedLines([], [])
         if item.is_bot or not self.settings.mirror.bubble_enabled:
             chunks = _split(full, MAX_CHUNK)
-            return RenderedLines(list(chunks), list(chunks))
-        boxed = self._bubble(full)
+            wire_chunks = [
+                chunk.replace(f"{nick}：", f"{nick}\n", 1) if nick and index == 0 else chunk
+                for index, chunk in enumerate(chunks)
+            ]
+            return RenderedLines(wire_chunks, list(chunks))
+        boxed = self._bubble(wire_full)
         if len(boxed) <= WIRE_MAX_CHARS:
             return RenderedLines([boxed], [full])
         # 只有超过平台单条保守上限才拆：此时宁可分成几条带框消息，
@@ -1531,9 +1540,12 @@ class MirrorRouter:
         )
         chunks = _split(full, MAX_CHUNK)
         wire: list[str] = []
-        for chunk in chunks:
-            chunk_boxed = self._bubble(chunk)
-            wire.append(chunk if len(chunk_boxed) > WIRE_MAX_CHARS else chunk_boxed)
+        for index, chunk in enumerate(chunks):
+            wire_text = (
+                chunk.replace(f"{nick}：", f"{nick}\n", 1) if nick and index == 0 else chunk
+            )
+            chunk_boxed = self._bubble(wire_text)
+            wire.append(wire_text if len(chunk_boxed) > WIRE_MAX_CHARS else chunk_boxed)
         return RenderedLines(wire, list(chunks))
 
     def _bubble(self, text: str) -> str:

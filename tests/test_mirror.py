@@ -38,16 +38,16 @@ WXG = "wxg:group"
 
 # 他人转发消息的线上形态（wire）：字体无关的左锚气泡（首行 `╭ 正文`、末行 `╰`）。
 # 期望串全部硬编码，不靠被测实现生成。
-WIRE_SHUNLU = "╭ 阿鱼：顺路\n╰"
-WIRE_YI = "╭ 阿鱼：一\n╰"
-WIRE_SAN = "╭ 阿鱼：三\n╰"
-WIRE_YIDUI = "╭ 阿鱼：一对\n╰"
-WIRE_ERDUI = "╭ 阿鱼：二对\n╰"
-WIRE_XINNIANCHENG = "╭ 新昵称：换群\n╰"
-WIRE_XINDUI = "╭ 阿鱼：新对\n╰"
-WIRE_DIER = "╭ 阿鱼：第二\n╰"
-WIRE_VIDEO = "╭ 阿鱼：[视频]\n╰"
-WIRE_IMAGE = "╭ 阿鱼：[图片]\n╰"
+WIRE_SHUNLU = "╭ 阿鱼\n│ 顺路\n╰"
+WIRE_YI = "╭ 阿鱼\n│ 一\n╰"
+WIRE_SAN = "╭ 阿鱼\n│ 三\n╰"
+WIRE_YIDUI = "╭ 阿鱼\n│ 一对\n╰"
+WIRE_ERDUI = "╭ 阿鱼\n│ 二对\n╰"
+WIRE_XINNIANCHENG = "╭ 新昵称\n│ 换群\n╰"
+WIRE_XINDUI = "╭ 阿鱼\n│ 新对\n╰"
+WIRE_DIER = "╭ 阿鱼\n│ 第二\n╰"
+WIRE_VIDEO = "╭ 阿鱼\n│ [视频]\n╰"
+WIRE_IMAGE = "╭ 阿鱼\n│ [图片]\n╰"
 
 
 class Recorder:
@@ -217,7 +217,7 @@ def test_render_wechat_link_card_keeps_title(tmp_path: Path) -> None:
     assert len(wire) == 1
     lines = wire[0].splitlines()
     bodies = [lines[0][2:]] + [line[2:] for line in lines[1:-1]]
-    assert "".join(bodies) == "阿鱼：" + title
+    assert "".join(bodies) == "阿鱼" + title
     assert "[link]" not in wire[0]
     assert "[链接]" not in wire[0]
 
@@ -531,13 +531,14 @@ def test_render_long_text_store_is_single_line(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------- 消息泡
 def test_wire_bubble_shape_for_human(tmp_path: Path) -> None:
-    """别人转来的消息线上是左锚气泡；入库仍是单行（store 零变化）。"""
+    """别人转来的消息线上是左锚气泡（昵称独占第一行）；入库仍是单行（store 零变化）。"""
     router, _store, _adapters = make_router(tmp_path)
     wire = render_wire(router, make_msg(QQ, "你好"))
     lines = wire[0].splitlines()
-    assert lines[0] == "╭ 阿鱼：你好"
+    assert lines[0] == "╭ 阿鱼"
+    assert lines[1] == "│ 你好"
     assert lines[-1] == "╰"
-    assert wire == ["╭ 阿鱼：你好\n╰"]
+    assert wire == ["╭ 阿鱼\n│ 你好\n╰"]
     # 入库基线（改动前硬编码）：单行「昵称：正文」。
     assert render(router, make_msg(QQ, "你好")) == ["阿鱼：你好"]
 
@@ -568,7 +569,7 @@ def test_wire_bubble_wraps_by_display_width(tmp_path: Path) -> None:
     assert len(lines) > 2
     bodies = [lines[0][2:]] + [line[2:] for line in lines[1:-1]]
     assert all(display_width(body) <= 30 for body in bodies)
-    assert "".join(bodies) == "阿鱼：" + content
+    assert "".join(bodies) == "阿鱼" + content
 
 
 def test_wire_bubble_only_drops_invisible_break_spaces(tmp_path: Path) -> None:
@@ -583,7 +584,7 @@ def test_wire_bubble_only_drops_invisible_break_spaces(tmp_path: Path) -> None:
     assert len(rendered.wire) == 1
     lines = rendered.wire[0].splitlines()
     joined = "".join([lines[0][2:]] + [line[2:] for line in lines[1:-1]])
-    assert joined.replace(" ", "") == ("阿鱼：" + content).replace(" ", "")
+    assert joined.replace(" ", "") == ("阿鱼" + content).replace(" ", "")
     assert all(line == line.rstrip() for line in lines)
     # 入库形态一个字符都不少。
     assert rendered.store == ["阿鱼：" + content]
@@ -615,8 +616,8 @@ def test_wire_bubble_never_names_the_platform(tmp_path: Path) -> None:
     assert "微信" not in joined
 
 
-def test_bubble_disabled_makes_wire_equal_store(tmp_path: Path) -> None:
-    """bubble_enabled=false 时完全退化为今天的形态。"""
+def test_bubble_disabled_keeps_nickname_on_its_own_line(tmp_path: Path) -> None:
+    """bubble_enabled=false 时不套框，但昵称仍独占第一行（store 保持单行契约）。"""
     settings = dataclasses.replace(
         make_settings(),
         mirror=MirrorConfig(
@@ -633,7 +634,8 @@ def test_bubble_disabled_makes_wire_equal_store(tmp_path: Path) -> None:
         {"qq": Recorder("qq:999"), "wechat": Recorder("wxg:self")},
     )
     rendered = router._render(router._snapshot(make_msg(QQ, "你好"), WXG, "qq"))
-    assert rendered.wire == rendered.store == ["阿鱼：你好"]
+    assert rendered.wire == ["阿鱼\n你好"]
+    assert rendered.store == ["阿鱼：你好"]
 
 
 def test_long_text_is_one_bubble_not_many(tmp_path: Path) -> None:
@@ -645,11 +647,12 @@ def test_long_text_is_one_bubble_not_many(tmp_path: Path) -> None:
     assert len(rendered.wire) == len(rendered.store) == 1
     assert rendered.store == ["阿鱼：" + body]
     lines = rendered.wire[0].splitlines()
-    assert lines[0].startswith("╭ 阿鱼：")
+    assert lines[0] == "╭ 阿鱼"
+    assert lines[1].startswith("│ ")
     assert lines[-1] == "╰"
     assert all(line.startswith("│ ") for line in lines[1:-1])
     bodies = [lines[0][2:]] + [line[2:] for line in lines[1:-1]]
-    assert "".join(bodies) == "阿鱼：" + body
+    assert "".join(bodies) == "阿鱼" + body
     assert len(rendered.wire[0]) <= mirror_module.WIRE_MAX_CHARS
 
 

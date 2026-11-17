@@ -595,12 +595,12 @@ WXG_CHAT = "wxg:group"
 
 
 # 他人转发消息的线上形态（wire）：字体无关的左锚气泡，期望串硬编码。
-WIRE_TEXT = "╭ 阿鱼：你好\n╰"
-WIRE_IMAGE = "╭ 阿鱼：[图片]\n╰"
-WIRE_VIDEO = "╭ 阿鱼：[视频]\n╰"
-WIRE_STICKER = "╭ 阿鱼：[表情]\n╰"
-WIRE_VOICE = "╭ 阿鱼：[语音]\n╰"
-WIRE_FILE = "╭ 阿鱼：[文件] doc.pdf\n╰"
+WIRE_TEXT = "╭ 阿鱼\n│ 你好\n╰"
+WIRE_IMAGE = "╭ 阿鱼\n│ [图片]\n╰"
+WIRE_VIDEO = "╭ 阿鱼\n│ [视频]\n╰"
+WIRE_STICKER = "╭ 阿鱼\n│ [表情]\n╰"
+WIRE_VOICE = "╭ 阿鱼\n│ [语音]\n╰"
+WIRE_FILE = "╭ 阿鱼\n│ [文件] doc.pdf\n╰"
 
 
 def make_router_settings(tmp_path: Path) -> Settings:
@@ -965,8 +965,8 @@ async def test_wechat_to_qq_video_builds_video_segment(tmp_path: Path) -> None:
         {"type": "video", "data": {"file": str(path.resolve())}}
     ]
     texts = [seg["data"]["text"] for seg in segments if seg.get("type") == "text"]
-    # 线上是完整气泡：占位文本必须仍可读地出现在框内。
-    assert any("阿鱼：[视频]" in text for text in texts)
+    # 线上是完整气泡：昵称单独一行，占位文本必须仍可读地出现在框内。
+    assert any("阿鱼\n│ [视频]" in text for text in texts)
 
 
 async def test_wechat_to_qq_file_uses_upload_file(tmp_path: Path) -> None:
