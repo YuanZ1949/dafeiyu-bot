@@ -17,7 +17,7 @@
 | 图片 | 支持（`images.enabled` 时落盘并把路径写进正文；失败保留 `[图片]`） | 支持（`gateway.wechat.media.enabled` 时解密落盘给路径；否则占位） | 支持（`send_segments` 的 image 段） | 支持（hook 后端经 `send_media`；UIA 后端对 image 同样恒 `unsupported_media`，正文照发） |
 | 语音 | 支持（`speech.enabled` 且 URL 下载由 `images.enabled` 门控时落盘 `voices/` 并转写，正文变 `[语音]（转写：…）`；依赖缺失、超时、解码失败保留 `[语音]` 占位） | 支持（`speech.enabled` 与 `gateway.wechat.media.enabled` 都打开时读取本地文件落盘并转写；否则占位） | 支持（`send_segments` 的 record 段，kind 为 `record`/`voice`） | 支持（hook 后端 `send_media` kind=voice；UIA 不支持） |
 | 视频 | 支持（`images.enabled` 时下载 URL 原文件到 `videos/`，`annotate` 为真时用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`gateway.wechat.media.enabled` 时复制原文件到 `videos/`，并用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`send_segments` 的 video 段，路径同样受 `replies/` 与后缀白名单约束） | 不支持（没有视频发送原语：hook 后端把视频附件降级成 `send_media` 的 `kind=file` 发原文件，对端当文件收；UIA 后端不支持视频，正文照发） |
-| 文件 | `images.enabled` + `images.file_download` 都开时经 OneBot `get_group_file_url` / `get_private_file_url` 解析下载 URL，下载到 `files/`（受 `images.file_max_bytes` 上限）；成功后正文变 `[文件] 名字 (files/...)`、附件带本地路径。关闭、超限或失败保留 `[文件] 名字` 占位与元数据，不抛异常 | appmsg type 6 解析成 `kind=file` 附件（名字/大小元数据），正文保留 `[文件] 名字` 占位；**不下载、没有路径** | 支持（`upload_file`，模型附件 `kind=file`） | 支持（hook 后端：模型附件 `kind=file` 经 `upload_file` → `send_media` 的 `kind=file`；桥回 `unsupported_media` 时附件跳过、正文照发。UIA 后端仍不支持） |
+| 文件 | `images.enabled` + `images.file_download` 都开时经 OneBot `get_group_file_url` / `get_private_file_url` 解析下载 URL，下载到 `files/`（受 `images.file_max_bytes` 上限）；成功后正文变 `[文件] 名字 (files/...)`、附件带本地路径。关闭、超限或失败保留 `[文件] 名字` 占位与元数据，不抛异常 | appmsg type 6 解析成 `kind=file` 附件（只有名字：附件 `name` 就是 `[文件] 名字` 全文，没有独立的大小字段），正文保留 `[文件] 名字` 占位；**不下载、没有路径** | 支持（`upload_file`，模型附件 `kind=file`） | 支持（hook 后端：模型附件 `kind=file` 经 `upload_file` → `send_media` 的 `kind=file`；桥回 `unsupported_media` 时附件跳过、正文照发。UIA 后端仍不支持） |
 | 表情 / 贴纸 | 占位但带标识（`face` 在 QQ 内置表情表内时显示名称 `[表情:<名称>]`，表外保留数字 id `[表情:<数字 id>]`；`mface` → `[表情:<摘要>]`，缺失时回退 `[表情]`；同时记录 sticker 名字/id） | 占位但带标识（`[表情:<desc>]`；`desc` 是 base64 protobuf 时解出中文名，无名字用 `[表情:<md5 前 8>]`，解析失败回退 `[表情]`）；贴纸图片在 `gateway.wechat.media.enabled` 时按图片落盘（缓存未命中则用 `cdnurl` 下载），模型可 `read` 查看；两者都拿不到时正文追加 `（未缓存）` | 支持（模型附件 `type=sticker`：`name` 可用**名称**（按内置表情表反查，如 `微笑`）或**数字 id**（1–6 位非 0）出 `face` 段；两者都未命中的文本出 `mface` 摘要段，mface 只有 summary，属 best-effort——缺 url/key/emoji_id 字段） | 支持（桥白名单接受 `sticker`，hook 后端把它映射到 `send_emoticon`：`path` 必须指向真实 GIF（GIF 头校验、≤1 MiB、≤1024px），非 GIF/超限被 hook 侧回 `hook_rejected` 时自动降级为图片再发；无 `path` 跳过实图发送、正文照发）。UIA 后端不支持任何媒体 |
 | @ | 支持（正文保留 `@名字`，并标记 `at_bot`） | 支持（正文保留原文，并标记 `at_bot`） | 支持（at 段；名字必须在本批次在场成员里，最多 3 个） | 支持（hook 后端 `send_at`；UIA 返回 `unsupported_at`，回落纯文本） |
 | 合并转发 | 支持（递归渲染成「昵称: 内容」文本，深度/节点数有上限，超限占位） | 占位（appmsg `type 19` 渲染为 `[合并转发] <title>`，无标题时仅 `[合并转发]`；不展开聊天记录，`kind` 仍是 `link`） | 支持（模型附件 `type=forward`，`nodes` 最多 5 条、单条 200 字；失败降级为一行占位文本） | 不支持（无转发发送原语；附件降级为正文末尾一行 `[合并转发 N 条]`，见下文） |
@@ -32,7 +32,7 @@
 - QQ 入站未知消息段一律忽略，不影响同一条消息的其余部分。
 - `Attachment` 与 `segments` 只在内存中流转，**不入库**；`messages.content` 仍是唯一持久载体。重启后只有正文里的占位/路径还在。
 - **好友 / 加群申请的通知规则（QQ 与微信共通）**：申请只记日志，并转发给 `groups.admins` 的第一个条目——`wxg:` 前缀走微信、纯数字走 QQ（多条目时取排序后的第一个）；名单为空时只记日志、不通知。**申请永远不会被自动通过**，也没有单独的开关配置：复用 `groups.admins`，不新增键。
-- **微信撤回**：只在本地库出现真实撤回行（`revokemsg`）时发 `recall` 帧，并经持久化的 `server_id → message_id` 映射对回 bot 侧消息 id；不从快照 diff 伪造撤回，映射不上的行只记日志、不发帧。
+- **微信撤回**：只在本地库出现真实撤回行（`revokemsg`）时发 `recall` 帧，并经持久化的 `server_id → message_id` 映射对回 bot 侧消息 id；不从快照 diff 伪造撤回，映射不上的行仍会发 `recall` 帧，`message_id` 回合成 `wechat:<newmsgid>`，并记一次 DEBUG 日志。
 
 ## 安全边界
 
@@ -109,7 +109,7 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 - GIF 入站图片的抽帧会先**本地数帧**（解析 GIF 块结构，不依赖 ffmpeg）：`<= 2` 帧按静图处理，只在候选帧里保留体积最大的一张，注记写 `[图片]（图存 images/...，可用 read 查看；原文件 ...）` 而不是「动图」；`> 2` 帧仍按 `0/8/24` 抽帧并注记「动图，已抽帧」。帧数解析失败（坏数据）沿用旧策略。
 - 微信/QQ 共用的图片目录按 `images.retention_days` 惰性清理：`> 0` 时在每次物化前删掉超期文件，`0` = 不清理。
 - QQ 文件：`images.enabled` + `images.file_download` 都开时，经 OneBot `get_group_file_url` / `get_private_file_url` 解析下载 URL，下载到 `<workspace.dir>/files/<时间戳>-<摘要>.<后缀>`，受 `images.file_max_bytes` 上限约束；成功后正文变 `[文件] 名字 (files/...)`、附件带本地路径。关闭、超限或任何一步失败保留 `[文件] 名字` 占位与元数据，不抛异常。
-- 微信文件：**不下载**。appmsg type 6 只解析出名字/大小元数据（附件 `kind=file`），正文保留 `[文件] 名字` 占位，**没有本地路径**；`images.file_download` / `images.file_max_bytes` 对微信不生效。
+- 微信文件：**不下载**。appmsg type 6 只解析出名字（附件 `kind=file`，`name` 即 `[文件] 名字` 全文，没有独立的大小字段），正文保留 `[文件] 名字` 占位，**没有本地路径**；`images.file_download` / `images.file_max_bytes` 对微信不生效。
 - **微信合并转发**：appmsg `type 19` 正文渲染为 `[合并转发] <title>`（无标题时仅 `[合并转发]`），不展开聊天记录；`kind` 仍是 `link`，XML 解析失败也不抛异常。
 - **语音转写**：`speech.enabled: true` 时，语音先落盘到 `<workspace.dir>/voices/` 再转写。SILK（QQ `record`）由 `pysilk` 解码成裸 PCM 再交给 ffmpeg；其它格式直接交给 ffmpeg；最后进本地 faster-whisper（默认 `base`、`int8`、`vad_filter=True`，可用 `initial_prompt` 引导简体）。转写失败只保留 `[语音]`，不影响同一条消息的其它段。`speech.enabled: false` 时完全不处理：不下载、不落盘、不改正文。
 - 视频不完整转码，只复制原文件并按固定百分比抽帧（见上）。转写依赖是可选的 `.[stt]` extra（faster-whisper + silk-python）；不装也能启动，只是语音保持占位。

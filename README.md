@@ -612,7 +612,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 ### 已知上限（不承诺与 QQ 完全一致）
 
 - **无真实 message_id**：桥为会话/消息在本地铸造 id，跨重启不保证稳定。
-- **入站撤回（仅本地库模式）**：撤回只来自本地库里的**真实撤回行**（`revokemsg`），桥用持久化的 `server_id → message_id` 映射把它对回 bot 侧消息 id；映射不上的行只记日志，**不会从快照 diff 伪造撤回**。bot 侧拿到 `recall` 后只做标记——原文留库但不再进 prompt，时间线显示 `[已撤回]` 占位，批次末条被撤回则整批不回复。UIA 轮询推不出撤回（快照 diff 只能得到新消息），没开本地库时撤回不会自动生效。编辑事件不支持：协议只有 `message` / `recall` / `health` / `resync` / `notice` 五类帧。
+- **入站撤回（仅本地库模式）**：撤回只来自本地库里的**真实撤回行**（`revokemsg`），桥用持久化的 `server_id → message_id` 映射把它对回 bot 侧消息 id；映射不上的行仍会发 `recall` 帧（`message_id` 回合成 `wechat:<newmsgid>`，并记一次 DEBUG 日志），**不会从快照 diff 伪造撤回**。bot 侧拿到 `recall` 后只做标记——原文留库但不再进 prompt，时间线显示 `[已撤回]` 占位，批次末条被撤回则整批不回复。UIA 轮询推不出撤回（快照 diff 只能得到新消息），没开本地库时撤回不会自动生效。编辑事件不支持：协议只有 `message` / `recall` / `health` / `resync` / `notice` 五类帧。
 - **同名群靠本地 alias + 成员集合区分，不靠显示名**：每个群铸本地 `wxg:<alias>`；同名群按成员集合的 Jaccard 重叠度判定，≥ 0.6（`MEMBER_OVERLAP_THRESHOLD`）视为同一个群（群改名也复用 alias），不重叠则铸新 alias 并告警 `wechat_alias_ambiguous`，绝不共用 alias/记忆。成员信息缺失时（例如老条目没记过成员）退回「同名唯一存活」的旧语义；只要同名存活 alias 多于一个，`resolve()` 就 fail-closed 拒绝发送，这时才需要人工核对面板白名单里的 `wxg:<alias>`。
 - `@` 触发依赖轮询，最坏有约一个 `poll_seconds`（默认 8 秒）的延迟；本地库模式同样受这个轮询间隔限制，但不再有开窗开销。
 - 发送有频率上限：`send_min_interval_seconds`（默认 20 秒）、`send_max_per_hour`（20）、`send_max_per_day`（60）；三者设为 `0` = 不限制。
