@@ -262,6 +262,96 @@ def test_unknown_notice_type_still_returns_none() -> None:
     assert parse_event(event, bot_qq=BOT_QQ) is None
 
 
+# --- 好友/群请求（request 帧） ---
+
+def test_friend_request_parsed_as_notice() -> None:
+    event = {
+        "post_type": "request",
+        "request_type": "friend",
+        "user_id": 20002,
+        "comment": "我是隔壁老王",
+        "flag": "friend-flag-1",
+        "sub_type": "add",
+        "sender": {"nickname": "老王"},
+    }
+    notice = parse_event(event, bot_qq=BOT_QQ)
+
+    assert isinstance(notice, NoticeEvent)
+    assert notice.kind == "friend_request"
+    assert notice.chat_type is ChatType.PRIVATE
+    assert notice.chat_id == "qq:20002"
+    assert notice.user_id == "qq:20002"
+    assert notice.nickname == "老王"
+    assert notice.comment == "我是隔壁老王"
+    assert notice.event_id == "friend-flag-1"
+    assert notice.sub_type == "add"
+
+
+def test_group_request_parsed_as_group_notice() -> None:
+    event = {
+        "post_type": "request",
+        "request_type": "group",
+        "group_id": 30003,
+        "user_id": 20002,
+        "comment": "求进群",
+        "flag": "group-flag-1",
+        "sub_type": "invite",
+        "sender": {"card": "群名片", "nickname": "老王"},
+    }
+    notice = parse_event(event, bot_qq=BOT_QQ)
+
+    assert isinstance(notice, NoticeEvent)
+    assert notice.kind == "group_request"
+    assert notice.chat_type is ChatType.GROUP
+    assert notice.chat_id == "qq:30003"
+    assert notice.user_id == "qq:20002"
+    assert notice.nickname == "群名片"
+    assert notice.comment == "求进群"
+    assert notice.event_id == "group-flag-1"
+    assert notice.sub_type == "invite"
+
+
+def test_request_nickname_falls_back_to_bare_qq() -> None:
+    notice = parse_event(
+        {
+            "post_type": "request",
+            "request_type": "friend",
+            "user_id": 20002,
+            "flag": "f1",
+        },
+        bot_qq=BOT_QQ,
+    )
+
+    assert isinstance(notice, NoticeEvent)
+    assert notice.nickname == "20002"
+    assert notice.comment == ""
+    assert notice.sub_type == ""
+
+
+def test_request_missing_user_id_or_flag_returns_none() -> None:
+    base = {"post_type": "request", "request_type": "friend", "user_id": 20002, "flag": "f1"}
+    assert parse_event({p: v for p, v in base.items() if p != "user_id"}, bot_qq=BOT_QQ) is None
+    assert parse_event({p: v for p, v in base.items() if p != "flag"}, bot_qq=BOT_QQ) is None
+    # 群请求没有 group_id 就没有可归属的会话。
+    assert (
+        parse_event(
+            {"post_type": "request", "request_type": "group", "user_id": 20002, "flag": "f1"},
+            bot_qq=BOT_QQ,
+        )
+        is None
+    )
+
+
+def test_unknown_request_type_returns_none() -> None:
+    event = {
+        "post_type": "request",
+        "request_type": "guild",
+        "user_id": 20002,
+        "flag": "f1",
+    }
+    assert parse_event(event, bot_qq=BOT_QQ) is None
+
+
 def test_mixed_segments_render_placeholders() -> None:
     event = group_event(segments=[text("文字"), image(), face()])
     m = parse_event(event, bot_qq=BOT_QQ)

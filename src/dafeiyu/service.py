@@ -170,6 +170,12 @@ REMIND_USAGE = "用法：/remind <分钟> <内容> · /remind list · /remind ca
 REMIND_MAX_MINUTES = 10080
 REMIND_MAX_CONTENT_CHARS = 200
 _REMIND_STATUS_LABELS = {"pending": "待发", "sent": "已发", "canceled": "已取消"}
+# 运维通知（好友/群请求）：与 control.MAX_NOTIFY_CHARS / NOTIFY_MIN_INTERVAL_SECONDS
+# 同值，但 service 不 import control（不能依赖面板层）。
+MAX_NOTIFY_CHARS = 1000
+NOTIFY_MIN_INTERVAL_SECONDS = 10.0
+# 已通知过的请求 flag：进程内 FIFO 上限，防止长期运行无限增长。
+NOTIFY_DEDUPE_CAPACITY = 256
 # 待发队列：通道恢复后补发的轮询间隔 / 重试上限 / 消息保鲜期。
 OUTBOX_RETRY_SECONDS = 15.0
 OUTBOX_MAX_ATTEMPTS = 8
@@ -531,6 +537,9 @@ class Service:
         self._last_prompt_tokens: dict[tuple[ChatType, str], int] = {}
         # 入站媒体表情回应的节流时刻（只有 mind.inbound_media_reactions 打开时才写）。
         self._inbound_reaction_at: dict[tuple[ChatType, str], float] = {}
+        # 管理员通知的进程内节流与去重：只存事件 flag，不存正文/票据。
+        self._notify_last_at: float | None = None
+        self._notify_seen: dict[str, None] = {}
         # 戳一戳的冷却/每日上限：测试可注入带假时钟的实例。
         self.poke_reactor = poke_reactor or PokeReactor(settings.social)
         # 链接解析（T6）：懒建浏览器进程，跨批复用；测试可整体替换成假实现
@@ -1305,6 +1314,8 @@ class Service:
             await self._handle_poke(event)
         elif event.kind == "group_increase":
             await self._handle_join_welcome(event)
+        elif event.kind in ("friend_request", "group_request"):
+            await self._handle_add_request(event)
         elif event.kind in ("group_decrease", "group_ban"):
             log.info(
                 "notice %s %s/%s user=%s operator=%s duration=%s（只记日志，不发送）",
@@ -1322,6 +1333,87 @@ class Service:
                 event.chat_type.value,
                 event.chat_id,
             )
+
+    async def _handle_add_request(self, event: NoticeEvent) -> None:
+        """好友/群申请：只记结构化日志并私聊管理员，**绝不**自动同意。
+
+        日志只写 kind/chat_type/chat_id/user_id/nickname/sub_type/event_id，
+        不落原始请求 JSON、comment 票据或 encryptusername。昵称/备注里的换行
+        折成空格，保证日志与通知都是一行。
+        """
+        nickname = " ".join(str(event.nickname or "").split()) or event.user_id
+        log.info(
+            "add_request kind=%s chat_type=%s chat_id=%s user_id=%s nickname=%s "
+            "sub_type=%s event_id=%s（不自动处理，通知管理员）",
+            event.kind,
+            event.chat_type.value,
+            event.chat_id,
+            event.user_id,
+            nickname,
+            event.sub_type,
+            event.event_id,
+        )
+        label = "微信" if event.chat_id.startswith("wxg:") else "QQ"
+        if event.kind == "friend_request":
+            text = f"{label}好友申请：{nickname}（{event.user_id}）"
+        else:
+            text = f"{label}群申请：群 {event.chat_id}，申请人 {nickname}（{event.user_id}）"
+        comment = " ".join(str(event.comment or "").split())
+        if comment:
+            text = f"{text} 备注：{comment}"
+        await self._notify_admin(text, dedupe_key=event.event_id)
+
+    async def _notify_admin(self, text: str, *, dedupe_key: str) -> bool:
+        """私聊管理员一条运维通知；返回是否真的发出。
+
+        与 ``/api/notify/admin`` 同一套规则：取排序后 ``groups.admins`` 的第一
+        个、按通道前缀选适配器、正文截到 1000 字、10 秒内最多一条。区别是这里
+        嵌在事件处理链路里，任何失败都只记日志、静默返回，绝不抛出。
+        同一 ``dedupe_key`` 只尝试一次（先登记再发送，失败也算见过）。
+        """
+        key = str(dedupe_key or "")
+        if key and key in self._notify_seen:
+            log.info("管理员通知去重（dedupe_key=%s）", key)
+            return False
+        if key:
+            self._notify_seen[key] = None
+            while len(self._notify_seen) > NOTIFY_DEDUPE_CAPACITY:
+                del self._notify_seen[next(iter(self._notify_seen))]
+
+        admins = sorted(self.settings.groups.admins)
+        if not admins:
+            log.info("管理员通知跳过：未配置 groups.admins（dedupe_key=%s）", key)
+            return False
+        try:
+            channel = channel_of(admins[0])
+        except ValueError:
+            channel = "qq"
+        adapter = self.adapters.get(channel)
+        if adapter is None or not bool(getattr(adapter, "connected", False)):
+            log.info("管理员通知跳过：%s 通道未连接（dedupe_key=%s）", channel, key)
+            return False
+        now = time.monotonic()
+        if (
+            self._notify_last_at is not None
+            and now - self._notify_last_at < NOTIFY_MIN_INTERVAL_SECONDS
+        ):
+            log.info(
+                "管理员通知节流：%ss 内已发过（dedupe_key=%s）",
+                NOTIFY_MIN_INTERVAL_SECONDS,
+                key,
+            )
+            return False
+        payload = str(text or "").strip()[:MAX_NOTIFY_CHARS]
+        if not payload:
+            return False
+        try:
+            await adapter.send(ChatType.PRIVATE, admins[0], payload)
+        except Exception as exc:  # noqa: BLE001 - 通知失败不能打断事件处理
+            log.warning("管理员通知发送失败（dedupe_key=%s）：%s", key, exc)
+            return False
+        self._notify_last_at = now
+        log.info("管理员通知已发送 → %s（dedupe_key=%s）", admins[0], key)
+        return True
 
     async def _handle_poke(self, event: NoticeEvent) -> None:
         """戳一戳：过完静音/强度/预算三道门后回一句固定短句，绝不调用模型。

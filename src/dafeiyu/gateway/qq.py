@@ -488,6 +488,51 @@ def _parse_notice(event: dict[str, Any]) -> NoticeEvent | None:
     )
 
 
+def _parse_request(event: dict[str, Any]) -> NoticeEvent | None:
+    """解析好友/群请求（加好友、加群邀请）。
+
+    只产出结构化事件交给上层通知管理员，**绝不**在这里回应
+    ``set_friend_add_request`` / ``set_group_add_request``：是否同意由人决定。
+    缺 ``user_id``、``flag`` 或（群请求的）``group_id`` 时返回 None。
+    """
+    request_type = str(event.get("request_type") or "")
+    if request_type == "friend":
+        kind = "friend_request"
+        chat_type = ChatType.PRIVATE
+        chat_id = _qq_id(event.get("user_id"))
+    elif request_type == "group":
+        kind = "group_request"
+        chat_type = ChatType.GROUP
+        chat_id = _qq_id(event.get("group_id"))
+    else:
+        return None
+    user_id = _qq_id(event.get("user_id"))
+    event_id = str(event.get("flag") or "")
+    if not user_id or not event_id or not chat_id:
+        return None
+
+    sender = event.get("sender")
+    if not isinstance(sender, dict):
+        sender = {}
+    # 与消息解析一致：昵称兜底用裸 QQ 号，不把带前缀的 id 写进昵称。
+    nickname = str(
+        sender.get("card")
+        or sender.get("nickname")
+        or event.get("nickname")
+        or _as_int(event.get("user_id"))
+    )
+    return NoticeEvent(
+        kind=kind,
+        chat_type=chat_type,
+        chat_id=chat_id,
+        user_id=user_id,
+        nickname=nickname,
+        comment=str(event.get("comment") or ""),
+        event_id=event_id,
+        sub_type=str(event.get("sub_type") or ""),
+    )
+
+
 def parse_event(
     event: dict[str, Any],
     bot_qq: int,
@@ -495,9 +540,13 @@ def parse_event(
 ) -> Message | RecallEvent | NoticeEvent | None:
     if not isinstance(event, dict):
         return None
-    if event.get("post_type") == "notice":
+    post_type = event.get("post_type")
+    if post_type == "notice":
         return _parse_recall(event) or _parse_notice(event)
-    if event.get("post_type") != "message":
+    # 请求事件与消息共用字段名（user_id/comment），必须在消息分支之前拦下。
+    if post_type == "request":
+        return _parse_request(event)
+    if post_type != "message":
         return None
 
     message_type = event.get("message_type")
