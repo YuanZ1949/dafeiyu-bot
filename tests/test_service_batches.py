@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from dafeiyu.brain.client import BrainError, BrainReply
+from dafeiyu.behavior import BehaviorSettings
 from dafeiyu.config import (
     BudgetConfig,
     GroupsConfig,
@@ -449,3 +450,63 @@ async def test_other_errors_are_not_retried(tmp_path):
         await service._call_brain(ChatType.GROUP, "qq:1001", [make_msg("hi")], "hi")
 
     assert [c[0] for c in brain.calls] == ["reply"]
+
+
+def test_quiet_gate_releases_alias_mention_but_not_plain_chat(tmp_path):
+    """安静模式的软闸门：只是提到别名也放行给模型；纯闲聊仍然不进批次。"""
+    service, _store, _brain, _ = build(tmp_path)
+    service.set_behavior(BehaviorSettings(chat_intensity="quiet"))
+
+    mention = make_msg("我昨天在b站看到有人讨论大肥鱼这个模型", message_id="m1")
+    plain = make_msg("今天食堂的鱼香肉丝还行", message_id="m2")
+
+    assert service._group_skip_reason(
+        plain,
+        addressed=service._is_addressed(plain),
+        signal=service._addressing_signal(plain),
+    ) == "intensity_quiet"
+    assert (
+        service._group_skip_reason(
+            mention,
+            addressed=service._is_addressed(mention),
+            signal=service._addressing_signal(mention),
+        )
+        is None
+    )
+
+
+def test_whitelist_is_not_bypassed_by_alias_mention(tmp_path):
+    """硬策略只看精确点名：非白名单群里「只是提到」不算被叫，照样挡。"""
+    service, _store, _brain, _ = build(tmp_path)
+    service.set_groups(
+        GroupsConfig(frozenset({"qq:other"}), frozenset(), frozenset({"qq:2002"}))
+    )
+
+    mention = make_msg("我昨天在b站看到有人讨论大肥鱼这个模型", message_id="m1")
+    assert service._addressing_signal(mention) == "alias_mention"
+    assert service._is_addressed(mention) is False
+    assert (
+        service._group_skip_reason(
+            mention,
+            addressed=service._is_addressed(mention),
+            signal=service._addressing_signal(mention),
+        )
+        == "whitelist"
+    )
+
+
+async def test_quiet_mode_alias_mention_still_reaches_the_model(tmp_path):
+    """安静模式端到端：提到别名的消息不静默丢弃，送进批次由模型判断。"""
+    service, store, brain, adapter = build(tmp_path)
+    service.set_behavior(BehaviorSettings(chat_intensity="quiet"))
+    # 没有已投递游标时 pending_batch 只给 anchor 一条，先钉一条旧消息当游标。
+    store.add_message(make_msg("上线前的旧消息", message_id="seed"))
+    store.mark_delivered(ChatType.GROUP, "qq:1001", "seed")
+    msg = make_msg("我昨天在b站看到有人讨论大肥鱼这个模型", message_id="m1")
+    store.add_message(msg)
+
+    await service._handle_batched(msg)
+    await service._run_batch(ChatType.GROUP, "qq:1001")
+
+    assert brain.reply_calls == 1
+    assert adapter.sent

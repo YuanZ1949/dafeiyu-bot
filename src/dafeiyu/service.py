@@ -321,6 +321,132 @@ def silence_backoff_decision(
     return "hold", "silence_backoff", age
 
 
+# 「纠正」判定（GAP-11 补丁）：紧接它发言之后的短纠正句是在跟它说话。
+# 11-19 23:13 实测「好像不是这个 是个德语名字」被判成非点名，被
+# silence_backoff 攒了 15 分钟；只认带明确纠正词的短句，避免把群里
+# 回别人的「不是」也算成点名。
+CORRECTION_WINDOW_SECONDS = 600
+CORRECTION_MAX_CHARS = 60
+_CORRECTION_MARKERS = (
+    "不是这个",
+    "不是这",
+    "并不是",
+    "好像不",
+    "不对",
+    "错了",
+    "搞错",
+    "说错",
+    "记错",
+    "弄错",
+    "搞反",
+    "其实是",
+    "更正",
+    "纠正",
+    "我说的是",
+    "我是说",
+)
+
+
+def looks_like_correction(
+    text: str, *, seconds_since_bot_spoke: float | None
+) -> bool:
+    """机器人刚说完话时，这句是不是在纠正它。
+
+    ``seconds_since_bot_spoke`` 为 ``None``（没说过 / 状态读不到）时直接
+    ``False``：没有上下文，就不把一句孤零零的「不对」当成对它的回应。
+    """
+    body = (text or "").strip()
+    if not body or len(body) > CORRECTION_MAX_CHARS:
+        return False
+    if (
+        seconds_since_bot_spoke is None
+        or seconds_since_bot_spoke > CORRECTION_WINDOW_SECONDS
+    ):
+        return False
+    return any(marker in body for marker in _CORRECTION_MARKERS)
+
+
+# 回复里的「查证」措辞：本轮没调检索工具却这么写，等于把记忆包装成查证。
+# 只做日志与决策流水标记，不改写要发出去的话（改写会让上下文与用户看到的
+# 内容不一致）；「没查到」「查不到」这类否定说法不算声称。
+_SEARCH_CLAIM_MARKERS = (
+    "查了一圈",
+    "查过",
+    "查到",
+    "我查了",
+    "搜过",
+    "搜了一圈",
+    "搜了一下",
+    "搜到",
+    "我搜了",
+)
+_SEARCH_TOOL_KEYWORDS = ("search", "fetch")
+_SEARCH_CLAIM_NEGATIONS = "没不别未"
+
+
+# 最新/求来源类问题：给模型一句「先查再答」，避免 11-19 那种凭记忆报数字。
+# 只看最后一条真人消息；「最近」「有没有」这类太常见，故意不收，免得闲聊
+# 也被推去跑检索。
+_FRESH_LOOKUP_MARKERS = (
+    "更多信息",
+    "最新",
+    "搜一下",
+    "查一下",
+    "查查",
+    "给个来源",
+    "有来源",
+    "有链接",
+    "真的假的",
+    "是真的吗",
+)
+FRESH_LOOKUP_HINT = (
+    "【这条像在问最新信息或要来源：先 websearch 再回答；"
+    "搜不到就直说没查到，别把记忆里的数字说成查到的。】"
+)
+
+# 高召回闸门放进来的「只是提到你」的消息：规则分不清是叫你还是聊到你，
+# 就把这个判断交给模型。只陈述事实，不给「必须回 / 不许回」的硬指令。
+ADDRESSING_HINT = (
+    "【这批消息里有人提到了你，但没有明确叫你：可能是在问你，"
+    "也可能只是在聊到你。是在叫你就正常接；只是提到、插不上话就 speak=false。】"
+)
+
+
+def fresh_lookup_hint(messages: list[Message]) -> str:
+    """最新/求来源类问题给一句「先检索」提示；其他情况返回空串。"""
+    for message in reversed(messages):
+        if message.is_bot or message.recalled_at:
+            continue
+        body = (message.content or "").strip()
+        if any(marker in body for marker in _FRESH_LOOKUP_MARKERS):
+            return FRESH_LOOKUP_HINT
+        return ""
+    return ""
+
+
+def claims_search_without_tool(
+    reply_text: str, tool_names: list[str] | tuple[str, ...] = ()
+) -> bool:
+    """回复声称「查过 / 搜过」，但本轮没调用任何检索工具。"""
+    body = (reply_text or "").strip()
+    if not body:
+        return False
+    if any(
+        keyword in str(name).casefold()
+        for name in tool_names
+        for keyword in _SEARCH_TOOL_KEYWORDS
+    ):
+        return False
+    for marker in _SEARCH_CLAIM_MARKERS:
+        start = body.find(marker)
+        while start != -1:
+            before = body[start - 1] if start else ""
+            if before not in _SEARCH_CLAIM_NEGATIONS:
+                return True
+            start = body.find(marker, start + 1)
+    return False
+
+
 @dataclass
 class ToolUse:
     """本轮模型是否调用过工具、调过哪些；只做内部判定，不往群里发任何提示。"""
@@ -999,9 +1125,63 @@ class Service:
             msg, previous
         )
 
+    def _seconds_since_bot_spoke(
+        self, chat_type: ChatType, chat_id: str, now_ts: int
+    ) -> float | None:
+        """距 bot 上次发言多少秒；没说过或状态读不到时返回 None。"""
+        try:
+            state = self.store.load_chat_state(chat_type, chat_id) or {}
+        except Exception:  # noqa: BLE001 - 状态读不到就当没说过，不拦批次
+            return None
+        last = state.get("last_bot_spoke")
+        if not isinstance(last, (int, float)) or last <= 0:
+            return None
+        return max(0.0, now_ts - float(last))
+
+    def _corrects_bot(self, msg: Message) -> bool:
+        """紧接它发言的短纠正句：也是在跟它说话，别被冷场 backoff 吞掉。"""
+        if msg.chat_type is not ChatType.GROUP or msg.is_bot:
+            return False
+        if msg.at_others or msg.at_all:
+            return False
+        # 先做纯文本的廉价筛选，绝大多数消息不必读 chat_state。
+        body = (msg.content or "").strip()
+        if (
+            not body
+            or len(body) > CORRECTION_MAX_CHARS
+            or not any(marker in body for marker in _CORRECTION_MARKERS)
+        ):
+            return False
+        now_ts = int(msg.timestamp or now_shanghai().timestamp())
+        return looks_like_correction(
+            msg.content,
+            seconds_since_bot_spoke=self._seconds_since_bot_spoke(
+                msg.chat_type, msg.chat_id, now_ts
+            ),
+        )
+
     def _is_addressed(self, msg: Message) -> bool:
-        """显式点名（@/引用/别名）+ 隐式接话（回答 bot 的上一句提问）。"""
-        return self.router.is_addressed(msg) or self._answers_bot_question(msg)
+        """显式点名（@/引用/别名）+ 隐式接话（回答提问 / 纠正它刚说的话）。"""
+        return (
+            self.router.is_addressed(msg)
+            or self._answers_bot_question(msg)
+            or self._corrects_bot(msg)
+        )
+
+    def _addressing_signal(self, msg: Message) -> str | None:
+        """高召回信号：值不值得把这条送进批次让模型判断。
+
+        在 ``_is_addressed`` 之上只多一类「别名被提到但不是称呼」。
+        硬策略（白名单、预算）仍然只看 ``_is_addressed``。
+        """
+        signal = self.router.addressing_signal(msg)
+        if signal:
+            return signal
+        if self._answers_bot_question(msg):
+            return "answers_bot"
+        if self._corrects_bot(msg):
+            return "correction"
+        return None
 
     def _lock(self, chat_type: ChatType, chat_id: str) -> asyncio.Lock:
         return self._locks.setdefault((chat_type, chat_id), asyncio.Lock())
@@ -1672,7 +1852,8 @@ class Service:
             return
 
         addressed = self._is_addressed(msg)
-        reason = self._group_skip_reason(msg, addressed=addressed)
+        signal = self._addressing_signal(msg)
+        reason = self._group_skip_reason(msg, addressed=addressed, signal=signal)
         if reason in ("intensity_quiet", "downshift"):
             # 这几道都是软闸门，不是终局：不 mark_skipped，把消息留在待投
             # 队列里，下次被点名/问句/「接着说」时一起送模型。否则降频窗口
@@ -1696,14 +1877,23 @@ class Service:
         whitelist = self.settings.groups.whitelist
         return not whitelist or msg.chat_id in whitelist
 
-    def _group_skip_reason(self, msg: Message, *, addressed: bool) -> str | None:
+    def _group_skip_reason(
+        self, msg: Message, *, addressed: bool, signal: str | None = None
+    ) -> str | None:
+        """软闸门看 ``addressed or signal``，硬策略只看 ``addressed``。
+
+        ``signal`` 是高召回信号（别名被提到等）：它只负责「别把可能是在叫它
+        的消息静默丢掉」，让模型判断要不要接；白名单这类策略仍然只认精确
+        点名，避免一句「我看评论区有不少大肥鱼」就把非白名单群拉进批次。
+        """
         if self.router.is_muted(msg.chat_type, msg.chat_id):
             return "muted"
         if self.router.is_quiet(msg.chat_type, msg.chat_id):
             return "quiet"
+        soft = addressed or signal is not None
         # 安静强度：非点名消息不进批次。对消息不做 mark_skipped，留在待投队列，
         # 等下次点名时一起给模型看，避免「这条永远不进 prompt」。
-        if not addressed and self.behavior.chat_intensity == "quiet":
+        if not soft and self.behavior.chat_intensity == "quiet":
             return "intensity_quiet"
         # 被点名消息不受强度约束；非点名消息里降频窗口仍保留（失败保护）。
         # 话题收尾不再拦截：一律进批次送模型，接不接由模型输出决定。
@@ -1715,7 +1905,7 @@ class Service:
             )
             # 连续三次选择不说后进入降频窗口：问句仍然可以破例，避免追问被吞。
             if (
-                not addressed
+                not soft
                 and not reopened
                 and self.router.is_downshifted(msg.chat_type, msg.chat_id)
             ):
@@ -2286,6 +2476,8 @@ class Service:
 
         addressed_ids = tuple(m.message_id for m in batch if self._is_addressed(m))
         addressed = bool(addressed_ids)
+        # 预览与真跑同口径：软闸门看高召回信号，硬策略（预算/白名单）看精确点名。
+        soft_addressed = any(self._addressing_signal(m) for m in batch)
         if addressed_ids:
             current_id: str | None = addressed_ids[-1]
         elif batch:
@@ -2312,7 +2504,7 @@ class Service:
                 chat_type,
                 chat_id,
                 batch,
-                addressed=addressed,
+                addressed=soft_addressed,
                 backlog=omitted,
                 now_ts=int(moment.timestamp()),
             )
@@ -2501,14 +2693,8 @@ class Service:
         """
         if seconds <= 0:
             return False
-        try:
-            state = self.store.load_chat_state(chat_type, chat_id) or {}
-        except Exception:  # noqa: BLE001 - 状态读不到就当没说过，不拦批次
-            return False
-        last = state.get("last_bot_spoke")
-        if not isinstance(last, (int, float)) or last <= 0:
-            return False
-        return now_ts - float(last) <= seconds
+        gap = self._seconds_since_bot_spoke(chat_type, chat_id, now_ts)
+        return gap is not None and gap <= seconds
 
     def _known_silent_reason(
         self, batch: list[Message], *, now_ts: int
@@ -2527,8 +2713,10 @@ class Service:
         if len(batch) != 1:
             return None
         msg = batch[0]
-        # 豁免①②：回答机器人上一句提问最优先，其次显式点名（@/引用/别名）。
-        if self._answers_bot_question(msg) or self.router.is_addressed(msg):
+        # 豁免①②：回答机器人上一句提问、纠正它刚说的话最优先，其次显式点名
+        # （@/引用/别名），再退一步是「别名被提到但没明确叫」（高召回信号，
+        # 精度交给模型）。走同一个 `_addressing_signal`，几条路径不会各判各的。
+        if self._addressing_signal(msg):
             return None
         if is_question(msg.content):
             # 豁免③：紧跟机器人发言的明确新提问。
@@ -2592,6 +2780,20 @@ class Service:
         ]
         addressed = bool(addressed_ids)
         current_id = addressed_ids[-1] if addressed_ids else ids[-1]
+        # 高召回信号：软闸门（安静强度 / 冷场 / 降频）用它，硬策略（预算、
+        # 白名单）仍用精确点名。签名同时写进决策流水，供影子对比复盘。
+        signals = {
+            m.message_id: signal
+            for m in batch
+            if (signal := self._addressing_signal(m))
+        }
+        addressed_set = set(addressed_ids)
+        addressing = {
+            "signals": signals,
+            "addressed": addressed_ids,
+            "soft_only": [mid for mid in signals if mid not in addressed_set],
+        }
+        soft_addressed = bool(signals)
         key = (chat_type, chat_id)
 
         # 攒着判定（安静强度 / 纯热聊）与寿命共用一个入口：超过
@@ -2603,7 +2805,7 @@ class Service:
                 chat_type,
                 chat_id,
                 batch,
-                addressed=addressed,
+                addressed=soft_addressed,
                 backlog=backlog,
                 now_ts=int(now_shanghai().timestamp()),
             )
@@ -2739,12 +2941,21 @@ class Service:
             self._check_workspace(chat_type, chat_id)
             return
 
+        if reply.speak and claims_search_without_tool(reply.reply, tool_use.names):
+            log.warning(
+                "回复声称查过但没有检索工具调用 %s/%s tools=%s",
+                chat_id,
+                current_id,
+                tool_use.names or "-",
+            )
         sent = await self._send_batch_reply(
             batch,
             reply,
             chat_type,
             chat_id,
             latency_ms=int((time.monotonic() - started) * 1000),
+            tool_use=tool_use,
+            addressing=addressing,
         )
         if not sent:
             self.router.note_no_reply(chat_type, chat_id)
@@ -3444,12 +3655,24 @@ class Service:
         chat_id: str,
         *,
         latency_ms: int = 0,
+        tool_use: ToolUse | None = None,
+        addressing: dict[str, Any] | None = None,
     ) -> list[tuple[str, str | None]]:
         """把批次回复分片发出并入库；返回 (分片文本, 网关真实 id) 列表。"""
 
         def record(
             outcome: str, checkpoint: str = "", reply_preview: str = ""
         ) -> None:
+            detail: dict[str, Any] = {}
+            if tool_use is not None:
+                detail["tools"] = list(tool_use.names)
+                if reply.speak and claims_search_without_tool(
+                    reply.reply, tool_use.names
+                ):
+                    detail["claimed_search_without_tool"] = True
+            if addressing is not None:
+                # 影子对比：规则判了什么、模型最终说了没说，落在同一条决策里。
+                detail["addressing"] = {**addressing, "spoke": bool(reply.speak)}
             self._record_decision(
                 chat_type,
                 chat_id,
@@ -3465,6 +3688,7 @@ class Service:
                 prompt_tokens=reply.prompt_tokens,
                 completion_tokens=reply.completion_tokens,
                 latency_ms=latency_ms,
+                detail=detail or None,
             )
 
         if reply.read or reply.think:
@@ -4062,6 +4286,29 @@ class Service:
         if fact_hint:
             injection = (
                 f"{injection}\n\n{fact_hint}" if injection.strip() else fact_hint
+            )
+
+        # 最新/求来源类问题：有工具就明确要求先查；没工具时人设章节已经说了
+        # 「本鱼查不了」，不再塞一条它做不到的指令。
+        if self._tools_enabled():
+            lookup_hint = fresh_lookup_hint(messages)
+            if lookup_hint:
+                injection = (
+                    f"{injection}\n\n{lookup_hint}"
+                    if injection.strip()
+                    else lookup_hint
+                )
+
+        # 高召回闸门放进来的「只是提到你」：规则分不清是不是在叫它，
+        # 把判断交给模型（这是本次「模型接管精度」的唯一入口）。
+        if chat_type is ChatType.GROUP and any(
+            self.router.addressing_signal(message) == "alias_mention"
+            for message in messages
+        ):
+            injection = (
+                f"{injection}\n\n{ADDRESSING_HINT}"
+                if injection.strip()
+                else ADDRESSING_HINT
             )
 
         # 攒着超龄的批次：只给一句事实 + 把说不说交还模型，不写任何指令。

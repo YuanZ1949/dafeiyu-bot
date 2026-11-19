@@ -547,6 +547,24 @@ class AlertManager:
                         detail,
                         {"calls": calls, "limit": limit},
                     )
+
+        # 点名判定影子对比：样本够久够多时在面板提醒「可以复盘了」。
+        # 这是提醒，不是故障：severity=info，恢复后自动消失。
+        shadow = bot.get("shadow") or {}
+        if isinstance(shadow, dict) and shadow.get("addressing_ready") is True:
+            samples = shadow.get("addressing_samples") or 0
+            days = shadow.get("addressing_days") or 0
+            conditions["shadow_review_ready"] = Condition(
+                True,
+                "info",
+                "点名判定影子对比可以复盘",
+                (
+                    f"已积累 {samples} 条样本 / {days} 天："
+                    "去决策流看看规则判的和模型实际接话差在哪，"
+                    "再决定要不要删掉别名后缀表。"
+                ),
+                {"samples": samples, "days": days},
+            )
         return conditions
 
     def _pending_seconds(self, rule: str) -> int:
@@ -562,6 +580,9 @@ class AlertManager:
     def _repeat_seconds(self, rule: str) -> int:
         if rule.startswith("budget_warning:"):
             return 86400
+        # 复盘提醒是「一次就够了」的待办，别按 6 小时循环骚扰。
+        if rule == "shadow_review_ready":
+            return 7 * 86400
         if rule == "disk_low":
             return max(DISK_REPEAT_SECONDS, int(self.cfg.repeat_seconds))
         return int(self.cfg.repeat_seconds)

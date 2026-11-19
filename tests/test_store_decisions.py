@@ -441,3 +441,43 @@ def test_init_schema_upgrades_old_database(tmp_path: Path) -> None:
     ).fetchone()
     assert row is not None
     assert store.record_decision(ChatType.GROUP, "qq:1001", outcome="replied") > 0
+
+
+def test_addressing_shadow_stats_counts_only_samples_in_window(
+    tmp_path: Path,
+) -> None:
+    """影子统计只数窗口内带 addressing 的决策，并按首末时间算跨度。"""
+    store = make_store(tmp_path)
+    now = time.time()
+
+    def record(detail: dict[str, object] | None, created_at: float) -> None:
+        row_id = store.record_decision(
+            ChatType.GROUP, "qq:1001", outcome="replied", detail=detail or {}
+        )
+        store._conn.execute(
+            "UPDATE decisions SET created_at = ? WHERE id = ?", (created_at, row_id)
+        )
+        store._conn.commit()
+
+    record({"addressing": {"signals": {}, "addressed": [], "soft_only": []}}, now - 3 * 86400)
+    record({"addressing": {"signals": {}, "addressed": [], "soft_only": []}}, now)
+    # 没有 addressing 的决策不算样本。
+    record({"tools": []}, now)
+    # 窗口外的旧样本也不算。
+    record({"addressing": {"signals": {}, "addressed": [], "soft_only": []}}, now - 30 * 86400)
+
+    stats = store.addressing_shadow_stats(now - 7 * 86400)
+
+    assert stats["samples"] == 2
+    assert stats["days"] == 4
+    assert stats["first_at"] == now - 3 * 86400
+
+
+def test_addressing_shadow_stats_empty_window(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+
+    assert store.addressing_shadow_stats(time.time() - 7 * 86400) == {
+        "samples": 0,
+        "days": 0,
+        "first_at": 0.0,
+    }

@@ -1155,3 +1155,69 @@ def test_new_alert_rule_defaults_and_parsing(tmp_path: Path) -> None:
     settings = load_settings(env_file=env, config_file=config)
     assert settings.alerts.rules.backup_stale_hours == 48
     assert settings.alerts.rules.memory_gap_days == 3
+
+
+def shadow_snapshot(*, ready: bool, samples: int = 42, days: int = 8) -> dict[str, Any]:
+    snapshot = base_snapshot()
+    snapshot["bot"]["shadow"] = {
+        "addressing_ready": ready,
+        "addressing_samples": samples,
+        "addressing_days": days,
+    }
+    return snapshot
+
+
+async def test_shadow_review_ready_fires_info_alert(tmp_path: Path) -> None:
+    """影子对比攒够样本/天数：面板弹一条 info 提醒去复盘。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+
+    await mgr.evaluate(shadow_snapshot(ready=True))
+
+    assert len(channel.sent) == 1
+    incident, event = channel.sent[0]
+    assert event == "firing"
+    assert incident.rule == "shadow_review_ready"
+    assert incident.severity == "info"
+    assert incident.data == {"samples": 42, "days": 8}
+    assert mgr.summary()["firing"] == 1
+
+
+async def test_shadow_review_repeats_only_after_a_week(tmp_path: Path) -> None:
+    """待办类提醒不按 6 小时循环：7 天内不重复，7 天后才再弹一次。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+    snapshot = shadow_snapshot(ready=True)
+
+    await mgr.evaluate(snapshot)
+    clock.advance(21600)
+    await mgr.evaluate(snapshot)
+    assert len(channel.sent) == 1
+
+    clock.advance(7 * 86400)
+    await mgr.evaluate(snapshot)
+    assert len(channel.sent) == 2
+
+
+async def test_shadow_review_silent_until_ready(tmp_path: Path) -> None:
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+
+    await mgr.evaluate(shadow_snapshot(ready=False, samples=3, days=1))
+
+    assert channel.sent == []
+    assert mgr.summary()["firing"] == 0
+
+
+async def test_shadow_review_absent_field_is_silent(tmp_path: Path) -> None:
+    """旧版 bot 快照没有 shadow 字段：不能因此误报。"""
+    clock = Clock()
+    channel = FakeChannel()
+    mgr = manager(tmp_path, clock, channel)
+
+    await mgr.evaluate(base_snapshot())
+
+    assert channel.sent == []

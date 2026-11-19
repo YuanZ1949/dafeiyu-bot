@@ -413,6 +413,111 @@ async def test_tool_use_is_recorded_for_internal_use(tmp_path, monkeypatch):
     assert adapter.texts() == ["在呢"]
 
 
+async def test_fresh_lookup_hint_reaches_prompt_when_tools_enabled(tmp_path):
+    """最新/求来源类问题：有工具时明确要求先查（11-19 凭记忆报数字）。"""
+    from dafeiyu.service import FRESH_LOOKUP_HINT
+
+    brain = FakeBrain()
+    brain.supports_tools = True  # type: ignore[attr-defined]
+    service, store, _, _ = build(tmp_path, brain=brain, with_workspace=True)
+    store.add_message(
+        make_msg(
+            "ANT上市前有个匿名模型突然反超了ANT的Fable  大肥鱼有没有更多信息",
+            message_id="m2",
+        )
+    )
+
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    assert FRESH_LOOKUP_HINT in brain.last_prompt
+
+
+async def test_fresh_lookup_hint_is_skipped_without_tools(tmp_path):
+    """没工具时人设已经说了「查不了」，不再塞一条它做不到的指令。"""
+    from dafeiyu.service import FRESH_LOOKUP_HINT
+
+    brain = FakeBrain()
+    service, store, _, _ = build(tmp_path, brain=brain)
+    store.add_message(make_msg("大肥鱼有没有更多信息", message_id="m2"))
+
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    assert FRESH_LOOKUP_HINT not in brain.last_prompt
+
+
+async def test_alias_mention_batch_gets_neutral_hint(tmp_path):
+    """只是提到「大肥鱼」也送模型：提示词只陈述事实，接不接由模型定。"""
+    from dafeiyu.service import ADDRESSING_HINT
+
+    brain = FakeBrain()
+    service, store, _, _ = build(tmp_path, brain=brain)
+    store.add_message(
+        make_msg("我昨天在b站看到有人讨论大肥鱼这个模型", message_id="m2")
+    )
+
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    assert ADDRESSING_HINT in brain.last_prompt
+
+
+async def test_decision_detail_records_addressing_shadow(tmp_path):
+    """影子对比：规则判了什么、模型说没说，落在同一条决策里。"""
+    brain = FakeBrain(speak=True)
+    service, store, _, _ = build(tmp_path, brain=brain)
+    store.add_message(
+        make_msg("我昨天在b站看到有人讨论大肥鱼这个模型", message_id="m2")
+    )
+
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    detail = store.list_decisions(limit=1, chat_id=CHAT)[0]["detail"]
+    addressing = detail["addressing"]
+    assert addressing["signals"] == {"m2": "alias_mention"}
+    assert addressing["addressed"] == []
+    assert addressing["soft_only"] == ["m2"]
+    assert addressing["spoke"] is True
+
+
+async def test_decision_detail_records_shadow_when_model_stays_silent(tmp_path):
+    """模型选择不说也照记：这才是「规则放行、模型否决」的对照样本。"""
+    brain = FakeBrain(speak=False)
+    service, store, _, _ = build(tmp_path, brain=brain)
+    store.add_message(
+        make_msg("我昨天在b站看到有人讨论大肥鱼这个模型", message_id="m2")
+    )
+
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    detail = store.list_decisions(limit=1, chat_id=CHAT)[0]["detail"]
+    assert detail["addressing"]["soft_only"] == ["m2"]
+    assert detail["addressing"]["spoke"] is False
+
+
+async def test_decision_detail_records_tools_and_search_claim(tmp_path):
+    """回复声称「查过」但本轮没检索：只在决策流水留标记，不改写要发的话。"""
+    brain = FakeBrain(text="我查了一圈，查到 1463 分")
+    service, store, _, adapter = build(tmp_path, brain=brain)
+
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    detail = store.list_decisions(limit=1, chat_id=CHAT)[0]["detail"]
+    assert detail["tools"] == []
+    assert detail["claimed_search_without_tool"] is True
+    # 用户看到的内容保持原样。
+    assert adapter.texts() == ["我查了一圈，查到 1463 分"]
+
+
+async def test_decision_detail_accepts_search_claim_when_tool_ran(tmp_path):
+    brain = FakeBrain(text="我查了一圈，查到 1463 分", fire_tool=True)
+    service, store, _, _ = build(tmp_path, brain=brain)
+
+    await service._run_batch(ChatType.GROUP, CHAT)
+
+    detail = store.list_decisions(limit=1, chat_id=CHAT)[0]["detail"]
+    assert detail["tools"] == ["webfetch"]
+    assert "claimed_search_without_tool" not in detail
+
+
 async def test_rotation_runs_before_model_call(tmp_path):
     service, store, brain, _ = build(tmp_path)
     store.bump_session_stats(ChatType.GROUP, CHAT, messages=60, tokens=0)

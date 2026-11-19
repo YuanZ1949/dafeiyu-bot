@@ -110,6 +110,11 @@ IMPRESSION_KINDS = {"nickname", "preference", "fact"}
 PROCESS_STARTED_AT = time.monotonic()
 # 健康快照里「最近错误」的统计窗口。
 ERROR_STATS_WINDOW_SECONDS = 3600
+
+# 点名判定影子对比：满 7 天且样本够多，才提醒「可以复盘了」。
+ADDRESSING_SHADOW_WINDOW_SECONDS = 7 * 24 * 3600
+ADDRESSING_SHADOW_MIN_SAMPLES = 30
+ADDRESSING_SHADOW_MIN_DAYS = 7
 # 运维通知：正文上限与进程内最小间隔。
 MAX_NOTIFY_CHARS = 1000
 MAX_DEDUPE_KEY_CHARS = 64
@@ -957,6 +962,26 @@ class BrainControl:
         pending = sorted({slot.date for slot in slots})
         return pending, slots
 
+    def _addressing_shadow_health(self) -> dict[str, Any]:
+        """影子对比进度：只读计数；读不到就降级为 0，绝不影响探活。"""
+        try:
+            stats = self.store.addressing_shadow_stats(
+                time.time() - ADDRESSING_SHADOW_WINDOW_SECONDS
+            )
+        except Exception as exc:  # noqa: BLE001 - 统计失败不拖垮健康快照
+            log.warning("读取影子对比统计失败：%s", exc)
+            stats = {"samples": 0, "days": 0, "first_at": 0.0}
+        samples = int(stats.get("samples") or 0)
+        days = int(stats.get("days") or 0)
+        return {
+            "addressing_samples": samples,
+            "addressing_days": days,
+            "addressing_ready": (
+                samples >= ADDRESSING_SHADOW_MIN_SAMPLES
+                and days >= ADDRESSING_SHADOW_MIN_DAYS
+            ),
+        }
+
     def health_snapshot(self) -> dict[str, Any]:
         """给 supervisor 与 dashboard 用的不可变健康快照。
 
@@ -1230,6 +1255,8 @@ class BrainControl:
             # 不含正文。与 errors（回复链路的 decision 错误）分开。
             "memory_failures": memory_failures,
             "mirror": mirror_health,
+            # 点名判定影子对比进度：supervisor 的告警规则据此在面板提醒复盘。
+            "shadow": self._addressing_shadow_health(),
         }
 
     def budget_snapshot(self, chat_type: ChatType, chat_id: str) -> dict[str, Any]:

@@ -3237,6 +3237,28 @@ function decisionLine(label, text) {
   return `<div class="decision-line"><b>${label}</b>${escapeHtml(text)}</div>`;
 }
 
+// 高召回闸门的影子对比：规则没判点名、靠信号放行时，模型最终接没接。
+// 只有 soft_only 非空才有对照价值（精确点名的样本两边本来就一致）。
+const ADDRESSING_SIGNAL_LABELS = {
+  at: "@",
+  reply: "引用",
+  alias: "叫别名",
+  alias_mention: "提到别名",
+  answers_bot: "答机器人提问",
+  correction: "纠正机器人",
+};
+
+function decisionAddressingLine(item) {
+  const shadow = item.detail && item.detail.addressing;
+  if (!shadow) return "";
+  const soft = Array.isArray(shadow.soft_only) ? shadow.soft_only : [];
+  if (!soft.length) return "";
+  const signals = shadow.signals || {};
+  const kinds = [...new Set(soft.map((id) => ADDRESSING_SIGNAL_LABELS[signals[id]] || "弱信号"))];
+  const verdict = shadow.spoke ? "选择接话" : "选择沉默";
+  return decisionLine("点名判定", `规则未判点名（${kinds.join("、")}），模型${verdict}`);
+}
+
 function decisionMessagesHtml(item) {
   const messages = Array.isArray(item.messages) ? item.messages.slice(0, 20) : [];
   const head = `<div class="decision-line"><b>当时看到</b></div>`;
@@ -3255,6 +3277,7 @@ function decisionDetailHtml(item) {
     decisionLine("读", item.read),
     decisionLine("想", item.think),
     decisionLine("理由", item.reason),
+    decisionAddressingLine(item),
     item.outcome === "replied" ? decisionLine("回复", item.reply_preview) : "",
     decisionMessagesHtml(item),
   ];

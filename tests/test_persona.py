@@ -101,6 +101,8 @@ def test_persona_has_link_protocol() -> None:
         "不是对最后一条的应答",
         "【链接内容】",
         "这链接本机读不到",
+        "本鱼没查",
+        "别把记忆里的数字包装成查证结果",
     ):
         assert needle in text, needle
 

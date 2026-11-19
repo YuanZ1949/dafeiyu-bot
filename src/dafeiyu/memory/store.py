@@ -5257,6 +5257,26 @@ class Store:
             return int(row["id"])
         return 0
 
+    def addressing_shadow_stats(self, since_ts: float) -> dict[str, Any]:
+        """影子对比的样本量：带 ``detail.addressing`` 的决策条数与时间跨度。
+
+        只数真正跑过模型的决策（``_send_batch_reply`` 里写入），所以样本里
+        一定有「规则怎么判 / 模型说没说」这一对。用于面板提醒「可以复盘了」。
+        """
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS n, MIN(created_at) AS first_at, MAX(created_at) AS last_at
+            FROM decisions
+            WHERE created_at >= ? AND detail LIKE '%"addressing"%'
+            """,
+            (float(since_ts),),
+        ).fetchone()
+        count = int(row["n"] or 0) if row is not None else 0
+        first_at = float(row["first_at"]) if row and row["first_at"] else 0.0
+        last_at = float(row["last_at"]) if row and row["last_at"] else 0.0
+        span_days = int((last_at - first_at) // 86400) + 1 if count else 0
+        return {"samples": count, "days": span_days, "first_at": first_at}
+
     def list_decisions(
         self,
         *,

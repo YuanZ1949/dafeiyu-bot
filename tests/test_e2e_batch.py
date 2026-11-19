@@ -567,6 +567,23 @@ async def test_e2e_addressed_batch_bypasses_silence_backoff(tmp_path):
     await brain.aclose()
 
 
+async def test_e2e_correction_right_after_bot_bypasses_silence_backoff(tmp_path):
+    """紧跟它发言的短纠正也算在跟它说话：别被 15 分钟冷场窗口吞掉。"""
+    from dafeiyu.timeutil import now_shanghai
+
+    service, store, brain, adapter, server = build(tmp_path, mind=MIND_ON)
+    now = int(now_shanghai().timestamp())
+    seed_silent_turns(store, turns=3, base_ts=now - 100_000)
+    store.save_chat_state(ChatType.GROUP, CHAT, {"last_bot_spoke": now - 20})
+
+    await service.handle(make_msg("好像不是这个 是个德语名字", message_id="c1", ts=now))
+    await flush_due(service)
+
+    assert len(server.prompts) == 1
+    assert "silence_backoff" not in checkpoints(store)
+    await brain.aclose()
+
+
 async def test_e2e_engaged_turn_resets_the_streak(tmp_path):
     """最早一轮有人接：streak 只剩 2，够不到阈值，批次照常送模型。"""
     from dafeiyu.timeutil import now_shanghai

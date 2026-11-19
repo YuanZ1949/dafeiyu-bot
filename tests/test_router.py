@@ -186,6 +186,39 @@ def test_alias_mention_is_not_addressed() -> None:
     assert router.should_handle(text).hard is False
 
 
+def test_alias_question_after_text_is_addressed() -> None:
+    """11-19 实测：别名在句中、后接「有没有」也是点名，不能判成提及。"""
+    router, _, _ = make_router()
+    text = msg("ANT上市前有个匿名模型突然跳出来反超了ANT的Fable  大肥鱼有没有更多信息")
+    assert router.addressed_source(text) == "alias"
+    # 微信可能把普通空格换成 \u2005 之类的不可见空白。
+    assert router.addressed_source(msg("大肥鱼\u2005有没有更多信息")) == "alias"
+    assert router.addressed_source(msg("想问下 大肥鱼是不是还能接入b站")) == "alias"
+
+
+def test_alias_object_usage_stays_mention() -> None:
+    """宾语/定语用法（后台、接入、就是…啊）仍然只是提到，不能当点名。"""
+    router, _, _ = make_router()
+    for content in (
+        "奇怪我在大肥鱼后台没看到你发的图",
+        "是不是还能把大肥鱼接入b站的",
+        "沃雅妮莎的这个骨骼结构就是大肥鱼啊",
+    ):
+        assert router.addressed_source(msg(content)) is None, content
+
+
+def test_addressing_signal_keeps_mentions_for_the_model() -> None:
+    """高召回：只是被提到也给信号，让模型判断是不是在叫它。"""
+    router, _, _ = make_router()
+    assert router.addressing_signal(msg("@溟月 在吗", at=True)) == "at"
+    assert router.addressing_signal(msg("大肥鱼有没有更多信息")) == "alias"
+    assert (
+        router.addressing_signal(msg("我昨天在b站看到有人讨论大肥鱼这个模型"))
+        == "alias_mention"
+    )
+    assert router.addressing_signal(msg("今天天气不错")) is None
+
+
 def test_alias_vocative_is_not_a_mention() -> None:
     router, _, _ = make_router()
     assert router.alias_mention(msg("大肥鱼在吗")) is False

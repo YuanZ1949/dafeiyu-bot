@@ -21,6 +21,8 @@ _NEGATION_CHARS = "没不无别"
 
 # 别名判定：「称呼」是明确在叫 bot，必须回；「提及」只是聊到它，只给提示。
 # 称呼形态：文本开头就是别名、别名后跟标点/称呼后缀、文本以别名结尾、或 @别名。
+# 后缀只收「对着它说」的疑问/祈使开头：11-19 实测「…Fable  大肥鱼有没有更多信息」
+# 因别名在句中、后接「有没有」被漏判成提及。别收「接入/后台/桌面」这类宾语用法。
 _ALIAS_ADDRESS_SUFFIXES = (
     "在吗",
     "在么",
@@ -37,7 +39,10 @@ _ALIAS_ADDRESS_SUFFIXES = (
     "您好",
     "帮我",
     "帮忙",
+    "帮看",
     "看看",
+    "看下",
+    "看一下",
     "出来",
     "过来",
     "醒醒",
@@ -47,9 +52,36 @@ _ALIAS_ADDRESS_SUFFIXES = (
     "解释",
     "讲讲",
     "说说",
+    "聊聊",
+    "介绍",
+    "推荐",
+    "有没有",
+    "是不是",
+    "能不能",
+    "会不会",
+    "可不可以",
+    "行不行",
+    "对不对",
+    "好不好",
+    "怎么",
+    "为什么",
+    "什么",
+    "啥",
+    "吗",
+    "你",
+    "查一下",
+    "查查",
+    "搜一下",
+    "发一",
+    "发个",
+    "发下",
 )
+# 微信正文会把普通空格换成 \u2005、\u00a0 等不可见空白，说话人自己看不出来；
+# 边界集不认它们就会把「大肥鱼 有没有…」判成提到，所以连零宽、全角空格一起收。
 _ALIAS_BOUNDARY = frozenset(
     " \t\r\n@，。！？、,.!?;:：；~～…—()（）[]【】<>《》\"'“”‘’"
+    "\u00a0\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008"
+    "\u2009\u200a\u200b\u202f\u205f\u3000"
 )
 
 
@@ -522,6 +554,21 @@ class Router:
     def is_addressed(self, msg: Message) -> bool:
         """被点名：@、引用回复、或正文里出现别名。批次模式用它决定防抖计时。"""
         return self.addressed_source(msg) is not None
+
+    def addressing_signal(self, msg: Message) -> str | None:
+        """高召回「可能是在叫它」：``at``/``reply``/``alias``/``alias_mention``。
+
+        只用来决定「这条值不值得送进批次让模型看一眼」，不参与预算、白名单
+        这类硬策略——那些仍看 ``addressed_source``。别名只是被提到（比如
+        「我看评论区有不少大肥鱼」）时，规则判不准它是不是在叫它，就把精度
+        交给模型：宁可多唤醒一次，也不静默丢掉一条其实在问它的话。
+        """
+        source = self.addressed_source(msg)
+        if source:
+            return source
+        if self.alias_mention(msg):
+            return "alias_mention"
+        return None
 
     def hard_trigger(self, msg: Message) -> bool:
         return self.is_addressed(msg)
