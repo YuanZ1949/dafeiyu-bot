@@ -101,6 +101,8 @@ _RESULT_KEYS = ("ok", "error_code", "delivered", "message_id", "not_sent")
 
 #: 共享执行的结局：(handler 回执字段表|None, 失败码|None)。error 非 None 表示
 #: 执行抛异常/超时——失败结局绝不缓存，后续同 key 请求重新执行。
+#: handler 正常返回但 `ok:false` 且 `not_sent:true`（能证明没发出去）同样不缓存，
+#: 否则通道恢复后补发会一直复读旧失败回执。
 _DedupeOutcome = tuple[dict[str, Any] | None, str | None]
 
 
@@ -108,7 +110,7 @@ class _DedupeEntry:
     """一个 dedupe key 的共享状态：在途任务或已完成结局。
 
     创建时挂 task；任务结束时要么写出 outcome 进入 TTL 缓存，
-    要么把自己从表里摘掉（失败不缓存）。
+    要么把自己从表里摘掉（失败不缓存：异常/超时，以及能证明没发出去的 `not_sent`）。
     """
 
     __slots__ = ("task", "outcome", "done_at")
@@ -138,6 +140,19 @@ def _receipt(
         # 处理，客户端行为与加字段前完全一致（保守、不重试）。
         "not_sent": False,
     }
+
+
+def _provably_not_sent(result: dict[str, Any] | None) -> bool:
+    """结局是否**能证明**这条消息没发出去（连接被拒 / 后端明确 sent:false）。
+
+    只有这种失败允许同 ``dedupe_key`` 重发：结果不明的失败（超时、5xx、
+    回执丢失）必须继续缓存，否则补发会变成重复发送。
+    """
+    return bool(
+        isinstance(result, dict)
+        and result.get("ok") is False
+        and result.get("not_sent") is True
+    )
 
 
 def _receipt_from_result(
@@ -828,8 +843,14 @@ class BridgeServer:
             logger.exception("微信桥指令处理异常 action=%s", action)
             return (None, "internal_error")
         if entry is not None:
-            entry.outcome = (result, None)
-            entry.done_at = time.monotonic()
+            if _provably_not_sent(result):
+                # 明确没发出去：结局不进缓存。否则客户端拿同一 dedupe_key
+                # 补发时会被这条旧失败回执挡住，hook 恢复了也发不出去
+                # （TTL 内一直复读 hook_unavailable，通道恢复了补发仍全失败）。
+                self._dedupe.pop(cache_key, None)
+            else:
+                entry.outcome = (result, None)
+                entry.done_at = time.monotonic()
         return (result, None)
 
 

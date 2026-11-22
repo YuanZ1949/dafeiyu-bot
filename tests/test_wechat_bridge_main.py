@@ -1303,6 +1303,80 @@ async def test_dedupe_failure_result_is_not_cached() -> None:
         await _stopped(server)
 
 
+async def test_dedupe_not_sent_failure_is_retried() -> None:
+    """`not_sent:true`（连接被拒等）不缓存：同 key 补发必须真正重发。
+
+    回归背景：hook 掉线时首发回 hook_unavailable+not_sent，若把它缓存 1h，
+    通道恢复后客户端补发仍会拿到这条旧失败回执，消息永远发不出去。
+    """
+    calls: list[str] = []
+    outcomes = [
+        {
+            "ok": False,
+            "error_code": "hook_unavailable",
+            "delivered": "failed",
+            "message_id": None,
+            "not_sent": True,
+        },
+        dict(_RESULT),
+    ]
+
+    async def handler(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any]:
+        calls.append(command_id)
+        return dict(outcomes[len(calls) - 1])
+
+    server = BridgeServer(command_handler=handler, send_timeout=STEP)
+    try:
+        params = {"chat_id": "wxg:a", "text": "hi", "dedupe_key": "k1"}
+        first = await asyncio.wait_for(
+            server._dispatch_command("send_text", params, "r1"), STEP
+        )
+        assert first["ok"] is False and first["error_code"] == "hook_unavailable"
+        assert first["not_sent"] is True
+        second = await asyncio.wait_for(
+            server._dispatch_command("send_text", params, "r2"), STEP
+        )
+        assert second["ok"] is True and second["message_id"] == "7:1"
+        assert second["id"] == "r2"
+        assert len(calls) == 2, "not_sent 的失败不缓存：补发要真正重发"
+    finally:
+        await _stopped(server)
+
+
+async def test_dedupe_unknown_failure_is_still_cached() -> None:
+    """结果不明的失败（not_sent:false）仍缓存：补发不能变成重复发送。"""
+    calls: list[str] = []
+
+    async def handler(
+        action: str, params: dict[str, Any], command_id: str
+    ) -> dict[str, Any]:
+        calls.append(command_id)
+        return {
+            "ok": False,
+            "error_code": "hook_unknown",
+            "delivered": "failed",
+            "message_id": None,
+            "not_sent": False,
+        }
+
+    server = BridgeServer(command_handler=handler, send_timeout=STEP)
+    try:
+        params = {"chat_id": "wxg:a", "text": "hi", "dedupe_key": "k1"}
+        first = await asyncio.wait_for(
+            server._dispatch_command("send_text", params, "r1"), STEP
+        )
+        second = await asyncio.wait_for(
+            server._dispatch_command("send_text", params, "r2"), STEP
+        )
+        assert first["ok"] is False and second["ok"] is False
+        assert second["id"] == "r2"
+        assert len(calls) == 1, "结果不明的失败要缓存，避免补发重复发送"
+    finally:
+        await _stopped(server)
+
+
 async def test_dedupe_timeout_receipt_and_reexecution() -> None:
     calls: list[str] = []
 
