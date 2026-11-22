@@ -16,6 +16,12 @@ class EvalMessage:
     at_bot: bool = False
     reply_to_bot: bool = False
     timestamp: int = 0
+    #: 显式消息 id：引用别的消息时用它连边；空则回退成 ``case.id:index``。
+    id: str = ""
+    reply_to_message_id: str | None = None
+    reply_to_author: str | None = None
+    at_all: bool = False
+    at_others: bool = False
 
 
 @dataclass(frozen=True)

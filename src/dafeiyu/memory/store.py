@@ -157,6 +157,9 @@ CREATE TABLE IF NOT EXISTS messages (
     recalled_at TEXT,
     -- 跨群镜像行：is_bot=1 但排除在目标群提示词与「上一条」判定之外。
     mirror INTEGER NOT NULL DEFAULT 0,
+    -- 广播 / @ 别人：落库后历史重放仍能看出这句不是在叫 bot。
+    at_all INTEGER NOT NULL DEFAULT 0,
+    at_others INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (chat_type, chat_id, message_id)
 );
@@ -327,6 +330,8 @@ CREATE TABLE IF NOT EXISTS chat_state (
     last_prompt_at REAL,
     thread_closed_until REAL,
     last_closed_at REAL,
+    -- 辩论账本：跨轮记住「已让步 / 未解决」的分歧（JSON，空串 = 无）。
+    debate_ledger TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (chat_type, chat_id)
 );
@@ -527,6 +532,8 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         "reply_to_user_id": "TEXT",
         "recalled_at": "TEXT",
         "mirror": "INTEGER NOT NULL DEFAULT 0",
+        "at_all": "INTEGER NOT NULL DEFAULT 0",
+        "at_others": "INTEGER NOT NULL DEFAULT 0",
     },
     "brain_sessions": {
         "created_at": "TEXT",
@@ -555,6 +562,7 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         "downshift_until": "REAL",
         "last_prompt": "TEXT NOT NULL DEFAULT ''",
         "last_prompt_at": "REAL",
+        "debate_ledger": "TEXT NOT NULL DEFAULT ''",
     },
     "pending_outbox": {
         "dedupe_key": "TEXT NOT NULL DEFAULT ''",
@@ -1188,8 +1196,8 @@ class Store:
             INSERT OR IGNORE INTO messages
                 (chat_type, chat_id, message_id, user_id, nickname, content, is_bot,
                  timestamp, at_bot, reply_to_bot, reply_to_message_id, reply_to_user_id,
-                 mirror)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 mirror, at_all, at_others)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 m.chat_type.value,
@@ -1205,6 +1213,8 @@ class Store:
                 m.reply_to_message_id,
                 m.reply_to_user_id,
                 int(m.mirror),
+                int(m.at_all),
+                int(m.at_others),
             ),
         )
         self._conn.commit()
@@ -2585,6 +2595,8 @@ class Store:
             timestamp=r["timestamp"],
             recalled_at=r["recalled_at"],
             mirror=bool(r["mirror"]),
+            at_all=bool(r["at_all"]),
+            at_others=bool(r["at_others"]),
         )
 
     # ---- OpenCode session mapping ---------------------------------
@@ -3236,6 +3248,36 @@ class Store:
                 state.get("thread_closed_until"),
                 state.get("last_closed_at"),
             ),
+        )
+        self._conn.commit()
+
+    # ---- 辩论账本 --------------------------------------------------
+    def load_debate_ledger(self, chat_type: ChatType, chat_id: str) -> str:
+        """读本会话的辩论账本（JSON 字符串）；没有记录返回空串。"""
+        row = self._conn.execute(
+            """
+            SELECT debate_ledger FROM chat_state
+            WHERE chat_type = ? AND chat_id = ?
+            """,
+            (chat_type.value, chat_id),
+        ).fetchone()
+        if row is None:
+            return ""
+        return str(row["debate_ledger"] or "")
+
+    def save_debate_ledger(
+        self, chat_type: ChatType, chat_id: str, value: str
+    ) -> None:
+        """只更新账本列，不碰 chat_state 的其它运行状态。"""
+        self._conn.execute(
+            """
+            INSERT INTO chat_state (chat_type, chat_id, debate_ledger)
+            VALUES (?, ?, ?)
+            ON CONFLICT (chat_type, chat_id) DO UPDATE SET
+                debate_ledger = excluded.debate_ledger,
+                updated_at = datetime('now')
+            """,
+            (chat_type.value, chat_id, value),
         )
         self._conn.commit()
 

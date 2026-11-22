@@ -301,10 +301,100 @@ def test_batch_block_has_four_elements() -> None:
     assert "说话人：梦幻天使、阿猫、阿狗" in prompt
     # ② 点名者
     assert "在跟你说话：1 条（阿狗）" in prompt
-    # ③ 话题锚点：本批第一句前 40 字
-    assert "话题锚点：本批开头是「大肥鱼今天怎么不理人」" in prompt
+    # ③ 话题锚点：点名那条优先，其次首条（末条与点名重复时去重）
+    assert "话题锚点：①「@溟月 出来玩」；②「大肥鱼今天怎么不理人」" in prompt
     # ④ 转发条数与发言人
     assert "跨群转发：1 条（阿猫）" in prompt
+
+
+def test_batch_block_puts_addressed_and_latest_before_first() -> None:
+    """多话题并行时，点名那条和末条比首条更接近「现在在聊什么」。"""
+    messages = [
+        make_msg("B 站和抖音的内容一样吗", "m1", timestamp=at(21, 0), nickname="阿猫"),
+        make_msg(
+            "@溟月 你先说", "m2", timestamp=at(21, 1), nickname="小北", at_bot=True
+        ),
+        make_msg("我也想知道", "m3", timestamp=at(21, 2), nickname="橙子"),
+    ]
+    prompt = build_batch_prompt(messages, "", addressed=[messages[1]])
+    assert (
+        "话题锚点：①「@溟月 你先说」；②「我也想知道」；③「B 站和抖音的内容一样吗」"
+        in prompt
+    )
+
+
+def test_batch_block_lists_each_addressed_speaker_with_their_question() -> None:
+    messages = [
+        make_msg(
+            "@溟月 你用过吗", "m1", timestamp=at(21, 0), nickname="阿猫", at_bot=True
+        ),
+        make_msg(
+            "@溟月 别听他的", "m2", timestamp=at(21, 1), nickname="小北", at_bot=True
+        ),
+    ]
+    prompt = build_batch_prompt(messages, "", addressed=messages)
+    assert (
+        "- 多人同时问你：阿猫「@溟月 你用过吗」；小北「@溟月 别听他的」。" in prompt
+    )
+
+
+def test_batch_block_keeps_only_last_question_per_speaker() -> None:
+    """同一个人连问两条不算「多人同时问你」。"""
+    messages = [
+        make_msg("第一问", "m1", timestamp=at(21, 0), nickname="阿猫", at_bot=True),
+        make_msg("补充一下", "m2", timestamp=at(21, 1), nickname="阿猫", at_bot=True),
+    ]
+    prompt = build_batch_prompt(messages, "", addressed=messages)
+    assert "多人同时问你" not in prompt
+
+
+def test_batch_block_renders_discussion_edges_from_reply_ids() -> None:
+    messages = [
+        make_msg("这插件不行", "a1", timestamp=at(21, 0), nickname="阿猫"),
+        make_msg(
+            "你哪只眼睛看到不行",
+            "a2",
+            timestamp=at(21, 1),
+            nickname="小北",
+            reply_to_message_id="a1",
+        ),
+        make_msg(
+            "你这就人身攻击了",
+            "a3",
+            timestamp=at(21, 2),
+            nickname="橙子",
+            reply_to_message_id="a2",
+        ),
+    ]
+    prompt = build_batch_prompt(messages, "", addressed=[messages[1]])
+    assert "- 讨论结构：小北→阿猫；橙子→小北。" in prompt
+
+
+def test_discussion_edges_fall_back_to_author_and_skip_self() -> None:
+    """没有引用 id 时用引用作者；自己回自己不算边。"""
+    messages = [
+        make_msg(
+            "我错了", "a1", timestamp=at(21, 0), nickname="阿猫", reply_to_author="阿猫"
+        ),
+        make_msg(
+            "行吧", "a2", timestamp=at(21, 1), nickname="小北", reply_to_author="阿猫"
+        ),
+    ]
+    prompt = build_batch_prompt(messages, "", addressed=messages)
+    assert "- 讨论结构：小北→阿猫。" in prompt
+    assert "阿猫→阿猫" not in prompt
+
+
+def test_topic_anchor_is_clipped_to_40_chars() -> None:
+    long_text = "这" * 60
+    prompt = build_batch_prompt(
+        [
+            make_msg(long_text, "m1", timestamp=at(21, 0), nickname="阿猫"),
+            make_msg("第二句", "m2", timestamp=at(21, 1), nickname="小北"),
+        ],
+        "",
+    )
+    assert f"话题锚点：①「第二句」；②「{'这' * 40}…」" in prompt
 
 
 def test_batch_block_without_addressed_param_falls_back_to_flags() -> None:

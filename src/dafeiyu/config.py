@@ -55,6 +55,9 @@ class PersonaConfig:
     # 硬边界——整轮总字数与单条字数。超出才截断，不再按软目标砍尾。
     reply_hard_total: int = 2000
     reply_hard_part: int = 500
+    # 群聊里回复明显在对人说（第二人称/反驳词）且本批有多个发言人时，
+    # 自动 @ 被回应的那个人；只有一个发言人时不补 @。
+    auto_at_rebuttal: bool = True
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,10 @@ class MemoryConfig:
     rotation_messages: int = 60
     rotation_days: int = 7
     rotation_tokens: int = 40000
+    # 辩论态批次窗口：多人互相反驳时，固定 20 条只够看半场。检测到辩论
+    # 就放宽到这么多条，再用字符预算兜底；非辩论批次仍按 window_size 截断。
+    debate_window_messages: int = 40
+    debate_window_chars: int = 6000
 
 
 @dataclass(frozen=True)
@@ -2021,6 +2028,9 @@ def _build_persona(raw: dict[str, Any]) -> PersonaConfig:
         quote_reply=_bool(raw.get("quote_reply", True), "persona.quote_reply"),
         reply_hard_total=hard_total,
         reply_hard_part=hard_part,
+        auto_at_rebuttal=_bool(
+            raw.get("auto_at_rebuttal", True), "persona.auto_at_rebuttal"
+        ),
     )
 
 
@@ -2645,6 +2655,16 @@ def load_settings(
             ),
             rotation_tokens=_positive_int(
                 memory_raw.get("rotation_tokens"), "memory.rotation_tokens", 40000
+            ),
+            debate_window_messages=_positive_int(
+                memory_raw.get("debate_window_messages"),
+                "memory.debate_window_messages",
+                40,
+            ),
+            debate_window_chars=_positive_int(
+                memory_raw.get("debate_window_chars"),
+                "memory.debate_window_chars",
+                6000,
             ),
         ),
         injection=_build_injection(workspace_raw, memory_raw, mind),

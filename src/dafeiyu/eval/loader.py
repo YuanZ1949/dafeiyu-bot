@@ -156,6 +156,19 @@ def _parse_message(raw: Any, where: str, index: int) -> EvalMessage:
         timestamp=_as_int(
             raw.get("timestamp", 0), where, f"messages[{index}].timestamp"
         ),
+        id=_as_str(raw.get("id", ""), where, f"messages[{index}].id"),
+        reply_to_message_id=_as_optional_str(
+            raw.get("reply_to_message_id"), where, f"messages[{index}].reply_to_message_id"
+        ),
+        reply_to_author=_as_optional_str(
+            raw.get("reply_to_author"), where, f"messages[{index}].reply_to_author"
+        ),
+        at_all=_as_bool(
+            raw.get("at_all", False), where, f"messages[{index}].at_all"
+        ),
+        at_others=_as_bool(
+            raw.get("at_others", False), where, f"messages[{index}].at_others"
+        ),
     )
 
 
@@ -263,6 +276,12 @@ def _as_bool(value: Any, where: str, field: str) -> bool:
     if isinstance(value, bool):
         return value
     raise EvalError(f"{where}: {field} 必须是布尔值")
+
+
+def _as_optional_str(value: Any, where: str, field: str) -> str | None:
+    if value is None:
+        return None
+    return _as_str(value, where, field)
 
 
 def _as_str_list(value: Any, where: str, field: str) -> tuple[str, ...]:

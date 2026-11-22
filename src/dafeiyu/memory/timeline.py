@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 
 from dafeiyu.memory.store import Store
@@ -23,7 +23,7 @@ TIMELINE_HINT = (
 )
 BATCH_HEADER = "—— 以下是自你上次开口以来的新消息 ——"
 BATCH_BLOCK_HEADER = "【本批】"
-# 话题锚点取本批第一句的前 40 字，足够认出「在聊哪件事」，又不至于把整句搬进去。
+# 话题锚点每条最多 40 字：足够认出「在聊哪件事」，又不至于把整句搬进去。
 TOPIC_ANCHOR_CHARS = 40
 CONTINUATION_HEADER = "【接续】"
 EMPTY_CONTENT = "（无文字内容）"
@@ -149,14 +149,108 @@ def build_prompt(store: Store, msg: Message, limit: int = TIMELINE_LIMIT) -> str
     return build_delivery(store, msg, limit)[0]
 
 
+def _clip_text(text: str, limit: int = TOPIC_ANCHOR_CHARS) -> str:
+    clean = " ".join((text or "").replace("\n", " ").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit].rstrip() + "…"
+
+
+def _topic_anchors(
+    messages: list[Message], addressed: Sequence[Message]
+) -> list[str]:
+    """最多三个话题锚点：点名消息优先，其次末条，最后首条。
+
+    多人多话题并行时，只看「本批开头」会把真正的主辩题漏掉；点名消息
+    是机器人被拉进去的那条，末条是最新进展，两条都比首条更接近「现在
+    在聊什么」。
+    """
+    picks: list[Message] = []
+    picks.extend(reversed(list(addressed)[-2:]))
+    if messages:
+        picks.append(messages[-1])
+        picks.append(messages[0])
+    anchors: list[str] = []
+    seen: set[str] = set()
+    for message in picks:
+        text = _clip_text(message.content)
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        anchors.append(text)
+        if len(anchors) >= 3:
+            break
+    return anchors
+
+
+def _multi_addressed_line(addressed: Sequence[Message]) -> str:
+    """多人同时点名：列出每个人最后问的那句，提示问题可能不是同一件事。"""
+    latest: dict[str, Message] = {}
+    for message in addressed:
+        who = (message.nickname or "").strip()
+        if who:
+            latest[who] = message
+    if len(latest) < 2:
+        return ""
+    parts = [
+        f"{who}「{_clip_text(message.content, 30)}」"
+        for who, message in latest.items()
+    ]
+    return "- 多人同时问你：" + "；".join(parts) + "。"
+
+
+def _discussion_edges(
+    messages: Sequence[Message],
+    reply_names: Mapping[str, str] | None,
+) -> list[str]:
+    """把「谁在接谁」压成一行结构图，最多 8 条边。
+
+    时间线里每条消息虽然带引用标记，但纯文本反驳（「你这话不对」）看不出
+    对象；这里用引用 id / 引用作者补出 A→B 的边，让模型一眼看到谁在跟谁辩。
+    """
+    id_to_nick: dict[str, str] = {}
+    for message in messages:
+        if message.message_id and message.nickname:
+            id_to_nick[message.message_id] = message.nickname
+    if reply_names:
+        for message_id, nickname in reply_names.items():
+            if message_id and nickname:
+                id_to_nick.setdefault(message_id, nickname)
+    edges: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for message in messages:
+        who = (message.nickname or "").strip()
+        if message.is_bot or not who:
+            continue
+        target = ""
+        if message.reply_to_message_id:
+            target = id_to_nick.get(message.reply_to_message_id, "")
+        if not target:
+            target = (message.reply_to_author or "").strip()
+        if not target or target == who:
+            continue
+        key = (who, target)
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append(f"{who}→{target}")
+        if len(edges) >= 8:
+            break
+    return edges
+
+
 def _batch_block(
     messages: list[Message],
     *,
     mirror_count: int,
     mirror_speakers: Sequence[str],
     addressed: Sequence[Message],
+    reply_names: Mapping[str, str] | None = None,
 ) -> str:
-    """【本批】块：谁在说、谁在叫你、在聊什么、几条是转发的。
+    """【本批】块：谁在说、谁在叫你、在聊什么、谁在接谁、几条是转发的。
 
     build_batch_prompt 是纯函数：镜像条数由调用方（service）查库后传入，
     这里只渲染，绝不查库；addressed 也是调用方用 router.addressed_source
@@ -169,11 +263,21 @@ def _batch_block(
     if addressed:
         who = list(dict.fromkeys(m.nickname for m in addressed if m.nickname))
         lines.append(f"- 在跟你说话：{len(addressed)} 条（{'、'.join(who)}）。")
-    anchor = (messages[0].content or "").strip().replace("\n", " ")
-    if anchor:
-        clipped = anchor[:TOPIC_ANCHOR_CHARS]
-        ellipsis = "…" if len(anchor) > TOPIC_ANCHOR_CHARS else ""
-        lines.append(f"- 话题锚点：本批开头是「{clipped}{ellipsis}」。")
+        multi = _multi_addressed_line(addressed)
+        if multi:
+            lines.append(multi)
+    anchors = _topic_anchors(messages, addressed)
+    if len(anchors) == 1:
+        lines.append(f"- 话题锚点：「{anchors[0]}」")
+    elif anchors:
+        marks = ("①", "②", "③")
+        joined = "；".join(
+            f"{marks[index]}「{anchor}」" for index, anchor in enumerate(anchors)
+        )
+        lines.append(f"- 话题锚点：{joined}")
+    edges = _discussion_edges(messages, reply_names)
+    if edges:
+        lines.append("- 讨论结构：" + "；".join(edges) + "。")
     if mirror_count > 0:
         who = "、".join(dict.fromkeys(mirror_speakers))
         suffix = f"（{who}）" if who else ""
@@ -224,6 +328,7 @@ def build_batch_prompt(
                 mirror_count=mirror_count,
                 mirror_speakers=mirror_speakers,
                 addressed=addressed_msgs,
+                reply_names=reply_names,
             )
         )
     if injection.strip():

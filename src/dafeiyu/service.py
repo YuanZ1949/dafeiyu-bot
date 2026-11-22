@@ -29,6 +29,7 @@ from .brain.tokens import estimate_tokens, resolve_usage
 from .budget import BudgetAction, BudgetDecision, BudgetReport, estimate_cost
 from .commands import PRIVATE_UNRESTRICTED, CommandRegistry, CommandSpec
 from .config import GroupsConfig, InjectionConfig, Settings
+from .debate import pick_auto_at_target, render_ledger, update_ledger
 from .delivery.scheduler import BatchScheduler
 from .faces import face_id
 from .gateway.base import Adapter
@@ -2738,15 +2739,82 @@ class Service:
             return None
         return shape
 
+    def _is_debate_batch(self, batch: list[Message]) -> bool:
+        """多人互相接话/反驳的批次：放宽历史窗口，避免只看到半场。"""
+        speakers = {
+            (m.nickname or "").strip()
+            for m in batch
+            if not m.is_bot and (m.nickname or "").strip()
+        }
+        if len(speakers) < 2:
+            return False
+        if len(batch) >= 6 and len(speakers) >= 3:
+            return True
+        if any(
+            m.reply_to_message_id or m.reply_to_author or m.reply_to_bot
+            for m in batch
+            if not m.is_bot
+        ):
+            return True
+        markers = ("但是", "不过", "不对", "问题在于", "我不同意", "恰恰相反", "凭什么")
+        hit_speakers = {
+            (m.nickname or "").strip()
+            for m in batch
+            if not m.is_bot
+            and (m.nickname or "").strip()
+            and any(marker in (m.content or "") for marker in markers)
+        }
+        return len(hit_speakers) >= 2
+
+    def _fit_batch_window(self, batch: list[Message]) -> list[Message]:
+        """按「是否辩论 + 字符预算」裁剪批次；裁剪后仍保持时间正序。
+
+        非辩论批次维持 window_size；辩论批次放宽到 debate_window_messages，
+        再用 debate_window_chars 兜底。裁剪掉的是最旧的消息，backlog 计数
+        会由调用方按新首条重算，prompt 里仍会告诉模型「更早还有 N 条」。
+        """
+        if not batch:
+            return batch
+        memory = self.settings.memory
+        base = max(1, int(memory.window_size))
+        limit = (
+            max(base, int(memory.debate_window_messages))
+            if self._is_debate_batch(batch)
+            else base
+        )
+        limit = max(1, limit)
+        trimmed = batch[-limit:] if len(batch) > limit else list(batch)
+        budget = max(0, int(memory.debate_window_chars))
+        if not budget:
+            return trimmed
+        kept: list[Message] = []
+        total = 0
+        for message in reversed(trimmed):
+            size = len(message.content or "")
+            if kept and total + size > budget:
+                break
+            kept.append(message)
+            total += size
+        return list(reversed(kept)) or trimmed[-1:]
+
     async def _run_batch_locked(
         self, chat_type: ChatType, chat_id: str, *, force_release: bool = False
     ) -> None:
         latest = self.store.recent_messages(chat_type, chat_id, 1)
         if not latest:
             return
-        batch = self.store.pending_batch(chat_type, chat_id, latest[0].message_id)
+        batch = self.store.pending_batch(
+            chat_type,
+            chat_id,
+            latest[0].message_id,
+            limit=max(
+                max(1, int(self.settings.memory.window_size)),
+                max(1, int(self.settings.memory.debate_window_messages)),
+            ),
+        )
         if not batch:
             return
+        batch = self._fit_batch_window(batch)
 
         if batch[-1].recalled_at:
             # 触发这一轮的最后一条被撤回：整批不回复，但游标要推进，避免反复重试。
@@ -3673,6 +3741,9 @@ class Service:
             if addressing is not None:
                 # 影子对比：规则判了什么、模型最终说了没说，落在同一条决策里。
                 detail["addressing"] = {**addressing, "spoke": bool(reply.speak)}
+            if reply.target:
+                # to 字段回流：先积累统计，稳定后再决定是否强制路由。
+                detail["target"] = reply.target
             self._record_decision(
                 chat_type,
                 chat_id,
@@ -3730,6 +3801,14 @@ class Service:
         # 一个字节都不许发出去。
         attachments = self._safe_reply_attachments(reply, chat_type, chat_id)
         at_names = tuple(resolve_at_names(reply.at, batch))
+        if (
+            not at_names
+            and chat_type is ChatType.GROUP
+            and bool(getattr(self.settings.persona, "auto_at_rebuttal", True))
+        ):
+            auto_at = pick_auto_at_target(batch, reply_text)
+            if auto_at:
+                at_names = (auto_at,)
         at_qq_ids = self._at_qq_ids(at_names, batch)
         # 语音只在「成型后的单段、无 @」时附加；失败一律退回纯文本。
         voice = await self._voice_attachment(reply, chat_id, chunks, at_names)
@@ -3811,6 +3890,8 @@ class Service:
             self.router.note_bot_spoke(chat_type, chat_id, ambient=not addressed)
         # 即使中途失败，已经发出去的分片也要进入历史，避免上下文断裂。
         self._store_bot_chunks(batch[-1], sent, attachments=attachments)
+        if sent:
+            self._update_debate_ledger(chat_type, chat_id, batch, reply_text)
         preview = "".join(chunks)
         # 一个分片都没发出去才算失败：入队也失败时 defer 为 0，不能因为
         # 「没有待发」就误记成已回复。
@@ -3819,6 +3900,24 @@ class Service:
         else:
             record("replied", reply_preview=preview)
         return sent
+
+    def _update_debate_ledger(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        batch: list[Message],
+        reply_text: str,
+    ) -> None:
+        """发送成功后更新辩论账本；任何失败都不能影响回复主链路。"""
+        try:
+            raw = self.store.load_debate_ledger(chat_type, chat_id)
+            updated = update_ledger(raw, batch, reply_text, int(time.time()))
+            if updated != raw:
+                self.store.save_debate_ledger(chat_type, chat_id, updated)
+        except Exception:  # noqa: BLE001 - 账本是锦上添花
+            log.debug(
+                "辩论账本更新失败 %s/%s", chat_type.value, chat_id, exc_info=True
+            )
 
     async def _apply_restrictions(
         self, chat_type: ChatType, chat_id: str, text: str, *, addressed: bool
@@ -4282,6 +4381,17 @@ class Service:
         framing = self.behavior.framing()
         if framing:
             injection = f"{injection}\n\n{framing}" if injection.strip() else framing
+
+        ledger_block = render_ledger(
+            self.store.load_debate_ledger(chat_type, chat_id),
+            int(moment.timestamp()),
+        )
+        if ledger_block:
+            injection = (
+                f"{injection}\n\n{ledger_block}"
+                if injection.strip()
+                else ledger_block
+            )
 
         if fact_hint:
             injection = (

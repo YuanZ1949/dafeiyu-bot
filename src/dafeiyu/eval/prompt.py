@@ -56,10 +56,14 @@ def to_messages(case: EvalCase) -> list[Message]:
             user_id=item.user_id,
             nickname=item.nickname,
             content=item.content,
-            message_id=f"{case.id}:{index}",
+            message_id=item.id or f"{case.id}:{index}",
             at_bot=item.at_bot,
             reply_to_bot=item.reply_to_bot,
             timestamp=item.timestamp,
+            reply_to_message_id=item.reply_to_message_id,
+            reply_to_author=item.reply_to_author,
+            at_all=item.at_all,
+            at_others=item.at_others,
         )
         for index, item in enumerate(case.messages)
     ]
@@ -137,10 +141,17 @@ def compose_prompt(case: EvalCase, link_block: str) -> str:
     injection = build_injection(case.context)
     if link_block:
         injection = f"{link_block}\n\n{injection}" if injection else link_block
+    messages = to_messages(case)
+    reply_names = {
+        message.message_id: message.nickname
+        for message in messages
+        if message.message_id and message.nickname
+    }
     return build_batch_prompt(
-        to_messages(case),
+        messages,
         injection,
         continuation=case.context.continuation,
+        reply_names=reply_names or None,
     )
 
 

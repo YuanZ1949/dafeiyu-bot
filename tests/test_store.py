@@ -187,3 +187,51 @@ def test_recent_impressions_paginates_and_filters(store: Store) -> None:
         i.content
         for i in store.recent_impressions(limit=10, chat_type=ChatType.GROUP, chat_id=1)
     ] == ["喜欢猫"]
+
+
+def test_at_flags_survive_roundtrip(store: Store) -> None:
+    """历史重放时要能看出这句是广播/在叫别人，而不是在叫 bot。"""
+    store.add_message(
+        Message(
+            chat_type=ChatType.GROUP,
+            chat_id="1",
+            user_id="2",
+            nickname="鱼片",
+            content="@所有人 开会了",
+            message_id="m1",
+            at_all=True,
+            at_others=True,
+        )
+    )
+
+    got = store.recent_messages(ChatType.GROUP, "1", limit=1)[0]
+    assert got.at_all is True
+    assert got.at_others is True
+    assert got.at_bot is False
+
+
+def test_debate_ledger_roundtrip_and_isolated(store: Store) -> None:
+    assert store.load_debate_ledger(ChatType.GROUP, "1") == ""
+
+    store.save_debate_ledger(ChatType.GROUP, "1", "[]")
+    assert store.load_debate_ledger(ChatType.GROUP, "1") == "[]"
+
+    store.save_debate_ledger(ChatType.GROUP, "1", '[{"kind": "open"}]')
+    assert store.load_debate_ledger(ChatType.GROUP, "1") == '[{"kind": "open"}]'
+    assert store.load_debate_ledger(ChatType.PRIVATE, "1") == ""
+
+
+def test_debate_ledger_does_not_clobber_chat_state(store: Store) -> None:
+    """账本只写自己那一列，别的运行状态不能被覆盖。"""
+    store.save_chat_state(
+        ChatType.GROUP, "1", {"thread_closed_until": 123.0, "last_closed_at": 100.0}
+    )
+    store.save_debate_ledger(ChatType.GROUP, "1", "[]")
+
+    row = store._conn.execute(
+        "SELECT thread_closed_until, debate_ledger FROM chat_state "
+        "WHERE chat_type = ? AND chat_id = ?",
+        (ChatType.GROUP.value, "1"),
+    ).fetchone()
+    assert row["thread_closed_until"] == 123.0
+    assert row["debate_ledger"] == "[]"

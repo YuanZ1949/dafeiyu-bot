@@ -510,3 +510,107 @@ async def test_quiet_mode_alias_mention_still_reaches_the_model(tmp_path):
 
     assert brain.reply_calls == 1
     assert adapter.sent
+
+
+# ---- 辩论态批次窗口 -------------------------------------------------------
+
+
+def debate_msg(
+    content: str,
+    message_id: str,
+    nickname: str,
+    *,
+    reply_to_bot: bool = False,
+    reply_to_message_id: str | None = None,
+) -> Message:
+    return Message(
+        chat_type=ChatType.GROUP,
+        chat_id="qq:1001",
+        user_id="qq:2002",
+        nickname=nickname,
+        content=content,
+        message_id=message_id,
+        segments=[],
+        is_bot=False,
+        at_bot=False,
+        reply_to_bot=reply_to_bot,
+        reply_to_message_id=reply_to_message_id,
+        timestamp=0,
+    )
+
+
+def bare_service() -> Service:
+    """只测纯函数，不建库、不起协程。"""
+    service = object.__new__(Service)
+    setattr(service, "settings", make_settings())
+    return service
+
+
+def test_is_debate_batch_detects_quote_chains() -> None:
+    service = bare_service()
+    batch = [
+        debate_msg("这插件不行", "a1", "阿猫"),
+        debate_msg("你哪只眼睛看到不行", "a2", "小北", reply_to_message_id="a1"),
+    ]
+    assert service._is_debate_batch(batch) is True
+
+
+def test_is_debate_batch_detects_rebuttal_from_two_speakers() -> None:
+    service = bare_service()
+    batch = [
+        debate_msg("我觉得不行", "a1", "阿猫"),
+        debate_msg("不对，你只看了截图", "a2", "小北"),
+        debate_msg("但是作者说能用", "a3", "橙子"),
+    ]
+    assert service._is_debate_batch(batch) is True
+
+
+def test_is_debate_batch_false_for_casual_chat() -> None:
+    service = bare_service()
+    batch = [
+        debate_msg("今天好热", "a1", "阿猫"),
+        debate_msg("是啊", "a2", "小北"),
+    ]
+    assert service._is_debate_batch(batch) is False
+
+
+def test_fit_batch_window_keeps_window_size_for_casual_chat() -> None:
+    service = bare_service()
+    batch = [
+        debate_msg(f"闲聊{index}", f"m{index}", "阿猫") for index in range(30)
+    ]
+    assert len(service._fit_batch_window(batch)) == 20
+    assert service._fit_batch_window(batch)[-1].content == "闲聊29"
+
+
+def test_fit_batch_window_widens_for_debate() -> None:
+    service = bare_service()
+    batch = [
+        debate_msg(f"你说得不对{index}", f"m{index}", f"人{index % 3}")
+        for index in range(30)
+    ]
+    assert service._is_debate_batch(batch) is True
+    assert len(service._fit_batch_window(batch)) == 30
+
+
+def test_fit_batch_window_respects_char_budget() -> None:
+    service = bare_service()
+    batch = [
+        debate_msg("你" * 500, f"m{index}", f"人{index % 3}") for index in range(40)
+    ]
+    kept = service._fit_batch_window(batch)
+    assert len(kept) < 40
+    assert sum(len(m.content) for m in kept) <= 6000
+    # 裁掉的是最旧的消息，最新一条必须保留。
+    assert kept[-1].message_id == "m39"
+
+
+def test_fit_batch_window_keeps_one_message_when_budget_is_tiny() -> None:
+    service = bare_service()
+    settings = make_settings()
+    object.__setattr__(
+        settings, "memory", MemoryConfig(20, 5, 20, debate_window_chars=1)
+    )
+    setattr(service, "settings", settings)
+    batch = [debate_msg("很长的一句话", "m1", "阿猫")]
+    assert [m.message_id for m in service._fit_batch_window(batch)] == ["m1"]

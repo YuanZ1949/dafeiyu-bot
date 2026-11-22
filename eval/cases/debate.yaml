@@ -1,0 +1,104 @@
+# 多人辩论相关的能力回归：多锚点、多人同时点名、讨论结构图、广播标记。
+# 全部只断言提示词证据（离线、不联网、不调模型）。
+
+- id: debate-multi-anchor
+  description: 多人同时点名 → 多个话题锚点 + 多人同时问你
+  chat_type: group
+  chat_id: qq:1001
+  context:
+    summary: ""
+  messages:
+    - user_id: "2002"
+      nickname: 阿猫
+      content: "翻译插件到底靠不靠谱"
+      timestamp: 1761888000
+    - user_id: "2003"
+      nickname: 小北
+      content: "@大肥鱼 你用过吗"
+      at_bot: true
+      timestamp: 1761888010
+    - user_id: "2004"
+      nickname: 橙子
+      content: "@大肥鱼 别听他的"
+      at_bot: true
+      timestamp: 1761888020
+    - user_id: "2002"
+      nickname: 阿猫
+      content: "我也想知道"
+      timestamp: 1761888030
+  expect:
+    prompt_must_contain:
+      - 【本批】这一批共 4 条消息，说话人：阿猫、小北、橙子。
+      - 在跟你说话：2 条（小北、橙子）
+      - 多人同时问你：小北「@大肥鱼 你用过吗」；橙子「@大肥鱼 别听他的」。
+      - 话题锚点：①「@大肥鱼 别听他的」；②「@大肥鱼 你用过吗」；③「我也想知道」
+    min_chars: 1
+    max_chars: 120
+    must_not_contain: []
+
+- id: debate-structure-edges
+  description: 引用回复连成边 → 讨论结构图能看出谁在跟谁辩
+  chat_type: group
+  chat_id: qq:1001
+  context:
+    summary: ""
+  messages:
+    - user_id: "2002"
+      nickname: 阿猫
+      content: "我觉得这插件不行"
+      id: a1
+      timestamp: 1761888000
+    - user_id: "2003"
+      nickname: 小北
+      content: "你哪只眼睛看到不行"
+      id: a2
+      reply_to_message_id: a1
+      timestamp: 1761888010
+    - user_id: "2004"
+      nickname: 橙子
+      content: "小北你这就人身攻击了"
+      id: a3
+      reply_to_message_id: a2
+      timestamp: 1761888020
+    - user_id: "2002"
+      nickname: 阿猫
+      content: "行行行我错了"
+      id: a4
+      reply_to_message_id: a3
+      reply_to_author: 橙子
+      timestamp: 1761888030
+  expect:
+    prompt_must_contain:
+      - 讨论结构：小北→阿猫；橙子→小北；阿猫→橙子。
+      - （回复 阿猫）
+      - （回复 小北）
+    min_chars: 1
+    max_chars: 120
+    must_not_contain: []
+
+- id: debate-broadcast-marks
+  description: 广播与 @ 别人 → 时间线标出「不是叫你」
+  chat_type: group
+  chat_id: qq:1001
+  context:
+    summary: ""
+  messages:
+    - user_id: "2002"
+      nickname: 阿猫
+      content: "全体注意，明天停服维护"
+      at_all: true
+      timestamp: 1761888000
+    - user_id: "2003"
+      nickname: 小北
+      content: "收到"
+      at_others: true
+      timestamp: 1761888010
+  expect:
+    prompt_must_contain:
+      - （@所有人）
+      - （@了别的群友）
+    prompt_must_not_contain:
+      - （@了你）
+    min_chars: 1
+    max_chars: 120
+    must_not_contain: []
