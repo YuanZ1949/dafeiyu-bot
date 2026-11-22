@@ -12,7 +12,7 @@ DEFAULT_OS_PROBABILITY = 0.05
 TOOLS_START = "<!-- tools:start -->"
 TOOLS_END = "<!-- tools:end -->"
 
-NO_TOOLS_SECTION = """## 六、你现在没有工具
+NO_TOOLS_SECTION = """## 七、你现在没有工具
 
 - 这一轮你只能聊天：不能读写工作区、不能上网查网页、不能执行命令。
 - 被问到实时信息、链接内容或本地文件时，直说「这个本鱼现在查不了」，再凭已有知识回答，并说明可能过时。
