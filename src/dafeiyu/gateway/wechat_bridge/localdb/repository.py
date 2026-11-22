@@ -153,6 +153,8 @@ _SENDER_PREFIX_RE = re.compile(r"^([^:\r\n]{1,128}):\r?\n")
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.DOTALL)
 _APPMSG_TYPE_RE = re.compile(r"<type[^>]*>\s*(\d+)\s*</type>", re.DOTALL)
+#: 链接卡片的可点目标；``<cdnthumburl>`` 之类不会误中（标签名必须正好是 url）。
+_APPMSG_URL_RE = re.compile(r"<url[^>]*>(.*?)</url>", re.DOTALL)
 _REFER_AUTHOR_RE = re.compile(r"<displayname[^>]*>(.*?)</displayname>", re.DOTALL)
 _REFER_CONTENT_RE = re.compile(r"<content[^>]*>(.*?)</content>", re.DOTALL)
 
@@ -1229,7 +1231,7 @@ def _render_emoji(body: str) -> str:
 
 
 def _render_appmsg(body: str) -> tuple[str, str, str, str]:
-    title, appmsg_type, refer_author, refer_content = _appmsg_fields(body)
+    title, appmsg_type, refer_author, refer_content, url = _appmsg_fields(body)
     if appmsg_type == str(_APPMSG_QUOTE):
         # 引用回复仍属于 appmsg；kind 用 quote 让下游能区分普通链接。
         return "quote", title, refer_content, refer_author
@@ -1245,8 +1247,23 @@ def _render_appmsg(body: str) -> tuple[str, str, str, str]:
         # 视频号的 <title> 是「当前版本不支持展示该内容」这类模板文案，真正
         # 内容在 <finderFeed> 里；kind 仍按链接归类（无附件、无媒体下载）。
         return "link", finder, "", ""
-    # 解析失败/没有 title 就是空文本：宁可这条气泡没有正文，也不伪造 "[链接]"。
-    return "link", title, "", ""
+    # 普通链接/分享卡片：标题之外必须带上 <url>，否则跨平台转发时链接本身
+    # 直接丢失（实测知乎卡片到 QQ 只剩标题 + 一个无用的 [链接] 占位）。
+    return "link", _link_text(title, url), "", ""
+
+
+def _link_text(title: str, url: str) -> str:
+    """链接卡片正文：``标题\\n链接``；任一缺失时只发另一个。
+
+    换行而不是空格，是为了让长链接（知乎问题 id、带 utm 参数）不被标题挤成
+    一整行；两端客户端都会把裸链接渲染成可点的文本。标题里的换行/连续空白
+    压成单空格，避免一张卡片把气泡撑成多段。
+    """
+    title = " ".join(title.split())
+    url = url.strip()
+    if title and url:
+        return f"{title}\n{url}"
+    return title or url
 
 
 def _finder_share(body: str) -> str | None:
@@ -1309,11 +1326,12 @@ def _regex_int(pattern: re.Pattern[str], text: str) -> int:
     return _safe_int(match.group(1))
 
 
-def _appmsg_fields(body: str) -> tuple[str, str, str, str]:
-    """从 appmsg XML 取 ``(title, type, refer displayname, refer content)``。
+def _appmsg_fields(body: str) -> tuple[str, str, str, str, str]:
+    """从 appmsg XML 取 ``(title, type, refer displayname, refer content, url)``。
 
     ElementTree 优先；微信 XML 常有未转义字符/未闭合标签，解析失败时回退正则；
-    回退也拿不到就返回空串——绝不抛异常。
+    回退也拿不到就返回空串——绝不抛异常。``url`` 是链接卡片唯一的可点目标，
+    解析不出来时正文只剩标题（旧行为），因此这里同样走两级兜底。
     """
     root = _parse_xml(body)
     if root is not None:
@@ -1322,12 +1340,14 @@ def _appmsg_fields(body: str) -> tuple[str, str, str, str]:
             _node_text(root, ".//appmsg/type"),
             _node_text(root, ".//refermsg/displayname"),
             _node_text(root, ".//refermsg/content"),
+            _node_text(root, ".//appmsg/url"),
         )
     return (
         _regex_text(_TITLE_RE, body),
         _regex_text(_APPMSG_TYPE_RE, body),
         _regex_text(_REFER_AUTHOR_RE, body),
         _regex_text(_REFER_CONTENT_RE, body),
+        _regex_text(_APPMSG_URL_RE, body),
     )
 
 

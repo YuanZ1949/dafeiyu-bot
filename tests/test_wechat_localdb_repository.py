@@ -476,11 +476,11 @@ def test_image_message_becomes_placeholder(tmp_path: Path) -> None:
     assert entry["nickname"] == "阿甲"
 
 
-def test_appmsg_link_uses_title(tmp_path: Path) -> None:
+def test_appmsg_link_keeps_title_and_url(tmp_path: Path) -> None:
     xml = (
         "<?xml version='1.0'?>"
         "<msg><appmsg><title>这是一条链接标题</title><type>5</type>"
-        "<url>https://example.com</url></appmsg></msg>"
+        "<url>https://example.com/a?b=1&amp;c=2</url></appmsg></msg>"
     )
     store, ref = _store_with_single_message(
         tmp_path, text_row(3, f"wxid_a:\n{xml}", local_type=49)
@@ -489,9 +489,44 @@ def test_appmsg_link_uses_title(tmp_path: Path) -> None:
     entry = store.recent(ref)[0]
 
     assert entry["kind"] == "link"
-    assert entry["text"] == "这是一条链接标题"
+    # 标题之外必须保留 <url>：跨平台转发时它是唯一能点开的目标。
+    assert entry["text"] == "这是一条链接标题\nhttps://example.com/a?b=1&c=2"
     assert entry["reply_to"] == ""
     assert entry["reply_author"] == ""
+
+
+def test_appmsg_link_without_title_keeps_url(tmp_path: Path) -> None:
+    """标题解析不出来时不能把链接一起丢掉。"""
+    xml = (
+        "<msg><appmsg><type>5</type>"
+        "<url>https://example.com/only-url</url></appmsg></msg>"
+    )
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, f"wxid_a:\n{xml}", local_type=49)
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["kind"] == "link"
+    assert entry["text"] == "https://example.com/only-url"
+
+
+def test_appmsg_link_broken_xml_falls_back_to_regex_and_unescapes_url(
+    tmp_path: Path,
+) -> None:
+    # 未转义的 "&" 让 ElementTree 解析失败；正则兜底仍要取到 url 并还原实体。
+    xml = (
+        "<msg><appmsg><title>标题 & 副标题</title><type>5</type>"
+        "<url>https://example.com/p?a=1&amp;b=2</url>"
+    )
+    store, ref = _store_with_single_message(
+        tmp_path, text_row(3, f"wxid_a:\n{xml}", local_type=49)
+    )
+
+    entry = store.recent(ref)[0]
+
+    assert entry["kind"] == "link"
+    assert entry["text"] == "标题 & 副标题\nhttps://example.com/p?a=1&b=2"
 
 
 def test_finder_share_renders_readable_text(tmp_path: Path) -> None:

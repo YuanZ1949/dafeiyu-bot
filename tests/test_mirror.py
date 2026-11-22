@@ -222,6 +222,23 @@ def test_render_wechat_link_card_keeps_title(tmp_path: Path) -> None:
     assert "[链接]" not in wire[0]
 
 
+def test_render_wechat_link_card_with_url_keeps_both_lines(tmp_path: Path) -> None:
+    """标题 + 链接两行都要转发；桥接不再伪造 link 占位附件。
+
+    线上事故：微信知乎卡片到 QQ 变成「标题 [链接]」，``<url>`` 根本没被
+    提取，收件人点不开原文。
+    """
+    router, _store, _adapters = make_router(tmp_path)
+    url = "https://www.zhihu.com/question/2107239235015263538"
+    message = make_msg(WXG, f"数学家称与 AI 合作证明了黎曼猜想\n{url}", user_id="wxg:human", kind="link")
+    assert render(router, message) == [f"阿鱼：数学家称与 AI 合作证明了黎曼猜想\n{url}"]
+    wire = render_wire(router, message)
+    assert len(wire) == 1
+    assert url in wire[0]
+    assert "[链接]" not in wire[0]
+    assert "[link]" not in wire[0]
+
+
 def test_render_wechat_link_card_without_title_keeps_chinese_placeholder(
     tmp_path: Path,
 ) -> None:

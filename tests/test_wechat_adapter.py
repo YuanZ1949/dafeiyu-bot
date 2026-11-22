@@ -650,6 +650,33 @@ async def test_message_non_text_kind_with_empty_text_has_no_placeholder() -> Non
     assert message.attachments == []
 
 
+async def test_message_link_kind_keeps_text_without_placeholder_attachment() -> None:
+    """链接/引用/卡片的正文就是全部内容：不再伪造同名占位附件。
+
+    伪造的 ``Attachment(kind="link")`` 会让镜像多渲染一个 ``[链接]``，
+    实测微信知乎卡片到 QQ 变成「标题 [链接]」，而链接本身已经被丢掉。
+    """
+    text = "这是一条链接标题\nhttps://example.com/a"
+    envelope = message_envelope(text=text, kind="link")
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.kind == "link"
+    assert message.content == text
+    assert message.attachments == []
+
+
+@pytest.mark.parametrize("kind", ["quote", "card"])
+async def test_message_textual_kinds_have_no_placeholder_attachment(
+    kind: str,
+) -> None:
+    envelope = message_envelope(text="正文", kind=kind)
+    message = WeChatAdapter(make_config(1))._parse_message(envelope)
+
+    assert message is not None
+    assert message.attachments == []
+
+
 @pytest.mark.parametrize("raw_kind", [None, [], "  ", 7])
 async def test_message_kind_normalizes_without_raising(raw_kind: object) -> None:
     envelope = message_envelope(kind=raw_kind)

@@ -75,6 +75,10 @@ _MESSAGE_KINDS = frozenset(
         "forward",
     }
 )
+#: 正文本身已是全部内容的 kind：再伪造一个同名占位附件，镜像到 QQ 会多出
+#: 一个 ``[链接]`` / ``[引用]``。标题/正文已经在 content 里，占位只是噪音
+#: （真实事故：微信知乎卡片到 QQ 变成「标题 [链接]」，链接本身反而丢了）。
+_TEXTUAL_KINDS = frozenset({"text", "link", "quote", "card"})
 _DESKTOPS = ("interactive", "locked", "no_wechat")
 _SENT_ECHO_MAX = 200
 #: 身份未知（入站没有 user_id）时允许的纯文本回声匹配窗口：必须远小于
@@ -624,7 +628,7 @@ class WeChatAdapter:
                         fallbacks=_str_tuple(media.get("fallbacks")),
                     )
                 ]
-        if kind != "text" and content:
+        if kind not in _TEXTUAL_KINDS and content:
             return [Attachment(kind=kind, name=content[:60])]
         return []
 

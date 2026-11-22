@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 import uuid
 from collections import deque
@@ -116,6 +117,10 @@ _UNKNOWN_PLACEHOLDER = "[其它消息]"
 
 #: 气泡内容行的左锚字符。
 _BAR = "│"
+
+#: 独占一行的裸链接：气泡按列宽换行会把它拆成几行，客户端就不再把它当链接
+#: （点不开）。这类行整行保留，宁可超宽也不折断。
+_BARE_URL_RE = re.compile(r"https?://\S+\Z", re.IGNORECASE)
 
 
 class RenderedLines(NamedTuple):
@@ -1565,6 +1570,11 @@ class MirrorRouter:
         limit = self.settings.mirror.bubble_max_content_width
         inner: list[str] = []
         for raw_line in text.split("\n"):
+            line = raw_line.strip()
+            if _BARE_URL_RE.match(line):
+                # 裸链接不换行：折断后客户端不会把它识别成可点链接。
+                inner.append(line)
+                continue
             inner.extend(wrap_by_width(raw_line, limit))
         if not inner:
             return corners[2]
