@@ -34,6 +34,7 @@ from .backup import BackupManager
 from .control_token import TOKEN_PATH, ControlToken
 from .dashboard import serve
 from .health import HealthMonitor
+from .hook_watch import hook_loop
 from .lan_access import PASSWORD_PATH as DASHBOARD_PASSWORD_PATH
 from .lan_access import (
     dashboard_urls,
@@ -790,6 +791,19 @@ async def run() -> int:
         tasks.append(asyncio.create_task(alert_loop(ops, settings, stop), name="alert-loop"))
     if settings.backup.enabled:
         tasks.append(asyncio.create_task(backup_loop(ops, settings, stop), name="backup-loop"))
+    if (
+        wechat_enabled_for(settings)
+        and settings.wechat.outbound in ("hook", "auto")
+        and settings.wechat.hook_url
+    ):
+        # hook 不是 supervisor 的子进程（start-all.ps1 先单独拉起），它自己退出
+        # 后没人补位，bridge 只会每分钟告警。这里补一个看门狗负责重新拉起。
+        tasks.append(
+            asyncio.create_task(
+                hook_loop(settings.wechat.hook_url, settings.wechat.account, stop),
+                name="hook-loop",
+            )
+        )
 
     clean = True
     try:

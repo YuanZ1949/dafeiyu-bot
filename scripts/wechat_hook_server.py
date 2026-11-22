@@ -51,6 +51,29 @@ log = logging.getLogger("wechat-hook")
 # --------------------------------------------------------------------------- 后端
 
 
+def _service_stopped(service: Any) -> bool:
+    """helper 的接收线程是否已自行退出。
+
+    helper 在账号切换、注入失败、微信换进程时会自己 ``_stop.set()`` 并结束
+    接收线程，但不会通知 hook；只检查 ``self._service is service`` 会让 hook
+    变成「端口还在、ready 还是 true、发送全失败」的僵尸。这里直接看 helper
+    的两个私有生命周期标记（跨仓库约定，helper 侧改动需同步本函数）。
+    """
+    stop = getattr(service, "_stop", None)
+    if stop is not None and stop.is_set():
+        return True
+    thread = getattr(service, "_thread", None)
+    return thread is not None and not thread.is_alive()
+
+
+def _service_error(service: Any) -> str:
+    """把 helper 自己记下的最后一个异常转成可读文本。"""
+    error = getattr(service, "last_error", None)
+    if error is None:
+        return ""
+    return f"{type(error).__name__}: {error}"
+
+
 class HookBackend:
     """把 helper 的 NativeTextService 包成「可重连 + 线程安全」的后端。"""
 
@@ -84,17 +107,24 @@ class HookBackend:
 
     @property
     def ready(self) -> bool:
-        return self._ready.is_set() and self._service is not None
+        service = self._service
+        if service is None or not self._ready.is_set():
+            return False
+        # helper 自行退出后 _service 还挂着，必须一并判掉，否则 /health 谎报就绪。
+        return not _service_stopped(service)
 
     def health(self) -> dict[str, Any]:
         service = self._service
+        last_error = self.last_error
+        if service is not None:
+            last_error = last_error or _service_error(service)
         payload: dict[str, Any] = {
             "ok": self.ready,
             "ready": self.ready,
             "self_wxid": getattr(service, "self_wxid", "") if service is not None else "",
             "wechat_version": self.wechat_version,
             "account": self.account or "",
-            "last_error": self.last_error,
+            "last_error": last_error,
         }
         payload.update(self._helper_frame())
         return payload
@@ -154,10 +184,19 @@ class HookBackend:
                 log.info("helper 原生桥就绪：wxid=%s 微信版本=%s",
                          getattr(service, "self_wxid", "?"), self.wechat_version or "?")
                 while not self._stop.is_set() and self._service is service:
+                    if _service_stopped(service):
+                        break
                     time.sleep(0.5)
+                stopped = _service_stopped(service)
                 if self._service is service:
                     self._service = None
                 self._ready.clear()
+                if stopped and not self._stop.is_set():
+                    # 微信换进程 / 账号切换 / 注入失败：helper 已自行停止，
+                    # 保留错误并重建，别让 hook 挂着旧服务装死。
+                    self.last_error = _service_error(service) or self.last_error
+                    log.warning("helper 原生桥已停止（%s），重建中",
+                                self.last_error or "未知原因")
                 try:
                     service.stop()
                 except Exception:  # noqa: BLE001

@@ -178,6 +178,36 @@ def test_health_reports_backend_state():
     assert body["self_wxid"] == "wxid_test"
 
 
+def _fake_service(*, stop: bool = False, alive: bool = True, error=None):
+    class FakeService:
+        def __init__(self) -> None:
+            self._stop = threading.Event()
+            if stop:
+                self._stop.set()
+            self._thread = types.SimpleNamespace(is_alive=lambda: alive)
+            self.last_error = error
+
+    return FakeService()
+
+
+def test_service_stopped_detects_stop_event_and_dead_thread():
+    assert hook._service_stopped(_fake_service(stop=True)) is True
+    assert hook._service_stopped(_fake_service(alive=False)) is True
+    assert hook._service_stopped(_fake_service()) is False
+    assert hook._service_stopped(types.SimpleNamespace()) is False
+
+
+def test_backend_is_not_ready_after_helper_dies(tmp_path):
+    backend = hook.HookBackend(tmp_path)
+    backend._service = _fake_service(stop=True, error=RuntimeError("账号变化"))
+    backend._ready.set()
+
+    assert backend.ready is False
+    health = backend.health()
+    assert health["ready"] is False
+    assert health["last_error"] == "RuntimeError: 账号变化"
+
+
 def test_token_is_enforced_when_configured():
     backend = FakeBackend()
     server, base = _serve(backend, token="s3cret")
