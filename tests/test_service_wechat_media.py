@@ -517,7 +517,10 @@ async def test_qq_file_download_replaces_placeholder_once(tmp_path, monkeypatch)
     assert attachment.name == "report.pdf"
     assert attachment.size == len(PNG)
     # todo-9 的 [文件] report.pdf 占位行被原位替换，不会出现第二行 [文件]。
-    assert msg.content == f"[文件] report.pdf (files/{Path(attachment.path).name})"
+    # 注记路径带上 workspace 前缀，模型 cwd 是仓库根时 read 得到。
+    assert msg.content == (
+        f"[文件] report.pdf ({(tmp_path / attachment.path).as_posix()})"
+    )
     assert msg.content.count("[文件] report.pdf") == 1
     # 落盘文件真实存在且字节一致（与 images/ 互不干扰）。
     stored = tmp_path / attachment.path

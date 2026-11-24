@@ -434,11 +434,12 @@ async def _materialize_voice(
         return attachment
 
     relative = _materialized_relative(target, root) or f"voices/{target.name}"
+    view = _view_path(root, relative)
     duration = int(getattr(attachment, "duration", 0) or 0)
     max_seconds = int(getattr(cfg, "max_seconds", 0) or 0)
     if max_seconds > 0 and duration > max_seconds:
         suffix = (
-            f"（太长，未转写；原文件 {relative}）"
+            f"（太长，未转写；原文件 {view}）"
             if annotate
             else "（太长，未转写）"
         )
@@ -447,13 +448,13 @@ async def _materialize_voice(
         text = await speech.transcribe(target, settings)
         if text:
             suffix = (
-                f"（转写：{text}，原文件 {relative}）"
+                f"（转写：{text}，原文件 {view}）"
                 if annotate
                 else f"（转写：{text}）"
             )
         else:
             suffix = (
-                f"（听不清，原文件 {relative}）" if annotate else "（听不清）"
+                f"（听不清，原文件 {view}）" if annotate else "（听不清）"
             )
     msg.content = _annotate_voice(msg.content, suffix)
     return Attachment(
@@ -474,6 +475,23 @@ def _materialized_relative(path: Path, root: Path) -> str | None:
         return None
 
 
+def _view_path(root: Path, relative: str) -> str:
+    """模型侧可 ``read`` 的注记路径：带上 workspace 目录前缀。
+
+    模型 cwd 是仓库根、只被授权读写 ``data/bot-workspace/`` 下文件；裸的
+    ``images/xxx`` 会被解析到仓库根且不在允许目录，``read`` 直接失败（此前
+    只有 QQ 侧图片能看，因为 ``images.py`` 一直注记 ``target.as_posix()``）。
+    这里与它对齐，得到 ``data/bot-workspace/images/xxx``。
+
+    只影响注记文本；附件 ``path`` 仍是 workspace 相对路径（镜像与看板的
+    ``resolve_media_path`` 靠它定位）。
+    """
+    candidate = Path(relative)
+    if candidate.is_absolute():
+        return relative
+    return (root / candidate).as_posix()
+
+
 def _cleanup(directory: Path, retention_days: int) -> None:
     """惰性清理：retention_days>0 时删掉过期文件。0 = 不清理。"""
     if retention_days <= 0:
@@ -491,9 +509,9 @@ def _cleanup(directory: Path, retention_days: int) -> None:
             log.debug("清理过期图片失败：%s", entry, exc_info=True)
 
 
-def _file_note(attachment: Attachment) -> str:
+def _file_note(attachment: Attachment, root: Path) -> str:
     name = attachment.name or Path(attachment.path).name
-    return f"{_FILE_PREFIX} {name} ({attachment.path})"
+    return f"{_FILE_PREFIX} {name} ({_view_path(root, attachment.path)})"
 
 
 def _probe_duration(ffmpeg: str, ffprobe: str | None, source: Path) -> float:
@@ -853,12 +871,15 @@ async def _materialize_video(
 
     frames: list[str] = []
     if annotate and video_path is not None:
-        frames = await _extract_video_frames(root, video_path, digest)
+        frames = [
+            _view_path(root, item)
+            for item in await _extract_video_frames(root, video_path, digest)
+        ]
     if annotate:
         suffix_text = (
-            f"（已抽帧 {'、'.join(frames)}，可用 read 查看；原文件 {stored}）"
+            f"（已抽帧 {'、'.join(frames)}，可用 read 查看；原文件 {_view_path(root, stored)}）"
             if frames
-            else f"（原文件 {stored}，无法抽帧）"
+            else f"（原文件 {_view_path(root, stored)}，无法抽帧）"
         )
         msg.content = _annotate_video(msg.content, suffix_text)
 
@@ -1063,7 +1084,7 @@ async def materialize_attachments(
                         updated.append(attachment)
                         continue
                     name = attachment.name or target.name
-                    note = f"{_FILE_PREFIX} {name} (files/{target.name})"
+                    note = f"{_FILE_PREFIX} {name} ({_view_path(root, f'files/{target.name}')})"
                     msg.content = _upsert_file_note(msg.content, name, note)
                     try:
                         size = target.stat().st_size
@@ -1074,7 +1095,7 @@ async def materialize_attachments(
                     )
                     done += 1
                     continue
-                note = _file_note(attachment)
+                note = _file_note(attachment, root)
                 if note not in msg.content:
                     msg.content = (
                         f"{msg.content}\n{note}" if msg.content else note
@@ -1240,37 +1261,41 @@ async def materialize_attachments(
             except OSError:
                 size = len(data)
             relative = _materialized_relative(target, root) or (f"images/{target.name}")
+            view = _view_path(root, relative)
             if target.suffix.lower() == ".gif":
                 # 动图首帧常是空白（微信动图实测）：抽几帧 jpg 再给模型看。
                 # 先本地数帧：<= 2 帧是「伪动图」（静态图被容器封装成两帧），
                 # 只保留最佳帧，注记也不写「动图」，免得模型以为画面会动。
                 gif_count = _gif_frame_count(data)
-                frames = (
-                    await _extract_gif_frames(
-                        root, target, target.stem, count=gif_count
+                frames = [
+                    _view_path(root, item)
+                    for item in (
+                        await _extract_gif_frames(
+                            root, target, target.stem, count=gif_count
+                        )
+                        if annotate
+                        else []
                     )
-                    if annotate
-                    else []
-                )
+                ]
                 if frames and 0 < gif_count <= _STILL_GIF_FRAMES:
                     msg.content = _annotate_first(
                         msg.content,
                         f"[图片]（图存 {frames[0]}，可用 read 查看；"
-                        f"原文件 {relative}）",
+                        f"原文件 {view}）",
                     )
                 elif frames:
                     msg.content = _annotate_first(
                         msg.content,
                         f"[图片]（动图，已抽帧 {'、'.join(frames)}，"
-                        f"可用 read 查看；原文件 {relative}）",
+                        f"可用 read 查看；原文件 {view}）",
                     )
                 else:
                     msg.content = _annotate_first(
-                        msg.content, _ANNOTATED.format(path=relative)
+                        msg.content, _ANNOTATED.format(path=view)
                     )
             else:
                 msg.content = _annotate_first(
-                    msg.content, _ANNOTATED.format(path=relative)
+                    msg.content, _ANNOTATED.format(path=view)
                 )
             updated.append(
                 Attachment(

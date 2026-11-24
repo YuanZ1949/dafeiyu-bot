@@ -1133,7 +1133,7 @@ async def test_retry_pending_media_backfills_batch_content(tmp_path, monkeypatch
     service._queue_media_retry(_image_message())
     _wire_resolver(service, key=object())
 
-    async def fake_materialize(message, settings, *, decode=None):
+    async def fake_materialize(message, settings, *, decode=None, keep_original=False):
         message.content = "[图片]（图存 images/retry.png，可用 read 查看）"
         return 1
 
@@ -1175,7 +1175,7 @@ async def test_retry_pending_media_waits_for_delayed_key(tmp_path, monkeypatch):
     monkeypatch.setattr(service_module, "MEDIA_KEY_POLL_SECONDS", 0.0)
     monkeypatch.setattr(service_module, "MEDIA_KEY_WAIT_SECONDS", 5.0)
 
-    async def fake_materialize(message, settings, *, decode=None):
+    async def fake_materialize(message, settings, *, decode=None, keep_original=False):
         message.content = "[图片]（图存 images/delayed.png，可用 read 查看）"
         return 1
 

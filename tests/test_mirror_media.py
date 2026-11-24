@@ -724,10 +724,11 @@ async def test_outbound_text_still_uses_inner_send(tmp_path: Path) -> None:
     assert router.stats()["sent"] == 1
 
 
-async def test_outbound_pure_media_sends_placeholder_then_media(
+async def test_outbound_pure_media_sends_media_without_placeholder(
     tmp_path: Path,
 ) -> None:
-    router, _store = make_router(tmp_path)
+    """纯媒体条目只发媒体：正文里的 [图片] 不能再当气泡发一遍（对面会看到重复）。"""
+    router, store = make_router(tmp_path)
     wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
     events = record_order(wechat)
     place(tmp_path, "images/x.png")
@@ -739,20 +740,23 @@ async def test_outbound_pure_media_sends_placeholder_then_media(
         )
     )
 
-    assert events[:2] == ["send", "send_media"]
-    assert [text for _ct, _cid, text in wechat.sent] == [WIRE_IMAGE]
+    assert events == ["send_media"]
+    assert wechat.sent == []
     assert len(wechat.media) == 1
     assert wechat.media[0][2:] == (
         "image",
         str((tmp_path / "ws" / "images" / "x.png").resolve()),
         "x.png",
     )
+    # 入库形态仍保留占位：面板与记忆靠它知道这条是图。
+    assert mirror_rows(store, WXG_CHAT) == ["阿鱼：[图片]"]
 
 
-async def test_outbound_placeholder_human_has_nickname_and_bot_not(
+async def test_outbound_pure_media_suppresses_placeholder_for_human_and_bot(
     tmp_path: Path,
 ) -> None:
-    router, _store = make_router(tmp_path)
+    """人类发的图与 bot 转发的图都不带占位气泡，但入库形态各按老契约。"""
+    router, store = make_router(tmp_path)
     wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
     place(tmp_path, "images/x.png")
     attachment = Attachment(kind="image", path="images/x.png", name="x.png")
@@ -764,11 +768,13 @@ async def test_outbound_placeholder_human_has_nickname_and_bot_not(
         make_item(source_channel="qq", attachments=(attachment,), is_bot=True)
     )
 
-    assert [text for _ct, _cid, text in wechat.sent] == [WIRE_IMAGE, "[图片]"]
+    assert wechat.sent == []
+    assert len(wechat.media) == 2
+    assert mirror_rows(store, WXG_CHAT) == ["阿鱼：[图片]", "[图片]"]
 
 
 async def test_video_wechat_degrades_to_file(tmp_path: Path) -> None:
-    """微信 hook 没有视频原语：物化成功的 mp4 按文件发，正文仍保留 [视频] 占位。"""
+    """微信 hook 没有视频原语：物化成功的 mp4 按文件发，纯媒体条目不补占位气泡。"""
     router, _store = make_router(tmp_path)
     wechat = cast(FakeChannelAdapter, router.adapters["wechat"])
     path = place(tmp_path, "videos/v.mp4", MP4)
@@ -782,12 +788,12 @@ async def test_video_wechat_degrades_to_file(tmp_path: Path) -> None:
         )
     )
 
-    assert [text for _ct, _cid, text in wechat.sent] == [WIRE_VIDEO]
+    assert [text for _ct, _cid, text in wechat.sent] == []
     _ct, _cid, kind, sent_path, name = wechat.media[0]
     assert kind == "file"
     assert sent_path == str(path.resolve())
     assert name == "v.mp4"
-    assert router.stats()["sent"] == 1
+    assert router.stats()["sent"] == 0
 
 
 async def test_qq_to_wechat_image_uses_resolved_absolute_path_once(
@@ -810,7 +816,7 @@ async def test_qq_to_wechat_image_uses_resolved_absolute_path_once(
     assert sent_path == str(path.resolve())
     assert name == "x.png"
     assert mirror_rows(store, WXG_CHAT) == ["阿鱼：[图片]"]
-    assert router.stats()["sent"] == 1
+    assert router.stats()["sent"] == 0
 
 
 async def test_wechat_to_qq_image_builds_image_segment(tmp_path: Path) -> None:
@@ -834,7 +840,8 @@ async def test_wechat_to_qq_image_builds_image_segment(tmp_path: Path) -> None:
     image_segments = [seg for seg in segments if seg.get("type") == "image"]
     assert image_segments == [{"type": "image", "data": {"file": str(path.resolve())}}]
     text_segments = [seg for seg in segments if seg.get("type") == "text"]
-    assert text_segments == [{"type": "text", "data": {"text": WIRE_IMAGE}}]
+    # 纯媒体：占位只留入库，消息段里只有图片（不再先发一条「阿鱼：[图片]」）。
+    assert text_segments == []
     assert mirror_rows(store, QQ_CHAT) == ["阿鱼：[图片]"]
 
 
@@ -900,8 +907,8 @@ async def test_sticker_fallback_sends_sticker_then_image(tmp_path: Path) -> None
     )
 
     assert kinds == ["sticker", "image"]
-    assert [text for _ct, _cid, text in wechat.sent] == [WIRE_STICKER]
-    assert router.stats()["sent"] == 1
+    assert wechat.sent == []
+    assert router.stats()["sent"] == 0
 
 
 class UploadRecorder(FakeChannelAdapter):
@@ -918,7 +925,7 @@ class UploadRecorder(FakeChannelAdapter):
 
 
 async def test_wechat_to_qq_voice_builds_record_segment(tmp_path: Path) -> None:
-    """微信语音落到 QQ 是 record 段，说明行仍保留可读占位。"""
+    """微信语音落到 QQ 是 record 段；纯媒体条目不额外发占位气泡。"""
     router, store = make_router(tmp_path)
     qq = cast(FakeChannelAdapter, router.adapters["qq"])
     path = place(tmp_path, "voices/v.slk", SILK)
@@ -938,9 +945,7 @@ async def test_wechat_to_qq_voice_builds_record_segment(tmp_path: Path) -> None:
     assert [seg for seg in segments if seg.get("type") == "record"] == [
         {"type": "record", "data": {"file": str(path.resolve())}}
     ]
-    assert [seg for seg in segments if seg.get("type") == "text"] == [
-        {"type": "text", "data": {"text": WIRE_VOICE}}
-    ]
+    assert [seg for seg in segments if seg.get("type") == "text"] == []
     assert mirror_rows(store, QQ_CHAT) == ["阿鱼：[语音]"]
 
 
@@ -965,8 +970,8 @@ async def test_wechat_to_qq_video_builds_video_segment(tmp_path: Path) -> None:
         {"type": "video", "data": {"file": str(path.resolve())}}
     ]
     texts = [seg["data"]["text"] for seg in segments if seg.get("type") == "text"]
-    # 线上是完整气泡：昵称单独一行，占位文本必须仍可读地出现在框内。
-    assert any("阿鱼\n│ [视频]" in text for text in texts)
+    # 纯媒体：视频段之外不再补一条「[视频]」气泡（入库形态仍带占位）。
+    assert texts == []
 
 
 async def test_wechat_to_qq_file_uses_upload_file(tmp_path: Path) -> None:
@@ -986,7 +991,7 @@ async def test_wechat_to_qq_file_uses_upload_file(tmp_path: Path) -> None:
     )
 
     assert qq.files == [(ChatType.GROUP, QQ_CHAT, str(path.resolve()), "doc.pdf")]
-    assert [text for _ct, _cid, text in qq.sent] == [WIRE_FILE]
+    assert qq.sent == []
     assert qq.segments == []
     assert mirror_rows(store, QQ_CHAT) == ["阿鱼：[文件] doc.pdf"]
 
@@ -1093,6 +1098,7 @@ async def test_wechat_text_failure_does_not_block_media(tmp_path: Path) -> None:
     await router._deliver(
         make_item(
             source_channel="qq",
+            segments=(Segment("text", {"text": "看这个"}),),
             attachments=(
                 Attachment(kind="image", path="images/x.png", name="x.png"),
             ),
@@ -1504,3 +1510,27 @@ async def test_full_queue_media_overflow_is_recorded(tmp_path: Path) -> None:
     assert failure["message_id"] == "img-2"
 
 
+
+
+# ------------------------------------------------- T8：入站图片保真判定
+def test_keeps_image_quality_only_for_paired_chats(tmp_path: Path) -> None:
+    """只有配对内的会话直传原图；非配对会话照旧按 max_edge 缩小。"""
+    router, _ = make_router(tmp_path)
+
+    assert router.keeps_image_quality(QQ_CHAT) is True
+    assert router.keeps_image_quality(WXG_CHAT) is True
+    assert router.keeps_image_quality("qq:9999") is False
+
+
+def test_keeps_image_quality_respects_config(tmp_path: Path) -> None:
+    """``mirror.keep_image_quality=false`` 时连配对会话也走降采样。"""
+    base = make_router_settings(tmp_path)
+    settings = replace(
+        base, mirror=replace(base.mirror, keep_image_quality=False)
+    )
+    store = Store(tmp_path / "mirror.db")
+    store.init_schema()
+    router = MirrorRouter(settings, store, {})
+
+    assert router.keeps_image_quality(QQ_CHAT) is False
+    assert router.keeps_image_quality(WXG_CHAT) is False

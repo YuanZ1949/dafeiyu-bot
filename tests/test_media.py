@@ -100,6 +100,11 @@ def make_settings(
     )
 
 
+def ws_view(tmp_path: Path, relative: str) -> str:
+    """注记里模型侧可 read 的路径：workspace 目录 + 相对路径（同 images.py）。"""
+    return (tmp_path / "ws" / relative).as_posix()
+
+
 def make_message(
     path: str,
     *,
@@ -156,7 +161,7 @@ async def test_dat_image_is_decoded_and_annotated(tmp_path: Path) -> None:
     stored = tmp_path / "ws" / attachment.path
     assert stored.is_file()
     assert stored.read_bytes() == PNG
-    assert f"[图片]（图存 {attachment.path}，可用 read 查看）" in message.content
+    assert f"[图片]（图存 {ws_view(tmp_path, attachment.path)}，可用 read 查看）" in message.content
     assert message.content.count("（图存") == 1
 
 
@@ -252,7 +257,7 @@ async def test_undecodable_wechat_original_falls_back_to_thumb(
     stored = tmp_path / "ws" / message.attachments[0].path
     assert stored.read_bytes() == PNG
     assert message.attachments[0].path.endswith(".png")
-    assert "（图存 images/" in message.content
+    assert f"（图存 {ws_view(tmp_path, 'images')}/" in message.content
 
 
 async def test_decodable_original_wins_over_fallback(tmp_path: Path) -> None:
@@ -409,7 +414,7 @@ async def test_sticker_placeholder_is_annotated_and_idempotent(
     second = await materialize_attachments(message, settings, decode=decode_dat)
 
     assert first == 1
-    assert "[表情:745c9c20]（图存 images/" in content
+    assert f"[表情:745c9c20]（图存 {ws_view(tmp_path, 'images')}/" in content
     assert content.count("（图存") == 1
     assert second == 0
     assert message.content == content
@@ -434,7 +439,7 @@ async def test_emoticon_cache_file_uses_async_decode(tmp_path: Path) -> None:
     assert attachment.path.startswith("images/")
     assert attachment.path.endswith(".png")
     assert (tmp_path / "ws" / attachment.path).read_bytes() == PNG
-    assert "[表情:745c9c20]（图存 images/" in message.content
+    assert f"[表情:745c9c20]（图存 {ws_view(tmp_path, 'images')}/" in message.content
 
 
 async def test_hex_named_file_without_decode_is_copied(tmp_path: Path) -> None:
@@ -548,9 +553,9 @@ async def test_video_is_copied_and_frames_are_annotated(
     assert len(frames) == 4
     assert all(frame.read_bytes() == JPG for frame in frames)
 
-    assert message.content.startswith("[视频]（已抽帧 images/video-")
-    assert "、images/" in message.content
-    assert "，可用 read 查看；原文件 videos/" in message.content
+    assert message.content.startswith(f"[视频]（已抽帧 {ws_view(tmp_path, 'images')}/video-")
+    assert f"、{ws_view(tmp_path, 'images')}/" in message.content
+    assert f"，可用 read 查看；原文件 {ws_view(tmp_path, 'videos')}/" in message.content
     assert message.content.count("（已抽帧") == 1
 
 
@@ -569,7 +574,9 @@ async def test_video_without_ffmpeg_copies_original_only(
     attachment = message.attachments[0]
     assert attachment.path.startswith("videos/")
     assert (tmp_path / "ws" / attachment.path).read_bytes() == MP4
-    assert message.content == f"[视频]（原文件 {attachment.path}，无法抽帧）"
+    assert message.content == (
+        f"[视频]（原文件 {ws_view(tmp_path, attachment.path)}，无法抽帧）"
+    )
     assert not (tmp_path / "ws" / "images").exists()
 
 
@@ -643,7 +650,9 @@ async def test_broken_video_does_not_block_image(
     count = await materialize_attachments(message, settings)
 
     assert count == 1
-    assert message.content.startswith("[视频] [图片]（图存 images/")
+    assert message.content.startswith(
+        f"[视频] [图片]（图存 {ws_view(tmp_path, 'images')}/"
+    )
     assert message.content.count("（图存") == 1
 
 
@@ -704,9 +713,9 @@ async def test_gif_frames_are_extracted_and_annotated(
     frames = sorted((tmp_path / "ws" / "images").glob("gif-*-*.jpg"))
     assert len(frames) == 3
     assert all(frame.read_bytes() == JPG for frame in frames)
-    assert "（动图，已抽帧 images/gif-" in message.content
-    assert "、images/gif-" in message.content
-    assert "原文件 images/" in message.content
+    assert f"（动图，已抽帧 {ws_view(tmp_path, 'images')}/gif-" in message.content
+    assert f"、{ws_view(tmp_path, 'images')}/gif-" in message.content
+    assert f"原文件 {ws_view(tmp_path, 'images')}/" in message.content
 
 
 def _tiny_gif(frames: int) -> bytes:
@@ -743,7 +752,7 @@ async def test_two_frame_gif_is_treated_as_still(
     frames = sorted((tmp_path / "ws" / "images").glob("gif-*-*.jpg"))
     assert len(frames) == 1
     assert frames[0].read_bytes() == JPG + b"x" * 10
-    assert "（图存 images/gif-" in message.content
+    assert f"（图存 {ws_view(tmp_path, 'images')}/gif-" in message.content
     assert "动图" not in message.content
 
 
@@ -766,7 +775,7 @@ async def test_url_image_is_downloaded_and_annotated(tmp_path: Path) -> None:
     assert seen and seen[0][0] == message.attachments[0].source
     assert message.attachments[0].path.startswith("images/")
     assert (tmp_path / "ws" / message.attachments[0].path).read_bytes() == PNG
-    assert message.content.startswith("[图片]（图存 images/")
+    assert message.content.startswith(f"[图片]（图存 {ws_view(tmp_path, 'images')}/")
 
 
 async def test_url_image_that_is_not_an_image_keeps_placeholder(
@@ -797,7 +806,7 @@ async def test_gif_frame_failure_keeps_original_note(
 
     assert calls == [0, 8, 24]
     assert "（动图，已抽帧" not in message.content
-    assert message.content.startswith("[图片]（图存 images/")
+    assert message.content.startswith(f"[图片]（图存 {ws_view(tmp_path, 'images')}/")
 
 
 # --------------------------------------------------------------- 语音转写
@@ -831,7 +840,7 @@ async def test_voice_with_local_path_is_stored_and_transcribed(
     assert stored.read_bytes() == SILK
     assert calls == [stored]
     assert message.content == (
-        f"[语音]（转写：今天天气不错，原文件 {attachment.path}）"
+        f"[语音]（转写：今天天气不错，原文件 {ws_view(tmp_path, attachment.path)}）"
     )
 
 
@@ -868,7 +877,7 @@ async def test_voice_with_url_is_downloaded_even_when_wechat_media_disabled(
     assert attachment.path.startswith("voices/")
     assert (tmp_path / "ws" / attachment.path).read_bytes() == SILK
     assert "转写：在吗" in message.content
-    assert f"原文件 {attachment.path}" in message.content
+    assert f"原文件 {ws_view(tmp_path, attachment.path)}" in message.content
 
 
 async def test_voice_disabled_keeps_placeholder_and_writes_nothing(
@@ -957,8 +966,8 @@ async def test_video_url_is_downloaded_and_framed(
     assert attachment.path.endswith(".mp4")
     assert (tmp_path / "ws" / attachment.path).read_bytes() == MP4
     assert len(calls) == 4
-    assert message.content.startswith("[视频]（已抽帧 images/video-")
-    assert "原文件 videos/" in message.content
+    assert message.content.startswith(f"[视频]（已抽帧 {ws_view(tmp_path, 'images')}/video-")
+    assert f"原文件 {ws_view(tmp_path, 'videos')}/" in message.content
     # 临时下载文件必须清理干净。
     assert list((tmp_path / "ws" / "videos").glob(".incoming-*")) == []
 

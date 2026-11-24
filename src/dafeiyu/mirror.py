@@ -128,10 +128,15 @@ class RenderedLines(NamedTuple):
 
     两个列表按分块一一对应：第 i 块的线上形态是 ``wire[i]``、
     入库形态是 ``store[i]``，长度恒相等。
+
+    ``wire_suppressed`` 为真表示这条消息**只有媒体占位、没有真正的正文**：
+    ``wire`` 里的气泡仅作媒体全部发不出去时的降级文本，正常情况不上线
+    （否则对面先看到一条「昵称：[图片]」再收到同一张图）。``store`` 不受影响。
     """
 
     wire: list[str]
     store: list[str]
+    wire_suppressed: bool = False
 
 
 class _Stop:
@@ -1177,10 +1182,18 @@ class MirrorRouter:
             else:
                 segment_attachments.append(prepared)
 
+        # 纯媒体条目：占位只留在入库形态，线上只发消息段/文件；媒体一个都发不
+        # 出去时再退回占位气泡，至少让对方知道这里丢了一张图。
+        suppress_text = rendered.wire_suppressed and bool(
+            segment_attachments or files
+        )
+        stored = False
+        delivered = False
+
         if segment_attachments and callable(
             getattr(adapter, "send_segments", None)
         ):
-            explanation = "".join(rendered.wire)
+            explanation = "" if suppress_text else "".join(rendered.wire)
             segments = build_onebot_segments(
                 explanation, attachments=segment_attachments
             )
@@ -1197,29 +1210,22 @@ class MirrorRouter:
                 self._counters["dropped"] += 1
             else:
                 self._counters["sent"] += 1
+                delivered = True
                 message_id = result if isinstance(result, str) else None
                 # 补发条目只有媒体：正文/指纹/入库都已在首次投递完成，
                 # 这里再写会多出一条空行。
                 if not item.media_only:
-                    self._register_fingerprints(
-                        item.target_chat_id, explanation, ()
-                    )
-                    try:
-                        # 入库永远是单行 store 形态，与今天逐字节一致。
-                        self._store_line(
-                            item,
-                            adapter,
-                            "".join(rendered.store),
-                            message_id,
-                            0,
+                    if explanation:
+                        self._register_fingerprints(
+                            item.target_chat_id, explanation, ()
                         )
-                    except Exception:  # noqa: BLE001 - 落库失败不阻断文件上传
-                        log.exception(
-                            "镜像消息落库失败：%s", item.target_chat_id
-                        )
-        else:
+                    # 入库永远是单行 store 形态，与今天逐字节一致。
+                    self._store_rendered(item, adapter, rendered, message_id)
+                    stored = True
+        elif not suppress_text:
             # 文本失败只计 dropped，不再连坐后面的文件上传（I-3）。
             await self._send_lines(item, adapter, rendered)
+            stored = True
 
         for attachment in files:
             ok, _result = await self._send_with_retry(
@@ -1237,6 +1243,15 @@ class MirrorRouter:
             if not ok:
                 # 文件/照片上传失败以前完全静默：这里补上计数与留痕（I-4）。
                 self._counters["dropped"] += 1
+            else:
+                delivered = True
+
+        if suppress_text and not delivered:
+            # 媒体全失败：退回占位气泡，别让这条消息彻底消失。
+            await self._send_lines(item, adapter, rendered)
+        elif suppress_text and not stored and not item.media_only:
+            # 纯媒体：气泡被抑制，入库记录补在这里（补发条目首投已记过）。
+            self._store_rendered(item, adapter, rendered, None)
 
     # ------------------------------------------------------------ 目标微信
     async def _deliver_wechat(
@@ -1248,9 +1263,14 @@ class MirrorRouter:
     ) -> None:
         # 文本失败也不能连坐媒体：图片/文件比一行占位更值钱（I-3）。
         # 补发条目没有正文（media_only），这里只跳过文本、照常发媒体。
-        if rendered.wire:
+        # 纯媒体条目同理：占位只留入库，线上只发媒体；媒体全失败再退回占位气泡。
+        suppress_text = rendered.wire_suppressed and self._has_readable_media(
+            attachments
+        )
+        if rendered.wire and not suppress_text:
             await self._send_lines(item, adapter, rendered)
 
+        sent_media = 0
         for attachment in attachments:
             kind = _media_kind(attachment.kind)
             if kind not in ("image", "voice", "file", "sticker", "video"):
@@ -1282,6 +1302,8 @@ class MirrorRouter:
                 )
                 if not ok:
                     self._counters["dropped"] += 1
+                else:
+                    sent_media += 1
                 continue
             if kind == "sticker":
                 delivered = await self._send_media(
@@ -1304,6 +1326,8 @@ class MirrorRouter:
                     )
                 if not delivered:
                     self._counters["dropped"] += 1
+                else:
+                    sent_media += 1
                 continue
             ok = await self._send_media(
                 adapter,
@@ -1316,6 +1340,15 @@ class MirrorRouter:
             if not ok:
                 # 图片/语音发送失败以前完全静默：补上计数（I-4）。
                 self._counters["dropped"] += 1
+            else:
+                sent_media += 1
+
+        if suppress_text and not sent_media:
+            # 媒体全失败：退回占位气泡，别让这条消息彻底消失。
+            await self._send_lines(item, adapter, rendered)
+        elif suppress_text and not item.media_only:
+            # 纯媒体：气泡被抑制，入库记录补在这里。
+            self._store_rendered(item, adapter, rendered, None)
 
     async def _send_lines(
         self, item: MirrorItem, adapter: Any, rendered: RenderedLines
@@ -1514,6 +1547,7 @@ class MirrorRouter:
             body = f"{text} {' '.join(placeholders)}"
         else:
             body = text
+        suppressed = self._wire_suppressed(item, text, placeholders)
         # 引用只作为一行前缀线索：对面没有引用关系，原文不能整段搬。
         if item.reply_hint:
             body = f"{item.reply_hint} {body}" if body else item.reply_hint
@@ -1531,10 +1565,11 @@ class MirrorRouter:
                 chunk.replace(f"{nick}：", f"{nick}\n", 1) if nick and index == 0 else chunk
                 for index, chunk in enumerate(chunks)
             ]
-            return RenderedLines(wire_chunks, list(chunks))
+            return RenderedLines(wire_chunks, list(chunks), suppressed)
         boxed = self._bubble(wire_full)
         if len(boxed) <= WIRE_MAX_CHARS:
-            return RenderedLines([boxed], [full])
+            return RenderedLines([boxed], [full], suppressed)
+
         # 只有超过平台单条保守上限才拆：此时宁可分成几条带框消息，
         # 也不能发出一段会被平台截断的文本。
         log.warning(
@@ -1551,7 +1586,22 @@ class MirrorRouter:
             )
             chunk_boxed = self._bubble(wire_text)
             wire.append(wire_text if len(chunk_boxed) > WIRE_MAX_CHARS else chunk_boxed)
-        return RenderedLines(wire, list(chunks))
+        return RenderedLines(wire, list(chunks), suppressed)
+
+    def _wire_suppressed(
+        self, item: MirrorItem, text: str, placeholders: Sequence[str]
+    ) -> bool:
+        """纯媒体条目的正文只有占位：线上不该再把它当正文发一遍。
+
+        媒体本身另走消息段/图片/文件发送，再把 ``[图片]`` 当文本发一次，对面
+        就会先看到一条占位气泡、再收到同一张图。合并转发的正文是真内容、
+        ``reply_hint`` 是「在回谁」的方向线索，两者都不抑制；入库形态
+        （``store``）始终保留占位，面板与记忆要用。
+        """
+        if text or not placeholders or item.reply_hint:
+            return False
+        kinds = [kind for kind, _name, _count in self._media_entries(item)]
+        return bool(kinds) and all(kind != "forward" for kind in kinds)
 
     def _bubble(self, text: str) -> str:
         """把正文（含昵称前缀）套成一个与字体无关的气泡。
@@ -1715,6 +1765,34 @@ class MirrorRouter:
         return _PLACEHOLDERS.get(kind, _UNKNOWN_PLACEHOLDER)
 
     # ------------------------------------------------------------ 落库
+    def _has_readable_media(self, attachments: Sequence[Attachment]) -> bool:
+        """目标侧至少有一个可读媒体：纯媒体条目据此决定要不要压掉占位气泡。"""
+        for attachment in attachments:
+            if _media_kind(attachment.kind) not in (
+                "image",
+                "voice",
+                "file",
+                "sticker",
+                "video",
+            ):
+                continue
+            if media.resolve_media_path(self.settings, attachment) is not None:
+                return True
+        return False
+
+    def _store_rendered(
+        self,
+        item: MirrorItem,
+        adapter: Any,
+        rendered: RenderedLines,
+        message_id: str | None,
+    ) -> None:
+        """按入库形态写一条记录；落库失败只记日志，不能连坐媒体发送。"""
+        try:
+            self._store_line(item, adapter, "".join(rendered.store), message_id, 0)
+        except Exception:  # noqa: BLE001 - 落库失败不阻断媒体发送
+            log.exception("镜像消息落库失败：%s", item.target_chat_id)
+
     def _store_line(
         self,
         item: MirrorItem,
@@ -1744,6 +1822,17 @@ class MirrorRouter:
     # ------------------------------------------------------------ 去重/指纹
     def _direction(self, chat_id: str) -> tuple[str, str] | None:
         return self._routes.get(chat_id)
+
+    def keeps_image_quality(self, chat_id: str) -> bool:
+        """该会话是否在镜像配对内、且要求直传原图（不受模型侧降采样影响）。
+
+        入站物化会按 ``images.max_edge`` 缩小模型用的副本；镜像若直接复用
+        那份副本，QQ/微信另一端拿到的就是 1280px 版本。配对会话在物化时
+        以 ``keep_original`` 落盘，镜像 worker 复用时才是原图。
+        """
+        if not self.settings.mirror.keep_image_quality:
+            return False
+        return self._direction(chat_id) is not None
 
     def _seen_before(self, key: tuple[str, str], now: float) -> bool:
         if key in self._seen:

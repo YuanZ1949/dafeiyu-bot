@@ -373,6 +373,51 @@ def test_prewarm_without_attach_returns_false(tmp_path: Path) -> None:
     assert resolver.prewarm() is False
 
 
+# ---------------------------------------------------------------- wxgf 原图
+# 微信 4.x 原图是私有 ``wxgf`` 容器（内部为裸 HEVC）：``decode_dat`` 会拒绝它，
+# 但解出的明文仍是有效样本。只认 ``decode_dat`` 会把这类原图判成「缓存 key
+# 失效」，随后退回 ``_h``/``_t``，画质直接掉一档。
+WXGF_HEAD = b"wxgf" + b"\x00" * 28
+
+
+def _wxgf_resolver(tmp_path: Path) -> MediaKeyResolver:
+    return MediaKeyResolver(
+        wxid=WXID,
+        cache_path=tmp_path / "media_key.json",
+        pids=lambda: [],
+        memory_factory=lambda _pid: FakeMemory(),
+    )
+
+
+def test_cached_accepts_wxgf_container_sample(tmp_path: Path) -> None:
+    (tmp_path / "media_key.json").write_text(
+        json.dumps({"dword": DWORD, "xor_key": XOR_KEY, "wxid": WXID}),
+        encoding="utf-8",
+    )
+    sample = _build_v2(aes_key=derive_aes_key(DWORD, WXID), head=WXGF_HEAD)
+    resolver = _wxgf_resolver(tmp_path)
+
+    # 前提：这不是可直读图片，``decode_dat`` 确实拒绝它。
+    assert (
+        decode_dat(
+            sample, aes_key=derive_aes_key(DWORD, WXID), xor_key=XOR_KEY
+        )
+        is None
+    )
+    assert resolver.cached(sample) == MediaKey(derive_aes_key(DWORD, WXID), XOR_KEY)
+
+
+def test_cached_rejects_wxgf_sample_with_stale_dword(tmp_path: Path) -> None:
+    (tmp_path / "media_key.json").write_text(
+        json.dumps({"dword": DWORD + 1, "xor_key": XOR_KEY, "wxid": WXID}),
+        encoding="utf-8",
+    )
+    sample = _build_v2(aes_key=derive_aes_key(DWORD, WXID), head=WXGF_HEAD)
+    resolver = _wxgf_resolver(tmp_path)
+
+    assert resolver.cached(sample) is None
+
+
 # ---------------------------------------------------------------- 解码闭环
 def test_resolved_key_decodes_real_layout(tmp_path: Path) -> None:
     resolver = _resolver(tmp_path)

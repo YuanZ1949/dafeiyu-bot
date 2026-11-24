@@ -1410,6 +1410,7 @@ def test_resource_attach_prefers_original_with_thumb_fallback(
 
 
 def test_resource_attach_orders_fallbacks_high_then_thumb(tmp_path: Path) -> None:
+    """`_h` 是高清洗版：它排第一，原图与缩略图依次作 fallback。"""
     store, attach = build_attach_store(
         tmp_path,
         infos=[(101, 1, IMAGE_MD5)],
@@ -1423,9 +1424,9 @@ def test_resource_attach_orders_fallbacks_high_then_thumb(tmp_path: Path) -> Non
 
     media = _media_by_text(store)["[图片]"]["media"]
 
-    assert Path(media["path"]) == (attach / f"{IMAGE_MD5}.dat").resolve()
+    assert Path(media["path"]) == (attach / f"{IMAGE_MD5}_h.dat").resolve()
     assert [Path(item) for item in media["fallbacks"]] == [
-        (attach / f"{IMAGE_MD5}_h.dat").resolve(),
+        (attach / f"{IMAGE_MD5}.dat").resolve(),
         (attach / f"{IMAGE_MD5}_t.dat").resolve(),
     ]
 

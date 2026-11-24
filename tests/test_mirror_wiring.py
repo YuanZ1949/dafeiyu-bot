@@ -638,7 +638,12 @@ def _noop_materializers(monkeypatch: pytest.MonkeyPatch) -> None:
         return None
 
     async def fake_attachments(
-        msg, settings, decode=None, annotate=True, resolve_file=None
+        msg,
+        settings,
+        decode=None,
+        annotate=True,
+        resolve_file=None,
+        keep_original=False,
     ) -> None:
         return None
 
@@ -673,7 +678,12 @@ async def test_service_handle_enqueues_before_materialize(
         order.append(("materialize", msg.message_id))
 
     async def fake_attachments(
-        msg, settings, decode=None, annotate=True, resolve_file=None
+        msg,
+        settings,
+        decode=None,
+        annotate=True,
+        resolve_file=None,
+        keep_original=False,
     ) -> None:
         order.append(("materialize_attachments", msg.message_id))
 
@@ -724,7 +734,12 @@ async def test_service_handle_ordering_text_image_text(
         await gate.wait()
 
     async def fake_attachments(
-        msg, settings, decode=None, annotate=True, resolve_file=None
+        msg,
+        settings,
+        decode=None,
+        annotate=True,
+        resolve_file=None,
+        keep_original=False,
     ) -> None:
         return None
 
@@ -1003,3 +1018,32 @@ async def test_control_mirror_disabled_keeps_inner_adapters(
     assert not isinstance(service.adapters["qq"], MirroredAdapter)
     assert captured["control_adapter"] is inner_qq
 
+
+
+async def test_service_handle_keeps_original_for_paired_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """配对会话物化入站图片时不降采样：镜像 worker 复用同一份文件。"""
+    seen: dict[str, object] = {}
+
+    class QualityMirror(RecordingMirror):
+        def keeps_image_quality(self, chat_id: str) -> bool:
+            return chat_id == QQ
+
+    service, store = make_service(tmp_path, mirror=QualityMirror())
+
+    async def fake_materialize(msg, settings, annotate=True) -> None:
+        return None
+
+    async def fake_attachments(msg, settings, **kwargs) -> None:
+        seen.update(kwargs)
+
+    monkeypatch.setattr("dafeiyu.service.materialize", fake_materialize)
+    monkeypatch.setattr("dafeiyu.service.materialize_attachments", fake_attachments)
+
+    try:
+        await service.handle(make_msg("m1"))
+    finally:
+        store.close()
+
+    assert seen["keep_original"] is True

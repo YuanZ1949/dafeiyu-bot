@@ -176,13 +176,17 @@ _MEDIA_KIND_BY_TYPE: dict[int, str] = {3: "image", 34: "voice", 43: "video", 47:
 #: 已知的微信媒体索引库（仓库里没有可验证的 schema，按「存在才读」适配）。
 _MEDIA_REL = "message/message_resource.db"
 
-#: 变体优先级：原图 > `_h` > `_t`。
+#: 变体优先级：`_h` > 原图 > `_t`。
 #:
-#: 4.x 的原图（无后缀 `.dat`）解密后多是微信私有的 ``wxgf`` 容器，解码层会
-#: 把其中的 HEVC 转成高分辨率 PNG；只有转码失败（缺密钥/缺 ffmpeg）时才按
-#: 顺序退回 `_h` / `_t`。早期按「模型能不能直接打开」排序，把 180px 的 `_t`
-#: 排在最前，导致能拿到原图的消息也只有缩略图画质。
-_VARIANT_ORDER: tuple[str, ...] = ("", "_h", "_t")
+#: 实测（112 组本机样本、48 组同时有原图与 `_h`）：微信 4.x 的「原图」（无后缀
+#: `.dat`）解密后多是 1280 短边的压缩版，而 `_h` 才是「查看高清」后下载的高清
+#: 副本——15 组像素更大（最高 12MP vs 2-3MP）、31 组同尺寸里 21 组更锐、字节
+#: 中位 1.04 倍（最高 9.6 倍）、mtime 没有一组更早；更小的只有 2 组且都只差 1
+#: 像素。原图优先会系统性丢掉最多的像素，所以 `_h` 排第一。
+#:
+#: 原图仍作第二候选：它解密后多为 ``wxgf`` 容器，解码层能把 HEVC 转成高分辨率
+#: PNG；`_h` 缺失时（34/112 组只缓存了 `_t`）才退到 180px 的缩略图。
+_VARIANT_ORDER: tuple[str, ...] = ("_h", "", "_t")
 
 #: 从 `packed_info` protobuf blob 里捞 32 位 hex md5（前后不能再接 hex 字符）。
 _MD5_IN_BLOB_RE = re.compile(rb"(?<![0-9a-fA-F])[0-9a-fA-F]{32}(?![0-9a-fA-F])")
@@ -933,7 +937,7 @@ class LocalMessageStore:
                             "duration": 0,
                         }
                         if len(paths) > 1:
-                            # 原图解不开时按优先级退回 `_h` / `_t`。
+                            # 首选的 `_h` 解不开时按优先级退回原图 / `_t`。
                             found[key]["fallbacks"] = [str(item) for item in paths[1:]]
                 return found
         except Exception as exc:  # noqa: BLE001 - 媒体发现永远不能打断消息读取
@@ -1590,10 +1594,11 @@ def _emoticon_file(root: Path, digest: str) -> Path | None:
 
 
 def _attach_files(base: Path, digest: str) -> list[Path]:
-    """按变体优先级返回**全部**存在的候选：原图 → ``_h`` → ``_t``。
+    """按变体优先级返回**全部**存在的候选：``_h`` → 原图 → ``_t``。
 
     每个变体只取排序后的第一个文件（同一 md5 理论上只有一个）。返回列表而
-    不是单个路径：原图可能是 ``wxgf``，解不开时要由下游按顺序退回。
+    不是单个路径：`_h` 或原图都可能解不开（``wxgf`` / 缺密钥），要由下游按
+    顺序退回。
     """
     found: list[Path] = []
     for suffix in _VARIANT_ORDER:
@@ -1613,7 +1618,7 @@ def _attach_files(base: Path, digest: str) -> list[Path]:
 
 
 def _attach_file(base: Path, digest: str) -> Path | None:
-    """首选变体路径（原图优先）；只需要单路径的调用方使用。"""
+    """首选变体路径（`_h` 优先）；只需要单路径的调用方使用。"""
     files = _attach_files(base, digest)
     return files[0] if files else None
 

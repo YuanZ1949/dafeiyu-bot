@@ -1411,6 +1411,20 @@ class Service:
             self._media_scan_lock.release()
             log.debug("微信图片密钥扫描线程无法启动")
 
+    def _mirror_keeps_image_quality(self, chat_id: str) -> bool:
+        """镜像配对会话是否要求入站图片落盘保真（不按模型侧 max_edge 缩小）。
+
+        镜像 worker 会复用 ``Service.handle`` 物化的同一份文件；若这里降采样，
+        另一端收到的就是缩小版。镜像对象可能是测试替身，故用鸭子类型探测。
+        """
+        check = getattr(self.mirror, "keeps_image_quality", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(check(chat_id))
+        except Exception:  # noqa: BLE001 - 图片保真判断失败只影响画质
+            return False
+
     def _queue_media_retry(self, msg: Message) -> None:
         """图片/表情没物化成功时登记一条待重试；没有图片的消息零开销。"""
         # 微信表情的占位是 `[表情:xxx]`，不能用 `[图片]` 做门：纯表情消息
@@ -1466,7 +1480,10 @@ class Service:
                 continue
             try:
                 done = await materialize_attachments(
-                    source, self.settings, decode=self._decode_wechat_dat
+                    source,
+                    self.settings,
+                    decode=self._decode_wechat_dat,
+                    keep_original=self._mirror_keeps_image_quality(source.chat_id),
                 )
             except Exception:  # noqa: BLE001 - 物化本身永不抛，这里只兜底
                 log.debug("图片重试物化失败：%s", message.message_id, exc_info=True)
@@ -1489,6 +1506,9 @@ class Service:
                 media_box = None
                 log.warning("镜像入队失败：%s", msg.message_id, exc_info=True)
         annotate = self._tools_enabled()
+        # 镜像配对会话的入站图片直传原图：模型侧副本会被降采样（max_edge），
+        # 镜像 worker 复用同一份文件，若这里不保真，另一端收到的就是缩小版。
+        keep_original = self._mirror_keeps_image_quality(msg.chat_id)
         # QQ 文件（只有 file_id/busid）要先向 OneBot 索回 URL 才能下载；
         # 非 QQ 通道或 file_download 关闭时保持 None，物化层只留 [文件] 占位。
         resolve_file = self._qq_file_resolver(msg)
@@ -1506,6 +1526,7 @@ class Service:
                 decode=decode,
                 annotate=annotate,
                 resolve_file=resolve_file,
+                keep_original=keep_original,
             )
         finally:
             # 镜像 worker 在等这次回填；异常时也要放行，别让它白等满超时。

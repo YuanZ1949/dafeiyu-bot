@@ -1133,7 +1133,7 @@ async def test_qq_video_reaches_wechat_as_file(tmp_path: Path) -> None:
     finally:
         await router.stop()
 
-    assert wechat.sent[0][1] == WIRE_VIDEO
+    assert wechat.sent == []
     assert wechat.media[0][0] == "file"
     assert wechat.media[0][1].endswith("clip.mp4")
     assert wechat.media[0][2] == "clip.mp4"

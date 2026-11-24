@@ -38,7 +38,7 @@ from typing import Any
 
 from ..localdb import keyscan
 from .aes import CipherError, aes_ecb_decrypt
-from .dat import decode_dat
+from .dat import decode_dat, decode_dat_container
 
 log = logging.getLogger(__name__)
 
@@ -548,9 +548,17 @@ class MediaKeyResolver:
             decoded = decode_dat(
                 sample, aes_key=key.aes_key, xor_key=key.xor_key
             )
+            # 4.x 原图是 ``wxgf`` 容器：``decode_dat`` 会拒绝（不是可直读图片），
+            # 但容器解密后仍是有效样本。只认 ``decode_dat`` 会把 wxgf 原图判成
+            # 「缓存 key 失效」，随后退回 ``_h``/``_t``，画质直接掉一档。
+            if decoded is not None and _strong_image_head(decoded[:16]):
+                return True
+            plain = decode_dat_container(
+                sample, aes_key=key.aes_key, xor_key=key.xor_key
+            )
         except Exception:  # noqa: BLE001 - 校验失败一律当作不可用
             return False
-        return decoded is not None and _strong_image_head(decoded[:16])
+        return plain is not None and plain.startswith(b"wxgf")
 
     def _resolve_wxid(self) -> str:
         if self._wxid:
