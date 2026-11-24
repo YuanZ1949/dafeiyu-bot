@@ -1331,7 +1331,7 @@ async def test_notice_handler_error_skips_ack() -> None:
 
 async def test_notice_without_handler_acked() -> None:
     """没注册 notice handler 也 ack：帧不会卡在未确认缓冲。"""
-    async with FakeBridge() as bridge, running(bridge) as adapter:
+    async with FakeBridge() as bridge, running(bridge):
         await bridge.push(notice_envelope(seq=13))
         await wait_for(
             lambda: any(

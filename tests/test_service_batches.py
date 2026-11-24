@@ -5,8 +5,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from dafeiyu.brain.client import BrainError, BrainReply
 from dafeiyu.behavior import BehaviorSettings
+from dafeiyu.brain.client import BrainError, BrainReply
 from dafeiyu.config import (
     BudgetConfig,
     GroupsConfig,
