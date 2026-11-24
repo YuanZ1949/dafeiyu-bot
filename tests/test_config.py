@@ -638,7 +638,7 @@ def test_mirror_bubble_mind_skip_lessons_defaults(tmp_path: Path) -> None:
     s = load_settings(env_file=env, config_file=write_yaml(tmp_path))
     assert s.mirror.bubble_enabled is True
     assert s.mirror.bubble_corner_chars == "╭╮╰╯"
-    assert s.mirror.bubble_max_content_width == 30
+    assert s.mirror.bubble_max_content_width == 24
     assert s.mind.skip_known_silent is True
     assert s.mind.skip_silent_cooldown_seconds == 90
     assert s.injection.lessons_chars == 300

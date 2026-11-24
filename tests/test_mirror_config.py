@@ -161,6 +161,7 @@ def test_valid_pair_and_capability_matrix(tmp_path: Path, caplog) -> None:
     # 默认 uia + 未开本地库：媒体能力必须降级，不能因为配置合法就报 on。
     assert "image=off(outbound=uia)" in text
     assert "video=off(outbound=uia,video-as-file)" in text
+    assert "sticker=off(outbound=uia,face-no-content)" in text
     assert "image=off(localdb/media)" in text
 
 
@@ -184,6 +185,8 @@ def test_video_degrades_to_file_when_hook_outbound(tmp_path: Path, caplog) -> No
     text = caplog.text
     assert "video=on(video-as-file)" in text
     assert "image=on" in text
+    # 贴纸只有 mface 带直链时才有内容：能力矩阵要把这个前提写清楚。
+    assert "sticker=on(mface-url-only)" in text
 
 
 def test_multiple_pairs_accepted(tmp_path: Path, caplog) -> None:

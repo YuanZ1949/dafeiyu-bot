@@ -4527,7 +4527,11 @@ class Store:
         days: int = 7,
         now_ts: int | None = None,
     ) -> dict[str, float | int]:
-        """面板/日省用：窗口内被接话率与连续被无视的原始计数。"""
+        """面板/日省用：窗口内被接话率与连续被无视的原始计数。
+
+        ``mirror=1`` 的消息是转发别人的原话，不算「心夏说完有没有人接」；
+        这里按 ``messages.mirror`` 排除（历史库里已有这类行，写入侧过滤救不了）。
+        """
         since = int(now_ts if now_ts is not None else time.time()) - max(1, days) * 86400
         scope, params = _memory_scope(chat_type, chat_id)
         extra = " AND spoken_at >= ?" if scope else " WHERE spoken_at >= ?"
@@ -4538,8 +4542,13 @@ class Store:
                    COALESCE(SUM(quoted), 0) AS quoted,
                    COALESCE(SUM(replied), 0) AS replied,
                    COALESCE(SUM(silence_after), 0) AS silent
-            FROM reply_outcomes
+            FROM reply_outcomes AS r
             {scope}{extra}
+              AND NOT EXISTS (
+                  SELECT 1 FROM messages AS m
+                  WHERE m.chat_type = r.chat_type AND m.chat_id = r.chat_id
+                    AND m.message_id = r.bot_message_id AND m.mirror = 1
+              )
             """,
             (*params, since),
         ).fetchone()
@@ -4563,15 +4572,21 @@ class Store:
 
         按 ``spoken_at`` 分组（不是按行）：同一次回复的多片 bot chunk 共享
         同一时间戳，只算 1 轮；组内任一行 engaged 即视为有人接，streak 到此
-        为止。``mirror=1`` 的消息在入库前就已被排除，无需再过滤。
+        为止。镜像消息（``messages.mirror=1``，bot 转发别人原话）不算自己
+        发言，这里显式排除——写入侧虽已过滤，但历史库里留有旧行。
         """
         rows = self._conn.execute(
             """
-            SELECT spoken_at, MAX(engaged) AS any_engaged
-            FROM reply_outcomes
-            WHERE chat_type = ? AND chat_id = ?
-            GROUP BY spoken_at
-            ORDER BY spoken_at DESC
+            SELECT r.spoken_at, MAX(r.engaged) AS any_engaged
+            FROM reply_outcomes AS r
+            WHERE r.chat_type = ? AND r.chat_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM messages AS m
+                  WHERE m.chat_type = r.chat_type AND m.chat_id = r.chat_id
+                    AND m.message_id = r.bot_message_id AND m.mirror = 1
+              )
+            GROUP BY r.spoken_at
+            ORDER BY r.spoken_at DESC
             LIMIT ?
             """,
             (chat_type.value, chat_id, max(1, int(limit))),
@@ -5294,6 +5309,85 @@ class Store:
                 WHERE id = ?
                 """,
                 (json.dumps(detail, ensure_ascii=False), int(row["id"])),
+            )
+            self._conn.commit()
+            return int(row["id"])
+        return 0
+
+    def mark_decision_dropped(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        origin_message_id: str,
+        *,
+        reason: str,
+        attempts: int = 0,
+        outbox_id: int = 0,
+        age_seconds: int = 0,
+    ) -> int:
+        """补发的分片被丢弃时，把原「发送失败」决策标成 ``send_dropped``。
+
+        与 `mark_decision_retried` 对称：``outcome`` 仍是 ``error``（这段回复
+        确实没送到），只用 checkpoint 把「还在排队」和「已放弃」分开；丢弃
+        原因、重试次数与分片数记进 ``detail``。已经补发成功的决策
+        （``replied``）不改 outcome/checkpoint，只补一笔 ``dropped_chunks``，
+        这样面板上「补发成功」和「真丢了」不会混成同一个数。
+
+        同一条决策可能对应多个分片，多次丢弃会累加 ``dropped_chunks``。
+        返回被更新的决策 id，找不到返回 0。
+        """
+        origin = str(origin_message_id or "")
+        if not origin:
+            return 0
+        rows = self._conn.execute(
+            """
+            SELECT id, outcome, checkpoint, detail, message_ids
+            FROM decisions
+            WHERE chat_type = ? AND chat_id = ?
+              AND outcome IN ('error', 'replied')
+            ORDER BY created_at DESC, id DESC
+            LIMIT 30
+            """,
+            (chat_type.value, chat_id),
+        ).fetchall()
+        for row in rows:
+            outcome = str(row["outcome"] or "")
+            checkpoint = str(row["checkpoint"] or "")
+            if outcome == "error" and checkpoint not in (
+                "send_failed",
+                "send_dropped",
+            ):
+                continue
+            try:
+                ids = json.loads(str(row["message_ids"]))
+            except (TypeError, ValueError):
+                ids = []
+            if not isinstance(ids, list) or origin not in [str(item) for item in ids]:
+                continue
+            try:
+                detail = json.loads(str(row["detail"]))
+            except (TypeError, ValueError):
+                detail = {}
+            if not isinstance(detail, dict):
+                detail = {}
+            detail.update(
+                {
+                    "dropped_chunks": int(detail.get("dropped_chunks") or 0) + 1,
+                    "drop_reason": str(reason or "")[:200],
+                    "attempts": max(0, int(attempts)),
+                    "outbox_id": int(outbox_id),
+                    "outbox_age_seconds": max(0, int(age_seconds)),
+                }
+            )
+            if outcome == "error":
+                checkpoint = "send_dropped"
+            self._conn.execute(
+                """
+                UPDATE decisions
+                SET checkpoint = ?, detail = ?
+                WHERE id = ?
+                """,
+                (checkpoint, json.dumps(detail, ensure_ascii=False), int(row["id"])),
             )
             self._conn.commit()
             return int(row["id"])

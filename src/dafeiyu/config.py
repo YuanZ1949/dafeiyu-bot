@@ -297,6 +297,43 @@ class ImagesConfig:
 
 
 @dataclass(frozen=True)
+class RemoteMediaConfig:
+    """模型在回复里直接引用网络图片（HTTP/HTTPS）的能力；默认关闭。
+
+    开启后模型可以写 ``{"type": "image", "path": "https://..."}``，由
+    :func:`dafeiyu.reply_media.download_remote_attachments` 下载到
+    ``<workspace>/replies/`` 再走原有出站链路。每一跳都做 SSRF 校验
+    （协议、凭据、私网/环回/链路本地地址），只接受图片内容；下载失败
+    只丢附件，不影响正文。
+    """
+
+    enabled: bool = False
+    max_bytes: int = 10 * 1024 * 1024
+    timeout_seconds: float = 10.0
+    #: 单条回复最多下载几个远端附件；超出部分直接丢弃。
+    max_items: int = 3
+    #: 主机白名单（小写、精确匹配，可含 ``*.example.com`` 通配）；空 = 任意公网主机。
+    allowed_hosts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StickerLibraryConfig:
+    """群贴纸库：入站贴纸自动归档，模型可引用重发；默认关闭。
+
+    归档只保存「已解码并落盘成图片」的贴纸（``images/`` 里那份的副本），
+    文件名用内容 md5 前缀，天然去重。库目录必须是 workspace 下的**单层**
+    相对目录；出站引用 ``{"type": "image", "path": "<dir>/<文件名>"}`` 与
+    ``replies/`` 一样恒允许，不需要会话归属。
+    """
+
+    enabled: bool = False
+    dir: str = "stickers"
+    #: 库容量：超出后按 mtime 淘汰最旧的文件。
+    max_files: int = 500
+    max_bytes: int = 5 * 1024 * 1024
+
+
+@dataclass(frozen=True)
 class SpeechConfig:
     """入站语音转写（faster-whisper）。默认关闭，关掉时不下载、不转写。"""
 
@@ -634,8 +671,10 @@ class MirrorConfig:
     # 四角字符，顺序：左上/右上/左下/右下。左锚形态只用到第 1 个（``╭``）
     # 与第 3 个（``╰``）；另两个保留兼容旧配置。
     bubble_corner_chars: str = "╭╮╰╯"
-    # 正文按中文显示宽度换行的最大列数。
-    bubble_max_content_width: int = 30
+    # 正文按中文显示宽度换行的最大列数。每行还会多出 ``│ ``（2 列）前缀，
+    # 而手机端气泡容器实测只放得下约 30 列：超了客户端会自己再折一次，
+    # 折出来的字落在行首、把左锚框撑破。24 = 12 个汉字 + 2 列前缀，留余量。
+    bubble_max_content_width: int = 24
     # 镜像转发是否保持原图清晰度：默认 true，relay 物化不降采样、原样直传；
     # 设 false 则与模型侧一致按 images.max_edge 降采样（省流量，但会二次编码）。
     keep_image_quality: bool = True
@@ -735,6 +774,12 @@ class Settings:
     mirror: MirrorConfig = field(default_factory=MirrorConfig)
     # 服务端链接解析：默认全开；缺 ``link:`` 段 = 全默认，老配置无感。
     link: LinkConfig = field(default_factory=LinkConfig)
+    # 模型回复直发网络图片：默认关闭，缺 ``remote_media:`` 段即关闭。
+    remote_media: RemoteMediaConfig = field(default_factory=RemoteMediaConfig)
+    # 群贴纸库：入站贴纸归档 + 模型引用重发；默认关闭。
+    sticker_library: StickerLibraryConfig = field(
+        default_factory=StickerLibraryConfig
+    )
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -1036,6 +1081,57 @@ def _build_images(raw: dict[str, Any]) -> ImagesConfig:
         file_download=bool(raw.get("file_download", True)),
         file_max_bytes=_positive_int(
             raw.get("file_max_bytes"), "images.file_max_bytes", 50 * 1024 * 1024
+        ),
+    )
+
+
+def _build_remote_media(raw: dict[str, Any]) -> RemoteMediaConfig:
+    """解析可选的 ``remote_media:`` 段；缺段 = 全默认（enabled=false）。"""
+    if not isinstance(raw, dict):
+        raise ConfigError("config.yaml 的 remote_media 必须是映射")
+    timeout = _float(raw.get("timeout_seconds", 10.0), "remote_media.timeout_seconds")
+    if timeout <= 0:
+        raise ConfigError("remote_media.timeout_seconds 必须大于 0")
+    raw_hosts = raw.get("allowed_hosts") or []
+    if not isinstance(raw_hosts, (list, tuple)):
+        raise ConfigError("remote_media.allowed_hosts 必须是列表")
+    hosts: list[str] = []
+    for item in raw_hosts:
+        host = str(item or "").strip().lower()
+        if host:
+            hosts.append(host)
+    return RemoteMediaConfig(
+        enabled=_bool(raw.get("enabled", False), "remote_media.enabled"),
+        max_bytes=_positive_int(
+            raw.get("max_bytes"), "remote_media.max_bytes", 10 * 1024 * 1024
+        ),
+        timeout_seconds=timeout,
+        max_items=_positive_int(raw.get("max_items"), "remote_media.max_items", 3),
+        allowed_hosts=tuple(hosts),
+    )
+
+
+def _build_sticker_library(raw: dict[str, Any]) -> StickerLibraryConfig:
+    """解析可选的 ``sticker_library:`` 段；缺段 = 全默认（enabled=false）。"""
+    if not isinstance(raw, dict):
+        raise ConfigError("config.yaml 的 sticker_library 必须是映射")
+    name = str(raw.get("dir", "stickers") or "").strip().strip("/\\")
+    if (
+        not name
+        or "/" in name
+        or "\\" in name
+        or ".." in name
+        or name in {".", ".."}
+    ):
+        raise ConfigError("sticker_library.dir 必须是 workspace 下的单层目录名")
+    return StickerLibraryConfig(
+        enabled=_bool(raw.get("enabled", False), "sticker_library.enabled"),
+        dir=name,
+        max_files=_positive_int(
+            raw.get("max_files"), "sticker_library.max_files", 500
+        ),
+        max_bytes=_positive_int(
+            raw.get("max_bytes"), "sticker_library.max_bytes", 5 * 1024 * 1024
         ),
     )
 
@@ -1395,7 +1491,7 @@ def _mirror_bubble(raw: dict[str, Any]) -> dict[str, Any]:
         "bubble_max_content_width": _positive_int(
             raw.get("bubble_max_content_width"),
             "mirror.bubble_max_content_width",
-            30,
+            24,
         ),
     }
 
@@ -1529,9 +1625,12 @@ def _compute_mirror_capabilities(
     if not speech.enabled:
         voice_reasons.append("speech")
 
-    sticker_reasons = ["no-content"]
-    if outbound_reason:
-        sticker_reasons.insert(0, outbound_reason)
+    # 贴纸只有 mface 段带真图直链（url/file）时才有内容；face 段永远只有 id。
+    sticker_state = (
+        "on(mface-url-only)"
+        if not qq_media_reasons
+        else f"off({','.join([*qq_media_reasons, 'face-no-content'])})"
+    )
 
     qq_to_wechat = [
         ("text", "on"),
@@ -1547,7 +1646,7 @@ def _compute_mirror_capabilities(
             "file",
             _mirror_file_capability(not outbound_reason, qq_media_reasons),
         ),
-        ("sticker", _mirror_capability(False, sticker_reasons)),
+        ("sticker", sticker_state),
         ("forward", "on"),
     ]
 
@@ -2607,6 +2706,8 @@ def load_settings(
     workspace = _build_workspace(workspace_raw)
     images = _build_images(raw.get("images") or {})
     speech = _build_speech(raw.get("speech") or {})
+    remote_media = _build_remote_media(raw.get("remote_media") or {})
+    sticker_library = _build_sticker_library(raw.get("sticker_library") or {})
     _log_mirror_capabilities(mirror, wechat, images, workspace, speech)
 
     try:
@@ -2671,6 +2772,8 @@ def load_settings(
         workspace=workspace,
         images=images,
         speech=speech,
+        remote_media=remote_media,
+        sticker_library=sticker_library,
         logging=LoggingConfig(
             level=str(logging_raw.get("level", "INFO")),
             dir=str(logging_raw.get("dir", "logs")),

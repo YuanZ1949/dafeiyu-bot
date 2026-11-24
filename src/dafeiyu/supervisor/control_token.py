@@ -24,7 +24,7 @@ def _current_user() -> str:
     return user or os.environ.get("USERNAME") or os.environ.get("USER") or ""
 
 
-def harden_token_file(path: Path) -> None:
+def harden_token_file(path: Path) -> bool:
     """把 token 文件收紧到当前用户可读写删；失败只告警，不能阻断启动。
 
     Windows 用 icacls 去掉继承；POSIX 用 0o600。测试会 mock 掉真正的系统调用，
@@ -34,39 +34,101 @@ def harden_token_file(path: Path) -> None:
     被 ``unlink`` 清除，二者都需要文件自身的删除权限；父目录未必授予
     DELETE_CHILD（例如只继承 ``(M)`` 的目录）。D 只给属主本人，不会让其他用户
     多读一个字节。
+
+    改 DACL 需要 WRITE_DAC：文件属主是当前用户时由所有者隐式拥有。历史上在
+    管理员进程里创建的文件属主是 ``BUILTIN\\Administrators``，普通权限下改不动
+    ACL（``icacls`` 报「拒绝访问」）。这时按原内容原子重写一次，属主回到当前
+    用户再收紧；重写失败才放弃。返回是否已收紧。
     """
     try:
-        if os.name == "nt":
-            user = _current_user()
-            if not user:
-                # 找不到当前用户时不贸然去掉继承，避免把自己锁在文件外。
-                log.warning("控制口令 ACL 加固跳过（%s）：无法确定当前用户", path)
-                return
-            args = [
-                "icacls",
-                str(path),
-                "/inheritance:r",
-                "/grant:r",
-                f"{user}:(R,W,D)",
-            ]
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-                **hidden_kwargs(),
-            )
-            if result.returncode != 0:
-                log.warning(
-                    "控制口令 ACL 加固失败（%s）：%s",
-                    path,
-                    (result.stderr or result.stdout or "").strip(),
-                )
-        else:
+        if os.name != "nt":
             os.chmod(path, 0o600)
+            return True
+        user = _current_user()
+        if not user:
+            # 找不到当前用户时不贸然去掉继承，避免把自己锁在文件外。
+            log.warning("控制口令 ACL 加固跳过（%s）：无法确定当前用户", path)
+            return False
+        result = _icacls_harden(path, user)
+        if result is not None and result.returncode == 0:
+            return True
+        if _rewrite_as_current_user(path):
+            result = _icacls_harden(path, user)
+            if result is not None and result.returncode == 0:
+                log.info("控制口令文件属主不是当前用户，已重写并收紧 ACL：%s", path)
+                return True
+        detail = ""
+        if result is not None:
+            detail = (result.stderr or result.stdout or "").strip()
+        log.warning(
+            "控制口令 ACL 加固失败（%s）：%s", path, detail or "icacls 不可用"
+        )
+        return False
     except Exception as exc:  # noqa: BLE001 - ACL 失败绝不能影响启动
         log.warning("控制口令 ACL 加固失败（%s）：%s", path, exc)
+        return False
+
+
+def _icacls_harden(path: Path, user: str) -> subprocess.CompletedProcess[str] | None:
+    """执行一次 icacls 收紧；进程起不来时返回 None（调用方负责告警）。"""
+    args = [
+        "icacls",
+        str(path),
+        "/inheritance:r",
+        "/grant:r",
+        f"{user}:(R,W,D)",
+    ]
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            **hidden_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("icacls 调用失败（%s）：%s", path, exc)
+        return None
+
+
+def _rewrite_as_current_user(path: Path) -> bool:
+    """按原字节原子重写，把属主变回当前用户；失败返回 False。
+
+    只在 ACL 加固被拒绝时使用：文件内容一个字节都不变，只是让当前进程成为
+    新文件的创建者，从而拿到改 DACL 所需的属主身份。
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+    try:
+        _atomic_write_bytes(path, data)
+    except OSError as exc:
+        log.debug("控制口令文件重写失败（%s）：%s", path, exc)
+        return False
+    return True
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """temp + os.replace：任何失败都不会留下半截内容覆盖旧文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    os.close(fd)  # mkstemp 已按 0600 创建，POSIX 上临时文件不会先泄露权限
+    tmp_path = Path(raw_tmp)
+    try:
+        tmp_path.write_bytes(data)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 class ControlToken:
@@ -150,23 +212,7 @@ class ControlToken:
 
     def _write_atomic(self, value: str) -> None:
         """temp + os.replace：任何失败都不会留下半截 token 覆盖旧文件。"""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, raw_tmp = tempfile.mkstemp(
-            prefix=f".{self.path.name}.",
-            suffix=".tmp",
-            dir=str(self.path.parent),
-        )
-        os.close(fd)  # mkstemp 已按 0600 创建，POSIX 上临时文件不会先泄露权限
-        tmp_path = Path(raw_tmp)
-        try:
-            tmp_path.write_text(value, encoding="utf-8")
-            os.replace(tmp_path, self.path)
-        except BaseException:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        _atomic_write_bytes(self.path, value.encode("utf-8"))
 
 
 def load_or_create_token(path: Path = TOKEN_PATH) -> str:

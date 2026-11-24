@@ -585,8 +585,23 @@ def test_wire_bubble_wraps_by_display_width(tmp_path: Path) -> None:
     lines = wire[0].splitlines()
     assert len(lines) > 2
     bodies = [lines[0][2:]] + [line[2:] for line in lines[1:-1]]
-    assert all(display_width(body) <= 30 for body in bodies)
+    limit = MirrorConfig().bubble_max_content_width
+    assert all(display_width(body) <= limit for body in bodies)
     assert "".join(bodies) == "阿鱼" + content
+
+
+def test_wire_bubble_rows_fit_client_container(tmp_path: Path) -> None:
+    """整行（含「│ 」前缀）要给客户端容器留余量。
+
+    手机端气泡容器约 30 列；正文给到 30 时每行实际 32 列，客户端会自己再折
+    一次，折出来的字落在行首、把左锚撑破（线上截图实测）。所以整行必须明显
+    小于 30。
+    """
+    router, _store, _adapters = make_router(tmp_path)
+    wire = render_wire(router, make_msg(QQ, "甲" * 60))
+    assert len(wire) == 1
+    for line in wire[0].splitlines():
+        assert display_width(line) <= 28
 
 
 def test_wire_bubble_only_drops_invisible_break_spaces(tmp_path: Path) -> None:

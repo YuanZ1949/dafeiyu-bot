@@ -18,7 +18,7 @@
 | 语音 | 支持（`speech.enabled` 且 URL 下载由 `images.enabled` 门控时落盘 `voices/` 并转写，正文变 `[语音]（转写：…）`；依赖缺失、超时、解码失败保留 `[语音]` 占位） | 支持（`speech.enabled` 与 `gateway.wechat.media.enabled` 都打开时读取本地文件落盘并转写；否则占位） | 支持（`send_segments` 的 record 段，kind 为 `record`/`voice`） | 支持（hook 后端 `send_media` kind=voice；UIA 不支持） |
 | 视频 | 支持（`images.enabled` 时下载 URL 原文件到 `videos/`，`annotate` 为真时用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`gateway.wechat.media.enabled` 时复制原文件到 `videos/`，并用 ffmpeg 抽 4 帧到 `images/` 供 `read` 查看；失败保留 `[视频]`） | 支持（`send_segments` 的 video 段，路径同样受 `replies/` 与后缀白名单约束） | 不支持（没有视频发送原语：hook 后端把视频附件降级成 `send_media` 的 `kind=file` 发原文件，对端当文件收；UIA 后端不支持视频，正文照发） |
 | 文件 | `images.enabled` + `images.file_download` 都开时经 OneBot `get_group_file_url` / `get_private_file_url` 解析下载 URL，下载到 `files/`（受 `images.file_max_bytes` 上限）；成功后正文变 `[文件] 名字 (files/...)`、附件带本地路径。关闭、超限或失败保留 `[文件] 名字` 占位与元数据，不抛异常 | appmsg type 6 解析成 `kind=file` 附件（只有名字：附件 `name` 就是 `[文件] 名字` 全文，没有独立的大小字段），正文保留 `[文件] 名字` 占位；**不下载、没有路径** | 支持（`upload_file`，模型附件 `kind=file`） | 支持（hook 后端：模型附件 `kind=file` 经 `upload_file` → `send_media` 的 `kind=file`；桥回 `unsupported_media` 时附件跳过、正文照发。UIA 后端仍不支持） |
-| 表情 / 贴纸 | 占位但带标识（`face` 在 QQ 内置表情表内时显示名称 `[表情:<名称>]`，表外保留数字 id `[表情:<数字 id>]`；`mface` → `[表情:<摘要>]`，缺失时回退 `[表情]`；同时记录 sticker 名字/id） | 占位但带标识（`[表情:<desc>]`；`desc` 是 base64 protobuf 时解出中文名，无名字用 `[表情:<md5 前 8>]`，解析失败回退 `[表情]`）；贴纸图片在 `gateway.wechat.media.enabled` 时按图片落盘（缓存未命中则用 `cdnurl` 下载），模型可 `read` 查看；两者都拿不到时正文追加 `（未缓存）` | 支持（模型附件 `type=sticker`：`name` 可用**名称**（按内置表情表反查，如 `微笑`）或**数字 id**（1–6 位非 0）出 `face` 段；两者都未命中的文本出 `mface` 摘要段，mface 只有 summary，属 best-effort——缺 url/key/emoji_id 字段） | 支持（桥白名单接受 `sticker`，hook 后端把它映射到 `send_emoticon`：`path` 必须指向真实 GIF（GIF 头校验、≤1 MiB、≤1024px），非 GIF/超限被 hook 侧回 `hook_rejected` 时自动降级为图片再发；无 `path` 跳过实图发送、正文照发）。UIA 后端不支持任何媒体 |
+| 表情 / 贴纸 | 占位但带标识（`face` 在 QQ 内置表情表内时显示名称 `[表情:<名称>]`，表外保留数字 id `[表情:<数字 id>]`；`mface` → `[表情:<摘要>]`，缺失时回退 `[表情]`；同时记录 sticker 名字/id，`mface` 带 `url`/`file` 直链时按图片物化，可直接镜像） | 占位但带标识（`[表情:<desc>]`；`desc` 是 base64 protobuf 时解出中文名，无名字用 `[表情:<md5 前 8>]`，解析失败回退 `[表情]`）；贴纸图片在 `gateway.wechat.media.enabled` 时按图片落盘（缓存未命中则用 `cdnurl` 下载），模型可 `read` 查看；两者都拿不到时正文追加 `（未缓存）` | 支持（模型附件 `type=sticker`：`name` 可用**名称**（按内置表情表反查，如 `微笑`）或**数字 id**（1–6 位非 0）出 `face` 段；两者都未命中的文本出 `mface` 摘要段，mface 只有 summary，属 best-effort——缺 url/key/emoji_id 字段） | 支持（桥白名单接受 `sticker`，hook 后端把它映射到 `send_emoticon`：`path` 必须指向真实 GIF（GIF 头校验、≤1 MiB、≤1024px），非 GIF/超限被 hook 侧回 `hook_rejected` 时自动降级为图片再发；无 `path` 跳过实图发送、正文照发）。UIA 后端不支持任何媒体 |
 | @ | 支持（正文保留 `@名字`，并标记 `at_bot`） | 支持（正文保留原文，并标记 `at_bot`） | 支持（at 段；名字必须在本批次在场成员里，最多 3 个） | 支持（hook 后端 `send_at`；UIA 返回 `unsupported_at`，回落纯文本） |
 | 合并转发 | 支持（递归渲染成「昵称: 内容」文本，深度/节点数有上限，超限占位） | 占位（appmsg `type 19` 渲染为 `[合并转发] <title>`，无标题时仅 `[合并转发]`；不展开聊天记录，`kind` 仍是 `link`） | 支持（模型附件 `type=forward`，`nodes` 最多 5 条、单条 200 字；失败降级为一行占位文本） | 不支持（无转发发送原语；附件降级为正文末尾一行 `[合并转发 N 条]`，见下文） |
 | 引用回复（quote） | 支持（`reply` 段解析出 `reply_to_message_id` / `reply_to_user_id`，`reply_to_bot` 参与点名判定） | 支持（`kind=quote`，引用块渲染成 `reply_to_text` / `reply_to_author`） | 支持（`persona.quote_reply` 为真时首片带 `quote_id`，走 `send_segments`） | 不支持（桥只有 `send_text` / `send_at` / `send_media`，没有引用原语；回落纯文本，需在正文复述，见下文） |
@@ -38,12 +38,13 @@
 
 ### 出站附件（模型 → 群）
 
-- 不支持**文生图 / 绘图 API**：机器人不会调用任何模型生成图片，出站图片只会是工作区里已经存在的文件（模型用文件工具写进 `replies/` 的，或本会话收到过并落盘的图）。
+- 不支持**文生图 / 绘图 API**：机器人不会调用任何模型生成图片。出站图片只有三个来源：工作区里已经存在的文件（模型用文件工具写进 `replies/` 的）、本会话收到过并落盘的 `images/`、以及 `remote_media.enabled` 时模型给 `http(s)://` 直链、由机器人自己下载的远端图片。另有 `sticker_library.enabled` 时入站贴纸归档成的群贴纸库（`<workspace.dir>/stickers/`）可直接引用重发。
 - 不允许**跨会话图片引用**：模型只能引用本会话最近消息里出现过的 `images/` 路径，其它会话收到的图一律拒绝（见下）。
 
 模型可以在回复 JSON 里带 `attachments: [{"type": "image"|"file"|"voice"|"video", "path": "replies/xxx.png"}]`，但路径必须同时满足：
 
-- 只接受两类根目录下的普通文件：`<workspace.dir>/replies/` 恒可用；`<workspace.dir>/images/` 下的 `<name>` 只在「本会话最近 **200 条**消息正文里逐字出现过 `images/<name>`」时放行（归属校验）。**跨会话的 images/ 路径**、200 条窗口之外的旧路径、以及正文从未出现过的路径一律拒绝；没有记忆存储可用时（`store=None`）`images/` 全部拒绝，只有 `replies/` 通过；
+- 只接受三类根目录下的普通文件：`<workspace.dir>/replies/` 恒可用；`sticker_library.enabled` 时 `<workspace.dir>/stickers/`（库目录）恒可用；`<workspace.dir>/images/` 下的 `<name>` 只在「本会话最近 **200 条**消息正文里逐字出现过 `images/<name>`」时放行（归属校验）。**跨会话的 images/ 路径**、200 条窗口之外的旧路径、以及正文从未出现过的路径一律拒绝；没有记忆存储可用时（`store=None`）`images/` 全部拒绝，只有 `replies/`（与贴纸库）通过；
+- `remote_media.enabled` 时，`http(s)://` 开头的 `path` 不走本地路径检查：先做形态校验（只认 http/https、拒凭据、拒 localhost/内网域名/私网与保留地址、白名单主机），再由下载侧做 DNS 复核、重定向逐跳校验、图片魔数/Content-Type 与大小上限检查，落盘 `replies/remote-<uuid>.<ext>`；被拒或下载失败只丢这张图；
 - 路径先做形态检查（绝对路径 / 盘符 / `..` 一律拒绝），再 `resolve()` 后检查是否仍在对应根目录内（软链逃逸也会被挡住）；
 - 后缀白名单：`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.mp4` / `.mp3` / `.wav` / `.pdf` / `.txt` / `.zip`（不区分大小写）；
 - 文件必须非空且不超过 **10 MiB**；
@@ -51,7 +52,7 @@
 
 回复 JSON 还有一个可选字段 `reaction`：写表情名（如 `微笑`）或数字 id，表示给本轮第一条发出成功的回复贴一个表情回应；默认省略，不写就完全不贴。
 
-QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。表情用 `{"type": "sticker", "name": "...", "path": "可选"}`：`name` 为 1–6 位非 0 数字或内置表情名称（如 微笑）时出 `face` 段，其它文本出 `mface` 摘要段（mface 只有 summary，best-effort，没有 url/key/emoji_id）；只校验名字非空。带 `path` 的贴纸先走与图片相同的路径白名单（`replies/` 或已归属的 `images/`，GIF/大小限制由 hook 侧校验，非 GIF/超限降级为图片）；`path` 合法但 `name` 为空的贴纸不发 QQ 表情段（不拿文件名伪装 mface）。
+QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。表情用 `{"type": "sticker", "name": "...", "path": "可选"}`：`name` 为 1–6 位非 0 数字或内置表情名称（如 微笑）时出 `face` 段，其它文本出 `mface` 摘要段（mface 只有 summary，best-effort，没有 url/key/emoji_id）；只校验名字非空。带 `path` 的贴纸先走与图片相同的路径白名单（`replies/`、贴纸库目录或已归属的 `images/`，GIF/大小限制由 hook 侧校验，非 GIF/超限降级为图片）；`path` 合法但 `name` 为空的贴纸不发 QQ 表情段（不拿文件名伪装 mface）。
 微信侧分两种后端：**hook** 后端走 `send_media`，支持图片/语音/文件/贴纸（贴纸要求 `path` 指向真实 GIF）；**UIA** 后端对**所有媒体**（图片/语音/视频/文件/贴纸）都明确返回 `unsupported_media`（`gateway/wechat_bridge/sender.py`），没有 sticker→image 这类降级链，客户端不重试，调用方继续发文本；不做剪贴板发图。
 
 入站表情的正文格式统一为 `[表情:<标识>]`：QQ `face` 在内置表情表内用显示名称、表外保留数字 id，`mface` 用摘要文本；微信优先用 `<emoji desc/attachedtext>`，为空时用 md5 前 8 位。标识只是让模型能区分「哪个表情」，真正的语义仍要靠贴纸图片本身（见下）。
@@ -150,7 +151,7 @@ QQ 侧：图片/语音/视频走 OneBot 消息段，文件走 `upload_file`。�
 | voice / record | 在图片条件上**另需 `speech.enabled`**（QQ 语音的 URL 下载在语音管线内，关闭时不下载）；满足时 `send_media kind=voice` 真发，否则 `[语音]` 占位 | `local_db_enabled` + `media.enabled` 满足时按 QQ 语音段真发（文件来自微信本地库，不需要 `speech.enabled`）；否则 `[语音]` 占位 |
 | video | 微信 hook 没有视频发送原语（`kind=video` 明确回 `unsupported_media`）；物化成功时把 mp4 原文件按 `kind=file` 发送（对端可下载/播放），被 hook 拒收或未物化时 `[视频]` 占位 | `local_db_enabled` + `media.enabled` 满足时按 QQ 视频段真发；否则 `[视频]` 占位 |
 | file | 需要 `outbound: hook`；QQ 人类入站的文件消息只有在 `images.file_download` 开启且下载成功时才有本地文件（`files/` 下，见上文矩阵），否则没有文件内容、通常只有 `[文件 名字]` 说明行 | `local_db_enabled` + `media.enabled` 满足且解析出本机可读文件时走 `upload_file`；否则 `[文件 名字]` 占位 |
-| sticker | 入站 `face`/`mface` 表情没有可发送的媒体内容，**恒为 `[表情]` 占位**；机器人主动发送的带路径贴纸附件会经 `send_media kind=sticker` 发送，被 hook 拒收时降级当图片再试一次 | 贴纸图片按图片链路处理（落盘后附件 `kind` 为 `image`）；发不出去时与图片一样只留占位说明行 |
+| sticker | 入站 `face` 表情没有可发送的媒体内容，**恒为 `[表情]` 占位**；`mface` 带 `url`/`file` 直链时按图片链接落盘后发送，否则同样只留占位；机器人主动发送的带路径贴纸附件会经 `send_media kind=sticker` 发送，被 hook 拒收时降级当图片再试一次 | 贴纸图片按图片链路处理（落盘后附件 `kind` 为 `image`）；发不出去时与图片一样只留占位说明行 |
 | 合并转发 | 能拉到节点时渲染 `[聊天记录]` + 每行 `昵称: 内容`（最多 10 条、单条截断 60 字），拉不到节点才退回 `[合并转发 N 条]` | 同左（微信入站的合并转发本就只渲染 `[合并转发] <标题>`，见上文） |
 
 微信侧媒体文件来自本地库发现的 `.dat`/缓存文件：**必须解码成功才会发送**；解不开（缺密钥、扫描失败、转码失败）就把附件路径清空、只发占位，绝不把原始 `.dat` 字节交给目标通道。

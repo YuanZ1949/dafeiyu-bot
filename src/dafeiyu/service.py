@@ -71,6 +71,7 @@ from .reply_media import (
     MAX_ATTACHMENT_BYTES,
     REPLIES_DIRNAME,
     build_onebot_segments,
+    download_remote_attachments,
     resolve_at_names,
     resolve_attachments,
 )
@@ -929,15 +930,31 @@ class Service:
         now = time.time()
         sent = 0
         for row in self.store.due_outbox(now):
-            try:
-                chat_type = ChatType(row["chat_type"])
-                adapter = self._adapter_for(str(row["chat_id"]))
-            except (ValueError, KeyError) as exc:
-                log.warning("待发队列里有无法路由的行 %r：%s", row.get("chat_id"), exc)
-                self.store.drop_outbox(int(row["id"]))
-                continue
             chat_id = str(row["chat_id"])
             row_id = int(row["id"])
+            # 会话类型认不出来时无从回写决策（连 chat_type 都没有），只能丢。
+            try:
+                chat_type = ChatType(row["chat_type"])
+            except ValueError as exc:
+                log.warning(
+                    "待发队列里有无法识别的会话类型 %r：%s", row.get("chat_type"), exc
+                )
+                self.store.drop_outbox(row_id)
+                continue
+            try:
+                adapter = self._adapter_for(chat_id)
+            except (KeyError, ValueError) as exc:
+                log.warning("待发队列里有无法路由的行 %r：%s", chat_id, exc)
+                self.store.drop_outbox(row_id)
+                self._mark_decision_dropped(
+                    chat_type,
+                    chat_id,
+                    origin_message_id=str(row["origin_message_id"] or ""),
+                    reason="no_route",
+                    attempts=int(row["attempts"]),
+                    outbox_id=row_id,
+                )
+                continue
             lock = self._batch_locks.get((chat_type, chat_id))
             # 正在进行的那一轮回复优先：别让补发的旧分片插进新对话里。
             if lock is not None and lock.locked():
@@ -956,6 +973,15 @@ class Service:
                     str(row["text"])[:40],
                 )
                 self.store.drop_outbox(row_id)
+                self._mark_decision_dropped(
+                    chat_type,
+                    chat_id,
+                    origin_message_id=str(row["origin_message_id"] or ""),
+                    reason="expired",
+                    attempts=int(row["attempts"]),
+                    outbox_id=row_id,
+                    age_seconds=int(age),
+                )
                 continue
             if not bool(getattr(adapter, "connected", True)):
                 # 通道还没恢复：留在队列里，等下一轮，不算尝试次数。
@@ -993,6 +1019,15 @@ class Service:
                 if attempts >= OUTBOX_MAX_ATTEMPTS:
                     log.warning("补发超限，丢弃 %s: %s", chat_id, str(row["text"])[:40])
                     self.store.drop_outbox(row_id)
+                    self._mark_decision_dropped(
+                        chat_type,
+                        chat_id,
+                        origin_message_id=str(row["origin_message_id"] or ""),
+                        reason="max_attempts",
+                        attempts=int(attempts),
+                        outbox_id=row_id,
+                        age_seconds=int(age),
+                    )
                 continue
             self.store.drop_outbox(row_id)
             self._store_outbox_message(
@@ -3459,23 +3494,30 @@ class Service:
             return forward_id
         return await self._send_text(adapter, chat_type, chat_id, chunk, dedupe_key)
 
-    def _safe_reply_attachments(
+    async def _safe_reply_attachments(
         self, reply: BrainReply, chat_type: ChatType, chat_id: str
     ) -> tuple[Attachment, ...]:
-        """解析模型附件；解析器自身出错也只丢附件，不影响文本。"""
+        """解析模型附件；解析器/远端下载出错也只丢附件，不影响文本。"""
         try:
-            return tuple(
-                resolve_attachments(
-                    reply,
-                    self.settings,
-                    store=self.store,
-                    chat_type=chat_type,
-                    chat_id=chat_id,
-                )
+            resolved = resolve_attachments(
+                reply,
+                self.settings,
+                store=self.store,
+                chat_type=chat_type,
+                chat_id=chat_id,
             )
         except Exception as exc:  # noqa: BLE001 - 文本优先
             log.warning("附件解析失败，本条只发文本 %s: %s", chat_id, exc)
             return ()
+        try:
+            return tuple(await download_remote_attachments(resolved, self.settings))
+        except Exception as exc:  # noqa: BLE001 - 远端图片是加分项
+            log.warning("远端附件下载失败，只发本地附件 %s: %s", chat_id, exc)
+            return tuple(
+                item
+                for item in resolved
+                if not (str(getattr(item, "source", "") or "").strip() and not item.path)
+            )
 
     @staticmethod
     def _discard_voice(path: Path) -> None:
@@ -3717,6 +3759,39 @@ class Service:
                 "补发决策更新失败 %s/%s", chat_type.value, chat_id, exc_info=True
             )
 
+    def _mark_decision_dropped(
+        self,
+        chat_type: ChatType,
+        chat_id: str,
+        *,
+        origin_message_id: str,
+        reason: str,
+        attempts: int = 0,
+        outbox_id: int = 0,
+        age_seconds: int = 0,
+    ) -> None:
+        """补发分片被丢弃时留痕：面板才能把「补发成功」和「真丢了」分开。
+
+        与 `_mark_decision_retried` 同样吞异常，老 store 没有该方法时跳过。
+        """
+        marker = getattr(self.store, "mark_decision_dropped", None)
+        if marker is None:
+            return
+        try:
+            marker(
+                chat_type,
+                chat_id,
+                origin_message_id,
+                reason=reason,
+                attempts=attempts,
+                outbox_id=outbox_id,
+                age_seconds=age_seconds,
+            )
+        except Exception:  # noqa: BLE001
+            log.debug(
+                "丢弃决策更新失败 %s/%s", chat_type.value, chat_id, exc_info=True
+            )
+
     def _shape_reply(self, reply: BrainReply, text: str, original: str) -> list[str]:
         """按模型给的分条边界整形；被言论限制改写后才回到字符串路径。"""
         total = int(getattr(self.settings.persona, "reply_hard_total", 2000))
@@ -3820,7 +3895,7 @@ class Service:
             return []
         # 附件与 @ 只在守卫确认有内容要发之后才解析/上传：文本被整体丢弃时
         # 一个字节都不许发出去。
-        attachments = self._safe_reply_attachments(reply, chat_type, chat_id)
+        attachments = await self._safe_reply_attachments(reply, chat_type, chat_id)
         at_names = tuple(resolve_at_names(reply.at, batch))
         if (
             not at_names
@@ -4858,7 +4933,9 @@ class Service:
             self.router.note_no_reply(msg.chat_type, msg.chat_id)
             return
         # 与批次路径同序：先确认有内容，再解析附件/@。
-        attachments = self._safe_reply_attachments(reply, msg.chat_type, msg.chat_id)
+        attachments = await self._safe_reply_attachments(
+            reply, msg.chat_type, msg.chat_id
+        )
         at_names = tuple(resolve_at_names(reply.at, [msg]))
         at_qq_ids = self._at_qq_ids(at_names, [msg])
         # 与批次路径同一 helper、同一启用条件（单段、无 @、TTS 开启）。

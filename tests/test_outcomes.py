@@ -34,6 +34,7 @@ def add(
     is_bot: bool = False,
     reply_to_message_id: str | None = None,
     reply_to_bot: bool = False,
+    mirror: bool = False,
 ) -> None:
     store.add_message(
         Message(
@@ -47,6 +48,7 @@ def add(
             reply_to_message_id=reply_to_message_id,
             reply_to_bot=reply_to_bot,
             timestamp=timestamp,
+            mirror=mirror,
         )
     )
 
@@ -181,6 +183,28 @@ def test_consecutive_silent_turns_resets_on_engaged_turn(store: Store) -> None:
 
 def test_consecutive_silent_turns_empty_table_returns_zero(store: Store) -> None:
     assert store.consecutive_silent_turns(GROUP, CHAT) == 0
+
+
+def test_reply_outcome_stats_excludes_mirror_rows(store: Store) -> None:
+    """镜像（转发别人原话）不是自己发言，不进被接话率。"""
+    add(store, "b1", 1000, user_id=BOT, is_bot=True, content="买冻干吧")
+    add(store, "b2", 1200, user_id=BOT, is_bot=True, content="哈哈哈", mirror=True)
+    outcome_row(store, "b1", 1000)
+    outcome_row(store, "b2", 1200)
+
+    result = stats(store)
+    assert result["total"] == 1
+    assert result["silent"] == 1
+
+
+def test_consecutive_silent_turns_ignores_mirror_rows(store: Store) -> None:
+    add(store, "b1", 1000, user_id=BOT, is_bot=True, content="买冻干吧")
+    add(store, "m1", 2000, user_id=BOT, is_bot=True, content="哈哈哈", mirror=True)
+    outcome_row(store, "b1", 1000)
+    outcome_row(store, "m1", 2000)
+
+    # 最近一轮是镜像，不该算成自己发言；真正的沉默只有 1 轮。
+    assert store.consecutive_silent_turns(GROUP, CHAT) == 1
 
 
 def test_replied_rate_formula(store: Store) -> None:

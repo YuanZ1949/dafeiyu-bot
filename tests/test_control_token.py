@@ -70,6 +70,31 @@ def test_harden_failure_only_logs_warning(monkeypatch, tmp_path, caplog) -> None
     assert any("ACL" in record.message for record in caplog.records)
 
 
+def test_harden_rewrites_when_owner_is_not_current_user(
+    monkeypatch, tmp_path
+) -> None:
+    """属主是 Administrators 时 icacls 报拒绝访问：重写一次再收紧。"""
+    calls: list[list[str]] = []
+    state = {"first": True}
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if state["first"]:
+            state["first"] = False
+            return subprocess.CompletedProcess(args, 5, "", "拒绝访问")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(control_token.os, "name", "nt")
+    monkeypatch.setattr(control_token.subprocess, "run", fake_run)
+    monkeypatch.setattr(control_token.getpass, "getuser", lambda: "alice")
+    path = _write(tmp_path / "supervisor.token", "tok")
+
+    assert harden_token_file(path) is True
+    assert len(calls) == 2
+    # 重写只换属主，内容一个字节都不能变。
+    assert path.read_text(encoding="utf-8") == "tok"
+
+
 def test_load_or_create_hardens_existing_file_and_keeps_content(
     monkeypatch, tmp_path
 ) -> None:
@@ -109,10 +134,10 @@ def test_rotate_write_failure_keeps_old_value(monkeypatch, tmp_path) -> None:
     holder = ControlToken(path)
     old = holder.load_or_create()
 
-    def failing_write_text(self, *_args, **_kwargs):
+    def failing_write_bytes(self, *_args, **_kwargs):
         raise OSError("磁盘已满")
 
-    monkeypatch.setattr(Path, "write_text", failing_write_text)
+    monkeypatch.setattr(Path, "write_bytes", failing_write_bytes)
 
     with pytest.raises(OSError):
         holder.rotate()

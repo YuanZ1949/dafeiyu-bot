@@ -183,8 +183,10 @@ mirror:
   # 四角字符，顺序：左上/右上/左下/右下；默认 ╭╮╰╯，必须给足 4 个字符。
   # 左锚形态只用到第 1 个（╭）与第 3 个（╰），另两个保留兼容旧配置。
   bubble_corner_chars: "╭╮╰╯"
-  # 正文按中文显示宽度换行的最大列数；默认 30（窄窗口也不易折行错位），最小 1。
-  bubble_max_content_width: 30
+  # 正文按中文显示宽度换行的最大列数；默认 24，最小 1。
+  # 每行另有「│ 」2 列前缀，而手机端气泡容器约 30 列——给到 30 会超宽，
+  # 客户端自己再折一次，折出的字落在行首把左锚框撑破（线上实测）。
+  bubble_max_content_width: 24
   # 镜像转发是否保持原图清晰度；默认 true：对侧收到的就是源图字节。
   # 设 false 则与模型侧一致，按 images.max_edge 降采样（省流量但会二次编码）。
   keep_image_quality: true
@@ -394,6 +396,26 @@ images:
   # QQ 文件下载大小上限（字节）：超过保持 [文件] 占位，不落盘；
   # 下载成功时文件落在 workspace 的 files/ 下，正文追加 (files/...) 路径。
   file_max_bytes: 52428800
+
+# 模型在回复里直接引用网络图片（HTTP/HTTPS）。默认关闭：关掉时 URL 附件
+# 与历史行为一致（拒绝并留痕）。开启后每一跳都做 SSRF 校验（协议、凭据、
+# 私网/环回/保留地址、重定向逐跳），只认图片内容，落盘 workspace/replies/。
+remote_media:
+  enabled: false
+  max_bytes: 10485760
+  timeout_seconds: 10
+  # 单条回复最多下载几张远端图；超出的直接丢弃。
+  max_items: 3
+  # 主机白名单（精确匹配，可写 *.example.com 通配）；空 = 任意公网主机。
+  allowed_hosts: []
+
+# 群贴纸库：入站贴纸解码成功后按内容 md5 归档到 workspace/<dir>/，模型可
+# 引用重发；目录里的 index.md 是清单。默认关闭：关掉时不建目录、不写盘。
+sticker_library:
+  enabled: false
+  dir: stickers
+  max_files: 500
+  max_bytes: 5242880
 
 # 入站语音转写（QQ 语音 / 微信语音）。默认关闭：关掉时语音完全不处理，
 # 正文只保留 [语音] 占位，也不下载、不落盘。

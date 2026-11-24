@@ -21,7 +21,11 @@ from dafeiyu.config import (
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router
-from dafeiyu.service import Service
+from dafeiyu.service import (
+    OUTBOX_MAX_AGE_SECONDS,
+    OUTBOX_MAX_ATTEMPTS,
+    Service,
+)
 
 SHANGHAI = timezone(timedelta(hours=8))
 NOON = datetime(2026, 10, 24, 12, 0, tzinfo=SHANGHAI)
@@ -291,6 +295,125 @@ async def test_retry_mark_is_skipped_on_old_store(tmp_path, monkeypatch):
 
     assert await service._flush_outbox() == 1
     assert adapter.sent
+
+
+async def test_outbox_expired_row_marks_decision_send_dropped(tmp_path, monkeypatch):
+    """过期丢弃要留痕：面板能区分「还在排队」和「真的丢了」。"""
+    service, store, adapter = build(tmp_path, SpeakingBrain())
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("hook_not_ready")
+
+    monkeypatch.setattr(adapter, "send", boom)
+    await service.handle(make_msg("hi"))
+    await service.drain()
+
+    row = store.due_outbox()[0]
+    store._conn.execute(
+        "UPDATE pending_outbox SET enqueued_at = ? WHERE id = ?",
+        (time.time() - OUTBOX_MAX_AGE_SECONDS - 60, int(row["id"])),
+    )
+    store._conn.commit()
+
+    assert await service._flush_outbox() == 0
+    assert store.outbox_size() == 0
+    items = store.list_decisions()
+    assert len(items) == 1
+    item = items[0]
+    assert item["outcome"] == "error"
+    assert item["checkpoint"] == "send_dropped"
+    assert item["detail"]["drop_reason"] == "expired"
+    assert item["detail"]["dropped_chunks"] == 1
+    assert item["detail"]["outbox_id"] == int(row["id"])
+    assert item["detail"]["outbox_age_seconds"] > OUTBOX_MAX_AGE_SECONDS
+
+
+async def test_outbox_max_attempts_marks_decision_send_dropped(tmp_path, monkeypatch):
+    """重试超限丢弃同样留痕，并记下最终尝试次数。"""
+    service, store, adapter = build(tmp_path, SpeakingBrain())
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("hook_not_ready")
+
+    monkeypatch.setattr(adapter, "send", boom)
+    await service.handle(make_msg("hi"))
+    await service.drain()
+
+    row = store.due_outbox()[0]
+    store._conn.execute(
+        "UPDATE pending_outbox SET attempts = ? WHERE id = ?",
+        (OUTBOX_MAX_ATTEMPTS - 1, int(row["id"])),
+    )
+    store._conn.commit()
+
+    assert await service._flush_outbox() == 0
+    assert store.outbox_size() == 0
+    item = store.list_decisions()[0]
+    assert item["outcome"] == "error"
+    assert item["checkpoint"] == "send_dropped"
+    assert item["detail"]["drop_reason"] == "max_attempts"
+    assert item["detail"]["attempts"] == OUTBOX_MAX_ATTEMPTS
+
+
+async def test_outbox_unroutable_row_marks_decision_send_dropped(
+    tmp_path, monkeypatch
+):
+    """通道整体消失时丢弃也要留痕（会话类型认得出来才回写）。"""
+    service, store, adapter = build(tmp_path, SpeakingBrain())
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("hook_not_ready")
+
+    monkeypatch.setattr(adapter, "send", boom)
+    await service.handle(make_msg("hi"))
+    await service.drain()
+
+    service.adapters.clear()
+
+    assert await service._flush_outbox() == 0
+    assert store.outbox_size() == 0
+    item = store.list_decisions()[0]
+    assert item["checkpoint"] == "send_dropped"
+    assert item["detail"]["drop_reason"] == "no_route"
+
+
+async def test_outbox_malformed_chat_id_is_dropped_not_sticky(
+    tmp_path, monkeypatch
+):
+    """chat_id 缺前缀：丢弃该行，不能每轮抛异常卡死整个待发队列。"""
+    service, store, adapter = build(tmp_path, SpeakingBrain())
+    store.enqueue_outbox(
+        ChatType.GROUP, "garbage", "hi", origin_message_id="m1", now=0.0
+    )
+
+    assert await service._flush_outbox() == 0
+    assert store.outbox_size() == 0
+
+
+async def test_drop_mark_failure_does_not_break_outbox(tmp_path, monkeypatch):
+    """决策留痕写库失败不能影响丢弃本身。"""
+    service, store, adapter = build(tmp_path, SpeakingBrain())
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("hook_not_ready")
+
+    monkeypatch.setattr(adapter, "send", boom)
+    await service.handle(make_msg("hi"))
+    await service.drain()
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("decision table unavailable")
+
+    monkeypatch.setattr(store, "mark_decision_dropped", explode)
+    row = store.due_outbox()[0]
+    store._conn.execute(
+        "UPDATE pending_outbox SET enqueued_at = ? WHERE id = ?",
+        (time.time() - OUTBOX_MAX_AGE_SECONDS - 60, int(row["id"])),
+    )
+    store._conn.commit()
+
+    assert await service._flush_outbox() == 0
+    assert store.outbox_size() == 0
 
 
 # --------------------------------------------- 注定沉默批次的确定性前置过滤

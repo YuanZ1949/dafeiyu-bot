@@ -721,6 +721,30 @@ def test_face_mface_and_video_mappings() -> None:
     ]
 
 
+def test_mface_with_url_becomes_downloadable_image() -> None:
+    """带直链的商城表情按图片走物化，镜像时才能发到微信。"""
+    m = parse_event(
+        group_event(
+            segments=[
+                {
+                    "type": "mface",
+                    "data": {
+                        "summary": "猫猫表情",
+                        "url": "https://gxh.vip.qq.com/a.gif",
+                    },
+                }
+            ]
+        ),
+        bot_qq=BOT_QQ,
+    )
+    assert isinstance(m, Message)
+    assert m.content == "[表情:猫猫表情]"
+    attachment = m.attachments[0]
+    assert attachment.kind == "image"
+    assert attachment.source == "https://gxh.vip.qq.com/a.gif"
+    assert attachment.name == "猫猫表情"
+
+
 def test_face_renders_known_name_and_keeps_unknown_id() -> None:
     known = parse_event(group_event(segments=[face()]), bot_qq=BOT_QQ)
     unknown = parse_event(

@@ -324,6 +324,11 @@ def _attachment_from_segment(seg_type: str, data: dict[str, Any]) -> Attachment 
         return Attachment(kind="sticker", name=name) if name else None
     if seg_type == "mface":
         name = _clip_first(data.get("summary"), _ATTACHMENT_NAME_CLIP)
+        # 商城表情包在部分 OneBot 实现（如 NapCat 某些版本）里带 url/file 直链：
+        # 有真图就当图片走物化，镜像时能发到微信；没有内容才退回贴纸占位。
+        source = _pick_media_source(data, ("url", "file"))
+        if source:
+            return Attachment(kind="image", source=source, name=name)
         return Attachment(kind="sticker", name=name) if name else None
     if seg_type == "node":
         # 摘要已经由 content 里的 [合并转发] 占位承载，这里只留类型标记。

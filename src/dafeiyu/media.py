@@ -509,6 +509,94 @@ def _cleanup(directory: Path, retention_days: int) -> None:
             log.debug("清理过期图片失败：%s", entry, exc_info=True)
 
 
+#: 贴纸库只收图片后缀；索引文件名固定，不参与裁剪。
+_STICKER_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+_STICKER_INDEX = "index.md"
+
+
+def sticker_library_dir(root: Path, settings: Settings) -> Path | None:
+    """贴纸库目录；未启用或目录名非法时返回 ``None``（绝不回退 cwd）。"""
+    cfg = getattr(settings, "sticker_library", None)
+    if cfg is None or not getattr(cfg, "enabled", False):
+        return None
+    name = str(getattr(cfg, "dir", "") or "").strip().strip("/\\")
+    if not name or "/" in name or "\\" in name or ".." in name:
+        return None
+    return root / name
+
+
+def _prune_sticker_library(library: Path, max_files: int) -> None:
+    """按 mtime 淘汰超出容量的最旧贴纸；删不掉只留 debug。"""
+    files = [
+        path
+        for path in library.iterdir()
+        if path.is_file()
+        and path.name != _STICKER_INDEX
+        and path.suffix.lower() in _STICKER_SUFFIXES
+    ]
+    overflow = len(files) - max(0, max_files)
+    if overflow <= 0:
+        return
+    files.sort(key=lambda path: path.stat().st_mtime)
+    for path in files[:overflow]:
+        try:
+            path.unlink()
+        except OSError:
+            log.debug("裁剪贴纸库失败：%s", path, exc_info=True)
+
+
+def _refresh_sticker_index(library: Path, root: Path) -> None:
+    """全量重建 ``index.md``：库最多几百个文件，重建比增量维护更不容易错。"""
+    entries: list[str] = []
+    for path in sorted(library.iterdir(), key=lambda item: item.name):
+        if (
+            not path.is_file()
+            or path.name == _STICKER_INDEX
+            or path.suffix.lower() not in _STICKER_SUFFIXES
+        ):
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        relative = path.relative_to(root).as_posix() if path.is_relative_to(root) else path.as_posix()
+        when = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+        entries.append(f"- `{relative}`（{max(1, stat.st_size // 1024)} KB，{when}）")
+    lines = [
+        "# 贴纸库",
+        "",
+        '发贴纸：{"type": "image", "path": "<上面某个路径>"}。',
+        "",
+        *(entries or ["（空）"]),
+    ]
+    (library / _STICKER_INDEX).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _archive_sticker(
+    settings: Settings, root: Path, data: bytes, suffix: str, msg: Message
+) -> None:
+    """把解码成功的贴纸复制进库（md5 命名去重）并刷新索引；失败只留痕。"""
+    library = sticker_library_dir(root, settings)
+    if library is None:
+        return
+    if not suffix or suffix.lower() not in _STICKER_SUFFIXES:
+        return
+    cfg = settings.sticker_library
+    if len(data) > int(cfg.max_bytes):
+        log.info("贴纸超过库上限，跳过归档：msg=%s size=%d", msg.message_id, len(data))
+        return
+    digest = hashlib.md5(data).hexdigest()[:16]
+    target = library / f"{digest}{suffix.lower()}"
+    try:
+        library.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            target.write_bytes(data)
+        _prune_sticker_library(library, int(cfg.max_files))
+        _refresh_sticker_index(library, root)
+    except OSError:
+        log.warning("贴纸归档失败：msg=%s", msg.message_id, exc_info=True)
+
+
 def _file_note(attachment: Attachment, root: Path) -> str:
     name = attachment.name or Path(attachment.path).name
     return f"{_FILE_PREFIX} {name} ({_view_path(root, attachment.path)})"
@@ -893,6 +981,38 @@ async def _materialize_video(
     )
 
 
+_IMAGE_VARIANT_SUFFIXES: tuple[str, ...] = ("_h", "", "_t")
+
+
+def _image_variant_candidates(path: Path) -> list[Path]:
+    """同一张图的本地变体候选：``_h`` → 原图 → ``_t``（缺哪个少哪个）。
+
+    微信把同一张图存成 ``<md5>[_h|_t].dat``。桥扫描那一刻还没下完的变体不会
+    出现在 ``fallbacks`` 里，于是明明后来有高清版却只用 180px 缩略图。这里按
+    文件名推兄弟文件，让后落盘的 ``_h``/原图也进入候选。非 hex32 命名的文件
+    原样返回，不猜。
+    """
+    stem = path.stem
+    digest = stem
+    for suffix in ("_h", "_t"):
+        if stem.endswith(suffix) and len(stem) > len(suffix):
+            digest = stem[: -len(suffix)]
+            break
+    if not _HEX32_NAME_RE.fullmatch(digest):
+        return [path]
+    found: list[Path] = []
+    for suffix in _IMAGE_VARIANT_SUFFIXES:
+        candidate = path.with_name(f"{digest}{suffix}{path.suffix}")
+        try:
+            if candidate.is_file():
+                found.append(candidate)
+        except OSError:
+            continue
+    if path not in found:
+        found.append(path)
+    return found or [path]
+
+
 async def _read_image_bytes(
     path: Path,
     decode: Decode | None,
@@ -1183,13 +1303,13 @@ async def materialize_attachments(
 
             if source_path is not None:
                 # 微信同一张图有多个变体（原图 / `_h` / `_t`）：原图是 `wxgf`
-                # 容器，解不开时按 `fallbacks` 顺序退回，避免只剩 180px 缩略图。
-                candidates = [source_path]
-                candidates.extend(
-                    Path(item)
-                    for item in getattr(attachment, "fallbacks", ())
-                    if item
-                )
+                # 容器，解不开时按变体优先级退回；兄弟文件一并纳入，覆盖
+                # 「桥扫描时 `_h` 还没落盘」的情况。
+                candidates: list[Path] = []
+                for item in (source_path, *attachment.fallbacks):
+                    for candidate in _image_variant_candidates(Path(item)):
+                        if candidate not in candidates:
+                            candidates.append(candidate)
                 picked: tuple[bytes, Path] | None = None
                 for candidate in candidates:
                     picked = await _read_image_bytes(candidate, decode, path_max)
@@ -1296,6 +1416,12 @@ async def materialize_attachments(
             else:
                 msg.content = _annotate_first(
                     msg.content, _ANNOTATED.format(path=view)
+                )
+            if getattr(msg, "kind", "") == "sticker":
+                # 贴纸库归档用落盘前的原始字节（未 downscale），保证库里是原图；
+                # 归档失败只 warning，不影响本条消息与 images/ 的产物。
+                await asyncio.to_thread(
+                    _archive_sticker, settings, root, data, target.suffix, msg
                 )
             updated.append(
                 Attachment(

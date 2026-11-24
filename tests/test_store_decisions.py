@@ -410,6 +410,115 @@ def test_mark_decision_retried_ignores_unmatched_rows(tmp_path: Path) -> None:
     assert store.list_decisions()[0]["outcome"] == "error"
 
 
+def test_mark_decision_dropped_marks_failed_row(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    row_id = store.record_decision(
+        ChatType.GROUP,
+        "qq:1001",
+        outcome="error",
+        checkpoint="send_failed",
+        message_ids=["m1"],
+        detail={"existing": 1},
+    )
+
+    updated = store.mark_decision_dropped(
+        ChatType.GROUP,
+        "qq:1001",
+        "m1",
+        reason="expired",
+        attempts=3,
+        outbox_id=9,
+        age_seconds=21601,
+    )
+
+    assert updated == row_id
+    items = store.list_decisions()
+    # 原地改 checkpoint，不新增行：失败这条仍然只占一行。
+    assert len(items) == 1
+    item = items[0]
+    assert item["outcome"] == "error"
+    assert item["checkpoint"] == "send_dropped"
+    assert item["detail"]["existing"] == 1
+    assert item["detail"]["dropped_chunks"] == 1
+    assert item["detail"]["drop_reason"] == "expired"
+    assert item["detail"]["attempts"] == 3
+    assert item["detail"]["outbox_id"] == 9
+    assert item["detail"]["outbox_age_seconds"] == 21601
+
+
+def test_mark_decision_dropped_accumulates_chunks(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    store.record_decision(
+        ChatType.GROUP,
+        "qq:1001",
+        outcome="error",
+        checkpoint="send_failed",
+        message_ids=["m1"],
+    )
+
+    for outbox_id in (9, 10):
+        assert (
+            store.mark_decision_dropped(
+                ChatType.GROUP,
+                "qq:1001",
+                "m1",
+                reason="expired",
+                outbox_id=outbox_id,
+            )
+            > 0
+        )
+
+    detail = store.list_decisions()[0]["detail"]
+    assert detail["dropped_chunks"] == 2
+    assert detail["outbox_id"] == 10
+
+
+def test_mark_decision_dropped_keeps_rescued_row_replied(tmp_path: Path) -> None:
+    """已补发成功（replied）的决策不退回 error，只补记丢片。"""
+    store = make_store(tmp_path)
+    row_id = store.record_decision(
+        ChatType.GROUP,
+        "qq:1001",
+        outcome="error",
+        checkpoint="send_failed",
+        message_ids=["m1"],
+    )
+    store.mark_decision_retried(
+        ChatType.GROUP, "qq:1001", "m1", retry_after_seconds=5
+    )
+
+    updated = store.mark_decision_dropped(
+        ChatType.GROUP, "qq:1001", "m1", reason="max_attempts", attempts=8
+    )
+
+    assert updated == row_id
+    item = store.list_decisions()[0]
+    assert item["outcome"] == "replied"
+    assert item["checkpoint"] == ""
+    assert item["detail"]["retried"] is True
+    assert item["detail"]["dropped_chunks"] == 1
+    assert item["detail"]["drop_reason"] == "max_attempts"
+
+
+def test_mark_decision_dropped_ignores_unmatched_rows(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    store.record_decision(
+        ChatType.GROUP, "qq:1001", outcome="held", checkpoint="budget"
+    )
+    store.record_decision(
+        ChatType.GROUP,
+        "qq:1001",
+        outcome="error",
+        checkpoint="send_failed",
+        message_ids=["m1"],
+    )
+
+    assert store.mark_decision_dropped(ChatType.GROUP, "qq:1001", "other", reason="x") == 0
+    assert store.mark_decision_dropped(ChatType.GROUP, "qq:2002", "m1", reason="x") == 0
+    items = store.list_decisions()
+    assert {item["checkpoint"] for item in items} == {"budget", "send_failed"}
+
+
 def test_init_schema_upgrades_old_database(tmp_path: Path) -> None:
     path = tmp_path / "old.db"
     conn = sqlite3.connect(path)

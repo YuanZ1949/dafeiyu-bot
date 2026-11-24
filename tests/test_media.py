@@ -276,6 +276,25 @@ async def test_decodable_original_wins_over_fallback(tmp_path: Path) -> None:
     assert stored.read_bytes() == PNG
 
 
+async def test_hd_sibling_is_picked_when_only_thumb_was_known(
+    tmp_path: Path,
+) -> None:
+    """桥扫描时只看到 `_t`：同目录后来落盘的 `_h` 也要优先用上。"""
+    digest = "0123456789abcdef0123456789abcdef"
+    thumb = tmp_path / f"{digest}_t.dat"
+    thumb.write_bytes(bytes(byte ^ 0x37 for byte in JPG))
+    hd = tmp_path / f"{digest}_h.dat"
+    hd.write_bytes(xor_png())
+    settings = make_settings(tmp_path)
+    message = make_message(str(thumb))
+
+    count = await materialize_attachments(message, settings, decode=decode_dat)
+
+    assert count == 1
+    stored = tmp_path / "ws" / message.attachments[0].path
+    assert stored.read_bytes() == PNG
+
+
 async def test_over_max_bytes_keeps_placeholder(tmp_path: Path) -> None:
     source = write_dat(tmp_path)
     settings = make_settings(tmp_path, max_bytes=8)

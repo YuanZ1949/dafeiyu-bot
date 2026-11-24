@@ -1988,6 +1988,8 @@ const DECISION_CHECKPOINT = {
   guard_dropped: "重复守卫",
   brain_error: "模型失败",
   send_failed: "发送失败",
+  // 待发队列放弃重试：`send_failed` 一直没补发成功，最后过期/超限被丢。
+  send_dropped: "补发丢弃",
 };
 
 let state = null;
@@ -3307,6 +3309,9 @@ function renderDecisionStats(stats) {
     `模型沉默率 <b>${silenceText}</b>`,
     `平均 <b>${fmtLatency(s.avg_latency_ms)}</b>`,
   ];
+  // 待发队列放弃补发（过期/超限/无路由）是真实丢失，只在有时才占位显示。
+  const dropped = Number((s.by_checkpoint || {}).send_dropped) || 0;
+  if (dropped > 0) chips.push(`补发丢弃 <b>${dropped}</b>`);
   $("decisions-stats").innerHTML = chips
     .map((text) => `<span class="pill">${text}</span>`)
     .join("");
