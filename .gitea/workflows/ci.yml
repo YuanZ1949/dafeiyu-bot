@@ -126,7 +126,9 @@ jobs:
       - name: Type check
         shell: pwsh
         run: |
-          & .\.ci-venv\Scripts\basedpyright.exe --level error src
+          # --pythonpath 指到 CI 自己的 venv：runner 用的是 .ci-venv，不是 .venv，
+          # 否则 basedpyright 找不到 pysilk / pyweixin 等已装依赖，误报 missing import。
+          & .\.ci-venv\Scripts\basedpyright.exe --level error --pythonpath .\.ci-venv\Scripts\python.exe src
           exit $LASTEXITCODE
 
       # 真实浏览器 E2E（headless Edge + CDP）：本机没有 Edge 时用例会 skip，

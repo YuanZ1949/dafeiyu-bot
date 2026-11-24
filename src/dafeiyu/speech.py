@@ -16,6 +16,7 @@ QQ 的语音段通常是 ``.amr`` 或 SILK（腾讯前缀 ``\\x02#!SILK_V``）�
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import shutil
@@ -187,9 +188,10 @@ def _load_model(cfg: Any) -> Any:
             # 本机直连 huggingface.co 会超时；镜像必须走环境变量。
             os.environ.setdefault("HF_ENDPOINT", endpoint)
         try:
-            from faster_whisper import WhisperModel  # noqa: PLC0415
-
-            model = WhisperModel(
+            # 按名字动态导入：faster-whisper 属 [stt] 可选依赖，CI 不装它，
+            # 静态检查不该把「没装」当错误（运行时会退化成 None）。
+            whisper = importlib.import_module("faster_whisper")
+            model = whisper.WhisperModel(
                 model_name, device=device, compute_type=compute_type
             )
         except Exception:
