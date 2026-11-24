@@ -4858,6 +4858,30 @@ async function loadConfig() {
       ["记忆", `窗口 ${c.memory.window_size} 条 · 保留 ${c.memory.retention_days > 0 ? `${c.memory.retention_days} 天` : "永久"}`],
       ["网关", c.gateway.provider],
     ];
+    const media = c.media || {};
+    if (media.remote) {
+      const remote = media.remote;
+      const hosts = remote.allowed_hosts || [];
+      rows.push([
+        "网络图片",
+        remote.enabled
+          ? `已开启 · 单条最多 ${remote.max_items} 张 · 单张 ≤ ${fmtBytes(remote.max_bytes)} · 超时 ${remote.timeout_seconds}s · ${hosts.length ? `白名单 ${hosts.join("、")}` : "任意公网主机"}`
+          : "已关闭",
+      ]);
+    }
+    if (media.stickers) {
+      const stickers = media.stickers;
+      const stored =
+        stickers.file_count != null
+          ? ` · 已存 ${stickers.file_count}/${stickers.max_files} 张 · ${fmtBytes(stickers.total_bytes || 0)}`
+          : "";
+      rows.push([
+        "群贴纸库",
+        stickers.enabled
+          ? `已开启 · 目录 ${stickers.dir} · 上限 ${stickers.max_files} 张 / ${fmtBytes(stickers.max_bytes)}${stored}`
+          : "已关闭",
+      ]);
+    }
     $("config-body").innerHTML = rows
       .map(([label, value]) => `<div><b>${escapeHtml(label)}</b>：${escapeHtml(value)}</div>`)
       .join("");

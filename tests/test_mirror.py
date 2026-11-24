@@ -1005,6 +1005,12 @@ async def test_not_connected_retries_three_times_then_terminal(
     assert router.stats()["sent"] == 0
 
 
+def test_default_retry_window_covers_bridge_restart() -> None:
+    """默认退避要盖住 NapCat 重启/桥重连窗口（≥60 秒），否则短暂断线就丢镜像。"""
+    assert len(mirror_module.RETRY_BACKOFF_SECONDS) >= 5
+    assert sum(mirror_module.RETRY_BACKOFF_SECONDS) >= 60.0
+
+
 async def test_hook_not_ready_is_retried_until_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2577,6 +2577,41 @@ class BrainControl:
         result["restart_required"] = True
         return result
 
+    def _sticker_library_stats(self) -> dict[str, Any]:
+        """贴纸库当前占用：文件数 / 总字节 / index.md 是否存在。
+
+        只读、失败不抛：目录还没建（库刚开启或还没收到贴纸）时返回 0，
+        面板据此显示「已存 0 张」，而不是报错或留空。
+        """
+        workspace = getattr(self.service, "workspace", None)
+        root = getattr(workspace, "root", None)
+        library = None
+        if root is not None:
+            name = str(self.settings.sticker_library.dir or "").strip().strip("/\\")
+            if name:
+                library = Path(root) / name
+        if library is None:
+            return {"file_count": 0, "total_bytes": 0, "index_exists": False}
+        try:
+            files = [
+                path
+                for path in library.iterdir()
+                if path.is_file() and path.name != "index.md"
+            ]
+        except OSError:
+            return {"file_count": 0, "total_bytes": 0, "index_exists": False}
+        total = 0
+        for path in files:
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+        return {
+            "file_count": len(files),
+            "total_bytes": total,
+            "index_exists": (library / "index.md").is_file(),
+        }
+
     def config_snapshot(self) -> dict[str, Any]:
         state = self.snapshot()
         persona = self.settings.persona
@@ -2622,6 +2657,22 @@ class BrainControl:
             },
             "gateway": {"provider": self.settings.gateway.provider},
             "wechat": {"account": self.settings.wechat.account},
+            "media": {
+                "remote": {
+                    "enabled": self.settings.remote_media.enabled,
+                    "max_items": self.settings.remote_media.max_items,
+                    "max_bytes": self.settings.remote_media.max_bytes,
+                    "timeout_seconds": self.settings.remote_media.timeout_seconds,
+                    "allowed_hosts": list(self.settings.remote_media.allowed_hosts),
+                },
+                "stickers": {
+                    "enabled": self.settings.sticker_library.enabled,
+                    "dir": self.settings.sticker_library.dir,
+                    "max_files": self.settings.sticker_library.max_files,
+                    "max_bytes": self.settings.sticker_library.max_bytes,
+                    **self._sticker_library_stats(),
+                },
+            },
         }
 
 

@@ -55,11 +55,18 @@ class FlakyAdapter:
         self.sent: list[tuple[ChatType, str, str]] = []
         self.fail = False
         self.rate_limited = False
+        self.unavailable = False
         self.connected = True
 
     async def send(self, chat_type: ChatType, chat_id: str, text: str) -> str:
         if self.rate_limited:
             raise GatewayError("桥返回限流", error_code="rate_limited")
+        if self.unavailable:
+            raise GatewayError(
+                "微信发送失败：hook_unavailable",
+                error_code="hook_unavailable",
+                not_sent=True,
+            )
         if self.fail:
             raise RuntimeError("微信桥已断开")
         self.sent.append((chat_type, chat_id, text))
@@ -69,6 +76,11 @@ class FlakyAdapter:
         pass
 
     async def stop(self) -> None:
+        pass
+
+    def on_message(
+        self, handler: Callable[[Message], Awaitable[None]]
+    ) -> None:  # pragma: no cover - 本测试不消费入站
         pass
 
 
@@ -386,3 +398,68 @@ async def test_flush_without_dedupe_key_still_sends_plain(tmp_path: Path) -> Non
 
     assert await service._flush_outbox() == 1
     assert adapter.sent_keys == [""]
+
+
+# ------------------------------------------------- 通道级不可用（hook_unavailable）
+async def test_flush_channel_unavailable_does_not_burn_attempts(tmp_path: Path) -> None:
+    """桥不可用（hook_unavailable）不该消耗补发次数：撞 20 次也不累加、不丢弃。"""
+    service, store, adapter = build(tmp_path)
+    row_id = store.enqueue_outbox(ChatType.GROUP, CHAT, "等通道恢复", now=time.time())
+    adapter.unavailable = True
+
+    assert await service._flush_outbox() == 0
+    row = store.due_outbox(now=time.time() + 61)[0]
+    assert row["id"] == row_id
+    assert row["attempts"] == 0, "通道不可用不能消耗补发次数"
+    assert row["last_error"] == "hook_unavailable"
+    # 下次重试推到 ~60 秒后，而不是 15 秒后每轮撞墙。
+    assert store.due_outbox(now=time.time() + 1) == [], "下次重试应推到约 60 秒后"
+
+    # 模拟桥长时间不可用：反复到期再撞，次数始终为 0，消息不丢。
+    for _ in range(20):
+        store.defer_outbox(
+            row_id,
+            error="hook_unavailable",
+            next_attempt_at=time.time() - 1,
+            bump_attempts=False,
+        )
+        assert await service._flush_outbox() == 0
+    rows = store.due_outbox(now=time.time() + 61)
+    assert [r["id"] for r in rows] == [row_id]
+    assert rows[0]["attempts"] == 0
+
+
+async def test_flush_channel_recovers_after_unavailable(tmp_path: Path) -> None:
+    """通道恢复后补发成功，并清掉不可用告警状态。"""
+    service, store, adapter = build(tmp_path)
+    store.enqueue_outbox(ChatType.GROUP, CHAT, "等通道恢复", now=time.time())
+    adapter.unavailable = True
+    assert await service._flush_outbox() == 0
+    assert CHAT in service._channel_down
+
+    adapter.unavailable = False
+    # 把下一次重试拉回现在，模拟 60 秒已过。
+    for row in store.due_outbox(now=time.time() + 61):
+        store.defer_outbox(
+            int(row["id"]),
+            error="hook_unavailable",
+            next_attempt_at=time.time() - 1,
+            bump_attempts=False,
+        )
+    assert await service._flush_outbox() == 1
+    assert [text for _, _, text in adapter.sent] == ["等通道恢复"]
+    assert CHAT not in service._channel_down
+
+
+def test_channel_unavailable_code_detection(tmp_path: Path) -> None:
+    """只有带通道级 error_code 的异常才算；普通异常（无 error_code）照旧计数。"""
+    service, _store, _adapter = build(tmp_path)
+    assert service._is_channel_unavailable(
+        GatewayError("x", error_code="hook_unavailable")
+    )
+    assert service._is_channel_unavailable(GatewayError("x", error_code="not_connected"))
+    assert service._is_channel_unavailable(GatewayError("x", error_code="timeout"))
+    assert not service._is_channel_unavailable(RuntimeError("hook_unavailable"))
+    assert not service._is_channel_unavailable(
+        GatewayError("x", error_code="rate_limited")
+    )

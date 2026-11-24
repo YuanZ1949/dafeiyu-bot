@@ -186,6 +186,25 @@ OUTBOX_MAX_AGE_SECONDS = 6 * 3600
 # 并推迟到下一个整点再试，避免每 15 秒撞墙、把重试次数耗光后丢消息。
 RATE_LIMITED_CODE = "rate_limited"
 RATE_LIMITED_MAX_AGE_SECONDS = 26 * 3600
+# 通道级不可用：桥/网关还没恢复（hook_unavailable、not_connected、等回执超时…），
+# 不是消息本身的问题。这类失败不能消耗补发次数——否则桥断得久一点，消息就在
+# 「第 8 次补发失败」时被真丢掉（线上日志里已有这种丢消息）。只等通道恢复，
+# 超过 OUTBOX_MAX_AGE_SECONDS 才按过期丢弃。
+CHANNEL_UNAVAILABLE_CODES = frozenset(
+    {
+        "hook_unavailable",
+        "hook_not_ready",
+        "not_connected",
+        "timeout",
+        "desktop_not_interactive",
+    }
+)
+#: 通道不可用时下一次补发的间隔：既不像 15 秒那样撞墙刷屏，也不像限流那样等一小时。
+OUTBOX_CHANNEL_RETRY_SECONDS = 60.0
+#: 同一会话通道不可用的日志节流间隔（避免每轮都打一条）。
+CHANNEL_DOWN_LOG_INTERVAL_SECONDS = 300.0
+#: 通道持续不可用超过这个时长，额外告警一次，提醒消息可能来不及在保鲜期内送达。
+CHANNEL_DOWN_ALERT_SECONDS = 600.0
 # 轮换摘要的输入窗口（spec §9.2：最近 40 条）。
 ROTATION_WINDOW = 40
 # 微信图片密钥就绪等待：重启后缓存命中/内存扫描通常几秒内完成，留 20 秒余量。
@@ -644,6 +663,9 @@ class Service:
         self._continuation_used: set[tuple[ChatType, str]] = set()
         # 待发队列的补发任务（通道恢复后把没发出去的分片补上）。
         self._outbox_task: asyncio.Task[None] | None = None
+        # 通道级不可用的告警状态：chat_id -> (首次不可用时刻, 最近一次告警时刻,
+        # 是否已发过「持续不可用」告警)。通道恢复后清除。
+        self._channel_down: dict[str, tuple[float, float, bool]] = {}
         # 面板可改的聊天强度/言论限制：整体替换，避免逐字段同步。
         self.behavior: BehaviorSettings = settings.behavior
         # 面板可改的群白名单：Service 与 Router 都读这一份，整体替换。
@@ -918,6 +940,38 @@ class Service:
         return str(getattr(exc, "error_code", "") or "") == RATE_LIMITED_CODE
 
     @staticmethod
+    def _error_code_of(exc: BaseException) -> str:
+        return str(getattr(exc, "error_code", "") or "")
+
+    def _is_channel_unavailable(self, exc: BaseException) -> bool:
+        """桥/网关还没恢复（可证明没发出）：不耗补发次数，只等通道恢复。"""
+        return self._error_code_of(exc) in CHANNEL_UNAVAILABLE_CODES
+
+    def _note_channel_down(self, chat_id: str, now: float) -> None:
+        """通道不可用：日志按 5 分钟节流；持续超 10 分钟只额外告警一次。"""
+        since, last_log, alerted = self._channel_down.get(chat_id, (now, 0.0, False))
+        if last_log == 0.0 or now - last_log >= CHANNEL_DOWN_LOG_INTERVAL_SECONDS:
+            log.warning(
+                "通道暂不可用，暂停补发 %s（已 %.0f 分钟）：等通道恢复后自动续发",
+                chat_id,
+                (now - since) / 60,
+            )
+            last_log = now
+        if not alerted and now - since >= CHANNEL_DOWN_ALERT_SECONDS:
+            log.error(
+                "通道持续不可用超过 %.0f 分钟 %s：待发消息可能无法在保鲜期内送达",
+                (now - since) / 60,
+                chat_id,
+            )
+            alerted = True
+        self._channel_down[chat_id] = (since, last_log, alerted)
+
+    def _note_channel_up(self, chat_id: str) -> None:
+        """补发成功即视为通道恢复：清掉告警状态，必要时打一条恢复日志。"""
+        if self._channel_down.pop(chat_id, None) is not None:
+            log.info("通道已恢复，继续补发 %s", chat_id)
+
+    @staticmethod
     def _next_hour(now: float) -> float:
         return float((int(now) // 3600 + 1) * 3600)
 
@@ -1009,6 +1063,17 @@ class Service:
                     )
                     log.warning("补发被限流，推迟到下一整点 %s: %s", chat_id, exc)
                     continue
+                if self._is_channel_unavailable(exc):
+                    # 通道级不可用：不耗补发次数（否则桥断久了会把消息真丢掉），
+                    # 只把下次重试推到 60 秒后；日志按 5 分钟节流，别每轮刷屏。
+                    self.store.defer_outbox(
+                        row_id,
+                        error=self._error_code_of(exc) or type(exc).__name__,
+                        next_attempt_at=now + OUTBOX_CHANNEL_RETRY_SECONDS,
+                        bump_attempts=False,
+                    )
+                    self._note_channel_down(chat_id, now)
+                    continue
                 attempts = self.store.defer_outbox(
                     row_id,
                     error=f"{type(exc).__name__}: {exc}",
@@ -1030,6 +1095,7 @@ class Service:
                     )
                 continue
             self.store.drop_outbox(row_id)
+            self._note_channel_up(chat_id)
             self._store_outbox_message(
                 chat_type, chat_id, str(row["text"]), message_id, row_id
             )
@@ -1087,22 +1153,19 @@ class Service:
         except Exception as exc:  # noqa: BLE001 - 失败转队列，不打断主流程
             log.warning("发送失败，转入待发队列 %s/%s: %s", chat_id, origin or "-", exc)
             if self._is_rate_limited(exc):
-                self.store.enqueue_outbox(
-                    chat_type,
-                    chat_id,
-                    text,
-                    origin_message_id=origin,
-                    dedupe_key=dedupe_key,
-                    next_attempt_at=self._next_hour(time.time()),
-                )
+                next_at: float | None = self._next_hour(time.time())
+            elif self._is_channel_unavailable(exc):
+                next_at = time.time() + OUTBOX_CHANNEL_RETRY_SECONDS
             else:
-                self.store.enqueue_outbox(
-                    chat_type,
-                    chat_id,
-                    text,
-                    origin_message_id=origin,
-                    dedupe_key=dedupe_key,
-                )
+                next_at = None
+            self.store.enqueue_outbox(
+                chat_type,
+                chat_id,
+                text,
+                origin_message_id=origin,
+                dedupe_key=dedupe_key,
+                next_attempt_at=next_at,
+            )
             return False
         return True
 
@@ -3944,12 +4007,13 @@ class Service:
                 log.warning("发送失败 %s/%s: %s", chat_id, batch[-1].message_id, exc)
                 # 失败这条和后面所有分片一起进待发队列：通道恢复后补发，
                 # 不让这段回复永久丢失。
-                # 若是桥明确回的限流，推迟到下一个整点再补，而不是每 15 秒撞墙。
-                retry_at = (
-                    self._next_hour(time.time())
-                    if self._is_rate_limited(exc)
-                    else None
-                )
+                # 限流推迟到下一整点；通道级不可用推迟 60 秒，都别每 15 秒撞墙。
+                if self._is_rate_limited(exc):
+                    retry_at: float | None = self._next_hour(time.time())
+                elif self._is_channel_unavailable(exc):
+                    retry_at = time.time() + OUTBOX_CHANNEL_RETRY_SECONDS
+                else:
+                    retry_at = None
                 for offset, rest in enumerate(chunks[index:]):
                     dedupe_key = (
                         f"reply:{chat_id}:{batch[-1].message_id}:{index + offset}"

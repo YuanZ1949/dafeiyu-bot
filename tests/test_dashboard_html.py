@@ -54,6 +54,14 @@ def test_html_shows_memory_health_line() -> None:
     assert "记忆摘要落后" in html
 
 
+def test_html_config_shows_media_capabilities() -> None:
+    """运行配置面板要只读展示网络图片与群贴纸库（含贴纸库当前占用）。"""
+    html = read_html()
+    assert '"网络图片"' in html
+    assert '"群贴纸库"' in html
+    assert "stickers.file_count" in html
+
+
 def test_html_memory_health_lists_pending_slots() -> None:
     """缺口要落到「哪个会话、哪天、多少条」，不能只报天数。"""
     html = read_html()

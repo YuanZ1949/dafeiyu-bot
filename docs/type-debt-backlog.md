@@ -1,50 +1,71 @@
 # 类型债清单（basedpyright）
 
-本仓库没有基于 basedpyright CLI 的检查入口（只能走编辑器的 LSP），所以这类问题一直
-"看得见、没人算"。本页把已知存量记下来，便于按文件、按成因分批判清理——**不是**缺陷
-清单，里面的代码都在跑，只是类型层面说不清。
+本仓库历史上没有基于 basedpyright CLI 的检查入口（只能走编辑器的 LSP），所以这类问题
+一直"看得见、没人算"。本页记录当前状态与**如何复测**；现在已补上 `scripts/typecheck.ps1`
+作为可重复执行的入口。
 
 ## 度量方式
 
-- 工具：LSP（basedpyright），逐文件 `diagnostics(severity=error)`；
+- 工具：LSP（basedpyright），逐文件 `diagnostics(severity=error)`；或安装 dev 依赖后
+  运行 `scripts/typecheck.ps1`（内部调用 `python -m basedpyright src`）；
 - 计数：按「行:列 + 规则名」去重（同一位置的同一规则只算一条）；
-- 日期：2026-11-15，基线 `41f7e7f` 之后的代码状态。
+- 最近一次复测：**2026-11-24**，对下列文件 `severity=error` 均为 **0**。
 
-## 存量
+## 存量（2026-11-24 复测）
 
-| 文件 | 条数 | 主要规则 | 典型成因 |
-|---|---|---|---|
-| `src/dafeiyu/control.py` | 54 | `reportArgumentType` 39、`reportOptionalMemberAccess` 11、`reportOperatorIssue` 5、`reportOptionalSubscript` 4、`reportGeneralTypeIssues` 2、`reportMissingTypeArgument` 1 | HTTP 处理器里 `await request.json()` 得到 `dict \| None` 直接下标；`store` 返回 `dict[str, object]` 后直接 `int(...)` / `float(...)` |
-| `src/dafeiyu/service.py` | 16 | `reportArgumentType` 7、`reportAttributeAccessIssue` 4、`reportGeneralTypeIssues` 4、`reportMissingTypeArgument` 2、`reportCallIssue` 1 | `create_task()` 收到非协程（`object` 不可 await）；`asyncio.Task` 缺泛型参数 |
-| `src/dafeiyu/memory/store.py` | 5 | `reportArgumentType` 9（位置去重后 5） | 聚合查询的 `dict[str, object]` 返回类型：调用方要 `int` / `float` |
-| `src/dafeiyu/supervisor/dashboard.py` | 4 | `reportOptionalMemberAccess`、`reportOptionalCall`、`reportArgumentType`、`reportMissingTypeArgument` | `app["x"]` 可能为 `None`；`create_task(None)` |
-| `src/dafeiyu/config.py`、`keepalive.py` | 0 | — | — |
+| 文件 | 条数 | 备注 |
+|---|---|---|
+| `src/dafeiyu/control.py` | 0 | 历史 54 条已清（`request.json()` 一律先判空再收窄） |
+| `src/dafeiyu/service.py` | 0 | 历史 16 条已清 |
+| `src/dafeiyu/memory/store.py` | 0 | 历史 5 条已清 |
+| `src/dafeiyu/supervisor/dashboard.py` | 0 | 历史 4 条已清 |
+| `src/dafeiyu/config.py`、`keepalive.py` | 0 | — |
 
-合计 79 条（`dashboard.py` 已从 13 条降到 4 条，见下）。
+合计 **0** 条 error（历史基线 79 条，见下方「已清掉的部分」）。
+
+复测范围不止这 4 个文件：另外抽查了 `__main__.py`、`gateway/wechat.py`、`gateway/qq.py`、
+`media.py`、`reply_media.py`、`mirror.py`、`sender.py`、`links.py`、`hotconfig.py`、
+`bootstrap.py`、`supervisor/manager.py`、`supervisor/main.py`、`workers/*.py`、
+`brain/client.py`、`router.py` 共 20 个文件，`severity=error` 仅 1 条（见下「已知误报」）。
+
+## 已知误报（不是缺陷，不要"修"）
+
+- `src/dafeiyu/__main__.py:477` `reportArgumentType`：
+  `MirrorRouter | None` 无法赋给参数 `MirrorRouter | None`，并递归输出
+  `"MirrorRouter" is not assignable to "MirrorRouter"`。这是 basedpyright 在
+  「先声明 `X | None = None`、再在 `if` 里赋值」时的已知自比较误报，两侧是同一个类
+  （`from .mirror import MirrorRouter`）。运行时无影响，遇到升级 basedpyright 后可复测。
+
+## 与「严格模式警告」区分
+
+编辑器当前启用的是较严格的规则集，`severity=warning` 下还会看到大量
+`reportAny` / `reportExplicitAny` / `reportUnknown*`（每文件数百条）。这些是
+**strict 类型化**的渐进项（大量 `Any` 入参、`dict[str, object]` 未收窄），不是本页说的
+79 条「真错误」，也不影响运行。要推进属于独立的大工程，需先定 `[tool.basedpyright]`
+的 `typeCheckingMode` 口径，再分模块清理。
 
 ## 已清掉的部分
 
+- **`control.py` / `service.py` / `store.py` / `dashboard.py` 的 79 条 error → 0**：
+  历史主要成因是 `await request.json()` 得到 `dict | None` 直接下标、`store` 返回
+  `dict[str, object]` 后直接 `int(...)`/`float(...)`、`create_task()` 收到非协程。
+  代码已在后续迭代中逐步收窄（如 `request.json()` 后先 `isinstance(payload, dict)`、
+  返回注解改 `dict[str, Any]`），2026-11-24 复测归零。
 - **备份上传路径（`dashboard.py` `restore_backup`）— 8 条 → 0**，提交 `28cd504`：
   aiohttp 的 multipart 迭代类型是 `MultipartReader | BodyPartReader | None`，改成
   `isinstance(part, BodyPartReader)` 收窄再用；新增
   `tests/test_supervisor_ops_api.py::test_restore_streams_multi_chunk_upload`
   用 256 KiB 备份体压住多次 `read_chunk()` 的路径。
 
-## 处置建议（按性价比排序）
+## 如何复测（防回退）
 
-1. **先改返回注解，再改调用点**：`control.py` 的 39 条 `reportArgumentType` 大半来自
-   `store` 的 `dict[str, object]`。把这类返回类型定成 `dict[str, Any]`（本轮
-   `thread_states()` 就是这么消掉 2 条的），一处注解能带走十几条。
-2. **`request.json()` 一律先判空**：`dict | None` 后直接下标是 `reportOptionalSubscript`
-   的主要来源；判空返回 400 顺带把「请求体不是对象」的运行时分支补上。
-3. **`create_task` 前确认拿到协程**：`service.py` / `dashboard.py` 的
-   `reportGeneralTypeIssues`（`object` 不可 await）都属于这一类，改法是把
-   「返回 `Awaitable` 的工厂」注解成 `Awaitable[...]` 而不是 `object`。
-4. **泛型参数**：`asyncio.Task` / `dict` 缺参数，纯注解，零运行时风险，可以随手修。
+1. 编辑器：对目标文件调用 LSP `diagnostics(severity=error)`，条数应为 0（除上方已知误报）；
+2. 命令行：`.venv\Scripts\python -m pip install -e ".[dev]"` 后运行
+   `powershell -ExecutionPolicy Bypass -File scripts/typecheck.ps1`，退出码 0 表示干净；
+3. 改动公共返回类型（`store` / `control`）时跑全量测试。
 
-## 清理一轮的验收口径
+## 验收口径
 
-- LSP 对目标文件 `severity=error` 条数**只减不增**；
-- `git blame` 逐行归因，确认减少的是基线行、新增行 error 为 0（本轮 F2 的做法）；
-- 每改一个模块跑该模块相关测试；涉及公共返回类型（`store` / `control`）时跑全量；
-- 每处改动做反向验证：改回旧注解 → 目标 error 复现 → 还原。
+- 目标文件 `severity=error` 条数**只减不增**；
+- 新增行 error 必须为 0；已知误报不计入；
+- 每改一个模块跑该模块相关测试；涉及公共返回类型时跑全量。

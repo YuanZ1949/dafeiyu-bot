@@ -46,6 +46,7 @@ class FakeService:
         self.behavior = BehaviorSettings()
         self.groups = GroupsConfig(frozenset(), frozenset(), frozenset())
         self.mirror: Any = None
+        self.workspace: Any = None
 
     def set_brain(self, brain):
         previous = self.brain
@@ -1229,6 +1230,35 @@ async def test_config_endpoint_has_thresholds_and_no_secrets(tmp_path: Path) -> 
     assert payload["memory"] == {"window_size": 20, "retention_days": 180}
     # 面板「运行配置」也能看到当前绑定的微信账号（只读展示）。
     assert payload["wechat"] == {"account": ""}
+    # 新增媒体能力也要在「运行配置」里只读可见（默认关闭）。
+    assert payload["media"]["remote"]["enabled"] is False
+    assert payload["media"]["remote"]["max_items"] == 3
+    assert payload["media"]["stickers"]["enabled"] is False
+    assert payload["media"]["stickers"]["dir"] == "stickers"
+    assert payload["media"]["stickers"]["file_count"] == 0
+
+
+async def test_config_media_reports_sticker_library_usage(tmp_path: Path) -> None:
+    """面板只读展示贴纸库当前占用：文件数 / 字节 / index.md 是否存在。"""
+    from dafeiyu.memory.workspace import Workspace
+
+    control, service, app = make_control(tmp_path)
+    workspace = Workspace(tmp_path / "ws")
+    workspace.ensure()
+    library = workspace.root / control.settings.sticker_library.dir
+    library.mkdir(parents=True, exist_ok=True)
+    (library / "a.png").write_bytes(b"x" * 10)
+    (library / "b.jpg").write_bytes(b"y" * 20)
+    (library / "index.md").write_text("index", encoding="utf-8")
+    service.workspace = workspace
+
+    async with running(app) as client:
+        payload = await (await client.get("/api/config")).json()
+
+    stickers = payload["media"]["stickers"]
+    assert stickers["file_count"] == 2
+    assert stickers["total_bytes"] == 30
+    assert stickers["index_exists"] is True
 
 
 async def test_behavior_get_and_put_persists_override(
