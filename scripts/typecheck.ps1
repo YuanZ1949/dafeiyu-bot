@@ -7,7 +7,10 @@
 # 前置：.venv 里装了 dev 依赖（basedpyright 在 pyproject 的 dev extra）。
 #   .venv\Scripts\python -m pip install -e ".[dev]"
 #
-# 退出码：0 = 没有 error；非 0 = 有 error 或环境缺失（看提示）。
+# 退出码：0 = 没有 error；1 = 有 error 或输出无法解析；2 = 环境缺失（看提示）。
+#
+# 只按 summary.errorCount 判定：recommended 模式有 6000+ 条存量 warning，
+# 直接用 basedpyright 的退出码会把 warning 也算失败，这条命令就永远「红」。
 
 $ErrorActionPreference = "Stop"
 
@@ -35,5 +38,25 @@ if ($probe -ne 0) {
     exit 2
 }
 
-& $python -m basedpyright src @args
-exit $LASTEXITCODE
+$raw = (& $python -m basedpyright --outputjson --level error src @args 2>$null | Out-String)
+try {
+    $data = $raw | ConvertFrom-Json
+} catch {
+    Write-Host "basedpyright 输出不是合法 JSON，原始输出如下：" -ForegroundColor Red
+    Write-Host $raw
+    exit 1
+}
+
+$summary = $data.summary
+Write-Host ("basedpyright: {0} files, {1} errors, {2} warnings" -f `
+    $summary.filesAnalyzed, $summary.errorCount, $summary.warningCount)
+if ($summary.errorCount -gt 0) {
+    foreach ($d in $data.generalDiagnostics) {
+        if ($d.severity -ne "error") { continue }
+        $pos = $d.range.start
+        Write-Host ("{0}:{1}:{2} {3} ({4})" -f `
+            $d.file, ($pos.line + 1), ($pos.character + 1), $d.message, $d.rule)
+    }
+    exit 1
+}
+exit 0
