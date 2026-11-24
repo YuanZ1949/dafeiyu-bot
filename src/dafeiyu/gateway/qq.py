@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Collection
@@ -48,6 +49,15 @@ _RPS_NAMES = {1: "石头", 2: "剪刀", 3: "布"}
 
 _CARD_FALLBACK = "[小程序卡片]"
 _XML_FALLBACK = "[卡片]"
+#: 卡片里真实地址可能出现的键，按可靠性排序：小程序卡是 ``qqdocurl``，
+#: 分享/公众号卡常见 ``jumpUrl``，兜底才看泛化的 ``url``。
+_CARD_URL_KEYS = ("qqdocurl", "jumpUrl", "jumpurl", "sourceUrl", "source_url", "url")
+#: 卡片 payload（json/xml）里裸写的链接。
+_CARD_URL_RE = re.compile(r"""https?://[^\s"'<>\\]+""")
+#: ``prompt`` 前面的「[QQ小程序]」这类标签，渲染标题时剥掉。
+_CARD_PROMPT_TAG_RE = re.compile(r"^\[[^\]\n]{1,12}\]\s*")
+#: 标题最多带这么多字，给后面的地址留位置。
+_CARD_TITLE_CLIP = 60
 _FORWARD_FALLBACK = "[合并转发]"
 _FORWARD_MAX_DEPTH = 2
 _FORWARD_MAX_NODES = 10
@@ -87,7 +97,12 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _render_json_card(data: dict[str, Any]) -> str:
-    """json 段（小程序/分享卡）：浅层两轮查找可读标题，失败回退占位。"""
+    """json 段（小程序/分享卡）：标题 + 真实地址，两样都取不到才回退占位。
+
+    小程序卡（``app=com.tencent.miniapp_01``）的 ``title``/``desc`` 往往只是
+    应用名（"知乎"），真实文章地址在 ``meta.detail_1.qqdocurl``。地址必须原样
+    带出来：下游只解析消息文本里的 URL，地址丢了模型就只能看到「一张空卡片」。
+    """
     try:
         raw = data.get("data")
         if isinstance(raw, str):
@@ -99,39 +114,93 @@ def _render_json_card(data: dict[str, Any]) -> str:
         if not isinstance(parsed, dict):
             return _CARD_FALLBACK
         title = _find_card_title(parsed, depth=2)
-        if not title:
+        url = _find_card_url(parsed, depth=2)
+        if not title and not url:
+            # 取不到可读内容时把原始段留在 debug 日志里，方便事后对字段名。
+            logger.debug("QQ json 卡片取不到标题与地址，原始段：%r", data)
             return _CARD_FALLBACK
-        return f"[卡片] {_clip(title, 80)}"
+        if title and url:
+            return f"{_XML_FALLBACK} {_clip(title, _CARD_TITLE_CLIP)} {url}"
+        if url:
+            return f"{_XML_FALLBACK} {url}"
+        return f"{_XML_FALLBACK} {_clip(title or '', _CARD_TITLE_CLIP)}"
     # 畸形卡片段渲染降级为占位符，绝不让解析异常冒泡。
     except Exception:  # noqa: BLE001
         return _CARD_FALLBACK
 
 
 def _find_card_title(node: Any, depth: int) -> str | None:
-    """在 JSON 里限深查找 title/desc 文本（meta.newsApp.title 之类）。"""
+    """在 JSON 里限深查找可读标题：先 title，再 prompt，最后 desc。
+
+    ``prompt`` 是 QQ 自己生成的摘要（"[QQ小程序]知乎"），比 ``desc`` 可靠；
+    ``desc`` 常是 "0" 这类占位，纯数字一律跳过。
+    """
+    for key in ("title", "prompt", "desc"):
+        found = _find_card_text(node, key, depth)
+        if found:
+            if key == "prompt":
+                return _CARD_PROMPT_TAG_RE.sub("", found).strip() or found
+            return found
+    return None
+
+
+def _find_card_text(node: Any, key: str, depth: int) -> str | None:
+    """限深找 ``key`` 的第一个非空字符串值（纯数字视为占位跳过）。"""
     if depth < 0 or not isinstance(node, dict):
         return None
-    for key in ("title", "desc"):
-        value = node.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    for value in node.values():
-        found = _find_card_title(value, depth - 1)
+    value = node.get(key)
+    if isinstance(value, str):
+        text = value.strip()
+        if text and not text.isdigit():
+            return text
+    for child in node.values():
+        found = _find_card_text(child, key, depth - 1)
         if found:
             return found
     return None
 
 
+def _find_card_url(node: Any, depth: int) -> str | None:
+    """限深查找卡片里的真实地址（按 :data:`_CARD_URL_KEYS` 的可靠性排序）。"""
+    for key in _CARD_URL_KEYS:
+        found = _find_card_text(node, key, depth)
+        if found and found.startswith(("http://", "https://")):
+            return found
+    return None
+
+
 def _render_xml_card(data: dict[str, Any]) -> str:
-    """xml 段：用 QQ 客户端生成的 summary，缺失回退占位。"""
+    """xml 段：用 QQ 客户端生成的 summary，并尽量带出 payload 里的地址。"""
     try:
         summary = str(data.get("summary", "")).strip()
-        if not summary:
+        url = _xml_card_url(data)
+        if not summary and not url:
             return _XML_FALLBACK
-        return f"{_XML_FALLBACK} {_clip(summary, 80)}"
+        head = _clip(summary, 80) if summary else ""
+        if head and url:
+            return f"{_XML_FALLBACK} {head} {url}"
+        if url:
+            return f"{_XML_FALLBACK} {url}"
+        return f"{_XML_FALLBACK} {head}"
     # 畸形 XML 段渲染降级为占位符，绝不让解析异常冒泡。
     except Exception:  # noqa: BLE001
         return _XML_FALLBACK
+
+
+def _xml_card_url(data: dict[str, Any]) -> str:
+    """xml 段的地址：先看独立字段，再看 payload 里的 ``url="..."`` 属性。"""
+    for key in _CARD_URL_KEYS:
+        value = data.get(key)
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith(("http://", "https://")):
+                return text
+    payload = data.get("data")
+    if isinstance(payload, str):
+        match = _CARD_URL_RE.search(payload)
+        if match:
+            return match.group(0)
+    return ""
 
 
 def _clip_first(value: Any, limit: int) -> str:

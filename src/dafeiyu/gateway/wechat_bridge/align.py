@@ -46,6 +46,8 @@ MIN_OVERLAP_RATIO = 0.5
 #: 宽窗补读时，旧窗口尾巴至少要连续命中这么多条才认账。
 #: 只命中 1 条可能只是「哈哈」这种巧合，会把整段历史当成新消息灌回去。
 MIN_WIDE_OVERLAP = 3
+#: 记住最近发过多少个服务端消息 id，用于跨 epoch 去重（FIFO 淘汰）。
+SERVER_ID_MEMORY = 2000
 AT_ALL_TOKENS = ("@所有人", "@全体成员")
 #: 轮询结果里 `messages` 用的是事件信封，不是 models.Message。
 CHAT_TYPES = ("group", "private")
@@ -118,6 +120,9 @@ class SessionAligner:
         self._epoch = epoch if epoch is not None else _new_epoch()
         self._seq = 0
         self._prev: list[Entry] = []
+        # 已发出的服务端消息 id：resync 换 epoch 后窗口可能把同一条再交上来，
+        # 靠它做精确去重（文本哈希不行——同一个人可以故意连发同一句）。
+        self._emitted_server_ids: dict[int, None] = {}
         self._warned_no_nickname = False
         # 昵称为空的条目（纯文本行）也要有一个稳定的 user_id，否则它们会被并进
         # 「某个人」；这里给每个会话发一个匿名槽位，而不是复用别人的别名。
@@ -168,7 +173,7 @@ class SessionAligner:
                 )
             fresh = current[overlap:]
 
-        messages = tuple(self._build_message(entry) for entry in fresh)
+        messages = tuple(self._build_message(entry) for entry in self._drop_replayed(fresh))
         self._prev = current[-self.window :]
         return PollResult(messages, None, self._epoch)
 
@@ -229,6 +234,24 @@ class SessionAligner:
         }
         return PollResult((), envelope, self._epoch)
 
+    def _drop_replayed(self, entries: Sequence[Entry]) -> list[Entry]:
+        """丢掉「已经发过」的服务端消息 id：resync 后窗口会把同一条再交上来。
+
+        只对带 ``server_id`` 的条目生效（本地库 4.x 才有这一列）。UIA 屏幕
+        快照没有稳定 id，那边由主进程的「同人同文」去重兜底。
+        """
+        kept: list[Entry] = []
+        for entry in entries:
+            sid = int(entry.server_id or 0)
+            if sid > 0:
+                if sid in self._emitted_server_ids:
+                    continue
+                self._emitted_server_ids[sid] = None
+                if len(self._emitted_server_ids) > SERVER_ID_MEMORY:
+                    self._emitted_server_ids.pop(next(iter(self._emitted_server_ids)))
+            kept.append(entry)
+        return kept
+
     def _build_message(self, entry: Entry) -> dict[str, Any]:
         self._seq += 1
         at_bot, at_all, at_others = self._detect_at(entry.text)
@@ -252,8 +275,10 @@ class SessionAligner:
             "reply_to_author": entry.reply_author or None,
             "ts": entry.ts or int(self._clock()),
             "message_id": f"{self._epoch}:{self._seq}",
-            # 微信侧服务端 id 随信封透传，主进程用它做关联/去重；本地编号
-            # 仍然只有 epoch:seq，server_id=0（旧库）不是丢弃理由。
+            # 微信侧服务端 id 随信封透传：对齐层用它做跨 epoch 去重
+            # （resync 后窗口会重放同一条，见 `_drop_replayed`），主进程用它
+            # 做撤回关联；本地编号仍然只有 epoch:seq，server_id=0（旧库）
+            # 不是丢弃理由。
             "server_id": int(entry.server_id or 0),
             # 自己的发言必须由桥自己标记：主进程侧还有两层回声过滤，但源头标对了
             # 才不会有「重启后先自我回复一次」的窗口。

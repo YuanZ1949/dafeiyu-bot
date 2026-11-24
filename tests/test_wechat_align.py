@@ -164,6 +164,45 @@ def test_resync_restarts_seq_under_new_epoch() -> None:
     assert ids(after) == [f"{new_epoch}:1"]
 
 
+def test_resync_does_not_reemit_message_with_same_server_id() -> None:
+    """快照落后一拍触发 resync 后，窗口把同一条再交上来也不能重发。
+
+    线上 11-24 12:29 的重复入库就是这个形状：``1471186826:21`` 发过一次，
+    resync 换 epoch 后同一条又以 ``1122161559:1`` 发了一遍。
+    """
+    aligner = make_aligner()
+    aligner.poll([msg("阿猫", "开场", server_id=1)])
+    first = aligner.poll(
+        [msg("阿猫", "开场", server_id=1), msg("阿猫", "新的一条", server_id=2)]
+    )
+    assert ids(first) == ["7:1"]
+
+    lost = aligner.poll([msg("阿猫", "开场", server_id=1)])
+    assert lost.resync is not None
+
+    replay = aligner.poll(
+        [msg("阿猫", "开场", server_id=1), msg("阿猫", "新的一条", server_id=2)]
+    )
+    assert replay.messages == ()
+
+
+def test_resync_still_emits_messages_with_new_server_id() -> None:
+    """去重只认 server_id：resync 之后真正的新消息照发。"""
+    aligner = make_aligner()
+    aligner.poll([msg("阿猫", "开场", server_id=1)])
+    assert ids(aligner.poll([msg("阿猫", "开场", server_id=1), msg("阿猫", "二", server_id=2)])) == ["7:1"]
+
+    lost = aligner.poll([msg("阿猫", "开场", server_id=1)])
+    assert lost.resync is not None
+    new_epoch = lost.epoch
+
+    after = aligner.poll(
+        [msg("阿猫", "开场", server_id=1), msg("阿狗", "断片后的第一条", server_id=3)]
+    )
+    assert ids(after) == [f"{new_epoch}:1"]
+    assert after.messages[0]["text"] == "断片后的第一条"
+
+
 # ------------------------------------------------------- 断档后宽窗补读
 def test_narrow_window_would_drop_a_long_gap() -> None:
     """反证：默认窄窗在缺口 > 窗口时重叠为 0，会把漏读消息当 resync 丢掉。"""

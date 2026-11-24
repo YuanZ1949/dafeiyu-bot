@@ -18,6 +18,7 @@ from dafeiyu.config import (
     Settings,
     TriggerConfig,
 )
+from dafeiyu.links import LinkBlock
 from dafeiyu.memory.store import Store
 from dafeiyu.models import ChatType, Message
 from dafeiyu.router import Router
@@ -700,3 +701,148 @@ async def test_wechat_private_reply_hot_toggles_from_overlay(tmp_path, monkeypat
         assert readonly[0]["detail"] == {"private_reply": False}
     finally:
         service_module._WECHAT_RUNTIME_VIEWS.clear()
+
+
+# ---------------------------------------------------------------- 纯链接与重复入站
+URL = "https://www.zhihu.com/question/2108257367678613356"
+
+
+class RecordingBrain(CountingBrain):
+    """记下每次送审的 prompt，用来断言「链接到底有没有进上下文」。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.prompts: list[str] = []
+
+    async def reply(self, chat_type, chat_id, text, *, on_tool=None) -> BrainReply:
+        self.prompts.append(text)
+        return await super().reply(chat_type, chat_id, text, on_tool=on_tool)
+
+
+class FakeLinkResolver:
+    """只按预设返回 LinkBlock，不碰网络。"""
+
+    def __init__(self, blocks: dict[str, LinkBlock]) -> None:
+        self.blocks = blocks
+        self.calls = 0
+
+    async def resolve_for_prompt(self, urls):
+        self.calls += 1
+        return [self.blocks[url] for url in urls if url in self.blocks]
+
+
+def stamped(content: str, *, message_id: str, ts: int | None = None) -> Message:
+    """带真实时间戳的消息：重复入站判定要靠时间差。"""
+    return replace(
+        make_msg(content, message_id=message_id),
+        timestamp=int(ts if ts is not None else time.time()),
+    )
+
+
+async def test_bare_link_readable_goes_to_model_with_content(tmp_path):
+    """纯链接读得到正文：不再被判 silent，模型能看到【链接内容】块。"""
+    brain = RecordingBrain()
+    service, store, adapter = build(tmp_path, brain, settings=make_batch_settings())
+    bot_spoke(store, seconds_ago=10)
+    service.link_resolver = FakeLinkResolver(
+        {URL: LinkBlock(url=URL, ok=True, title="懂车帝那篇", text="正文段落")}
+    )
+
+    await service.handle(stamped(URL, message_id="m1"))
+    await service.drain()
+
+    assert brain.calls == 1
+    assert "正文段落" in brain.prompts[-1]
+    assert store.list_decisions()[0]["outcome"] == "replied"
+
+
+async def test_bare_link_unreadable_stays_pending_for_next_batch(tmp_path):
+    """纯链接读不到：不送模型、不 mark_delivered，用户补一句时随下一批进 prompt。"""
+    brain = RecordingBrain()
+    service, store, _ = build(tmp_path, brain, settings=make_batch_settings())
+    bot_spoke(store, seconds_ago=10)
+    service.link_resolver = FakeLinkResolver(
+        {URL: LinkBlock(url=URL, ok=False, reason="browser_error")}
+    )
+    # 先钉住投递下限：全新库里 pending_batch 只会返回当前这一条（首次投递语义），
+    # 这里要验证的是「投递下限已存在时，读不到的 URL 仍留在待投队列」。
+    store.add_message(make_msg("开场", message_id="m0"))
+    store.mark_delivered(ChatType.GROUP, "qq:1001", "m0")
+
+    await service.handle(stamped(URL, message_id="m1"))
+    await service.drain()
+
+    assert brain.calls == 0
+    item = store.list_decisions()[0]
+    assert item["outcome"] == "silent"
+    assert item["checkpoint"] == "bare_link_unreadable"
+
+    # 用户补一句：URL 那条还在待投队列里，必须跟着一起送审。
+    # 点名才会立刻投（非点名之间有 ambient_min_interval_seconds 间隔）。
+    await service.handle(stamped("@溟月 这个你没收到? " + URL, message_id="m2"))
+    await service.drain()
+
+    assert brain.calls == 1
+    assert URL in brain.prompts[-1]
+
+
+async def test_duplicate_inbound_same_content_is_dropped(tmp_path):
+    """桥 resync 后按新 id 重发同一条：同人同文且时间很近，只保留第一条。"""
+    brain = CountingBrain()
+    service, store, _ = build(tmp_path, brain, settings=make_batch_settings())
+    text = "我应该没眼花 今天打开微信的时候 就那一瞬间 背景还是月球"
+    now = int(time.time())
+
+    await service.handle(stamped(text, message_id="m1", ts=now))
+    await service.drain()
+    await service.handle(stamped(text, message_id="m2", ts=now + 15))
+    await service.drain()
+
+    assert brain.calls == 1
+    stored = [
+        m for m in store.recent_messages(ChatType.GROUP, "qq:1001", 10) if not m.is_bot
+    ]
+    assert [m.message_id for m in stored] == ["m1"]
+
+
+async def test_short_repeat_is_not_deduped(tmp_path):
+    """短回应连发是真的在说话：入站不去重（后续仍由沉默闸门按形态处理）。"""
+    brain = CountingBrain()
+    service, store, _ = build(tmp_path, brain, settings=make_batch_settings())
+    now = int(time.time())
+
+    await service.handle(stamped("在吗", message_id="m1", ts=now))
+    await service.drain()
+    await service.handle(stamped("在吗", message_id="m2", ts=now + 5))
+    await service.drain()
+
+    stored = [
+        m for m in store.recent_messages(ChatType.GROUP, "qq:1001", 10) if not m.is_bot
+    ]
+    assert [m.message_id for m in stored] == ["m1", "m2"]
+
+
+class RotatingBrain(SpeakingBrain):
+    """带 reset_session 的主脑桩：轮换流程要调它。"""
+
+    def reset_session(self, chat_type, chat_id) -> None:
+        return None
+
+
+async def test_rotation_summary_failure_backs_off(tmp_path, monkeypatch):
+    """轮换摘要失败后进入退避：同一窗口内不再重复等一次超时。"""
+    calls: list[int] = []
+
+    async def failing(*args, **kwargs):
+        calls.append(1)
+        return ""
+
+    monkeypatch.setattr("dafeiyu.service.summarize_for_rotation", failing)
+    service, store, _ = build(tmp_path, RotatingBrain(), settings=make_batch_settings())
+    store.bump_session_stats(ChatType.GROUP, "qq:1001", messages=60, tokens=0)
+
+    await service._maybe_rotate(ChatType.GROUP, "qq:1001")
+    await service._maybe_rotate(ChatType.GROUP, "qq:1001")
+
+    assert len(calls) == 1
+    assert service._rotation_failures[(ChatType.GROUP, "qq:1001")][0] == 1

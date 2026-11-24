@@ -207,6 +207,14 @@ CHANNEL_DOWN_LOG_INTERVAL_SECONDS = 300.0
 CHANNEL_DOWN_ALERT_SECONDS = 600.0
 # 轮换摘要的输入窗口（spec §9.2：最近 40 条）。
 ROTATION_WINDOW = 40
+#: 轮换摘要失败后的退避：摘要调用失败（OpenCode 超时）时每批都重试会把回复
+#: 主链路一起拖住，失败一次就退到下一次再试。
+ROTATION_RETRY_SECONDS = 120.0
+ROTATION_RETRY_MAX_SECONDS = 900.0
+#: 连续失败到这个次数才升级成 WARNING（首次失败只记 INFO，避免刷屏）。
+ROTATION_ALERT_AFTER = 3
+#: 入站去重的最小正文长度：太短的话「哈哈」「在吗」连发是真的在说话。
+DUPLICATE_INBOUND_MIN_CHARS = 8
 # 微信图片密钥就绪等待：重启后缓存命中/内存扫描通常几秒内完成，留 20 秒余量。
 # 只在一批消息里确有「未物化图片」时等待；超时就按占位继续，绝不阻塞回复。
 MEDIA_KEY_WAIT_SECONDS = 20.0
@@ -685,6 +693,8 @@ class Service:
         # 每会话上一轮的 prompt_tokens：opencode 报的是整段上下文，累计会重复
         # 计数，轮换阈值（rotation_tokens）只能按「本轮增量」累加。
         self._last_prompt_tokens: dict[tuple[ChatType, str], int] = {}
+        # 轮换摘要失败退避：key -> (连续失败次数, 下次可重试的 monotonic 时刻)。
+        self._rotation_failures: dict[tuple[ChatType, str], tuple[int, float]] = {}
         # 入站媒体表情回应的节流时刻（只有 mind.inbound_media_reactions 打开时才写）。
         self._inbound_reaction_at: dict[tuple[ChatType, str], float] = {}
         # 管理员通知的进程内节流与去重：只存事件 flag，不存正文/票据。
@@ -1593,6 +1603,18 @@ class Service:
                 log.info("图片重试物化成功：%s（%d 张）", message.message_id, done)
 
     async def handle(self, msg: Message) -> None:
+        # 同人同文的重复入站：桥在 resync 换 epoch 后可能把同一条再发一遍
+        # （见 wechat_bridge/align.py）。必须在镜像入队/入库之前拦掉，否则
+        # 对面群多一行镜像、模型也会被问两遍。
+        if not msg.is_bot and self._is_duplicate_inbound(msg):
+            log.info(
+                "重复入站消息已丢弃 %s/%s id=%s user=%s",
+                msg.chat_type.value,
+                msg.chat_id,
+                msg.message_id,
+                msg.user_id,
+            )
+            return
         # 入队必须在第一个 await 之前：qq.py 每条消息一个独立 task，
         # 先同步发布才能保证到达顺序与队列顺序一致。
         media_box: MediaBox | None = None
@@ -2751,6 +2773,9 @@ class Service:
             if expired:
                 return "release", "intensity_quiet_expired", age
             return "hold", "intensity_quiet", age
+        if self._is_bare_link_batch(batch, now_ts=now_ts):
+            # 纯链接要先解析再决定说不说，攒着只会把「看一眼这个」拖到窗口后。
+            return "none", "", age
         # 冷场快反馈（GAP-11）：插在安静强度与纯热聊之间，15 分钟窗口独立于
         # persona.hold_max_seconds。先豁免注定沉默的弱批次：交给
         # _run_batch_locked 的 skip_known_silent 照常 mark_delivered，否则
@@ -2816,6 +2841,48 @@ class Service:
         gap = self._seconds_since_bot_spoke(chat_type, chat_id, now_ts)
         return gap is not None and gap <= seconds
 
+    def _is_duplicate_inbound(self, msg: Message) -> bool:
+        """同一个人、同样正文、时间挨得很近的重复入站消息。
+
+        桥在 ``resync`` 换 epoch 后会把窗口里的同一条按新 id 再发一次，两条
+        ``message_id`` 不同、正文一模一样；只靠 id 去重拦不住，模型会当成
+        两轮问题各答一遍，对面群还多一行镜像。
+
+        只在冷却窗口内、正文够长、同一个人时才认重复：短回应（"哈哈""在吗"）
+        连发是真的在说话，不能被吞。命令一律跳过。
+        """
+        content = (msg.content or "").strip()
+        if len(content) <= DUPLICATE_INBOUND_MIN_CHARS:
+            return False
+        # 单测里常把 settings 换成只有 `trigger` 的 SimpleNamespace（调度器同样
+        # 兼容两种写法）；缺这一段就当去重没开，不能因此打断入站主链路。
+        triggers = getattr(self.settings, "triggers", None) or getattr(
+            self.settings, "trigger", None
+        )
+        window = int(getattr(triggers, "cooldown_seconds", 0) or 0)
+        if window <= 0:
+            return False
+        if self.commands.match(content, msg.chat_type) is not None:
+            return False
+        now_ts = int(msg.timestamp or time.time())
+        try:
+            recent = self.store.recent_messages(
+                msg.chat_type, msg.chat_id, 10, include_mirror=False
+            )
+        except Exception:  # noqa: BLE001 - 去重是兜底，读库失败按原样放行
+            log.warning("重复入站检查读库失败：%s/%s", msg.chat_id, msg.message_id)
+            return False
+        for previous in recent:
+            if previous.is_bot or previous.user_id != msg.user_id:
+                continue
+            if (previous.content or "").strip() != content:
+                continue
+            if not previous.timestamp:
+                continue
+            if abs(now_ts - int(previous.timestamp)) <= window:
+                return True
+        return False
+
     def _known_silent_reason(
         self, batch: list[Message], *, now_ts: int
     ) -> str | None:
@@ -2852,11 +2919,36 @@ class Service:
         shape = _silent_content_shape(msg.content)
         if shape is None:
             return None
+        if shape == "纯链接":
+            # 纯链接不在这里定沉默：链接得先解析，读得到才值得送模型，读不到
+            # 就留在待投队列等用户补一句（见 `_run_batch_locked` 的纯链接分支）。
+            return None
         if not self._bot_spoke_within(
             msg.chat_type, msg.chat_id, mind.skip_silent_cooldown_seconds, now_ts
         ):
             return None
         return shape
+
+    def _is_bare_link_batch(self, batch: list[Message], *, now_ts: int) -> bool:
+        """单条纯链接、没点名、机器人刚说过话：先解析链接再决定说不说。
+
+        前提与 :meth:`_known_silent_reason` 一致，只是把「确定性沉默」换成
+        「先看能不能读到内容」：读得到就带着正文送模型，读不到就把这条留在
+        待投队列（不 mark_delivered），用户补一句时随下一批一起进 prompt。
+        """
+        if len(batch) != 1:
+            return False
+        msg = batch[0]
+        if msg.is_bot or msg.recalled_at or self._addressing_signal(msg):
+            return False
+        if _silent_content_shape(msg.content or "") != "纯链接":
+            return False
+        return self._bot_spoke_within(
+            msg.chat_type,
+            msg.chat_id,
+            self.settings.mind.skip_silent_cooldown_seconds,
+            now_ts,
+        )
 
     def _is_debate_batch(self, batch: list[Message]) -> bool:
         """多人互相接话/反驳的批次：放宽历史窗口，避免只看到半场。"""
@@ -3047,6 +3139,32 @@ class Service:
             )
             return
 
+        # 纯链接先解析再决定：读得到就带着正文送模型；读不到就不送、也不
+        # mark_delivered——这条 URL 留在待投队列里，用户补一句时随下一批进
+        # prompt。以前这里直接判 silent，URL 从此再也不会出现在任何 prompt。
+        link_block: str | None = None
+        if self._is_bare_link_batch(batch, now_ts=int(now_shanghai().timestamp())):
+            blocks = await self._link_blocks_for_prompt(chat_type, batch)
+            if not any(block.ok and (block.text or block.title) for block in blocks):
+                self._record_decision(
+                    chat_type,
+                    chat_id,
+                    outcome="silent",
+                    checkpoint="bare_link_unreadable",
+                    message_ids=ids,
+                    addressed=addressed,
+                    message_count=len(batch),
+                    reason="纯链接（服务器读不到，留待下批）",
+                )
+                log.info(
+                    "纯链接读不到，留在待投 %s/%s ids=%d",
+                    chat_id,
+                    current_id,
+                    len(ids),
+                )
+                return
+            link_block = render_link_block(blocks) or None
+
         # 注定沉默的批次在调模型前确定性过滤（GAP-8）：单条弱消息 + 机器人
         # 刚说过话 + 没有任何点名/接话钩子，直接判 silent，省一整轮调用。
         # 游标随 mark_delivered 推进，与模型自决 silent 的记账同口径。
@@ -3082,8 +3200,10 @@ class Service:
         continuation = self._continuation_for(chat_type, chat_id)
         fact_hint = self._shared_fact_hint(chat_type, chat_id, batch)
         # 链接解析挂在异步批处理层（不是同步的 _build_prompt）：总预算内能读
-        # 多少算多少，读不到的 URL 在同一块里标「服务器读不到」。
-        link_block = await self._link_block_for_prompt(chat_type, batch)
+        # 多少算多少，读不到的 URL 在同一块里标「服务器读不到」。纯链接分支
+        # 已经解析过一次，这里直接复用，避免同一批 URL 再读一遍。
+        if link_block is None:
+            link_block = await self._link_block_for_prompt(chat_type, batch)
         prompt = self._build_prompt(
             chat_type,
             chat_id,
@@ -4218,8 +4338,20 @@ class Service:
         return self.store.recent_session_summary(chat_type, chat_id)
 
     async def _maybe_rotate(self, chat_type: ChatType, chat_id: str) -> None:
-        """到阈值就换 session；摘要写不出来就继续用旧的，下一批再试。"""
+        """到阈值就换 session；摘要写不出来就退避重试，继续用旧 session。"""
         if not callable(getattr(self.brain, "reset_session", None)):
+            return
+        key = (chat_type, chat_id)
+        failures, retry_at = self._rotation_failures.get(key, (0, 0.0))
+        now_mono = time.monotonic()
+        if now_mono < retry_at:
+            # 摘要服务刚失败过：这一批别再去等一次超时，回复主链路优先。
+            log.debug(
+                "轮换摘要退避中 %s/%s（%d 秒后重试）",
+                chat_type.value,
+                chat_id,
+                int(retry_at - now_mono),
+            )
             return
         memory = self.settings.memory
         stats = self.store.session_stats(chat_type, chat_id)
@@ -4236,11 +4368,31 @@ class Service:
             self.brain, self.store, summarize_for_rotation, chat_type, chat_id, recent
         )
         if continuation:
+            self._rotation_failures.pop(key, None)
             self._continuations[(chat_type, chat_id)] = continuation
             # 轮换产出了新接续语，旧的「已消费」标记必须失效，否则这条新语不会注入。
             self._continuation_used.discard((chat_type, chat_id))
             # 新 session 的上下文从头算：上一轮 prompt_tokens 不再可比。
             self._last_prompt_tokens.pop((chat_type, chat_id), None)
+            return
+        failures += 1
+        delay = min(ROTATION_RETRY_SECONDS * failures, ROTATION_RETRY_MAX_SECONDS)
+        self._rotation_failures[key] = (failures, now_mono + delay)
+        if failures >= ROTATION_ALERT_AFTER:
+            log.warning(
+                "轮换摘要连续失败 %d 次 %s/%s，%d 秒后重试（继续用旧 session）",
+                failures,
+                chat_type.value,
+                chat_id,
+                int(delay),
+            )
+        else:
+            log.info(
+                "轮换摘要失败，%d 秒后重试 %s/%s",
+                int(delay),
+                chat_type.value,
+                chat_id,
+            )
 
     def _check_workspace(self, chat_type: ChatType, chat_id: str) -> None:
         """每轮结束后 stat 一次；超上限保留尾部并留截断注释。"""
@@ -4454,17 +4606,17 @@ class Service:
                     parts.append(f"这批是 {'、'.join(speakers)} 在说")
         return "【此刻】" + "；".join(parts) + "。"
 
-    async def _link_block_for_prompt(
+    async def _link_blocks_for_prompt(
         self, chat_type: ChatType, messages: list[Message]
-    ) -> str | None:
-        """本批群友消息里的 URL → 【链接内容】块；没有链接就返回 None。
+    ) -> list[LinkBlock]:
+        """本批群友消息里的 URL → 解析结果；不满足解析条件时返回空列表。
 
         只解析群聊里非机器人发的消息（T6 规格）：机器人自己的消息、私聊与
         其它来源都不解析。同一 URL 只解析一次（由 LinkPromptResolver 去重）。
         解析失败不抛异常，最坏情况是整块「服务器读不到」，绝不挡回复主链路。
         """
         if chat_type is not ChatType.GROUP or not self.settings.link.enabled:
-            return None
+            return []
         urls: list[str] = []
         for message in messages:
             if message.is_bot or message.recalled_at or not message.content:
@@ -4472,16 +4624,22 @@ class Service:
             urls.extend(extract_urls(message.content))
         urls = list(dict.fromkeys(urls))
         if not urls:
-            return None
+            return []
         resolver = self.link_resolver
         resolve_many: Any = getattr(resolver, "resolve_for_prompt", None)
         if resolve_many is None:
-            return None
+            return []
         try:
-            blocks = await resolve_many(urls)
+            return list(await resolve_many(urls))
         except Exception:  # noqa: BLE001 - 链接是锦上添花，不能挡回复
             log.warning("链接解析失败，按读不到处理", exc_info=True)
-            blocks = [LinkBlock(url=url, ok=False, reason="error") for url in urls]
+            return [LinkBlock(url=url, ok=False, reason="error") for url in urls]
+
+    async def _link_block_for_prompt(
+        self, chat_type: ChatType, messages: list[Message]
+    ) -> str | None:
+        """本批群友消息里的 URL → 【链接内容】块；没有链接就返回 None。"""
+        blocks = await self._link_blocks_for_prompt(chat_type, messages)
         return render_link_block(blocks) or None
 
     def _build_prompt(

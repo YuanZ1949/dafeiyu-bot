@@ -413,10 +413,57 @@ def test_json_segment_broken_falls_back() -> None:
 
 
 def test_json_segment_no_title_falls_back() -> None:
-    embedded = json.dumps({"app": "com.tencent.foo", "prompt": "[应用] 某应用"}, ensure_ascii=False)
+    """标题与地址都取不到才回退占位（desc 是 "0" 这类占位时不算标题）。"""
+    embedded = json.dumps({"app": "com.tencent.foo", "desc": "0"}, ensure_ascii=False)
     m = parse_event(group_event(segments=[json_card(embedded)]), bot_qq=BOT_QQ)
     assert m is not None
     assert m.content == "[小程序卡片]"
+
+
+def test_json_segment_prompt_used_as_title() -> None:
+    """prompt 是 QQ 生成的摘要，比 desc 可靠；前面的「[QQ小程序]」标签剥掉。"""
+    embedded = json.dumps(
+        {"app": "com.tencent.foo", "prompt": "[QQ小程序]某应用"}, ensure_ascii=False
+    )
+    m = parse_event(group_event(segments=[json_card(embedded)]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "[卡片] 某应用"
+
+
+def test_json_miniapp_card_keeps_qqdocurl() -> None:
+    """知乎这类小程序卡：title 只有应用名，真实地址在 meta.detail_1.qqdocurl。"""
+    embedded = json.dumps(
+        {
+            "app": "com.tencent.miniapp_01",
+            "desc": "0",
+            "meta": {
+                "detail_1": {
+                    "appid": "wx1234",
+                    "title": "知乎",
+                    "desc": "知乎",
+                    "qqdocurl": "https://www.zhihu.com/question/2108257367678613356",
+                }
+            },
+            "prompt": "[QQ小程序]知乎",
+        },
+        ensure_ascii=False,
+    )
+    m = parse_event(group_event(segments=[json_card(embedded)]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == (
+        "[卡片] 知乎 https://www.zhihu.com/question/2108257367678613356"
+    )
+
+
+def test_json_card_without_title_keeps_url() -> None:
+    """标题缺失也不能丢地址：下游只认消息文本里的 URL。"""
+    embedded = json.dumps(
+        {"meta": {"detail_1": {"qqdocurl": "https://example.com/a"}}},
+        ensure_ascii=False,
+    )
+    m = parse_event(group_event(segments=[json_card(embedded)]), bot_qq=BOT_QQ)
+    assert m is not None
+    assert m.content == "[卡片] https://example.com/a"
 
 
 def test_json_segment_non_dict_data_falls_back() -> None:
@@ -437,6 +484,23 @@ def test_xml_segment_without_summary_falls_back() -> None:
     m = parse_event(group_event(segments=[{"type": "xml", "data": {"data": "<msg/>"}}]), bot_qq=BOT_QQ)
     assert m is not None
     assert m.content == "[卡片]"
+
+
+def test_xml_segment_keeps_url_attribute() -> None:
+    """xml payload 里的 url 属性也要带出来，否则分享卡同样是空壳。"""
+    m = parse_event(
+        group_event(
+            segments=[
+                xml_card(
+                    "[分享] 某网页标题",
+                    xml='<msg url="https://example.com/x">payload</msg>',
+                )
+            ]
+        ),
+        bot_qq=BOT_QQ,
+    )
+    assert m is not None
+    assert m.content == "[卡片] [分享] 某网页标题 https://example.com/x"
 
 
 # --- 合并转发 ---

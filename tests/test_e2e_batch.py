@@ -334,7 +334,9 @@ async def send_chatter(service, *, count: int, ts: int, prefix: str) -> list[str
     ids: list[str] = []
     for i in range(count):
         mid = f"{prefix}{i}"
-        await service.handle(make_msg(f"{HOT_LINE}{i}", message_id=mid, ts=ts))
+        # 正文带上批次前缀：不同批次不能是同一句，否则会被入站去重当成
+        # resync 重放（同人同文 + 时间相近）而丢掉。
+        await service.handle(make_msg(f"{HOT_LINE}{prefix}{i}", message_id=mid, ts=ts))
         ids.append(mid)
     return ids
 
