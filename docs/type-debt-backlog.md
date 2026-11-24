@@ -69,3 +69,22 @@
 - 目标文件 `severity=error` 条数**只减不增**；
 - 新增行 error 必须为 0；已知误报不计入；
 - 每改一个模块跑该模块相关测试；涉及公共返回类型时跑全量。
+
+## CI 口径（2026-11-24 起）
+
+`.gitea/workflows/ci.yml` 的 Type check 步骤不再看 basedpyright 的退出码：
+
+```pwsh
+basedpyright --outputjson --level error --pythonpath .ci-venv\Scripts\python.exe src
+```
+
+只读 `summary.errorCount`，> 0 才失败并打印 error 明细。原因两条，都是实测踩出来的：
+
+1. **runner 的 venv 是 `.ci-venv` 不是 `.venv`**：不传 `--pythonpath` 时 basedpyright
+   找不到已装的 `pysilk` / `pyweixin`，误报 3 条 missing import；
+2. **recommended 模式有 6302 条存量 warning**（`reportAny` / `reportExplicitAny` /
+   `reportUnknown*`）：`--level error` 只影响展示和退出码，`summary.warningCount`
+   仍计全量，按退出码判定会把 warning 也算失败，CI 永远红。
+
+当前基线（CI 实测）：139 files、0 errors、6302 warnings；覆盖率 84.91%（门槛 82%）。
+warning 属上文「严格模式债」，不影响 CI 绿灯。
