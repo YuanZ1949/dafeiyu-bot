@@ -375,6 +375,43 @@ _CHAT_INPUT_SPEC: dict[str, Any] = {"control_type": "Edit", "auto_id": "chat_inp
 _MULTISELECT_TOOLBAR_CLASS = "mmui::MultiSelectToolIButtonTexttem"
 
 
+#: 微信顶层窗口的窗口类名与标题（与 pyweixin `Navigator.open_weixin` 一致）。
+_WEIXIN_WINDOW_CLASS = "Qt51514QWindowIcon"
+_WEIXIN_WINDOW_TITLES = ("微信", "Weixin")
+_WEIXIN_MAIN_CLASS = "mmui::MainWindow"
+
+
+def _window_by_handle(wx: Any) -> Any | None:
+    """按句柄直接解析微信主窗口：不 restore、不置顶、不移动。
+
+    `Navigator.open_weixin()` 内部会 `restore()`、`SetWindowPos(HWND_TOPMOST)`、
+    把窗口移到屏幕中央并 `SC_RESTORE`（见 pyweixin `WeChatTools.py` 的
+    `open_weixin`）；未读轮询每 8 秒走一次，等于不停把用户的窗口拽回前台。
+    这里复用 pyweixin 已经建好的 uia `desktop`，只按句柄取窗口并校验主窗口
+    类名，有任何异常都返回 None，交给调用方回退到 `open_weixin()`。
+    """
+    tools = _attr(wx, "WeChatTools")
+    win32gui = _attr(tools, "win32gui")
+    desktop = _attr(tools, "desktop")
+    if win32gui is None or desktop is None:
+        return None
+    try:
+        hwnd = 0
+        for title in _WEIXIN_WINDOW_TITLES:
+            hwnd = win32gui.FindWindow(_WEIXIN_WINDOW_CLASS, title)
+            if hwnd:
+                break
+        if not hwnd:
+            return None
+        window = desktop.window(handle=hwnd)
+        if window.class_name() != _WEIXIN_MAIN_CLASS:
+            return None
+        return window
+    except Exception as exc:  # noqa: BLE001 - 解析失败就回退 open_weixin
+        _log.debug("按句柄解析微信主窗口失败，回退 open_weixin：%s", exc)
+        return None
+
+
 def _main_window() -> Any:
     """取微信主窗口（带缓存）：未读探测只需要一个窗口句柄，不做任何激活。"""
     global _main_window_cache
@@ -385,7 +422,7 @@ def _main_window() -> Any:
             alive = True if not callable(checker) else bool(checker(timeout=0.1))
             namer = getattr(cached, "class_name", None)
             is_main = (
-                True if not callable(namer) else namer() == "mmui::MainWindow"
+                True if not callable(namer) else namer() == _WEIXIN_MAIN_CLASS
             )
             if alive and is_main:
                 return cached
@@ -395,7 +432,11 @@ def _main_window() -> Any:
         _main_window_cache = None
 
     wx = _pyweixin()
-    window = _call(lambda: wx.Navigator.open_weixin(), "main_window_failed")
+    # 先试无副作用的句柄解析；只有拿不到主窗口时才退回 open_weixin()，
+    # 因为后者会把窗口 restore + 置顶 + 居中（用户能肉眼看到弹窗）。
+    window = _window_by_handle(wx)
+    if window is None:
+        window = _call(lambda: wx.Navigator.open_weixin(), "main_window_failed")
     if window is None:
         raise DriverError("window_unavailable", "微信主窗口不可用")
     _main_window_cache = window

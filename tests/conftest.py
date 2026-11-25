@@ -17,6 +17,32 @@ def _isolate_local_overrides(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(config_module, "OVERRIDES_PATH", missing)
 
 
+# 控制口切档时会 `ensure_server()` 拉起本机 LM Studio、切走时 `stop_server()`
+# 关掉它（见 src/dafeiyu/control.py 的 switch / _stop_local_model_if_unused）。
+# 用例只验路由与落盘契约，真跑一遍会让跑测试的人莫名其妙多出一个
+# `LM Studio.exe --run-as-service`（2026-11-24 的「自启动」就是这么来的）。
+# tests/test_lmstudio.py 直接测 brain.lmstudio 的编排，不受这里影响；需要断言
+# stop 调用的用例（test_control_brain_mode 的 lm_stop_spy）会自己覆盖同名属性。
+@pytest.fixture(autouse=True)
+def _no_real_lmstudio(monkeypatch):
+    from dafeiyu import control as control_module
+    from dafeiyu.brain.lmstudio import EnsureResult
+    from dafeiyu.brain.lmstudio import stop_server as _real_stop_server
+
+    async def _ensure_noop(*_args, **_kwargs):
+        return EnsureResult(ready=False, started=False, detail="测试禁用自启")
+
+    monkeypatch.setattr(control_module, "ensure_server", _ensure_noop)
+
+    # 只在 control 还指向真实函数时才替换 stop_server，避免盖掉用例自己的替身。
+    if getattr(control_module, "stop_server", None) is _real_stop_server:
+
+        async def _stop_noop(*_args, **_kwargs):
+            return EnsureResult(ready=False, started=False, detail="测试禁用停机")
+
+        monkeypatch.setattr(control_module, "stop_server", _stop_noop)
+
+
 # `build_specs()` 要求 `vendor/napcat/node.exe` 存在，而 vendor 目录是**本机安装状态**
 # （.gitignore 里，CI 干净 workspace 一定没有）。不隔离的话，同一份测试在开发机绿、
 # 在 CI 红 14 个。需要「没装 NapCat」语义的用例自行 monkeypatch NAPCAT_DIR 覆盖。
@@ -60,6 +86,7 @@ local_model:
   base_url: http://127.0.0.1:1/v1
   model: ""
   api_key: local
+  autostart: false
 """
 
 # 面板默认绑定 0.0.0.0（会强制登录）。功能类用例不该被鉴权挡住，所以把它们
