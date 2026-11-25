@@ -590,6 +590,49 @@ def test_wire_bubble_wraps_by_display_width(tmp_path: Path) -> None:
     assert "".join(bodies) == "阿鱼" + content
 
 
+def test_wire_bubble_never_splits_url_in_card_text(tmp_path: Path) -> None:
+    """卡片正文里的链接必须整段留在同一行（左锚气泡不能把它拦腰折断）。
+
+    线上事故：QQ 小程序卡渲染成「[卡片] 知乎 https://zhuanlan.zhihu.com/p/…」，
+    24 列折行把地址切成 5 行、每行带「│ 」前缀，微信不再识别成可点链接。
+    """
+    router, _store, _adapters = make_router(tmp_path)
+    url = (
+        "https://zhuanlan.zhihu.com/p/2108679792132362474"
+        "?share_code=eP1JNe7gDMxt&utm_psn=2108724483657941689"
+    )
+    message = make_msg(QQ, f"[卡片] 知乎 {url}")
+    wire = render_wire(router, message)
+    assert len(wire) == 1
+    url_lines = [line for line in wire[0].splitlines() if "https://" in line]
+    assert url_lines == [f"│ {url}"]
+    # 入库形态逐字节保留原文（气泡只管线上）。
+    assert render(router, message) == [f"阿鱼：[卡片] 知乎 {url}"]
+
+
+def test_wire_bubble_keeps_url_followed_by_text(tmp_path: Path) -> None:
+    """链接后面还有字：链接整段不拆，后续文字另起一行。"""
+    router, _store, _adapters = make_router(tmp_path)
+    url = "https://example.com/a?b=1&c=2"
+    wire = render_wire(router, make_msg(QQ, f"看这个 {url} 很有意思"))[0]
+    assert url in wire
+    assert [line for line in wire.splitlines() if url in line] == [f"│ {url}"]
+    assert "很有意思" in wire
+
+
+def test_render_qq_card_segment_does_not_add_unknown_placeholder(tmp_path: Path) -> None:
+    """QQ 卡片段（json/xml）的可读正文已在 text_lines 里，不再补 [其它消息]。"""
+    router, _store, _adapters = make_router(tmp_path)
+    url = "https://zhuanlan.zhihu.com/p/1"
+    message = make_msg(
+        QQ,
+        f"[卡片] 知乎 {url}",
+        segments=[Segment(type="json", data={"data": "{}"})],
+    )
+    assert render(router, message) == [f"阿鱼：[卡片] 知乎 {url}"]
+    assert "[其它消息]" not in render_wire(router, message)[0]
+
+
 def test_wire_bubble_rows_fit_client_container(tmp_path: Path) -> None:
     """整行（含「│ 」前缀）要给客户端容器留余量。
 
@@ -1274,3 +1317,84 @@ def test_private_chat_is_never_mirrored(tmp_path: Path) -> None:
     assert router._queues == {}
     assert router.stats()["sent"] == 0
     assert router.stats()["deduped"] == 0
+
+
+# ---------------------------------------------------------------- 卡片补标题
+CARD_URL = "https://zhuanlan.zhihu.com/p/2108679792132362474?share_code=eP1JNe7gDMxt"
+
+
+async def test_card_line_gets_page_title_before_delivery(tmp_path: Path) -> None:
+    """QQ 卡片只带应用名时，投递前补上页面标题；地址逐字保留、独立成行。"""
+    router, store, adapters = make_router(tmp_path)
+    calls: list[str] = []
+
+    async def fake_title(url: str) -> str:
+        calls.append(url)
+        return "如何看待本鱼的记忆力"
+
+    router.link_title = fake_title
+    router.start()
+    try:
+        router.observe_inbound(
+            make_msg(
+                QQ, f"[卡片] 知乎 {CARD_URL}", user_id="qq:2002", message_id="q1"
+            )
+        )
+        await wait_until(lambda: router.stats()["sent"] == 1)
+    finally:
+        await router.stop()
+
+    assert calls == [CARD_URL]
+    # 地址必须整行出现：折行拆开过（线上旧形态）客户端就认不出链接了。
+    assert f"│ {CARD_URL}" in adapters["wechat"].sent[0][1].split("\n")
+    row = store._conn.execute(
+        "SELECT content FROM messages WHERE chat_id = ? AND mirror = 1", (WXG,)
+    ).fetchone()
+    assert row["content"] == f"阿鱼：[卡片] 如何看待本鱼的记忆力 {CARD_URL}"
+
+
+async def test_card_title_kept_when_fetch_returns_nothing(tmp_path: Path) -> None:
+    """取不到标题（空串 / 太短）时原样发送，不能凭空改写卡片正文。"""
+    router, store, _adapters = make_router(tmp_path)
+
+    async def no_title(_url: str) -> str:
+        return "知乎"
+
+    router.link_title = no_title
+    router.start()
+    try:
+        router.observe_inbound(
+            make_msg(
+                QQ, f"[卡片] 知乎 {CARD_URL}", user_id="qq:2002", message_id="q1"
+            )
+        )
+        await wait_until(lambda: router.stats()["sent"] == 1)
+    finally:
+        await router.stop()
+
+    row = store._conn.execute(
+        "SELECT content FROM messages WHERE chat_id = ? AND mirror = 1", (WXG,)
+    ).fetchone()
+    assert row["content"] == f"阿鱼：[卡片] 知乎 {CARD_URL}"
+
+
+async def test_plain_link_message_does_not_fetch_title(tmp_path: Path) -> None:
+    """非卡片消息里的链接不抓标题：那条链接交给客户端自己生成预览。"""
+    router, _store, _adapters = make_router(tmp_path)
+    calls: list[str] = []
+
+    async def fake_title(url: str) -> str:
+        calls.append(url)
+        return "不该被用到"
+
+    router.link_title = fake_title
+    router.start()
+    try:
+        router.observe_inbound(
+            make_msg(QQ, f"看这个 {CARD_URL}", user_id="qq:2002", message_id="q1")
+        )
+        await wait_until(lambda: router.stats()["sent"] == 1)
+    finally:
+        await router.stop()
+
+    assert calls == []

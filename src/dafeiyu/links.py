@@ -63,6 +63,14 @@ DEFAULT_USER_AGENT = (
 #: 缓存条目文件名形态：URL 的 sha256 + .json。淘汰只碰这种文件。
 _CACHE_ENTRY_RE = re.compile(r"^[0-9a-f]{64}\.json$")
 
+#: 只为展示取标题（镜像卡片）时的请求上限：镜像队列是共享的，不能被一个
+#: 慢站按 ``link.timeout_seconds``（默认 12s）整批拖住。
+TITLE_ONLY_MAX_SECONDS = 12.0
+#: 成功标题的进程内 memo 容量（同一链接反复镜像时不再渲染第二次）。
+TITLE_ONLY_MEMO_MAX = 200
+#: 取标题失败后该 host 的退避：Edge 起不来时别让每张卡都白等一次上限。
+TITLE_ONLY_FAIL_BACKOFF_SECONDS = 300.0
+
 #: 挑战页特征（Cloudflare / 站点风控）。命中且正文极短时按 challenge 处理。
 _CHALLENGE_MARKERS = ("just a moment", "cf-challenge", "人机验证", "安全验证")
 #: 「极短」的阈值：真页面的正文几乎不可能少于这么多字。
@@ -549,6 +557,10 @@ class LinkPromptResolver:
         self._clock: Callable[[], float] = clock or time.time
         # T8：跨批次的 host 级失败知识。None = 不读也不写（测试与一次性调用）。
         self._failures: HostFailureStore | None = failures
+        # 镜像卡片取标题：成功 memo（URL→标题）与失败退避（host→可重试时刻）。
+        self._titles: dict[str, str] = {}
+        self._title_backoff: dict[str, float] = {}
+        self._title_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
         """只关自己起的浏览器进程；注入进来的实现由调用方负责。"""
@@ -590,6 +602,59 @@ class LinkPromptResolver:
                 blocks.append(_unreadable(url, exc.layer, "budget_exhausted"))
                 exhausted = True
         return blocks
+
+    async def title_for(self, url: str) -> str:
+        """只为展示取页面标题（卡片镜像）：失败返回空串，绝不抛异常。
+
+        与提示词侧共用同一条 HTTP→浏览器降级链，区别只有三点：① 整体有硬上限
+        :data:`TITLE_ONLY_MAX_SECONDS`（镜像队列不能为一行标题等太久）；② 成功
+        标题在进程内再 memo 一层，同一链接反复镜像不重复渲染；③ 失败按 host
+        退避 :data:`TITLE_ONLY_FAIL_BACKOFF_SECONDS`，Edge 起不来时不为每张卡
+        白等一次上限。
+        """
+        if not self._config.enabled:
+            return ""
+        target = _trim_url(url)
+        if not target:
+            return ""
+        cached = self._titles.get(target)
+        if cached is not None:
+            return cached
+        host = url_host(target)
+        if host and self._title_backoff.get(host, 0.0) > self._clock():
+            return ""
+        # 浏览器层共用同一个 renderer：并发渲染会互相踩 target，串行更稳。
+        async with self._title_lock:
+            cached = self._titles.get(target)
+            if cached is not None:
+                return cached
+            try:
+                block = await self._resolve_one(
+                    target, self._clock() + TITLE_ONLY_MAX_SECONDS
+                )
+            except Exception:  # noqa: BLE001 - 取标题失败绝不影响镜像发送
+                self._title_failed(host)
+                return ""
+            title = _squash_whitespace(block.title) if block.ok else ""
+            if not title:
+                self._title_failed(host)
+                return ""
+            self._title_backoff.pop(host, None)
+            self._titles[target] = title
+            while len(self._titles) > TITLE_ONLY_MEMO_MAX:
+                self._titles.pop(next(iter(self._titles)))
+            return title
+
+    def _title_failed(self, host: str) -> None:
+        """记一次取标题失败：同一 host 在退避窗口内不再尝试。"""
+        if not host:
+            return
+        self._title_backoff[host] = self._clock() + TITLE_ONLY_FAIL_BACKOFF_SECONDS
+        log.info(
+            "镜像卡片取标题失败（host=%s），%d 秒内不再尝试",
+            host,
+            int(TITLE_ONLY_FAIL_BACKOFF_SECONDS),
+        )
 
     async def _resolve_one(self, url: str, deadline: float) -> LinkBlock:
         """查失败知识 → 该跳的层直接跳 → 逐层失败就地记录（T6 + T8）。"""

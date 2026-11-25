@@ -50,6 +50,22 @@ log = logging.getLogger(__name__)
 _POLL_SLICE = 0.25
 #: 等文档 load 完的轮询间隔（``document.readyState`` 采样）。
 _READY_POLL = 0.2
+#: 「够用了」的文档体积下限：``readyState`` 停在 ``interactive`` 但文档已经有
+#: 这么大时，正文其实已经到了（线上实测知乎专栏 1s=293 KB、19s 才 complete）。
+_STABLE_MIN_HTML = 20_000
+#: 一次采样同时取 readyState 与文档体积，少一个来回。
+_READY_PROBE = (
+    "JSON.stringify({"
+    "state: document.readyState,"
+    "size: document.documentElement"
+    " ? document.documentElement.outerHTML.length : 0"
+    "})"
+)
+#: 快照重试上限：换文档的瞬间 ``documentElement`` 为 null，等一下就有。
+_SNAPSHOT_MAX_RETRIES = 20
+#: CDP 的 HTTP 发现端点偶发超时（最小化后主线程忙 / Edge 刚起来）：重试几次。
+_CDP_HTTP_ATTEMPTS = 3
+_CDP_HTTP_BACKOFF = 0.3
 #: 版本端点就绪重试的保底次数上限：即便注入时钟被冻结也不会无限循环。
 _MAX_VERSION_RETRIES = 500
 
@@ -128,15 +144,21 @@ def _squash_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _walk_initial_data(
-    node: Any, titles: list[str], chunks: list[str]
-) -> None:
-    """深度优先收集 initialData 里的标题与正文串（content/excerpt 常是 HTML）。"""
+def _walk_initial_data(node: Any, titles: list[tuple[bool, str]], chunks: list[str]) -> None:
+    """深度优先收集 initialData 里的标题与正文串（content/excerpt 常是 HTML）。
+
+    标题按「同一节点是否也带正文」记账：知乎的 initialData 里用户/栏目节点也
+    带 ``title``（实测抓到「新知答主」这种栏目名），直接取第一个会抓到栏目名；
+    文章实体同时有 ``content`` 与 ``title``，只有那一份才是文章标题。
+    """
     if isinstance(node, dict):
+        has_body = any(
+            isinstance(node.get(key), str) and str(node.get(key)).strip() for key in _CONTENT_KEYS
+        )
         for key, value in node.items():
             if isinstance(value, str):
-                if key == _TITLE_KEY and value.strip() and not titles:
-                    titles.append(value.strip())
+                if key == _TITLE_KEY and value.strip():
+                    titles.append((has_body, value.strip()))
                 elif key in _CONTENT_KEYS and value.strip():
                     chunks.append(value)
             else:
@@ -147,7 +169,11 @@ def _walk_initial_data(
 
 
 def _initial_data_text(html: str) -> tuple[str, str]:
-    """从整页 HTML 里解析 js-initialData，返回 (标题, 正文)；解析不动就都为空。"""
+    """从整页 HTML 里解析 js-initialData，返回 (文章标题, 正文)。
+
+    只认「同节点带正文」的标题；没有这种标题就返回空串，让调用方保留
+    ``document.title``——栏目名/作者名不能顶替文章标题。解析不动就都为空。
+    """
     match = _INITIAL_DATA_RE.search(html)
     if match is None:
         return "", ""
@@ -155,12 +181,31 @@ def _initial_data_text(html: str) -> tuple[str, str]:
         data = json.loads(match.group(1))
     except ValueError:
         return "", ""
-    titles: list[str] = []
+    titles: list[tuple[bool, str]] = []
     chunks: list[str] = []
     _walk_initial_data(data, titles, chunks)
-    title = titles[0] if titles else ""
+    titled = [text for has_body, text in titles if has_body]
+    title = titled[0] if titled else ""
     text = html_to_text("\n".join(chunks)) if chunks else ""
     return title, text
+
+
+def _parse_ready(raw: Any) -> tuple[str, int]:
+    """解析 ``_READY_PROBE`` 的回包；格式意外时按「没就绪」处理（会继续轮询）。"""
+    if not isinstance(raw, str):
+        return "", 0
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return "", 0
+    if not isinstance(data, dict):
+        return "", 0
+    state = str(data.get("state") or "")
+    try:
+        size = int(data.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return state, size
 
 
 # ---- 默认 CDP 连接实现 -------------------------------------------------------
@@ -263,36 +308,39 @@ class _DefaultCdpConnector:
     """真实端点实现：HTTP 发现端点用 httpx，target 连接用 websockets。"""
 
     async def version(self, port: int) -> dict[str, Any]:
-        async with httpx.AsyncClient(
-            timeout=5.0, verify=default_ssl_context()
-        ) as client:
+        async with httpx.AsyncClient(timeout=5.0, verify=default_ssl_context()) as client:
             resp = await client.get(f"http://127.0.0.1:{port}/json/version")
             resp.raise_for_status()
             return resp.json()
 
     async def create_target(self, port: int, url: str) -> dict[str, Any]:
-        async with httpx.AsyncClient(
-            timeout=5.0, verify=default_ssl_context()
-        ) as client:
+        # CDP 的 HTTP 端点在浏览器刚拉起 / 窗口刚最小化时偶发超时（线上
+        # 2026-11-23 就是这里 ReadTimeout）：重试几次再判失败，重试之间让出
+        # 事件循环，别把一次抖动变成整条链接解析失败。
+        for attempt in range(1, _CDP_HTTP_ATTEMPTS + 1):
+            try:
+                return await self._create_target_once(port, url)
+            except (httpx.TimeoutException, httpx.ConnectError):
+                if attempt >= _CDP_HTTP_ATTEMPTS:
+                    raise
+                await asyncio.sleep(_CDP_HTTP_BACKOFF * attempt)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def _create_target_once(self, port: int, url: str) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=5.0, verify=default_ssl_context()) as client:
             try:
                 # 新版 Chrome/Edge 只认 PUT；旧版只认 GET（PUT 会回 405）。
-                resp = await client.put(
-                    f"http://127.0.0.1:{port}/json/new", params={"url": url}
-                )
+                resp = await client.put(f"http://127.0.0.1:{port}/json/new", params={"url": url})
                 resp.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code != 405:
                     raise
-                resp = await client.get(
-                    f"http://127.0.0.1:{port}/json/new", params={"url": url}
-                )
+                resp = await client.get(f"http://127.0.0.1:{port}/json/new", params={"url": url})
                 resp.raise_for_status()
             return resp.json()
 
     async def close_target(self, port: int, target_id: str) -> None:
-        async with httpx.AsyncClient(
-            timeout=5.0, verify=default_ssl_context()
-        ) as client:
+        async with httpx.AsyncClient(timeout=5.0, verify=default_ssl_context()) as client:
             # best-effort：关不掉也不抛，进程回收会兜底。
             with suppress(httpx.HTTPError):
                 await client.get(f"http://127.0.0.1:{port}/json/close/{target_id}")
@@ -383,20 +431,15 @@ class BrowserRenderer:
                 # 渲染——窗口状态只影响前台观感，不影响读到的内容。
                 with suppress(Exception):
                     await self._minimize_window(session, target_id, deadline)
-                await self._call(
-                    session.command("Page.navigate", {"url": url}), deadline
-                )
-                await self._call(
-                    session.wait_event("Page.loadEventFired"), deadline
-                )
-                await self._wait_document_complete(session, deadline)
+                await self._call(session.command("Page.navigate", {"url": url}), deadline)
+                # 不瞪 Page.loadEventFired（可能永不触发 / 是 about:blank 那次）：
+                # 直接按文档自身状态判断「可读」，见 _wait_document_ready。
+                await self._wait_document_ready(session, deadline)
                 snapshot = await self._snapshot(session, deadline)
                 title, text = self._extract(snapshot)
                 if not text:
                     return self._failure(url, "empty")
-                return BrowserResult(
-                    ok=True, url=url, title=title, text=text, reason="ok"
-                )
+                return BrowserResult(ok=True, url=url, title=title, text=text, reason="ok")
             except TimeoutError:
                 kill = True
                 return self._failure(url, "browser_timeout")
@@ -537,38 +580,36 @@ class BrowserRenderer:
 
     # ---- 渲染步骤 ---------------------------------------------------------
 
-    async def _wait_document_complete(
-        self, session: CdpSession, deadline: float
-    ) -> None:
-        """等 target 的文档真的 load 完再抓快照。
+    async def _wait_document_ready(self, session: CdpSession, deadline: float) -> None:
+        """等文档「可读」：``complete``，或 ``interactive`` 且文档已经足够大。
 
-        ``Page.loadEventFired`` 可能是「创建 target 时 about:blank」那一次的
-        事件（它可能晚于 ``Page.navigate`` 才排队到我们手上），此时正文还没
-        到，抓到的是前端站的加载占位页——F3 真机实测知乎：占位 639 B、无
-        ``js-initialData``；真正 load 完是 316 KB、正文 3252 字。以
-        ``document.readyState === 'complete'`` 为准可以无视事件先后。
+        为什么不能只看 ``complete``：线上实测（2026-11-25 知乎专栏）文档 1s 就
+        ``interactive``、293 KB、``document.title`` 已是文章标题，但某个长尾资源
+        拖着，直到 19s 才 ``complete``，有时干脆永远不到——按 ``complete`` 死等会
+        把整份预算烧光并误判 ``browser_timeout``。小页面（新闻/博客）依旧以
+        ``complete`` 为准，避免拿骨架页当真内容。
 
-        deadline 到了仍没 load 完就按超时处理（渲染预算用尽 = browser_timeout），
-        绝不在半成品页面上判成功。
+        也不再等 ``Page.loadEventFired``：那个事件可能是 about:blank 那一次、也可能
+        永不触发，事件顺序本身不可靠；文档自身的状态才是判据。
         """
         while True:
             reply = await self._call(
                 session.command(
                     "Runtime.evaluate",
-                    {"expression": "document.readyState", "returnByValue": True},
+                    {"expression": _READY_PROBE, "returnByValue": True},
                 ),
                 deadline,
             )
-            if (reply.get("result") or {}).get("value") == "complete":
+            raw = (reply.get("result") or {}).get("value")
+            state, size = _parse_ready(raw)
+            if state == "complete" or (state == "interactive" and size >= _STABLE_MIN_HTML):
                 return
             remaining = deadline - self._clock()
             if remaining <= 0:
                 raise TimeoutError("document did not finish loading")
             await asyncio.sleep(min(_READY_POLL, remaining))
 
-    async def _minimize_window(
-        self, session: CdpSession, target_id: str, deadline: float
-    ) -> None:
+    async def _minimize_window(self, session: CdpSession, target_id: str, deadline: float) -> None:
         """把承载 ``target_id`` 的浏览器窗口最小化（有头不抢前台焦点）。
 
         走 CDP 而不是启动参数：``--start-minimized`` 实测无效（见 ``render``
@@ -605,9 +646,7 @@ class BrowserRenderer:
                 remaining = deadline - self._clock()
                 if remaining <= 0:
                     raise TimeoutError("cdp call deadline exceeded")
-                done, _ = await asyncio.wait(
-                    {task}, timeout=min(remaining, _POLL_SLICE)
-                )
+                done, _ = await asyncio.wait({task}, timeout=min(remaining, _POLL_SLICE))
                 if done:
                     if task.cancelled():
                         raise TimeoutError("cdp call cancelled")
@@ -618,12 +657,31 @@ class BrowserRenderer:
             raise
 
     async def _snapshot(self, session: CdpSession, deadline: float) -> dict[str, str]:
+        """抓一次快照；document 还没换成真文档时按 readyState 的节奏重试几次。
+
+        线上 2026-11-22 的 ``TypeError: Cannot read properties of null (reading
+        'outerHTML')`` 就是换文档瞬间 ``document.documentElement`` 为 null：
+        取值一律判空，html 为空说明真正的文档还没到，等一会儿再抓。
+        """
+        snapshot = {"title": "", "html": "", "text": ""}
+        for _ in range(_SNAPSHOT_MAX_RETRIES):
+            snapshot = await self._snapshot_once(session, deadline)
+            if snapshot["html"]:
+                return snapshot
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(_READY_POLL, remaining))
+        return snapshot
+
+    async def _snapshot_once(self, session: CdpSession, deadline: float) -> dict[str, str]:
         # 一次 evaluate 拿齐标题/整页 HTML/innerText，少三个来回。
         expression = (
             "JSON.stringify({"
-            "title: document.title,"
-            "html: document.documentElement.outerHTML,"
-            "text: document.body.innerText"
+            "title: document.title || '',"
+            "html: document.documentElement"
+            " ? document.documentElement.outerHTML : '',"
+            "text: document.body ? document.body.innerText : ''"
             "})"
         )
         reply = await self._call(
@@ -664,9 +722,7 @@ class BrowserRenderer:
     def _failure(self, url: str, reason: str) -> BrowserResult:
         return BrowserResult(ok=False, url=url, reason=reason)
 
-    async def _teardown(
-        self, session: CdpSession | None, target_id: str, *, kill: bool
-    ) -> None:
+    async def _teardown(self, session: CdpSession | None, target_id: str, *, kill: bool) -> None:
         if session is not None:
             with suppress(Exception):
                 await session.close()

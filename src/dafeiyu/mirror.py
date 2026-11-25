@@ -23,7 +23,7 @@ from .memory.store import Store
 from .models import Attachment, ChatType, Message, Segment
 from .reply_media import build_onebot_segments
 from .sender import MAX_CHUNK, _split
-from .textwidth import wrap_by_width
+from .textwidth import display_width, wrap_by_width
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +124,53 @@ _BAR = "│"
 #: 独占一行的裸链接：气泡按列宽换行会把它拆成几行，客户端就不再把它当链接
 #: （点不开）。这类行整行保留，宁可超宽也不折断。
 _BARE_URL_RE = re.compile(r"https?://\S+\Z", re.IGNORECASE)
+#: 正文里任何位置的链接：卡片正文是「昵称：标题 URL」这种混合行，折行时同样
+#: 不能拆——拆开后下一行还带 ``│`` 左锚，客户端就再也认不出这是链接。
+_URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+#: QQ 解析器渲染的卡片行前缀（``[卡片] 知乎 https://...``）。
+_CARD_LINE_RE = re.compile(r"^(\[(?:卡片|小程序卡片)\])[ \t]*(.*)$")
+#: 抓来的页面标题少于这么多字就别替换：``404``、``验证`` 之类没有信息量。
+_MIRROR_TITLE_MIN_CHARS = 4
+
+
+def _wrap_keeping_urls(line: str, limit: int) -> list[str]:
+    """按显示宽度折行，但把行内 URL 当作不可拆的整体。
+
+    裸链接已由 ``_BARE_URL_RE`` 整行保留；这里补的是「文本里夹着链接」的行：
+    QQ 小程序卡渲染成 ``[卡片] 知乎 https://zhuanlan.zhihu.com/p/...``，
+    按 24 列硬折会把一条 90 字的地址切成 5 行、每行再带 ``│ `` 前缀，微信
+    就不再识别成可点链接（线上实测）。URL 放得下才贴在前一行末尾，否则单独
+    成行，宁可超宽也不折断。
+    """
+    if limit <= 0 or not line:
+        return [line]
+    out: list[str] = []
+    cursor = 0
+    for match in _URL_RE.finditer(line):
+        if match.start() > cursor:
+            out.extend(wrap_by_width(line[cursor : match.start()], limit))
+        url = match.group(0)
+        if out and display_width(out[-1]) + display_width(url) <= limit:
+            out[-1] += url
+        else:
+            out.append(url)
+        cursor = match.end()
+    if cursor < len(line):
+        out.extend(wrap_by_width(line[cursor:], limit))
+    return out or [line]
+
+
+def _card_line_parts(line: str) -> tuple[str, str, str] | None:
+    """卡片行 → ``(前缀, 现有标题, 地址)``；不是带地址的卡片行时返回 ``None``。"""
+    matched = _CARD_LINE_RE.match(line.strip())
+    if matched is None:
+        return None
+    tag, rest = matched.group(1), matched.group(2).strip()
+    url_match = _URL_RE.search(rest)
+    if url_match is None:
+        return None
+    current = rest[: url_match.start()].strip(" ·|｜-—:：")
+    return tag, current, url_match.group(0)
 
 
 class RenderedLines(NamedTuple):
@@ -598,6 +645,9 @@ class MirrorRouter:
         #: 微信 .dat 解码器与下载函数（见类 docstring）；T5 会覆写 decode。
         self.decode: DecodeFn | None = decode
         self.fetch: FetchFn | None = fetch
+        #: 卡片补标题钩子（``url -> 页面标题``，失败返回空串）。与 ``decode`` 一样
+        #: 由 ``Service`` 注入，未注入时卡片保持 QQ 解析器给出的标题。
+        self.link_title: Callable[[str], Awaitable[str]] | None = None
         pairs = tuple(settings.mirror.pairs) if settings.mirror.enabled else ()
         #: chat_id → (来源通道, 目标群)；多对时每对独立匹配，群之间不交叉。
         self._routes: dict[str, tuple[str, str]] = {}
@@ -927,6 +977,8 @@ class MirrorRouter:
         attachments = await self._materialized_attachments(item, raw=raw)
         # 微信 .dat 解码失败可能是密钥迟到：有限次延迟补发，别让图永久丢失。
         self._maybe_retry_dat(item, attachments)
+        # 卡片补标题放在渲染之前：气泡与入库形态都能拿到文章标题。
+        item = await self._with_card_titles(item)
         rendered = (
             RenderedLines([], []) if item.media_only else self._render(item)
         )
@@ -1628,7 +1680,7 @@ class MirrorRouter:
                 # 裸链接不换行：折断后客户端不会把它识别成可点链接。
                 inner.append(line)
                 continue
-            inner.extend(wrap_by_width(raw_line, limit))
+            inner.extend(_wrap_keeping_urls(raw_line, limit))
         if not inner:
             return corners[2]
         rows = [f"{corners[0]} {inner[0]}"]
@@ -1671,6 +1723,38 @@ class MirrorRouter:
             return ""
         return "\n".join(item.text_lines).strip()
 
+    async def _with_card_titles(self, item: MirrorItem) -> MirrorItem:
+        """QQ 卡片缺正文标题时补抓页面标题（每条至多一次请求）。
+
+        QQ 的小程序/分享卡通常只带应用名（``[卡片] 知乎 https://...``），文章标题
+        只存在于落地页。这里在**投递前**补上，入库形态一起受益，地址保持原样；
+        抓不到、标题太短或已被现有标题包含时原样返回——绝不为了标题拖住发送。
+        """
+        resolver = self.link_title
+        if (
+            resolver is None
+            or item.source_channel != "qq"
+            or item.media_only
+            or not item.text_lines
+        ):
+            return item
+        lines = list(item.text_lines)
+        for index, line in enumerate(lines):
+            parts = _card_line_parts(line)
+            if parts is None:
+                continue
+            tag, current, url = parts
+            try:
+                fetched = str(await resolver(url) or "").strip()
+            except Exception:  # noqa: BLE001 - 补标题失败保持原样
+                log.info("镜像卡片取标题异常（保持原样）：%s", url, exc_info=True)
+                return item
+            if len(fetched) < _MIRROR_TITLE_MIN_CHARS or fetched in current:
+                return item
+            lines[index] = f"{tag} {fetched} {url}"
+            return replace(item, text_lines=tuple(lines))
+        return item
+
     def _placeholders(self, item: MirrorItem) -> list[str]:
         """媒体占位；合并转发优先用节点内容替换 ``[合并转发 N 条]``。"""
         entries = self._media_entries(item)
@@ -1679,11 +1763,18 @@ class MirrorRouter:
             for seg in item.segments
             if _media_kind(seg.type) == "forward"
         ]
+        # QQ 的 json/xml 卡片段没有对应的中文占位，会兜底成 ``[其它消息]``；
+        # 这类段的可读正文已经由 QQ 解析器渲染进 ``text_lines``（标题 + 地址），
+        # 再挂一个未知占位只是噪音，还会跟着镜像行一起入库。
+        has_text = any(line.strip() for line in item.text_lines)
         out: list[str] = []
         cursor = 0
         for entry in entries:
             if entry[0] != "forward":
-                out.append(self._placeholder(entry))
+                placeholder = self._placeholder(entry)
+                if placeholder == _UNKNOWN_PLACEHOLDER and has_text:
+                    continue
+                out.append(placeholder)
                 continue
             block = blocks[cursor] if cursor < len(blocks) else ""
             cursor += 1

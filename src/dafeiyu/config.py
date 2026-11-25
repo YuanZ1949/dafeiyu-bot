@@ -285,7 +285,10 @@ class ImagesConfig:
     """
 
     enabled: bool = True
-    max_bytes: int = 10 * 1024 * 1024
+    #: 单张下载/落盘上限。手机原图常见 10-25 MB，10 MiB 会把「QQ 原图」整条
+    #: 丢掉（2026-11-25 01:21 实测：超限 → 不转发、模型也拿不到）。落盘后仍按
+    #: ``max_edge`` 降采样，这个上限只挡异常大响应，不决定清晰度。
+    max_bytes: int = 32 * 1024 * 1024
     timeout_seconds: float = 8.0
     retention_days: int = 7
     #: 入站图片最长边上限；超过则用 ffmpeg 等比缩小。0 = 不降采样。
@@ -1069,7 +1072,7 @@ def _build_images(raw: dict[str, Any]) -> ImagesConfig:
     return ImagesConfig(
         enabled=bool(raw.get("enabled", True)),
         max_bytes=_positive_int(
-            raw.get("max_bytes"), "images.max_bytes", 10 * 1024 * 1024
+            raw.get("max_bytes"), "images.max_bytes", 32 * 1024 * 1024
         ),
         timeout_seconds=timeout,
         retention_days=_non_negative_int(

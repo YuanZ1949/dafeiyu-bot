@@ -131,6 +131,10 @@ class FakeBehavior:
         self.minimize_error = False
         # Runtime.evaluate 的 document.readyState 依次回这些值（取完停在最后一个）
         self.ready_states: list[str] = ["complete"]
+        # 采样时上报的文档体积（字符数）：interactive 是否「够用」看它
+        self.doc_size = 4_000
+        # 依次返回的快照（模拟换文档瞬间拿到空文档）；取完回落到 snapshot_payload
+        self.snapshot_payloads: list[str] = []
 
     def reply(self, method: str, params: dict[str, Any], mid: int) -> dict[str, Any] | None:
         if method == "Browser.getWindowForTarget":
@@ -157,14 +161,19 @@ class FakeBehavior:
             expression = str(params.get("expression", ""))
             if "readyState" in expression:
                 state = (
-                    self.ready_states.pop(0)
-                    if len(self.ready_states) > 1
-                    else self.ready_states[0]
+                    self.ready_states.pop(0) if len(self.ready_states) > 1 else self.ready_states[0]
                 )
-                return {"id": mid, "result": {"result": {"type": "string", "value": state}}}
+                probe = json.dumps({"state": state, "size": self.doc_size})
+                return {
+                    "id": mid,
+                    "result": {"result": {"type": "string", "value": probe}},
+                }
+            payload = (
+                self.snapshot_payloads.pop(0) if self.snapshot_payloads else self.snapshot_payload
+            )
             return {
                 "id": mid,
-                "result": {"result": {"type": "string", "value": self.snapshot_payload}},
+                "result": {"result": {"type": "string", "value": payload}},
             }
         return {"id": mid, "result": {}}
 
@@ -244,7 +253,11 @@ class Fixture:
     def __init__(self, config: LinkBrowserConfig, *, clock_step: float = 0.0) -> None:
         self.behavior = FakeBehavior()
         self.behavior.snapshot_payload = json.dumps(
-            {"title": "知乎标题", "html": _PAGE_HTML, "text": "整页innerText噪音：侧栏导航噪音文本"},
+            {
+                "title": "知乎标题",
+                "html": _PAGE_HTML,
+                "text": "整页innerText噪音：侧栏导航噪音文本",
+            },
             ensure_ascii=False,
         )
         self.clock = FakeClock(step=clock_step)
@@ -346,7 +359,8 @@ async def test_waits_for_document_complete_before_snapshot(tmp_path: Path) -> No
 
     sent = fixture.connector.page_sessions[0].sent
     ready = [i for i, item in enumerate(sent) if "readyState" in str(item["params"])]
-    shots = [i for i, item in enumerate(sent) if "outerHTML" in str(item["params"])]
+    # 快照的判据用 document.body（只有它才取 innerText）；探测式也含 outerHTML。
+    shots = [i for i, item in enumerate(sent) if "document.body" in str(item["params"])]
     assert len(ready) == 3
     # 快照必须发生在最后一次 readyState=complete 之后
     assert shots and shots[0] > ready[-1]
@@ -375,6 +389,80 @@ async def test_initial_data_preferred_over_page_inner_text(tmp_path: Path) -> No
     assert "腾讯回应全文要点" in result.text
     # 优先取 js-initialData：整页 innerText 的导航噪音不得混进正文
     assert "侧栏导航噪音文本" not in result.text
+
+
+async def test_initial_data_ignores_column_title(tmp_path: Path) -> None:
+    """initialData 里栏目/用户节点的 title（实测「新知答主」）不能顶替文章标题。"""
+    fixture = Fixture(make_config(tmp_path))
+    page = json.loads(fixture.behavior.snapshot_payload)
+    initial = {
+        "state": {
+            "entities": {
+                "users": {"u1": {"title": "新知答主", "name": "某某"}},
+                "articles": {"a1": {"title": "如何看待本鱼的记忆力", "content": "<p>正文要点</p>"}},
+            }
+        }
+    }
+    page["title"] = "页面标题兜底"
+    page["html"] = (
+        "<html><head><title>页面标题兜底</title></head><body>"
+        "<script id='js-initialData' type='application/json'>"
+        f"{json.dumps(initial, ensure_ascii=False)}</script></body></html>"
+    )
+    fixture.behavior.snapshot_payload = json.dumps(page, ensure_ascii=False)
+
+    result = await fixture.renderer.render("https://zhuanlan.zhihu.com/p/1")
+
+    assert result.title == "如何看待本鱼的记忆力"
+    assert "正文要点" in result.text
+
+
+async def test_snapshot_retries_when_document_is_missing(tmp_path: Path) -> None:
+    """换文档瞬间 documentElement 为 null：html 为空要重抓，不能折成 browser_error。"""
+    fixture = Fixture(make_config(tmp_path))
+    empty = json.dumps({"title": "", "html": "", "text": ""})
+    fixture.behavior.snapshot_payloads = [empty, empty]
+
+    result = await fixture.renderer.render("https://www.zhihu.com/question/1")
+
+    assert result.ok is True
+    assert result.title == "知乎标题"
+
+
+async def test_default_connector_retries_after_read_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CDP 发现端点偶发 ReadTimeout：重试一次就成功，不能直接判整体失败。"""
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if len(methods) == 1:
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(
+            200,
+            json={"id": "t3", "webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/page/t3"},
+        )
+
+    _patch_httpx(monkeypatch, handler)
+    info = await _DefaultCdpConnector().create_target(1, "about:blank")
+
+    assert info["id"] == "t3"
+    assert methods == ["PUT", "PUT"]
+
+
+async def test_interactive_with_large_document_is_readable(tmp_path: Path) -> None:
+    """readyState 停在 interactive 但文档已足够大：立刻快照，不等长尾资源。"""
+    fixture = Fixture(make_config(tmp_path))
+    fixture.behavior.ready_states = ["interactive"]
+    fixture.behavior.doc_size = 293_734
+
+    result = await fixture.renderer.render("https://zhuanlan.zhihu.com/p/1")
+
+    assert result.ok is True
+    sent = fixture.connector.page_sessions[0].sent
+    ready = [i for i, item in enumerate(sent) if "readyState" in str(item["params"])]
+    assert len(ready) == 1, "interactive + 大文档只该采样一次"
 
 
 # ---- (d) navigate 装死 → browser_timeout + terminate 一次 + target 关闭 -----------
@@ -460,9 +548,7 @@ async def test_version_endpoint_never_ready_is_launch_failed(tmp_path: Path) -> 
     clock = FakeClock(step=0.1)  # 每次读时钟推进，注入时钟几步内越过 deadline
     launcher = FakeLauncher()
     connector = NeverReadyConnector(FakeBehavior())
-    renderer = BrowserRenderer(
-        config, clock=clock, launcher=launcher, connector=connector
-    )
+    renderer = BrowserRenderer(config, clock=clock, launcher=launcher, connector=connector)
 
     result = await asyncio.wait_for(
         renderer.render("http://example.test/never-ready"), timeout=10.0

@@ -317,7 +317,7 @@ powershell -ExecutionPolicy Bypass -File scripts/napcat-qr.ps1 -ImageViewer
 | `gateway.wechat.media.max_bytes` | `10485760` | 微信入站图片解密后的单张大小上限（10 MiB）；超限保留占位 |
 | `gateway.wechat.media.storage_root` | `""` | 微信本地媒体根目录；空 = 自动探测 `xwechat_files`，只接受该目录内的文件 |
 | `images.enabled` | `true` | QQ 图片落盘开关：落盘到 `workspace.dir/images/` 并把路径写进正文；关闭时只保留 `[图片]` 占位。同时门控 QQ 语音/视频的 URL 下载 |
-| `images.max_bytes` | `10485760` | 单张图片下载/落盘大小上限（10 MiB）；超限或下载失败保留 `[图片]` 占位 |
+| `images.max_bytes` | `33554432` | 单张图片下载/落盘大小上限（32 MiB；手机原图常见 10-25 MB）；超限或下载失败保留 `[图片]` 占位。落盘后仍按 `max_edge` 降采样 |
 | `images.timeout_seconds` | `8` | 单张图片下载/解码总超时（秒）；超时保留 `[图片]` 占位 |
 | `images.retention_days` | `7` | `images/` 落盘图片保留天数，每次物化前惰性清理超期文件；`0` = 永久保留 |
 | `images.max_edge` | `1280` | 入站图片最长边上限：超过则用 ffmpeg 等比缩小（JPEG 显式 `-q:v 3`；缺 ffmpeg 时保留原图）；`0` = 不降采样；GIF 不处理（保动画） |

@@ -293,17 +293,24 @@ SHARED_FACT_HINT = "这条是别的群查过的结论，别直接当事实复述
 _MEDIA_PLACEHOLDER_RE = re.compile(
     r"^\[(?:图片|文件|视频|语音)(?::[^\]\n]*)?\](?:（[^）\n]*）)?$"
 )
+# 已物化图片的注记标记（images.py 的 ``[图片]（图存 <path>，可用 read 查看）``）。
+# 带它说明图已经落盘、模型能用 read 真看到，"没内容可回"这个沉默前提不成立；
+# 裸 [图片]（下载失败/未物化）与文件/视频/语音仍然算弱消息。
+_MATERIALIZED_IMAGE_MARK = "（图存 "
 
 
 def _silent_content_shape(content: str) -> str | None:
     """弱消息形态：纯表情/纯媒体占位、纯链接、或正文 ≤3 字。
 
     返回命中原因短语；像一句正常发言返回 None（不进沉默过滤）。
+    已物化的图片（带「图存」注记）不算弱消息：图在模型手里，交给它自己判断。
     """
     body = (content or "").strip()
     if is_sticker_content(body):
         return "纯表情占位"
     if _MEDIA_PLACEHOLDER_RE.fullmatch(body):
+        if body.startswith("[图片]") and _MATERIALIZED_IMAGE_MARK in body:
+            return None
         return "纯媒体占位"
     tokens = body.split()
     if tokens and all(
@@ -653,6 +660,8 @@ class Service:
         if mirror is not None:
             # 微信源的 .dat 解码必须与 handle 用同一实现，镜像才能解出可发送的图片。
             mirror.decode = self._decode_wechat_dat
+            # 卡片镜像补文章标题：只在展示方向用到，失败保持 QQ 解析器给的标题。
+            mirror.link_title = self._link_title_for_mirror
         self._sleep = sleep or asyncio.sleep
         self.commands = CommandRegistry()
         self._command_clock: Callable[[], float] = time.monotonic
@@ -4641,6 +4650,20 @@ class Service:
         """本批群友消息里的 URL → 【链接内容】块；没有链接就返回 None。"""
         blocks = await self._link_blocks_for_prompt(chat_type, messages)
         return render_link_block(blocks) or None
+
+    async def _link_title_for_mirror(self, url: str) -> str:
+        """镜像卡片补标题：复用链接解析器取页面标题，失败返回空串。
+
+        与提示词侧共用同一条降级链与缓存：卡片镜像读过的页面，模型随后读同一
+        链接会直接命中。这里的任何失败都只是「镜像标题保持原样」。
+        """
+        title_for: Any = getattr(self.link_resolver, "title_for", None)
+        if title_for is None:
+            return ""
+        try:
+            return str(await title_for(url) or "").strip()
+        except Exception:  # noqa: BLE001 - 标题是锦上添花，绝不影响镜像
+            return ""
 
     def _build_prompt(
         self,

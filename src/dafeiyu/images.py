@@ -209,8 +209,12 @@ async def _materialize(
         try:
             data = await _obtain(kind, value, settings=settings, fetch=fetch)
         except Exception:
+            # 带上网关声明的 file_size：超限时能立刻看出是真大图还是异常响应。
             log.info(
-                "图片获取失败，保持占位：msg=%s kind=%s", msg.message_id, kind,
+                "图片获取失败，保持占位：msg=%s kind=%s size=%s",
+                msg.message_id,
+                kind,
+                seg.data.get("file_size"),
                 exc_info=True,
             )
             continue
@@ -325,9 +329,10 @@ async def _materialize_relay(
             data = await _obtain(kind, value, settings=settings, fetch=fetch)
         except Exception:
             log.info(
-                "镜像图片获取失败，保持占位：msg=%s kind=%s",
+                "镜像图片获取失败，保持占位：msg=%s kind=%s size=%s",
                 msg.message_id,
                 kind,
+                seg.data.get("file_size"),
                 exc_info=True,
             )
             continue

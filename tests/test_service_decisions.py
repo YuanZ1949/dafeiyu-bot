@@ -516,6 +516,37 @@ async def test_short_answer_to_bot_question_not_filtered(tmp_path):
     assert brain.calls == 1
 
 
+async def test_materialized_image_batch_goes_to_model(tmp_path):
+    """已物化图片（带「图存」注记）不算弱消息：单条也要送模型，别把图吞掉。"""
+    brain = CountingBrain()
+    service, store, adapter = build(tmp_path, brain, settings=make_batch_settings())
+    bot_spoke(store, seconds_ago=10)
+
+    await service.handle(
+        make_msg("[图片]（图存 images/20261125-012121-ab12cd.jpg，可用 read 查看）")
+    )
+    await service.drain()
+
+    assert brain.calls == 1
+    assert adapter.sent
+    assert store.list_decisions()[0]["outcome"] == "replied"
+
+
+async def test_bare_image_placeholder_still_silent(tmp_path):
+    """裸 [图片]（下载失败/未物化）仍是弱消息：图都没有，别让模型瞎编。"""
+    brain = CountingBrain()
+    service, store, _ = build(tmp_path, brain, settings=make_batch_settings())
+    bot_spoke(store, seconds_ago=10)
+
+    await service.handle(make_msg("[图片]"))
+    await service.drain()
+
+    assert brain.calls == 0
+    item = store.list_decisions()[0]
+    assert item["checkpoint"] == "skip_known_silent"
+    assert item["reason"] == "纯媒体占位"
+
+
 async def test_silent_skip_respects_cooldown_window(tmp_path):
     """同一条表情包：冷却窗内 0 次调用；超过 90 秒后 1 次调用。"""
     brain = CountingBrain()

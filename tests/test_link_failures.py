@@ -20,6 +20,7 @@ from dafeiyu.config import LinkBrowserConfig, LinkConfig
 from dafeiyu.links import (
     _TRANSIENT_BROWSER_REASONS,
     LINK_UNREADABLE,
+    TITLE_ONLY_FAIL_BACKOFF_SECONDS,
     LinkPromptResolver,
     LinkResolution,
     render_link_block,
@@ -447,3 +448,48 @@ def test_failure_shape_normalizes_reasons() -> None:
     assert failure_shape("challenge") == "challenge"
     assert failure_shape("empty") == "empty"
     assert failure_shape("") == "unknown"
+
+
+# ---- 镜像卡片取标题（title_for）--------------------------------------------
+
+
+async def test_title_for_returns_browser_title_and_memoizes(tmp_path: Path) -> None:
+    """HTTP 403 时靠浏览器层拿标题；同一链接第二次必须命中 memo，不再渲染。"""
+    engine, _store, http, browser, _config, _clock = build(tmp_path)
+
+    assert await engine.title_for(URL) == "渲染标题"
+    assert await engine.title_for(URL) == "渲染标题"
+
+    assert http.calls == [URL]
+    assert browser.calls == [URL], "同一链接第二次取标题不能重复渲染"
+
+
+async def test_title_for_skips_browser_when_http_works(tmp_path: Path) -> None:
+    engine, _store, http, browser, _config, _clock = build(
+        tmp_path, http_result=ok_resolution()
+    )
+
+    assert await engine.title_for(URL) == "标题"
+    assert http.calls == [URL]
+    assert browser.calls == [], "HTTP 成功就不该起浏览器"
+
+
+async def test_title_for_backs_off_after_failure(tmp_path: Path) -> None:
+    """站点侧失败后按 host 退避：退避窗口内不再为标题发请求。"""
+    clock = FakeClock()
+    engine, _store, http, browser, _config, _clock = build(
+        tmp_path,
+        browser_result=BrowserResult(ok=False, url=URL, reason="browser_timeout"),
+        clock=clock,
+    )
+
+    assert await engine.title_for(URL) == ""
+    assert await engine.title_for(URL) == ""
+    assert len(http.calls) == 1
+    assert browser.calls == [URL], "退避窗口内不得再次渲染"
+
+    clock.advance(TITLE_ONLY_FAIL_BACKOFF_SECONDS + 1)
+    assert await engine.title_for(URL) == ""
+    # 浏览器层失败已被记成 search_only：退避结束后也不再发任何请求。
+    assert len(http.calls) == 1
+    assert browser.calls == [URL]

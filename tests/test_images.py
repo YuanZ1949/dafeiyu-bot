@@ -394,7 +394,7 @@ async def test_retention_zero_disables_cleanup(tmp_path):
 def test_build_images_defaults():
     cfg = _build_images({})
     assert cfg.enabled is True
-    assert cfg.max_bytes == 10 * 1024 * 1024
+    assert cfg.max_bytes == 32 * 1024 * 1024
     assert cfg.timeout_seconds == 8.0
     assert cfg.retention_days == 7
 
